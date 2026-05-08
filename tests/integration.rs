@@ -297,5 +297,9 @@ function Counter() {
         "clean.tsx",
     );
     assert!(!result.parse_error);
-    assert!(result.warnings.is_empty(), "unexpected warnings: {:?}", result.warnings);
+    assert!(
+        result.warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        result.warnings
+    );
 }

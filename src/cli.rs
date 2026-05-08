@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use clap::Parser;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::diagnostics::{Severity, Warning};
@@ -93,7 +93,10 @@ pub fn format_warning(w: &Warning, no_color: bool) -> String {
         ));
         out.push_str(&format!("     {}\n", w.message));
         for r in &w.related {
-            out.push_str(&format!("     ↳ {} ({}:{}:{})\n", r.message, r.loc.file, r.loc.line, r.loc.column));
+            out.push_str(&format!(
+                "     ↳ {} ({}:{}:{})\n",
+                r.message, r.loc.file, r.loc.line, r.loc.column
+            ));
         }
     } else {
         let col = severity_color(&w.severity);
@@ -143,7 +146,10 @@ pub fn format_file_block(result: &FileResult, opts: &Cli) -> String {
     }
 
     if result.parse_error {
-        let msg = result.parse_error_message.as_deref().unwrap_or("parse error");
+        let msg = result
+            .parse_error_message
+            .as_deref()
+            .unwrap_or("parse error");
         out.push_str(&format!("  {RED}parse error{RESET}: {msg}\n"));
     }
 
@@ -158,7 +164,10 @@ pub fn format_summary(summary: &AnalysisSummary, no_color: bool) -> String {
         if no_color {
             format!("✓ No issues in {} file(s).\n", summary.files_analyzed)
         } else {
-            format!("{GREEN}✓ No issues in {} file(s).{RESET}\n", summary.files_analyzed)
+            format!(
+                "{GREEN}✓ No issues in {} file(s).{RESET}\n",
+                summary.files_analyzed
+            )
         }
     } else {
         let msg = format!(

@@ -1,13 +1,13 @@
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::fs;
 use serde::Serialize;
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::diagnostics::{Severity, Warning};
 use crate::engine::walker::walk_file;
 use crate::events::AnalysisEvent;
 use crate::registry::DefaultHookRegistry;
-use crate::rules::{all_rules, Rule};
+use crate::rules::{Rule, all_rules};
 
 #[derive(Debug, Serialize)]
 pub struct SeverityCounts {
@@ -58,7 +58,10 @@ impl Dispatcher {
     }
 
     fn collect_warnings(self) -> Vec<Warning> {
-        self.rules.into_iter().flat_map(|r| r.warnings().to_vec()).collect()
+        self.rules
+            .into_iter()
+            .flat_map(|r| r.warnings().to_vec())
+            .collect()
     }
 }
 
@@ -68,7 +71,9 @@ pub struct Runner {
 
 impl Runner {
     pub fn new() -> Self {
-        Runner { registry: DefaultHookRegistry::new() }
+        Runner {
+            registry: DefaultHookRegistry::new(),
+        }
     }
 
     pub fn analyze_source(&self, source: &str, file: &str) -> FileResult {
@@ -77,7 +82,12 @@ impl Runner {
         match result {
             Ok(()) => {
                 let warnings = dispatcher.collect_warnings();
-                FileResult { file: file.to_owned(), warnings, parse_error: false, parse_error_message: None }
+                FileResult {
+                    file: file.to_owned(),
+                    warnings,
+                    parse_error: false,
+                    parse_error_message: None,
+                }
             }
             Err(msg) => FileResult {
                 file: file.to_owned(),
@@ -138,7 +148,11 @@ impl Runner {
                 files_analyzed: files.len() as u32,
                 files_with_warnings,
                 by_rule,
-                by_severity: SeverityCounts { errors, warnings: warnings_count, infos },
+                by_severity: SeverityCounts {
+                    errors,
+                    warnings: warnings_count,
+                    infos,
+                },
             },
             files,
         }

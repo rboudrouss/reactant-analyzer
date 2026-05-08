@@ -1,7 +1,7 @@
-use oxc_ast::ast::*;
 use crate::core::abs_env::{AbsEnv, lookup};
 use crate::core::aval::{AVal, CstValue, join};
 use crate::events::{SetterArgClassif, ValueResolution};
+use oxc_ast::ast::*;
 
 pub fn eval_expr(env: &AbsEnv, expr: &Expression) -> AVal {
     match expr {
@@ -29,12 +29,11 @@ pub fn eval_expr(env: &AbsEnv, expr: &Expression) -> AVal {
         Expression::ArrowFunctionExpression(arrow) => {
             AVal::Clos(format!("clos_{}", arrow.span.start))
         }
-        Expression::FunctionExpression(func) => {
-            AVal::Clos(format!("clos_{}", func.span.start))
-        }
-        Expression::SequenceExpression(seq) => {
-            seq.expressions.last().map_or(AVal::Top, |e| eval_expr(env, e))
-        }
+        Expression::FunctionExpression(func) => AVal::Clos(format!("clos_{}", func.span.start)),
+        Expression::SequenceExpression(seq) => seq
+            .expressions
+            .last()
+            .map_or(AVal::Top, |e| eval_expr(env, e)),
         Expression::TSTypeAssertion(a) => eval_expr(env, &a.expression),
         Expression::TSAsExpression(a) => eval_expr(env, &a.expression),
         Expression::TSSatisfiesExpression(a) => eval_expr(env, &a.expression),
@@ -76,8 +75,10 @@ fn eval_bop(env: &AbsEnv, bin: &BinaryExpression) -> AVal {
             (AVal::Number, AVal::Number)
             | (AVal::Cst(CstValue::Num(_)), AVal::Number)
             | (AVal::Number, AVal::Cst(CstValue::Num(_))) => AVal::Number,
-            (AVal::String_, _) | (_, AVal::String_)
-            | (AVal::Cst(CstValue::Str(_)), _) | (_, AVal::Cst(CstValue::Str(_))) => AVal::String_,
+            (AVal::String_, _)
+            | (_, AVal::String_)
+            | (AVal::Cst(CstValue::Str(_)), _)
+            | (_, AVal::Cst(CstValue::Str(_))) => AVal::String_,
             _ => AVal::Top,
         },
         BinaryOperator::Subtraction
@@ -166,12 +167,10 @@ pub fn classify_setter_arg(env: &AbsEnv, arg: &Expression) -> (SetterArgClassif,
         Expression::ArrowFunctionExpression(arrow) => {
             classify_fn_body(&arrow.params, &arrow.body, arrow.expression)
         }
-        Expression::FunctionExpression(func) => {
-            match &func.body {
-                Some(body) => classify_fn_body(&func.params, body, false),
-                None => SetterArgClassif::Unknown,
-            }
-        }
+        Expression::FunctionExpression(func) => match &func.body {
+            Some(body) => classify_fn_body(&func.params, body, false),
+            None => SetterArgClassif::Unknown,
+        },
         _ => match &value {
             ValueResolution::Literal(_) => SetterArgClassif::Constant,
             _ => SetterArgClassif::Unknown,
@@ -208,7 +207,10 @@ fn classify_fn_body(
     }
 }
 
-fn extract_return_expr<'a>(body: &'a FunctionBody<'a>, is_expression_body: bool) -> Option<&'a Expression<'a>> {
+fn extract_return_expr<'a>(
+    body: &'a FunctionBody<'a>,
+    is_expression_body: bool,
+) -> Option<&'a Expression<'a>> {
     if is_expression_body {
         // Concise arrow: single ExpressionStatement wrapping the return expr
         if let Some(Statement::ExpressionStatement(es)) = body.statements.first() {
@@ -243,10 +245,12 @@ pub fn identifier_appears_in(name: &str, expr: &Expression) -> bool {
                 || identifier_appears_in(name, &c.alternate)
         }
         Expression::CallExpression(c) => c.arguments.iter().any(|a| {
-            a.as_expression().map_or(false, |e| identifier_appears_in(name, e))
+            a.as_expression()
+                .map_or(false, |e| identifier_appears_in(name, e))
         }),
         Expression::ArrayExpression(a) => a.elements.iter().any(|el| {
-            el.as_expression().map_or(false, |e| identifier_appears_in(name, e))
+            el.as_expression()
+                .map_or(false, |e| identifier_appears_in(name, e))
         }),
         _ => false,
     }

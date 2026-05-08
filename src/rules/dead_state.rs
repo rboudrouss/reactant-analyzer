@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet};
 use crate::diagnostics::{Severity, Warning};
 use crate::events::{AnalysisEvent, SourceLocation};
 use crate::rules::Rule;
+use std::collections::{HashMap, HashSet};
 
 struct StateInfo {
     value_name: String,
@@ -41,10 +41,18 @@ impl Rule for DeadStateRule {
                 self.setter_called.clear();
                 self.value_read.clear();
             }
-            AnalysisEvent::StateDeclaration { state_id, value_name, loc, .. } => {
+            AnalysisEvent::StateDeclaration {
+                state_id,
+                value_name,
+                loc,
+                ..
+            } => {
                 self.state_decls.insert(
                     state_id.clone(),
-                    StateInfo { value_name: value_name.clone(), loc: loc.clone() },
+                    StateInfo {
+                        value_name: value_name.clone(),
+                        loc: loc.clone(),
+                    },
                 );
             }
             AnalysisEvent::SetterCall { state_id, .. } => {
@@ -55,7 +63,8 @@ impl Rule for DeadStateRule {
             }
             AnalysisEvent::ComponentExit { .. } => {
                 for (state_id, info) in &self.state_decls {
-                    if self.setter_called.contains(state_id) && !self.value_read.contains(state_id) {
+                    if self.setter_called.contains(state_id) && !self.value_read.contains(state_id)
+                    {
                         self.warnings.push(Warning::new(
                             "dead-state",
                             Severity::Warning,

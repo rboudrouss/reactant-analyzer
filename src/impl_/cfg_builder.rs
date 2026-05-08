@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::core::cfg::{CfgEdge, CfgEdgeLabel, CfgNode, CfgNodeKind, FunctionCfg};
+use std::collections::HashMap;
 
 pub struct CfgBuilder {
     next_id: u32,
@@ -25,7 +25,11 @@ impl CfgBuilder {
     fn new_node(&mut self, kind: CfgNodeKind) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
-        self.nodes.push(CfgNode { id, kind, ast_node_id: None });
+        self.nodes.push(CfgNode {
+            id,
+            kind,
+            ast_node_id: None,
+        });
         id
     }
 

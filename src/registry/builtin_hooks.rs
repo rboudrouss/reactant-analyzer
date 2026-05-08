@@ -4,7 +4,10 @@ pub const BUILTIN_HOOKS: &[HookDefinition] = &[
     HookDefinition {
         name: "useState",
         semantics: HookSemantics::State,
-        state_position: Some(StatePosition { value: 0, setter: 1 }),
+        state_position: Some(StatePosition {
+            value: 0,
+            setter: 1,
+        }),
         effect_callback_position: None,
         deps_position: None,
         triggers_rerender: true,
@@ -13,7 +16,10 @@ pub const BUILTIN_HOOKS: &[HookDefinition] = &[
     HookDefinition {
         name: "useReducer",
         semantics: HookSemantics::State,
-        state_position: Some(StatePosition { value: 0, setter: 1 }),
+        state_position: Some(StatePosition {
+            value: 0,
+            setter: 1,
+        }),
         effect_callback_position: None,
         deps_position: None,
         triggers_rerender: true,
@@ -85,7 +91,10 @@ pub const BUILTIN_HOOKS: &[HookDefinition] = &[
     HookDefinition {
         name: "useTransition",
         semantics: HookSemantics::State,
-        state_position: Some(StatePosition { value: 0, setter: 1 }),
+        state_position: Some(StatePosition {
+            value: 0,
+            setter: 1,
+        }),
         effect_callback_position: None,
         deps_position: None,
         triggers_rerender: false,
@@ -139,7 +148,10 @@ pub const BUILTIN_HOOKS: &[HookDefinition] = &[
     HookDefinition {
         name: "useOptimistic",
         semantics: HookSemantics::State,
-        state_position: Some(StatePosition { value: 0, setter: 1 }),
+        state_position: Some(StatePosition {
+            value: 0,
+            setter: 1,
+        }),
         effect_callback_position: None,
         deps_position: None,
         triggers_rerender: true,
@@ -148,7 +160,10 @@ pub const BUILTIN_HOOKS: &[HookDefinition] = &[
     HookDefinition {
         name: "useActionState",
         semantics: HookSemantics::State,
-        state_position: Some(StatePosition { value: 0, setter: 1 }),
+        state_position: Some(StatePosition {
+            value: 0,
+            setter: 1,
+        }),
         effect_callback_position: None,
         deps_position: None,
         triggers_rerender: true,

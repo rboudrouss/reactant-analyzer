@@ -1,7 +1,7 @@
-use std::collections::HashMap;
 use crate::diagnostics::{Severity, Warning};
 use crate::events::{AnalysisContext, AnalysisEvent, SetterArgClassif, ValueResolution};
 use crate::rules::Rule;
+use std::collections::HashMap;
 
 pub struct UnnecessaryRerenderRule {
     component_name: String,
@@ -38,8 +38,14 @@ impl Rule for UnnecessaryRerenderRule {
                 self.component_name = component_name.clone();
                 self.state_decls.clear();
             }
-            AnalysisEvent::StateDeclaration { state_id, initial_value, loc, .. } => {
-                self.state_decls.insert(state_id.clone(), (initial_value.clone(), loc.clone()));
+            AnalysisEvent::StateDeclaration {
+                state_id,
+                initial_value,
+                loc,
+                ..
+            } => {
+                self.state_decls
+                    .insert(state_id.clone(), (initial_value.clone(), loc.clone()));
             }
             AnalysisEvent::SetterCall {
                 state_id,

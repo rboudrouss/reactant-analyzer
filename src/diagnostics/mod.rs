@@ -1,5 +1,5 @@
-use serde::Serialize;
 use crate::events::SourceLocation;
+use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -24,7 +24,11 @@ pub struct SerializedLoc {
 
 impl From<&SourceLocation> for SerializedLoc {
     fn from(l: &SourceLocation) -> Self {
-        SerializedLoc { file: l.file.clone(), line: l.line, column: l.column }
+        SerializedLoc {
+            file: l.file.clone(),
+            line: l.line,
+            column: l.column,
+        }
     }
 }
 
@@ -57,7 +61,10 @@ impl Warning {
     }
 
     pub fn with_related(mut self, message: String, loc: &SourceLocation) -> Self {
-        self.related.push(RelatedLoc { message, loc: loc.into() });
+        self.related.push(RelatedLoc {
+            message,
+            loc: loc.into(),
+        });
         self
     }
 }

@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::marker::PhantomData;
 use crate::core::cfg::{CfgEdgeLabel, FunctionCfg};
 use crate::core::fixpoint::{FixpointEngine, FixpointResult, Lattice};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::marker::PhantomData;
 
 const MAX_ITER: u32 = 10_000;
 
@@ -12,7 +12,10 @@ pub struct WorklistEngine<T, L> {
 
 impl<T: Clone, L: Lattice<T>> WorklistEngine<T, L> {
     pub fn new(lattice: L) -> Self {
-        WorklistEngine { lattice, _phantom: PhantomData }
+        WorklistEngine {
+            lattice,
+            _phantom: PhantomData,
+        }
     }
 
     fn compute_rpo(&self, cfg: &FunctionCfg) -> (Vec<u32>, HashMap<u32, usize>) {
@@ -25,12 +28,21 @@ impl<T: Clone, L: Lattice<T>> WorklistEngine<T, L> {
             }
         }
         post_order.reverse();
-        let index: HashMap<u32, usize> =
-            post_order.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+        let index: HashMap<u32, usize> = post_order
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, i))
+            .collect();
         (post_order, index)
     }
 
-    fn dfs(&self, cfg: &FunctionCfg, node: u32, visited: &mut HashSet<u32>, post_order: &mut Vec<u32>) {
+    fn dfs(
+        &self,
+        cfg: &FunctionCfg,
+        node: u32,
+        visited: &mut HashSet<u32>,
+        post_order: &mut Vec<u32>,
+    ) {
         if !visited.insert(node) {
             return;
         }
@@ -72,14 +84,21 @@ impl<T: Clone, L: Lattice<T>> FixpointEngine<T> for WorklistEngine<T, L> {
             }
             iterations += 1;
 
-            let pre = pre_envs.get(&node_id).cloned().unwrap_or_else(|| self.lattice.bot());
+            let pre = pre_envs
+                .get(&node_id)
+                .cloned()
+                .unwrap_or_else(|| self.lattice.bot());
             let post = transfer(node_id, &pre);
             post_envs.insert(node_id, post.clone());
 
             for (succ_id, label) in cfg.successors(node_id) {
-                let old_succ = pre_envs.get(&succ_id).cloned().unwrap_or_else(|| self.lattice.bot());
+                let old_succ = pre_envs
+                    .get(&succ_id)
+                    .cloned()
+                    .unwrap_or_else(|| self.lattice.bot());
                 let contrib = if *label == CfgEdgeLabel::Back {
-                    self.lattice.widen(&old_succ, &self.lattice.join(&old_succ, &post))
+                    self.lattice
+                        .widen(&old_succ, &self.lattice.join(&old_succ, &post))
                 } else {
                     self.lattice.join(&old_succ, &post)
                 };
@@ -92,6 +111,10 @@ impl<T: Clone, L: Lattice<T>> FixpointEngine<T> for WorklistEngine<T, L> {
             }
         }
 
-        FixpointResult { pre_envs, post_envs, iterations }
+        FixpointResult {
+            pre_envs,
+            post_envs,
+            iterations,
+        }
     }
 }

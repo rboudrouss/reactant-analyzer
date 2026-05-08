@@ -35,7 +35,9 @@ impl PartialEq for ValueResolution {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (ValueResolution::Literal(a), ValueResolution::Literal(b)) => a == b,
-            (ValueResolution::State { state_id: a }, ValueResolution::State { state_id: b }) => a == b,
+            (ValueResolution::State { state_id: a }, ValueResolution::State { state_id: b }) => {
+                a == b
+            }
             (ValueResolution::Top, ValueResolution::Top) => true,
             _ => false,
         }

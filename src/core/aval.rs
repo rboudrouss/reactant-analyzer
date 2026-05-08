@@ -76,11 +76,7 @@ pub fn join(a: &AVal, b: &AVal) -> AVal {
             } else {
                 let lifted = lift_cst(v1);
                 let lifted2 = lift_cst(v2);
-                if lifted == lifted2 {
-                    lifted
-                } else {
-                    AVal::Top
-                }
+                if lifted == lifted2 { lifted } else { AVal::Top }
             }
         }
         (AVal::Cst(v), t) | (t, AVal::Cst(v)) => {
@@ -94,10 +90,18 @@ pub fn join(a: &AVal, b: &AVal) -> AVal {
         (AVal::Bool, AVal::Bool) => AVal::Bool,
         (AVal::String_, AVal::String_) => AVal::String_,
         (AVal::Clos(l1), AVal::Clos(l2)) => {
-            if l1 == l2 { AVal::Clos(l1.clone()) } else { AVal::Top }
+            if l1 == l2 {
+                AVal::Clos(l1.clone())
+            } else {
+                AVal::Top
+            }
         }
         (AVal::Setter(l1), AVal::Setter(l2)) => {
-            if l1 == l2 { AVal::Setter(l1.clone()) } else { AVal::Top }
+            if l1 == l2 {
+                AVal::Setter(l1.clone())
+            } else {
+                AVal::Top
+            }
         }
         _ => AVal::Top,
     }
@@ -131,23 +135,44 @@ mod tests {
 
     #[test]
     fn join_same_const() {
-        assert_eq!(join(&AVal::Cst(CstValue::Num(1.0)), &AVal::Cst(CstValue::Num(1.0))), AVal::Cst(CstValue::Num(1.0)));
+        assert_eq!(
+            join(
+                &AVal::Cst(CstValue::Num(1.0)),
+                &AVal::Cst(CstValue::Num(1.0))
+            ),
+            AVal::Cst(CstValue::Num(1.0))
+        );
     }
 
     #[test]
     fn join_different_num_consts() {
-        assert_eq!(join(&AVal::Cst(CstValue::Num(1.0)), &AVal::Cst(CstValue::Num(2.0))), AVal::Number);
+        assert_eq!(
+            join(
+                &AVal::Cst(CstValue::Num(1.0)),
+                &AVal::Cst(CstValue::Num(2.0))
+            ),
+            AVal::Number
+        );
     }
 
     #[test]
     fn join_cross_type() {
-        assert_eq!(join(&AVal::Cst(CstValue::Num(1.0)), &AVal::Cst(CstValue::Str("x".into()))), AVal::Top);
+        assert_eq!(
+            join(
+                &AVal::Cst(CstValue::Num(1.0)),
+                &AVal::Cst(CstValue::Str("x".into()))
+            ),
+            AVal::Top
+        );
     }
 
     #[test]
     fn join_bot_identity() {
         assert_eq!(join(&AVal::Bot, &AVal::Number), AVal::Number);
-        assert_eq!(join(&AVal::Cst(CstValue::Bool(true)), &AVal::Bot), AVal::Cst(CstValue::Bool(true)));
+        assert_eq!(
+            join(&AVal::Cst(CstValue::Bool(true)), &AVal::Bot),
+            AVal::Cst(CstValue::Bool(true))
+        );
     }
 
     #[test]
@@ -158,12 +183,24 @@ mod tests {
 
     #[test]
     fn widen_different_consts_lifts() {
-        assert_eq!(widen(&AVal::Cst(CstValue::Num(1.0)), &AVal::Cst(CstValue::Num(2.0))), AVal::Number);
+        assert_eq!(
+            widen(
+                &AVal::Cst(CstValue::Num(1.0)),
+                &AVal::Cst(CstValue::Num(2.0))
+            ),
+            AVal::Number
+        );
     }
 
     #[test]
     fn widen_same_const_keeps() {
-        assert_eq!(widen(&AVal::Cst(CstValue::Num(1.0)), &AVal::Cst(CstValue::Num(1.0))), AVal::Cst(CstValue::Num(1.0)));
+        assert_eq!(
+            widen(
+                &AVal::Cst(CstValue::Num(1.0)),
+                &AVal::Cst(CstValue::Num(1.0))
+            ),
+            AVal::Cst(CstValue::Num(1.0))
+        );
     }
 
     #[test]
@@ -188,13 +225,25 @@ mod tests {
 
     #[test]
     fn join_cst_and_type() {
-        assert_eq!(join(&AVal::Cst(CstValue::Num(1.0)), &AVal::Number), AVal::Number);
-        assert_eq!(join(&AVal::Cst(CstValue::Bool(true)), &AVal::Number), AVal::Top);
+        assert_eq!(
+            join(&AVal::Cst(CstValue::Num(1.0)), &AVal::Number),
+            AVal::Number
+        );
+        assert_eq!(
+            join(&AVal::Cst(CstValue::Bool(true)), &AVal::Number),
+            AVal::Top
+        );
     }
 
     #[test]
     fn join_closures() {
-        assert_eq!(join(&AVal::Clos("a".into()), &AVal::Clos("a".into())), AVal::Clos("a".into()));
-        assert_eq!(join(&AVal::Clos("a".into()), &AVal::Clos("b".into())), AVal::Top);
+        assert_eq!(
+            join(&AVal::Clos("a".into()), &AVal::Clos("a".into())),
+            AVal::Clos("a".into())
+        );
+        assert_eq!(
+            join(&AVal::Clos("a".into()), &AVal::Clos("b".into())),
+            AVal::Top
+        );
     }
 }

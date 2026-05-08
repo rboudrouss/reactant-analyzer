@@ -90,7 +90,10 @@ pub const BUILTIN_THIRD_PARTY_HOOKS: &[HookDefinition] = &[
     HookDefinition {
         name: "useAtom",
         semantics: HookSemantics::State,
-        state_position: Some(StatePosition { value: 0, setter: 1 }),
+        state_position: Some(StatePosition {
+            value: 0,
+            setter: 1,
+        }),
         effect_callback_position: None,
         deps_position: None,
         triggers_rerender: true,

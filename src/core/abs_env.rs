@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::core::aval::{AVal, join, leq, widen};
+use std::collections::HashMap;
 
 pub type AbsEnv = HashMap<String, AVal>;
 
@@ -71,7 +71,11 @@ mod tests {
 
     #[test]
     fn join_env_pointwise() {
-        let a = [("x".to_string(), AVal::Cst(CstValue::Num(1.0))), ("y".to_string(), AVal::Number)].into();
+        let a = [
+            ("x".to_string(), AVal::Cst(CstValue::Num(1.0))),
+            ("y".to_string(), AVal::Number),
+        ]
+        .into();
         let b = [("x".to_string(), AVal::Cst(CstValue::Num(2.0)))].into();
         let j = join_env(&a, &b);
         assert_eq!(j["x"], AVal::Number);

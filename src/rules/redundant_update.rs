@@ -9,7 +9,10 @@ pub struct RedundantUpdateRule {
 
 impl RedundantUpdateRule {
     pub fn new() -> Self {
-        RedundantUpdateRule { component_name: String::new(), warnings: vec![] }
+        RedundantUpdateRule {
+            component_name: String::new(),
+            warnings: vec![],
+        }
     }
 }
 
@@ -23,9 +26,12 @@ impl Rule for RedundantUpdateRule {
             AnalysisEvent::ComponentEnter { component_name, .. } => {
                 self.component_name = component_name.clone();
             }
-            AnalysisEvent::SetterCall { setter_name, argument_classif, loc, .. }
-                if *argument_classif == SetterArgClassif::Identity =>
-            {
+            AnalysisEvent::SetterCall {
+                setter_name,
+                argument_classif,
+                loc,
+                ..
+            } if *argument_classif == SetterArgClassif::Identity => {
                 self.warnings.push(Warning::new(
                     "redundant-update",
                     Severity::Warning,

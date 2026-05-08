@@ -80,6 +80,7 @@ impl HookRegistry for DefaultHookRegistry {
     }
 
     fn is_semantics(&self, name: &str, semantics: &HookSemantics) -> bool {
-        self.resolve(name).map_or(false, |d| &d.semantics == semantics)
+        self.resolve(name)
+            .map_or(false, |d| &d.semantics == semantics)
     }
 }

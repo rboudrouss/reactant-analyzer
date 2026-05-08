@@ -9,7 +9,10 @@ pub struct InfiniteLoopEffectRule {
 
 impl InfiniteLoopEffectRule {
     pub fn new() -> Self {
-        InfiniteLoopEffectRule { component_name: String::new(), warnings: vec![] }
+        InfiniteLoopEffectRule {
+            component_name: String::new(),
+            warnings: vec![],
+        }
     }
 }
 

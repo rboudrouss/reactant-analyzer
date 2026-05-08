@@ -1,16 +1,16 @@
-mod core;
-mod impl_;
-mod events;
-mod diagnostics;
-mod rules;
-mod registry;
-mod engine;
 mod cli;
+mod core;
+mod diagnostics;
+mod engine;
+mod events;
+mod impl_;
+mod registry;
+mod rules;
 
-use std::process;
 use clap::Parser;
 use cli::Cli;
 use engine::runner::Runner;
+use std::process;
 
 fn main() {
     let args = Cli::parse();
@@ -20,7 +20,11 @@ fn main() {
         process::exit(2);
     }
 
-    let files: Vec<_> = args.paths.iter().flat_map(|p| cli::collect_files(p)).collect();
+    let files: Vec<_> = args
+        .paths
+        .iter()
+        .flat_map(|p| cli::collect_files(p))
+        .collect();
 
     if files.is_empty() {
         eprintln!("No supported files found.");
@@ -31,7 +35,10 @@ fn main() {
     let report = runner.analyze_files(&files);
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        );
     } else {
         print!("{}", cli::format_report(&report, &args));
     }

@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::core::cfg::FunctionCfg;
+use std::collections::HashMap;
 
 pub struct FixpointResult<T> {
     pub pre_envs: HashMap<u32, T>,

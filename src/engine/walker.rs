@@ -5,12 +5,10 @@ use oxc_ast::ast::*;
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::{SourceType, Span};
 
-use crate::core::abs_env::{empty_env, extend, join_env, AbsEnv};
+use crate::core::abs_env::{AbsEnv, empty_env, extend, join_env};
 use crate::core::aval::AVal;
 use crate::engine::expr_eval::{classify_setter_arg, eval_expr, resolve_value};
-use crate::events::{
-    AnalysisContext, AnalysisEvent, BranchKind, SourceLocation, ValueResolution,
-};
+use crate::events::{AnalysisContext, AnalysisEvent, BranchKind, SourceLocation, ValueResolution};
 use crate::registry::{HookRegistry, HookSemantics};
 
 // ── Emitter trait ─────────────────────────────────────────────────────────────
@@ -59,11 +57,19 @@ pub fn walk_file(
     let allocator = Allocator::default();
     let source_type = source_type_from_path(file);
     let ret = Parser::new(&allocator, source, source_type)
-        .with_options(ParseOptions { parse_regular_expression: false, ..Default::default() })
+        .with_options(ParseOptions {
+            parse_regular_expression: false,
+            ..Default::default()
+        })
         .parse();
 
     if !ret.errors.is_empty() {
-        let msg = ret.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
+        let msg = ret
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
         return Err(msg);
     }
 
@@ -107,7 +113,11 @@ fn visit_top_level(stmt: &Statement, state: &mut WalkerState) {
         }
         Statement::ExportDefaultDeclaration(exp) => match &exp.declaration {
             ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
-                let name = func.id.as_ref().map(|i| i.name.as_str()).unwrap_or("DefaultExport");
+                let name = func
+                    .id
+                    .as_ref()
+                    .map(|i| i.name.as_str())
+                    .unwrap_or("DefaultExport");
                 analyze_component(name, &func.params, func.body.as_deref(), state);
             }
             ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => {
@@ -185,13 +195,19 @@ fn analyze_component(
     }
 
     let loc = state.loc(params.span);
-    state.emit(AnalysisEvent::ComponentEnter { component_name: name.to_owned(), loc: loc.clone() });
+    state.emit(AnalysisEvent::ComponentEnter {
+        component_name: name.to_owned(),
+        loc: loc.clone(),
+    });
 
     if let Some(body) = body {
         walk_stmts(&body.statements, env, state);
     }
 
-    state.emit(AnalysisEvent::ComponentExit { component_name: name.to_owned(), loc });
+    state.emit(AnalysisEvent::ComponentExit {
+        component_name: name.to_owned(),
+        loc,
+    });
 
     state.component_name = saved_name;
     state.ctx = saved_ctx;
@@ -291,7 +307,11 @@ fn walk_stmt(stmt: &Statement, env: AbsEnv, state: &mut WalkerState) -> AbsEnv {
             env
         }
         Statement::FunctionDeclaration(func) => {
-            let name = func.id.as_ref().map(|i| i.name.as_str()).unwrap_or("__anon");
+            let name = func
+                .id
+                .as_ref()
+                .map(|i| i.name.as_str())
+                .unwrap_or("__anon");
             extend(&env, name, AVal::Top)
         }
         _ => env,
@@ -343,7 +363,9 @@ fn handle_hook_call(
     });
 
     match def.semantics {
-        HookSemantics::State => Some(handle_state_hook(name, pattern, call, env, state, &def, loc)),
+        HookSemantics::State => Some(handle_state_hook(
+            name, pattern, call, env, state, &def, loc,
+        )),
         HookSemantics::Effect => {
             handle_effect_hook(name, call, &env, state, &def);
             Some(bind_pattern(env, pattern, AVal::Top))
@@ -379,8 +401,14 @@ fn handle_state_hook(
         .map(|e| resolve_value(&env, e))
         .unwrap_or(ValueResolution::Top);
 
-    let sp = def.state_position.as_ref().cloned()
-        .unwrap_or(crate::registry::StatePosition { value: 0, setter: 1 });
+    let sp = def
+        .state_position
+        .as_ref()
+        .cloned()
+        .unwrap_or(crate::registry::StatePosition {
+            value: 0,
+            setter: 1,
+        });
 
     let (value_name, setter_name) = extract_state_names(pattern, &sp, state.state_counter - 1);
 
@@ -392,15 +420,23 @@ fn handle_state_hook(
         loc,
     });
 
-    state.setter_map.insert(setter_name.clone(), state_id.clone());
-    state.state_value_map.insert(value_name.clone(), state_id.clone());
+    state
+        .setter_map
+        .insert(setter_name.clone(), state_id.clone());
+    state
+        .state_value_map
+        .insert(value_name.clone(), state_id.clone());
 
     match pattern {
         BindingPattern::ArrayPattern(arr) => {
             let mut e = env;
             for (i, el) in arr.elements.iter().enumerate() {
                 let Some(bp) = el else { continue };
-                let val = if i == sp.setter { AVal::Setter(state_id.clone()) } else { AVal::Top };
+                let val = if i == sp.setter {
+                    AVal::Setter(state_id.clone())
+                } else {
+                    AVal::Top
+                };
                 e = bind_pattern(e, bp, val);
             }
             e
@@ -416,14 +452,18 @@ fn extract_state_names(
 ) -> (String, String) {
     match pattern {
         BindingPattern::ArrayPattern(arr) => {
-            let val = arr.elements.get(sp.value)
+            let val = arr
+                .elements
+                .get(sp.value)
                 .and_then(|e| e.as_ref())
                 .and_then(|bp| match bp {
                     BindingPattern::BindingIdentifier(id) => Some(id.name.as_str().to_owned()),
                     _ => None,
                 })
                 .unwrap_or_else(|| format!("_state{counter}"));
-            let set = arr.elements.get(sp.setter)
+            let set = arr
+                .elements
+                .get(sp.setter)
                 .and_then(|e| e.as_ref())
                 .and_then(|bp| match bp {
                     BindingPattern::BindingIdentifier(id) => Some(id.name.as_str().to_owned()),
@@ -454,7 +494,9 @@ fn handle_effect_hook(
     let (declared_deps, empty_deps) = match deps_arg {
         None => (None, false),
         Some(Expression::ArrayExpression(arr)) => {
-            let names: Vec<String> = arr.elements.iter()
+            let names: Vec<String> = arr
+                .elements
+                .iter()
                 .filter_map(|el| match el {
                     ArrayExpressionElement::Identifier(id) => Some(id.name.as_str().to_owned()),
                     _ => None,
@@ -482,7 +524,10 @@ fn handle_effect_hook(
     state.cond_depth = 0;
     state.effect_stack.push(effect_id.clone());
 
-    state.emit(AnalysisEvent::EffectEnter { effect_id: effect_id.clone(), loc: loc.clone() });
+    state.emit(AnalysisEvent::EffectEnter {
+        effect_id: effect_id.clone(),
+        loc: loc.clone(),
+    });
 
     match cb_expr {
         Expression::ArrowFunctionExpression(arrow) => {
@@ -510,7 +555,9 @@ fn walk_if(stmt: &IfStatement, env: AbsEnv, state: &mut WalkerState) -> AbsEnv {
     walk_expr(&stmt.test, &env, state);
     state.cond_depth += 1;
     let then_env = walk_stmt(&stmt.consequent, env.clone(), state);
-    let else_env = stmt.alternate.as_ref()
+    let else_env = stmt
+        .alternate
+        .as_ref()
         .map(|alt| walk_stmt(alt, env.clone(), state))
         .unwrap_or(env.clone());
     state.cond_depth -= 1;
@@ -658,7 +705,10 @@ fn handle_setter_call(
     let arg = call.arguments.first().and_then(|a| a.as_expression());
     let (classif, value) = match arg {
         Some(e) => classify_setter_arg(env, e),
-        None => (crate::events::SetterArgClassif::Unknown, ValueResolution::Top),
+        None => (
+            crate::events::SetterArgClassif::Unknown,
+            ValueResolution::Top,
+        ),
     };
     state.emit(AnalysisEvent::SetterCall {
         state_id: state_id.to_owned(),
@@ -760,11 +810,19 @@ pub fn bind_pattern(env: AbsEnv, pattern: &BindingPattern, val: AVal) -> AbsEnv 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn branch_enter(kind: BranchKind, state: &mut WalkerState, loc: SourceLocation) {
-    state.emit(AnalysisEvent::BranchEnter { branch_kind: kind, cond_depth: state.cond_depth, loc });
+    state.emit(AnalysisEvent::BranchEnter {
+        branch_kind: kind,
+        cond_depth: state.cond_depth,
+        loc,
+    });
 }
 
 fn branch_exit(kind: BranchKind, state: &mut WalkerState, loc: SourceLocation) {
-    state.emit(AnalysisEvent::BranchExit { branch_kind: kind, cond_depth: state.cond_depth, loc });
+    state.emit(AnalysisEvent::BranchExit {
+        branch_kind: kind,
+        cond_depth: state.cond_depth,
+        loc,
+    });
 }
 
 fn resolve_callee_name<'a>(expr: &'a Expression) -> Option<&'a str> {
@@ -796,5 +854,9 @@ fn span_to_loc(source: &str, span: Span, file: &str) -> SourceLocation {
     let before = &source[..offset.min(source.len())];
     let line = before.chars().filter(|&c| c == '\n').count() as u32 + 1;
     let col = before.rfind('\n').map_or(offset, |p| offset - p - 1) as u32 + 1;
-    SourceLocation { file: file.to_owned(), line, column: col }
+    SourceLocation {
+        file: file.to_owned(),
+        line,
+        column: col,
+    }
 }

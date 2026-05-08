@@ -9,7 +9,10 @@ pub struct InfiniteLoopTopLevelRule {
 
 impl InfiniteLoopTopLevelRule {
     pub fn new() -> Self {
-        InfiniteLoopTopLevelRule { component_name: String::new(), warnings: vec![] }
+        InfiniteLoopTopLevelRule {
+            component_name: String::new(),
+            warnings: vec![],
+        }
     }
 }
 
@@ -23,9 +26,13 @@ impl Rule for InfiniteLoopTopLevelRule {
             AnalysisEvent::ComponentEnter { component_name, .. } => {
                 self.component_name = component_name.clone();
             }
-            AnalysisEvent::SetterCall { setter_name, cond_depth, ctx, loc, .. }
-                if *cond_depth == 0 && *ctx == AnalysisContext::Render =>
-            {
+            AnalysisEvent::SetterCall {
+                setter_name,
+                cond_depth,
+                ctx,
+                loc,
+                ..
+            } if *cond_depth == 0 && *ctx == AnalysisContext::Render => {
                 self.warnings.push(Warning::new(
                     "infinite-loop-top-level",
                     Severity::Error,

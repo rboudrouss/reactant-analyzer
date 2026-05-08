@@ -9,7 +9,10 @@ pub struct ConditionalHookRule {
 
 impl ConditionalHookRule {
     pub fn new() -> Self {
-        ConditionalHookRule { component_name: String::new(), warnings: vec![] }
+        ConditionalHookRule {
+            component_name: String::new(),
+            warnings: vec![],
+        }
     }
 }
 
@@ -23,7 +26,12 @@ impl Rule for ConditionalHookRule {
             AnalysisEvent::ComponentEnter { component_name, .. } => {
                 self.component_name = component_name.clone();
             }
-            AnalysisEvent::HookCall { hook_name, cond_depth, loc, .. } if *cond_depth > 0 => {
+            AnalysisEvent::HookCall {
+                hook_name,
+                cond_depth,
+                loc,
+                ..
+            } if *cond_depth > 0 => {
                 self.warnings.push(Warning::new(
                     "conditional-hook",
                     Severity::Error,

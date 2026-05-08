@@ -1,10 +1,10 @@
 pub mod conditional_hook;
-pub mod infinite_loop_top;
-pub mod infinite_loop_effect;
-pub mod unnecessary_rerender;
-pub mod stale_closure;
 pub mod dead_state;
+pub mod infinite_loop_effect;
+pub mod infinite_loop_top;
 pub mod redundant_update;
+pub mod stale_closure;
+pub mod unnecessary_rerender;
 
 use crate::diagnostics::Warning;
 use crate::events::AnalysisEvent;
