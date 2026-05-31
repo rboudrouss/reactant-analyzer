@@ -3,7 +3,6 @@ mod core;
 mod diagnostics;
 mod engine;
 mod events;
-mod impl_;
 mod registry;
 mod rules;
 
