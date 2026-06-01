@@ -5,5 +5,6 @@ pub mod engine;
 pub mod events;
 pub mod registry;
 pub mod rules;
+pub mod domains;
 pub mod ir;
 pub mod lowering;
