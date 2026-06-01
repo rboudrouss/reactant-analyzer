@@ -6,3 +6,4 @@ pub mod events;
 pub mod registry;
 pub mod rules;
 pub mod ir;
+pub mod lowering;
