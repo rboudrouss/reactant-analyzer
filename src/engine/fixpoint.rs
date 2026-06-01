@@ -6,7 +6,7 @@ use crate::{
         stores::{AbstractEnv, MemoStore, StateStore},
     },
     ir::{
-        cfg::{CFG, Terminator},
+        cfg::CFG,
         component::ComponentIR,
         expr::Expr,
         hooks::HookEntry,
@@ -114,6 +114,7 @@ pub fn analyze_component<T: Transfer>(
 
     let hook_calls = collect_hook_calls(&hooks, &render_cfg);
     let effect_info = collect_effect_info(&hooks);
+    let hooks_clone = hooks.clone();
 
     AnalysisResult {
         state_store,
@@ -123,22 +124,19 @@ pub fn analyze_component<T: Transfer>(
         effect_info,
         widened_labels,
         render_cfg,
+        hooks: hooks_clone,
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Join the abstract envs of all blocks that have a `Return` terminator.
-///
-/// Uses `reduce` (not `fold(bottom, join)`) because `bottom.join(env)` sets
-/// any key not in `bottom` to `D::top()`, making bottom a non-identity element.
 fn exit_env<D: AbstractDomain>(
     cfg: &CFG,
     block_states: &HashMap<BlockId, AbstractEnv<D>>,
 ) -> AbstractEnv<D> {
     cfg.blocks
         .values()
-        .filter(|b| matches!(b.term, Terminator::Return(_)))
+        .filter(|b| matches!(b.term, crate::ir::cfg::Terminator::Return(_)))
         .filter_map(|b| block_states.get(&b.id))
         .cloned()
         .reduce(|acc, env| acc.join(&env))

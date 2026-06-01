@@ -5,7 +5,12 @@ use crate::{
         AbstractDomain,
         stores::{AbstractEnv, MemoStore, StateStore},
     },
-    ir::{cfg::CFG, expr::Expr, types::{BlockId, HookLabel, Var}},
+    ir::{
+        cfg::{CFG, Terminator},
+        expr::Expr,
+        hooks::HookEntry,
+        types::{BlockId, HookLabel, Var},
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,11 +49,30 @@ pub struct EffectInfo {
 pub struct AnalysisResult<D: AbstractDomain> {
     pub state_store: StateStore<D>,
     pub memo_store: MemoStore<D>,
-    /// Abstract environment at the *entry* of each render-CFG block.
+    /// Abstract environment at the *exit* of each render-CFG block.
     pub block_states: HashMap<BlockId, AbstractEnv<D>>,
     pub hook_calls: Vec<HookCallInfo>,
     pub effect_info: HashMap<HookLabel, EffectInfo>,
     /// Labels whose state was widened to force convergence.
     pub widened_labels: HashSet<HookLabel>,
     pub render_cfg: CFG,
+    /// Original hook entries — needed by rules that inspect effect body CFGs.
+    pub hooks: Vec<HookEntry>,
+}
+
+impl<D: AbstractDomain> AnalysisResult<D> {
+    /// Join the abstract exit envs of all `Return`-terminated blocks.
+    ///
+    /// Uses `reduce` (not `fold(bottom, join)`) since `bottom.join(env)` maps
+    /// any key not in `bottom` to `D::top()`, making bottom a non-identity.
+    pub fn exit_env(&self) -> AbstractEnv<D> {
+        self.render_cfg
+            .blocks
+            .values()
+            .filter(|b| matches!(b.term, Terminator::Return(_)))
+            .filter_map(|b| self.block_states.get(&b.id))
+            .cloned()
+            .reduce(|acc, env| acc.join(&env))
+            .unwrap_or_else(AbstractEnv::bottom)
+    }
 }

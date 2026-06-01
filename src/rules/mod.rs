@@ -1,34 +1,60 @@
 pub mod conditional_hook;
-pub mod dead_state;
-pub mod infinite_loop_effect;
-pub mod infinite_loop_top;
-pub mod redundant_update;
-pub mod stale_closure;
-pub mod unnecessary_rerender;
+pub mod infinite_loop;
+pub mod missing_deps;
+pub mod redundant_set_state;
 
-use crate::diagnostics::Warning;
-use crate::events::AnalysisEvent;
-use crate::registry::HookRegistry;
+pub use conditional_hook::ConditionalHook;
+pub use infinite_loop::InfiniteLoop;
+pub use missing_deps::MissingDeps;
+pub use redundant_set_state::RedundantSetState;
 
+use crate::{
+    domains::Stability,
+    engine::AnalysisResult,
+    ir::types::{HookLabel, Var},
+};
+
+/// Warning produced by a rule against the fixpoint analysis result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Diagnostic {
+    pub rule: &'static str,
+    pub message: String,
+    /// Hook label most directly involved, if any.
+    pub hook_label: Option<HookLabel>,
+    /// Variable name most directly involved, if any.
+    pub var: Option<Var>,
+}
+
+impl Diagnostic {
+    pub fn new(rule: &'static str, message: impl Into<String>) -> Self {
+        Diagnostic { rule, message: message.into(), hook_label: None, var: None }
+    }
+
+    pub fn with_label(mut self, label: HookLabel) -> Self {
+        self.hook_label = Some(label);
+        self
+    }
+
+    pub fn with_var(mut self, var: impl Into<Var>) -> Self {
+        self.var = Some(var.into());
+        self
+    }
+}
+
+/// Post-pass analysis rule operating on a fully-computed `AnalysisResult`.
+///
+/// Rules are stateless; adding a new rule = new struct + `impl Rule`.
 pub trait Rule {
     fn name(&self) -> &'static str;
-    fn on_event(&mut self, event: &AnalysisEvent);
-    fn warnings(&self) -> &[Warning];
-    fn reset(&mut self);
+    fn check(&self, result: &AnalysisResult<Stability>) -> Vec<Diagnostic>;
 }
 
-pub struct RuleContext<'a> {
-    pub hook_registry: &'a dyn HookRegistry,
-}
-
+/// Instantiate all built-in rules.
 pub fn all_rules() -> Vec<Box<dyn Rule>> {
     vec![
-        Box::new(conditional_hook::ConditionalHookRule::new()),
-        Box::new(infinite_loop_top::InfiniteLoopTopLevelRule::new()),
-        Box::new(infinite_loop_effect::InfiniteLoopEffectRule::new()),
-        Box::new(unnecessary_rerender::UnnecessaryRerenderRule::new()),
-        Box::new(stale_closure::StaleClosureInEffectRule::new()),
-        Box::new(dead_state::DeadStateRule::new()),
-        Box::new(redundant_update::RedundantUpdateRule::new()),
+        Box::new(ConditionalHook),
+        Box::new(MissingDeps),
+        Box::new(RedundantSetState),
+        Box::new(InfiniteLoop),
     ]
 }
