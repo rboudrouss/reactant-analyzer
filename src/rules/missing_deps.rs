@@ -42,6 +42,11 @@ impl Rule for MissingDeps {
                 if declared.contains(var) {
                     continue;
                 }
+                // Only report vars that the analysis explicitly tracked.
+                // Globals (String, fetch, console, …) are not in env_exit → skip.
+                if !env_exit.contains(var) {
+                    continue;
+                }
                 let stab = env_exit.lookup(var);
                 if stab != Stability::Stable {
                     diags.push(
@@ -201,7 +206,8 @@ mod tests {
 
     #[test]
     fn missing_unknown_dep_warns() {
-        // Unknown stability also triggers warning (not Stable)
+        // Unknown stability (explicitly tracked) triggers warning (not Stable).
+        // x IS in env with Unknown stability → should warn.
         let mut effect_info = HashMap::new();
         effect_info.insert(
             0,
@@ -212,12 +218,32 @@ mod tests {
             },
         );
         let mut block_states = HashMap::new();
-        // x not in env → lookup returns Unknown (top)
-        block_states.insert(0, env_with(&[]));
+        // x explicitly bound to Unknown → should trigger warning.
+        block_states.insert(0, env_with(&[("x", Stability::Unknown)]));
 
         let result = make_result(block_states, effect_info, trivial_cfg());
         let diags = MissingDeps.check(&result);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].var.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn untracked_global_not_warned() {
+        // Vars not in env (globals like String, fetch, console) are skipped.
+        let mut effect_info = HashMap::new();
+        effect_info.insert(
+            0,
+            EffectInfo {
+                label: 0,
+                free_vars: HashSet::from(["fetch".to_string()]),
+                declared_deps: vec![Expr::Lit(Prim::Unit)],
+            },
+        );
+        let mut block_states = HashMap::new();
+        // fetch not in env at all → skip (treated as global)
+        block_states.insert(0, env_with(&[]));
+
+        let result = make_result(block_states, effect_info, trivial_cfg());
+        assert!(MissingDeps.check(&result).is_empty());
     }
 }

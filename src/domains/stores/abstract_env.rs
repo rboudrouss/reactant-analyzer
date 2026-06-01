@@ -36,6 +36,12 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         self.stabs.get(var).copied().unwrap_or_else(D::top)
     }
 
+    /// Returns true if `var` has an explicit binding in this env.
+    /// Use to distinguish "unknown because not tracked" from "unknown because merged paths".
+    pub fn contains(&self, var: &str) -> bool {
+        self.stabs.contains_key(var)
+    }
+
     /// Bind (or update) a variable to a domain value.
     pub fn extend(&mut self, var: Var, val: D) {
         self.stabs.insert(var, val);
