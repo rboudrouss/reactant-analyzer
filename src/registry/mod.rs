@@ -1,86 +1,141 @@
-pub mod builtin_hooks;
-pub mod builtin_third_party;
+pub mod builtins;
 
+pub use builtins::register_all;
+
+use std::collections::HashMap;
+
+use crate::domains::Stability;
+
+// ── Effect semantics ─────────────────────────────────────────────────────────
+
+/// Describes when a hook with side-effects runs relative to renders.
 #[derive(Debug, Clone, PartialEq)]
-pub enum HookSemantics {
-    State,
-    Effect,
-    Ref,
-    Memo,
-    Context,
-    Custom,
-    Unknown,
+pub enum EffectSemantics {
+    /// Standard useEffect behavior: runs after render based on deps array.
+    Standard,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum HookSource {
-    Builtin,
-    ThirdParty,
-    Config,
-    Inferred,
-}
+// ── Hook analysis result ─────────────────────────────────────────────────────
 
+/// Abstract analysis result for a single hook invocation.
 #[derive(Debug, Clone)]
-pub struct StatePosition {
-    pub value: usize,
-    pub setter: usize,
+pub struct HookResult {
+    /// Abstract stability of the hook's primary return value.
+    pub return_stability: Stability,
+    /// Whether the hook introduces a piece of mutable state (useState/useReducer).
+    pub creates_state: bool,
+    /// Side-effect semantics, if any.
+    pub effect_semantics: Option<EffectSemantics>,
 }
 
-#[derive(Debug, Clone)]
-pub struct HookDefinition {
-    pub name: &'static str,
-    pub semantics: HookSemantics,
-    pub state_position: Option<StatePosition>,
-    pub effect_callback_position: Option<usize>,
-    pub deps_position: Option<usize>,
-    pub triggers_rerender: bool,
-    pub source: HookSource,
+// ── HookModel trait ──────────────────────────────────────────────────────────
+
+/// Describes the abstract behavior of a React hook.
+///
+/// Each implementation represents one hook (builtin or custom) and defines
+/// how to compute `HookResult` from the already-evaluated argument stabilities.
+/// Adding a new hook = new struct + `impl HookModel` + call `registry.register()`.
+pub trait HookModel: Send + Sync {
+    fn name(&self) -> &str;
+
+    /// Compute the abstract result of calling this hook.
+    ///
+    /// - `args`  — stability of each positional argument (e.g. initial state).
+    /// - `deps`  — stability of each dep in the deps array, or `None` if absent.
+    fn analyze(&self, args: &[Stability], deps: Option<&[Stability]>) -> HookResult;
 }
 
-pub trait HookRegistry {
-    fn resolve(&self, name: &str) -> Option<HookDefinition>;
-    fn is_semantics(&self, name: &str, semantics: &HookSemantics) -> bool;
+// ── Registry ─────────────────────────────────────────────────────────────────
+
+pub struct Registry {
+    models: HashMap<String, Box<dyn HookModel>>,
 }
 
-pub struct DefaultHookRegistry {
-    defs: Vec<HookDefinition>,
-}
-
-impl DefaultHookRegistry {
+impl Registry {
     pub fn new() -> Self {
-        let mut defs = Vec::new();
-        defs.extend_from_slice(builtin_hooks::BUILTIN_HOOKS);
-        defs.extend_from_slice(builtin_third_party::BUILTIN_THIRD_PARTY_HOOKS);
-        DefaultHookRegistry { defs }
+        Registry { models: HashMap::new() }
+    }
+
+    /// Create a registry pre-populated with all builtin hook models.
+    pub fn new_with_builtins() -> Self {
+        let mut r = Self::new();
+        register_all(&mut r);
+        r
+    }
+
+    pub fn register(&mut self, model: Box<dyn HookModel>) {
+        self.models.insert(model.name().to_string(), model);
+    }
+
+    /// Look up a hook by name. Returns `None` for unknown hooks.
+    pub fn lookup(&self, name: &str) -> Option<&dyn HookModel> {
+        self.models.get(name).map(|m| m.as_ref())
+    }
+
+    /// Convenience: analyze a hook by name, or return a conservative fallback.
+    pub fn analyze(
+        &self,
+        name: &str,
+        args: &[Stability],
+        deps: Option<&[Stability]>,
+    ) -> HookResult {
+        self.lookup(name)
+            .map(|m| m.analyze(args, deps))
+            .unwrap_or(HookResult {
+                return_stability: Stability::Unknown,
+                creates_state: false,
+                effect_semantics: None,
+            })
     }
 }
 
-impl HookRegistry for DefaultHookRegistry {
-    fn resolve(&self, name: &str) -> Option<HookDefinition> {
-        // Search in reverse (last registered = highest priority)
-        for def in self.defs.iter().rev() {
-            if def.name == name {
-                return Some(def.clone());
+impl Default for Registry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_unknown_returns_none() {
+        let r = Registry::new();
+        assert!(r.lookup("useUnknownHook").is_none());
+    }
+
+    #[test]
+    fn analyze_unknown_returns_conservative() {
+        let r = Registry::new();
+        let res = r.analyze("useUnknown", &[], None);
+        assert_eq!(res.return_stability, Stability::Unknown);
+        assert!(!res.creates_state);
+        assert!(res.effect_semantics.is_none());
+    }
+
+    #[test]
+    fn register_and_lookup() {
+        struct MyHook;
+        impl HookModel for MyHook {
+            fn name(&self) -> &str { "useMyHook" }
+            fn analyze(&self, _: &[Stability], _: Option<&[Stability]>) -> HookResult {
+                HookResult { return_stability: Stability::Stable, creates_state: false, effect_semantics: None }
             }
         }
-        // Fallback: use[A-Z]... → inferred custom hook
-        let mut chars = name.chars();
-        if name.starts_with("use") && chars.nth(3).map_or(false, |c| c.is_uppercase()) {
-            return Some(HookDefinition {
-                name: "<<inferred>>",
-                semantics: HookSemantics::Custom,
-                state_position: None,
-                effect_callback_position: None,
-                deps_position: None,
-                triggers_rerender: true,
-                source: HookSource::Inferred,
-            });
-        }
-        None
+        let mut r = Registry::new();
+        r.register(Box::new(MyHook));
+        assert!(r.lookup("useMyHook").is_some());
+        assert_eq!(r.analyze("useMyHook", &[], None).return_stability, Stability::Stable);
     }
 
-    fn is_semantics(&self, name: &str, semantics: &HookSemantics) -> bool {
-        self.resolve(name)
-            .map_or(false, |d| &d.semantics == semantics)
+    #[test]
+    fn builtins_registered() {
+        let r = Registry::new_with_builtins();
+        for name in ["useState", "useEffect", "useMemo", "useCallback", "useRef", "useContext", "useReducer"] {
+            assert!(r.lookup(name).is_some(), "missing builtin: {name}");
+        }
     }
 }
