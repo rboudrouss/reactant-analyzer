@@ -5,3 +5,4 @@ pub mod engine;
 pub mod events;
 pub mod registry;
 pub mod rules;
+pub mod ir;
