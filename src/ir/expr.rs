@@ -3,7 +3,7 @@ use crate::ir::{
     types::{HookLabel, Symbol, Var},
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Prim {
     String(String),
     Int(i32),
@@ -13,7 +13,7 @@ pub enum Prim {
     Unit,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BinOp {
     Add,
     Sub,
@@ -29,7 +29,7 @@ pub enum BinOp {
     Geq,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum UnaryOp {
     Neg,
     Not,
@@ -37,7 +37,7 @@ pub enum UnaryOp {
 
 type TSType = String; // TODO
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Expr {
     // Primitive literals
     Lit(Prim),

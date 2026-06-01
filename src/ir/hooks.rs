@@ -4,7 +4,7 @@ use crate::ir::{
     types::{HookLabel, Symbol},
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum HookEntry {
     State {
         label: HookLabel,

@@ -1,0 +1,563 @@
+use std::collections::{HashMap, HashSet};
+
+use crate::{
+    domains::{
+        AbstractDomain, Transfer,
+        stores::{AbstractEnv, MemoStore, StateStore},
+    },
+    ir::{
+        cfg::{CFG, Terminator},
+        component::ComponentIR,
+        expr::Expr,
+        hooks::HookEntry,
+        stmt::Stmt,
+        types::{BlockId, HookLabel, Var},
+    },
+};
+
+use super::{
+    analysis_result::{AnalysisResult, EffectInfo, HookCallInfo, HookKind},
+    cfg_analyzer::analyze_cfg,
+};
+
+pub struct Config {
+    pub widen_threshold: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config { widen_threshold: 3 }
+    }
+}
+
+/// Run the full fixpoint analysis for one component.
+///
+/// Outer loop:
+///   1. Render pass: analyze `render_cfg` with the current `state_store`.
+///   2. Recompute memo store from exit env.
+///   3. Effect passes: analyze each effect body with exit env + current state.
+///   4. Convergence check: if `new_state ⊑ state_store`, done.
+///   5. Otherwise widen (after `config.widen_threshold` iterations) and repeat.
+pub fn analyze_component<T: Transfer>(
+    comp: ComponentIR,
+    transfer: &T,
+    config: &Config,
+) -> AnalysisResult<T::Domain> {
+    let ComponentIR { render_cfg, hooks, .. } = comp;
+
+    let mut state_store: StateStore<T::Domain> = StateStore::bottom();
+    let mut memo_store: MemoStore<T::Domain> = MemoStore::new();
+    let mut widened_labels: HashSet<HookLabel> = HashSet::new();
+    let mut iteration: usize = 0;
+    let mut block_states: HashMap<BlockId, AbstractEnv<T::Domain>>;
+
+    loop {
+        // ── Render pass ───────────────────────────────────────────────────────
+        let (bs, state_from_render) = analyze_cfg::<T>(
+            &render_cfg,
+            AbstractEnv::bottom(),
+            &state_store,
+            &memo_store,
+            transfer,
+            config.widen_threshold,
+        );
+        block_states = bs;
+
+        // ── Recompute memo store from exit env ────────────────────────────────
+        let env_exit = exit_env(&render_cfg, &block_states);
+        for hook in &hooks {
+            match hook {
+                HookEntry::Memo { label, deps, .. } => {
+                    memo_store.set(*label, transfer.recompute_memo(deps, &env_exit));
+                }
+                HookEntry::Callback { label, deps, .. } => {
+                    memo_store.set(*label, transfer.recompute_memo(deps, &env_exit));
+                }
+                _ => {}
+            }
+        }
+
+        // ── Effect passes ─────────────────────────────────────────────────────
+        let mut state_from_effects = StateStore::bottom();
+        for hook in &hooks {
+            if let HookEntry::Effect { body_cfg, .. } = hook {
+                let (_, eff_state) = analyze_cfg::<T>(
+                    body_cfg,
+                    env_exit.clone(),
+                    &state_store,
+                    &memo_store,
+                    transfer,
+                    config.widen_threshold,
+                );
+                state_from_effects = state_from_effects.join(&eff_state);
+            }
+        }
+
+        // ── Convergence check ─────────────────────────────────────────────────
+        let new_state = state_from_render.join(&state_from_effects);
+        if new_state.leq(&state_store) {
+            break;
+        }
+
+        iteration += 1;
+        assert!(iteration < 100, "fixpoint did not converge after 100 iterations");
+
+        if iteration >= config.widen_threshold {
+            for label in new_state.changed_labels(&state_store) {
+                widened_labels.insert(label);
+            }
+            state_store = state_store.widen(&new_state);
+        } else {
+            state_store = new_state;
+        }
+    }
+
+    let hook_calls = collect_hook_calls(&hooks, &render_cfg);
+    let effect_info = collect_effect_info(&hooks);
+
+    AnalysisResult {
+        state_store,
+        memo_store,
+        block_states,
+        hook_calls,
+        effect_info,
+        widened_labels,
+        render_cfg,
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Join the abstract envs of all blocks that have a `Return` terminator.
+///
+/// Uses `reduce` (not `fold(bottom, join)`) because `bottom.join(env)` sets
+/// any key not in `bottom` to `D::top()`, making bottom a non-identity element.
+fn exit_env<D: AbstractDomain>(
+    cfg: &CFG,
+    block_states: &HashMap<BlockId, AbstractEnv<D>>,
+) -> AbstractEnv<D> {
+    cfg.blocks
+        .values()
+        .filter(|b| matches!(b.term, Terminator::Return(_)))
+        .filter_map(|b| block_states.get(&b.id))
+        .cloned()
+        .reduce(|acc, env| acc.join(&env))
+        .unwrap_or_else(AbstractEnv::bottom)
+}
+
+/// Scan `render_cfg` for hook-related expressions and build `HookCallInfo` list.
+///
+/// State/Memo/Callback/Ref hooks are identified by the binding expression in the
+/// render CFG.  Effect hooks emit no statement in the render CFG, so their
+/// `block_id` defaults to `cfg.entry`.
+fn collect_hook_calls(hooks: &[HookEntry], cfg: &CFG) -> Vec<HookCallInfo> {
+    // Build label → kind map
+    let label_to_kind: HashMap<HookLabel, HookKind> = hooks
+        .iter()
+        .map(|h| match h {
+            HookEntry::State { label, .. } => (*label, HookKind::State),
+            HookEntry::Effect { label, .. } => (*label, HookKind::Effect),
+            HookEntry::Memo { label, .. } => (*label, HookKind::Memo),
+            HookEntry::Callback { label, .. } => (*label, HookKind::Callback),
+            HookEntry::Ref { label, .. } => (*label, HookKind::Ref),
+            HookEntry::Custom { label, .. } => (*label, HookKind::Custom),
+        })
+        .collect();
+
+    // Effect hooks have no render-CFG binding; pre-populate with entry block.
+    let mut call_map: HashMap<HookLabel, HookCallInfo> = hooks
+        .iter()
+        .filter_map(|h| {
+            if let HookEntry::Effect { label, .. } = h {
+                Some((*label, HookCallInfo { label: *label, kind: HookKind::Effect, block_id: cfg.entry }))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Scan blocks for StateVal / StateSetter / MemoVal / CallbackVal
+    let mut sorted_ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
+    sorted_ids.sort_unstable();
+
+    for block_id in sorted_ids {
+        if let Some(block) = cfg.blocks.get(&block_id) {
+            for stmt in &block.stmts {
+                for label in hook_labels_in_stmt(stmt) {
+                    if let Some(&kind) = label_to_kind.get(&label) {
+                        call_map
+                            .entry(label)
+                            .or_insert(HookCallInfo { label, kind, block_id });
+                    }
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<HookCallInfo> = call_map.into_values().collect();
+    result.sort_by_key(|h| h.label);
+    result
+}
+
+fn hook_labels_in_stmt(stmt: &Stmt) -> Vec<HookLabel> {
+    let mut out = Vec::new();
+    match stmt {
+        Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => {
+            collect_hook_labels_expr(rhs, &mut out);
+        }
+        Stmt::ExprStmt(e) => collect_hook_labels_expr(e, &mut out),
+    }
+    out
+}
+
+fn collect_hook_labels_expr(expr: &Expr, out: &mut Vec<HookLabel>) {
+    match expr {
+        Expr::StateVal(l) | Expr::StateSetter(l) | Expr::MemoVal(l) | Expr::CallbackVal(l) => {
+            out.push(*l);
+        }
+        Expr::ObjectLit(fields) => fields.iter().for_each(|(_, v)| collect_hook_labels_expr(v, out)),
+        Expr::ArrayLit(elems) => elems.iter().for_each(|e| collect_hook_labels_expr(e, out)),
+        Expr::FnLit { .. } => {}
+        Expr::FieldAccess { obj, .. } => collect_hook_labels_expr(obj, out),
+        Expr::IndexAccess { arr, idx } => {
+            collect_hook_labels_expr(arr, out);
+            collect_hook_labels_expr(idx, out);
+        }
+        Expr::BinOp { lhs, rhs, .. } => {
+            collect_hook_labels_expr(lhs, out);
+            collect_hook_labels_expr(rhs, out);
+        }
+        Expr::UnaryOp { arg, .. } => collect_hook_labels_expr(arg, out),
+        Expr::Call { fn_, args } => {
+            collect_hook_labels_expr(fn_, out);
+            args.iter().for_each(|a| collect_hook_labels_expr(a, out));
+        }
+        Expr::CompApp { props, .. } => collect_hook_labels_expr(props, out),
+        Expr::NativeElem { props, children, .. } => {
+            collect_hook_labels_expr(props, out);
+            children.iter().for_each(|c| collect_hook_labels_expr(c, out));
+        }
+        Expr::TSAnnotated(e, _) => collect_hook_labels_expr(e, out),
+        _ => {}
+    }
+}
+
+/// Build `EffectInfo` for each `useEffect` hook.
+fn collect_effect_info(hooks: &[HookEntry]) -> HashMap<HookLabel, EffectInfo> {
+    hooks
+        .iter()
+        .filter_map(|h| {
+            if let HookEntry::Effect { label, body_cfg, deps } = h {
+                let free_vars = compute_free_vars(body_cfg);
+                let declared_deps = deps.clone().unwrap_or_default();
+                Some((*label, EffectInfo { label: *label, free_vars, declared_deps }))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// `free_vars(cfg)` = variables read anywhere in cfg − variables locally defined.
+fn compute_free_vars(cfg: &CFG) -> HashSet<Var> {
+    let mut used: HashSet<Var> = HashSet::new();
+    let mut defined: HashSet<Var> = HashSet::new();
+
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Let { var, rhs } => {
+                    collect_used_vars(rhs, &mut used);
+                    defined.insert(var.clone());
+                }
+                Stmt::Assign { var, rhs } => {
+                    collect_used_vars(rhs, &mut used);
+                    defined.insert(var.clone());
+                }
+                Stmt::ExprStmt(e) => collect_used_vars(e, &mut used),
+            }
+        }
+    }
+
+    used.difference(&defined).cloned().collect()
+}
+
+fn collect_used_vars(expr: &Expr, out: &mut HashSet<Var>) {
+    match expr {
+        Expr::Var(v) => {
+            out.insert(v.clone());
+        }
+        Expr::ObjectLit(fields) => fields.iter().for_each(|(_, v)| collect_used_vars(v, out)),
+        Expr::ArrayLit(elems) => elems.iter().for_each(|e| collect_used_vars(e, out)),
+        Expr::FnLit { body_cfg, .. } => {
+            // Recurse into closures; their free vars are free in the outer CFG too.
+            out.extend(compute_free_vars(body_cfg));
+        }
+        Expr::FieldAccess { obj, .. } => collect_used_vars(obj, out),
+        Expr::IndexAccess { arr, idx } => {
+            collect_used_vars(arr, out);
+            collect_used_vars(idx, out);
+        }
+        Expr::BinOp { lhs, rhs, .. } => {
+            collect_used_vars(lhs, out);
+            collect_used_vars(rhs, out);
+        }
+        Expr::UnaryOp { arg, .. } => collect_used_vars(arg, out),
+        Expr::Call { fn_, args } => {
+            collect_used_vars(fn_, out);
+            args.iter().for_each(|a| collect_used_vars(a, out));
+        }
+        Expr::CompApp { props, .. } => collect_used_vars(props, out),
+        Expr::NativeElem { props, children, .. } => {
+            collect_used_vars(props, out);
+            children.iter().for_each(|c| collect_used_vars(c, out));
+        }
+        Expr::TSAnnotated(e, _) => collect_used_vars(e, out),
+        _ => {}
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        domains::{Stability, StabilityTransfer},
+        ir::{
+            cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator},
+            component::ComponentIR,
+            expr::{Expr, Prim},
+            hooks::HookEntry,
+            stmt::Stmt,
+        },
+    };
+
+    fn trivial_cfg() -> CFG {
+        let mut blocks = HashMap::new();
+        blocks.insert(
+            0,
+            BasicBlock { id: 0, stmts: vec![], term: Terminator::Return(Expr::Lit(Prim::Unit)) },
+        );
+        CFG { entry: 0, blocks, edges: vec![] }
+    }
+
+    fn component(hooks: Vec<HookEntry>, render_stmts: Vec<Stmt>) -> ComponentIR {
+        let mut blocks = HashMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: render_stmts,
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        ComponentIR {
+            name: "TestComp".to_string(),
+            param: "props".to_string(),
+            render_cfg: CFG { entry: 0, blocks, edges: vec![] },
+            hooks,
+        }
+    }
+
+    #[test]
+    fn no_hooks_converges_immediately() {
+        let comp = component(vec![], vec![]);
+        let result = analyze_component(comp, &StabilityTransfer, &Config::default());
+        assert_eq!(result.state_store.get(0), Stability::Bottom);
+        assert!(result.widened_labels.is_empty());
+        assert_eq!(result.hook_calls.len(), 0);
+    }
+
+    #[test]
+    fn state_hook_no_setter_call_stays_bottom() {
+        // useState with no setState → state[0] stays Bottom
+        let hooks = vec![HookEntry::State { label: 0, init: Expr::Lit(Prim::Int(0)) }];
+        let render_stmts = vec![Stmt::Let {
+            var: "n".to_string(),
+            rhs: Expr::StateVal(0),
+        }];
+        let comp = component(hooks, render_stmts);
+        let result = analyze_component(comp, &StabilityTransfer, &Config::default());
+        assert_eq!(result.state_store.get(0), Stability::Bottom);
+        assert!(result.widened_labels.is_empty());
+    }
+
+    #[test]
+    fn effect_with_stable_setstate_converges_in_two_iterations() {
+        // useEffect(() => { setN(42); }, [])
+        // 42 is Lit → Stable; state[0] becomes Stable after iter 1, stays Stable iter 2.
+        let mut eff_blocks = HashMap::new();
+        eff_blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![
+                    Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
+                    Stmt::ExprStmt(Expr::Call {
+                        fn_: Box::new(Expr::Var("setN".to_string())),
+                        args: vec![Expr::Lit(Prim::Int(42))],
+                    }),
+                ],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let eff_cfg = CFG { entry: 0, blocks: eff_blocks, edges: vec![] };
+
+        let hooks = vec![
+            HookEntry::State { label: 0, init: Expr::Lit(Prim::Int(0)) },
+            HookEntry::Effect { label: 1, body_cfg: eff_cfg, deps: Some(vec![]) },
+        ];
+        let render_stmts = vec![
+            Stmt::Let { var: "n".to_string(), rhs: Expr::StateVal(0) },
+            Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
+        ];
+        let comp = component(hooks, render_stmts);
+        let result = analyze_component(comp, &StabilityTransfer, &Config::default());
+        assert_eq!(result.state_store.get(0), Stability::Stable);
+        assert!(result.widened_labels.is_empty());
+    }
+
+    #[test]
+    fn effect_with_unstable_setstate_converges() {
+        // useEffect(() => { setN({}); }, [])
+        // {} is Unstable; state[0] becomes Unstable after iter 1, stays Unstable iter 2.
+        let mut eff_blocks = HashMap::new();
+        eff_blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![
+                    Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
+                    Stmt::ExprStmt(Expr::Call {
+                        fn_: Box::new(Expr::Var("setN".to_string())),
+                        args: vec![Expr::ObjectLit(vec![])],
+                    }),
+                ],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let eff_cfg = CFG { entry: 0, blocks: eff_blocks, edges: vec![] };
+
+        let hooks = vec![
+            HookEntry::State { label: 0, init: Expr::Lit(Prim::Int(0)) },
+            HookEntry::Effect { label: 1, body_cfg: eff_cfg, deps: Some(vec![]) },
+        ];
+        let comp = component(hooks, vec![]);
+        let result = analyze_component(comp, &StabilityTransfer, &Config::default());
+        assert_eq!(result.state_store.get(0), Stability::Unstable);
+        assert!(result.widened_labels.is_empty());
+    }
+
+    #[test]
+    fn widened_labels_triggered_with_low_threshold() {
+        // With widen_threshold = 1, any state change on iter 1 marks widened_labels.
+        let mut eff_blocks = HashMap::new();
+        eff_blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![
+                    Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
+                    Stmt::ExprStmt(Expr::Call {
+                        fn_: Box::new(Expr::Var("setN".to_string())),
+                        args: vec![Expr::ObjectLit(vec![])],
+                    }),
+                ],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let eff_cfg = CFG { entry: 0, blocks: eff_blocks, edges: vec![] };
+
+        let hooks = vec![
+            HookEntry::State { label: 0, init: Expr::Lit(Prim::Int(0)) },
+            HookEntry::Effect { label: 1, body_cfg: eff_cfg, deps: Some(vec![]) },
+        ];
+        let comp = component(hooks, vec![]);
+        let config = Config { widen_threshold: 1 };
+        let result = analyze_component(comp, &StabilityTransfer, &config);
+        assert!(result.widened_labels.contains(&0));
+    }
+
+    #[test]
+    fn memo_store_recomputed_from_deps() {
+        // useMemo(() => x, [x]) where x = Stable → memo[0] = Stable
+        let hooks = vec![
+            HookEntry::Memo {
+                label: 0,
+                body_cfg: trivial_cfg(),
+                deps: vec![Expr::Var("x".to_string())],
+            },
+        ];
+        let render_stmts = vec![
+            Stmt::Let { var: "x".to_string(), rhs: Expr::Lit(Prim::Int(1)) },
+            Stmt::Let { var: "val".to_string(), rhs: Expr::MemoVal(0) },
+        ];
+        let comp = component(hooks, render_stmts);
+        let result = analyze_component(comp, &StabilityTransfer, &Config::default());
+        assert_eq!(result.memo_store.get(0), Stability::Stable);
+    }
+
+    #[test]
+    fn effect_info_captures_free_vars() {
+        // Effect body uses "n" and "setN" — both are free vars
+        let mut eff_blocks = HashMap::new();
+        eff_blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![Stmt::ExprStmt(Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Var("n".to_string())],
+                })],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let eff_cfg = CFG { entry: 0, blocks: eff_blocks, edges: vec![] };
+
+        let hooks = vec![HookEntry::Effect { label: 0, body_cfg: eff_cfg, deps: Some(vec![]) }];
+        let comp = component(hooks, vec![]);
+        let result = analyze_component(comp, &StabilityTransfer, &Config::default());
+        let info = &result.effect_info[&0];
+        assert!(info.free_vars.contains("n"));
+        assert!(info.free_vars.contains("setN"));
+    }
+
+    #[test]
+    fn two_block_cfg_propagates_exit_env() {
+        // block 0: let x = 42; jump 1
+        // block 1: return x   ← exit env should have x=Stable
+        let mut blocks = HashMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![Stmt::Let {
+                    var: "x".to_string(),
+                    rhs: Expr::Lit(Prim::Int(42)),
+                }],
+                term: Terminator::Jump(1),
+            },
+        );
+        blocks.insert(
+            1,
+            BasicBlock {
+                id: 1,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Var("x".to_string())),
+            },
+        );
+        let comp = ComponentIR {
+            name: "C".to_string(),
+            param: "props".to_string(),
+            render_cfg: CFG {
+                entry: 0,
+                blocks,
+                edges: vec![Edge { from: 0, to: 1, kind: EdgeKind::Unconditional }],
+            },
+            hooks: vec![],
+        };
+        let result = analyze_component(comp, &StabilityTransfer, &Config::default());
+        assert_eq!(result.block_states[&1].lookup("x"), Stability::Stable);
+    }
+}

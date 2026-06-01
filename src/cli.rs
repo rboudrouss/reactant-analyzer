@@ -3,7 +3,30 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::diagnostics::{Severity, Warning};
-use crate::engine::runner::{AnalysisReport, AnalysisSummary, FileResult};
+
+pub struct FileResult {
+    pub file: String,
+    pub warnings: Vec<Warning>,
+    pub parse_error: bool,
+    pub parse_error_message: Option<String>,
+}
+
+pub struct SeverityCount {
+    pub errors: usize,
+    pub warnings: usize,
+}
+
+pub struct AnalysisSummary {
+    pub total: usize,
+    pub files_analyzed: usize,
+    pub files_with_warnings: usize,
+    pub by_severity: SeverityCount,
+}
+
+pub struct AnalysisReport {
+    pub files: Vec<FileResult>,
+    pub summary: AnalysisSummary,
+}
 
 const SUPPORTED_EXTS: &[&str] = &["ts", "tsx", "js", "jsx"];
 

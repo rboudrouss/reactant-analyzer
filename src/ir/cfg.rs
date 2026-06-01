@@ -2,14 +2,14 @@ use std::collections::HashMap;
 
 use crate::ir::{expr::Expr, stmt::Stmt, types::BlockId};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BasicBlock {
     pub id: BlockId,
     pub stmts: Vec<Stmt>,
     pub term: Terminator,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Terminator {
     Jump(BlockId),
     Branch {
@@ -21,7 +21,7 @@ pub enum Terminator {
     Unreachable,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum EdgeKind {
     Unconditional,
     IfTrue,
@@ -29,14 +29,14 @@ pub enum EdgeKind {
     Back,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Edge {
     pub from: BlockId,
     pub to: BlockId,
     pub kind: EdgeKind,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CFG {
     pub entry: BlockId,
     pub blocks: HashMap<BlockId, BasicBlock>,
