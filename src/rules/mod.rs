@@ -1,13 +1,13 @@
 pub mod conditional_hook;
 pub mod infinite_loop;
-pub mod infinite_loop_render;
+pub mod setter_in_render;
 pub mod missing_deps;
 pub mod redundant_set_state;
 pub mod unnecessary_rerender;
 
 pub use conditional_hook::ConditionalHook;
 pub use infinite_loop::InfiniteLoop;
-pub use infinite_loop_render::InfiniteLoopRender;
+pub use setter_in_render::SetterInRender;
 pub use missing_deps::MissingDeps;
 pub use redundant_set_state::RedundantSetState;
 pub use unnecessary_rerender::UnnecessaryRerender;
@@ -60,7 +60,7 @@ pub fn all_rules() -> Vec<Box<dyn Rule>> {
         Box::new(MissingDeps),
         Box::new(RedundantSetState),
         Box::new(UnnecessaryRerender),
-        Box::new(InfiniteLoopRender),
+        Box::new(SetterInRender),
         Box::new(InfiniteLoop),
     ]
 }

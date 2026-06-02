@@ -10,16 +10,15 @@ use super::{Diagnostic, Rule};
 
 /// Fires when any state setter is called directly in the render body.
 ///
-/// A setter call in the render body unconditionally schedules a new render on
-/// every execution of the component function → infinite render loop.  Unlike
-/// `InfiniteLoop` (effect-cycle detection via widening), this rule is purely
-/// structural: the presence of any reachable setter call in the render CFG is
-/// enough to warn, regardless of the domain value.
-pub struct InfiniteLoopRender;
+/// Calling a setter during render is always a mistake — it should be moved
+/// into a `useEffect` or an event handler. Unlike `InfiniteLoop` (effect-cycle
+/// detection via widening), this rule is purely structural: the presence of
+/// any reachable setter call in the render CFG is enough to warn.
+pub struct SetterInRender;
 
-impl Rule for InfiniteLoopRender {
+impl Rule for SetterInRender {
     fn name(&self) -> &'static str {
-        "infinite-loop-render"
+        "setter-in-render"
     }
 
     fn check(&self, result: &AnalysisResult<StateValue>) -> Vec<Diagnostic> {
@@ -65,10 +64,9 @@ impl Rule for InfiniteLoopRender {
                     };
                     if setter_vars.contains(name) {
                         return vec![Diagnostic::new(
-                            "infinite-loop-render",
+                            "setter-in-render",
                             format!(
-                                "setter `{name}` called in render body \
-                                 — triggers a re-render on every call, causing an infinite loop"
+                                "setter `{name}` called directly in the render body, move this call into a useEffect or an event handler"
                             ),
                         )];
                     }
@@ -136,7 +134,7 @@ mod tests {
     #[test]
     fn no_setter_no_warning() {
         let result = make_result(vec![], vec![]);
-        assert!(InfiniteLoopRender.check(&result).is_empty());
+        assert!(SetterInRender.check(&result).is_empty());
     }
 
     #[test]
@@ -147,7 +145,7 @@ mod tests {
             rhs: Expr::StateSetter(0),
         }];
         let result = make_result(vec![], render_stmts);
-        assert!(InfiniteLoopRender.check(&result).is_empty());
+        assert!(SetterInRender.check(&result).is_empty());
     }
 
     #[test]
@@ -163,9 +161,9 @@ mod tests {
             }),
         ];
         let result = make_result(vec![], render_stmts);
-        let diags = InfiniteLoopRender.check(&result);
+        let diags = SetterInRender.check(&result);
         assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].rule, "infinite-loop-render");
+        assert_eq!(diags[0].rule, "setter-in-render");
     }
 
     #[test]
@@ -233,12 +231,12 @@ mod tests {
             },
             hooks: vec![],
         };
-        assert!(!InfiniteLoopRender.check(&result).is_empty());
+        assert!(!SetterInRender.check(&result).is_empty());
     }
 
     #[test]
     fn via_analyze_component_count_plus_one_warns() {
-        // setCount(count + 1) directly in render body → InfiniteLoopRender fires.
+        // setCount(count + 1) directly in render body → SetterInRender fires.
         let hooks = vec![HookEntry::State {
             label: 0,
             init: Expr::Lit(Prim::Int(0)),
@@ -281,7 +279,7 @@ mod tests {
             hooks,
         };
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let diags = InfiniteLoopRender.check(&result);
+        let diags = SetterInRender.check(&result);
         assert!(!diags.is_empty(), "setter in render body should warn");
     }
 }
