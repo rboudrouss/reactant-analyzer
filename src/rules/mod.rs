@@ -12,10 +12,17 @@ pub use redundant_set_state::RedundantSetState;
 pub use setter_in_render::SetterInRender;
 pub use unnecessary_rerender::UnnecessaryRerender;
 
+use std::collections::{HashSet, VecDeque};
+
 use crate::{
     domains::StateValue,
     engine::AnalysisResult,
-    ir::types::{HookLabel, Var},
+    ir::{
+        cfg::CFG,
+        expr::Expr,
+        stmt::Stmt,
+        types::{HookLabel, Var},
+    },
 };
 
 /// Warning produced by a rule against the fixpoint analysis result.
@@ -56,6 +63,75 @@ impl Diagnostic {
 pub trait Rule {
     fn name(&self) -> &'static str;
     fn check(&self, result: &AnalysisResult<StateValue>) -> Vec<Diagnostic>;
+}
+
+/// Collect all setter variable names called in `cfg`, descending into FnLit
+/// argument bodies up to `max_depth` levels. Returns deduplicated names.
+pub fn collect_setter_calls(cfg: &CFG, setter_vars: &HashSet<Var>, max_depth: usize) -> Vec<Var> {
+    let mut found: HashSet<Var> = HashSet::new();
+    collect_setter_calls_inner(cfg, setter_vars, max_depth, &mut found);
+    found.into_iter().collect()
+}
+
+fn collect_setter_calls_inner(
+    cfg: &CFG,
+    setter_vars: &HashSet<Var>,
+    depth: usize,
+    found: &mut HashSet<Var>,
+) {
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    queue.push_back(cfg.entry);
+    visited.insert(cfg.entry);
+
+    while let Some(bid) = queue.pop_front() {
+        if let Some(block) = cfg.blocks.get(&bid) {
+            for stmt in &block.stmts {
+                check_stmt_for_setters(stmt, setter_vars, depth, found);
+            }
+            for succ in cfg.successors(bid) {
+                if visited.insert(succ) {
+                    queue.push_back(succ);
+                }
+            }
+        }
+    }
+}
+
+fn check_stmt_for_setters(
+    stmt: &Stmt,
+    setter_vars: &HashSet<Var>,
+    depth: usize,
+    found: &mut HashSet<Var>,
+) {
+    if let Stmt::ExprStmt(expr) = stmt {
+        check_expr_for_setters(expr, setter_vars, depth, found);
+    }
+}
+
+fn check_expr_for_setters(
+    expr: &Expr,
+    setter_vars: &HashSet<Var>,
+    depth: usize,
+    found: &mut HashSet<Var>,
+) {
+    match expr {
+        Expr::Call { fn_, args } => {
+            if let Expr::Var(name) = fn_.as_ref()
+                && setter_vars.contains(name)
+            {
+                found.insert(name.clone());
+            }
+            if depth > 0 {
+                for arg in args {
+                    if let Expr::FnLit { body_cfg, .. } = arg {
+                        collect_setter_calls_inner(body_cfg, setter_vars, depth - 1, found);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Instantiate all built-in rules.

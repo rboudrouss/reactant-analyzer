@@ -1,12 +1,14 @@
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::{
     domains::{AbstractDomain, AbstractEnv, MemoStore, QueryContext, StateStore, Transfer},
     ir::{
+        cfg::{CFG, EdgeKind, Terminator},
         expr::{BinOp, Expr, Prim, UnaryOp},
         stmt::Stmt,
+        types::BlockId,
     },
 };
 
@@ -415,14 +417,99 @@ fn exec_state_value(
                 && let Expr::Var(name) = fn_.as_ref()
                 && let Some(label) = env.setter_label(name)
             {
-                let arg_val = args
-                    .first()
-                    .map(|a| eval_state_value(a, env, state, memo))
-                    .unwrap_or(StateValue::Top);
+                let arg_val = match args.first() {
+                    Some(Expr::FnLit { params, body_cfg }) => {
+                        let mut sub_env = env.clone();
+                        if let Some(param) = params.first() {
+                            sub_env.extend(param.clone(), state.get(label));
+                        }
+                        exec_body(body_cfg, &sub_env, state, memo)
+                    }
+                    Some(a) => eval_state_value(a, env, state, memo),
+                    None => StateValue::Top,
+                };
                 state.update(label, arg_val);
             }
         }
     }
+}
+
+/// Execute a FnLit body CFG with `entry_env` as starting environment.
+///
+/// Processes blocks in topological order (no back-edge loops — conservative
+/// fallback to `Reference(Unstable)` if any back edge is present). At branches,
+/// both paths are executed and their environments are joined (over-approximate).
+/// Return values from all `Terminator::Return` blocks are joined.
+pub(crate) fn exec_body(
+    cfg: &CFG,
+    entry_env: &AbstractEnv<StateValue>,
+    state: &mut StateStore<StateValue>,
+    memo: &mut MemoStore<StateValue>,
+) -> StateValue {
+    if cfg.edges.iter().any(|e| matches!(e.kind, EdgeKind::Back)) {
+        return StateValue::Reference(Stability::Unstable);
+    }
+
+    let topo = topo_sort(cfg);
+    let mut env_at: HashMap<BlockId, AbstractEnv<StateValue>> = HashMap::new();
+    env_at.insert(cfg.entry, entry_env.clone());
+
+    let mut return_val = StateValue::Bottom;
+
+    for bid in topo {
+        let env = if bid == cfg.entry {
+            env_at.get(&bid).cloned().unwrap_or_default()
+        } else {
+            cfg.predecessors(bid)
+                .iter()
+                .filter_map(|p| env_at.get(p))
+                .cloned()
+                .reduce(|a, b| a.join(&b))
+                .unwrap_or_default()
+        };
+        let mut env = env;
+
+        if let Some(block) = cfg.blocks.get(&bid) {
+            for stmt in &block.stmts {
+                exec_state_value(stmt, &mut env, state, memo);
+            }
+            match &block.term {
+                Terminator::Return(expr) => {
+                    let v = eval_state_value(expr, &env, state, memo);
+                    return_val = return_val.join(&v);
+                }
+                Terminator::Jump(next) => {
+                    env_at.entry(*next).and_modify(|e| *e = e.join(&env)).or_insert(env);
+                }
+                Terminator::Branch { then_, else_, .. } => {
+                    for &next in &[*then_, *else_] {
+                        env_at.entry(next).and_modify(|e| *e = e.join(&env)).or_insert_with(|| env.clone());
+                    }
+                }
+                Terminator::Unreachable => {}
+            }
+        }
+    }
+
+    return_val
+}
+
+fn topo_sort(cfg: &CFG) -> Vec<BlockId> {
+    let mut visited: HashSet<BlockId> = HashSet::new();
+    let mut order: Vec<BlockId> = Vec::new();
+    dfs_post(cfg.entry, cfg, &mut visited, &mut order);
+    order.reverse();
+    order
+}
+
+fn dfs_post(bid: BlockId, cfg: &CFG, visited: &mut HashSet<BlockId>, order: &mut Vec<BlockId>) {
+    if !visited.insert(bid) {
+        return;
+    }
+    for succ in cfg.successors(bid) {
+        dfs_post(succ, cfg, visited, order);
+    }
+    order.push(bid);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -431,7 +518,10 @@ fn exec_state_value(
 mod tests {
     use super::*;
     use crate::domains::NullCtx;
-    use crate::ir::expr::Prim;
+    use crate::ir::{
+        cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator},
+        expr::Prim,
+    };
 
     // ── StateValue domain ─────────────────────────────────────────────────────
 
@@ -767,5 +857,135 @@ mod tests {
             &NullCtx,
         );
         assert_eq!(v, str_singleton("dark"));
+    }
+
+    // ── exec_body / functional updaters ──────────────────────────────────────
+
+    fn single_block_cfg(stmts: Vec<Stmt>, ret: Expr) -> CFG {
+        let mut blocks = std::collections::HashMap::new();
+        blocks.insert(0, BasicBlock { id: 0, stmts, term: Terminator::Return(ret) });
+        CFG { entry: 0, blocks, edges: vec![] }
+    }
+
+    #[test]
+    fn functional_updater_increments_state() {
+        // setState(c => c + 1) where state[0] = Number([5,5])
+        // Expected: state[0] becomes Number([6,6])
+        let (mut env, mut state, mut memo) = empty();
+        state.update(0, StateValue::Number(Interval::point(5.0)));
+        env.bind_setter("setN".to_string(), 0);
+        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+
+        let body_cfg = single_block_cfg(
+            vec![],
+            Expr::BinOp {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Var("c".to_string())),
+                rhs: Box::new(Expr::Lit(Prim::Int(1))),
+            },
+        );
+
+        StateValueTransfer.exec_stmt(
+            &Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::FnLit {
+                    params: vec!["c".to_string()],
+                    body_cfg: Box::new(body_cfg),
+                }],
+            }),
+            &mut env,
+            &mut state,
+            &mut memo,
+            &NullCtx,
+        );
+
+        // state.update joins monotonically: Number([5,5]) ⊔ Number([6,6]) = Number([5,6])
+        assert_eq!(state.get(0), StateValue::Number(Interval { lo: 5.0, hi: 6.0 }));
+    }
+
+    #[test]
+    fn functional_updater_branch_joins() {
+        // setState(c => c > 0 ? c : 0) — two-block body
+        // state[0] = Number([3,3]) → both branches: Number([3,3]) join Number([0,0]) = Number([0,3])
+        let (mut env, mut state, mut memo) = empty();
+        state.update(0, StateValue::Number(Interval::point(3.0)));
+        env.bind_setter("setN".to_string(), 0);
+        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+
+        // block 0: branch cond=true → 1, false → 2
+        // block 1: return Var("c")  (c > 0 path)
+        // block 2: return Lit(0)    (else path)
+        let mut blocks = std::collections::HashMap::new();
+        blocks.insert(0, BasicBlock {
+            id: 0,
+            stmts: vec![],
+            term: Terminator::Branch {
+                cond: Expr::Lit(Prim::Bool(true)),
+                then_: 1,
+                else_: 2,
+            },
+        });
+        blocks.insert(1, BasicBlock {
+            id: 1,
+            stmts: vec![],
+            term: Terminator::Return(Expr::Var("c".to_string())),
+        });
+        blocks.insert(2, BasicBlock {
+            id: 2,
+            stmts: vec![],
+            term: Terminator::Return(Expr::Lit(Prim::Int(0))),
+        });
+        let body_cfg = CFG {
+            entry: 0,
+            blocks,
+            edges: vec![
+                Edge { from: 0, to: 1, kind: EdgeKind::IfTrue },
+                Edge { from: 0, to: 2, kind: EdgeKind::IfFalse },
+            ],
+        };
+
+        StateValueTransfer.exec_stmt(
+            &Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::FnLit {
+                    params: vec!["c".to_string()],
+                    body_cfg: Box::new(body_cfg),
+                }],
+            }),
+            &mut env,
+            &mut state,
+            &mut memo,
+            &NullCtx,
+        );
+
+        // join of Number([3,3]) and Number([0,0]) = Number([0,3])
+        assert_eq!(
+            state.get(0),
+            StateValue::Number(Interval { lo: 0.0, hi: 3.0 })
+        );
+    }
+
+    #[test]
+    fn back_edge_in_fnlit_body_returns_unstable() {
+        // A FnLit body with a back edge → conservative fallback
+        let mut blocks = std::collections::HashMap::new();
+        blocks.insert(0, BasicBlock {
+            id: 0,
+            stmts: vec![],
+            term: Terminator::Jump(0), // self-loop
+        });
+        let body_cfg = CFG {
+            entry: 0,
+            blocks,
+            edges: vec![Edge { from: 0, to: 0, kind: EdgeKind::Back }],
+        };
+
+        let mut entry_env = AbstractEnv::new();
+        entry_env.extend("c".to_string(), StateValue::Number(Interval::point(0.0)));
+        let mut state = StateStore::bottom();
+        let mut memo = MemoStore::new();
+
+        let result = exec_body(&body_cfg, &entry_env, &mut state, &mut memo);
+        assert_eq!(result, StateValue::Reference(Stability::Unstable));
     }
 }

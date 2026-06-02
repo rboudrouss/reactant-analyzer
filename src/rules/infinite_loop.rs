@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     domains::StateValue,
@@ -11,7 +11,7 @@ use crate::{
     },
 };
 
-use super::{Diagnostic, Rule};
+use super::{Diagnostic, Rule, collect_setter_calls};
 
 /// Fires when a state label required widening to converge AND there is an effect
 /// that unconditionally calls the corresponding setter — a potential infinite loop.
@@ -59,7 +59,7 @@ impl Rule for InfiniteLoop {
                         continue;
                     }
 
-                    if setter_reachable_from_entry(setter_vars, body_cfg) {
+                    if !collect_setter_calls(body_cfg, setter_vars, 1).is_empty() {
                         diags.push(
                             Diagnostic::new(
                                 "infinite-loop",
@@ -99,36 +99,6 @@ fn build_setter_map(result: &AnalysisResult<StateValue>) -> HashMap<HookLabel, H
     map
 }
 
-/// BFS from the effect entry block. Returns true if ANY reachable block
-/// contains a setter call `ExprStmt(Call(Var(name), ...))` where `name ∈ setter_vars`.
-///
-/// Over-approximate (any-path): sound for warnings (no missed loops), may
-/// produce false positives for setters only reachable on guarded paths.
-fn setter_reachable_from_entry(setter_vars: &HashSet<Var>, body_cfg: &crate::ir::cfg::CFG) -> bool {
-    let mut visited: HashSet<crate::ir::types::BlockId> = HashSet::new();
-    let mut queue: VecDeque<crate::ir::types::BlockId> = VecDeque::new();
-    queue.push_back(body_cfg.entry);
-    visited.insert(body_cfg.entry);
-
-    while let Some(bid) = queue.pop_front() {
-        if let Some(block) = body_cfg.blocks.get(&bid) {
-            for stmt in &block.stmts {
-                if let Stmt::ExprStmt(Expr::Call { fn_, .. }) = stmt
-                    && let Expr::Var(name) = fn_.as_ref()
-                    && setter_vars.contains(name)
-                {
-                    return true;
-                }
-            }
-            for succ in body_cfg.successors(bid) {
-                if visited.insert(succ) {
-                    queue.push_back(succ);
-                }
-            }
-        }
-    }
-    false
-}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

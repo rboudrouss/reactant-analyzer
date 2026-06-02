@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 
 use crate::{
     domains::StateValue,
@@ -6,7 +6,7 @@ use crate::{
     ir::{expr::Expr, stmt::Stmt, types::Var},
 };
 
-use super::{Diagnostic, Rule};
+use super::{Diagnostic, Rule, collect_setter_calls};
 
 /// Fires when any state setter is called directly in the render body.
 ///
@@ -45,43 +45,17 @@ impl Rule for SetterInRender {
             return vec![];
         }
 
-        // BFS through render CFG; warn on any reachable setter call.
-        // FnLit bodies (e.g. onClick handlers) are not in render_cfg blocks,
-        // so they're naturally excluded.
-        let mut visited: HashSet<_> = HashSet::new();
-        let mut queue: VecDeque<_> = VecDeque::new();
-        queue.push_back(result.render_cfg.entry);
-        visited.insert(result.render_cfg.entry);
-
-        let mut diags = vec![];
-
-        while let Some(bid) = queue.pop_front() {
-            if let Some(block) = result.render_cfg.blocks.get(&bid) {
-                for stmt in &block.stmts {
-                    let Stmt::ExprStmt(Expr::Call { fn_, .. }) = stmt else {
-                        continue;
-                    };
-                    let Expr::Var(name) = fn_.as_ref() else {
-                        continue;
-                    };
-                    if setter_vars.contains(name) {
-                        diags.push(Diagnostic::new(
-                            "setter-in-render",
-                            format!(
-                                "setter `{name}` called directly in the render body, move this call into a useEffect or an event handler"
-                            ),
-                        ));
-                    }
-                }
-                for succ in result.render_cfg.successors(bid) {
-                    if visited.insert(succ) {
-                        queue.push_back(succ);
-                    }
-                }
-            }
-        }
-
-        diags
+        collect_setter_calls(&result.render_cfg, &setter_vars, 1)
+            .into_iter()
+            .map(|name| {
+                Diagnostic::new(
+                    "setter-in-render",
+                    format!(
+                        "setter `{name}` called directly in the render body, move this call into a useEffect or an event handler"
+                    ),
+                )
+            })
+            .collect()
     }
 }
 
@@ -308,5 +282,40 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         let diags = SetterInRender.check(&result);
         assert!(!diags.is_empty(), "setter in render body should warn");
+    }
+
+    #[test]
+    fn setter_inside_callback_arg_warns() {
+        // render body: someCall((u) => { setN(u) })
+        // setN is inside a FnLit arg → must be detected via collect_setter_calls depth=1
+        let mut cb_blocks = HashMap::new();
+        cb_blocks.insert(0, BasicBlock {
+            id: 0,
+            stmts: vec![Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Var("u".to_string())],
+            })],
+            term: Terminator::Return(Expr::Lit(Prim::Unit)),
+        });
+        let cb_cfg = CFG { entry: 0, blocks: cb_blocks, edges: vec![] };
+
+        let render_stmts = vec![
+            Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+            },
+            // someCall(u => setN(u))
+            Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("someCall".to_string())),
+                args: vec![Expr::FnLit {
+                    params: vec!["u".to_string()],
+                    body_cfg: Box::new(cb_cfg),
+                }],
+            }),
+        ];
+        let result = make_result(vec![], render_stmts);
+        let diags = SetterInRender.check(&result);
+        assert_eq!(diags.len(), 1, "setter inside callback arg should be detected");
+        assert_eq!(diags[0].rule, "setter-in-render");
     }
 }
