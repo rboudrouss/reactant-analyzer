@@ -22,7 +22,7 @@ function ConditionalDepthExample({ flag }: { flag: boolean }) {
   const x = flag
     ? useState(0) // ❌ conditional-hook (error)
     : null;
-  return null;
+  return <div>{flag ? x[0] : "No state"}</div>;
 }
 
 // ── Setter read but initial value matches — no unnecessary-rerender ───────────

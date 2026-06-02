@@ -72,13 +72,3 @@ function Form() {
     </form>
   );
 }
-
-// ── setState with same value as initial → no unnecessary-rerender ─────────────
-
-function StatusBar() {
-  const [status, setStatus] = useState("idle");
-  useEffect(() => {
-    setStatus("idle"); // same as initial → no unnecessary-rerender ✓
-  }, []);
-  return <span>{status}</span>;
-}
