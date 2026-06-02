@@ -4,16 +4,12 @@ Fonctionnalités utiles non encore implémentées. Classées par thème.
 
 ## Précision d'analyse
 
-### Traverser les callbacks `.then()` et Promise chains — **design acté, [ADR-009](adr/ADR-009-callback-traversal.md)**
+### Affiner la traversée des callbacks in-cycle *(suite d'[ADR-009](adr/ADR-009-callback-traversal.md))*
 
-Pattern non détecté :
-```js
-useEffect(() => {
-  fetch("/api/user").then((u) => setUser(u))
-}, [])
-```
+La descente sémantique dans `.then`/`.catch`/`.finally`, timers et HOF sync est **faite** (`classify_callee` + `exec_callbacks_in_expr` dans `state_value.rs` ; fixtures `tests/fixtures/callbacks.tsx`). Limites restantes :
 
-`setUser` est dans un `FnLit` passé comme argument — `exec_stmt` ne descend pas dans les corps de FnLit. **Décision** ([ADR-009](adr/ADR-009-callback-traversal.md)) : descente *sémantique* dans le fixpoint, callbacks classés par `TriggerClass` (in-cycle : `.then`/timers/HOF → descendre ; subscription/inconnu → skip), via une pré-passe d'effets de bord par statement. Les handlers (`onClick`/`addEventListener`) restent `skip` pour l'instant — le chemin de migration vers leur analyse (points d'entrée + provenance) est décrit dans l'ADR.
+- **Back-edge dans un corps de callback** → `exec_body` bail conservateur (`Reference(Unstable)`) sans exécuter les statements → un setter dans une boucle interne au callback n'est pas propagé (faux négatif). Fix : une traversée *side-effect-only* qui collecte les setters même en présence de back-edge.
+- **Callees inconnus non descendus** (`myHelper(() => setX())`) → faux négatif sur les helpers qui appellent le callback en synchrone. Lié à l'analyse des handlers (store event-triggered, voir Infrastructure).
 
 ### Functional updaters `(n) => n + 1` ne déclenchent pas de widening
 
@@ -26,6 +22,17 @@ useEffect(() => {
 `FnLit` → `Reference(Unstable)` → cross-type join avec `Number([init])` → `Top`. Converge en 2 iter sans déclencher `widened_labels`. Il faut un signal spécifique pour les functional updaters : si l'argument est un `FnLit` dont le corps appelle le setter de façon non-identity → potential infinite loop.
 
 ## Infrastructure
+
+### Analyse des event handlers comme points d'entrée *([ADR-009](adr/ADR-009-callback-traversal.md))*
+
+Les handlers (`onClick={}`, `addEventListener`) sont actuellement **skippés** (classes `Subscription`/`Unknown`) pour éviter les faux positifs `infinite-loop`. Pour les analyser sans FP, suivre le chemin de migration acté dans l'ADR :
+
+1. **Lowering** — lifter les handlers (props JSX `onX` + `addEventListener`) en racines de première classe avec leur env de binding (render-exit pour inline, env au site `addEventListener` pour les effects).
+2. **Engine** — analyser chaque racine via `analyze_cfg` ; weak-join des effets de state taggés provenance `event`, **exclus de `widened_labels`** (sinon FP).
+3. **Politique** — flip `Subscription`/`Unknown` de `skip` à `analyze-as-entry-point` dans `classify_callee`.
+4. **Multiplicité** — handler / `setInterval` tournent 0..N fois → fixpoint aussi sur ces racines (widening induit ≠ bug).
+
+Débloque les règles : **stale-closure-in-handler** (réutilise la logique `missing-deps`), **missing-cleanup** (`addEventListener` sans `removeEventListener` dans le return). Acter que « setter dans un handler » n'est PAS un bug.
 
 ### Analyse inter-composants
 
