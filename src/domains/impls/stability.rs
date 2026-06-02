@@ -308,5 +308,4 @@ mod tests {
             Stability::Unknown
         );
     }
-
 }

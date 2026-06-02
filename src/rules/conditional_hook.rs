@@ -32,7 +32,9 @@ impl Rule for ConditionalHook {
             .iter()
             .filter(|call| {
                 // Conditional = doesn't dominate at least one exit.
-                exits.iter().any(|&exit| !dominates(&result.render_cfg, call.block_id, exit))
+                exits
+                    .iter()
+                    .any(|&exit| !dominates(&result.render_cfg, call.block_id, exit))
             })
             .map(|call| {
                 Diagnostic::new(
@@ -53,10 +55,12 @@ impl Rule for ConditionalHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
     use crate::{
-        domains::{StateValue, StateValueTransfer, stores::{MemoStore, StateStore}},
-        engine::{AnalysisResult, HookCallInfo, HookKind, analyze_component, Config},
+        domains::{
+            StateValue, StateValueTransfer,
+            stores::{MemoStore, StateStore},
+        },
+        engine::{AnalysisResult, Config, HookCallInfo, HookKind, analyze_component},
         ir::{
             cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator},
             component::ComponentIR,
@@ -66,6 +70,7 @@ mod tests {
         },
         rules::Rule,
     };
+    use std::collections::{HashMap, HashSet};
 
     fn make_result(render_cfg: CFG, hook_calls: Vec<HookCallInfo>) -> AnalysisResult<StateValue> {
         AnalysisResult {
@@ -82,15 +87,30 @@ mod tests {
 
     fn linear_cfg() -> CFG {
         let mut blocks = HashMap::new();
-        blocks.insert(0, BasicBlock { id: 0, stmts: vec![], term: Terminator::Jump(1) });
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![],
+                term: Terminator::Jump(1),
+            },
+        );
         blocks.insert(
             1,
-            BasicBlock { id: 1, stmts: vec![], term: Terminator::Return(Expr::Lit(Prim::Unit)) },
+            BasicBlock {
+                id: 1,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
         );
         CFG {
             entry: 0,
             blocks,
-            edges: vec![Edge { from: 0, to: 1, kind: EdgeKind::Unconditional }],
+            edges: vec![Edge {
+                from: 0,
+                to: 1,
+                kind: EdgeKind::Unconditional,
+            }],
         }
     }
 
@@ -108,20 +128,54 @@ mod tests {
                 },
             },
         );
-        blocks.insert(1, BasicBlock { id: 1, stmts: vec![], term: Terminator::Jump(3) });
-        blocks.insert(2, BasicBlock { id: 2, stmts: vec![], term: Terminator::Jump(3) });
+        blocks.insert(
+            1,
+            BasicBlock {
+                id: 1,
+                stmts: vec![],
+                term: Terminator::Jump(3),
+            },
+        );
+        blocks.insert(
+            2,
+            BasicBlock {
+                id: 2,
+                stmts: vec![],
+                term: Terminator::Jump(3),
+            },
+        );
         blocks.insert(
             3,
-            BasicBlock { id: 3, stmts: vec![], term: Terminator::Return(Expr::Lit(Prim::Unit)) },
+            BasicBlock {
+                id: 3,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
         );
         CFG {
             entry: 0,
             blocks,
             edges: vec![
-                Edge { from: 0, to: 1, kind: EdgeKind::IfTrue },
-                Edge { from: 0, to: 2, kind: EdgeKind::IfFalse },
-                Edge { from: 1, to: 3, kind: EdgeKind::Unconditional },
-                Edge { from: 2, to: 3, kind: EdgeKind::Unconditional },
+                Edge {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::IfTrue,
+                },
+                Edge {
+                    from: 0,
+                    to: 2,
+                    kind: EdgeKind::IfFalse,
+                },
+                Edge {
+                    from: 1,
+                    to: 3,
+                    kind: EdgeKind::Unconditional,
+                },
+                Edge {
+                    from: 2,
+                    to: 3,
+                    kind: EdgeKind::Unconditional,
+                },
             ],
         }
     }
@@ -129,21 +183,42 @@ mod tests {
     #[test]
     fn hook_at_entry_no_warning() {
         let cfg = linear_cfg();
-        let result = make_result(cfg, vec![HookCallInfo { label: 0, kind: HookKind::State, block_id: 0 }]);
+        let result = make_result(
+            cfg,
+            vec![HookCallInfo {
+                label: 0,
+                kind: HookKind::State,
+                block_id: 0,
+            }],
+        );
         assert!(ConditionalHook.check(&result).is_empty());
     }
 
     #[test]
     fn hook_after_unconditional_jump_no_warning() {
         let cfg = linear_cfg();
-        let result = make_result(cfg, vec![HookCallInfo { label: 0, kind: HookKind::State, block_id: 1 }]);
+        let result = make_result(
+            cfg,
+            vec![HookCallInfo {
+                label: 0,
+                kind: HookKind::State,
+                block_id: 1,
+            }],
+        );
         assert!(ConditionalHook.check(&result).is_empty());
     }
 
     #[test]
     fn hook_in_branch_warns() {
         let cfg = diamond_cfg();
-        let result = make_result(cfg, vec![HookCallInfo { label: 0, kind: HookKind::State, block_id: 1 }]);
+        let result = make_result(
+            cfg,
+            vec![HookCallInfo {
+                label: 0,
+                kind: HookKind::State,
+                block_id: 1,
+            }],
+        );
         let diags = ConditionalHook.check(&result);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].hook_label, Some(0));
@@ -152,7 +227,14 @@ mod tests {
     #[test]
     fn hook_at_join_point_no_warning() {
         let cfg = diamond_cfg();
-        let result = make_result(cfg, vec![HookCallInfo { label: 0, kind: HookKind::State, block_id: 3 }]);
+        let result = make_result(
+            cfg,
+            vec![HookCallInfo {
+                label: 0,
+                kind: HookKind::State,
+                block_id: 3,
+            }],
+        );
         assert!(ConditionalHook.check(&result).is_empty());
     }
 
@@ -160,8 +242,16 @@ mod tests {
     fn two_hooks_one_conditional() {
         let cfg = diamond_cfg();
         let hook_calls = vec![
-            HookCallInfo { label: 0, kind: HookKind::State, block_id: 0 }, // unconditional
-            HookCallInfo { label: 1, kind: HookKind::State, block_id: 1 }, // conditional
+            HookCallInfo {
+                label: 0,
+                kind: HookKind::State,
+                block_id: 0,
+            }, // unconditional
+            HookCallInfo {
+                label: 1,
+                kind: HookKind::State,
+                block_id: 1,
+            }, // conditional
         ];
         let result = make_result(cfg, hook_calls);
         let diags = ConditionalHook.check(&result);
@@ -171,20 +261,30 @@ mod tests {
 
     #[test]
     fn via_analyze_component_top_level_no_warning() {
-        let hooks = vec![HookEntry::State { label: 0, init: Expr::Lit(Prim::Int(0)) }];
+        let hooks = vec![HookEntry::State {
+            label: 0,
+            init: Expr::Lit(Prim::Int(0)),
+        }];
         let mut blocks = HashMap::new();
         blocks.insert(
             0,
             BasicBlock {
                 id: 0,
-                stmts: vec![Stmt::Let { var: "n".to_string(), rhs: Expr::StateVal(0) }],
+                stmts: vec![Stmt::Let {
+                    var: "n".to_string(),
+                    rhs: Expr::StateVal(0),
+                }],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
         );
         let comp = ComponentIR {
             name: "C".to_string(),
             param: "props".to_string(),
-            render_cfg: CFG { entry: 0, blocks, edges: vec![] },
+            render_cfg: CFG {
+                entry: 0,
+                blocks,
+                edges: vec![],
+            },
             hooks,
         };
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
@@ -194,7 +294,10 @@ mod tests {
     #[test]
     fn via_analyze_component_conditional_hook_warns() {
         // useState in a branch block
-        let hooks = vec![HookEntry::State { label: 0, init: Expr::Lit(Prim::Int(0)) }];
+        let hooks = vec![HookEntry::State {
+            label: 0,
+            init: Expr::Lit(Prim::Int(0)),
+        }];
         let mut blocks = HashMap::new();
         blocks.insert(
             0,
@@ -213,16 +316,33 @@ mod tests {
             BasicBlock {
                 id: 1,
                 stmts: vec![
-                    Stmt::Let { var: "n".to_string(), rhs: Expr::StateVal(0) },
-                    Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
+                    Stmt::Let {
+                        var: "n".to_string(),
+                        rhs: Expr::StateVal(0),
+                    },
+                    Stmt::Let {
+                        var: "setN".to_string(),
+                        rhs: Expr::StateSetter(0),
+                    },
                 ],
                 term: Terminator::Jump(3),
             },
         );
-        blocks.insert(2, BasicBlock { id: 2, stmts: vec![], term: Terminator::Jump(3) });
+        blocks.insert(
+            2,
+            BasicBlock {
+                id: 2,
+                stmts: vec![],
+                term: Terminator::Jump(3),
+            },
+        );
         blocks.insert(
             3,
-            BasicBlock { id: 3, stmts: vec![], term: Terminator::Return(Expr::Lit(Prim::Unit)) },
+            BasicBlock {
+                id: 3,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
         );
         let comp = ComponentIR {
             name: "C".to_string(),
@@ -231,10 +351,26 @@ mod tests {
                 entry: 0,
                 blocks,
                 edges: vec![
-                    Edge { from: 0, to: 1, kind: EdgeKind::IfTrue },
-                    Edge { from: 0, to: 2, kind: EdgeKind::IfFalse },
-                    Edge { from: 1, to: 3, kind: EdgeKind::Unconditional },
-                    Edge { from: 2, to: 3, kind: EdgeKind::Unconditional },
+                    Edge {
+                        from: 0,
+                        to: 1,
+                        kind: EdgeKind::IfTrue,
+                    },
+                    Edge {
+                        from: 0,
+                        to: 2,
+                        kind: EdgeKind::IfFalse,
+                    },
+                    Edge {
+                        from: 1,
+                        to: 3,
+                        kind: EdgeKind::Unconditional,
+                    },
+                    Edge {
+                        from: 2,
+                        to: 3,
+                        kind: EdgeKind::Unconditional,
+                    },
                 ],
             },
             hooks,

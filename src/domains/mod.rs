@@ -31,12 +31,24 @@ pub trait AbstractDomain: Clone + PartialEq + PartialOrd + std::fmt::Debug {
 
     // Branch narrowing: default = identity (sound, imprecise).
     // Override for numeric domains to refine interval bounds on branch conditions.
-    fn narrow_lt(self, _v: f64) -> Self { self }
-    fn narrow_leq(self, _v: f64) -> Self { self }
-    fn narrow_gt(self, _v: f64) -> Self { self }
-    fn narrow_geq(self, _v: f64) -> Self { self }
-    fn narrow_eq(self, _v: f64) -> Self { self }
-    fn narrow_neq(self, _v: f64) -> Self { self }
+    fn narrow_lt(self, _v: f64) -> Self {
+        self
+    }
+    fn narrow_leq(self, _v: f64) -> Self {
+        self
+    }
+    fn narrow_gt(self, _v: f64) -> Self {
+        self
+    }
+    fn narrow_geq(self, _v: f64) -> Self {
+        self
+    }
+    fn narrow_eq(self, _v: f64) -> Self {
+        self
+    }
+    fn narrow_neq(self, _v: f64) -> Self {
+        self
+    }
 }
 
 // ── Transfer trait ────────────────────────────────────────────────────────────

@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::{
-    domains::{AbstractEnv, MemoStore, NullCtx, StateStore, StateValue, StateValueTransfer, Transfer},
+    domains::{
+        AbstractEnv, MemoStore, NullCtx, StateStore, StateValue, StateValueTransfer, Transfer,
+    },
     engine::AnalysisResult,
     ir::{
         expr::Expr,
@@ -38,7 +40,13 @@ impl Rule for UnnecessaryRerender {
             .iter()
             .filter_map(|h| {
                 if let HookEntry::State { label, init } = h {
-                    let val = StateValueTransfer.eval_expr(init, &empty_env, &empty_state, &empty_memo, &NullCtx);
+                    let val = StateValueTransfer.eval_expr(
+                        init,
+                        &empty_env,
+                        &empty_state,
+                        &empty_memo,
+                        &NullCtx,
+                    );
                     Some((*label, val))
                 } else {
                     None
@@ -51,7 +59,11 @@ impl Rule for UnnecessaryRerender {
             let mut map: HashMap<HookLabel, HashSet<Var>> = HashMap::new();
             for block in result.render_cfg.blocks.values() {
                 for stmt in &block.stmts {
-                    if let Stmt::Let { var, rhs: Expr::StateSetter(label) } = stmt {
+                    if let Stmt::Let {
+                        var,
+                        rhs: Expr::StateSetter(label),
+                    } = stmt
+                    {
                         map.entry(*label).or_default().insert(var.clone());
                     }
                 }
@@ -62,8 +74,13 @@ impl Rule for UnnecessaryRerender {
         let mut diags = Vec::new();
 
         for hook in &result.hooks {
-            let HookEntry::Effect { label: _eff_label, body_cfg, deps: Some(deps) } = hook else {
-                continue
+            let HookEntry::Effect {
+                label: _eff_label,
+                body_cfg,
+                deps: Some(deps),
+            } = hook
+            else {
+                continue;
             };
             if !deps.is_empty() {
                 continue; // only mount-only effects (deps = [])
@@ -78,8 +95,12 @@ impl Rule for UnnecessaryRerender {
             while let Some(bid) = queue.pop_front() {
                 if let Some(block) = body_cfg.blocks.get(&bid) {
                     for stmt in &block.stmts {
-                        let Stmt::ExprStmt(Expr::Call { fn_, args }) = stmt else { continue };
-                        let Expr::Var(setter_name) = fn_.as_ref() else { continue };
+                        let Stmt::ExprStmt(Expr::Call { fn_, args }) = stmt else {
+                            continue;
+                        };
+                        let Expr::Var(setter_name) = fn_.as_ref() else {
+                            continue;
+                        };
 
                         // Resolve setter name → state label.
                         let Some(state_label) = setters_for
@@ -87,10 +108,12 @@ impl Rule for UnnecessaryRerender {
                             .find(|(_, names)| names.contains(setter_name))
                             .map(|(&lbl, _)| lbl)
                         else {
-                            continue
+                            continue;
                         };
 
-                        let Some(init_val) = init_values.get(&state_label) else { continue };
+                        let Some(init_val) = init_values.get(&state_label) else {
+                            continue;
+                        };
                         if !init_val.is_stable() {
                             continue; // init not a known constant — can't compare
                         }
@@ -146,9 +169,8 @@ impl Rule for UnnecessaryRerender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use crate::{
-        domains::{StateValueTransfer},
+        domains::StateValueTransfer,
         engine::{Config, analyze_component},
         ir::{
             cfg::{BasicBlock, CFG, Terminator},
@@ -159,28 +181,43 @@ mod tests {
         },
         rules::Rule,
     };
+    use std::collections::HashMap;
 
     fn effect_cfg(stmts: Vec<Stmt>) -> CFG {
         let mut blocks = HashMap::new();
         blocks.insert(
             0,
-            BasicBlock { id: 0, stmts, term: Terminator::Return(Expr::Lit(Prim::Unit)) },
+            BasicBlock {
+                id: 0,
+                stmts,
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
         );
-        CFG { entry: 0, blocks, edges: vec![] }
+        CFG {
+            entry: 0,
+            blocks,
+            edges: vec![],
+        }
     }
 
-    fn component_with(
-        init: Expr,
-        effect_stmts: Vec<Stmt>,
-        deps: Option<Vec<Expr>>,
-    ) -> ComponentIR {
+    fn component_with(init: Expr, effect_stmts: Vec<Stmt>, deps: Option<Vec<Expr>>) -> ComponentIR {
         let hooks = vec![
             HookEntry::State { label: 0, init },
-            HookEntry::Effect { label: 1, body_cfg: effect_cfg(effect_stmts), deps },
+            HookEntry::Effect {
+                label: 1,
+                body_cfg: effect_cfg(effect_stmts),
+                deps,
+            },
         ];
         let render_stmts = vec![
-            Stmt::Let { var: "x".to_string(), rhs: Expr::StateVal(0) },
-            Stmt::Let { var: "setX".to_string(), rhs: Expr::StateSetter(0) },
+            Stmt::Let {
+                var: "x".to_string(),
+                rhs: Expr::StateVal(0),
+            },
+            Stmt::Let {
+                var: "setX".to_string(),
+                rhs: Expr::StateSetter(0),
+            },
         ];
         let mut blocks = HashMap::new();
         blocks.insert(
@@ -194,7 +231,11 @@ mod tests {
         ComponentIR {
             name: "C".to_string(),
             param: "props".to_string(),
-            render_cfg: CFG { entry: 0, blocks, edges: vec![] },
+            render_cfg: CFG {
+                entry: 0,
+                blocks,
+                edges: vec![],
+            },
             hooks,
         }
     }
@@ -206,7 +247,11 @@ mod tests {
             fn_: Box::new(Expr::Var("setX".to_string())),
             args: vec![Expr::Lit(Prim::String("dark".into()))],
         })];
-        let comp = component_with(Expr::Lit(Prim::String("light".into())), eff_stmts, Some(vec![]));
+        let comp = component_with(
+            Expr::Lit(Prim::String("light".into())),
+            eff_stmts,
+            Some(vec![]),
+        );
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         let diags = UnnecessaryRerender.check(&result);
         assert_eq!(diags.len(), 1);
@@ -221,7 +266,11 @@ mod tests {
             fn_: Box::new(Expr::Var("setX".to_string())),
             args: vec![Expr::Lit(Prim::String("light".into()))],
         })];
-        let comp = component_with(Expr::Lit(Prim::String("light".into())), eff_stmts, Some(vec![]));
+        let comp = component_with(
+            Expr::Lit(Prim::String("light".into())),
+            eff_stmts,
+            Some(vec![]),
+        );
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(UnnecessaryRerender.check(&result).is_empty());
     }

@@ -22,7 +22,10 @@ pub struct AbstractEnv<D: AbstractDomain> {
 
 impl<D: AbstractDomain> Default for AbstractEnv<D> {
     fn default() -> Self {
-        AbstractEnv { stabs: HashMap::new(), setter_bindings: HashMap::new() }
+        AbstractEnv {
+            stabs: HashMap::new(),
+            setter_bindings: HashMap::new(),
+        }
     }
 }
 
@@ -64,7 +67,7 @@ impl<D: AbstractDomain> AbstractEnv<D> {
             let w = other.stabs.get(k).cloned().unwrap_or_else(D::top);
             stabs.insert(k.clone(), v.join(&w));
         }
-        for (k, _) in &other.stabs {
+        for k in other.stabs.keys() {
             if !self.stabs.contains_key(k) {
                 stabs.insert(k.clone(), D::top());
             }
@@ -74,7 +77,10 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         for (k, &v) in &other.setter_bindings {
             setter_bindings.entry(k.clone()).or_insert(v);
         }
-        AbstractEnv { stabs, setter_bindings }
+        AbstractEnv {
+            stabs,
+            setter_bindings,
+        }
     }
 
     /// Pointwise widening. Used for back-edge merging in `analyze_cfg`.
@@ -84,7 +90,7 @@ impl<D: AbstractDomain> AbstractEnv<D> {
             let w = other.stabs.get(k).cloned().unwrap_or_else(D::top);
             stabs.insert(k.clone(), v.widen(&w));
         }
-        for (k, _) in &other.stabs {
+        for k in other.stabs.keys() {
             if !self.stabs.contains_key(k) {
                 stabs.insert(k.clone(), D::top());
             }
@@ -93,7 +99,10 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         for (k, &v) in &other.setter_bindings {
             setter_bindings.entry(k.clone()).or_insert(v);
         }
-        AbstractEnv { stabs, setter_bindings }
+        AbstractEnv {
+            stabs,
+            setter_bindings,
+        }
     }
 
     /// Empty env — lattice bottom.

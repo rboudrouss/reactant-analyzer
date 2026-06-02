@@ -6,4 +6,4 @@ pub mod typed_state_store;
 pub use abstract_env::AbstractEnv;
 pub use memo_store::MemoStore;
 pub use state_store::StateStore;
-pub use typed_state_store::{TypedStateStore, StateType, infer_state_type};
+pub use typed_state_store::{StateType, TypedStateStore, infer_state_type};

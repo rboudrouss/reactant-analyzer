@@ -69,10 +69,11 @@ impl<D: AbstractDomain> StateStore<D> {
 
     /// Labels whose value differs between `self` and `other`.
     pub fn changed_labels(&self, other: &Self) -> Vec<HookLabel> {
-        let all: HashSet<HookLabel> =
-            self.0.keys().chain(other.0.keys()).copied().collect();
-        let mut changed: Vec<HookLabel> =
-            all.into_iter().filter(|&k| self.get(k) != other.get(k)).collect();
+        let all: HashSet<HookLabel> = self.0.keys().chain(other.0.keys()).copied().collect();
+        let mut changed: Vec<HookLabel> = all
+            .into_iter()
+            .filter(|&k| self.get(k) != other.get(k))
+            .collect();
         changed.sort_unstable();
         changed
     }

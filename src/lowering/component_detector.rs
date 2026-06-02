@@ -139,7 +139,7 @@ fn is_component(name: &str, stmts: &[Statement], return_type: Option<&TSTypeAnno
         return false;
     }
     // React convention: component names must start with uppercase
-    if !name.chars().next().map_or(false, |c| c.is_uppercase()) {
+    if !name.chars().next().is_some_and(|c| c.is_uppercase()) {
         return false;
     }
     // Rule 2: any return path yields JSX
@@ -147,10 +147,10 @@ fn is_component(name: &str, stmts: &[Statement], return_type: Option<&TSTypeAnno
         return true;
     }
     // Rule 3: TypeScript component type annotation on the return type
-    if let Some(ann) = return_type {
-        if ts_type_is_component(&ann.type_annotation) {
-            return true;
-        }
+    if let Some(ann) = return_type
+        && ts_type_is_component(&ann.type_annotation)
+    {
+        return true;
     }
     false
 }
@@ -163,10 +163,9 @@ fn body_returns_jsx(stmts: &[Statement]) -> bool {
 
 fn stmt_has_jsx_return(stmt: &Statement) -> bool {
     match stmt {
-        Statement::ReturnStatement(ret) => ret
-            .argument
-            .as_ref()
-            .map_or(false, |e| expr_contains_jsx(e)),
+        Statement::ReturnStatement(ret) => {
+            ret.argument.as_ref().is_some_and(|e| expr_contains_jsx(e))
+        }
         // Expression-body arrows (`() => <div/>`) store the expression as an ExpressionStatement
         Statement::ExpressionStatement(es) => expr_contains_jsx(&es.expression),
         Statement::BlockStatement(block) => body_returns_jsx(&block.body),
@@ -175,7 +174,7 @@ fn stmt_has_jsx_return(stmt: &Statement) -> bool {
                 || if_
                     .alternate
                     .as_ref()
-                    .map_or(false, |alt| stmt_has_jsx_return(alt))
+                    .is_some_and(|alt| stmt_has_jsx_return(alt))
         }
         Statement::WhileStatement(w) => stmt_has_jsx_return(&w.body),
         Statement::ForStatement(f) => stmt_has_jsx_return(&f.body),
@@ -185,11 +184,11 @@ fn stmt_has_jsx_return(stmt: &Statement) -> bool {
                 || tr
                     .handler
                     .as_ref()
-                    .map_or(false, |h| body_returns_jsx(&h.body.body))
+                    .is_some_and(|h| body_returns_jsx(&h.body.body))
                 || tr
                     .finalizer
                     .as_ref()
-                    .map_or(false, |f| body_returns_jsx(&f.body))
+                    .is_some_and(|f| body_returns_jsx(&f.body))
         }
         _ => false,
     }

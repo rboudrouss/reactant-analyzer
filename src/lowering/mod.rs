@@ -19,8 +19,16 @@ pub fn lower_program(program: &Program) -> Vec<ComponentIR> {
             let mut render_cfg = build_cfg(candidate.body);
             let hooks = extract_hooks(&mut render_cfg);
             let params = expr_lower::lower_params(candidate.params);
-            let param = params.into_iter().next().unwrap_or_else(|| "props".to_string());
-            ComponentIR { name: candidate.name, param, render_cfg, hooks }
+            let param = params
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "props".to_string());
+            ComponentIR {
+                name: candidate.name,
+                param,
+                render_cfg,
+                hooks,
+            }
         })
         .collect()
 }

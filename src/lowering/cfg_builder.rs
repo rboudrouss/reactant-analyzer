@@ -2,12 +2,15 @@ use std::collections::HashMap;
 
 use oxc_ast::ast::*;
 
-use crate::{ir::{
-    cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator},
-    expr::{Expr, Prim},
-    stmt::Stmt,
-    types::BlockId,
-}, lowering::expr_lower::{empty_cfg, lower_expr}};
+use crate::{
+    ir::{
+        cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator},
+        expr::{Expr, Prim},
+        stmt::Stmt,
+        types::BlockId,
+    },
+    lowering::expr_lower::{empty_cfg, lower_expr},
+};
 
 // ── BlockBuilder ──────────────────────────────────────────────────────────────
 
@@ -197,10 +200,10 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
                     lower_stmts(&handler.body.body, builder);
                 }
             }
-            if let Some(finalizer) = &tr.finalizer {
-                if !builder.is_terminated() {
-                    lower_stmts(&finalizer.body, builder);
-                }
+            if let Some(finalizer) = &tr.finalizer
+                && !builder.is_terminated()
+            {
+                lower_stmts(&finalizer.body, builder);
             }
         }
         Statement::SwitchStatement(sw) => {
@@ -347,7 +350,9 @@ fn lower_for(
     builder.add_edge(pre, header, EdgeKind::Unconditional);
 
     builder.start_block(header);
-    let cond = test.map(|e| lower_expr(e, builder)).unwrap_or(Expr::Lit(Prim::Bool(true)));
+    let cond = test
+        .map(|e| lower_expr(e, builder))
+        .unwrap_or(Expr::Lit(Prim::Bool(true)));
     let h = builder.seal_with(Terminator::Branch {
         cond,
         then_: body_block,

@@ -15,12 +15,18 @@ impl Interval {
     }
 
     pub fn top() -> Self {
-        Interval { lo: f64::NEG_INFINITY, hi: f64::INFINITY }
+        Interval {
+            lo: f64::NEG_INFINITY,
+            hi: f64::INFINITY,
+        }
     }
 
     /// Empty interval — represents ⊥ for the numeric sub-lattice.
     pub fn bottom() -> Self {
-        Interval { lo: f64::INFINITY, hi: f64::NEG_INFINITY }
+        Interval {
+            lo: f64::INFINITY,
+            hi: f64::NEG_INFINITY,
+        }
     }
 
     pub fn is_bottom(&self) -> bool {
@@ -43,7 +49,10 @@ impl Interval {
         if other.is_bottom() {
             return *self;
         }
-        Interval { lo: self.lo.min(other.lo), hi: self.hi.max(other.hi) }
+        Interval {
+            lo: self.lo.min(other.lo),
+            hi: self.hi.max(other.hi),
+        }
     }
 
     /// Widening: if other grows the bound beyond self, jump to ±∞.
@@ -55,8 +64,16 @@ impl Interval {
             return *self;
         }
         Interval {
-            lo: if other.lo < self.lo { f64::NEG_INFINITY } else { self.lo },
-            hi: if other.hi > self.hi { f64::INFINITY } else { self.hi },
+            lo: if other.lo < self.lo {
+                f64::NEG_INFINITY
+            } else {
+                self.lo
+            },
+            hi: if other.hi > self.hi {
+                f64::INFINITY
+            } else {
+                self.hi
+            },
         }
     }
 
@@ -64,14 +81,20 @@ impl Interval {
         if self.is_bottom() || other.is_bottom() {
             return Interval::bottom();
         }
-        Interval { lo: self.lo + other.lo, hi: self.hi + other.hi }
+        Interval {
+            lo: self.lo + other.lo,
+            hi: self.hi + other.hi,
+        }
     }
 
     pub fn sub(&self, other: &Self) -> Self {
         if self.is_bottom() || other.is_bottom() {
             return Interval::bottom();
         }
-        Interval { lo: self.lo - other.hi, hi: self.hi - other.lo }
+        Interval {
+            lo: self.lo - other.hi,
+            hi: self.hi - other.lo,
+        }
     }
 
     pub fn mul(&self, other: &Self) -> Self {
@@ -93,27 +116,48 @@ impl Interval {
         if self.is_bottom() {
             return Interval::bottom();
         }
-        Interval { lo: -self.hi, hi: -self.lo }
+        Interval {
+            lo: -self.hi,
+            hi: -self.lo,
+        }
     }
 
     // Narrowing: restrict interval to satisfy a comparison against a literal `v`.
     pub fn narrow_lt(&self, v: f64) -> Self {
-        Interval { lo: self.lo, hi: self.hi.min(v - 1.0) }
+        Interval {
+            lo: self.lo,
+            hi: self.hi.min(v - 1.0),
+        }
     }
     pub fn narrow_leq(&self, v: f64) -> Self {
-        Interval { lo: self.lo, hi: self.hi.min(v) }
+        Interval {
+            lo: self.lo,
+            hi: self.hi.min(v),
+        }
     }
     pub fn narrow_gt(&self, v: f64) -> Self {
-        Interval { lo: self.lo.max(v + 1.0), hi: self.hi }
+        Interval {
+            lo: self.lo.max(v + 1.0),
+            hi: self.hi,
+        }
     }
     pub fn narrow_geq(&self, v: f64) -> Self {
-        Interval { lo: self.lo.max(v), hi: self.hi }
+        Interval {
+            lo: self.lo.max(v),
+            hi: self.hi,
+        }
     }
     pub fn narrow_eq(&self, v: f64) -> Self {
-        if self.lo <= v && v <= self.hi { Interval::point(v) } else { Interval::bottom() }
+        if self.lo <= v && v <= self.hi {
+            Interval::point(v)
+        } else {
+            Interval::bottom()
+        }
     }
     /// Conservative: can't split an interval at a point; return self.
-    pub fn narrow_neq(&self, _v: f64) -> Self { *self }
+    pub fn narrow_neq(&self, _v: f64) -> Self {
+        *self
+    }
 }
 
 /// [a,b] ≤ [c,d] iff [a,b] ⊆ [c,d] (i.e. c ≤ a && b ≤ d).
@@ -136,24 +180,46 @@ impl PartialOrd for Interval {
 // ── AbstractDomain ────────────────────────────────────────────────────────────
 
 impl AbstractDomain for Interval {
-    fn bottom() -> Self { Interval::bottom() }
-    fn top() -> Self { Interval::top() }
-    fn is_bottom(&self) -> bool { Interval::is_bottom(self) }
-    fn join(&self, other: &Self) -> Self { self.hull(other) }
+    fn bottom() -> Self {
+        Interval::bottom()
+    }
+    fn top() -> Self {
+        Interval::top()
+    }
+    fn is_bottom(&self) -> bool {
+        Interval::is_bottom(self)
+    }
+    fn join(&self, other: &Self) -> Self {
+        self.hull(other)
+    }
     fn meet(&self, other: &Self) -> Self {
         let lo = self.lo.max(other.lo);
         let hi = self.hi.min(other.hi);
         Interval { lo, hi } // bottom if lo > hi
     }
-    fn widen(&self, other: &Self) -> Self { Interval::widen(self, other) }
+    fn widen(&self, other: &Self) -> Self {
+        Interval::widen(self, other)
+    }
 
     // Use fully-qualified inherent methods to avoid recursive trait dispatch.
-    fn narrow_lt(self, v: f64) -> Self { Interval::narrow_lt(&self, v) }
-    fn narrow_leq(self, v: f64) -> Self { Interval::narrow_leq(&self, v) }
-    fn narrow_gt(self, v: f64) -> Self { Interval::narrow_gt(&self, v) }
-    fn narrow_geq(self, v: f64) -> Self { Interval::narrow_geq(&self, v) }
-    fn narrow_eq(self, v: f64) -> Self { Interval::narrow_eq(&self, v) }
-    fn narrow_neq(self, v: f64) -> Self { Interval::narrow_neq(&self, v) }
+    fn narrow_lt(self, v: f64) -> Self {
+        Interval::narrow_lt(&self, v)
+    }
+    fn narrow_leq(self, v: f64) -> Self {
+        Interval::narrow_leq(&self, v)
+    }
+    fn narrow_gt(self, v: f64) -> Self {
+        Interval::narrow_gt(&self, v)
+    }
+    fn narrow_geq(self, v: f64) -> Self {
+        Interval::narrow_geq(&self, v)
+    }
+    fn narrow_eq(self, v: f64) -> Self {
+        Interval::narrow_eq(&self, v)
+    }
+    fn narrow_neq(self, v: f64) -> Self {
+        Interval::narrow_neq(&self, v)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

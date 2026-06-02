@@ -33,7 +33,10 @@ fn main() {
     if total_issues == 0 {
         println!("✓  {} file(s) — no issues found.", total_files);
     } else {
-        println!("⚠  {} issue(s) across {} file(s).", total_issues, total_files);
+        println!(
+            "⚠  {} issue(s) across {} file(s).",
+            total_issues, total_files
+        );
         std::process::exit(1);
     }
 }
@@ -95,8 +98,15 @@ fn analyze_file(path: &Path) -> usize {
                     .hook_label
                     .map(|l| format!("  [hook:{l}]"))
                     .unwrap_or_default();
-                let var_info = d.var.as_deref().map(|v| format!("  var:{v}")).unwrap_or_default();
-                println!("    ⚠  {}{}{}  — {}", d.rule, label_info, var_info, d.message);
+                let var_info = d
+                    .var
+                    .as_deref()
+                    .map(|v| format!("  var:{v}"))
+                    .unwrap_or_default();
+                println!(
+                    "    ⚠  {}{}{}  — {}",
+                    d.rule, label_info, var_info, d.message
+                );
             }
             file_issues += diags.len();
         }

@@ -53,7 +53,9 @@ pub struct Registry {
 
 impl Registry {
     pub fn new() -> Self {
-        Registry { models: HashMap::new() }
+        Registry {
+            models: HashMap::new(),
+        }
     }
 
     /// Create a registry pre-populated with all builtin hook models.
@@ -120,21 +122,38 @@ mod tests {
     fn register_and_lookup() {
         struct MyHook;
         impl HookModel for MyHook {
-            fn name(&self) -> &str { "useMyHook" }
+            fn name(&self) -> &str {
+                "useMyHook"
+            }
             fn analyze(&self, _: &[Stability], _: Option<&[Stability]>) -> HookResult {
-                HookResult { return_stability: Stability::Stable, creates_state: false, effect_semantics: None }
+                HookResult {
+                    return_stability: Stability::Stable,
+                    creates_state: false,
+                    effect_semantics: None,
+                }
             }
         }
         let mut r = Registry::new();
         r.register(Box::new(MyHook));
         assert!(r.lookup("useMyHook").is_some());
-        assert_eq!(r.analyze("useMyHook", &[], None).return_stability, Stability::Stable);
+        assert_eq!(
+            r.analyze("useMyHook", &[], None).return_stability,
+            Stability::Stable
+        );
     }
 
     #[test]
     fn builtins_registered() {
         let r = Registry::new_with_builtins();
-        for name in ["useState", "useEffect", "useMemo", "useCallback", "useRef", "useContext", "useReducer"] {
+        for name in [
+            "useState",
+            "useEffect",
+            "useMemo",
+            "useCallback",
+            "useRef",
+            "useContext",
+            "useReducer",
+        ] {
             assert!(r.lookup(name).is_some(), "missing builtin: {name}");
         }
     }

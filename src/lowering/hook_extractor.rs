@@ -63,11 +63,17 @@ fn process_stmt(
                     // subsequent IndexAccess stmts will be rewritten by rewrite_expr.
                     state_temps.insert(var, lbl);
                 } else {
-                    out.push(Stmt::Let { var, rhs: hook_result_expr(&name, lbl) });
+                    out.push(Stmt::Let {
+                        var,
+                        rhs: hook_result_expr(&name, lbl),
+                    });
                 }
             }
             Err(rhs) => {
-                out.push(Stmt::Let { var, rhs: rewrite_expr(rhs, state_temps) });
+                out.push(Stmt::Let {
+                    var,
+                    rhs: rewrite_expr(rhs, state_temps),
+                });
             }
         },
         Stmt::ExprStmt(expr) => match try_consume_hook_call(expr) {
@@ -84,7 +90,10 @@ fn process_stmt(
             }
         },
         Stmt::Assign { var, rhs } => {
-            out.push(Stmt::Assign { var, rhs: rewrite_expr(rhs, state_temps) });
+            out.push(Stmt::Assign {
+                var,
+                rhs: rewrite_expr(rhs, state_temps),
+            });
         }
     }
 }
@@ -123,19 +132,40 @@ fn make_hook_entry(name: &str, label: HookLabel, args: Vec<Expr>) -> Option<Hook
             Some(HookEntry::State { label, init })
         }
         "useEffect" => {
-            let body_cfg = it.next().and_then(expr_into_cfg).unwrap_or_else(fallback_cfg);
+            let body_cfg = it
+                .next()
+                .and_then(expr_into_cfg)
+                .unwrap_or_else(fallback_cfg);
             let deps = it.next().and_then(expr_into_deps);
-            Some(HookEntry::Effect { label, body_cfg, deps })
+            Some(HookEntry::Effect {
+                label,
+                body_cfg,
+                deps,
+            })
         }
         "useMemo" => {
-            let body_cfg = it.next().and_then(expr_into_cfg).unwrap_or_else(fallback_cfg);
+            let body_cfg = it
+                .next()
+                .and_then(expr_into_cfg)
+                .unwrap_or_else(fallback_cfg);
             let deps = it.next().and_then(expr_into_deps).unwrap_or_default();
-            Some(HookEntry::Memo { label, body_cfg, deps })
+            Some(HookEntry::Memo {
+                label,
+                body_cfg,
+                deps,
+            })
         }
         "useCallback" => {
-            let body_cfg = it.next().and_then(expr_into_cfg).unwrap_or_else(fallback_cfg);
+            let body_cfg = it
+                .next()
+                .and_then(expr_into_cfg)
+                .unwrap_or_else(fallback_cfg);
             let deps = it.next().and_then(expr_into_deps).unwrap_or_default();
-            Some(HookEntry::Callback { label, body_cfg, deps })
+            Some(HookEntry::Callback {
+                label,
+                body_cfg,
+                deps,
+            })
         }
         "useRef" => {
             let init = it.next().unwrap_or(Expr::Lit(Prim::Null));
@@ -143,7 +173,12 @@ fn make_hook_entry(name: &str, label: HookLabel, args: Vec<Expr>) -> Option<Hook
         }
         _ if name.starts_with("use") => {
             let args: Vec<Expr> = it.collect();
-            Some(HookEntry::Custom { label, name: name.to_string(), args, deps: None })
+            Some(HookEntry::Custom {
+                label,
+                name: name.to_string(),
+                args,
+                deps: None,
+            })
         }
         _ => None,
     }
@@ -177,8 +212,19 @@ fn expr_into_deps(expr: Expr) -> Option<Vec<Expr>> {
 
 fn fallback_cfg() -> CFG {
     let mut blocks = std::collections::HashMap::new();
-    blocks.insert(0, BasicBlock { id: 0, stmts: vec![], term: Terminator::Unreachable });
-    CFG { entry: 0, blocks, edges: vec![] }
+    blocks.insert(
+        0,
+        BasicBlock {
+            id: 0,
+            stmts: vec![],
+            term: Terminator::Unreachable,
+        },
+    );
+    CFG {
+        entry: 0,
+        blocks,
+        edges: vec![],
+    }
 }
 
 // ── Expr rewriting ────────────────────────────────────────────────────────────
@@ -210,18 +256,28 @@ fn rewrite_expr(expr: Expr, state_temps: &HashMap<String, HookLabel>) -> Expr {
             lhs: Box::new(rewrite_expr(*lhs, state_temps)),
             rhs: Box::new(rewrite_expr(*rhs, state_temps)),
         },
-        Expr::UnaryOp { op, arg } => {
-            Expr::UnaryOp { op, arg: Box::new(rewrite_expr(*arg, state_temps)) }
-        }
+        Expr::UnaryOp { op, arg } => Expr::UnaryOp {
+            op,
+            arg: Box::new(rewrite_expr(*arg, state_temps)),
+        },
         Expr::Call { fn_, args } => Expr::Call {
             fn_: Box::new(rewrite_expr(*fn_, state_temps)),
-            args: args.into_iter().map(|a| rewrite_expr(a, state_temps)).collect(),
+            args: args
+                .into_iter()
+                .map(|a| rewrite_expr(a, state_temps))
+                .collect(),
         },
-        Expr::ArrayLit(elems) => {
-            Expr::ArrayLit(elems.into_iter().map(|e| rewrite_expr(e, state_temps)).collect())
-        }
+        Expr::ArrayLit(elems) => Expr::ArrayLit(
+            elems
+                .into_iter()
+                .map(|e| rewrite_expr(e, state_temps))
+                .collect(),
+        ),
         Expr::ObjectLit(props) => Expr::ObjectLit(
-            props.into_iter().map(|(k, v)| (k, rewrite_expr(v, state_temps))).collect(),
+            props
+                .into_iter()
+                .map(|(k, v)| (k, rewrite_expr(v, state_temps)))
+                .collect(),
         ),
         Expr::TSAnnotated(inner, ty) => {
             Expr::TSAnnotated(Box::new(rewrite_expr(*inner, state_temps)), ty)
@@ -280,24 +336,45 @@ mod tests {
             "function Counter() { const [n, setN] = useState(0); return <div/>; }",
         );
         assert_eq!(hooks.len(), 1);
-        assert!(matches!(&hooks[0], HookEntry::State { label: 0, init: Expr::Lit(Prim::Int(0)) }));
+        assert!(matches!(
+            &hooks[0],
+            HookEntry::State {
+                label: 0,
+                init: Expr::Lit(Prim::Int(0))
+            }
+        ));
 
         let stmts = entry_stmts(&cfg);
         // Temp var must be gone
-        assert!(!stmts.iter().any(|s| matches!(s, Stmt::Let { var, .. } if var.starts_with("__arr_"))));
+        assert!(
+            !stmts
+                .iter()
+                .any(|s| matches!(s, Stmt::Let { var, .. } if var.starts_with("__arr_")))
+        );
         assert!(matches!(find_let_rhs(stmts, "n"), Some(Expr::StateVal(0))));
-        assert!(matches!(find_let_rhs(stmts, "setN"), Some(Expr::StateSetter(0))));
+        assert!(matches!(
+            find_let_rhs(stmts, "setN"),
+            Some(Expr::StateSetter(0))
+        ));
     }
 
     #[test]
     fn use_state_no_destructure() {
-        let (cfg, hooks) = parse_and_extract(
-            "function S() { const pair = useState(42); return <div/>; }",
-        );
+        let (cfg, hooks) =
+            parse_and_extract("function S() { const pair = useState(42); return <div/>; }");
         assert_eq!(hooks.len(), 1);
-        assert!(matches!(&hooks[0], HookEntry::State { label: 0, init: Expr::Lit(Prim::Int(42)) }));
+        assert!(matches!(
+            &hooks[0],
+            HookEntry::State {
+                label: 0,
+                init: Expr::Lit(Prim::Int(42))
+            }
+        ));
         let stmts = entry_stmts(&cfg);
-        assert!(matches!(find_let_rhs(stmts, "pair"), Some(Expr::StateVal(0))));
+        assert!(matches!(
+            find_let_rhs(stmts, "pair"),
+            Some(Expr::StateVal(0))
+        ));
     }
 
     // ── useEffect ────────────────────────────────────────────────────────────
@@ -312,16 +389,26 @@ mod tests {
             matches!(&hooks[0], HookEntry::Effect { label: 0, deps: Some(deps), .. } if deps.len() == 1)
         );
         // No ExprStmt for useEffect in the entry block
-        assert!(!entry_stmts(&cfg).iter().any(|s| matches!(s, Stmt::ExprStmt(_))));
+        assert!(
+            !entry_stmts(&cfg)
+                .iter()
+                .any(|s| matches!(s, Stmt::ExprStmt(_)))
+        );
     }
 
     #[test]
     fn use_effect_no_deps() {
-        let (_, hooks) = parse_and_extract(
-            "function Comp() { useEffect(() => {}); return <div/>; }",
-        );
+        let (_, hooks) =
+            parse_and_extract("function Comp() { useEffect(() => {}); return <div/>; }");
         assert_eq!(hooks.len(), 1);
-        assert!(matches!(&hooks[0], HookEntry::Effect { label: 0, deps: None, .. }));
+        assert!(matches!(
+            &hooks[0],
+            HookEntry::Effect {
+                label: 0,
+                deps: None,
+                ..
+            }
+        ));
     }
 
     // ── useMemo ───────────────────────────────────────────────────────────────
@@ -332,9 +419,7 @@ mod tests {
             "function Comp({ x }) { const v = useMemo(() => x * 2, [x]); return <div/>; }",
         );
         assert_eq!(hooks.len(), 1);
-        assert!(
-            matches!(&hooks[0], HookEntry::Memo { label: 0, deps, .. } if deps.len() == 1)
-        );
+        assert!(matches!(&hooks[0], HookEntry::Memo { label: 0, deps, .. } if deps.len() == 1));
         let stmts = entry_stmts(&cfg);
         assert!(matches!(find_let_rhs(stmts, "v"), Some(Expr::MemoVal(0))));
     }
@@ -349,34 +434,47 @@ mod tests {
         assert_eq!(hooks.len(), 1);
         assert!(matches!(&hooks[0], HookEntry::Callback { label: 0, .. }));
         let stmts = entry_stmts(&cfg);
-        assert!(matches!(find_let_rhs(stmts, "cb"), Some(Expr::CallbackVal(0))));
+        assert!(matches!(
+            find_let_rhs(stmts, "cb"),
+            Some(Expr::CallbackVal(0))
+        ));
     }
 
     // ── useRef ────────────────────────────────────────────────────────────────
 
     #[test]
     fn use_ref_extracted() {
-        let (cfg, hooks) = parse_and_extract(
-            "function Comp() { const r = useRef(null); return <div/>; }",
-        );
+        let (cfg, hooks) =
+            parse_and_extract("function Comp() { const r = useRef(null); return <div/>; }");
         assert_eq!(hooks.len(), 1);
-        assert!(matches!(&hooks[0], HookEntry::Ref { label: 0, init: Expr::Lit(Prim::Null) }));
+        assert!(matches!(
+            &hooks[0],
+            HookEntry::Ref {
+                label: 0,
+                init: Expr::Lit(Prim::Null)
+            }
+        ));
         // useRef result is opaque Lit(Unit)
         let stmts = entry_stmts(&cfg);
-        assert!(matches!(find_let_rhs(stmts, "r"), Some(Expr::Lit(Prim::Unit))));
+        assert!(matches!(
+            find_let_rhs(stmts, "r"),
+            Some(Expr::Lit(Prim::Unit))
+        ));
     }
 
     // ── Custom hook ───────────────────────────────────────────────────────────
 
     #[test]
     fn custom_hook_extracted() {
-        let (cfg, hooks) = parse_and_extract(
-            "function Comp({ id }) { const data = useData(id); return <div/>; }",
-        );
+        let (cfg, hooks) =
+            parse_and_extract("function Comp({ id }) { const data = useData(id); return <div/>; }");
         assert_eq!(hooks.len(), 1);
         assert!(matches!(&hooks[0], HookEntry::Custom { label: 0, name, .. } if name == "useData"));
         let stmts = entry_stmts(&cfg);
-        assert!(matches!(find_let_rhs(stmts, "data"), Some(Expr::Lit(Prim::Unit))));
+        assert!(matches!(
+            find_let_rhs(stmts, "data"),
+            Some(Expr::Lit(Prim::Unit))
+        ));
     }
 
     // ── Multiple hooks ────────────────────────────────────────────────────────
@@ -391,14 +489,32 @@ mod tests {
             }",
         );
         assert_eq!(hooks.len(), 2);
-        assert!(matches!(&hooks[0], HookEntry::State { label: 0, init: Expr::Lit(Prim::Int(1)) }));
-        assert!(matches!(&hooks[1], HookEntry::State { label: 1, init: Expr::Lit(Prim::Int(2)) }));
+        assert!(matches!(
+            &hooks[0],
+            HookEntry::State {
+                label: 0,
+                init: Expr::Lit(Prim::Int(1))
+            }
+        ));
+        assert!(matches!(
+            &hooks[1],
+            HookEntry::State {
+                label: 1,
+                init: Expr::Lit(Prim::Int(2))
+            }
+        ));
 
         let stmts = entry_stmts(&cfg);
         assert!(matches!(find_let_rhs(stmts, "a"), Some(Expr::StateVal(0))));
-        assert!(matches!(find_let_rhs(stmts, "setA"), Some(Expr::StateSetter(0))));
+        assert!(matches!(
+            find_let_rhs(stmts, "setA"),
+            Some(Expr::StateSetter(0))
+        ));
         assert!(matches!(find_let_rhs(stmts, "b"), Some(Expr::StateVal(1))));
-        assert!(matches!(find_let_rhs(stmts, "setB"), Some(Expr::StateSetter(1))));
+        assert!(matches!(
+            find_let_rhs(stmts, "setB"),
+            Some(Expr::StateSetter(1))
+        ));
     }
 
     // ── React.useState namespace form ─────────────────────────────────────────
@@ -412,7 +528,10 @@ mod tests {
         assert!(matches!(&hooks[0], HookEntry::State { label: 0, .. }));
         let stmts = entry_stmts(&cfg);
         assert!(matches!(find_let_rhs(stmts, "v"), Some(Expr::StateVal(0))));
-        assert!(matches!(find_let_rhs(stmts, "setV"), Some(Expr::StateSetter(0))));
+        assert!(matches!(
+            find_let_rhs(stmts, "setV"),
+            Some(Expr::StateSetter(0))
+        ));
     }
 
     // ── useReducer ────────────────────────────────────────────────────────────
@@ -426,9 +545,17 @@ mod tests {
             }",
         );
         assert_eq!(hooks.len(), 1);
-        assert!(matches!(&hooks[0], HookEntry::Custom { label: 0, name, .. } if name == "useReducer"));
+        assert!(
+            matches!(&hooks[0], HookEntry::Custom { label: 0, name, .. } if name == "useReducer")
+        );
         let stmts = entry_stmts(&cfg);
-        assert!(matches!(find_let_rhs(stmts, "state"), Some(Expr::StateVal(0))));
-        assert!(matches!(find_let_rhs(stmts, "dispatch"), Some(Expr::StateSetter(0))));
+        assert!(matches!(
+            find_let_rhs(stmts, "state"),
+            Some(Expr::StateVal(0))
+        ));
+        assert!(matches!(
+            find_let_rhs(stmts, "dispatch"),
+            Some(Expr::StateSetter(0))
+        ));
     }
 }

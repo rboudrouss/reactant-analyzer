@@ -24,9 +24,15 @@ impl PartialOrd for BoolVal {
 }
 
 impl AbstractDomain for BoolVal {
-    fn bottom() -> Self { BoolVal::Bottom }
-    fn top() -> Self { BoolVal::Top }
-    fn is_bottom(&self) -> bool { matches!(self, BoolVal::Bottom) }
+    fn bottom() -> Self {
+        BoolVal::Bottom
+    }
+    fn top() -> Self {
+        BoolVal::Top
+    }
+    fn is_bottom(&self) -> bool {
+        matches!(self, BoolVal::Bottom)
+    }
 
     fn join(&self, other: &Self) -> Self {
         match (self, other) {

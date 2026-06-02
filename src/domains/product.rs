@@ -31,9 +31,15 @@ impl<D1: AbstractDomain, D2: AbstractDomain> PartialOrd for ProductDomain<D1, D2
 }
 
 impl<D1: AbstractDomain, D2: AbstractDomain> AbstractDomain for ProductDomain<D1, D2> {
-    fn bottom() -> Self { ProductDomain(D1::bottom(), D2::bottom()) }
-    fn top() -> Self { ProductDomain(D1::top(), D2::top()) }
-    fn is_bottom(&self) -> bool { self.0.is_bottom() && self.1.is_bottom() }
+    fn bottom() -> Self {
+        ProductDomain(D1::bottom(), D2::bottom())
+    }
+    fn top() -> Self {
+        ProductDomain(D1::top(), D2::top())
+    }
+    fn is_bottom(&self) -> bool {
+        self.0.is_bottom() && self.1.is_bottom()
+    }
 
     fn join(&self, other: &Self) -> Self {
         ProductDomain(self.0.join(&other.0), self.1.join(&other.1))

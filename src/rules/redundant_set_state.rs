@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    domains::{AbstractEnv, MemoStore, NullCtx, StateStore, StateValue, StateValueTransfer, Transfer},
+    domains::{
+        AbstractEnv, MemoStore, NullCtx, StateStore, StateValue, StateValueTransfer, Transfer,
+    },
     engine::AnalysisResult,
     ir::{cfg::CFG, expr::Expr, hooks::HookEntry, stmt::Stmt, types::HookLabel},
 };
@@ -92,7 +94,15 @@ fn check_cfg_for_redundant_sets(
     sorted.sort_unstable();
     for block_id in sorted {
         if let Some(block) = cfg.blocks.get(&block_id) {
-            check_setter_calls(&block.stmts, env, state, memo, transfer, diags, &skip_labels);
+            check_setter_calls(
+                &block.stmts,
+                env,
+                state,
+                memo,
+                transfer,
+                diags,
+                &skip_labels,
+            );
         }
     }
 }
@@ -146,20 +156,20 @@ fn collect_setter_vals_in_expr(
 ) {
     match expr {
         Expr::Call { fn_, args } => {
-            if let Expr::Var(name) = fn_.as_ref() {
-                if let Some(label) = env.setter_label(name) {
-                    let arg_val = args
-                        .first()
-                        .map(|a| transfer.eval_expr(a, env, state, memo, &NullCtx))
-                        .unwrap_or(StateValue::Top);
-                    match tracker.entry(label) {
-                        std::collections::hash_map::Entry::Vacant(e) => {
-                            e.insert((arg_val, false));
-                        }
-                        std::collections::hash_map::Entry::Occupied(mut e) => {
-                            if e.get().0 != arg_val {
-                                e.get_mut().1 = true;
-                            }
+            if let Expr::Var(name) = fn_.as_ref()
+                && let Some(label) = env.setter_label(name)
+            {
+                let arg_val = args
+                    .first()
+                    .map(|a| transfer.eval_expr(a, env, state, memo, &NullCtx))
+                    .unwrap_or(StateValue::Top);
+                match tracker.entry(label) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert((arg_val, false));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        if e.get().0 != arg_val {
+                            e.get_mut().1 = true;
                         }
                     }
                 }
@@ -208,34 +218,33 @@ fn check_setter_calls(
     skip_labels: &HashSet<HookLabel>,
 ) {
     for stmt in stmts {
-        if let Stmt::ExprStmt(Expr::Call { fn_, args }) = stmt {
-            if let Expr::Var(name) = fn_.as_ref() {
-                if let Some(label) = env.setter_label(name) {
-                    if skip_labels.contains(&label) {
-                        continue;
-                    }
+        if let Stmt::ExprStmt(Expr::Call { fn_, args }) = stmt
+            && let Expr::Var(name) = fn_.as_ref()
+            && let Some(label) = env.setter_label(name)
+        {
+            if skip_labels.contains(&label) {
+                continue;
+            }
 
-                    let arg_val = args
-                        .first()
-                        .map(|a| transfer.eval_expr(a, env, state, memo, &NullCtx))
-                        .unwrap_or(StateValue::Top);
+            let arg_val = args
+                .first()
+                .map(|a| transfer.eval_expr(a, env, state, memo, &NullCtx))
+                .unwrap_or(StateValue::Top);
 
-                    let current_val = state.get(label);
+            let current_val = state.get(label);
 
-                    if arg_val.is_stable() && current_val.is_stable() {
-                        diags.push(
-                            Diagnostic::new(
-                                "redundant-set-state",
-                                format!(
-                                    "setState for hook {} called with a stable value \
+            if arg_val.is_stable() && current_val.is_stable() {
+                diags.push(
+                    Diagnostic::new(
+                        "redundant-set-state",
+                        format!(
+                            "setState for hook {} called with a stable value \
                                      when state is already stable — update is redundant",
-                                    label
-                                ),
-                            )
-                            .with_label(label),
-                        );
-                    }
-                }
+                            label
+                        ),
+                    )
+                    .with_label(label),
+                );
             }
         }
     }

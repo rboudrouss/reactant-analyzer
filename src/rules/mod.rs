@@ -1,15 +1,15 @@
 pub mod conditional_hook;
 pub mod infinite_loop;
-pub mod setter_in_render;
 pub mod missing_deps;
 pub mod redundant_set_state;
+pub mod setter_in_render;
 pub mod unnecessary_rerender;
 
 pub use conditional_hook::ConditionalHook;
 pub use infinite_loop::InfiniteLoop;
-pub use setter_in_render::SetterInRender;
 pub use missing_deps::MissingDeps;
 pub use redundant_set_state::RedundantSetState;
+pub use setter_in_render::SetterInRender;
 pub use unnecessary_rerender::UnnecessaryRerender;
 
 use crate::{
@@ -31,7 +31,12 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     pub fn new(rule: &'static str, message: impl Into<String>) -> Self {
-        Diagnostic { rule, message: message.into(), hook_label: None, var: None }
+        Diagnostic {
+            rule,
+            message: message.into(),
+            hook_label: None,
+            var: None,
+        }
     }
 
     pub fn with_label(mut self, label: HookLabel) -> Self {

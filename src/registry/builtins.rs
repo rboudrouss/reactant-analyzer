@@ -7,7 +7,7 @@ use super::{EffectSemantics, HookModel, HookResult, Registry};
 /// Join all dep stabilities. Empty deps = Stable (runs once). Absent deps = Unknown.
 fn join_deps(deps: Option<&[Stability]>) -> Stability {
     match deps {
-        None => Stability::Unknown,  // no deps array → runs every render
+        None => Stability::Unknown,    // no deps array → runs every render
         Some([]) => Stability::Stable, // [] → runs once → Stable
         Some(ds) => ds.iter().fold(Stability::Bottom, |acc, d| acc.join(d)),
     }
@@ -26,7 +26,9 @@ fn state_result() -> HookResult {
 pub struct UseState;
 
 impl HookModel for UseState {
-    fn name(&self) -> &str { "useState" }
+    fn name(&self) -> &str {
+        "useState"
+    }
 
     fn analyze(&self, _args: &[Stability], _deps: Option<&[Stability]>) -> HookResult {
         state_result()
@@ -38,7 +40,9 @@ impl HookModel for UseState {
 pub struct UseReducer;
 
 impl HookModel for UseReducer {
-    fn name(&self) -> &str { "useReducer" }
+    fn name(&self) -> &str {
+        "useReducer"
+    }
 
     fn analyze(&self, _args: &[Stability], _deps: Option<&[Stability]>) -> HookResult {
         state_result()
@@ -50,7 +54,9 @@ impl HookModel for UseReducer {
 pub struct UseEffect;
 
 impl HookModel for UseEffect {
-    fn name(&self) -> &str { "useEffect" }
+    fn name(&self) -> &str {
+        "useEffect"
+    }
 
     fn analyze(&self, _args: &[Stability], _deps: Option<&[Stability]>) -> HookResult {
         HookResult {
@@ -66,7 +72,9 @@ impl HookModel for UseEffect {
 pub struct UseMemo;
 
 impl HookModel for UseMemo {
-    fn name(&self) -> &str { "useMemo" }
+    fn name(&self) -> &str {
+        "useMemo"
+    }
 
     fn analyze(&self, _args: &[Stability], deps: Option<&[Stability]>) -> HookResult {
         HookResult {
@@ -82,7 +90,9 @@ impl HookModel for UseMemo {
 pub struct UseCallback;
 
 impl HookModel for UseCallback {
-    fn name(&self) -> &str { "useCallback" }
+    fn name(&self) -> &str {
+        "useCallback"
+    }
 
     fn analyze(&self, _args: &[Stability], deps: Option<&[Stability]>) -> HookResult {
         HookResult {
@@ -98,7 +108,9 @@ impl HookModel for UseCallback {
 pub struct UseRef;
 
 impl HookModel for UseRef {
-    fn name(&self) -> &str { "useRef" }
+    fn name(&self) -> &str {
+        "useRef"
+    }
 
     fn analyze(&self, _args: &[Stability], _deps: Option<&[Stability]>) -> HookResult {
         HookResult {
@@ -114,7 +126,9 @@ impl HookModel for UseRef {
 pub struct UseContext;
 
 impl HookModel for UseContext {
-    fn name(&self) -> &str { "useContext" }
+    fn name(&self) -> &str {
+        "useContext"
+    }
 
     fn analyze(&self, _args: &[Stability], _deps: Option<&[Stability]>) -> HookResult {
         HookResult {
@@ -206,14 +220,22 @@ mod tests {
     #[test]
     fn use_memo_stable_deps_stable() {
         let r = registry();
-        let res = r.analyze("useMemo", &[], Some(&[Stability::Stable, Stability::Stable]));
+        let res = r.analyze(
+            "useMemo",
+            &[],
+            Some(&[Stability::Stable, Stability::Stable]),
+        );
         assert_eq!(res.return_stability, Stability::Stable);
     }
 
     #[test]
     fn use_memo_unstable_dep_unstable() {
         let r = registry();
-        let res = r.analyze("useMemo", &[], Some(&[Stability::Stable, Stability::Unstable]));
+        let res = r.analyze(
+            "useMemo",
+            &[],
+            Some(&[Stability::Stable, Stability::Unstable]),
+        );
         assert_eq!(res.return_stability, Stability::Unknown); // join(Stable, Unstable) = Unknown
     }
 
@@ -248,7 +270,11 @@ mod tests {
         let r = registry();
         for args in [vec![], vec![Stability::Unknown], vec![Stability::Unstable]] {
             let res = r.analyze("useRef", &args, None);
-            assert_eq!(res.return_stability, Stability::Stable, "useRef should always be Stable");
+            assert_eq!(
+                res.return_stability,
+                Stability::Stable,
+                "useRef should always be Stable"
+            );
             assert!(!res.creates_state);
         }
     }
@@ -280,9 +306,15 @@ mod tests {
     fn manual_hook_overrides_builtin() {
         struct AlwaysStable;
         impl HookModel for AlwaysStable {
-            fn name(&self) -> &str { "useMemo" }
+            fn name(&self) -> &str {
+                "useMemo"
+            }
             fn analyze(&self, _: &[Stability], _: Option<&[Stability]>) -> HookResult {
-                HookResult { return_stability: Stability::Stable, creates_state: false, effect_semantics: None }
+                HookResult {
+                    return_stability: Stability::Stable,
+                    creates_state: false,
+                    effect_semantics: None,
+                }
             }
         }
         let mut r = Registry::new_with_builtins();

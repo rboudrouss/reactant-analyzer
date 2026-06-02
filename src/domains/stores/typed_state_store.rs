@@ -1,12 +1,8 @@
-use std::collections::HashMap;
 use crate::{
     domains::{
         AbstractDomain,
         impls::{
-            bool_val::BoolVal,
-            interval::Interval,
-            stability::Stability,
-            state_value::StateValue,
+            bool_val::BoolVal, interval::Interval, stability::Stability, state_value::StateValue,
             str_const::StrConst,
         },
         stores::StateStore,
@@ -17,6 +13,7 @@ use crate::{
         types::HookLabel,
     },
 };
+use std::collections::HashMap;
 
 // ── StateType ─────────────────────────────────────────────────────────────────
 
@@ -63,10 +60,10 @@ pub fn infer_state_type(init: &Expr) -> StateType {
 /// per-domain join/widen precision.
 pub struct TypedStateStore {
     type_map: HashMap<HookLabel, StateType>,
-    number_store:  StateStore<Interval>,
-    bool_store:    StateStore<BoolVal>,
-    str_store:     StateStore<StrConst>,
-    ref_store:     StateStore<Stability>,
+    number_store: StateStore<Interval>,
+    bool_store: StateStore<BoolVal>,
+    str_store: StateStore<StrConst>,
+    ref_store: StateStore<Stability>,
     unknown_store: StateStore<StateValue>,
 }
 
@@ -74,10 +71,10 @@ impl TypedStateStore {
     fn empty_with_types(type_map: HashMap<HookLabel, StateType>) -> Self {
         TypedStateStore {
             type_map,
-            number_store:  StateStore::bottom(),
-            bool_store:    StateStore::bottom(),
-            str_store:     StateStore::bottom(),
-            ref_store:     StateStore::bottom(),
+            number_store: StateStore::bottom(),
+            bool_store: StateStore::bottom(),
+            str_store: StateStore::bottom(),
+            ref_store: StateStore::bottom(),
             unknown_store: StateStore::bottom(),
         }
     }
@@ -104,20 +101,32 @@ impl TypedStateStore {
         let typed_val = match self.type_map.get(&label) {
             Some(StateType::Number) => {
                 let i = self.number_store.get(label);
-                if i.is_bottom() { StateValue::Bottom } else { StateValue::Number(i) }
+                if i.is_bottom() {
+                    StateValue::Bottom
+                } else {
+                    StateValue::Number(i)
+                }
             }
             Some(StateType::Boolean) => {
                 let b = self.bool_store.get(label);
-                if b.is_bottom() { StateValue::Bottom } else { StateValue::Boolean(b) }
+                if b.is_bottom() {
+                    StateValue::Bottom
+                } else {
+                    StateValue::Boolean(b)
+                }
             }
             Some(StateType::Str) => match self.str_store.get(label) {
                 StrConst::Bottom => StateValue::Bottom,
-                StrConst::Top    => StateValue::Str,
+                StrConst::Top => StateValue::Str,
                 StrConst::Set(set) => StateValue::StrConst(set),
             },
             Some(StateType::Reference) => {
                 let s = self.ref_store.get(label);
-                if s.is_bottom() { StateValue::Bottom } else { StateValue::Reference(s) }
+                if s.is_bottom() {
+                    StateValue::Bottom
+                } else {
+                    StateValue::Reference(s)
+                }
             }
             // Unknown labels: only in unknown_store.
             _ => return self.unknown_store.get(label),
@@ -191,10 +200,10 @@ impl TypedStateStore {
     pub fn join(&self, other: &Self) -> Self {
         TypedStateStore {
             type_map: self.type_map.clone(),
-            number_store:  self.number_store.join(&other.number_store),
-            bool_store:    self.bool_store.join(&other.bool_store),
-            str_store:     self.str_store.join(&other.str_store),
-            ref_store:     self.ref_store.join(&other.ref_store),
+            number_store: self.number_store.join(&other.number_store),
+            bool_store: self.bool_store.join(&other.bool_store),
+            str_store: self.str_store.join(&other.str_store),
+            ref_store: self.ref_store.join(&other.ref_store),
             unknown_store: self.unknown_store.join(&other.unknown_store),
         }
     }
@@ -203,17 +212,19 @@ impl TypedStateStore {
     pub fn widen(&self, other: &Self) -> Self {
         TypedStateStore {
             type_map: self.type_map.clone(),
-            number_store:  self.number_store.widen(&other.number_store),
-            bool_store:    self.bool_store.widen(&other.bool_store),
-            str_store:     self.str_store.widen(&other.str_store),
-            ref_store:     self.ref_store.widen(&other.ref_store),
+            number_store: self.number_store.widen(&other.number_store),
+            bool_store: self.bool_store.widen(&other.bool_store),
+            str_store: self.str_store.widen(&other.str_store),
+            ref_store: self.ref_store.widen(&other.ref_store),
             unknown_store: self.unknown_store.widen(&other.unknown_store),
         }
     }
 
     /// Labels whose abstract value differs between `self` and `other`.
     pub fn changed_labels(&self, other: &Self) -> Vec<HookLabel> {
-        let mut changed: Vec<HookLabel> = self.type_map.keys()
+        let mut changed: Vec<HookLabel> = self
+            .type_map
+            .keys()
             .filter(|&&label| self.get(label) != other.get(label))
             .copied()
             .collect();
@@ -226,28 +237,46 @@ impl TypedStateStore {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use super::*;
     use crate::ir::expr::Prim;
+    use std::sync::Arc;
 
     fn make_hooks(inits: &[(HookLabel, Expr)]) -> Vec<HookEntry> {
-        inits.iter().map(|(l, e)| HookEntry::State { label: *l, init: e.clone() }).collect()
+        inits
+            .iter()
+            .map(|(l, e)| HookEntry::State {
+                label: *l,
+                init: e.clone(),
+            })
+            .collect()
     }
 
     #[test]
     fn infer_int_literal_is_number() {
-        assert_eq!(infer_state_type(&Expr::Lit(Prim::Int(0))), StateType::Number);
-        assert_eq!(infer_state_type(&Expr::Lit(Prim::Float(1.5))), StateType::Number);
+        assert_eq!(
+            infer_state_type(&Expr::Lit(Prim::Int(0))),
+            StateType::Number
+        );
+        assert_eq!(
+            infer_state_type(&Expr::Lit(Prim::Float(1.5))),
+            StateType::Number
+        );
     }
 
     #[test]
     fn infer_bool_literal_is_boolean() {
-        assert_eq!(infer_state_type(&Expr::Lit(Prim::Bool(true))), StateType::Boolean);
+        assert_eq!(
+            infer_state_type(&Expr::Lit(Prim::Bool(true))),
+            StateType::Boolean
+        );
     }
 
     #[test]
     fn infer_string_literal_is_str() {
-        assert_eq!(infer_state_type(&Expr::Lit(Prim::String("x".into()))), StateType::Str);
+        assert_eq!(
+            infer_state_type(&Expr::Lit(Prim::String("x".into()))),
+            StateType::Str
+        );
     }
 
     #[test]
@@ -258,8 +287,14 @@ mod tests {
 
     #[test]
     fn infer_object_is_reference() {
-        assert_eq!(infer_state_type(&Expr::ObjectLit(vec![])), StateType::Reference);
-        assert_eq!(infer_state_type(&Expr::ArrayLit(vec![])), StateType::Reference);
+        assert_eq!(
+            infer_state_type(&Expr::ObjectLit(vec![])),
+            StateType::Reference
+        );
+        assert_eq!(
+            infer_state_type(&Expr::ArrayLit(vec![])),
+            StateType::Reference
+        );
     }
 
     #[test]
@@ -339,9 +374,10 @@ mod tests {
     fn str_update_and_get() {
         let hooks = make_hooks(&[(0, Expr::Lit(Prim::String("dark".into())))]);
         let mut store = TypedStateStore::from_component(&hooks);
-        store.update(0, StateValue::StrConst(Arc::new(
-            ["dark".to_string()].into_iter().collect()
-        )));
+        store.update(
+            0,
+            StateValue::StrConst(Arc::new(["dark".to_string()].into_iter().collect())),
+        );
         match store.get(0) {
             StateValue::StrConst(set) => assert!(set.contains("dark")),
             other => panic!("expected StrConst, got {other:?}"),

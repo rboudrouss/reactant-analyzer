@@ -62,9 +62,15 @@ impl PartialOrd for StrConst {
 }
 
 impl AbstractDomain for StrConst {
-    fn bottom() -> Self { StrConst::Bottom }
-    fn top() -> Self { StrConst::Top }
-    fn is_bottom(&self) -> bool { matches!(self, StrConst::Bottom) }
+    fn bottom() -> Self {
+        StrConst::Bottom
+    }
+    fn top() -> Self {
+        StrConst::Top
+    }
+    fn is_bottom(&self) -> bool {
+        matches!(self, StrConst::Bottom)
+    }
 
     fn join(&self, other: &Self) -> Self {
         match (self, other) {

@@ -29,7 +29,10 @@ pub fn analyze_cfg<T: Transfer>(
     transfer: &T,
     widen_threshold: usize,
     ctx: &dyn QueryContext,
-) -> (HashMap<BlockId, AbstractEnv<T::Domain>>, StateStore<T::Domain>) {
+) -> (
+    HashMap<BlockId, AbstractEnv<T::Domain>>,
+    StateStore<T::Domain>,
+) {
     let mut entry_envs: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
     let mut exit_envs: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
     let mut state_out = state.clone();
@@ -72,7 +75,10 @@ pub fn analyze_cfg<T: Transfer>(
                     Terminator::Return(_) | Terminator::Unreachable => vec![],
                 }
             } else {
-                cfg.successors(b).into_iter().map(|s| (s, env_out.clone())).collect()
+                cfg.successors(b)
+                    .into_iter()
+                    .map(|s| (s, env_out.clone()))
+                    .collect()
             };
 
         for (succ, outgoing_env) in outgoing {
@@ -98,7 +104,7 @@ pub fn analyze_cfg<T: Transfer>(
                 }
             };
 
-            if entry_envs.get(&succ).map_or(true, |e| e != &new_entry) {
+            if entry_envs.get(&succ) != Some(&new_entry) {
                 entry_envs.insert(succ, new_entry);
                 if in_worklist.insert(succ) {
                     worklist.push_back(succ);
@@ -131,17 +137,17 @@ fn narrow_env_for_branch<D: AbstractDomain>(
         if let (Expr::Var(x), Some(v)) = (lhs.as_ref(), v) {
             let cur = env.lookup(x);
             let refined = match (op, taken) {
-                (BinOp::Lt,  true)  => cur.narrow_lt(v),
-                (BinOp::Lt,  false) => cur.narrow_geq(v),
-                (BinOp::Leq, true)  => cur.narrow_leq(v),
+                (BinOp::Lt, true) => cur.narrow_lt(v),
+                (BinOp::Lt, false) => cur.narrow_geq(v),
+                (BinOp::Leq, true) => cur.narrow_leq(v),
                 (BinOp::Leq, false) => cur.narrow_gt(v),
-                (BinOp::Gt,  true)  => cur.narrow_gt(v),
-                (BinOp::Gt,  false) => cur.narrow_leq(v),
-                (BinOp::Geq, true)  => cur.narrow_geq(v),
+                (BinOp::Gt, true) => cur.narrow_gt(v),
+                (BinOp::Gt, false) => cur.narrow_leq(v),
+                (BinOp::Geq, true) => cur.narrow_geq(v),
                 (BinOp::Geq, false) => cur.narrow_lt(v),
-                (BinOp::Eq,  true)  => cur.narrow_eq(v),
-                (BinOp::Eq,  false) => cur.narrow_neq(v),
-                (BinOp::Neq, true)  => cur.narrow_neq(v),
+                (BinOp::Eq, true) => cur.narrow_eq(v),
+                (BinOp::Eq, false) => cur.narrow_neq(v),
+                (BinOp::Neq, true) => cur.narrow_neq(v),
                 (BinOp::Neq, false) => cur.narrow_eq(v),
                 _ => cur,
             };
@@ -160,7 +166,7 @@ mod tests {
     use super::*;
     use crate::{
         domains::{
-            NullCtx, Stability, StateValue, StateValueTransfer, Interval,
+            Interval, NullCtx, Stability, StateValue, StateValueTransfer,
             stores::{AbstractEnv, MemoStore, StateStore},
         },
         ir::{
@@ -174,9 +180,17 @@ mod tests {
         let mut blocks = HashMap::new();
         blocks.insert(
             0,
-            BasicBlock { id: 0, stmts, term: Terminator::Return(Expr::Lit(Prim::Unit)) },
+            BasicBlock {
+                id: 0,
+                stmts,
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
         );
-        CFG { entry: 0, blocks, edges: vec![] }
+        CFG {
+            entry: 0,
+            blocks,
+            edges: vec![],
+        }
     }
 
     #[test]
@@ -210,14 +224,20 @@ mod tests {
             3,
             &NullCtx,
         );
-        assert_eq!(exit_envs[&0].lookup("x"), StateValue::Number(Interval::point(42.0)));
+        assert_eq!(
+            exit_envs[&0].lookup("x"),
+            StateValue::Number(Interval::point(42.0))
+        );
     }
 
     #[test]
     fn set_state_updates_state_store() {
         // let setN = StateSetter(0);  setN({});
         let stmts = vec![
-            Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
+            Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+            },
             Stmt::ExprStmt(Expr::Call {
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::ObjectLit(vec![])],
@@ -255,12 +275,20 @@ mod tests {
         );
         blocks.insert(
             1,
-            BasicBlock { id: 1, stmts: vec![], term: Terminator::Return(Expr::Lit(Prim::Unit)) },
+            BasicBlock {
+                id: 1,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
         );
         let cfg = CFG {
             entry: 0,
             blocks,
-            edges: vec![Edge { from: 0, to: 1, kind: EdgeKind::Unconditional }],
+            edges: vec![Edge {
+                from: 0,
+                to: 1,
+                kind: EdgeKind::Unconditional,
+            }],
         };
 
         let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
@@ -272,7 +300,10 @@ mod tests {
             3,
             &NullCtx,
         );
-        assert_eq!(exit_envs[&1].lookup("x"), StateValue::Reference(Stability::Unstable));
+        assert_eq!(
+            exit_envs[&1].lookup("x"),
+            StateValue::Reference(Stability::Unstable)
+        );
     }
 
     #[test]
@@ -318,16 +349,36 @@ mod tests {
         );
         blocks.insert(
             3,
-            BasicBlock { id: 3, stmts: vec![], term: Terminator::Return(Expr::Lit(Prim::Unit)) },
+            BasicBlock {
+                id: 3,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
         );
         let cfg = CFG {
             entry: 0,
             blocks,
             edges: vec![
-                Edge { from: 0, to: 1, kind: EdgeKind::IfTrue },
-                Edge { from: 0, to: 2, kind: EdgeKind::IfFalse },
-                Edge { from: 1, to: 3, kind: EdgeKind::Unconditional },
-                Edge { from: 2, to: 3, kind: EdgeKind::Unconditional },
+                Edge {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::IfTrue,
+                },
+                Edge {
+                    from: 0,
+                    to: 2,
+                    kind: EdgeKind::IfFalse,
+                },
+                Edge {
+                    from: 1,
+                    to: 3,
+                    kind: EdgeKind::Unconditional,
+                },
+                Edge {
+                    from: 2,
+                    to: 3,
+                    kind: EdgeKind::Unconditional,
+                },
             ],
         };
 
@@ -346,7 +397,7 @@ mod tests {
 
     #[test]
     fn branch_narrowing_restricts_then_env() {
-        use crate::domains::{StateValue, StateValueTransfer, Interval};
+        use crate::domains::{Interval, StateValue, StateValueTransfer};
         use crate::ir::expr::BinOp;
         // block 0: let x = Number([0,+∞)); branch x < 10 → 1, else → 2
         // block 1 (then): x narrowed to [0, 9]
@@ -373,18 +424,34 @@ mod tests {
         );
         blocks.insert(
             1,
-            BasicBlock { id: 1, stmts: vec![], term: Terminator::Return(Expr::Lit(Prim::Unit)) },
+            BasicBlock {
+                id: 1,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
         );
         blocks.insert(
             2,
-            BasicBlock { id: 2, stmts: vec![], term: Terminator::Return(Expr::Lit(Prim::Unit)) },
+            BasicBlock {
+                id: 2,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
         );
         let cfg = CFG {
             entry: 0,
             blocks,
             edges: vec![
-                Edge { from: 0, to: 1, kind: EdgeKind::IfTrue },
-                Edge { from: 0, to: 2, kind: EdgeKind::IfFalse },
+                Edge {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::IfTrue,
+                },
+                Edge {
+                    from: 0,
+                    to: 2,
+                    kind: EdgeKind::IfFalse,
+                },
             ],
         };
 
@@ -392,7 +459,10 @@ mod tests {
         let mut entry_env = AbstractEnv::bottom();
         entry_env.extend(
             "x".to_string(),
-            StateValue::Number(Interval { lo: 0.0, hi: f64::INFINITY }),
+            StateValue::Number(Interval {
+                lo: 0.0,
+                hi: f64::INFINITY,
+            }),
         );
 
         let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
@@ -418,6 +488,9 @@ mod tests {
         // then-branch: x < 10, so x ∈ [0, 9] (or point [0,0] narrowed to [0,0])
         assert!(matches!(then_x, StateValue::Number(i) if !i.is_bottom()));
         // else-branch: x >= 10 on top of [0,0] → bottom (can't be ≥ 10 when x was 0)
-        assert!(matches!(else_x, StateValue::Number(i) if i.is_bottom()) || else_x == StateValue::Bottom);
+        assert!(
+            matches!(else_x, StateValue::Number(i) if i.is_bottom())
+                || else_x == StateValue::Bottom
+        );
     }
 }

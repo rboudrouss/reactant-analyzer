@@ -18,7 +18,11 @@ pub use super::interval::Interval;
 const STR_WIDEN_THRESHOLD: usize = 4;
 
 fn str_const(set: BTreeSet<String>) -> StateValue {
-    if set.len() > STR_WIDEN_THRESHOLD { StateValue::Str } else { StateValue::StrConst(Arc::new(set)) }
+    if set.len() > STR_WIDEN_THRESHOLD {
+        StateValue::Str
+    } else {
+        StateValue::StrConst(Arc::new(set))
+    }
 }
 
 // ── StateValue ────────────────────────────────────────────────────────────────
@@ -59,9 +63,7 @@ impl StateValue {
             Expr::Lit(Prim::Bool(b)) => {
                 StateValue::Boolean(if *b { BoolVal::True } else { BoolVal::False })
             }
-            Expr::Lit(Prim::String(s)) => {
-                str_const(std::iter::once(s.to_string()).collect())
-            }
+            Expr::Lit(Prim::String(s)) => str_const(std::iter::once(s.to_string()).collect()),
             Expr::Lit(Prim::Null) => StateValue::Null,
             Expr::Lit(Prim::Unit) => StateValue::Undefined,
             Expr::ObjectLit(_) | Expr::ArrayLit(_) | Expr::FnLit { .. } => {
@@ -113,10 +115,15 @@ impl PartialOrd for StateValue {
             (StateValue::Boolean(a), StateValue::Boolean(b)) => a.partial_cmp(b),
             (StateValue::Reference(a), StateValue::Reference(b)) => a.partial_cmp(b),
             (StateValue::StrConst(a), StateValue::StrConst(b)) => {
-                if a == b { Some(Ordering::Equal) }
-                else if a.is_subset(b) { Some(Ordering::Less) }
-                else if b.is_subset(a) { Some(Ordering::Greater) }
-                else { None }
+                if a == b {
+                    Some(Ordering::Equal)
+                } else if a.is_subset(b) {
+                    Some(Ordering::Less)
+                } else if b.is_subset(a) {
+                    Some(Ordering::Greater)
+                } else {
+                    None
+                }
             }
             (StateValue::StrConst(_), StateValue::Str) => Some(Ordering::Less),
             (StateValue::Str, StateValue::StrConst(_)) => Some(Ordering::Greater),
@@ -129,27 +136,51 @@ impl PartialOrd for StateValue {
 }
 
 impl AbstractDomain for StateValue {
-    fn bottom() -> Self { StateValue::Bottom }
-    fn top() -> Self { StateValue::Top }
-    fn is_bottom(&self) -> bool { matches!(self, StateValue::Bottom) }
+    fn bottom() -> Self {
+        StateValue::Bottom
+    }
+    fn top() -> Self {
+        StateValue::Top
+    }
+    fn is_bottom(&self) -> bool {
+        matches!(self, StateValue::Bottom)
+    }
 
     fn narrow_lt(self, v: f64) -> Self {
-        match self { StateValue::Number(i) => StateValue::Number(i.narrow_lt(v)), _ => self }
+        match self {
+            StateValue::Number(i) => StateValue::Number(i.narrow_lt(v)),
+            _ => self,
+        }
     }
     fn narrow_leq(self, v: f64) -> Self {
-        match self { StateValue::Number(i) => StateValue::Number(i.narrow_leq(v)), _ => self }
+        match self {
+            StateValue::Number(i) => StateValue::Number(i.narrow_leq(v)),
+            _ => self,
+        }
     }
     fn narrow_gt(self, v: f64) -> Self {
-        match self { StateValue::Number(i) => StateValue::Number(i.narrow_gt(v)), _ => self }
+        match self {
+            StateValue::Number(i) => StateValue::Number(i.narrow_gt(v)),
+            _ => self,
+        }
     }
     fn narrow_geq(self, v: f64) -> Self {
-        match self { StateValue::Number(i) => StateValue::Number(i.narrow_geq(v)), _ => self }
+        match self {
+            StateValue::Number(i) => StateValue::Number(i.narrow_geq(v)),
+            _ => self,
+        }
     }
     fn narrow_eq(self, v: f64) -> Self {
-        match self { StateValue::Number(i) => StateValue::Number(i.narrow_eq(v)), _ => self }
+        match self {
+            StateValue::Number(i) => StateValue::Number(i.narrow_eq(v)),
+            _ => self,
+        }
     }
     fn narrow_neq(self, v: f64) -> Self {
-        match self { StateValue::Number(i) => StateValue::Number(i.narrow_neq(v)), _ => self }
+        match self {
+            StateValue::Number(i) => StateValue::Number(i.narrow_neq(v)),
+            _ => self,
+        }
     }
 
     fn join(&self, other: &Self) -> Self {
@@ -159,7 +190,9 @@ impl AbstractDomain for StateValue {
             (StateValue::Top, _) | (_, StateValue::Top) => StateValue::Top,
             (StateValue::Number(a), StateValue::Number(b)) => StateValue::Number(a.hull(b)),
             (StateValue::Boolean(a), StateValue::Boolean(b)) => StateValue::Boolean(a.join(b)),
-            (StateValue::Reference(a), StateValue::Reference(b)) => StateValue::Reference(a.join(b)),
+            (StateValue::Reference(a), StateValue::Reference(b)) => {
+                StateValue::Reference(a.join(b))
+            }
             (StateValue::Null, StateValue::Null) => StateValue::Null,
             (StateValue::Undefined, StateValue::Undefined) => StateValue::Undefined,
             (StateValue::StrConst(a), StateValue::StrConst(b)) => {
@@ -179,17 +212,26 @@ impl AbstractDomain for StateValue {
             (StateValue::Bottom, _) | (_, StateValue::Bottom) => StateValue::Bottom,
             (StateValue::Number(a), StateValue::Number(b)) => {
                 let hull = a.hull(b);
-                if hull == *a && hull == *b { StateValue::Number(*a) } else { StateValue::Bottom }
+                if hull == *a && hull == *b {
+                    StateValue::Number(*a)
+                } else {
+                    StateValue::Bottom
+                }
             }
             (StateValue::Boolean(a), StateValue::Boolean(b)) => StateValue::Boolean(a.meet(b)),
-            (StateValue::Reference(a), StateValue::Reference(b)) => StateValue::Reference(a.meet(b)),
+            (StateValue::Reference(a), StateValue::Reference(b)) => {
+                StateValue::Reference(a.meet(b))
+            }
             (StateValue::StrConst(a), StateValue::StrConst(b)) => {
                 let inter: BTreeSet<String> = a.intersection(b).cloned().collect();
-                if inter.is_empty() { StateValue::Bottom } else { StateValue::StrConst(Arc::new(inter)) }
+                if inter.is_empty() {
+                    StateValue::Bottom
+                } else {
+                    StateValue::StrConst(Arc::new(inter))
+                }
             }
-            (StateValue::StrConst(a), StateValue::Str) | (StateValue::Str, StateValue::StrConst(a)) => {
-                StateValue::StrConst(a.clone())
-            }
+            (StateValue::StrConst(a), StateValue::Str)
+            | (StateValue::Str, StateValue::StrConst(a)) => StateValue::StrConst(a.clone()),
             _ => StateValue::Bottom,
         }
     }
@@ -235,17 +277,17 @@ impl Transfer for StateValueTransfer {
         exec_state_value(stmt, env, state, memo);
     }
 
-    fn recompute_memo(&self, deps: &[Expr], env: &AbstractEnv<StateValue>, _ctx: &dyn QueryContext) -> StateValue {
+    fn recompute_memo(
+        &self,
+        deps: &[Expr],
+        env: &AbstractEnv<StateValue>,
+        _ctx: &dyn QueryContext,
+    ) -> StateValue {
         if deps.is_empty() {
             return StateValue::Reference(Stability::Stable);
         }
         let stability = deps.iter().fold(Stability::Bottom, |acc, dep| {
-            let val = eval_state_value(
-                dep,
-                env,
-                &StateStore::bottom(),
-                &MemoStore::new(),
-            );
+            let val = eval_state_value(dep, env, &StateStore::bottom(), &MemoStore::new());
             acc.join(&val.to_stability())
         });
         StateValue::Reference(stability)
@@ -308,8 +350,10 @@ fn eval_binop(op: &BinOp, lhs: StateValue, rhs: StateValue) -> StateValue {
             (StateValue::Number(a), StateValue::Number(b)) => StateValue::Number(a.add(&b)),
             // Cartesian product of known string constants.
             (StateValue::StrConst(a), StateValue::StrConst(b)) => {
-                let product: BTreeSet<String> =
-                    a.iter().flat_map(|s1| b.iter().map(move |s2| format!("{s1}{s2}"))).collect();
+                let product: BTreeSet<String> = a
+                    .iter()
+                    .flat_map(|s1| b.iter().map(move |s2| format!("{s1}{s2}")))
+                    .collect();
                 str_const(product)
             }
             (StateValue::StrConst(_), StateValue::Str)
@@ -367,16 +411,15 @@ fn exec_state_value(
             env.extend(var.clone(), val);
         }
         Stmt::ExprStmt(expr) => {
-            if let Expr::Call { fn_, args } = expr {
-                if let Expr::Var(name) = fn_.as_ref() {
-                    if let Some(label) = env.setter_label(name) {
-                        let arg_val = args
-                            .first()
-                            .map(|a| eval_state_value(a, env, state, memo))
-                            .unwrap_or(StateValue::Top);
-                        state.update(label, arg_val);
-                    }
-                }
+            if let Expr::Call { fn_, args } = expr
+                && let Expr::Var(name) = fn_.as_ref()
+                && let Some(label) = env.setter_label(name)
+            {
+                let arg_val = args
+                    .first()
+                    .map(|a| eval_state_value(a, env, state, memo))
+                    .unwrap_or(StateValue::Top);
+                state.update(label, arg_val);
             }
         }
     }
@@ -451,8 +494,16 @@ mod tests {
 
     // ── StateValueTransfer eval ───────────────────────────────────────────────
 
-    fn empty() -> (AbstractEnv<StateValue>, StateStore<StateValue>, MemoStore<StateValue>) {
-        (AbstractEnv::bottom(), StateStore::bottom(), MemoStore::new())
+    fn empty() -> (
+        AbstractEnv<StateValue>,
+        StateStore<StateValue>,
+        MemoStore<StateValue>,
+    ) {
+        (
+            AbstractEnv::bottom(),
+            StateStore::bottom(),
+            MemoStore::new(),
+        )
     }
 
     #[test]
@@ -468,7 +519,13 @@ mod tests {
     fn eval_bool_literal() {
         let (env, state, memo) = empty();
         assert_eq!(
-            StateValueTransfer.eval_expr(&Expr::Lit(Prim::Bool(true)), &env, &state, &memo, &NullCtx),
+            StateValueTransfer.eval_expr(
+                &Expr::Lit(Prim::Bool(true)),
+                &env,
+                &state,
+                &memo,
+                &NullCtx
+            ),
             StateValue::Boolean(BoolVal::True)
         );
     }
@@ -528,15 +585,24 @@ mod tests {
     fn exec_setter_call_updates_state() {
         let (mut env, mut state, mut memo) = empty();
         StateValueTransfer.exec_stmt(
-            &Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
-            &mut env, &mut state, &mut memo, &NullCtx,
+            &Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+            },
+            &mut env,
+            &mut state,
+            &mut memo,
+            &NullCtx,
         );
         StateValueTransfer.exec_stmt(
             &Stmt::ExprStmt(Expr::Call {
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::Lit(Prim::Int(42))],
             }),
-            &mut env, &mut state, &mut memo, &NullCtx,
+            &mut env,
+            &mut state,
+            &mut memo,
+            &NullCtx,
         );
         assert_eq!(state.get(0), StateValue::Number(Interval::point(42.0)));
     }
@@ -551,7 +617,10 @@ mod tests {
 
     #[test]
     fn from_init_null_gives_null() {
-        assert_eq!(StateValue::from_init(&Expr::Lit(Prim::Null)), StateValue::Null);
+        assert_eq!(
+            StateValue::from_init(&Expr::Lit(Prim::Null)),
+            StateValue::Null
+        );
     }
 
     #[test]
@@ -566,7 +635,10 @@ mod tests {
 
     #[test]
     fn interval_narrow_lt_caps_hi() {
-        let i = Interval { lo: 0.0, hi: f64::INFINITY };
+        let i = Interval {
+            lo: 0.0,
+            hi: f64::INFINITY,
+        };
         let n = i.narrow_lt(10.0);
         assert_eq!(n.lo, 0.0);
         assert_eq!(n.hi, 9.0);
@@ -574,7 +646,10 @@ mod tests {
 
     #[test]
     fn interval_narrow_geq_lifts_lo() {
-        let i = Interval { lo: 0.0, hi: f64::INFINITY };
+        let i = Interval {
+            lo: 0.0,
+            hi: f64::INFINITY,
+        };
         let n = i.narrow_geq(10.0);
         assert_eq!(n.lo, 10.0);
         assert!(n.hi.is_infinite());
@@ -594,7 +669,10 @@ mod tests {
 
     #[test]
     fn state_value_narrow_lt_on_number() {
-        let v = StateValue::Number(Interval { lo: 0.0, hi: f64::INFINITY });
+        let v = StateValue::Number(Interval {
+            lo: 0.0,
+            hi: f64::INFINITY,
+        });
         let n = v.narrow_lt(10.0);
         assert_eq!(n, StateValue::Number(Interval { lo: 0.0, hi: 9.0 }));
     }
@@ -611,7 +689,9 @@ mod tests {
         StateValue::StrConst(Arc::new(std::iter::once(s.to_string()).collect()))
     }
     fn str_pair(a: &str, b: &str) -> StateValue {
-        StateValue::StrConst(Arc::new([a.to_string(), b.to_string()].into_iter().collect()))
+        StateValue::StrConst(Arc::new(
+            [a.to_string(), b.to_string()].into_iter().collect(),
+        ))
     }
 
     #[test]
@@ -681,7 +761,10 @@ mod tests {
         let (env, state, memo) = empty();
         let v = StateValueTransfer.eval_expr(
             &Expr::Lit(Prim::String("dark".into())),
-            &env, &state, &memo, &NullCtx,
+            &env,
+            &state,
+            &memo,
+            &NullCtx,
         );
         assert_eq!(v, str_singleton("dark"));
     }

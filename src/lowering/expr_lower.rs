@@ -8,7 +8,7 @@ use crate::ir::{
     stmt::Stmt,
 };
 
-use super::cfg_builder::{build_cfg, BlockBuilder};
+use super::cfg_builder::{BlockBuilder, build_cfg};
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -60,13 +60,21 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         Expression::UnaryExpression(un) => {
             let arg = lower_expr(&un.argument, builder);
             match un.operator {
-                UnaryOperator::UnaryNegation => Expr::UnaryOp { op: IrUnaryOp::Neg, arg: Box::new(arg) },
-                UnaryOperator::LogicalNot => Expr::UnaryOp { op: IrUnaryOp::Not, arg: Box::new(arg) },
+                UnaryOperator::UnaryNegation => Expr::UnaryOp {
+                    op: IrUnaryOp::Neg,
+                    arg: Box::new(arg),
+                },
+                UnaryOperator::LogicalNot => Expr::UnaryOp {
+                    op: IrUnaryOp::Not,
+                    arg: Box::new(arg),
+                },
                 _ => arg,
             }
         }
         Expression::UpdateExpression(upd) => match &upd.argument {
-            SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => Expr::Var(id.name.to_string()),
+            SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                Expr::Var(id.name.to_string())
+            }
             _ => Expr::Var("__opaque".to_string()),
         },
 
@@ -82,7 +90,10 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 .iter()
                 .filter_map(|a| a.as_expression().map(|e| lower_expr(e, builder)))
                 .collect();
-            Expr::Call { fn_: Box::new(fn_), args }
+            Expr::Call {
+                fn_: Box::new(fn_),
+                args,
+            }
         }
         Expression::NewExpression(new_) => {
             let fn_ = lower_expr(&new_.callee, builder);
@@ -91,11 +102,15 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 .iter()
                 .filter_map(|a| a.as_expression().map(|e| lower_expr(e, builder)))
                 .collect();
-            Expr::Call { fn_: Box::new(fn_), args }
+            Expr::Call {
+                fn_: Box::new(fn_),
+                args,
+            }
         }
-        Expression::TaggedTemplateExpression(t) => {
-            Expr::Call { fn_: Box::new(lower_expr(&t.tag, builder)), args: vec![] }
-        }
+        Expression::TaggedTemplateExpression(t) => Expr::Call {
+            fn_: Box::new(lower_expr(&t.tag, builder)),
+            args: vec![],
+        },
 
         // ── Member access ─────────────────────────────────────────────────────
         Expression::StaticMemberExpression(m) => Expr::FieldAccess {
@@ -143,18 +158,32 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         Expression::ArrowFunctionExpression(arrow) => {
             let params = lower_params(&arrow.params);
             let body_cfg = build_cfg(&arrow.body);
-            Expr::FnLit { params, body_cfg: Box::new(body_cfg) }
+            Expr::FnLit {
+                params,
+                body_cfg: Box::new(body_cfg),
+            }
         }
         Expression::FunctionExpression(func) => {
             let params = lower_params(&func.params);
-            let body_cfg = func.body.as_ref().map(|b| build_cfg(b)).unwrap_or_else(empty_cfg);
-            Expr::FnLit { params, body_cfg: Box::new(body_cfg) }
+            let body_cfg = func
+                .body
+                .as_ref()
+                .map(|b| build_cfg(b))
+                .unwrap_or_else(empty_cfg);
+            Expr::FnLit {
+                params,
+                body_cfg: Box::new(body_cfg),
+            }
         }
 
         // ── JSX ───────────────────────────────────────────────────────────────
         Expression::JSXElement(jsx) => lower_jsx_element(jsx, builder),
         Expression::JSXFragment(frag) => {
-            let children = frag.children.iter().filter_map(|c| lower_jsx_child(c, builder)).collect();
+            let children = frag
+                .children
+                .iter()
+                .filter_map(|c| lower_jsx_child(c, builder))
+                .collect();
             Expr::NativeElem {
                 tag: "Fragment".to_string(),
                 props: Box::new(Expr::ObjectLit(vec![])),
@@ -164,9 +193,10 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
 
         // ── TypeScript wrappers ───────────────────────────────────────────────
         Expression::ParenthesizedExpression(p) => lower_expr(&p.expression, builder),
-        Expression::TSAsExpression(ts) => {
-            Expr::TSAnnotated(Box::new(lower_expr(&ts.expression, builder)), "as".to_string())
-        }
+        Expression::TSAsExpression(ts) => Expr::TSAnnotated(
+            Box::new(lower_expr(&ts.expression, builder)),
+            "as".to_string(),
+        ),
         Expression::TSNonNullExpression(ts) => lower_expr(&ts.expression, builder),
         Expression::TSSatisfiesExpression(ts) => lower_expr(&ts.expression, builder),
         Expression::TSTypeAssertion(ts) => lower_expr(&ts.expression, builder),
@@ -206,19 +236,29 @@ fn lower_ternary(cond: &ConditionalExpression, builder: &mut BlockBuilder) -> Ex
     let join_id = builder.new_block();
     let tmp = builder.fresh_temp();
 
-    let bid = builder.seal_with(Terminator::Branch { cond: test, then_: then_id, else_: else_id });
+    let bid = builder.seal_with(Terminator::Branch {
+        cond: test,
+        then_: then_id,
+        else_: else_id,
+    });
     builder.add_edge(bid, then_id, EdgeKind::IfTrue);
     builder.add_edge(bid, else_id, EdgeKind::IfFalse);
 
     builder.start_block(then_id);
     let cons = lower_expr(&cond.consequent, builder);
-    builder.push_stmt(Stmt::Let { var: tmp.clone(), rhs: cons });
+    builder.push_stmt(Stmt::Let {
+        var: tmp.clone(),
+        rhs: cons,
+    });
     let t = builder.seal_with(Terminator::Jump(join_id));
     builder.add_edge(t, join_id, EdgeKind::Unconditional);
 
     builder.start_block(else_id);
     let alt = lower_expr(&cond.alternate, builder);
-    builder.push_stmt(Stmt::Let { var: tmp.clone(), rhs: alt });
+    builder.push_stmt(Stmt::Let {
+        var: tmp.clone(),
+        rhs: alt,
+    });
     let e = builder.seal_with(Terminator::Jump(join_id));
     builder.add_edge(e, join_id, EdgeKind::Unconditional);
 
@@ -242,23 +282,49 @@ fn lower_ternary(cond: &ConditionalExpression, builder: &mut BlockBuilder) -> Ex
 fn lower_logical(log: &LogicalExpression, builder: &mut BlockBuilder) -> Expr {
     let tmp = builder.fresh_temp();
     let left = lower_expr(&log.left, builder);
-    builder.push_stmt(Stmt::Let { var: tmp.clone(), rhs: left });
+    builder.push_stmt(Stmt::Let {
+        var: tmp.clone(),
+        rhs: left,
+    });
 
     let rhs_id = builder.new_block();
     let join_id = builder.new_block();
 
     let (then_, else_) = match log.operator {
-        LogicalOperator::And => (rhs_id, join_id),  // truthy → rhs; falsy → join (keep a)
+        LogicalOperator::And => (rhs_id, join_id), // truthy → rhs; falsy → join (keep a)
         LogicalOperator::Or | LogicalOperator::Coalesce => (join_id, rhs_id), // truthy → join (keep a); falsy → rhs
     };
 
-    let bid = builder.seal_with(Terminator::Branch { cond: Expr::Var(tmp.clone()), then_, else_ });
-    builder.add_edge(bid, then_, if then_ == rhs_id { EdgeKind::IfTrue } else { EdgeKind::IfFalse });
-    builder.add_edge(bid, else_, if else_ == rhs_id { EdgeKind::IfFalse } else { EdgeKind::IfTrue });
+    let bid = builder.seal_with(Terminator::Branch {
+        cond: Expr::Var(tmp.clone()),
+        then_,
+        else_,
+    });
+    builder.add_edge(
+        bid,
+        then_,
+        if then_ == rhs_id {
+            EdgeKind::IfTrue
+        } else {
+            EdgeKind::IfFalse
+        },
+    );
+    builder.add_edge(
+        bid,
+        else_,
+        if else_ == rhs_id {
+            EdgeKind::IfFalse
+        } else {
+            EdgeKind::IfTrue
+        },
+    );
 
     builder.start_block(rhs_id);
     let right = lower_expr(&log.right, builder);
-    builder.push_stmt(Stmt::Assign { var: tmp.clone(), rhs: right });
+    builder.push_stmt(Stmt::Assign {
+        var: tmp.clone(),
+        rhs: right,
+    });
     let r = builder.seal_with(Terminator::Jump(join_id));
     builder.add_edge(r, join_id, EdgeKind::Unconditional);
 
@@ -270,13 +336,24 @@ fn lower_logical(log: &LogicalExpression, builder: &mut BlockBuilder) -> Expr {
 
 fn lower_jsx_element(jsx: &JSXElement, builder: &mut BlockBuilder) -> Expr {
     let name = jsx_element_name(&jsx.opening_element.name);
-    let children: Vec<Expr> = jsx.children.iter().filter_map(|c| lower_jsx_child(c, builder)).collect();
+    let children: Vec<Expr> = jsx
+        .children
+        .iter()
+        .filter_map(|c| lower_jsx_child(c, builder))
+        .collect();
     let props = lower_jsx_props(&jsx.opening_element.attributes, builder);
 
-    if name.chars().next().map_or(false, |c| c.is_uppercase()) || name.contains('.') {
-        Expr::CompApp { name, props: Box::new(props) }
+    if name.chars().next().is_some_and(|c| c.is_uppercase()) || name.contains('.') {
+        Expr::CompApp {
+            name,
+            props: Box::new(props),
+        }
     } else {
-        Expr::NativeElem { tag: name, props: Box::new(props), children }
+        Expr::NativeElem {
+            tag: name,
+            props: Box::new(props),
+            children,
+        }
     }
 }
 
@@ -287,13 +364,19 @@ fn lower_jsx_props(attrs: &[JSXAttributeItem], builder: &mut BlockBuilder) -> Ex
             JSXAttributeItem::Attribute(a) => {
                 let key = match &a.name {
                     JSXAttributeName::Identifier(id) => id.name.to_string(),
-                    JSXAttributeName::NamespacedName(n) => format!("{}:{}", n.namespace.name, n.name.name),
+                    JSXAttributeName::NamespacedName(n) => {
+                        format!("{}:{}", n.namespace.name, n.name.name)
+                    }
                 };
                 let val = match &a.value {
-                    Some(JSXAttributeValue::StringLiteral(s)) => Expr::Lit(Prim::String(s.value.to_string())),
-                    Some(JSXAttributeValue::ExpressionContainer(ec)) => {
-                        ec.expression.as_expression().map(|e| lower_expr(e, builder)).unwrap_or(Expr::Lit(Prim::Unit))
+                    Some(JSXAttributeValue::StringLiteral(s)) => {
+                        Expr::Lit(Prim::String(s.value.to_string()))
                     }
+                    Some(JSXAttributeValue::ExpressionContainer(ec)) => ec
+                        .expression
+                        .as_expression()
+                        .map(|e| lower_expr(e, builder))
+                        .unwrap_or(Expr::Lit(Prim::Unit)),
                     Some(JSXAttributeValue::Element(el)) => lower_jsx_element(el, builder),
                     Some(JSXAttributeValue::Fragment(_)) => Expr::Lit(Prim::Unit),
                     None => Expr::Lit(Prim::Bool(true)), // boolean attribute: <Comp disabled />
@@ -332,16 +415,21 @@ fn lower_jsx_child(child: &JSXChild, builder: &mut BlockBuilder) -> Option<Expr>
     match child {
         JSXChild::Element(el) => Some(lower_jsx_element(el, builder)),
         JSXChild::Fragment(frag) => {
-            let children = frag.children.iter().filter_map(|c| lower_jsx_child(c, builder)).collect();
+            let children = frag
+                .children
+                .iter()
+                .filter_map(|c| lower_jsx_child(c, builder))
+                .collect();
             Some(Expr::NativeElem {
                 tag: "Fragment".to_string(),
                 props: Box::new(Expr::ObjectLit(vec![])),
                 children,
             })
         }
-        JSXChild::ExpressionContainer(ec) => {
-            ec.expression.as_expression().map(|e| lower_expr(e, builder))
-        }
+        JSXChild::ExpressionContainer(ec) => ec
+            .expression
+            .as_expression()
+            .map(|e| lower_expr(e, builder)),
         JSXChild::Text(_) | JSXChild::Spread(_) => None,
     }
 }
@@ -379,8 +467,19 @@ pub(super) fn lower_params(params: &FormalParameters) -> Vec<String> {
 
 pub(super) fn empty_cfg() -> CFG {
     let mut blocks = HashMap::new();
-    blocks.insert(0, BasicBlock { id: 0, stmts: vec![], term: Terminator::Unreachable });
-    CFG { entry: 0, blocks, edges: vec![] }
+    blocks.insert(
+        0,
+        BasicBlock {
+            id: 0,
+            stmts: vec![],
+            term: Terminator::Unreachable,
+        },
+    );
+    CFG {
+        entry: 0,
+        blocks,
+        edges: vec![],
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -413,9 +512,21 @@ mod tests {
         // const x = cond ? a : b; return x;
         let cfg = build("function f(cond, a, b) { const x = cond ? a : b; return x; }");
         // entry(Branch) + then(Let tmp=a, Jump) + else(Let tmp=b, Jump) + join(Let x=tmp, Return)
-        assert!(cfg.blocks.len() >= 4, "expected ≥4 blocks, got {}", cfg.blocks.len());
-        let if_true = cfg.edges.iter().filter(|e| matches!(e.kind, EdgeKind::IfTrue)).count();
-        let if_false = cfg.edges.iter().filter(|e| matches!(e.kind, EdgeKind::IfFalse)).count();
+        assert!(
+            cfg.blocks.len() >= 4,
+            "expected ≥4 blocks, got {}",
+            cfg.blocks.len()
+        );
+        let if_true = cfg
+            .edges
+            .iter()
+            .filter(|e| matches!(e.kind, EdgeKind::IfTrue))
+            .count();
+        let if_false = cfg
+            .edges
+            .iter()
+            .filter(|e| matches!(e.kind, EdgeKind::IfFalse))
+            .count();
         assert_eq!(if_true, 1);
         assert_eq!(if_false, 1);
     }
@@ -427,7 +538,11 @@ mod tests {
         // entry: Let __t0=enabled, Branch(Var(__t0), rhs, join)
         // rhs: Assign __t0 = doSomething(), Jump(join)
         // join: ExprStmt(Var(__t0)) [pushed by ExprStmt handler] + Unreachable
-        assert!(cfg.blocks.len() >= 3, "expected ≥3 blocks, got {}", cfg.blocks.len());
+        assert!(
+            cfg.blocks.len() >= 3,
+            "expected ≥3 blocks, got {}",
+            cfg.blocks.len()
+        );
         let branches: Vec<_> = cfg
             .blocks
             .values()
@@ -440,7 +555,11 @@ mod tests {
     fn logical_or_splits_blocks() {
         let cfg = build("function f(a, b) { return a || b; }");
         assert!(cfg.blocks.len() >= 3);
-        let back_edges = cfg.edges.iter().filter(|e| matches!(e.kind, EdgeKind::Back)).count();
+        let back_edges = cfg
+            .edges
+            .iter()
+            .filter(|e| matches!(e.kind, EdgeKind::Back))
+            .count();
         assert_eq!(back_edges, 0); // no loops
     }
 
@@ -453,7 +572,10 @@ mod tests {
             .values()
             .filter(|b| matches!(b.term, crate::ir::cfg::Terminator::Branch { .. }))
             .count();
-        assert!(branches >= 2, "expected ≥2 branches for nested ternary, got {branches}");
+        assert!(
+            branches >= 2,
+            "expected ≥2 branches for nested ternary, got {branches}"
+        );
     }
 
     #[test]
@@ -467,7 +589,13 @@ mod tests {
         let entry = cfg.blocks.get(&cfg.entry).unwrap();
         // First stmt should be Let { var: "cb", rhs: FnLit { ... } }
         assert!(
-            matches!(entry.stmts.first(), Some(crate::ir::stmt::Stmt::Let { rhs: Expr::FnLit { .. }, .. })),
+            matches!(
+                entry.stmts.first(),
+                Some(crate::ir::stmt::Stmt::Let {
+                    rhs: Expr::FnLit { .. },
+                    ..
+                })
+            ),
             "expected FnLit for arrow function"
         );
     }

@@ -62,7 +62,13 @@ impl Rule for MissingDeps {
 
 fn dep_var_names(deps: &[Expr]) -> HashSet<Var> {
     deps.iter()
-        .filter_map(|e| if let Expr::Var(v) = e { Some(v.clone()) } else { None })
+        .filter_map(|e| {
+            if let Expr::Var(v) = e {
+                Some(v.clone())
+            } else {
+                None
+            }
+        })
         .collect()
 }
 
@@ -71,9 +77,11 @@ fn dep_var_names(deps: &[Expr]) -> HashSet<Var> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
     use crate::{
-        domains::{Stability, StateValue, stores::{AbstractEnv, MemoStore, StateStore}},
+        domains::{
+            Stability, StateValue,
+            stores::{AbstractEnv, MemoStore, StateStore},
+        },
         engine::{AnalysisResult, EffectInfo},
         ir::{
             cfg::{BasicBlock, CFG, Terminator},
@@ -82,14 +90,23 @@ mod tests {
         },
         rules::Rule,
     };
+    use std::collections::{HashMap, HashSet};
 
     fn trivial_cfg() -> CFG {
         let mut blocks = HashMap::new();
         blocks.insert(
             0,
-            BasicBlock { id: 0, stmts: vec![], term: Terminator::Return(Expr::Lit(Prim::Unit)) },
+            BasicBlock {
+                id: 0,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
         );
-        CFG { entry: 0, blocks, edges: vec![] }
+        CFG {
+            entry: 0,
+            blocks,
+            edges: vec![],
+        }
     }
 
     fn make_result(
@@ -231,7 +248,11 @@ mod tests {
 
         let result = make_result(block_states, effect_info, trivial_cfg());
         let diags = MissingDeps.check(&result);
-        assert_eq!(diags.len(), 1, "mount-only effect with empty deps array should warn for unstable free var");
+        assert_eq!(
+            diags.len(),
+            1,
+            "mount-only effect with empty deps array should warn for unstable free var"
+        );
         assert_eq!(diags[0].var.as_deref(), Some("n"));
     }
 

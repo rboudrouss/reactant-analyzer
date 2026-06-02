@@ -65,7 +65,7 @@ pub fn compute_dominators(cfg: &CFG) -> HashMap<BlockId, HashSet<BlockId>> {
 pub fn dominates(cfg: &CFG, a: BlockId, b: BlockId) -> bool {
     compute_dominators(cfg)
         .get(&b)
-        .map_or(false, |dom_b| dom_b.contains(&a))
+        .is_some_and(|dom_b| dom_b.contains(&a))
 }
 
 /// Reverse Post-Order traversal starting from `cfg.entry`.
@@ -105,18 +105,44 @@ mod tests {
     fn linear_cfg() -> CFG {
         // 0 → 1 → 2
         let mut blocks = HashMap::new();
-        blocks.insert(0, BasicBlock { id: 0, stmts: vec![], term: Terminator::Jump(1) });
-        blocks.insert(1, BasicBlock { id: 1, stmts: vec![], term: Terminator::Jump(2) });
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![],
+                term: Terminator::Jump(1),
+            },
+        );
+        blocks.insert(
+            1,
+            BasicBlock {
+                id: 1,
+                stmts: vec![],
+                term: Terminator::Jump(2),
+            },
+        );
         blocks.insert(
             2,
-            BasicBlock { id: 2, stmts: vec![], term: Terminator::Return(Expr::Lit(Prim::Unit)) },
+            BasicBlock {
+                id: 2,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
         );
         CFG {
             entry: 0,
             blocks,
             edges: vec![
-                Edge { from: 0, to: 1, kind: EdgeKind::Unconditional },
-                Edge { from: 1, to: 2, kind: EdgeKind::Unconditional },
+                Edge {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::Unconditional,
+                },
+                Edge {
+                    from: 1,
+                    to: 2,
+                    kind: EdgeKind::Unconditional,
+                },
             ],
         }
     }
@@ -136,20 +162,54 @@ mod tests {
                 },
             },
         );
-        blocks.insert(1, BasicBlock { id: 1, stmts: vec![], term: Terminator::Jump(3) });
-        blocks.insert(2, BasicBlock { id: 2, stmts: vec![], term: Terminator::Jump(3) });
+        blocks.insert(
+            1,
+            BasicBlock {
+                id: 1,
+                stmts: vec![],
+                term: Terminator::Jump(3),
+            },
+        );
+        blocks.insert(
+            2,
+            BasicBlock {
+                id: 2,
+                stmts: vec![],
+                term: Terminator::Jump(3),
+            },
+        );
         blocks.insert(
             3,
-            BasicBlock { id: 3, stmts: vec![], term: Terminator::Return(Expr::Lit(Prim::Unit)) },
+            BasicBlock {
+                id: 3,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
         );
         CFG {
             entry: 0,
             blocks,
             edges: vec![
-                Edge { from: 0, to: 1, kind: EdgeKind::IfTrue },
-                Edge { from: 0, to: 2, kind: EdgeKind::IfFalse },
-                Edge { from: 1, to: 3, kind: EdgeKind::Unconditional },
-                Edge { from: 2, to: 3, kind: EdgeKind::Unconditional },
+                Edge {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::IfTrue,
+                },
+                Edge {
+                    from: 0,
+                    to: 2,
+                    kind: EdgeKind::IfFalse,
+                },
+                Edge {
+                    from: 1,
+                    to: 3,
+                    kind: EdgeKind::Unconditional,
+                },
+                Edge {
+                    from: 2,
+                    to: 3,
+                    kind: EdgeKind::Unconditional,
+                },
             ],
         }
     }

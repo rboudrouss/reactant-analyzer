@@ -45,7 +45,12 @@ impl Rule for InfiniteLoop {
             }
 
             for hook in &result.hooks {
-                if let HookEntry::Effect { label: eff_label, body_cfg, deps } = hook {
+                if let HookEntry::Effect {
+                    label: eff_label,
+                    body_cfg,
+                    deps,
+                } = hook
+                {
                     // deps: Some(vec![]) = runs once on mount only → no cycle possible.
                     // Skip: an effect with an explicit empty deps array can never cause
                     // an infinite loop regardless of what it calls.
@@ -82,7 +87,11 @@ fn build_setter_map(result: &AnalysisResult<StateValue>) -> HashMap<HookLabel, H
     // The render_cfg contains the setter bindings via `let setN = StateSetter(0)` stmts.
     for block in result.render_cfg.blocks.values() {
         for stmt in &block.stmts {
-            if let Stmt::Let { var, rhs: Expr::StateSetter(label) } = stmt {
+            if let Stmt::Let {
+                var,
+                rhs: Expr::StateSetter(label),
+            } = stmt
+            {
                 map.entry(*label).or_default().insert(var.clone());
             }
         }
@@ -95,10 +104,7 @@ fn build_setter_map(result: &AnalysisResult<StateValue>) -> HashMap<HookLabel, H
 ///
 /// Over-approximate (any-path): sound for warnings (no missed loops), may
 /// produce false positives for setters only reachable on guarded paths.
-fn setter_reachable_from_entry(
-    setter_vars: &HashSet<Var>,
-    body_cfg: &crate::ir::cfg::CFG,
-) -> bool {
+fn setter_reachable_from_entry(setter_vars: &HashSet<Var>, body_cfg: &crate::ir::cfg::CFG) -> bool {
     let mut visited: HashSet<crate::ir::types::BlockId> = HashSet::new();
     let mut queue: VecDeque<crate::ir::types::BlockId> = VecDeque::new();
     queue.push_back(body_cfg.entry);
@@ -107,12 +113,11 @@ fn setter_reachable_from_entry(
     while let Some(bid) = queue.pop_front() {
         if let Some(block) = body_cfg.blocks.get(&bid) {
             for stmt in &block.stmts {
-                if let Stmt::ExprStmt(Expr::Call { fn_, .. }) = stmt {
-                    if let Expr::Var(name) = fn_.as_ref() {
-                        if setter_vars.contains(name) {
-                            return true;
-                        }
-                    }
+                if let Stmt::ExprStmt(Expr::Call { fn_, .. }) = stmt
+                    && let Expr::Var(name) = fn_.as_ref()
+                    && setter_vars.contains(name)
+                {
+                    return true;
                 }
             }
             for succ in body_cfg.successors(bid) {
@@ -130,10 +135,12 @@ fn setter_reachable_from_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
     use crate::{
-        domains::{StateValue, StateValueTransfer, stores::{MemoStore, StateStore}},
-        engine::{AnalysisResult, analyze_component, Config},
+        domains::{
+            StateValue, StateValueTransfer,
+            stores::{MemoStore, StateStore},
+        },
+        engine::{AnalysisResult, Config, analyze_component},
         ir::{
             cfg::{BasicBlock, CFG, Terminator},
             component::ComponentIR,
@@ -143,14 +150,23 @@ mod tests {
         },
         rules::Rule,
     };
+    use std::collections::{HashMap, HashSet};
 
     fn trivial_cfg() -> CFG {
         let mut blocks = HashMap::new();
         blocks.insert(
             0,
-            BasicBlock { id: 0, stmts: vec![], term: Terminator::Return(Expr::Lit(Prim::Unit)) },
+            BasicBlock {
+                id: 0,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
         );
-        CFG { entry: 0, blocks, edges: vec![] }
+        CFG {
+            entry: 0,
+            blocks,
+            edges: vec![],
+        }
     }
 
     fn make_result_with_widened(
@@ -174,7 +190,11 @@ mod tests {
             hook_calls: vec![],
             effect_info: HashMap::new(),
             widened_labels: widened,
-            render_cfg: CFG { entry: 0, blocks, edges: vec![] },
+            render_cfg: CFG {
+                entry: 0,
+                blocks,
+                edges: vec![],
+            },
             hooks,
         }
     }
@@ -202,13 +222,22 @@ mod tests {
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
         );
-        let eff_cfg = CFG { entry: 0, blocks: eff_blocks, edges: vec![] };
+        let eff_cfg = CFG {
+            entry: 0,
+            blocks: eff_blocks,
+            edges: vec![],
+        };
 
         // deps: None = no deps array = runs every render = can cycle
-        let hooks = vec![HookEntry::Effect { label: 1, body_cfg: eff_cfg, deps: None }];
-        let render_stmts = vec![
-            Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
-        ];
+        let hooks = vec![HookEntry::Effect {
+            label: 1,
+            body_cfg: eff_cfg,
+            deps: None,
+        }];
+        let render_stmts = vec![Stmt::Let {
+            var: "setN".to_string(),
+            rhs: Expr::StateSetter(0),
+        }];
 
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
         let diags = InfiniteLoop.check(&result);
@@ -220,10 +249,15 @@ mod tests {
     fn widened_but_setter_only_conditional_no_warning() {
         // Effect body has no setter call in entry block → no warning
         let eff_cfg = trivial_cfg(); // empty body
-        let hooks = vec![HookEntry::Effect { label: 1, body_cfg: eff_cfg, deps: None }];
-        let render_stmts = vec![
-            Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
-        ];
+        let hooks = vec![HookEntry::Effect {
+            label: 1,
+            body_cfg: eff_cfg,
+            deps: None,
+        }];
+        let render_stmts = vec![Stmt::Let {
+            var: "setN".to_string(),
+            rhs: Expr::StateSetter(0),
+        }];
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
         assert!(InfiniteLoop.check(&result).is_empty());
     }
@@ -243,11 +277,25 @@ mod tests {
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
         );
-        let eff_cfg = CFG { entry: 0, blocks: eff_blocks, edges: vec![] };
-        let hooks = vec![HookEntry::Effect { label: 1, body_cfg: eff_cfg, deps: Some(vec![]) }];
-        let render_stmts = vec![Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) }];
+        let eff_cfg = CFG {
+            entry: 0,
+            blocks: eff_blocks,
+            edges: vec![],
+        };
+        let hooks = vec![HookEntry::Effect {
+            label: 1,
+            body_cfg: eff_cfg,
+            deps: Some(vec![]),
+        }];
+        let render_stmts = vec![Stmt::Let {
+            var: "setN".to_string(),
+            rhs: Expr::StateSetter(0),
+        }];
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
-        assert!(InfiniteLoop.check(&result).is_empty(), "deps:[] = one-shot, never infinite");
+        assert!(
+            InfiniteLoop.check(&result).is_empty(),
+            "deps:[] = one-shot, never infinite"
+        );
     }
 
     #[test]
@@ -265,13 +313,22 @@ mod tests {
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
         );
-        let eff_cfg = CFG { entry: 0, blocks: eff_blocks, edges: vec![] };
+        let eff_cfg = CFG {
+            entry: 0,
+            blocks: eff_blocks,
+            edges: vec![],
+        };
 
-        let hooks = vec![HookEntry::Effect { label: 1, body_cfg: eff_cfg, deps: None }];
+        let hooks = vec![HookEntry::Effect {
+            label: 1,
+            body_cfg: eff_cfg,
+            deps: None,
+        }];
         // render only registers setN for state 0, not setOther
-        let render_stmts = vec![
-            Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
-        ];
+        let render_stmts = vec![Stmt::Let {
+            var: "setN".to_string(),
+            rhs: Expr::StateSetter(0),
+        }];
         // widened = {0} but effect calls setOther which isn't mapped to 0
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
         assert!(InfiniteLoop.check(&result).is_empty());
@@ -287,7 +344,10 @@ mod tests {
             BasicBlock {
                 id: 0,
                 stmts: vec![
-                    Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
+                    Stmt::Let {
+                        var: "setN".to_string(),
+                        rhs: Expr::StateSetter(0),
+                    },
                     Stmt::ExprStmt(Expr::Call {
                         fn_: Box::new(Expr::Var("setN".to_string())),
                         args: vec![Expr::ObjectLit(vec![])],
@@ -296,16 +356,33 @@ mod tests {
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
         );
-        let eff_cfg = CFG { entry: 0, blocks: eff_blocks, edges: vec![] };
+        let eff_cfg = CFG {
+            entry: 0,
+            blocks: eff_blocks,
+            edges: vec![],
+        };
 
         let hooks = vec![
-            HookEntry::State { label: 0, init: Expr::Lit(Prim::Int(0)) },
+            HookEntry::State {
+                label: 0,
+                init: Expr::Lit(Prim::Int(0)),
+            },
             // deps: None = no deps array = runs every render = can cycle
-            HookEntry::Effect { label: 1, body_cfg: eff_cfg, deps: None },
+            HookEntry::Effect {
+                label: 1,
+                body_cfg: eff_cfg,
+                deps: None,
+            },
         ];
         let render_stmts = vec![
-            Stmt::Let { var: "n".to_string(), rhs: Expr::StateVal(0) },
-            Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
+            Stmt::Let {
+                var: "n".to_string(),
+                rhs: Expr::StateVal(0),
+            },
+            Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+            },
         ];
         let mut blocks = HashMap::new();
         blocks.insert(
@@ -319,7 +396,11 @@ mod tests {
         let comp = ComponentIR {
             name: "C".to_string(),
             param: "props".to_string(),
-            render_cfg: CFG { entry: 0, blocks, edges: vec![] },
+            render_cfg: CFG {
+                entry: 0,
+                blocks,
+                edges: vec![],
+            },
             hooks,
         };
         let config = Config { widen_threshold: 1 };
@@ -340,7 +421,10 @@ mod tests {
             BasicBlock {
                 id: 0,
                 stmts: vec![
-                    Stmt::Let { var: "setCount".to_string(), rhs: Expr::StateSetter(0) },
+                    Stmt::Let {
+                        var: "setCount".to_string(),
+                        rhs: Expr::StateSetter(0),
+                    },
                     Stmt::ExprStmt(Expr::Call {
                         fn_: Box::new(Expr::Var("setCount".to_string())),
                         args: vec![Expr::BinOp {
@@ -353,10 +437,17 @@ mod tests {
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
         );
-        let eff_cfg = CFG { entry: 0, blocks: eff_blocks, edges: vec![] };
+        let eff_cfg = CFG {
+            entry: 0,
+            blocks: eff_blocks,
+            edges: vec![],
+        };
 
         let hooks = vec![
-            HookEntry::State { label: 0, init: Expr::Lit(Prim::Int(0)) },
+            HookEntry::State {
+                label: 0,
+                init: Expr::Lit(Prim::Int(0)),
+            },
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
@@ -364,8 +455,14 @@ mod tests {
             },
         ];
         let render_stmts = vec![
-            Stmt::Let { var: "count".to_string(), rhs: Expr::StateVal(0) },
-            Stmt::Let { var: "setCount".to_string(), rhs: Expr::StateSetter(0) },
+            Stmt::Let {
+                var: "count".to_string(),
+                rhs: Expr::StateVal(0),
+            },
+            Stmt::Let {
+                var: "setCount".to_string(),
+                rhs: Expr::StateSetter(0),
+            },
         ];
         let mut blocks = HashMap::new();
         blocks.insert(
@@ -379,14 +476,21 @@ mod tests {
         let comp = ComponentIR {
             name: "Counter".to_string(),
             param: "props".to_string(),
-            render_cfg: CFG { entry: 0, blocks, edges: vec![] },
+            render_cfg: CFG {
+                entry: 0,
+                blocks,
+                edges: vec![],
+            },
             hooks,
         };
         let config = Config { widen_threshold: 3 };
         let result = analyze_component(comp, &StateValueTransfer, &config);
         assert!(result.widened_labels.contains(&0), "count should widen");
         let diags = InfiniteLoop.check(&result);
-        assert!(!diags.is_empty(), "setState(count+1) should be detected as infinite loop");
+        assert!(
+            !diags.is_empty(),
+            "setState(count+1) should be detected as infinite loop"
+        );
     }
 
     #[test]
@@ -423,11 +527,20 @@ mod tests {
             }],
         };
 
-        let hooks = vec![HookEntry::Effect { label: 1, body_cfg: eff_cfg, deps: None }];
-        let render_stmts =
-            vec![Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) }];
+        let hooks = vec![HookEntry::Effect {
+            label: 1,
+            body_cfg: eff_cfg,
+            deps: None,
+        }];
+        let render_stmts = vec![Stmt::Let {
+            var: "setN".to_string(),
+            rhs: Expr::StateSetter(0),
+        }];
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
         let diags = InfiniteLoop.check(&result);
-        assert!(!diags.is_empty(), "setter in block 1 should be detected via BFS");
+        assert!(
+            !diags.is_empty(),
+            "setter in block 1 should be detected via BFS"
+        );
     }
 }
