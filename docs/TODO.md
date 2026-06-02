@@ -65,7 +65,7 @@ const [data, setData] = useState(expensiveCompute())  // recalculé chaque rende
 
 Si `HookEntry::State { init: Expr::Call { .. } }` → warn. Règle structurelle pure, pas besoin du fixpoint. Faux positifs sur les calls cheap acceptables (sound).
 
-### `derived-state`
+### `derived-state` *(bloqué — dépend du support fonctions)*
 
 ```js
 const [n, setN] = useState(0);
@@ -73,7 +73,17 @@ const [doubled, setDoubled] = useState(0);
 useEffect(() => { setDoubled(n * 2) }, [n])  // doubled = f(n) → devrait être useMemo
 ```
 
-État B est **toujours** mis à `f(StateVal(A))` dans un effect dont les deps incluent A et dont le corps ne fait que ce setter call. Nécessite `effect_block_states` pour inspecter les corps d'effect. Règle ambitieuse, dépend de l'item `effect_block_states`.
+**Définition retenue** : effect dont les deps sont `[stateA, ...]`, qui appelle `setB(expr)` inconditionnellement où `expr` est **call-free** (pas de `Expr::Call` dans les sous-termes) et ne lit que des `StateVal` des labels sources, et où `setB` n'est appelé **nulle part ailleurs** dans le composant (render + autres effects + handlers).
+
+Multi-source supporté (`setSum(a + b)` avec deps `[a, b]`).
+
+**Bloqué par** :
+
+1. **Pas de support fonctions** — `Expr::Call` est opaque. `setFormatted(format(n))` où `format` est pure serait un faux négatif. Pour l'éviter sans exploser les faux positifs (ex. `setUser(fetchUser(id))`), il faudrait soit distinguer sync/async dans l'IR, soit un registre de fonctions pures connues (`Math.abs`, etc.), soit une analyse de corps de fonction.
+
+2. **Functional updaters** — `setB(prev => ...)` est lui aussi un `FnLit` non analysé (voir item ci-dessus). Même prérequis.
+
+Dépend aussi de `effect_block_states` pour inspecter les corps d'effect proprement.
 
 ---
 
