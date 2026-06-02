@@ -1,6 +1,6 @@
-# ADR-008 : Domaine de valeurs pour le fixpoint SCC — StateValue enum (Option A)
+# ADR-008 : Domaine de valeurs pour le fixpoint SCC — StateValue enum + TypedStateStore
 
-- **Statut** : Accepté (Option A actif, Option B documenté pour migration future)
+- **Statut** : Implémenté (Option A + Option B actifs)
 - **Date** : 2026-06-02
 - **Contexte** : [ADR-007](ADR-007-cross-domain-queries.md) (cross-domain), [ADR-002](ADR-002-abstract-domains.md) (Stability)
 
@@ -31,10 +31,13 @@ React utilise `Object.is` pour comparer. `Object.is(null, null) === true` donc
 
 ---
 
-## Option A (active) — Enum `StateValue` unifiée
+## Option A (implémentée) — Enum `StateValue` unifiée
+
+`StateValue` est une enum plate représentant toutes les valeurs JS abstraites.
+`Copy` retiré (trop large) — Clone seulement.
 
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StateValue {
     /// ⊥ — chemin non atteignable (distinct de Null).
     Bottom,
@@ -46,7 +49,9 @@ pub enum StateValue {
     Number(Interval),
     /// Valeur booléenne.
     Boolean(BoolVal),
-    /// Chaîne de caractères (on ne track pas le contenu pour l'instant).
+    /// Chaîne de caractères — ensemble exact de valeurs possibles.
+    StrConst(Arc<BTreeSet<String>>),
+    /// Chaîne de caractères — précision perdue (⊤ pour les strings).
     Str,
     /// Référence objet/tableau/fonction — stability de référence.
     Reference(Stability),
@@ -55,14 +60,23 @@ pub enum StateValue {
 }
 ```
 
+Note : `StateValue::StrConst` contient directement un `Arc<BTreeSet<String>>`,
+pas le type wrapper `StrConst`. Le widening string est géré par `StrConst`
+(voir Option B / `str_const.rs`), mais le résultat final stocké dans
+`StateValue` est l'arc brut ou `Str` une fois la précision perdue.
+
+Fichiers extraits pour lisibilité :
+- `src/domains/impls/interval.rs` — type `Interval`
+- `src/domains/impls/bool_val.rs` — type `BoolVal`
+
 ### Lattice et `join`
 
 ```
                     Top  (⊤)
                  /   |   \   \
          Number  Boolean  Str  Reference
-           |       |           |
-       Interval  BoolVal    Stability
+           |       |      |        |
+       Interval  BoolVal StrConst Stability
            \       \          /
             Null  Undefined  Bottom (⊥)
 ```
@@ -77,6 +91,8 @@ Règles de `join` :
 | Null | Undefined | Top |
 | Number(i) | Number(j) | Number(i.join(j)) |
 | Boolean(x) | Boolean(y) | Boolean(x.join(y)) |
+| StrConst(a) | StrConst(b) | StrConst(a ∪ b) ou Str si seuil dépassé |
+| StrConst(_) | Str | Str |
 | Str | Str | Str |
 | Reference(s) | Reference(t) | Reference(s.join(t)) |
 | **Null \| Undefined** | **Number(i)** | **Top** (¹) |
@@ -89,6 +105,7 @@ Règles de `join` :
 
 - `Number` → interval widening standard : si `lo` décroît → `lo = -∞`, si `hi` croît → `hi = +∞`
 - `Boolean` → `join` (treillis fini, height 2)
+- `StrConst` → `join` puis widen à `Str` si `|set| > 4` (seuil = 4, voir `str_const.rs`)
 - `Str`, `Null`, `Undefined`, `Reference` → `join` (finis)
 - `Top` → stable
 
@@ -127,16 +144,16 @@ impl StateValue {
     /// Valeur initiale abstraite du state.
     pub fn init_value(init: &Expr) -> Self {
         match init {
-            Expr::Lit(Prim::Int(n))   => StateValue::Number(Interval::point(*n as f64)),
-            Expr::Lit(Prim::Float(f)) => StateValue::Number(Interval::point(*f)),
-            Expr::Lit(Prim::Bool(b))  => StateValue::Boolean(BoolVal::from(*b)),
-            Expr::Lit(Prim::String(_))=> StateValue::Str,
-            Expr::Lit(Prim::Null)     => StateValue::Null,
-            Expr::Lit(Prim::Unit)     => StateValue::Undefined,
+            Expr::Lit(Prim::Int(n))    => StateValue::Number(Interval::point(*n as f64)),
+            Expr::Lit(Prim::Float(f))  => StateValue::Number(Interval::point(*f)),
+            Expr::Lit(Prim::Bool(b))   => StateValue::Boolean(BoolVal::from(*b)),
+            Expr::Lit(Prim::String(s)) => StateValue::StrConst(Arc::new(BTreeSet::from([s.clone()]))),
+            Expr::Lit(Prim::Null)      => StateValue::Null,
+            Expr::Lit(Prim::Unit)      => StateValue::Undefined,
             Expr::ObjectLit(_)
             | Expr::ArrayLit(_)
-            | Expr::FnLit { .. }      => StateValue::Reference(Stability::Unstable),
-            _                         => StateValue::Top,
+            | Expr::FnLit { .. }       => StateValue::Reference(Stability::Unstable),
+            _                          => StateValue::Top,
         }
     }
 }
@@ -173,34 +190,89 @@ Pour l'instant : **connu et accepté**. L'annotation `useState<number>(null)` en
 
 ---
 
-## Option B (future) — Type tag + domaine spécialisé par label
+## Option B (implémentée) — `TypedStateStore` avec sous-stores spécialisés
 
-Au lieu d'une enum unifiée, chaque `HookLabel` est associé à un `StateType`
-inféré statiquement. Le `StateStore` devient hétérogène :
+Chaque `HookLabel` est associé à un `StateType` inféré statiquement.
+`TypedStateStore` dispatche vers un sous-store spécialisé selon ce type.
+
+### Structure (`src/domains/stores/typed_state_store.rs`)
 
 ```rust
-enum TypedStateStore {
-    Number(StateStore<Interval>),
-    Boolean(StateStore<BoolVal>),
-    Ref(StateStore<Stability>),
-    Unknown(StateStore<StateValue>),  // fallback Option A
+pub struct TypedStateStore {
+    type_map:      HashMap<HookLabel, StateType>,
+    number_store:  StateStore<Interval>,
+    bool_store:    StateStore<BoolVal>,
+    str_store:     StateStore<StrConst>,
+    ref_store:     StateStore<Stability>,
+    unknown_store: StateStore<StateValue>,  // fallback / mélange de types
 }
 ```
 
-**Avantage** : les domaines numériques/booléens sont purs, pas de `Top` parasite
-pour les mélanges de types.
+### `get()` — join avec `unknown_store`
 
-**Inconvénients** :
-1. Le trait `Transfer` doit être générique sur le type de store → casse l'API actuelle
-2. Les règles et l'engine doivent gérer plusieurs stores simultanément
-3. Complexité de migration proportionnelle au nombre de règles existantes
+Pour gérer les labels dont le type change en cours d'itération (type-mismatch),
+`get(label)` joint la valeur du sous-store spécialisé avec celle de
+`unknown_store` :
 
-**Pattern de migration depuis Option A vers B** :
-1. Introduire `StateType` enum + inférence depuis `init` (déjà dans `type_from_init`)
-2. Wrapper `StateStore<StateValue>` dans `TypedStateStore` avec dispatch par label
-3. Remplacer les usages de `StateStore::get(label)` par `TypedStateStore::get_as_number(label)` etc.
-4. Mettre à jour `Transfer::exec_stmt` pour prendre `&mut TypedStateStore` à la place
-5. Supprimer `StateValue` enum une fois tous les chemins migrés
+```rust
+// pseudo-code
+fn get(&self, label: &HookLabel) -> StateValue {
+    let typed_val = match self.type_map.get(label) {
+        Some(StateType::Number)  => self.number_store.get(label).into(),
+        Some(StateType::Boolean) => self.bool_store.get(label).into(),
+        Some(StateType::Str)     => self.str_store.get(label).into(),
+        Some(StateType::Reference) => self.ref_store.get(label).into(),
+        _ => StateValue::Bottom,
+    };
+    typed_val.join(self.unknown_store.get(label))
+}
+```
+
+Si un setter appelle le label avec un type inattendu, la valeur va dans
+`unknown_store` et remonte via le join → pas de perte silencieuse.
+
+### `update()` — dispatch par `(state_type, &val)`
+
+```rust
+fn update(&mut self, label: &HookLabel, val: StateValue) {
+    match (self.type_map.get(label), &val) {
+        (Some(StateType::Number), StateValue::Number(i))    => self.number_store.update(label, *i),
+        (Some(StateType::Boolean), StateValue::Boolean(b))  => self.bool_store.update(label, *b),
+        (Some(StateType::Str), StateValue::StrConst(_) | StateValue::Str) => self.str_store.update(label, ...),
+        (Some(StateType::Reference), StateValue::Reference(s)) => self.ref_store.update(label, *s),
+        _ => self.unknown_store.update(label, val),  // fallback
+    }
+}
+```
+
+### Interface Transfer / règles — inchangée
+
+`TypedStateStore` est interne au fixpoint dans `analyze_component`.
+Le trait `Transfer` et toutes les règles voient toujours `StateStore<StateValue>`.
+Les méthodes `to_untyped()` / `from_untyped()` assurent la conversion :
+
+```rust
+impl TypedStateStore {
+    pub fn to_untyped(&self) -> StateStore<StateValue> { ... }
+    pub fn from_untyped(store: StateStore<StateValue>, type_map: ...) -> Self { ... }
+}
+```
+
+`AnalysisResult::state_store` retourne toujours `StateStore<StateValue>` — API publique inchangée.
+
+### `StrConst` (`src/domains/impls/str_const.rs`)
+
+```rust
+pub enum StrConst {
+    Bottom,
+    Set(Arc<BTreeSet<String>>),
+    Top,
+}
+```
+
+- Seuil de widening : 4 (`|set| > 4` → widen vers `Top`)
+- `str_store` dans `TypedStateStore` utilise `StateStore<StrConst>`
+- Lors de `to_untyped()`, `StrConst::Set(s)` → `StateValue::StrConst(s)`, `StrConst::Top` → `StateValue::Str`
 
 ---
 
@@ -216,6 +288,7 @@ Précision par type :
 |---|---|---|---|
 | Number (Interval) | ✓ widening [0,+∞) | n/a | ✓ avec narrowing |
 | Boolean | ✓ oscillation true↔false | n/a | ✓ fini |
+| StrConst | ✓ track ensemble exact, widen → Str au seuil=4 | n/a | n/a |
 | Reference (Stability) | n/a | ✓ Unstable | n/a |
 | Null init → Number | ✗ faux négatif possible | n/a | n/a |
 | Top | ✗ converge immédiatement | ✗ | ✗ |
@@ -224,8 +297,12 @@ Précision par type :
 
 ## Conséquences
 
-- Nouveau fichier `src/domains/impls/state_value.rs` avec `StateValue`, `Interval`, `BoolVal`
+- `src/domains/impls/state_value.rs` — `StateValue` enum (Clone, pas Copy)
+- `src/domains/impls/interval.rs` — type `Interval` extrait
+- `src/domains/impls/bool_val.rs` — type `BoolVal` extrait
+- `src/domains/impls/str_const.rs` — enum `StrConst { Bottom, Set(Arc<BTreeSet<String>>), Top }`, seuil widening = 4
+- `src/domains/stores/typed_state_store.rs` — `TypedStateStore`, interne à `analyze_component`
 - `HookEntry::State { init }` utilisé pour inférer `StateValue::init_value(init)` au démarrage du fixpoint SCC
 - Le fixpoint SCC est **distinct** du fixpoint Stability principal (cf. [ADR-007](ADR-007-cross-domain-queries.md), Option A post-pass)
-- `StateStore<StateValue>` utilisé uniquement dans le fixpoint SCC, pas dans le fixpoint principal
+- `StateStore<StateValue>` utilisé dans l'API publique ; `TypedStateStore` transparent pour Transfer et les règles
 - Limite connue : états `T | null` initialisés à `null` peuvent produire des faux négatifs sur certains patterns

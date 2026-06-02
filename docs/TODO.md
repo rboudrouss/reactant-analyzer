@@ -31,10 +31,6 @@ useEffect(() => {
 
 Analyse intra-procédurale uniquement. État propagé d'un parent vers un enfant via props non tracé. Nécessiterait un graphe de composants + analyse inter-procédurale (scope futur, complexité O(n²)).
 
-### Narrowing sur les branches pour le fixpoint SCC
-
-`if (count < 10) setCount(count + 1)` génère un faux négatif : l'analyse widen mais `unconditionally_calls_setter` retourne false (setter dans une branche). Fix : implémenter narrowing dans `cfg_analyzer` sur les terminators `Branch { cond }` pour restreindre les intervals après les conditions.
-
 ### Block-states pour les effect bodies
 
 `AnalysisResult::block_states` ne contient que les états du render CFG. Les règles qui veulent analyser l'intérieur des effect bodies re-calculent manuellement. Ajouter `effect_block_states: HashMap<HookLabel, HashMap<BlockId, AbstractEnv<D>>>`.

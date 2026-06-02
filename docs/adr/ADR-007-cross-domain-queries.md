@@ -1,8 +1,6 @@
-# ADR-007 : Cross-domain queries — AnalysisCtx now, typed Manager later
+# ADR-007 : Cross-domain queries — QueryContext trait (B3 implémenté)
 
-## <!> Outdated ?
-
-- **Statut** : Accepté (B3 actif, B1 documenté pour migration future)
+- **Statut** : Implémenté (B3 actif, B1 groundwork en place)
 - **Date** : 2026-06-02
 
 ## Contexte
@@ -31,21 +29,15 @@ Le type de retour est polymorphe (`'r`) et statiquement sûr grâce aux GADTs OC
 
 ---
 
-## Decision A : Solution — `AnalysisCtx` struct (B3)
+## Decision A : Solution implémentée — `QueryContext` trait (B3)
 
-Passer une struct concrète en lecture seule à `exec_stmt` / `eval_expr` :
+Le trait `Transfer` prend `ctx: &dyn QueryContext` — `dyn` (pas `impl`) pour garder `Transfer` object-safe (pas de paramètre générique dans les méthodes).
 
 ```rust
-pub struct AnalysisCtx<'a> {
-    pub stability_env:   &'a AbstractEnv<Stability>,
-    pub stability_state: &'a StateStore<Stability>,
-    // ajouter un champ par domaine supplémentaire
+pub trait QueryContext {
+    fn state_value_of(&self, expr: &Expr) -> StateValue;
 }
-```
 
-Le trait `Transfer` devient :
-
-```rust
 pub trait Transfer {
     type Domain: AbstractDomain;
 
@@ -55,7 +47,7 @@ pub trait Transfer {
         env: &AbstractEnv<Self::Domain>,
         state: &StateStore<Self::Domain>,
         memo: &MemoStore<Self::Domain>,
-        ctx: &AnalysisCtx<'_>,        // ← nouveau
+        ctx: &dyn QueryContext,
     ) -> Self::Domain;
 
     fn exec_stmt(
@@ -64,19 +56,22 @@ pub trait Transfer {
         env: &mut AbstractEnv<Self::Domain>,
         state: &mut StateStore<Self::Domain>,
         memo: &mut MemoStore<Self::Domain>,
-        ctx: &AnalysisCtx<'_>,        // ← nouveau
+        ctx: &dyn QueryContext,
     );
 }
 ```
 
-**Avantages** : pas de type erasure, pas de lifetime hell, aucun downcast, immédiatement lisible.  
-**Limite** : chaque nouveau domaine ajoute un champ à `AnalysisCtx`. Acceptable à ≤5 domaines.
+### Trois implémentations de `QueryContext`
+
+**`NullCtx`** — retourne `Top` pour toute query. Utilisé dans les tests et comme base de récursion dans `recompute_memo`.
+
+**`FixpointCtx<'a>`** — utilisé pendant le calcul du point fixe. Enveloppe `&StateStore<StateValue>` et `&MemoStore<StateValue>`. Passé à `analyze_cfg`, scopé à chaque appel pour éviter les conflits d'emprunt avec `memo_store.set`.
+
+**`AnalysisQueryCtx<'a>`** — utilisé post-point-fixe. Enveloppe `&AnalysisResult<StateValue>`.
 
 ---
 
-## Decision B : Solution future — Manager générique (B1)
-
-Quand le nombre de domaines dépasse ~5, migrer vers un Manager typé :
+## Decision B : Migration future — Manager générique (B1)
 
 ### Le problème : les GADTs n'existent pas en Rust
 
@@ -97,9 +92,7 @@ struct ProductManager<M1, M2>(M1, M2);
 
 impl<M1: Manager, M2: Manager> Manager for ProductManager<M1, M2> {
     fn ask<Q: DomainQuery>(&self, q: Q) -> Option<Q::Result> {
-        // M1::ask retourne Option<Q::Result>, M2::ask retourne Option<Q::Result>
-        // mais on ne peut pas savoir statiquement si M1 ou M2 gère Q
-        // → requires specialization (#31844), unstable depuis 2015
+        // requires specialization (#31844), unstable depuis 2015
         self.0.ask(q).or_else(|| self.1.ask(q))
         //                              ^^ q déjà moved
     }
@@ -115,11 +108,8 @@ impl<M1: Manager, M2: Manager> Manager for ProductManager<M1, M2> {
 ### Solution B1 viable en Rust stable : marker types + `where` bounds
 
 ```rust
-// Chaque domaine déclare les queries qu'il répond
 struct StabilityOf<'a>(pub &'a Expr);
-struct SetterEffectOf(pub HookLabel);
 
-// Chaque Transfer implémente Queryable<Q> pour ses queries
 trait Queryable<Q: DomainQuery> {
     fn ask(&self, q: &Q, env: &AbstractEnv<Self::Domain>, ...) -> Q::Result
     where Self: Transfer;
@@ -131,7 +121,6 @@ impl Queryable<StabilityOf<'_>> for StabilityTransfer {
     }
 }
 
-// ProductTransfer délègue au premier sous-domaine qui implémente Queryable<Q>
 impl<T1, T2, Q> Queryable<Q> for ProductTransfer<T1, T2>
 where
     T1: Transfer + Queryable<Q>,
@@ -144,29 +133,19 @@ where
 ```
 
 **Avantage** : 100% stable Rust, type-safe, zéro overhead runtime.  
-**Limite** : si T1 ne gère pas Q mais T2 le fait, il faut un impl séparé `where T2: Queryable<Q>`. Avec N domaines et M queries, ça donne potentiellement N×M impls dans `ProductTransfer`. Un macro `impl_queryable_product!` peut générer ça automatiquement.
+**Limite** : si T1 ne gère pas Q mais T2 le fait, il faut un impl séparé `where T2: Queryable<Q>`. Un macro `impl_queryable_product!` peut générer ça automatiquement.
 
-### Pattern de migration depuis B3 vers B1
-
-1. Remplacer `&AnalysisCtx<'_>` dans le trait `Transfer` par `ctx: &impl QueryContext`
-2. `QueryContext` est un trait avec des méthodes concrètes (pas de GADT) :
-   ```rust
-   trait QueryContext {
-       fn stability_of(&self, expr: &Expr) -> Stability;
-       fn setter_effect_of(&self, label: HookLabel) -> SetterEffect;
-   }
-   ```
-3. Implémenter `QueryContext` pour `AnalysisCtx` (migration transparente, même API)
-4. Implémenter `QueryContext` pour `ProductManager<T1, T2>` par délégation
-5. Supprimer `AnalysisCtx` une fois tous les sites migrés
-
-Cette migration est mécanique et ne casse pas les règles existantes.
+Le groundwork existe déjà : `DomainQuery` et `Queryable<Q>` sont définis dans `query.rs` ; `ProductTransfer` délègue via ce trait dans `product.rs`. Aucun type de query concret n'est encore défini — c'est le travail restant.
 
 ---
 
 ## Conséquences
 
-- **Maintenant** : `Transfer` prend `ctx: &AnalysisCtx<'_>`. `SetterEffect` lit `ctx.stability_env` directement.
-- **Futur (>5 domaines)** : migrer vers `ctx: &impl QueryContext` via le pattern ci-dessus.
-- `StabilityTransfer` passe `ctx` sans l'utiliser (`let _ = ctx`) — overhead nul.
-- Chaque nouveau domaine ajoute un champ à `AnalysisCtx` ET une méthode à `QueryContext` lors de la migration.
+**Actuel** :
+- `Transfer` prend `ctx: &dyn QueryContext`. `SetterEffect` appelle `ctx.state_value_of(expr)`.
+- `NullCtx` / `FixpointCtx` / `AnalysisQueryCtx` couvrent les trois phases d'utilisation.
+- `dyn` assure l'object-safety de `Transfer` (pas de monomorphisation par contexte).
+
+**Reste à faire** :
+- Définir des types de query concrets (`StabilityOf`, etc.) pour les requêtes cross-domaine au-delà de `state_value_of`.
+- Implémenter `Queryable<Q>` sur les transfers concernés et étendre `QueryContext` ou migrer vers le pattern B1 si le nombre de domaines dépasse ~5.
