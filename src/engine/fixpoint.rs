@@ -51,6 +51,20 @@ pub fn analyze_component<T: Transfer>(
     let mut iteration: usize = 0;
     let mut block_states: HashMap<BlockId, AbstractEnv<T::Domain>>;
 
+    // Seed each useState label with its init expression so that interval-based
+    // domains can detect divergence (e.g. setState(count + 1) with useState(0)).
+    {
+        let init_env = AbstractEnv::bottom();
+        let init_memo = MemoStore::new();
+        for hook in &hooks {
+            if let HookEntry::State { label, init } = hook {
+                let init_val =
+                    transfer.eval_expr(init, &init_env, &state_store, &init_memo);
+                state_store.update(*label, init_val);
+            }
+        }
+    }
+
     loop {
         // ── Render pass ───────────────────────────────────────────────────────
         let (bs, state_from_render) = analyze_cfg::<T>(
@@ -247,8 +261,9 @@ fn collect_effect_info(hooks: &[HookEntry]) -> HashMap<HookLabel, EffectInfo> {
         .filter_map(|h| {
             if let HookEntry::Effect { label, body_cfg, deps } = h {
                 let free_vars = compute_free_vars(body_cfg);
+                let has_deps_array = deps.is_some();
                 let declared_deps = deps.clone().unwrap_or_default();
-                Some((*label, EffectInfo { label: *label, free_vars, declared_deps }))
+                Some((*label, EffectInfo { label: *label, free_vars, declared_deps, has_deps_array }))
             } else {
                 None
             }
@@ -321,7 +336,7 @@ fn collect_used_vars(expr: &Expr, out: &mut HashSet<Var>) {
 mod tests {
     use super::*;
     use crate::{
-        domains::{Stability, StabilityTransfer},
+        domains::{Stability, StateValue, StateValueTransfer, Interval},
         ir::{
             cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator},
             component::ComponentIR,
@@ -361,30 +376,30 @@ mod tests {
     #[test]
     fn no_hooks_converges_immediately() {
         let comp = component(vec![], vec![]);
-        let result = analyze_component(comp, &StabilityTransfer, &Config::default());
-        assert_eq!(result.state_store.get(0), Stability::Bottom);
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+        assert_eq!(result.state_store.get(0), StateValue::Bottom);
         assert!(result.widened_labels.is_empty());
         assert_eq!(result.hook_calls.len(), 0);
     }
 
     #[test]
-    fn state_hook_no_setter_call_stays_bottom() {
-        // useState with no setState → state[0] stays Bottom
+    fn state_hook_no_setter_call_seeds_init_value() {
+        // useState(0) with no setState → state[0] seeded to Number([0,0]) from init
         let hooks = vec![HookEntry::State { label: 0, init: Expr::Lit(Prim::Int(0)) }];
         let render_stmts = vec![Stmt::Let {
             var: "n".to_string(),
             rhs: Expr::StateVal(0),
         }];
         let comp = component(hooks, render_stmts);
-        let result = analyze_component(comp, &StabilityTransfer, &Config::default());
-        assert_eq!(result.state_store.get(0), Stability::Bottom);
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+        assert_eq!(result.state_store.get(0), StateValue::Number(Interval::point(0.0)));
         assert!(result.widened_labels.is_empty());
     }
 
     #[test]
-    fn effect_with_stable_setstate_converges_in_two_iterations() {
+    fn effect_with_stable_setstate_converges() {
         // useEffect(() => { setN(42); }, [])
-        // 42 is Lit → Stable; state[0] becomes Stable after iter 1, stays Stable iter 2.
+        // 42 → Number([42,42]); init is 0 → Number([0,0]); settles at Number([42,42]).
         let mut eff_blocks = HashMap::new();
         eff_blocks.insert(
             0,
@@ -411,15 +426,20 @@ mod tests {
             Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
         ];
         let comp = component(hooks, render_stmts);
-        let result = analyze_component(comp, &StabilityTransfer, &Config::default());
-        assert_eq!(result.state_store.get(0), Stability::Stable);
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+        // Init = Number([0,0]); setN(42) joins on top → settles at Number([0,42]).
+        // The interval [0,42] covers both the init value and the set value.
+        assert_eq!(
+            result.state_store.get(0),
+            StateValue::Number(Interval { lo: 0.0, hi: 42.0 })
+        );
         assert!(result.widened_labels.is_empty());
     }
 
     #[test]
     fn effect_with_unstable_setstate_converges() {
         // useEffect(() => { setN({}); }, [])
-        // {} is Unstable; state[0] becomes Unstable after iter 1, stays Unstable iter 2.
+        // {} → Reference(Unstable); cross-type join with init Number → Top; stable at Top.
         let mut eff_blocks = HashMap::new();
         eff_blocks.insert(
             0,
@@ -442,8 +462,9 @@ mod tests {
             HookEntry::Effect { label: 1, body_cfg: eff_cfg, deps: Some(vec![]) },
         ];
         let comp = component(hooks, vec![]);
-        let result = analyze_component(comp, &StabilityTransfer, &Config::default());
-        assert_eq!(result.state_store.get(0), Stability::Unstable);
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+        // Init = Number([0,0]); setN({}) joins cross-type → Top; settles at Top.
+        assert_eq!(result.state_store.get(0), StateValue::Top);
         assert!(result.widened_labels.is_empty());
     }
 
@@ -473,13 +494,13 @@ mod tests {
         ];
         let comp = component(hooks, vec![]);
         let config = Config { widen_threshold: 1 };
-        let result = analyze_component(comp, &StabilityTransfer, &config);
+        let result = analyze_component(comp, &StateValueTransfer, &config);
         assert!(result.widened_labels.contains(&0));
     }
 
     #[test]
     fn memo_store_recomputed_from_deps() {
-        // useMemo(() => x, [x]) where x = Stable → memo[0] = Stable
+        // useMemo(() => x, [x]) where x = Number([1,1]) (stable point) → memo[0] = Reference(Stable)
         let hooks = vec![
             HookEntry::Memo {
                 label: 0,
@@ -492,8 +513,9 @@ mod tests {
             Stmt::Let { var: "val".to_string(), rhs: Expr::MemoVal(0) },
         ];
         let comp = component(hooks, render_stmts);
-        let result = analyze_component(comp, &StabilityTransfer, &Config::default());
-        assert_eq!(result.memo_store.get(0), Stability::Stable);
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+        // dep x = Number([1,1]).to_stability() = Stable → Reference(Stable)
+        assert_eq!(result.memo_store.get(0), StateValue::Reference(Stability::Stable));
     }
 
     #[test]
@@ -515,7 +537,7 @@ mod tests {
 
         let hooks = vec![HookEntry::Effect { label: 0, body_cfg: eff_cfg, deps: Some(vec![]) }];
         let comp = component(hooks, vec![]);
-        let result = analyze_component(comp, &StabilityTransfer, &Config::default());
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         let info = &result.effect_info[&0];
         assert!(info.free_vars.contains("n"));
         assert!(info.free_vars.contains("setN"));
@@ -524,7 +546,7 @@ mod tests {
     #[test]
     fn two_block_cfg_propagates_exit_env() {
         // block 0: let x = 42; jump 1
-        // block 1: return x   ← exit env should have x=Stable
+        // block 1: return x   ← exit env should have x=Number([42,42])
         let mut blocks = HashMap::new();
         blocks.insert(
             0,
@@ -555,7 +577,7 @@ mod tests {
             },
             hooks: vec![],
         };
-        let result = analyze_component(comp, &StabilityTransfer, &Config::default());
-        assert_eq!(result.block_states[&1].lookup("x"), Stability::Stable);
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+        assert_eq!(result.block_states[&1].lookup("x"), StateValue::Number(Interval::point(42.0)));
     }
 }

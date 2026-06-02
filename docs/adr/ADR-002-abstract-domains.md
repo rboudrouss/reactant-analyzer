@@ -66,4 +66,5 @@ Override via config Mopsa-style.
 - `src/domains/state_store.rs`, `memo_store.rs`, `ref_store.rs` implémentent les 3 stores.
 - Chaque domaine implémente le trait `AbstractDomain` (join, meet, widen, subset).
 - Domaines composables en produit réduit via `src/domains/product.rs`.
-- Extension future : `ConstantDomain` ajouté en produit sans modifier les autres domaines.
+- Communication cross-domaine (ex. `SetterEffect` lisant `Stability`) via `AnalysisCtx` struct — voir [ADR-007](ADR-007-cross-domain-queries.md) pour la décision et la migration future vers un Manager générique.
+- Extension future : `SetterEffect` ou `ConstantDomain` ajoutés en produit sans modifier les autres domaines.

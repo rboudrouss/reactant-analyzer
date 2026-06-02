@@ -5,7 +5,7 @@ use oxc_parser::{ParseOptions, Parser};
 use oxc_span::SourceType;
 
 use reactant::{
-    domains::StabilityTransfer,
+    domains::StateValueTransfer,
     engine::{Config, analyze_component},
     lowering::lower_program,
     rules::all_rules,
@@ -81,7 +81,7 @@ fn analyze_file(path: &Path) -> usize {
         let name = comp.name.clone();
         let hook_count = comp.hooks.len();
 
-        let result = analyze_component(comp, &StabilityTransfer, &config);
+        let result = analyze_component(comp, &StateValueTransfer, &config);
 
         let mut diags: Vec<_> = rules.iter().flat_map(|r| r.check(&result)).collect();
         diags.sort_by_key(|d| d.rule);

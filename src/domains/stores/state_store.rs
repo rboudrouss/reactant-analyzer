@@ -21,7 +21,7 @@ impl<D: AbstractDomain> StateStore<D> {
 
     /// Returns `D::bottom()` for labels not yet updated by any setter call.
     pub fn get(&self, label: HookLabel) -> D {
-        self.0.get(&label).copied().unwrap_or_else(D::bottom)
+        self.0.get(&label).cloned().unwrap_or_else(D::bottom)
     }
 
     /// Monotone update: `self[label] = self[label] ⊔ val`.
@@ -33,16 +33,22 @@ impl<D: AbstractDomain> StateStore<D> {
     /// Pointwise join of two stores.
     pub fn join(&self, other: &Self) -> Self {
         let mut out = self.0.clone();
-        for (&k, &v) in &other.0 {
-            let cur = out.get(&k).copied().unwrap_or_else(D::bottom);
-            out.insert(k, cur.join(&v));
+        for (&k, v) in &other.0 {
+            let cur = out.get(&k).cloned().unwrap_or_else(D::bottom);
+            out.insert(k, cur.join(v));
         }
         StateStore(out)
     }
 
-    /// Widening = join (finite-height lattice).
+    /// Widening — pointwise `D::widen`. Critical for interval domains where
+    /// widen ≠ join (bounds jump to ±∞ instead of hull).
     pub fn widen(&self, other: &Self) -> Self {
-        self.join(other)
+        let mut out = self.0.clone();
+        for (&k, v) in &other.0 {
+            let cur = out.get(&k).cloned().unwrap_or_else(D::bottom);
+            out.insert(k, cur.widen(v));
+        }
+        StateStore(out)
     }
 
     /// Lattice bottom — all labels have `D::bottom()`.

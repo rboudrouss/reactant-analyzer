@@ -24,7 +24,7 @@ impl<D: AbstractDomain> MemoStore<D> {
 
     /// Returns `D::top()` for labels not yet computed (conservative).
     pub fn get(&self, label: HookLabel) -> D {
-        self.0.get(&label).copied().unwrap_or_else(D::top)
+        self.0.get(&label).cloned().unwrap_or_else(D::top)
     }
 
     /// Store a precomputed domain value for a label.

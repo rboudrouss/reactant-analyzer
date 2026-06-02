@@ -1,15 +1,19 @@
 pub mod conditional_hook;
 pub mod infinite_loop;
+pub mod infinite_loop_render;
 pub mod missing_deps;
 pub mod redundant_set_state;
+pub mod unnecessary_rerender;
 
 pub use conditional_hook::ConditionalHook;
 pub use infinite_loop::InfiniteLoop;
+pub use infinite_loop_render::InfiniteLoopRender;
 pub use missing_deps::MissingDeps;
 pub use redundant_set_state::RedundantSetState;
+pub use unnecessary_rerender::UnnecessaryRerender;
 
 use crate::{
-    domains::Stability,
+    domains::StateValue,
     engine::AnalysisResult,
     ir::types::{HookLabel, Var},
 };
@@ -46,7 +50,7 @@ impl Diagnostic {
 /// Rules are stateless; adding a new rule = new struct + `impl Rule`.
 pub trait Rule {
     fn name(&self) -> &'static str;
-    fn check(&self, result: &AnalysisResult<Stability>) -> Vec<Diagnostic>;
+    fn check(&self, result: &AnalysisResult<StateValue>) -> Vec<Diagnostic>;
 }
 
 /// Instantiate all built-in rules.
@@ -55,6 +59,8 @@ pub fn all_rules() -> Vec<Box<dyn Rule>> {
         Box::new(ConditionalHook),
         Box::new(MissingDeps),
         Box::new(RedundantSetState),
+        Box::new(UnnecessaryRerender),
+        Box::new(InfiniteLoopRender),
         Box::new(InfiniteLoop),
     ]
 }

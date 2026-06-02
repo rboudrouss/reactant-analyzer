@@ -1,7 +1,13 @@
+pub mod context;
 pub mod impls;
+pub mod product;
+pub mod query;
 pub mod stores;
 
-pub use impls::{Stability, StabilityTransfer};
+pub use context::{AnalysisQueryCtx, QueryContext};
+pub use impls::{BoolVal, Interval, Stability, StabilityTransfer, StateValue, StateValueTransfer};
+pub use product::{ProductDomain, ProductTransfer};
+pub use query::{DomainQuery, Queryable};
 pub use stores::{AbstractEnv, MemoStore, StateStore};
 
 use crate::ir::{Expr, Stmt};
@@ -13,13 +19,22 @@ use crate::ir::{Expr, Stmt};
 /// - `PartialEq`     — needed for convergence checks
 /// - `PartialOrd`    — lattice order (a ≤ b = a ⊑ b)
 /// - `Debug`         — required for diagnostics and derive macros on generic containers
-pub trait AbstractDomain: Clone + Copy + PartialEq + PartialOrd + std::fmt::Debug {
+pub trait AbstractDomain: Clone + PartialEq + PartialOrd + std::fmt::Debug {
     fn bottom() -> Self;
     fn top() -> Self;
     fn is_bottom(&self) -> bool;
     fn join(&self, other: &Self) -> Self;
     fn meet(&self, other: &Self) -> Self;
     fn widen(&self, other: &Self) -> Self;
+
+    // Branch narrowing: default = identity (sound, imprecise).
+    // Override for numeric domains to refine interval bounds on branch conditions.
+    fn narrow_lt(self, _v: f64) -> Self { self }
+    fn narrow_leq(self, _v: f64) -> Self { self }
+    fn narrow_gt(self, _v: f64) -> Self { self }
+    fn narrow_geq(self, _v: f64) -> Self { self }
+    fn narrow_eq(self, _v: f64) -> Self { self }
+    fn narrow_neq(self, _v: f64) -> Self { self }
 }
 
 // ── Transfer trait ────────────────────────────────────────────────────────────

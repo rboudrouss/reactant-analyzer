@@ -33,7 +33,7 @@ impl<D: AbstractDomain> AbstractEnv<D> {
 
     /// Conservative lookup: `D::top()` for any variable not in the map.
     pub fn lookup(&self, var: &str) -> D {
-        self.stabs.get(var).copied().unwrap_or_else(D::top)
+        self.stabs.get(var).cloned().unwrap_or_else(D::top)
     }
 
     /// Returns true if `var` has an explicit binding in this env.
@@ -60,8 +60,8 @@ impl<D: AbstractDomain> AbstractEnv<D> {
     /// Pointwise join. Variables present in only one side → `D::top()`.
     pub fn join(&self, other: &Self) -> Self {
         let mut stabs = HashMap::new();
-        for (k, &v) in &self.stabs {
-            let w = other.stabs.get(k).copied().unwrap_or_else(D::top);
+        for (k, v) in &self.stabs {
+            let w = other.stabs.get(k).cloned().unwrap_or_else(D::top);
             stabs.insert(k.clone(), v.join(&w));
         }
         for (k, _) in &other.stabs {
@@ -70,6 +70,25 @@ impl<D: AbstractDomain> AbstractEnv<D> {
             }
         }
         // Setter bindings are structural (fixed by CFG); union is safe.
+        let mut setter_bindings = self.setter_bindings.clone();
+        for (k, &v) in &other.setter_bindings {
+            setter_bindings.entry(k.clone()).or_insert(v);
+        }
+        AbstractEnv { stabs, setter_bindings }
+    }
+
+    /// Pointwise widening. Used for back-edge merging in `analyze_cfg`.
+    pub fn widen(&self, other: &Self) -> Self {
+        let mut stabs = HashMap::new();
+        for (k, v) in &self.stabs {
+            let w = other.stabs.get(k).cloned().unwrap_or_else(D::top);
+            stabs.insert(k.clone(), v.widen(&w));
+        }
+        for (k, _) in &other.stabs {
+            if !self.stabs.contains_key(k) {
+                stabs.insert(k.clone(), D::top());
+            }
+        }
         let mut setter_bindings = self.setter_bindings.clone();
         for (k, &v) in &other.setter_bindings {
             setter_bindings.entry(k.clone()).or_insert(v);
@@ -86,8 +105,8 @@ impl<D: AbstractDomain> AbstractEnv<D> {
     /// Missing keys use `D::bottom()` so that `bottom().leq(anything) = true`.
     pub fn leq(&self, other: &Self) -> bool {
         for k in self.stabs.keys() {
-            let a = self.stabs.get(k).copied().unwrap_or_else(D::bottom);
-            let b = other.stabs.get(k).copied().unwrap_or_else(D::bottom);
+            let a = self.stabs.get(k).cloned().unwrap_or_else(D::bottom);
+            let b = other.stabs.get(k).cloned().unwrap_or_else(D::bottom);
             match a.partial_cmp(&b) {
                 Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) => {}
                 _ => return false,

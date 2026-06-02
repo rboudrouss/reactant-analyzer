@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::{
-    domains::Stability,
+    domains::StateValue,
     engine::AnalysisResult,
     ir::{expr::Expr, types::Var},
 };
@@ -9,7 +9,7 @@ use crate::{
 use super::{Diagnostic, Rule};
 
 /// Fires when a useEffect free variable is not listed in the deps array
-/// and has non-Stable stability (would cause stale-closure bugs).
+/// and is not stable (would cause stale-closure bugs).
 pub struct MissingDeps;
 
 impl Rule for MissingDeps {
@@ -17,24 +17,15 @@ impl Rule for MissingDeps {
         "missing-deps"
     }
 
-    fn check(&self, result: &AnalysisResult<Stability>) -> Vec<Diagnostic> {
+    fn check(&self, result: &AnalysisResult<StateValue>) -> Vec<Diagnostic> {
         let env_exit = result.exit_env();
         let mut diags = Vec::new();
 
         for (label, info) in &result.effect_info {
             let declared: HashSet<Var> = dep_var_names(&info.declared_deps);
 
-            // No deps array (None) → runs every render → no stale closure possible.
-            // Empty deps ([]) means it was explicitly declared; missing vars may stale.
-            if info.declared_deps.is_empty() && declared.is_empty() {
-                // Distinguish: were deps explicitly `[]` (declared as empty)?
-                // Our EffectInfo stores declared_deps as the inner Vec; if `deps: None`
-                // we can't distinguish from `deps: Some(vec![])` here.
-                // Per spec: treat absent dep array as "runs every render" = no warning.
-                // However, since we can't distinguish them, we skip if declared is empty
-                // AND the info was built from a `None` deps — which we can't tell here.
-                // Conservative: if declared is empty, skip (avoids false positives on
-                // effects without a deps array).
+            if !info.has_deps_array {
+                // deps: None → runs every render → closure always fresh → no stale capture possible.
                 continue;
             }
 
@@ -47,15 +38,15 @@ impl Rule for MissingDeps {
                 if !env_exit.contains(var) {
                     continue;
                 }
-                let stab = env_exit.lookup(var);
-                if stab != Stability::Stable {
+                let val = env_exit.lookup(var);
+                if !val.is_stable() {
                     diags.push(
                         Diagnostic::new(
                             "missing-deps",
                             format!(
                                 "variable `{}` is used in effect {} but not in its deps array \
-                                 (stability: {:?})",
-                                var, label, stab
+                                 (value: {:?})",
+                                var, label, val
                             ),
                         )
                         .with_label(*label)
@@ -82,7 +73,7 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
     use crate::{
-        domains::{Stability, stores::{AbstractEnv, MemoStore, StateStore}},
+        domains::{Stability, StateValue, stores::{AbstractEnv, MemoStore, StateStore}},
         engine::{AnalysisResult, EffectInfo},
         ir::{
             cfg::{BasicBlock, CFG, Terminator},
@@ -102,10 +93,10 @@ mod tests {
     }
 
     fn make_result(
-        block_states: HashMap<BlockId, AbstractEnv<Stability>>,
+        block_states: HashMap<BlockId, AbstractEnv<StateValue>>,
         effect_info: HashMap<HookLabel, EffectInfo>,
         render_cfg: CFG,
-    ) -> AnalysisResult<Stability> {
+    ) -> AnalysisResult<StateValue> {
         AnalysisResult {
             state_store: StateStore::bottom(),
             memo_store: MemoStore::new(),
@@ -118,28 +109,31 @@ mod tests {
         }
     }
 
-    fn env_with(vars: &[(&str, Stability)]) -> AbstractEnv<Stability> {
+    fn env_with(vars: &[(&str, StateValue)]) -> AbstractEnv<StateValue> {
         let mut env = AbstractEnv::new();
-        for (name, stab) in vars {
-            env.extend((*name).to_string(), *stab);
+        for (name, val) in vars {
+            env.extend((*name).to_string(), val.clone());
         }
         env
     }
 
     #[test]
     fn missing_unstable_dep_warns() {
-        // Effect uses "n" (Unstable), deps = []. "n" not in declared deps.
         let mut effect_info = HashMap::new();
         effect_info.insert(
             0,
             EffectInfo {
                 label: 0,
                 free_vars: HashSet::from(["n".to_string()]),
-                declared_deps: vec![Expr::Lit(Prim::Bool(true))], // non-empty to trigger check
+                declared_deps: vec![Expr::Lit(Prim::Bool(true))],
+                has_deps_array: true,
             },
         );
         let mut block_states = HashMap::new();
-        block_states.insert(0, env_with(&[("n", Stability::Unstable)]));
+        block_states.insert(
+            0,
+            env_with(&[("n", StateValue::Reference(Stability::Unstable))]),
+        );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
         let diags = MissingDeps.check(&result);
@@ -149,18 +143,21 @@ mod tests {
 
     #[test]
     fn missing_stable_dep_no_warning() {
-        // Effect uses "setN" (Stable), deps = [] (non-empty trigger) → no warning
         let mut effect_info = HashMap::new();
         effect_info.insert(
             0,
             EffectInfo {
                 label: 0,
                 free_vars: HashSet::from(["setN".to_string()]),
-                declared_deps: vec![Expr::Lit(Prim::Unit)], // non-empty
+                declared_deps: vec![Expr::Lit(Prim::Unit)],
+                has_deps_array: true,
             },
         );
         let mut block_states = HashMap::new();
-        block_states.insert(0, env_with(&[("setN", Stability::Stable)]));
+        block_states.insert(
+            0,
+            env_with(&[("setN", StateValue::Reference(Stability::Stable))]),
+        );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
         assert!(MissingDeps.check(&result).is_empty());
@@ -168,7 +165,6 @@ mod tests {
 
     #[test]
     fn dep_declared_no_warning() {
-        // Effect uses "n" (Unstable), "n" is in declared deps → no warning
         let mut effect_info = HashMap::new();
         effect_info.insert(
             0,
@@ -176,18 +172,22 @@ mod tests {
                 label: 0,
                 free_vars: HashSet::from(["n".to_string()]),
                 declared_deps: vec![Expr::Var("n".to_string())],
+                has_deps_array: true,
             },
         );
         let mut block_states = HashMap::new();
-        block_states.insert(0, env_with(&[("n", Stability::Unstable)]));
+        block_states.insert(
+            0,
+            env_with(&[("n", StateValue::Reference(Stability::Unstable))]),
+        );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
         assert!(MissingDeps.check(&result).is_empty());
     }
 
     #[test]
-    fn empty_declared_deps_skipped() {
-        // declared_deps empty → treated as "no deps array" → skip
+    fn no_deps_array_skipped() {
+        // deps: None → no deps argument passed → runs every render → skip.
         let mut effect_info = HashMap::new();
         effect_info.insert(
             0,
@@ -195,19 +195,48 @@ mod tests {
                 label: 0,
                 free_vars: HashSet::from(["n".to_string()]),
                 declared_deps: vec![],
+                has_deps_array: false,
             },
         );
         let mut block_states = HashMap::new();
-        block_states.insert(0, env_with(&[("n", Stability::Unstable)]));
+        block_states.insert(
+            0,
+            env_with(&[("n", StateValue::Reference(Stability::Unstable))]),
+        );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
         assert!(MissingDeps.check(&result).is_empty());
     }
 
     #[test]
-    fn missing_unknown_dep_warns() {
-        // Unknown stability (explicitly tracked) triggers warning (not Stable).
-        // x IS in env with Unknown stability → should warn.
+    fn mount_only_empty_deps_array_with_unstable_free_var_warns() {
+        // useEffect(() => { doX(n) }, [])
+        // deps: Some([]) = mount-only effect with explicit empty array.
+        // n is free and unstable → stale closure on all renders after mount.
+        let mut effect_info = HashMap::new();
+        effect_info.insert(
+            0,
+            EffectInfo {
+                label: 0,
+                free_vars: HashSet::from(["n".to_string()]),
+                declared_deps: vec![],
+                has_deps_array: true,
+            },
+        );
+        let mut block_states = HashMap::new();
+        block_states.insert(
+            0,
+            env_with(&[("n", StateValue::Reference(Stability::Unstable))]),
+        );
+
+        let result = make_result(block_states, effect_info, trivial_cfg());
+        let diags = MissingDeps.check(&result);
+        assert_eq!(diags.len(), 1, "mount-only effect with empty deps array should warn for unstable free var");
+        assert_eq!(diags[0].var.as_deref(), Some("n"));
+    }
+
+    #[test]
+    fn missing_unknown_val_warns() {
         let mut effect_info = HashMap::new();
         effect_info.insert(
             0,
@@ -215,11 +244,11 @@ mod tests {
                 label: 0,
                 free_vars: HashSet::from(["x".to_string()]),
                 declared_deps: vec![Expr::Lit(Prim::Unit)],
+                has_deps_array: true,
             },
         );
         let mut block_states = HashMap::new();
-        // x explicitly bound to Unknown → should trigger warning.
-        block_states.insert(0, env_with(&[("x", Stability::Unknown)]));
+        block_states.insert(0, env_with(&[("x", StateValue::Top)]));
 
         let result = make_result(block_states, effect_info, trivial_cfg());
         let diags = MissingDeps.check(&result);
@@ -229,7 +258,6 @@ mod tests {
 
     #[test]
     fn untracked_global_not_warned() {
-        // Vars not in env (globals like String, fetch, console) are skipped.
         let mut effect_info = HashMap::new();
         effect_info.insert(
             0,
@@ -237,10 +265,10 @@ mod tests {
                 label: 0,
                 free_vars: HashSet::from(["fetch".to_string()]),
                 declared_deps: vec![Expr::Lit(Prim::Unit)],
+                has_deps_array: true,
             },
         );
         let mut block_states = HashMap::new();
-        // fetch not in env at all → skip (treated as global)
         block_states.insert(0, env_with(&[]));
 
         let result = make_result(block_states, effect_info, trivial_cfg());

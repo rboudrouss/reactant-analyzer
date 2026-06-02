@@ -1,5 +1,5 @@
 use crate::{
-    domains::Stability,
+    domains::StateValue,
     engine::{AnalysisResult, dominates},
     ir::cfg::Terminator,
 };
@@ -18,7 +18,7 @@ impl Rule for ConditionalHook {
         "conditional-hook"
     }
 
-    fn check(&self, result: &AnalysisResult<Stability>) -> Vec<Diagnostic> {
+    fn check(&self, result: &AnalysisResult<StateValue>) -> Vec<Diagnostic> {
         let exits: Vec<_> = result
             .render_cfg
             .blocks
@@ -55,7 +55,7 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
     use crate::{
-        domains::{Stability, StabilityTransfer, stores::{MemoStore, StateStore}},
+        domains::{StateValue, StateValueTransfer, stores::{MemoStore, StateStore}},
         engine::{AnalysisResult, HookCallInfo, HookKind, analyze_component, Config},
         ir::{
             cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator},
@@ -67,7 +67,7 @@ mod tests {
         rules::Rule,
     };
 
-    fn make_result(render_cfg: CFG, hook_calls: Vec<HookCallInfo>) -> AnalysisResult<Stability> {
+    fn make_result(render_cfg: CFG, hook_calls: Vec<HookCallInfo>) -> AnalysisResult<StateValue> {
         AnalysisResult {
             state_store: StateStore::bottom(),
             memo_store: MemoStore::new(),
@@ -187,7 +187,7 @@ mod tests {
             render_cfg: CFG { entry: 0, blocks, edges: vec![] },
             hooks,
         };
-        let result = analyze_component(comp, &StabilityTransfer, &Config::default());
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(ConditionalHook.check(&result).is_empty());
     }
 
@@ -239,7 +239,7 @@ mod tests {
             },
             hooks,
         };
-        let result = analyze_component(comp, &StabilityTransfer, &Config::default());
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(!ConditionalHook.check(&result).is_empty());
     }
 }

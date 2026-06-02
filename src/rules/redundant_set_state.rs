@@ -1,16 +1,20 @@
 use crate::{
-    domains::{Stability, StabilityTransfer, Transfer},
+    domains::{AbstractEnv, MemoStore, StateStore, StateValue, StateValueTransfer, Transfer},
     engine::AnalysisResult,
-    ir::{expr::Expr, stmt::Stmt},
+    ir::{cfg::CFG, expr::Expr, hooks::HookEntry, stmt::Stmt},
 };
 
 use super::{Diagnostic, Rule};
 
-/// Fires when `setState` is called with a value that is Stable AND the current
-/// state for that label is already Stable — the update won't change anything.
+/// Fires when `setState` is called with a stable value AND the current state
+/// for that label is already stable — the update won't change anything.
 ///
-/// Conservative: only fires when BOTH argument and current state are Stable.
-/// Unstable/Unknown arguments are never flagged (could still cause change).
+/// Rationale: if the new value is stable (won't change render-to-render) and
+/// the state is already stable, there is no reason to call setState at all.
+/// Checked in both the render body and useEffect bodies.
+///
+/// Conservative: only fires when BOTH argument and current state are stable.
+/// Unstable/Top arguments are never flagged (could still cause a change).
 pub struct RedundantSetState;
 
 impl Rule for RedundantSetState {
@@ -18,10 +22,11 @@ impl Rule for RedundantSetState {
         "redundant-set-state"
     }
 
-    fn check(&self, result: &AnalysisResult<Stability>) -> Vec<Diagnostic> {
-        let transfer = StabilityTransfer;
+    fn check(&self, result: &AnalysisResult<StateValue>) -> Vec<Diagnostic> {
+        let transfer = StateValueTransfer;
         let mut diags = Vec::new();
 
+        // ── Render body ───────────────────────────────────────────────────────
         let mut sorted_ids: Vec<_> = result.render_cfg.blocks.keys().copied().collect();
         sorted_ids.sort_unstable();
 
@@ -30,50 +35,96 @@ impl Rule for RedundantSetState {
                 Some(b) => b,
                 None => continue,
             };
-            // Use the exit env of this block (contains all setter bindings from the block).
             let env = match result.block_states.get(&block_id) {
                 Some(e) => e,
                 None => continue,
             };
+            check_setter_calls(
+                &block.stmts,
+                env,
+                &result.state_store,
+                &result.memo_store,
+                &transfer,
+                &mut diags,
+            );
+        }
 
-            for stmt in &block.stmts {
-                if let Stmt::ExprStmt(Expr::Call { fn_, args }) = stmt {
-                    if let Expr::Var(name) = fn_.as_ref() {
-                        if let Some(label) = env.setter_label(name) {
-                            let arg_stab = args
-                                .first()
-                                .map(|a| {
-                                    transfer.eval_expr(
-                                        a,
-                                        env,
-                                        &result.state_store,
-                                        &result.memo_store,
-                                    )
-                                })
-                                .unwrap_or(Stability::Unknown);
+        // ── Effect bodies ─────────────────────────────────────────────────────
+        // Use the render-exit env to resolve setter bindings (setters are bound
+        // in render scope and captured as free variables by effect closures).
+        let env_exit = result.exit_env();
 
-                            let current_stab = result.state_store.get(label);
-
-                            if arg_stab == Stability::Stable && current_stab == Stability::Stable {
-                                diags.push(
-                                    Diagnostic::new(
-                                        "redundant-set-state",
-                                        format!(
-                                            "setState for hook {} called with a Stable value \
-                                             when state is already Stable — update is redundant",
-                                            label
-                                        ),
-                                    )
-                                    .with_label(label),
-                                );
-                            }
-                        }
-                    }
-                }
+        for hook in &result.hooks {
+            if let HookEntry::Effect { body_cfg, .. } = hook {
+                check_cfg_for_redundant_sets(
+                    body_cfg,
+                    &env_exit,
+                    &result.state_store,
+                    &result.memo_store,
+                    &transfer,
+                    &mut diags,
+                );
             }
         }
 
         diags
+    }
+}
+
+/// Scan all blocks of `cfg` for redundant setter calls.
+fn check_cfg_for_redundant_sets(
+    cfg: &CFG,
+    env: &AbstractEnv<StateValue>,
+    state: &StateStore<StateValue>,
+    memo: &MemoStore<StateValue>,
+    transfer: &StateValueTransfer,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let mut sorted: Vec<_> = cfg.blocks.keys().copied().collect();
+    sorted.sort_unstable();
+    for block_id in sorted {
+        if let Some(block) = cfg.blocks.get(&block_id) {
+            check_setter_calls(&block.stmts, env, state, memo, transfer, diags);
+        }
+    }
+}
+
+/// Check a list of statements for `setState(stable)` when state is already stable.
+fn check_setter_calls(
+    stmts: &[Stmt],
+    env: &AbstractEnv<StateValue>,
+    state: &StateStore<StateValue>,
+    memo: &MemoStore<StateValue>,
+    transfer: &StateValueTransfer,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for stmt in stmts {
+        if let Stmt::ExprStmt(Expr::Call { fn_, args }) = stmt {
+            if let Expr::Var(name) = fn_.as_ref() {
+                if let Some(label) = env.setter_label(name) {
+                    let arg_val = args
+                        .first()
+                        .map(|a| transfer.eval_expr(a, env, state, memo))
+                        .unwrap_or(StateValue::Top);
+
+                    let current_val = state.get(label);
+
+                    if arg_val.is_stable() && current_val.is_stable() {
+                        diags.push(
+                            Diagnostic::new(
+                                "redundant-set-state",
+                                format!(
+                                    "setState for hook {} called with a stable value \
+                                     when state is already stable — update is redundant",
+                                    label
+                                ),
+                            )
+                            .with_label(label),
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -84,7 +135,7 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
     use crate::{
-        domains::{Stability, stores::{AbstractEnv, MemoStore, StateStore}},
+        domains::{Stability, StateValue, stores::{AbstractEnv, MemoStore, StateStore}},
         engine::AnalysisResult,
         ir::{
             cfg::{BasicBlock, CFG, Terminator},
@@ -97,9 +148,9 @@ mod tests {
 
     fn make_result(
         render_blocks: Vec<(u32, Vec<Stmt>)>,
-        env_bindings: Vec<(&str, Stability, Option<HookLabel>)>,
-        state_values: Vec<(HookLabel, Stability)>,
-    ) -> AnalysisResult<Stability> {
+        env_bindings: Vec<(&str, StateValue, Option<HookLabel>)>,
+        state_values: Vec<(HookLabel, StateValue)>,
+    ) -> AnalysisResult<StateValue> {
         let mut blocks = HashMap::new();
         for (id, stmts) in render_blocks {
             let id = id as usize;
@@ -114,9 +165,9 @@ mod tests {
         }
         let render_cfg = CFG { entry: 0, blocks, edges: vec![] };
 
-        let mut env = AbstractEnv::<Stability>::new();
-        for (name, stab, setter) in &env_bindings {
-            env.extend((*name).to_string(), *stab);
+        let mut env = AbstractEnv::<StateValue>::new();
+        for (name, val, setter) in &env_bindings {
+            env.extend((*name).to_string(), val.clone());
             if let Some(label) = setter {
                 env.bind_setter((*name).to_string(), *label);
             }
@@ -125,8 +176,8 @@ mod tests {
         block_states.insert(0usize, env);
 
         let mut state_store = StateStore::new();
-        for (label, stab) in state_values {
-            state_store.update(label, stab);
+        for (label, val) in state_values {
+            state_store.update(label, val);
         }
 
         AnalysisResult {
@@ -143,7 +194,7 @@ mod tests {
 
     #[test]
     fn stable_arg_stable_state_warns() {
-        // setN(42) where state[0] = Stable → redundant
+        // setN(42) — 42 is a point interval (stable), state is a point interval → redundant
         let stmts = vec![
             Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
             Stmt::ExprStmt(Expr::Call {
@@ -153,8 +204,8 @@ mod tests {
         ];
         let result = make_result(
             vec![(0, stmts)],
-            vec![("setN", Stability::Stable, Some(0))],
-            vec![(0, Stability::Stable)],
+            vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
+            vec![(0, StateValue::Reference(Stability::Stable))],
         );
         let diags = RedundantSetState.check(&result);
         assert_eq!(diags.len(), 1);
@@ -163,7 +214,7 @@ mod tests {
 
     #[test]
     fn unstable_arg_no_warning() {
-        // setN({}) where state[0] = Stable → arg Unstable → no redundant warning
+        // setN({}) → Reference(Unstable) → not stable → no warning
         let stmts = vec![
             Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
             Stmt::ExprStmt(Expr::Call {
@@ -173,15 +224,15 @@ mod tests {
         ];
         let result = make_result(
             vec![(0, stmts)],
-            vec![("setN", Stability::Stable, Some(0))],
-            vec![(0, Stability::Stable)],
+            vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
+            vec![(0, StateValue::Reference(Stability::Stable))],
         );
         assert!(RedundantSetState.check(&result).is_empty());
     }
 
     #[test]
     fn stable_arg_unstable_state_no_warning() {
-        // setN(42) where state[0] = Unstable → state could change → no warning
+        // state is Reference(Unstable) → not stable → no warning
         let stmts = vec![
             Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
             Stmt::ExprStmt(Expr::Call {
@@ -191,15 +242,14 @@ mod tests {
         ];
         let result = make_result(
             vec![(0, stmts)],
-            vec![("setN", Stability::Stable, Some(0))],
-            vec![(0, Stability::Unstable)],
+            vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
+            vec![(0, StateValue::Reference(Stability::Unstable))],
         );
         assert!(RedundantSetState.check(&result).is_empty());
     }
 
     #[test]
     fn non_setter_call_no_warning() {
-        // doSomething() is not a setter → no warning
         let stmts = vec![Stmt::ExprStmt(Expr::Call {
             fn_: Box::new(Expr::Var("doSomething".to_string())),
             args: vec![Expr::Lit(Prim::Int(1))],
@@ -209,21 +259,154 @@ mod tests {
     }
 
     #[test]
-    fn stable_state_setter_literal_warns() {
-        // StateSetter() value is Stable (constant), state is Stable
+    fn setter_arg_is_stable_reference() {
         let stmts = vec![
             Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
             Stmt::ExprStmt(Expr::Call {
                 fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::StateSetter(0)], // setters are Stable
+                args: vec![Expr::StateSetter(0)],
             }),
         ];
         let result = make_result(
             vec![(0, stmts)],
-            vec![("setN", Stability::Stable, Some(0))],
-            vec![(0, Stability::Stable)],
+            vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
+            vec![(0, StateValue::Reference(Stability::Stable))],
+        );
+        assert_eq!(RedundantSetState.check(&result).len(), 1);
+    }
+
+    // ── Effect body tests ─────────────────────────────────────────────────────
+
+    fn make_result_with_effect(
+        render_stmts: Vec<Stmt>,
+        effect_stmts: Vec<Stmt>,
+        env_bindings: Vec<(&str, StateValue, Option<HookLabel>)>,
+        state_values: Vec<(HookLabel, StateValue)>,
+    ) -> AnalysisResult<StateValue> {
+        use crate::ir::hooks::HookEntry;
+
+        // Render CFG block
+        let mut blocks = HashMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: render_stmts,
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let render_cfg = CFG { entry: 0, blocks, edges: vec![] };
+
+        // Render exit env (used by effect check)
+        let mut env = AbstractEnv::<StateValue>::new();
+        for (name, val, setter) in &env_bindings {
+            env.extend((*name).to_string(), val.clone());
+            if let Some(label) = setter {
+                env.bind_setter((*name).to_string(), *label);
+            }
+        }
+        let mut block_states = HashMap::new();
+        block_states.insert(0usize, env);
+
+        // Effect CFG
+        let mut eff_blocks = HashMap::new();
+        eff_blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: effect_stmts,
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let eff_cfg = CFG { entry: 0, blocks: eff_blocks, edges: vec![] };
+
+        let mut state_store = StateStore::new();
+        for (label, val) in state_values {
+            state_store.update(label, val);
+        }
+
+        AnalysisResult {
+            state_store,
+            memo_store: MemoStore::new(),
+            block_states,
+            hook_calls: vec![],
+            effect_info: HashMap::new(),
+            widened_labels: HashSet::new(),
+            render_cfg,
+            hooks: vec![HookEntry::Effect {
+                label: 1,
+                body_cfg: eff_cfg,
+                deps: Some(vec![]),
+            }],
+        }
+    }
+
+    #[test]
+    fn effect_stable_setter_stable_state_warns() {
+        // useEffect(() => { setN(42) }, []) where state is already stable
+        // Setter is bound in render, used in effect body as free var.
+        let render_stmts = vec![
+            Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
+        ];
+        let effect_stmts = vec![
+            Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Lit(Prim::Int(42))],
+            }),
+        ];
+        let result = make_result_with_effect(
+            render_stmts,
+            effect_stmts,
+            vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
+            vec![(0, StateValue::Reference(Stability::Stable))],
         );
         let diags = RedundantSetState.check(&result);
-        assert_eq!(diags.len(), 1);
+        assert_eq!(diags.len(), 1, "effect body setter should be checked");
+        assert_eq!(diags[0].hook_label, Some(0));
+    }
+
+    #[test]
+    fn effect_unstable_arg_no_warning() {
+        // useEffect(() => { setN({}) }, []) — arg unstable → no warning
+        let render_stmts = vec![
+            Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
+        ];
+        let effect_stmts = vec![
+            Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::ObjectLit(vec![])],
+            }),
+        ];
+        let result = make_result_with_effect(
+            render_stmts,
+            effect_stmts,
+            vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
+            vec![(0, StateValue::Reference(Stability::Stable))],
+        );
+        assert!(RedundantSetState.check(&result).is_empty());
+    }
+
+    #[test]
+    fn effect_unknown_arg_no_warning() {
+        // setN(someCall()) → Top → not stable → no warning
+        let render_stmts = vec![
+            Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
+        ];
+        let effect_stmts = vec![
+            Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Call {
+                    fn_: Box::new(Expr::Var("fetchData".to_string())),
+                    args: vec![],
+                }],
+            }),
+        ];
+        let result = make_result_with_effect(
+            render_stmts,
+            effect_stmts,
+            vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
+            vec![(0, StateValue::Reference(Stability::Stable))],
+        );
+        assert!(RedundantSetState.check(&result).is_empty());
     }
 }

@@ -43,6 +43,9 @@ pub struct EffectInfo {
     pub free_vars: HashSet<Var>,
     /// Deps array as declared by the caller (`[]` = empty, `None` = absent).
     pub declared_deps: Vec<Expr>,
+    /// `true` when caller wrote an explicit deps array (even `[]`).
+    /// `false` when no deps argument was passed (`deps: None`).
+    pub has_deps_array: bool,
 }
 
 #[derive(Debug)]
