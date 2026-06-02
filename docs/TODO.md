@@ -4,7 +4,7 @@ Fonctionnalités utiles non encore implémentées. Classées par thème.
 
 ## Précision d'analyse
 
-### Traverser les callbacks `.then()` et Promise chains
+### Traverser les callbacks `.then()` et Promise chains — **design acté, [ADR-009](adr/ADR-009-callback-traversal.md)**
 
 Pattern non détecté :
 ```js
@@ -13,7 +13,7 @@ useEffect(() => {
 }, [])
 ```
 
-`setUser` est dans un `FnLit` passé comme argument — `exec_stmt` ne descend pas dans les corps de FnLit. Fix : lors du CFG analysis, extraire les setters appelés dans les closures immédiates (un niveau de profondeur suffit pour les cas courants).
+`setUser` est dans un `FnLit` passé comme argument — `exec_stmt` ne descend pas dans les corps de FnLit. **Décision** ([ADR-009](adr/ADR-009-callback-traversal.md)) : descente *sémantique* dans le fixpoint, callbacks classés par `TriggerClass` (in-cycle : `.then`/timers/HOF → descendre ; subscription/inconnu → skip), via une pré-passe d'effets de bord par statement. Les handlers (`onClick`/`addEventListener`) restent `skip` pour l'instant — le chemin de migration vers leur analyse (points d'entrée + provenance) est décrit dans l'ADR.
 
 ### Functional updaters `(n) => n + 1` ne déclenchent pas de widening
 
