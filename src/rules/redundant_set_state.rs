@@ -1,7 +1,9 @@
+use std::collections::{HashMap, HashSet};
+
 use crate::{
     domains::{AbstractEnv, MemoStore, StateStore, StateValue, StateValueTransfer, Transfer},
     engine::AnalysisResult,
-    ir::{cfg::CFG, expr::Expr, hooks::HookEntry, stmt::Stmt},
+    ir::{cfg::CFG, expr::Expr, hooks::HookEntry, stmt::Stmt, types::HookLabel},
 };
 
 use super::{Diagnostic, Rule};
@@ -46,6 +48,7 @@ impl Rule for RedundantSetState {
                 &result.memo_store,
                 &transfer,
                 &mut diags,
+                &HashSet::new(),
             );
         }
 
@@ -72,6 +75,10 @@ impl Rule for RedundantSetState {
 }
 
 /// Scan all blocks of `cfg` for redundant setter calls.
+///
+/// Setters whose argument value differs across calls in the effect CFG
+/// (including inside `FnLit` bodies such as `.then()` callbacks) are skipped
+/// — they're part of a state-transition sequence, not a redundant set.
 fn check_cfg_for_redundant_sets(
     cfg: &CFG,
     env: &AbstractEnv<StateValue>,
@@ -80,12 +87,113 @@ fn check_cfg_for_redundant_sets(
     transfer: &StateValueTransfer,
     diags: &mut Vec<Diagnostic>,
 ) {
+    let skip_labels = collect_transition_setters(cfg, env, state, memo, transfer);
     let mut sorted: Vec<_> = cfg.blocks.keys().copied().collect();
     sorted.sort_unstable();
     for block_id in sorted {
         if let Some(block) = cfg.blocks.get(&block_id) {
-            check_setter_calls(&block.stmts, env, state, memo, transfer, diags);
+            check_setter_calls(&block.stmts, env, state, memo, transfer, diags, &skip_labels);
         }
+    }
+}
+
+/// Returns setter labels whose evaluated argument value differs across calls in
+/// `cfg` (including nested `FnLit` bodies). A diverged setter is part of a
+/// state-transition pattern and should not be flagged as redundant.
+fn collect_transition_setters(
+    cfg: &CFG,
+    env: &AbstractEnv<StateValue>,
+    state: &StateStore<StateValue>,
+    memo: &MemoStore<StateValue>,
+    transfer: &StateValueTransfer,
+) -> HashSet<HookLabel> {
+    // per label: (first seen arg value, has seen a different value)
+    let mut tracker: HashMap<HookLabel, (StateValue, bool)> = HashMap::new();
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            collect_setter_vals_in_stmt(stmt, env, state, memo, transfer, &mut tracker);
+        }
+    }
+    tracker
+        .into_iter()
+        .filter(|(_, (_, diverged))| *diverged)
+        .map(|(l, _)| l)
+        .collect()
+}
+
+fn collect_setter_vals_in_stmt(
+    stmt: &Stmt,
+    env: &AbstractEnv<StateValue>,
+    state: &StateStore<StateValue>,
+    memo: &MemoStore<StateValue>,
+    transfer: &StateValueTransfer,
+    tracker: &mut HashMap<HookLabel, (StateValue, bool)>,
+) {
+    match stmt {
+        Stmt::ExprStmt(e) | Stmt::Let { rhs: e, .. } | Stmt::Assign { rhs: e, .. } => {
+            collect_setter_vals_in_expr(e, env, state, memo, transfer, tracker);
+        }
+    }
+}
+
+fn collect_setter_vals_in_expr(
+    expr: &Expr,
+    env: &AbstractEnv<StateValue>,
+    state: &StateStore<StateValue>,
+    memo: &MemoStore<StateValue>,
+    transfer: &StateValueTransfer,
+    tracker: &mut HashMap<HookLabel, (StateValue, bool)>,
+) {
+    match expr {
+        Expr::Call { fn_, args } => {
+            if let Expr::Var(name) = fn_.as_ref() {
+                if let Some(label) = env.setter_label(name) {
+                    let arg_val = args
+                        .first()
+                        .map(|a| transfer.eval_expr(a, env, state, memo))
+                        .unwrap_or(StateValue::Top);
+                    match tracker.entry(label) {
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert((arg_val, false));
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            if e.get().0 != arg_val {
+                                e.get_mut().1 = true;
+                            }
+                        }
+                    }
+                }
+            }
+            collect_setter_vals_in_expr(fn_, env, state, memo, transfer, tracker);
+            for arg in args {
+                collect_setter_vals_in_expr(arg, env, state, memo, transfer, tracker);
+            }
+        }
+        Expr::FnLit { body_cfg, .. } => {
+            for block in body_cfg.blocks.values() {
+                for stmt in &block.stmts {
+                    collect_setter_vals_in_stmt(stmt, env, state, memo, transfer, tracker);
+                }
+            }
+        }
+        Expr::BinOp { lhs, rhs, .. } => {
+            collect_setter_vals_in_expr(lhs, env, state, memo, transfer, tracker);
+            collect_setter_vals_in_expr(rhs, env, state, memo, transfer, tracker);
+        }
+        Expr::UnaryOp { arg, .. } => {
+            collect_setter_vals_in_expr(arg, env, state, memo, transfer, tracker);
+        }
+        Expr::ArrayLit(items) => {
+            for item in items {
+                collect_setter_vals_in_expr(item, env, state, memo, transfer, tracker);
+            }
+        }
+        Expr::ObjectLit(fields) => {
+            for (_, val) in fields {
+                collect_setter_vals_in_expr(val, env, state, memo, transfer, tracker);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -97,11 +205,16 @@ fn check_setter_calls(
     memo: &MemoStore<StateValue>,
     transfer: &StateValueTransfer,
     diags: &mut Vec<Diagnostic>,
+    skip_labels: &HashSet<HookLabel>,
 ) {
     for stmt in stmts {
         if let Stmt::ExprStmt(Expr::Call { fn_, args }) = stmt {
             if let Expr::Var(name) = fn_.as_ref() {
                 if let Some(label) = env.setter_label(name) {
+                    if skip_labels.contains(&label) {
+                        continue;
+                    }
+
                     let arg_val = args
                         .first()
                         .map(|a| transfer.eval_expr(a, env, state, memo))
@@ -133,9 +246,11 @@ fn check_setter_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
     use crate::{
-        domains::{Stability, StateValue, stores::{AbstractEnv, MemoStore, StateStore}},
+        domains::{
+            Stability, StateValue,
+            stores::{AbstractEnv, MemoStore, StateStore},
+        },
         engine::AnalysisResult,
         ir::{
             cfg::{BasicBlock, CFG, Terminator},
@@ -145,6 +260,7 @@ mod tests {
         },
         rules::Rule,
     };
+    use std::collections::{HashMap, HashSet};
 
     fn make_result(
         render_blocks: Vec<(u32, Vec<Stmt>)>,
@@ -163,7 +279,11 @@ mod tests {
                 },
             );
         }
-        let render_cfg = CFG { entry: 0, blocks, edges: vec![] };
+        let render_cfg = CFG {
+            entry: 0,
+            blocks,
+            edges: vec![],
+        };
 
         let mut env = AbstractEnv::<StateValue>::new();
         for (name, val, setter) in &env_bindings {
@@ -196,7 +316,10 @@ mod tests {
     fn stable_arg_stable_state_warns() {
         // setN(42) — 42 is a point interval (stable), state is a point interval → redundant
         let stmts = vec![
-            Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
+            Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+            },
             Stmt::ExprStmt(Expr::Call {
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::Lit(Prim::Int(42))],
@@ -216,7 +339,10 @@ mod tests {
     fn unstable_arg_no_warning() {
         // setN({}) → Reference(Unstable) → not stable → no warning
         let stmts = vec![
-            Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
+            Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+            },
             Stmt::ExprStmt(Expr::Call {
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::ObjectLit(vec![])],
@@ -234,7 +360,10 @@ mod tests {
     fn stable_arg_unstable_state_no_warning() {
         // state is Reference(Unstable) → not stable → no warning
         let stmts = vec![
-            Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
+            Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+            },
             Stmt::ExprStmt(Expr::Call {
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::Lit(Prim::Int(42))],
@@ -261,7 +390,10 @@ mod tests {
     #[test]
     fn setter_arg_is_stable_reference() {
         let stmts = vec![
-            Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
+            Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+            },
             Stmt::ExprStmt(Expr::Call {
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::StateSetter(0)],
@@ -295,7 +427,11 @@ mod tests {
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
         );
-        let render_cfg = CFG { entry: 0, blocks, edges: vec![] };
+        let render_cfg = CFG {
+            entry: 0,
+            blocks,
+            edges: vec![],
+        };
 
         // Render exit env (used by effect check)
         let mut env = AbstractEnv::<StateValue>::new();
@@ -318,7 +454,11 @@ mod tests {
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
         );
-        let eff_cfg = CFG { entry: 0, blocks: eff_blocks, edges: vec![] };
+        let eff_cfg = CFG {
+            entry: 0,
+            blocks: eff_blocks,
+            edges: vec![],
+        };
 
         let mut state_store = StateStore::new();
         for (label, val) in state_values {
@@ -345,15 +485,14 @@ mod tests {
     fn effect_stable_setter_stable_state_warns() {
         // useEffect(() => { setN(42) }, []) where state is already stable
         // Setter is bound in render, used in effect body as free var.
-        let render_stmts = vec![
-            Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
-        ];
-        let effect_stmts = vec![
-            Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::Lit(Prim::Int(42))],
-            }),
-        ];
+        let render_stmts = vec![Stmt::Let {
+            var: "setN".to_string(),
+            rhs: Expr::StateSetter(0),
+        }];
+        let effect_stmts = vec![Stmt::ExprStmt(Expr::Call {
+            fn_: Box::new(Expr::Var("setN".to_string())),
+            args: vec![Expr::Lit(Prim::Int(42))],
+        })];
         let result = make_result_with_effect(
             render_stmts,
             effect_stmts,
@@ -368,15 +507,14 @@ mod tests {
     #[test]
     fn effect_unstable_arg_no_warning() {
         // useEffect(() => { setN({}) }, []) — arg unstable → no warning
-        let render_stmts = vec![
-            Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
-        ];
-        let effect_stmts = vec![
-            Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::ObjectLit(vec![])],
-            }),
-        ];
+        let render_stmts = vec![Stmt::Let {
+            var: "setN".to_string(),
+            rhs: Expr::StateSetter(0),
+        }];
+        let effect_stmts = vec![Stmt::ExprStmt(Expr::Call {
+            fn_: Box::new(Expr::Var("setN".to_string())),
+            args: vec![Expr::ObjectLit(vec![])],
+        })];
         let result = make_result_with_effect(
             render_stmts,
             effect_stmts,
@@ -389,18 +527,17 @@ mod tests {
     #[test]
     fn effect_unknown_arg_no_warning() {
         // setN(someCall()) → Top → not stable → no warning
-        let render_stmts = vec![
-            Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
-        ];
-        let effect_stmts = vec![
-            Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::Call {
-                    fn_: Box::new(Expr::Var("fetchData".to_string())),
-                    args: vec![],
-                }],
-            }),
-        ];
+        let render_stmts = vec![Stmt::Let {
+            var: "setN".to_string(),
+            rhs: Expr::StateSetter(0),
+        }];
+        let effect_stmts = vec![Stmt::ExprStmt(Expr::Call {
+            fn_: Box::new(Expr::Var("setN".to_string())),
+            args: vec![Expr::Call {
+                fn_: Box::new(Expr::Var("fetchData".to_string())),
+                args: vec![],
+            }],
+        })];
         let result = make_result_with_effect(
             render_stmts,
             effect_stmts,
