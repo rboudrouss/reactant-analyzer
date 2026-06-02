@@ -513,4 +513,215 @@ mod tests {
             "setter in block 1 should be detected via BFS"
         );
     }
+
+    // ── callback traversal (ADR-009) ─────────────────────────────────────────
+
+    /// Builds a component whose effect body is `Let setX = StateSetter(0)` followed
+    /// by `ExprStmt(call_expr)`, with `state[0]` init 0 and deps `deps`.
+    fn component_with_effect_call(
+        setter_name: &str,
+        call_expr: Expr,
+        deps: Option<Vec<Expr>>,
+    ) -> ComponentIR {
+        let mut eff_blocks = HashMap::new();
+        eff_blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![
+                    Stmt::Let {
+                        var: setter_name.to_string(),
+                        rhs: Expr::StateSetter(0),
+                    },
+                    Stmt::ExprStmt(call_expr),
+                ],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let eff_cfg = CFG {
+            entry: 0,
+            blocks: eff_blocks,
+            edges: vec![],
+        };
+        let hooks = vec![
+            HookEntry::State {
+                label: 0,
+                init: Expr::Lit(Prim::Int(0)),
+            },
+            HookEntry::Effect {
+                label: 1,
+                body_cfg: eff_cfg,
+                deps,
+            },
+        ];
+        let render_stmts = vec![
+            Stmt::Let {
+                var: "n".to_string(),
+                rhs: Expr::StateVal(0),
+            },
+            Stmt::Let {
+                var: setter_name.to_string(),
+                rhs: Expr::StateSetter(0),
+            },
+        ];
+        let mut blocks = HashMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: render_stmts,
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        ComponentIR {
+            name: "C".to_string(),
+            param: "props".to_string(),
+            render_cfg: CFG {
+                entry: 0,
+                blocks,
+                edges: vec![],
+            },
+            hooks,
+        }
+    }
+
+    /// `() => setN(n + 1)` as a single-block FnLit (no params).
+    fn incrementing_setter_cb(setter_name: &str) -> Expr {
+        let mut b = HashMap::new();
+        b.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![Stmt::ExprStmt(Expr::Call {
+                    fn_: Box::new(Expr::Var(setter_name.to_string())),
+                    args: vec![Expr::BinOp {
+                        op: crate::ir::expr::BinOp::Add,
+                        lhs: Box::new(Expr::StateVal(0)),
+                        rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                    }],
+                })],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        Expr::FnLit {
+            params: vec![],
+            body_cfg: Box::new(CFG {
+                entry: 0,
+                blocks: b,
+                edges: vec![],
+            }),
+        }
+    }
+
+    #[test]
+    fn then_callback_setter_triggers_infinite_loop() {
+        // useEffect(() => { p.then(() => setN(n + 1)) }, [n])
+        // The .then callback is descended (ADR-009) → n grows → widens → InfiniteLoop.
+        let call = Expr::Call {
+            fn_: Box::new(Expr::FieldAccess {
+                obj: Box::new(Expr::Var("p".to_string())),
+                field: "then".to_string(),
+            }),
+            args: vec![incrementing_setter_cb("setN")],
+        };
+        let comp = component_with_effect_call("setN", call, Some(vec![Expr::StateVal(0)]));
+        let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
+        assert!(
+            result.widened_labels.contains(&0),
+            "n should widen via the .then callback"
+        );
+        assert!(
+            !InfiniteLoop.check(&result).is_empty(),
+            "setN(n+1) inside .then should be detected as infinite loop"
+        );
+    }
+
+    #[test]
+    fn add_event_listener_setter_does_not_loop() {
+        // useEffect(() => { el.addEventListener('click', () => setN(n + 1)) })  (deps: None)
+        // Subscription handler is NOT descended → n never grows → no widening, no diag.
+        // This is the key anti-false-positive test for event handlers.
+        let call = Expr::Call {
+            fn_: Box::new(Expr::FieldAccess {
+                obj: Box::new(Expr::Var("el".to_string())),
+                field: "addEventListener".to_string(),
+            }),
+            args: vec![
+                Expr::Lit(Prim::String("click".to_string())),
+                incrementing_setter_cb("setN"),
+            ],
+        };
+        let comp = component_with_effect_call("setN", call, None);
+        let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
+        assert!(
+            !result.widened_labels.contains(&0),
+            "event handler must not widen state (would be a false positive)"
+        );
+        assert!(
+            InfiniteLoop.check(&result).is_empty(),
+            "addEventListener handler must not trigger InfiniteLoop"
+        );
+    }
+
+    #[test]
+    fn unknown_callee_setter_does_not_loop() {
+        // useEffect(() => { myHelper(() => setN(n + 1)) })  (deps: None)
+        // Unknown callee is NOT descended (FP-averse) → no widening, no diag.
+        let call = Expr::Call {
+            fn_: Box::new(Expr::Var("myHelper".to_string())),
+            args: vec![incrementing_setter_cb("setN")],
+        };
+        let comp = component_with_effect_call("setN", call, None);
+        let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
+        assert!(!result.widened_labels.contains(&0));
+        assert!(InfiniteLoop.check(&result).is_empty());
+    }
+
+    #[test]
+    fn back_edge_in_then_callback_is_conservative() {
+        // useEffect(() => { p.then(() => { loop { setN(n+1) } }) })  (deps: None)
+        // exec_body bails on the callback's back edge → setN not propagated → no widening.
+        // Known FN documented in ADR-009 (conservative, not a bug).
+        let mut cb_blocks = HashMap::new();
+        cb_blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![Stmt::ExprStmt(Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::BinOp {
+                        op: crate::ir::expr::BinOp::Add,
+                        lhs: Box::new(Expr::StateVal(0)),
+                        rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                    }],
+                })],
+                term: Terminator::Jump(0), // self-loop
+            },
+        );
+        let cb = Expr::FnLit {
+            params: vec![],
+            body_cfg: Box::new(CFG {
+                entry: 0,
+                blocks: cb_blocks,
+                edges: vec![crate::ir::cfg::Edge {
+                    from: 0,
+                    to: 0,
+                    kind: crate::ir::cfg::EdgeKind::Back,
+                }],
+            }),
+        };
+        let call = Expr::Call {
+            fn_: Box::new(Expr::FieldAccess {
+                obj: Box::new(Expr::Var("p".to_string())),
+                field: "then".to_string(),
+            }),
+            args: vec![cb],
+        };
+        let comp = component_with_effect_call("setN", call, None);
+        let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
+        assert!(
+            !result.widened_labels.contains(&0),
+            "back-edge in callback body → conservative bail → no widening (known FN)"
+        );
+    }
 }

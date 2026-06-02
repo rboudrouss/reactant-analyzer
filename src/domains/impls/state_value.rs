@@ -394,12 +394,143 @@ fn eval_unary(op: &UnaryOp, val: StateValue) -> StateValue {
     }
 }
 
+/// How a call's closure arguments should be treated by the side-effect pre-pass.
+/// See [ADR-009](../../../docs/adr/ADR-009-callback-traversal.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerClass {
+    /// Callee is a bound state setter — handled by `exec_state_value`'s setter
+    /// branch (functional updaters), so the pre-pass must NOT descend its closure.
+    Setter,
+    /// Runs as a consequence of the current render/effect: synchronous HOFs
+    /// (`map`, `forEach`, …) and scheduled async (`.then`/`.catch`/`.finally`,
+    /// `setTimeout`/`setInterval`, `queueMicrotask`, `requestAnimationFrame`).
+    /// Its closure arguments ARE descended into.
+    InCycle,
+    /// Event subscription (`addEventListener`/`removeEventListener`) — triggered
+    /// externally, NOT part of the render→effect→render cycle. Not descended,
+    /// otherwise InfiniteLoop would fire false positives on event handlers.
+    Subscription,
+    /// Unrecognized callee (custom helper/hook). Conservatively NOT descended
+    /// (FP-averse: avoids flagging custom subscription wrappers).
+    Unknown,
+}
+
+/// Classify a call's callee to decide whether its closure arguments run as a
+/// consequence of the current render/effect (and so must be descended into for
+/// their side effects). See [ADR-009] for the policy rationale.
+fn classify_callee(fn_: &Expr, env: &AbstractEnv<StateValue>) -> TriggerClass {
+    match fn_ {
+        Expr::Var(name) => {
+            if env.setter_label(name).is_some() {
+                TriggerClass::Setter
+            } else {
+                match name.as_str() {
+                    "setTimeout" | "setInterval" | "queueMicrotask"
+                    | "requestAnimationFrame" => TriggerClass::InCycle,
+                    _ => TriggerClass::Unknown,
+                }
+            }
+        }
+        Expr::FieldAccess { field, .. } => match field.as_str() {
+            "then" | "catch" | "finally" => TriggerClass::InCycle,
+            "map" | "forEach" | "reduce" | "filter" | "find" | "flatMap" | "some"
+            | "every" => TriggerClass::InCycle,
+            "addEventListener" | "removeEventListener" => TriggerClass::Subscription,
+            _ => TriggerClass::Unknown,
+        },
+        _ => TriggerClass::Unknown,
+    }
+}
+
+/// Per-statement side-effect pre-pass: walk the whole expression tree and, for any
+/// in-cycle call (`.then`, timers, sync HOFs), execute its closure arguments for
+/// their side effects (setter calls weak-update `state`). The callback's return
+/// value is discarded.
+///
+/// Invariant: never recurse INTO a `FnLit` body here. Bodies run only via
+/// `exec_body` (when the `FnLit` is an in-cycle argument); otherwise
+/// `exec_body → exec_state_value → exec_callbacks_in_expr` would double-execute
+/// them. Nesting (`.then(() => other.map(cb2))`) is handled by that recursion.
+/// See [ADR-009].
+fn exec_callbacks_in_expr(
+    expr: &Expr,
+    env: &AbstractEnv<StateValue>,
+    state: &mut StateStore<StateValue>,
+    memo: &mut MemoStore<StateValue>,
+) {
+    match expr {
+        Expr::Call { fn_, args } => {
+            let class = classify_callee(fn_, env);
+            // Descend the receiver too — handles chains like `a.then(x).then(y)`
+            // and nested calls like `foo(bar().then(cb))`.
+            exec_callbacks_in_expr(fn_, env, state, memo);
+            for arg in args {
+                match arg {
+                    Expr::FnLit { params, body_cfg } if class == TriggerClass::InCycle => {
+                        let mut sub_env = env.clone();
+                        for p in params {
+                            // Callback params (resolved promise value, list element,
+                            // …) are unknown → Top.
+                            sub_env.extend(p.clone(), StateValue::Top);
+                        }
+                        // Side effects only; return value irrelevant here.
+                        let _ = exec_body(body_cfg, &sub_env, state, memo);
+                    }
+                    // Setter/Subscription/Unknown closures are not descended (ADR-009).
+                    Expr::FnLit { .. } => {}
+                    other => exec_callbacks_in_expr(other, env, state, memo),
+                }
+            }
+        }
+        Expr::BinOp { lhs, rhs, .. } => {
+            exec_callbacks_in_expr(lhs, env, state, memo);
+            exec_callbacks_in_expr(rhs, env, state, memo);
+        }
+        Expr::UnaryOp { arg, .. } => exec_callbacks_in_expr(arg, env, state, memo),
+        Expr::FieldAccess { obj, .. } => exec_callbacks_in_expr(obj, env, state, memo),
+        Expr::IndexAccess { arr, idx } => {
+            exec_callbacks_in_expr(arr, env, state, memo);
+            exec_callbacks_in_expr(idx, env, state, memo);
+        }
+        Expr::ObjectLit(fields) => {
+            for (_, v) in fields {
+                exec_callbacks_in_expr(v, env, state, memo);
+            }
+        }
+        Expr::ArrayLit(items) => {
+            for item in items {
+                exec_callbacks_in_expr(item, env, state, memo);
+            }
+        }
+        Expr::CompApp { props, .. } => exec_callbacks_in_expr(props, env, state, memo),
+        Expr::NativeElem { props, children, .. } => {
+            exec_callbacks_in_expr(props, env, state, memo);
+            for c in children {
+                exec_callbacks_in_expr(c, env, state, memo);
+            }
+        }
+        Expr::TSAnnotated(inner, _) => exec_callbacks_in_expr(inner, env, state, memo),
+        _ => {}
+    }
+}
+
 fn exec_state_value(
     stmt: &Stmt,
     env: &mut AbstractEnv<StateValue>,
     state: &mut StateStore<StateValue>,
     memo: &mut MemoStore<StateValue>,
 ) {
+    // Side-effect pre-pass: descend into in-cycle callbacks (`.then`, timers, HOFs)
+    // so setters called inside them update `state`. Runs before the main match so
+    // the setter branch below still handles plain setter calls / functional
+    // updaters exactly once (their callee is classified `Setter` → not descended).
+    // See ADR-009.
+    let main_expr = match stmt {
+        Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => rhs,
+        Stmt::ExprStmt(expr) => expr,
+    };
+    exec_callbacks_in_expr(main_expr, env, state, memo);
+
     match stmt {
         Stmt::Let { var, rhs } => {
             if let Expr::StateSetter(label) = rhs {
@@ -987,5 +1118,227 @@ mod tests {
 
         let result = exec_body(&body_cfg, &entry_env, &mut state, &mut memo);
         assert_eq!(result, StateValue::Reference(Stability::Unstable));
+    }
+
+    // ── callback traversal (ADR-009) ─────────────────────────────────────────
+
+    #[test]
+    fn classify_callee_recognizes_in_cycle_and_subscription() {
+        let env: AbstractEnv<StateValue> = AbstractEnv::bottom();
+        let field = |f: &str| Expr::FieldAccess {
+            obj: Box::new(Expr::Var("x".to_string())),
+            field: f.to_string(),
+        };
+        assert_eq!(classify_callee(&field("then"), &env), TriggerClass::InCycle);
+        assert_eq!(classify_callee(&field("map"), &env), TriggerClass::InCycle);
+        assert_eq!(
+            classify_callee(&field("addEventListener"), &env),
+            TriggerClass::Subscription
+        );
+        assert_eq!(classify_callee(&field("doThing"), &env), TriggerClass::Unknown);
+        assert_eq!(
+            classify_callee(&Expr::Var("setTimeout".to_string()), &env),
+            TriggerClass::InCycle
+        );
+        assert_eq!(
+            classify_callee(&Expr::Var("myHelper".to_string()), &env),
+            TriggerClass::Unknown
+        );
+    }
+
+    #[test]
+    fn classify_callee_setter_var() {
+        let mut env: AbstractEnv<StateValue> = AbstractEnv::bottom();
+        env.bind_setter("setN".to_string(), 0);
+        assert_eq!(
+            classify_callee(&Expr::Var("setN".to_string()), &env),
+            TriggerClass::Setter
+        );
+    }
+
+    #[test]
+    fn then_callback_updates_state() {
+        // fetch().then(u => setUser(u)) → setUser called with u (Top) → state[0] = Top.
+        let (mut env, mut state, mut memo) = empty();
+        state.update(0, StateValue::Number(Interval::point(0.0)));
+        env.bind_setter("setUser".to_string(), 0);
+        env.extend("setUser".to_string(), StateValue::Reference(Stability::Stable));
+
+        let cb_body = single_block_cfg(
+            vec![Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setUser".to_string())),
+                args: vec![Expr::Var("u".to_string())],
+            })],
+            Expr::Lit(Prim::Unit),
+        );
+        let stmt = Stmt::ExprStmt(Expr::Call {
+            fn_: Box::new(Expr::FieldAccess {
+                obj: Box::new(Expr::Call {
+                    fn_: Box::new(Expr::Var("fetch".to_string())),
+                    args: vec![],
+                }),
+                field: "then".to_string(),
+            }),
+            args: vec![Expr::FnLit {
+                params: vec!["u".to_string()],
+                body_cfg: Box::new(cb_body),
+            }],
+        });
+        StateValueTransfer.exec_stmt(&stmt, &mut env, &mut state, &mut memo, &NullCtx);
+
+        // u is unknown (Top); Number([0,0]) ⊔ Top = Top.
+        assert_eq!(state.get(0), StateValue::Top);
+    }
+
+    #[test]
+    fn set_timeout_callback_updates_state() {
+        // setTimeout(() => setN(42), 1000) → state[0] = Number([42,42]).
+        let (mut env, mut state, mut memo) = empty();
+        env.bind_setter("setN".to_string(), 0);
+        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+
+        let cb_body = single_block_cfg(
+            vec![Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Lit(Prim::Int(42))],
+            })],
+            Expr::Lit(Prim::Unit),
+        );
+        let stmt = Stmt::ExprStmt(Expr::Call {
+            fn_: Box::new(Expr::Var("setTimeout".to_string())),
+            args: vec![
+                Expr::FnLit {
+                    params: vec![],
+                    body_cfg: Box::new(cb_body),
+                },
+                Expr::Lit(Prim::Int(1000)),
+            ],
+        });
+        StateValueTransfer.exec_stmt(&stmt, &mut env, &mut state, &mut memo, &NullCtx);
+
+        assert_eq!(state.get(0), StateValue::Number(Interval::point(42.0)));
+    }
+
+    #[test]
+    fn then_chain_descends_both_callbacks() {
+        // p.then(() => setA(1)).then(() => setB(2)) → state[0]=1 AND state[1]=2.
+        let (mut env, mut state, mut memo) = empty();
+        env.bind_setter("setA".to_string(), 0);
+        env.extend("setA".to_string(), StateValue::Reference(Stability::Stable));
+        env.bind_setter("setB".to_string(), 1);
+        env.extend("setB".to_string(), StateValue::Reference(Stability::Stable));
+
+        let cb_a = single_block_cfg(
+            vec![Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setA".to_string())),
+                args: vec![Expr::Lit(Prim::Int(1))],
+            })],
+            Expr::Lit(Prim::Unit),
+        );
+        let cb_b = single_block_cfg(
+            vec![Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setB".to_string())),
+                args: vec![Expr::Lit(Prim::Int(2))],
+            })],
+            Expr::Lit(Prim::Unit),
+        );
+        let inner = Expr::Call {
+            fn_: Box::new(Expr::FieldAccess {
+                obj: Box::new(Expr::Var("p".to_string())),
+                field: "then".to_string(),
+            }),
+            args: vec![Expr::FnLit {
+                params: vec![],
+                body_cfg: Box::new(cb_a),
+            }],
+        };
+        let outer = Expr::Call {
+            fn_: Box::new(Expr::FieldAccess {
+                obj: Box::new(inner),
+                field: "then".to_string(),
+            }),
+            args: vec![Expr::FnLit {
+                params: vec![],
+                body_cfg: Box::new(cb_b),
+            }],
+        };
+        StateValueTransfer.exec_stmt(
+            &Stmt::ExprStmt(outer),
+            &mut env,
+            &mut state,
+            &mut memo,
+            &NullCtx,
+        );
+
+        assert_eq!(state.get(0), StateValue::Number(Interval::point(1.0)));
+        assert_eq!(state.get(1), StateValue::Number(Interval::point(2.0)));
+    }
+
+    #[test]
+    fn then_in_let_binding_descends() {
+        // const p = fetch().then(() => setN(7)) → state[0]=7 even though it's a Let rhs.
+        let (mut env, mut state, mut memo) = empty();
+        env.bind_setter("setN".to_string(), 0);
+        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+
+        let cb = single_block_cfg(
+            vec![Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Lit(Prim::Int(7))],
+            })],
+            Expr::Lit(Prim::Unit),
+        );
+        let stmt = Stmt::Let {
+            var: "p".to_string(),
+            rhs: Expr::Call {
+                fn_: Box::new(Expr::FieldAccess {
+                    obj: Box::new(Expr::Call {
+                        fn_: Box::new(Expr::Var("fetch".to_string())),
+                        args: vec![],
+                    }),
+                    field: "then".to_string(),
+                }),
+                args: vec![Expr::FnLit {
+                    params: vec![],
+                    body_cfg: Box::new(cb),
+                }],
+            },
+        };
+        StateValueTransfer.exec_stmt(&stmt, &mut env, &mut state, &mut memo, &NullCtx);
+
+        assert_eq!(state.get(0), StateValue::Number(Interval::point(7.0)));
+    }
+
+    #[test]
+    fn subscription_callback_not_descended() {
+        // el.addEventListener('click', () => setN(99)) → state[0] stays Bottom (skip).
+        let (mut env, mut state, mut memo) = empty();
+        env.bind_setter("setN".to_string(), 0);
+        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+
+        let cb = single_block_cfg(
+            vec![Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Lit(Prim::Int(99))],
+            })],
+            Expr::Lit(Prim::Unit),
+        );
+        let stmt = Stmt::ExprStmt(Expr::Call {
+            fn_: Box::new(Expr::FieldAccess {
+                obj: Box::new(Expr::Var("el".to_string())),
+                field: "addEventListener".to_string(),
+            }),
+            args: vec![
+                Expr::Lit(Prim::String("click".to_string())),
+                Expr::FnLit {
+                    params: vec![],
+                    body_cfg: Box::new(cb),
+                },
+            ],
+        });
+        StateValueTransfer.exec_stmt(&stmt, &mut env, &mut state, &mut memo, &NullCtx);
+
+        // Subscription handler not descended → no state update.
+        assert_eq!(state.get(0), StateValue::Bottom);
     }
 }
