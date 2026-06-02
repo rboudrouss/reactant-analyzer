@@ -53,6 +53,8 @@ impl Rule for SetterInRender {
         queue.push_back(result.render_cfg.entry);
         visited.insert(result.render_cfg.entry);
 
+        let mut diags = vec![];
+
         while let Some(bid) = queue.pop_front() {
             if let Some(block) = result.render_cfg.blocks.get(&bid) {
                 for stmt in &block.stmts {
@@ -63,12 +65,12 @@ impl Rule for SetterInRender {
                         continue;
                     };
                     if setter_vars.contains(name) {
-                        return vec![Diagnostic::new(
+                        diags.push(Diagnostic::new(
                             "setter-in-render",
                             format!(
                                 "setter `{name}` called directly in the render body, move this call into a useEffect or an event handler"
                             ),
-                        )];
+                        ));
                     }
                 }
                 for succ in result.render_cfg.successors(bid) {
@@ -79,7 +81,7 @@ impl Rule for SetterInRender {
             }
         }
 
-        vec![]
+        diags
     }
 }
 
@@ -232,6 +234,31 @@ mod tests {
             hooks: vec![],
         };
         assert!(!SetterInRender.check(&result).is_empty());
+    }
+
+    #[test]
+    fn multiple_setters_called_all_reported() {
+        let render_stmts = vec![
+            Stmt::Let {
+                var: "setA".to_string(),
+                rhs: Expr::StateSetter(0),
+            },
+            Stmt::Let {
+                var: "setB".to_string(),
+                rhs: Expr::StateSetter(1),
+            },
+            Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setA".to_string())),
+                args: vec![Expr::Lit(Prim::Int(1))],
+            }),
+            Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setB".to_string())),
+                args: vec![Expr::Lit(Prim::Int(2))],
+            }),
+        ];
+        let result = make_result(vec![], render_stmts);
+        let diags = SetterInRender.check(&result);
+        assert_eq!(diags.len(), 2, "both setA and setB should be reported");
     }
 
     #[test]
