@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     domains::{
-        AbstractDomain, Transfer,
-        stores::{AbstractEnv, MemoStore, StateStore},
+        AbstractDomain, FixpointCtx, NullCtx, Transfer,
+        impls::StateValue,
+        stores::{AbstractEnv, MemoStore, StateStore, TypedStateStore},
     },
     ir::{
         cfg::CFG,
@@ -38,43 +39,54 @@ impl Default for Config {
 ///   3. Effect passes: analyze each effect body with exit env + current state.
 ///   4. Convergence check: if `new_state ⊑ state_store`, done.
 ///   5. Otherwise widen (after `config.widen_threshold` iterations) and repeat.
-pub fn analyze_component<T: Transfer>(
+///
+/// Internally uses `TypedStateStore` (ADR-008 Option B) for per-label precision:
+/// numeric labels widen via `Interval`, boolean labels stay in `BoolVal`, etc.
+/// The `Transfer` trait is unchanged; `StateStore<StateValue>` is projected in
+/// and out of `TypedStateStore` at each iteration boundary.
+pub fn analyze_component<T: Transfer<Domain = StateValue>>(
     comp: ComponentIR,
     transfer: &T,
     config: &Config,
-) -> AnalysisResult<T::Domain> {
+) -> AnalysisResult<StateValue> {
     let ComponentIR { render_cfg, hooks, .. } = comp;
 
-    let mut state_store: StateStore<T::Domain> = StateStore::bottom();
-    let mut memo_store: MemoStore<T::Domain> = MemoStore::new();
+    let mut typed_state = TypedStateStore::from_component(&hooks);
+    let mut memo_store: MemoStore<StateValue> = MemoStore::new();
     let mut widened_labels: HashSet<HookLabel> = HashSet::new();
     let mut iteration: usize = 0;
-    let mut block_states: HashMap<BlockId, AbstractEnv<T::Domain>>;
+    let mut block_states: HashMap<BlockId, AbstractEnv<StateValue>>;
 
-    // Seed each useState label with its init expression so that interval-based
-    // domains can detect divergence (e.g. setState(count + 1) with useState(0)).
+    // Seed each useState label with its init expression.
     {
         let init_env = AbstractEnv::bottom();
         let init_memo = MemoStore::new();
+        let init_untyped = StateStore::bottom();
         for hook in &hooks {
             if let HookEntry::State { label, init } = hook {
-                let init_val =
-                    transfer.eval_expr(init, &init_env, &state_store, &init_memo);
-                state_store.update(*label, init_val);
+                let init_val = transfer.eval_expr(init, &init_env, &init_untyped, &init_memo, &NullCtx);
+                typed_state.update(*label, init_val);
             }
         }
     }
 
     loop {
+        // Project to StateStore<StateValue> for Transfer compatibility.
+        let state_store = typed_state.to_untyped();
+
         // ── Render pass ───────────────────────────────────────────────────────
-        let (bs, state_from_render) = analyze_cfg::<T>(
-            &render_cfg,
-            AbstractEnv::bottom(),
-            &state_store,
-            &memo_store,
-            transfer,
-            config.widen_threshold,
-        );
+        let (bs, state_from_render) = {
+            let ctx = FixpointCtx { state: &state_store, memo: &memo_store };
+            analyze_cfg::<T>(
+                &render_cfg,
+                AbstractEnv::bottom(),
+                &state_store,
+                &memo_store,
+                transfer,
+                config.widen_threshold,
+                &ctx,
+            )
+        };
         block_states = bs;
 
         // ── Recompute memo store from exit env ────────────────────────────────
@@ -82,10 +94,10 @@ pub fn analyze_component<T: Transfer>(
         for hook in &hooks {
             match hook {
                 HookEntry::Memo { label, deps, .. } => {
-                    memo_store.set(*label, transfer.recompute_memo(deps, &env_exit));
+                    memo_store.set(*label, transfer.recompute_memo(deps, &env_exit, &NullCtx));
                 }
                 HookEntry::Callback { label, deps, .. } => {
-                    memo_store.set(*label, transfer.recompute_memo(deps, &env_exit));
+                    memo_store.set(*label, transfer.recompute_memo(deps, &env_exit, &NullCtx));
                 }
                 _ => {}
             }
@@ -95,21 +107,27 @@ pub fn analyze_component<T: Transfer>(
         let mut state_from_effects = StateStore::bottom();
         for hook in &hooks {
             if let HookEntry::Effect { body_cfg, .. } = hook {
-                let (_, eff_state) = analyze_cfg::<T>(
-                    body_cfg,
-                    env_exit.clone(),
-                    &state_store,
-                    &memo_store,
-                    transfer,
-                    config.widen_threshold,
-                );
+                let (_, eff_state) = {
+                    let ctx = FixpointCtx { state: &state_store, memo: &memo_store };
+                    analyze_cfg::<T>(
+                        body_cfg,
+                        env_exit.clone(),
+                        &state_store,
+                        &memo_store,
+                        transfer,
+                        config.widen_threshold,
+                        &ctx,
+                    )
+                };
                 state_from_effects = state_from_effects.join(&eff_state);
             }
         }
 
-        // ── Convergence check ─────────────────────────────────────────────────
-        let new_state = state_from_render.join(&state_from_effects);
-        if new_state.leq(&state_store) {
+        // ── Convergence check (per-sub-store precision) ───────────────────────
+        let new_untyped = state_from_render.join(&state_from_effects);
+        let new_typed = typed_state.from_untyped(&new_untyped);
+
+        if new_typed.leq(&typed_state) {
             break;
         }
 
@@ -117,12 +135,12 @@ pub fn analyze_component<T: Transfer>(
         assert!(iteration < 100, "fixpoint did not converge after 100 iterations");
 
         if iteration >= config.widen_threshold {
-            for label in new_state.changed_labels(&state_store) {
+            for label in new_typed.changed_labels(&typed_state) {
                 widened_labels.insert(label);
             }
-            state_store = state_store.widen(&new_state);
+            typed_state = typed_state.widen(&new_typed);
         } else {
-            state_store = new_state;
+            typed_state = new_typed;
         }
     }
 
@@ -131,7 +149,7 @@ pub fn analyze_component<T: Transfer>(
     let hooks_clone = hooks.clone();
 
     AnalysisResult {
-        state_store,
+        state_store: typed_state.to_untyped(),
         memo_store,
         block_states,
         hook_calls,

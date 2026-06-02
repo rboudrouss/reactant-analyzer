@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::{
     domains::{
-        AbstractDomain, Transfer,
+        AbstractDomain, QueryContext, Transfer,
         stores::{AbstractEnv, MemoStore, StateStore},
     },
     ir::{
@@ -28,6 +28,7 @@ pub fn analyze_cfg<T: Transfer>(
     memo: &MemoStore<T::Domain>,
     transfer: &T,
     widen_threshold: usize,
+    ctx: &dyn QueryContext,
 ) -> (HashMap<BlockId, AbstractEnv<T::Domain>>, StateStore<T::Domain>) {
     let mut entry_envs: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
     let mut exit_envs: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
@@ -52,7 +53,7 @@ pub fn analyze_cfg<T: Transfer>(
 
         if let Some(block) = cfg.blocks.get(&b) {
             for stmt in &block.stmts {
-                transfer.exec_stmt(stmt, &mut env_out, &mut state_out, &mut memo_local);
+                transfer.exec_stmt(stmt, &mut env_out, &mut state_out, &mut memo_local, ctx);
             }
         }
 
@@ -159,7 +160,7 @@ mod tests {
     use super::*;
     use crate::{
         domains::{
-            Stability, StabilityTransfer,
+            NullCtx, Stability, StateValue, StateValueTransfer, Interval,
             stores::{AbstractEnv, MemoStore, StateStore},
         },
         ir::{
@@ -181,13 +182,14 @@ mod tests {
     #[test]
     fn empty_cfg_entry_env_preserved() {
         let cfg = single_block_cfg(vec![]);
-        let (exit_envs, state_out) = analyze_cfg::<StabilityTransfer>(
+        let (exit_envs, state_out) = analyze_cfg::<StateValueTransfer>(
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
             &MemoStore::new(),
-            &StabilityTransfer,
+            &StateValueTransfer,
             3,
+            &NullCtx,
         );
         assert!(exit_envs.contains_key(&0));
         assert_eq!(state_out, StateStore::bottom());
@@ -199,15 +201,16 @@ mod tests {
             var: "x".to_string(),
             rhs: Expr::Lit(Prim::Int(42)),
         }]);
-        let (exit_envs, _) = analyze_cfg::<StabilityTransfer>(
+        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
             &MemoStore::new(),
-            &StabilityTransfer,
+            &StateValueTransfer,
             3,
+            &NullCtx,
         );
-        assert_eq!(exit_envs[&0].lookup("x"), Stability::Stable);
+        assert_eq!(exit_envs[&0].lookup("x"), StateValue::Number(Interval::point(42.0)));
     }
 
     #[test]
@@ -221,15 +224,16 @@ mod tests {
             }),
         ];
         let cfg = single_block_cfg(stmts);
-        let (_, state_out) = analyze_cfg::<StabilityTransfer>(
+        let (_, state_out) = analyze_cfg::<StateValueTransfer>(
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
             &MemoStore::new(),
-            &StabilityTransfer,
+            &StateValueTransfer,
             3,
+            &NullCtx,
         );
-        assert_eq!(state_out.get(0), Stability::Unstable);
+        assert_eq!(state_out.get(0), StateValue::Reference(Stability::Unstable));
     }
 
     #[test]
@@ -259,15 +263,16 @@ mod tests {
             edges: vec![Edge { from: 0, to: 1, kind: EdgeKind::Unconditional }],
         };
 
-        let (exit_envs, _) = analyze_cfg::<StabilityTransfer>(
+        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
             &MemoStore::new(),
-            &StabilityTransfer,
+            &StateValueTransfer,
             3,
+            &NullCtx,
         );
-        assert_eq!(exit_envs[&1].lookup("x"), Stability::Unstable);
+        assert_eq!(exit_envs[&1].lookup("x"), StateValue::Reference(Stability::Unstable));
     }
 
     #[test]
@@ -326,16 +331,17 @@ mod tests {
             ],
         };
 
-        let (exit_envs, _) = analyze_cfg::<StabilityTransfer>(
+        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
             &MemoStore::new(),
-            &StabilityTransfer,
+            &StateValueTransfer,
             3,
+            &NullCtx,
         );
-        // join(Stable, Unstable) = Unknown at merge block 3
-        assert_eq!(exit_envs[&3].lookup("x"), Stability::Unknown);
+        // join(Number([1,1]), Reference(Unstable)) = Top at merge block 3
+        assert_eq!(exit_envs[&3].lookup("x"), StateValue::Top);
     }
 
     #[test]
@@ -396,6 +402,7 @@ mod tests {
             &MemoStore::new(),
             &StateValueTransfer,
             3,
+            &NullCtx,
         );
 
         // then-branch: x < 10 → x ∈ [0, 9]  (after block 0's let x=0 re-binds to Number([0,0]),

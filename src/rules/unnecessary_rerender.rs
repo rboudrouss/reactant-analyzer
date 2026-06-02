@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::{
-    domains::{AbstractEnv, MemoStore, StateStore, StateValue, StateValueTransfer, Transfer},
+    domains::{AbstractEnv, MemoStore, NullCtx, StateStore, StateValue, StateValueTransfer, Transfer},
     engine::AnalysisResult,
     ir::{
         expr::Expr,
@@ -38,7 +38,7 @@ impl Rule for UnnecessaryRerender {
             .iter()
             .filter_map(|h| {
                 if let HookEntry::State { label, init } = h {
-                    let val = StateValueTransfer.eval_expr(init, &empty_env, &empty_state, &empty_memo);
+                    let val = StateValueTransfer.eval_expr(init, &empty_env, &empty_state, &empty_memo, &NullCtx);
                     Some((*label, val))
                 } else {
                     None
@@ -103,6 +103,7 @@ impl Rule for UnnecessaryRerender {
                                     &empty_env,
                                     &result.state_store,
                                     &result.memo_store,
+                                    &NullCtx,
                                 )
                             })
                             .unwrap_or(StateValue::Top);

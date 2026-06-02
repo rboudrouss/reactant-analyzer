@@ -1,4 +1,4 @@
-use crate::domains::{AbstractEnv, MemoStore, StateStore, Transfer};
+use crate::domains::{AbstractEnv, MemoStore, QueryContext, StateStore, Transfer};
 
 // ── DomainQuery ───────────────────────────────────────────────────────────────
 
@@ -26,5 +26,6 @@ pub trait Queryable<Q: DomainQuery>: Transfer {
         env: &AbstractEnv<Self::Domain>,
         state: &StateStore<Self::Domain>,
         memo: &MemoStore<Self::Domain>,
+        ctx: &dyn QueryContext,
     ) -> Q::Result;
 }

@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::{
-    domains::{AbstractDomain, AbstractEnv, MemoStore, StateStore, Transfer},
+    domains::{AbstractDomain, AbstractEnv, MemoStore, QueryContext, StateStore, Transfer},
     ir::{
         expr::{BinOp, Expr, Prim, UnaryOp},
         stmt::Stmt,
@@ -11,194 +11,14 @@ use crate::{
 };
 
 use super::Stability;
+pub use super::bool_val::BoolVal;
+pub use super::interval::Interval;
 
 /// Max strings tracked in a `StrConst` set before widening to `Str`.
 const STR_WIDEN_THRESHOLD: usize = 4;
 
 fn str_const(set: BTreeSet<String>) -> StateValue {
     if set.len() > STR_WIDEN_THRESHOLD { StateValue::Str } else { StateValue::StrConst(Arc::new(set)) }
-}
-
-// ── Interval ──────────────────────────────────────────────────────────────────
-
-/// Closed interval [lo, hi] over f64. `lo > hi` = bottom (empty).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Interval {
-    pub lo: f64,
-    pub hi: f64,
-}
-
-impl Interval {
-    pub fn point(v: f64) -> Self {
-        Interval { lo: v, hi: v }
-    }
-
-    pub fn top() -> Self {
-        Interval { lo: f64::NEG_INFINITY, hi: f64::INFINITY }
-    }
-
-    /// Empty interval — represents ⊥ for the numeric sub-lattice.
-    pub fn bottom() -> Self {
-        Interval { lo: f64::INFINITY, hi: f64::NEG_INFINITY }
-    }
-
-    pub fn is_bottom(&self) -> bool {
-        self.lo > self.hi
-    }
-
-    pub fn is_point(&self) -> bool {
-        !self.is_bottom() && self.lo == self.hi
-    }
-
-    pub fn is_top(&self) -> bool {
-        self.lo == f64::NEG_INFINITY && self.hi == f64::INFINITY
-    }
-
-    /// Least upper bound: smallest interval containing both.
-    pub fn hull(&self, other: &Self) -> Self {
-        if self.is_bottom() {
-            return *other;
-        }
-        if other.is_bottom() {
-            return *self;
-        }
-        Interval { lo: self.lo.min(other.lo), hi: self.hi.max(other.hi) }
-    }
-
-    /// Widening: if other grows the bound beyond self, jump to ±∞.
-    pub fn widen(&self, other: &Self) -> Self {
-        if self.is_bottom() {
-            return *other;
-        }
-        if other.is_bottom() {
-            return *self;
-        }
-        Interval {
-            lo: if other.lo < self.lo { f64::NEG_INFINITY } else { self.lo },
-            hi: if other.hi > self.hi { f64::INFINITY } else { self.hi },
-        }
-    }
-
-    pub fn add(&self, other: &Self) -> Self {
-        if self.is_bottom() || other.is_bottom() {
-            return Interval::bottom();
-        }
-        Interval { lo: self.lo + other.lo, hi: self.hi + other.hi }
-    }
-
-    pub fn sub(&self, other: &Self) -> Self {
-        if self.is_bottom() || other.is_bottom() {
-            return Interval::bottom();
-        }
-        Interval { lo: self.lo - other.hi, hi: self.hi - other.lo }
-    }
-
-    pub fn mul(&self, other: &Self) -> Self {
-        if self.is_bottom() || other.is_bottom() {
-            return Interval::bottom();
-        }
-        let products = [
-            self.lo * other.lo,
-            self.lo * other.hi,
-            self.hi * other.lo,
-            self.hi * other.hi,
-        ];
-        let lo = products.iter().cloned().fold(f64::INFINITY, f64::min);
-        let hi = products.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        Interval { lo, hi }
-    }
-
-    pub fn neg(&self) -> Self {
-        if self.is_bottom() {
-            return Interval::bottom();
-        }
-        Interval { lo: -self.hi, hi: -self.lo }
-    }
-
-    // Narrowing: restrict interval to satisfy a comparison against a literal `v`.
-    pub fn narrow_lt(&self, v: f64) -> Self {
-        Interval { lo: self.lo, hi: self.hi.min(v - 1.0) }
-    }
-    pub fn narrow_leq(&self, v: f64) -> Self {
-        Interval { lo: self.lo, hi: self.hi.min(v) }
-    }
-    pub fn narrow_gt(&self, v: f64) -> Self {
-        Interval { lo: self.lo.max(v + 1.0), hi: self.hi }
-    }
-    pub fn narrow_geq(&self, v: f64) -> Self {
-        Interval { lo: self.lo.max(v), hi: self.hi }
-    }
-    pub fn narrow_eq(&self, v: f64) -> Self {
-        if self.lo <= v && v <= self.hi { Interval::point(v) } else { Interval::bottom() }
-    }
-    /// Conservative: can't split an interval at a point; return self.
-    pub fn narrow_neq(&self, _v: f64) -> Self { *self }
-}
-
-/// [a,b] ≤ [c,d] iff [a,b] ⊆ [c,d] (i.e. c ≤ a && b ≤ d).
-impl PartialOrd for Interval {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        if self == other {
-            return Some(Ordering::Equal);
-        }
-        let self_in_other = other.lo <= self.lo && self.hi <= other.hi;
-        let other_in_self = self.lo <= other.lo && other.hi <= self.hi;
-        match (self_in_other, other_in_self) {
-            (true, false) => Some(Ordering::Less),
-            (false, true) => Some(Ordering::Greater),
-            (true, true) => Some(Ordering::Equal),
-            (false, false) => None,
-        }
-    }
-}
-
-// ── BoolVal ───────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BoolVal {
-    /// ⊥ — unreachable.
-    Bottom,
-    True,
-    False,
-    /// ⊤ — may be either.
-    Top,
-}
-
-impl PartialOrd for BoolVal {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        match (self, other) {
-            (a, b) if a == b => Some(Ordering::Equal),
-            (BoolVal::Bottom, _) | (_, BoolVal::Top) => Some(Ordering::Less),
-            (BoolVal::Top, _) | (_, BoolVal::Bottom) => Some(Ordering::Greater),
-            _ => None,
-        }
-    }
-}
-
-impl AbstractDomain for BoolVal {
-    fn bottom() -> Self { BoolVal::Bottom }
-    fn top() -> Self { BoolVal::Top }
-    fn is_bottom(&self) -> bool { matches!(self, BoolVal::Bottom) }
-
-    fn join(&self, other: &Self) -> Self {
-        match (self, other) {
-            (a, b) if a == b => *a,
-            (BoolVal::Bottom, x) | (x, BoolVal::Bottom) => *x,
-            _ => BoolVal::Top,
-        }
-    }
-
-    fn meet(&self, other: &Self) -> Self {
-        match (self, other) {
-            (a, b) if a == b => *a,
-            (BoolVal::Top, x) | (x, BoolVal::Top) => *x,
-            _ => BoolVal::Bottom,
-        }
-    }
-
-    fn widen(&self, other: &Self) -> Self {
-        self.join(other)
-    }
 }
 
 // ── StateValue ────────────────────────────────────────────────────────────────
@@ -399,6 +219,7 @@ impl Transfer for StateValueTransfer {
         env: &AbstractEnv<StateValue>,
         state: &StateStore<StateValue>,
         memo: &MemoStore<StateValue>,
+        _ctx: &dyn QueryContext,
     ) -> StateValue {
         eval_state_value(expr, env, state, memo)
     }
@@ -409,11 +230,12 @@ impl Transfer for StateValueTransfer {
         env: &mut AbstractEnv<StateValue>,
         state: &mut StateStore<StateValue>,
         memo: &mut MemoStore<StateValue>,
+        _ctx: &dyn QueryContext,
     ) {
         exec_state_value(stmt, env, state, memo);
     }
 
-    fn recompute_memo(&self, deps: &[Expr], env: &AbstractEnv<StateValue>) -> StateValue {
+    fn recompute_memo(&self, deps: &[Expr], env: &AbstractEnv<StateValue>, _ctx: &dyn QueryContext) -> StateValue {
         if deps.is_empty() {
             return StateValue::Reference(Stability::Stable);
         }
@@ -565,60 +387,8 @@ fn exec_state_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domains::NullCtx;
     use crate::ir::expr::Prim;
-
-    // ── Interval ──────────────────────────────────────────────────────────────
-
-    #[test]
-    fn interval_point_is_stable() {
-        let i = Interval::point(42.0);
-        assert!(i.is_point());
-        assert!(!i.is_bottom());
-    }
-
-    #[test]
-    fn interval_hull() {
-        let a = Interval::point(0.0);
-        let b = Interval::point(1.0);
-        let h = a.hull(&b);
-        assert_eq!(h.lo, 0.0);
-        assert_eq!(h.hi, 1.0);
-    }
-
-    #[test]
-    fn interval_widen_grows_hi() {
-        let a = Interval::point(0.0);
-        let b = Interval::point(1.0);
-        let w = a.widen(&b);
-        assert_eq!(w.lo, 0.0);
-        assert!(w.hi.is_infinite());
-    }
-
-    #[test]
-    fn interval_widen_shrinks_lo() {
-        let a = Interval { lo: 0.0, hi: 5.0 };
-        let b = Interval { lo: -1.0, hi: 5.0 };
-        let w = a.widen(&b);
-        assert!(w.lo.is_infinite() && w.lo < 0.0);
-        assert_eq!(w.hi, 5.0);
-    }
-
-    #[test]
-    fn interval_add() {
-        let a = Interval { lo: 0.0, hi: 3.0 };
-        let b = Interval::point(1.0);
-        let r = a.add(&b);
-        assert_eq!(r.lo, 1.0);
-        assert_eq!(r.hi, 4.0);
-    }
-
-    #[test]
-    fn interval_partial_ord() {
-        let narrow = Interval { lo: 1.0, hi: 2.0 };
-        let wide = Interval { lo: 0.0, hi: 5.0 };
-        assert!(narrow < wide);
-        assert!(!(wide < narrow));
-    }
 
     // ── StateValue domain ─────────────────────────────────────────────────────
 
@@ -689,7 +459,7 @@ mod tests {
     fn eval_int_literal() {
         let (env, state, memo) = empty();
         assert_eq!(
-            StateValueTransfer.eval_expr(&Expr::Lit(Prim::Int(5)), &env, &state, &memo),
+            StateValueTransfer.eval_expr(&Expr::Lit(Prim::Int(5)), &env, &state, &memo, &NullCtx),
             StateValue::Number(Interval::point(5.0))
         );
     }
@@ -698,7 +468,7 @@ mod tests {
     fn eval_bool_literal() {
         let (env, state, memo) = empty();
         assert_eq!(
-            StateValueTransfer.eval_expr(&Expr::Lit(Prim::Bool(true)), &env, &state, &memo),
+            StateValueTransfer.eval_expr(&Expr::Lit(Prim::Bool(true)), &env, &state, &memo, &NullCtx),
             StateValue::Boolean(BoolVal::True)
         );
     }
@@ -707,7 +477,7 @@ mod tests {
     fn eval_object_is_unstable_reference() {
         let (env, state, memo) = empty();
         assert_eq!(
-            StateValueTransfer.eval_expr(&Expr::ObjectLit(vec![]), &env, &state, &memo),
+            StateValueTransfer.eval_expr(&Expr::ObjectLit(vec![]), &env, &state, &memo, &NullCtx),
             StateValue::Reference(Stability::Unstable)
         );
     }
@@ -721,7 +491,7 @@ mod tests {
             rhs: Box::new(Expr::Lit(Prim::Int(4))),
         };
         assert_eq!(
-            StateValueTransfer.eval_expr(&expr, &env, &state, &memo),
+            StateValueTransfer.eval_expr(&expr, &env, &state, &memo, &NullCtx),
             StateValue::Number(Interval::point(7.0))
         );
     }
@@ -736,7 +506,7 @@ mod tests {
             rhs: Box::new(Expr::Lit(Prim::Int(1))),
         };
         assert_eq!(
-            StateValueTransfer.eval_expr(&expr, &env, &state, &memo),
+            StateValueTransfer.eval_expr(&expr, &env, &state, &memo, &NullCtx),
             StateValue::Number(Interval::point(3.0))
         );
     }
@@ -749,7 +519,7 @@ mod tests {
             arg: Box::new(Expr::Lit(Prim::Bool(true))),
         };
         assert_eq!(
-            StateValueTransfer.eval_expr(&expr, &env, &state, &memo),
+            StateValueTransfer.eval_expr(&expr, &env, &state, &memo, &NullCtx),
             StateValue::Boolean(BoolVal::False)
         );
     }
@@ -759,14 +529,14 @@ mod tests {
         let (mut env, mut state, mut memo) = empty();
         StateValueTransfer.exec_stmt(
             &Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
-            &mut env, &mut state, &mut memo,
+            &mut env, &mut state, &mut memo, &NullCtx,
         );
         StateValueTransfer.exec_stmt(
             &Stmt::ExprStmt(Expr::Call {
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::Lit(Prim::Int(42))],
             }),
-            &mut env, &mut state, &mut memo,
+            &mut env, &mut state, &mut memo, &NullCtx,
         );
         assert_eq!(state.get(0), StateValue::Number(Interval::point(42.0)));
     }
@@ -911,7 +681,7 @@ mod tests {
         let (env, state, memo) = empty();
         let v = StateValueTransfer.eval_expr(
             &Expr::Lit(Prim::String("dark".into())),
-            &env, &state, &memo,
+            &env, &state, &memo, &NullCtx,
         );
         assert_eq!(v, str_singleton("dark"));
     }

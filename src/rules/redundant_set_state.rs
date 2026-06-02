@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    domains::{AbstractEnv, MemoStore, StateStore, StateValue, StateValueTransfer, Transfer},
+    domains::{AbstractEnv, MemoStore, NullCtx, StateStore, StateValue, StateValueTransfer, Transfer},
     engine::AnalysisResult,
     ir::{cfg::CFG, expr::Expr, hooks::HookEntry, stmt::Stmt, types::HookLabel},
 };
@@ -150,7 +150,7 @@ fn collect_setter_vals_in_expr(
                 if let Some(label) = env.setter_label(name) {
                     let arg_val = args
                         .first()
-                        .map(|a| transfer.eval_expr(a, env, state, memo))
+                        .map(|a| transfer.eval_expr(a, env, state, memo, &NullCtx))
                         .unwrap_or(StateValue::Top);
                     match tracker.entry(label) {
                         std::collections::hash_map::Entry::Vacant(e) => {
@@ -217,7 +217,7 @@ fn check_setter_calls(
 
                     let arg_val = args
                         .first()
-                        .map(|a| transfer.eval_expr(a, env, state, memo))
+                        .map(|a| transfer.eval_expr(a, env, state, memo, &NullCtx))
                         .unwrap_or(StateValue::Top);
 
                     let current_val = state.get(label);

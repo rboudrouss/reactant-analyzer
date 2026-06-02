@@ -4,13 +4,15 @@ pub mod product;
 pub mod query;
 pub mod stores;
 
-pub use context::{AnalysisQueryCtx, QueryContext};
-pub use impls::{BoolVal, Interval, Stability, StabilityTransfer, StateValue, StateValueTransfer};
+pub use context::{AnalysisQueryCtx, FixpointCtx, NullCtx, QueryContext};
+pub use impls::{BoolVal, Interval, Stability, StateValue, StateValueTransfer};
 pub use product::{ProductDomain, ProductTransfer};
 pub use query::{DomainQuery, Queryable};
 pub use stores::{AbstractEnv, MemoStore, StateStore};
 
 use crate::ir::{Expr, Stmt};
+
+// ── AbstractDomain ────────────────────────────────────────────────────────────
 
 /// Core abstract domain trait.
 ///
@@ -45,8 +47,9 @@ pub trait AbstractDomain: Clone + PartialEq + PartialOrd + std::fmt::Debug {
 /// expressions are evaluated and how statements update the abstract state.
 /// Adding a new domain = new struct + `impl Transfer`.
 ///
-/// The engine (stage 5) will be parameterised over `T: Transfer`, enabling
-/// per-analysis-run domain selection and composition.
+/// The `ctx` parameter lets a Transfer query other domains during analysis
+/// (cross-domain ask pattern — ADR-007 B3). Pass `&NullCtx` when no
+/// cross-domain queries are needed (tests, simple impls).
 pub trait Transfer {
     type Domain: AbstractDomain;
 
@@ -57,6 +60,7 @@ pub trait Transfer {
         env: &AbstractEnv<Self::Domain>,
         state: &StateStore<Self::Domain>,
         memo: &MemoStore<Self::Domain>,
+        ctx: &dyn QueryContext,
     ) -> Self::Domain;
 
     /// Execute a statement, updating `env`, `state`, and `memo` in place.
@@ -66,6 +70,7 @@ pub trait Transfer {
         env: &mut AbstractEnv<Self::Domain>,
         state: &mut StateStore<Self::Domain>,
         memo: &mut MemoStore<Self::Domain>,
+        ctx: &dyn QueryContext,
     );
 
     /// Compute the abstract value for a memoized hook from its dependency list.
@@ -74,5 +79,6 @@ pub trait Transfer {
         &self,
         deps: &[Expr],
         env: &AbstractEnv<Self::Domain>,
+        ctx: &dyn QueryContext,
     ) -> Self::Domain;
 }

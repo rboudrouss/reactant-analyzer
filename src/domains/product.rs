@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use crate::domains::{AbstractDomain, AbstractEnv, MemoStore, StateStore, Transfer};
+use crate::domains::{AbstractDomain, AbstractEnv, MemoStore, QueryContext, StateStore, Transfer};
 
 use super::query::{DomainQuery, Queryable};
 
@@ -78,6 +78,7 @@ where
         _env: &AbstractEnv<Self::Domain>,
         _state: &StateStore<Self::Domain>,
         _memo: &MemoStore<Self::Domain>,
+        ctx: &dyn QueryContext,
     ) -> Q::Result {
         // Project to T1's domain via bottom env (conservative but type-correct).
         // Full projection requires map_values on stores — TODO when fused fixpoint
@@ -85,7 +86,7 @@ where
         let empty_env = AbstractEnv::bottom();
         let empty_state = StateStore::bottom();
         let empty_memo = MemoStore::new();
-        self.0.ask(q, &empty_env, &empty_state, &empty_memo)
+        self.0.ask(q, &empty_env, &empty_state, &empty_memo, ctx)
     }
 }
 
@@ -101,6 +102,7 @@ where
         _env: &AbstractEnv<Self::Domain>,
         _state: &StateStore<Self::Domain>,
         _memo: &MemoStore<Self::Domain>,
+        _ctx: &dyn QueryContext,
     ) -> Self::Domain {
         // TODO: implement full projection/injection when fused fixpoint is needed.
         // For now ProductTransfer exists for Queryable delegation only.
@@ -113,6 +115,7 @@ where
         _env: &mut AbstractEnv<Self::Domain>,
         _state: &mut StateStore<Self::Domain>,
         _memo: &mut MemoStore<Self::Domain>,
+        _ctx: &dyn QueryContext,
     ) {
         // TODO: implement full projection/injection when fused fixpoint is needed.
     }
@@ -121,6 +124,7 @@ where
         &self,
         _deps: &[crate::ir::expr::Expr],
         _env: &AbstractEnv<Self::Domain>,
+        _ctx: &dyn QueryContext,
     ) -> Self::Domain {
         ProductDomain::bottom()
     }
