@@ -7,7 +7,7 @@ use oxc_span::SourceType;
 use reactant::{
     domains::StateValueTransfer,
     engine::{Config, analyze_component},
-    lowering::lower_program,
+    lowering::{compute_line_starts, lower_program},
     rules::all_rules,
 };
 
@@ -70,7 +70,8 @@ fn analyze_file(path: &Path) -> usize {
         return 0;
     }
 
-    let components = lower_program(&ret.program);
+    let line_starts = compute_line_starts(&source);
+    let components = lower_program(&ret.program, &line_starts);
     if components.is_empty() {
         println!("  (no components detected)");
         return 0;
@@ -103,10 +104,25 @@ fn analyze_file(path: &Path) -> usize {
                     .as_deref()
                     .map(|v| format!("  var:{v}"))
                     .unwrap_or_default();
+                let range_info = d
+                    .range
+                    .map(|r| format!("  (line {}:{})", r.line, r.col))
+                    .unwrap_or_default();
                 println!(
-                    "    ⚠  {}{}{}  — {}",
-                    d.rule, label_info, var_info, d.message
+                    "    ⚠  {}{}{}{}  — {}",
+                    d.rule, label_info, var_info, range_info, d.message
                 );
+                for note in &d.notes {
+                    let note_hook = note
+                        .hook_label
+                        .map(|l| format!(" [hook:{l}]"))
+                        .unwrap_or_default();
+                    let note_range = note
+                        .range
+                        .map(|r| format!(" (line {}:{})", r.line, r.col))
+                        .unwrap_or_default();
+                    println!("       → {}{}{}", note.message, note_hook, note_range);
+                }
             }
             file_issues += diags.len();
         }

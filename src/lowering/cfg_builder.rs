@@ -23,10 +23,11 @@ pub(super) struct BlockBuilder {
     terminated: bool,
     temp_counter: usize,
     expr_counter: usize,
+    pub(super) line_starts: Vec<u32>,
 }
 
 impl BlockBuilder {
-    pub(super) fn new() -> Self {
+    pub(super) fn new_with_line_starts(line_starts: &[u32]) -> Self {
         Self {
             blocks: HashMap::new(),
             edges: Vec::new(),
@@ -36,7 +37,12 @@ impl BlockBuilder {
             terminated: false,
             temp_counter: 0,
             expr_counter: 0,
+            line_starts: line_starts.to_vec(),
         }
+    }
+
+    pub(super) fn new() -> Self {
+        Self::new_with_line_starts(&[])
     }
 
     pub(super) fn new_block(&mut self) -> BlockId {
@@ -110,12 +116,20 @@ impl BlockBuilder {
         self.temp_counter += 1;
         t
     }
+
+    pub(super) fn span_at(&self, offset: u32) -> Option<crate::ir::SourceRange> {
+        if self.line_starts.is_empty() {
+            None
+        } else {
+            Some(crate::ir::offset_to_range(&self.line_starts, offset))
+        }
+    }
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-pub fn build_cfg(body: &FunctionBody) -> CFG {
-    let mut builder = BlockBuilder::new();
+pub fn build_cfg(body: &FunctionBody, line_starts: &[u32]) -> CFG {
+    let mut builder = BlockBuilder::new_with_line_starts(line_starts);
     builder.start_block(0);
     lower_stmts(&body.statements, &mut builder);
     builder.into_cfg(0)
@@ -141,7 +155,7 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
         }
         Statement::ExpressionStatement(es) => {
             let expr = lower_expr(&es.expression, builder);
-            builder.push_stmt(Stmt::ExprStmt(expr));
+            builder.push_stmt(Stmt::ExprStmt(expr, builder.span_at(es.span.start)));
         }
         Statement::ReturnStatement(ret) => {
             let expr = ret
@@ -196,7 +210,7 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
         }
         Statement::ThrowStatement(th) => {
             let expr = lower_expr(&th.argument, builder);
-            builder.push_stmt(Stmt::ExprStmt(expr));
+            builder.push_stmt(Stmt::ExprStmt(expr, builder.span_at(th.span.start)));
             builder.seal_with(Terminator::Unreachable);
         }
         Statement::TryStatement(tr) => {
@@ -238,7 +252,7 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
                 let body_cfg = func
                     .body
                     .as_ref()
-                    .map(|b| build_cfg(b))
+                    .map(|b| build_cfg(b, &builder.line_starts.clone()))
                     .unwrap_or_else(empty_cfg);
                 let expr_id = builder.next_expr_id();
                 builder.push_stmt(Stmt::Let {
@@ -248,6 +262,7 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
                         params,
                         body_cfg: std::sync::Arc::new(body_cfg),
                     },
+                    span: builder.span_at(func.span.start),
                 });
             }
         }
@@ -345,7 +360,7 @@ fn lower_for(
             _ => {
                 if let Some(e) = init.as_expression() {
                     let expr = lower_expr(e, builder);
-                    builder.push_stmt(Stmt::ExprStmt(expr));
+                    builder.push_stmt(Stmt::ExprStmt(expr, None));
                 }
             }
         }
@@ -381,7 +396,7 @@ fn lower_for(
     builder.start_block(update_block);
     if let Some(upd) = update {
         let expr = lower_expr(upd, builder);
-        builder.push_stmt(Stmt::ExprStmt(expr));
+        builder.push_stmt(Stmt::ExprStmt(expr, None));
     }
     let u = builder.seal_with(Terminator::Jump(header));
     builder.add_edge(u, header, EdgeKind::Back);
@@ -420,7 +435,7 @@ fn lower_iter_loop(body: &Statement, builder: &mut BlockBuilder) {
 fn lower_switch(sw: &SwitchStatement, builder: &mut BlockBuilder) {
     let exit_block = builder.new_block();
     let disc = lower_expr(&sw.discriminant, builder);
-    builder.push_stmt(Stmt::ExprStmt(disc));
+    builder.push_stmt(Stmt::ExprStmt(disc, None));
 
     // Lower each case's body sequentially; break → jump to exit
     for case in &sw.cases {
@@ -458,6 +473,7 @@ fn lower_var_declarator(vd: &VariableDeclarator, builder: &mut BlockBuilder) {
             builder.push_stmt(Stmt::Let {
                 var: id.name.to_string(),
                 rhs,
+                span: builder.span_at(vd.span.start),
             });
         }
         BindingPattern::ArrayPattern(arr) => {
@@ -466,6 +482,7 @@ fn lower_var_declarator(vd: &VariableDeclarator, builder: &mut BlockBuilder) {
             builder.push_stmt(Stmt::Let {
                 var: temp.clone(),
                 rhs,
+                span: builder.span_at(vd.span.start),
             });
             for (i, elem) in arr.elements.iter().enumerate() {
                 let Some(elem) = elem else { continue };
@@ -477,6 +494,7 @@ fn lower_var_declarator(vd: &VariableDeclarator, builder: &mut BlockBuilder) {
                                 arr: Box::new(Expr::Var(temp.clone())),
                                 idx: Box::new(Expr::Lit(Prim::Int(i as i32))),
                             },
+                            span: None,
                         });
                     }
                     BindingPattern::AssignmentPattern(ap) => {
@@ -488,6 +506,7 @@ fn lower_var_declarator(vd: &VariableDeclarator, builder: &mut BlockBuilder) {
                                     arr: Box::new(Expr::Var(temp.clone())),
                                     idx: Box::new(Expr::Lit(Prim::Int(i as i32))),
                                 },
+                                span: None,
                             });
                         }
                     }
@@ -501,6 +520,7 @@ fn lower_var_declarator(vd: &VariableDeclarator, builder: &mut BlockBuilder) {
             builder.push_stmt(Stmt::Let {
                 var: temp.clone(),
                 rhs,
+                span: None,
             });
             for prop in &obj.properties {
                 let field = match &prop.key {
@@ -516,6 +536,7 @@ fn lower_var_declarator(vd: &VariableDeclarator, builder: &mut BlockBuilder) {
                                 obj: Box::new(Expr::Var(temp.clone())),
                                 field,
                             },
+                            span: None,
                         });
                     }
                     BindingPattern::AssignmentPattern(ap) => {
@@ -526,6 +547,7 @@ fn lower_var_declarator(vd: &VariableDeclarator, builder: &mut BlockBuilder) {
                                     obj: Box::new(Expr::Var(temp.clone())),
                                     field,
                                 },
+                                span: None,
                             });
                         }
                     }

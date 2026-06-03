@@ -19,12 +19,23 @@ use crate::{
     domains::StateValue,
     engine::AnalysisResult,
     ir::{
+        SourceRange,
         cfg::CFG,
         expr::Expr,
         stmt::Stmt,
         types::{HookLabel, Var},
     },
 };
+
+/// Secondary evidence item attached to a diagnostic.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Note {
+    pub message: String,
+    /// Hook label this note points to, if any.
+    pub hook_label: Option<HookLabel>,
+    /// Source location this note points to, if available.
+    pub range: Option<SourceRange>,
+}
 
 /// Warning produced by a rule against the fixpoint analysis result.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +46,10 @@ pub struct Diagnostic {
     pub hook_label: Option<HookLabel>,
     /// Variable name most directly involved, if any.
     pub var: Option<Var>,
+    /// Source location of the primary finding, if available.
+    pub range: Option<SourceRange>,
+    /// Secondary evidence items explaining the causal chain.
+    pub notes: Vec<Note>,
 }
 
 impl Diagnostic {
@@ -44,6 +59,8 @@ impl Diagnostic {
             message: message.into(),
             hook_label: None,
             var: None,
+            range: None,
+            notes: vec![],
         }
     }
 
@@ -54,6 +71,25 @@ impl Diagnostic {
 
     pub fn with_var(mut self, var: impl Into<Var>) -> Self {
         self.var = Some(var.into());
+        self
+    }
+
+    pub fn with_range(mut self, range: SourceRange) -> Self {
+        self.range = Some(range);
+        self
+    }
+
+    pub fn with_note(
+        mut self,
+        message: impl Into<String>,
+        hook_label: Option<HookLabel>,
+        range: Option<SourceRange>,
+    ) -> Self {
+        self.notes.push(Note {
+            message: message.into(),
+            hook_label,
+            range,
+        });
         self
     }
 }
@@ -84,6 +120,7 @@ fn collect_fn_bindings(cfg: &CFG) -> HashMap<Var, Arc<CFG>> {
             if let Stmt::Let {
                 var,
                 rhs: Expr::FnLit { body_cfg, .. },
+                ..
             } = stmt
             {
                 map.insert(var.clone(), Arc::clone(body_cfg));
@@ -127,7 +164,7 @@ fn check_stmt_for_setters(
     found: &mut HashSet<Var>,
 ) {
     let expr = match stmt {
-        Stmt::ExprStmt(e) => e,
+        Stmt::ExprStmt(e, _) => e,
         // Also descend into Let rhs that are FnLit — direct setter call at top level of a closure.
         Stmt::Let { rhs, .. } => rhs,
         Stmt::Assign { rhs, .. } => rhs,

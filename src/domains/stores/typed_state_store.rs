@@ -83,7 +83,7 @@ impl TypedStateStore {
     pub fn from_component(hooks: &[HookEntry]) -> Self {
         let mut type_map = HashMap::new();
         for hook in hooks {
-            if let HookEntry::State { label, init } = hook {
+            if let HookEntry::State { label, init, .. } = hook {
                 type_map.insert(*label, infer_state_type(init));
             }
         }
@@ -247,6 +247,7 @@ mod tests {
             .map(|(l, e)| HookEntry::State {
                 label: *l,
                 init: e.clone(),
+                span: None,
             })
             .collect()
     }

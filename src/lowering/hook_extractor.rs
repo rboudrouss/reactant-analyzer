@@ -4,6 +4,7 @@ use crate::ir::{
     cfg::{BasicBlock, CFG, Terminator},
     expr::{Expr, Prim},
     hooks::HookEntry,
+    source_range::SourceRange,
     stmt::Stmt,
     types::{BlockId, HookLabel},
 };
@@ -21,7 +22,7 @@ pub fn extract_handlers(cfg: &CFG, hooks: &mut Vec<HookEntry>, next_label: &mut 
         for stmt in &block.stmts {
             let expr = match stmt {
                 Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => rhs,
-                Stmt::ExprStmt(e) => e,
+                Stmt::ExprStmt(e, _) => e,
             };
             collect_handlers_in_expr(expr, hooks, next_label);
         }
@@ -46,6 +47,7 @@ fn collect_handlers_in_expr(expr: &Expr, hooks: &mut Vec<HookEntry>, next_label:
                                 label,
                                 event: prop_to_event(name),
                                 body_cfg: (**body_cfg).clone(),
+                                span: None,
                             });
                         }
                         // Non-FnLit onX props (e.g. onX={someVar}) are not analysed.
@@ -123,14 +125,18 @@ fn process_stmt(
     state_temps: &mut HashMap<String, HookLabel>,
 ) {
     match stmt {
-        Stmt::Let { var, rhs } => match try_consume_hook_call(rhs) {
+        Stmt::Let {
+            var,
+            rhs,
+            span: stmt_span,
+        } => match try_consume_hook_call(rhs) {
             Ok((name, args)) => {
                 let lbl = *label;
                 *label += 1;
                 let is_state_like = matches!(name.as_str(), "useState" | "useReducer");
                 let is_arr_temp = var.starts_with("__arr_");
 
-                if let Some(entry) = make_hook_entry(&name, lbl, args) {
+                if let Some(entry) = make_hook_entry(&name, lbl, args, stmt_span) {
                     hooks.push(entry);
                 }
 
@@ -142,6 +148,7 @@ fn process_stmt(
                     out.push(Stmt::Let {
                         var,
                         rhs: hook_result_expr(&name, lbl),
+                        span: None,
                     });
                 }
             }
@@ -149,26 +156,28 @@ fn process_stmt(
                 out.push(Stmt::Let {
                     var,
                     rhs: rewrite_expr(rhs, state_temps),
+                    span: None,
                 });
             }
         },
-        Stmt::ExprStmt(expr) => match try_consume_hook_call(expr) {
+        Stmt::ExprStmt(expr, stmt_span) => match try_consume_hook_call(expr) {
             Ok((name, args)) => {
                 let lbl = *label;
                 *label += 1;
-                if let Some(entry) = make_hook_entry(&name, lbl, args) {
+                if let Some(entry) = make_hook_entry(&name, lbl, args, stmt_span) {
                     hooks.push(entry);
                 }
                 // useEffect and similar void hooks: no stmt emitted.
             }
             Err(expr) => {
-                out.push(Stmt::ExprStmt(rewrite_expr(expr, state_temps)));
+                out.push(Stmt::ExprStmt(rewrite_expr(expr, state_temps), None));
             }
         },
-        Stmt::Assign { var, rhs } => {
+        Stmt::Assign { var, rhs, .. } => {
             out.push(Stmt::Assign {
                 var,
                 rhs: rewrite_expr(rhs, state_temps),
+                span: None,
             });
         }
     }
@@ -200,12 +209,17 @@ fn hook_name_from_callee(fn_: &Expr) -> Option<String> {
 
 // ── HookEntry construction ────────────────────────────────────────────────────
 
-fn make_hook_entry(name: &str, label: HookLabel, args: Vec<Expr>) -> Option<HookEntry> {
+fn make_hook_entry(
+    name: &str,
+    label: HookLabel,
+    args: Vec<Expr>,
+    span: Option<SourceRange>,
+) -> Option<HookEntry> {
     let mut it = args.into_iter();
     match name {
         "useState" => {
             let init = it.next().unwrap_or(Expr::Lit(Prim::Unit));
-            Some(HookEntry::State { label, init })
+            Some(HookEntry::State { label, init, span })
         }
         "useEffect" => {
             let body_cfg = it
@@ -217,6 +231,7 @@ fn make_hook_entry(name: &str, label: HookLabel, args: Vec<Expr>) -> Option<Hook
                 label,
                 body_cfg,
                 deps,
+                span,
             })
         }
         "useMemo" => {
@@ -229,6 +244,7 @@ fn make_hook_entry(name: &str, label: HookLabel, args: Vec<Expr>) -> Option<Hook
                 label,
                 body_cfg,
                 deps,
+                span,
             })
         }
         "useCallback" => {
@@ -241,11 +257,12 @@ fn make_hook_entry(name: &str, label: HookLabel, args: Vec<Expr>) -> Option<Hook
                 label,
                 body_cfg,
                 deps,
+                span,
             })
         }
         "useRef" => {
             let init = it.next().unwrap_or(Expr::Lit(Prim::Null));
-            Some(HookEntry::Ref { label, init })
+            Some(HookEntry::Ref { label, init, span })
         }
         _ if name.starts_with("use") => {
             let args: Vec<Expr> = it.collect();
@@ -254,6 +271,7 @@ fn make_hook_entry(name: &str, label: HookLabel, args: Vec<Expr>) -> Option<Hook
                 name: name.to_string(),
                 args,
                 deps: None,
+                span,
             })
         }
         _ => None,
@@ -391,7 +409,7 @@ mod tests {
             .body
             .iter()
             .find_map(|s| match s {
-                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| build_cfg(b)),
+                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| build_cfg(b, &[])),
                 _ => None,
             })
             .expect("no function found");
@@ -405,7 +423,7 @@ mod tests {
 
     fn find_let_rhs<'a>(stmts: &'a [Stmt], name: &str) -> Option<&'a Expr> {
         stmts.iter().find_map(|s| match s {
-            Stmt::Let { var, rhs } if var == name => Some(rhs),
+            Stmt::Let { var, rhs, .. } if var == name => Some(rhs),
             _ => None,
         })
     }
@@ -422,7 +440,8 @@ mod tests {
             &hooks[0],
             HookEntry::State {
                 label: 0,
-                init: Expr::Lit(Prim::Int(0))
+                init: Expr::Lit(Prim::Int(0)),
+                ..
             }
         ));
 
@@ -449,7 +468,8 @@ mod tests {
             &hooks[0],
             HookEntry::State {
                 label: 0,
-                init: Expr::Lit(Prim::Int(42))
+                init: Expr::Lit(Prim::Int(42)),
+                ..
             }
         ));
         let stmts = entry_stmts(&cfg);
@@ -474,7 +494,7 @@ mod tests {
         assert!(
             !entry_stmts(&cfg)
                 .iter()
-                .any(|s| matches!(s, Stmt::ExprStmt(_)))
+                .any(|s| matches!(s, Stmt::ExprStmt(_, _)))
         );
     }
 
@@ -533,7 +553,8 @@ mod tests {
             &hooks[0],
             HookEntry::Ref {
                 label: 0,
-                init: Expr::Lit(Prim::Null)
+                init: Expr::Lit(Prim::Null),
+                ..
             }
         ));
         // useRef result is opaque Lit(Unit)
@@ -575,14 +596,16 @@ mod tests {
             &hooks[0],
             HookEntry::State {
                 label: 0,
-                init: Expr::Lit(Prim::Int(1))
+                init: Expr::Lit(Prim::Int(1)),
+                ..
             }
         ));
         assert!(matches!(
             &hooks[1],
             HookEntry::State {
                 label: 1,
-                init: Expr::Lit(Prim::Int(2))
+                init: Expr::Lit(Prim::Int(2)),
+                ..
             }
         ));
 
@@ -629,7 +652,7 @@ mod tests {
             .body
             .iter()
             .find_map(|s| match s {
-                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| build_cfg(b)),
+                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| build_cfg(b, &[])),
                 _ => None,
             })
             .expect("no function found");

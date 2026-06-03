@@ -267,6 +267,7 @@ mod tests {
         let hooks = vec![HookEntry::State {
             label: 0,
             init: Expr::Lit(Prim::Int(0)),
+            span: None,
         }];
         let mut blocks = HashMap::new();
         blocks.insert(
@@ -276,6 +277,7 @@ mod tests {
                 stmts: vec![Stmt::Let {
                     var: "n".to_string(),
                     rhs: Expr::StateVal(0),
+                    span: None,
                 }],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
@@ -300,6 +302,7 @@ mod tests {
         let hooks = vec![HookEntry::State {
             label: 0,
             init: Expr::Lit(Prim::Int(0)),
+            span: None,
         }];
         let mut blocks = HashMap::new();
         blocks.insert(
@@ -322,10 +325,12 @@ mod tests {
                     Stmt::Let {
                         var: "n".to_string(),
                         rhs: Expr::StateVal(0),
+                        span: None,
                     },
                     Stmt::Let {
                         var: "setN".to_string(),
                         rhs: Expr::StateSetter(0),
+                        span: None,
                     },
                 ],
                 term: Terminator::Jump(3),

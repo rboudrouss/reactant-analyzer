@@ -11,6 +11,14 @@ use crate::{
     },
 };
 
+fn capitalize_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+    }
+}
+
 use super::{Diagnostic, Rule, collect_setter_calls};
 
 /// Fires when a state label required widening to converge AND there is an effect
@@ -49,28 +57,55 @@ impl Rule for InfiniteLoop {
                     label: eff_label,
                     body_cfg,
                     deps,
+                    span: eff_span,
+                    ..
                 } = hook
                 {
                     // deps: Some(vec![]) = runs once on mount only → no cycle possible.
-                    // Skip: an effect with an explicit empty deps array can never cause
-                    // an infinite loop regardless of what it calls.
-                    // TODO: replace with full SCC graph analysis (ADR-008).
                     if matches!(deps, Some(d) if d.is_empty()) {
                         continue;
                     }
 
                     if !collect_setter_calls(body_cfg, setter_vars, 1).is_empty() {
-                        diags.push(
-                            Diagnostic::new(
-                                "infinite-loop",
-                                format!(
-                                    "effect {} unconditionally sets state {} which needed \
-                                     widening — potential infinite render loop",
-                                    eff_label, state_label
-                                ),
-                            )
-                            .with_label(state_label),
-                        );
+                        let mut diag = Diagnostic::new(
+                            "infinite-loop",
+                            format!(
+                                "effect {} sets state {} which needed widening \
+                                 — potential infinite render loop",
+                                eff_label, state_label
+                            ),
+                        )
+                        .with_label(state_label);
+
+                        if let Some(r) = eff_span {
+                            diag = diag.with_range(*r);
+                        }
+
+                        // Attach a note for each handler that also calls this setter.
+                        for h in &result.hooks {
+                            if let HookEntry::Handler {
+                                label: h_label,
+                                event,
+                                body_cfg: h_cfg,
+                                span: h_span,
+                            } = h
+                            {
+                                if !collect_setter_calls(h_cfg, setter_vars, 1).is_empty() {
+                                    diag = diag.with_note(
+                                        format!(
+                                            "handler `on{}` also calls setter — \
+                                             grows state {} range across fixpoint iterations",
+                                            capitalize_first(event),
+                                            state_label
+                                        ),
+                                        Some(*h_label),
+                                        *h_span,
+                                    );
+                                }
+                            }
+                        }
+
+                        diags.push(diag);
                     }
                 }
             }
@@ -90,6 +125,7 @@ fn build_setter_map(result: &AnalysisResult<StateValue>) -> HashMap<HookLabel, H
             if let Stmt::Let {
                 var,
                 rhs: Expr::StateSetter(label),
+                ..
             } = stmt
             {
                 map.entry(*label).or_default().insert(var.clone());
@@ -187,13 +223,16 @@ mod tests {
             0,
             BasicBlock {
                 id: 0,
-                stmts: vec![Stmt::ExprStmt(Expr::Call {
-                    fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::ObjectLit {
-                        id: crate::ir::types::ExprId(0),
-                        fields: vec![],
-                    }],
-                })],
+                stmts: vec![Stmt::ExprStmt(
+                    Expr::Call {
+                        fn_: Box::new(Expr::Var("setN".to_string())),
+                        args: vec![Expr::ObjectLit {
+                            id: crate::ir::types::ExprId(0),
+                            fields: vec![],
+                        }],
+                    },
+                    None,
+                )],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
         );
@@ -208,10 +247,12 @@ mod tests {
             label: 1,
             body_cfg: eff_cfg,
             deps: None,
+            span: None,
         }];
         let render_stmts = vec![Stmt::Let {
             var: "setN".to_string(),
             rhs: Expr::StateSetter(0),
+            span: None,
         }];
 
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
@@ -228,10 +269,12 @@ mod tests {
             label: 1,
             body_cfg: eff_cfg,
             deps: None,
+            span: None,
         }];
         let render_stmts = vec![Stmt::Let {
             var: "setN".to_string(),
             rhs: Expr::StateSetter(0),
+            span: None,
         }];
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
         assert!(InfiniteLoop.check(&result).is_empty());
@@ -245,13 +288,16 @@ mod tests {
             0,
             BasicBlock {
                 id: 0,
-                stmts: vec![Stmt::ExprStmt(Expr::Call {
-                    fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::ObjectLit {
-                        id: crate::ir::types::ExprId(0),
-                        fields: vec![],
-                    }],
-                })],
+                stmts: vec![Stmt::ExprStmt(
+                    Expr::Call {
+                        fn_: Box::new(Expr::Var("setN".to_string())),
+                        args: vec![Expr::ObjectLit {
+                            id: crate::ir::types::ExprId(0),
+                            fields: vec![],
+                        }],
+                    },
+                    None,
+                )],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
         );
@@ -264,10 +310,12 @@ mod tests {
             label: 1,
             body_cfg: eff_cfg,
             deps: Some(vec![]),
+            span: None,
         }];
         let render_stmts = vec![Stmt::Let {
             var: "setN".to_string(),
             rhs: Expr::StateSetter(0),
+            span: None,
         }];
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
         assert!(
@@ -284,13 +332,16 @@ mod tests {
             0,
             BasicBlock {
                 id: 0,
-                stmts: vec![Stmt::ExprStmt(Expr::Call {
-                    fn_: Box::new(Expr::Var("setOther".to_string())),
-                    args: vec![Expr::ObjectLit {
-                        id: crate::ir::types::ExprId(0),
-                        fields: vec![],
-                    }],
-                })],
+                stmts: vec![Stmt::ExprStmt(
+                    Expr::Call {
+                        fn_: Box::new(Expr::Var("setOther".to_string())),
+                        args: vec![Expr::ObjectLit {
+                            id: crate::ir::types::ExprId(0),
+                            fields: vec![],
+                        }],
+                    },
+                    None,
+                )],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
         );
@@ -304,11 +355,13 @@ mod tests {
             label: 1,
             body_cfg: eff_cfg,
             deps: None,
+            span: None,
         }];
         // render only registers setN for state 0, not setOther
         let render_stmts = vec![Stmt::Let {
             var: "setN".to_string(),
             rhs: Expr::StateSetter(0),
+            span: None,
         }];
         // widened = {0} but effect calls setOther which isn't mapped to 0
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
@@ -328,14 +381,18 @@ mod tests {
                     Stmt::Let {
                         var: "setN".to_string(),
                         rhs: Expr::StateSetter(0),
+                        span: None,
                     },
-                    Stmt::ExprStmt(Expr::Call {
-                        fn_: Box::new(Expr::Var("setN".to_string())),
-                        args: vec![Expr::ObjectLit {
-                            id: crate::ir::types::ExprId(0),
-                            fields: vec![],
-                        }],
-                    }),
+                    Stmt::ExprStmt(
+                        Expr::Call {
+                            fn_: Box::new(Expr::Var("setN".to_string())),
+                            args: vec![Expr::ObjectLit {
+                                id: crate::ir::types::ExprId(0),
+                                fields: vec![],
+                            }],
+                        },
+                        None,
+                    ),
                 ],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
@@ -350,22 +407,26 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                span: None,
             },
             // deps: None = no deps array = runs every render = can cycle
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
                 deps: None,
+                span: None,
             },
         ];
         let render_stmts = vec![
             Stmt::Let {
                 var: "n".to_string(),
                 rhs: Expr::StateVal(0),
+                span: None,
             },
             Stmt::Let {
                 var: "setN".to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
         ];
         let mut blocks = HashMap::new();
@@ -408,15 +469,19 @@ mod tests {
                     Stmt::Let {
                         var: "setCount".to_string(),
                         rhs: Expr::StateSetter(0),
+                        span: None,
                     },
-                    Stmt::ExprStmt(Expr::Call {
-                        fn_: Box::new(Expr::Var("setCount".to_string())),
-                        args: vec![Expr::BinOp {
-                            op: crate::ir::expr::BinOp::Add,
-                            lhs: Box::new(Expr::StateVal(0)),
-                            rhs: Box::new(Expr::Lit(Prim::Int(1))),
-                        }],
-                    }),
+                    Stmt::ExprStmt(
+                        Expr::Call {
+                            fn_: Box::new(Expr::Var("setCount".to_string())),
+                            args: vec![Expr::BinOp {
+                                op: crate::ir::expr::BinOp::Add,
+                                lhs: Box::new(Expr::StateVal(0)),
+                                rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                            }],
+                        },
+                        None,
+                    ),
                 ],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
@@ -431,21 +496,25 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                span: None,
             },
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
                 deps: Some(vec![Expr::StateVal(0)]),
+                span: None,
             },
         ];
         let render_stmts = vec![
             Stmt::Let {
                 var: "count".to_string(),
                 rhs: Expr::StateVal(0),
+                span: None,
             },
             Stmt::Let {
                 var: "setCount".to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
         ];
         let mut blocks = HashMap::new();
@@ -494,13 +563,16 @@ mod tests {
             1,
             BasicBlock {
                 id: 1,
-                stmts: vec![Stmt::ExprStmt(Expr::Call {
-                    fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::ObjectLit {
-                        id: crate::ir::types::ExprId(0),
-                        fields: vec![],
-                    }],
-                })],
+                stmts: vec![Stmt::ExprStmt(
+                    Expr::Call {
+                        fn_: Box::new(Expr::Var("setN".to_string())),
+                        args: vec![Expr::ObjectLit {
+                            id: crate::ir::types::ExprId(0),
+                            fields: vec![],
+                        }],
+                    },
+                    None,
+                )],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
         );
@@ -518,10 +590,12 @@ mod tests {
             label: 1,
             body_cfg: eff_cfg,
             deps: None,
+            span: None,
         }];
         let render_stmts = vec![Stmt::Let {
             var: "setN".to_string(),
             rhs: Expr::StateSetter(0),
+            span: None,
         }];
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
         let diags = InfiniteLoop.check(&result);
@@ -549,8 +623,9 @@ mod tests {
                     Stmt::Let {
                         var: setter_name.to_string(),
                         rhs: Expr::StateSetter(0),
+                        span: None,
                     },
-                    Stmt::ExprStmt(call_expr),
+                    Stmt::ExprStmt(call_expr, None),
                 ],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
@@ -564,21 +639,25 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                span: None,
             },
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
                 deps,
+                span: None,
             },
         ];
         let render_stmts = vec![
             Stmt::Let {
                 var: "n".to_string(),
                 rhs: Expr::StateVal(0),
+                span: None,
             },
             Stmt::Let {
                 var: setter_name.to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
         ];
         let mut blocks = HashMap::new();
@@ -609,14 +688,17 @@ mod tests {
             0,
             BasicBlock {
                 id: 0,
-                stmts: vec![Stmt::ExprStmt(Expr::Call {
-                    fn_: Box::new(Expr::Var(setter_name.to_string())),
-                    args: vec![Expr::BinOp {
-                        op: crate::ir::expr::BinOp::Add,
-                        lhs: Box::new(Expr::StateVal(0)),
-                        rhs: Box::new(Expr::Lit(Prim::Int(1))),
-                    }],
-                })],
+                stmts: vec![Stmt::ExprStmt(
+                    Expr::Call {
+                        fn_: Box::new(Expr::Var(setter_name.to_string())),
+                        args: vec![Expr::BinOp {
+                            op: crate::ir::expr::BinOp::Add,
+                            lhs: Box::new(Expr::StateVal(0)),
+                            rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                        }],
+                    },
+                    None,
+                )],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
         );
@@ -705,14 +787,17 @@ mod tests {
             0,
             BasicBlock {
                 id: 0,
-                stmts: vec![Stmt::ExprStmt(Expr::Call {
-                    fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::BinOp {
-                        op: crate::ir::expr::BinOp::Add,
-                        lhs: Box::new(Expr::StateVal(0)),
-                        rhs: Box::new(Expr::Lit(Prim::Int(1))),
-                    }],
-                })],
+                stmts: vec![Stmt::ExprStmt(
+                    Expr::Call {
+                        fn_: Box::new(Expr::Var("setN".to_string())),
+                        args: vec![Expr::BinOp {
+                            op: crate::ir::expr::BinOp::Add,
+                            lhs: Box::new(Expr::StateVal(0)),
+                            rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                        }],
+                    },
+                    None,
+                )],
                 term: Terminator::Jump(0), // self-loop
             },
         );
@@ -754,6 +839,7 @@ mod tests {
         let mut all_stmts = vec![Stmt::Let {
             var: setter_name.to_string(),
             rhs: Expr::StateSetter(0),
+            span: None,
         }];
         all_stmts.extend(stmts);
         eff_blocks.insert(
@@ -773,21 +859,25 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                span: None,
             },
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
                 deps,
+                span: None,
             },
         ];
         let render_stmts = vec![
             Stmt::Let {
                 var: "n".to_string(),
                 rhs: Expr::StateVal(0),
+                span: None,
             },
             Stmt::Let {
                 var: setter_name.to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
         ];
         let mut blocks = HashMap::new();
@@ -822,14 +912,17 @@ mod tests {
                 0,
                 BasicBlock {
                     id: 0,
-                    stmts: vec![Stmt::ExprStmt(Expr::Call {
-                        fn_: Box::new(Expr::Var("setN".to_string())),
-                        args: vec![Expr::BinOp {
-                            op: crate::ir::expr::BinOp::Add,
-                            lhs: Box::new(Expr::StateVal(0)),
-                            rhs: Box::new(Expr::Lit(Prim::Int(1))),
-                        }],
-                    })],
+                    stmts: vec![Stmt::ExprStmt(
+                        Expr::Call {
+                            fn_: Box::new(Expr::Var("setN".to_string())),
+                            args: vec![Expr::BinOp {
+                                op: crate::ir::expr::BinOp::Add,
+                                lhs: Box::new(Expr::StateVal(0)),
+                                rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                            }],
+                        },
+                        None,
+                    )],
                     term: Terminator::Return(Expr::Lit(Prim::Unit)),
                 },
             );
@@ -847,11 +940,15 @@ mod tests {
                     params: vec![],
                     body_cfg: std::sync::Arc::new(cb_body_cfg),
                 },
+                span: None,
             },
-            Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setTimeout".to_string())),
-                args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(1000))],
-            }),
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setTimeout".to_string())),
+                    args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(1000))],
+                },
+                None,
+            ),
         ];
         let comp = component_with_effect_stmts("setN", stmts, Some(vec![Expr::StateVal(0)]));
         let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
@@ -876,14 +973,17 @@ mod tests {
                 0,
                 BasicBlock {
                     id: 0,
-                    stmts: vec![Stmt::ExprStmt(Expr::Call {
-                        fn_: Box::new(Expr::Var("setN".to_string())),
-                        args: vec![Expr::BinOp {
-                            op: crate::ir::expr::BinOp::Add,
-                            lhs: Box::new(Expr::StateVal(0)),
-                            rhs: Box::new(Expr::Lit(Prim::Int(1))),
-                        }],
-                    })],
+                    stmts: vec![Stmt::ExprStmt(
+                        Expr::Call {
+                            fn_: Box::new(Expr::Var("setN".to_string())),
+                            args: vec![Expr::BinOp {
+                                op: crate::ir::expr::BinOp::Add,
+                                lhs: Box::new(Expr::StateVal(0)),
+                                rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                            }],
+                        },
+                        None,
+                    )],
                     term: Terminator::Return(Expr::Lit(Prim::Unit)),
                 },
             );
@@ -901,17 +1001,21 @@ mod tests {
                     params: vec![],
                     body_cfg: std::sync::Arc::new(cb_body_cfg),
                 },
+                span: None,
             },
-            Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::FieldAccess {
-                    obj: Box::new(Expr::Call {
-                        fn_: Box::new(Expr::Var("fetch".to_string())),
-                        args: vec![],
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::FieldAccess {
+                        obj: Box::new(Expr::Call {
+                            fn_: Box::new(Expr::Var("fetch".to_string())),
+                            args: vec![],
+                        }),
+                        field: "then".to_string(),
                     }),
-                    field: "then".to_string(),
-                }),
-                args: vec![Expr::Var("inc".to_string())],
-            }),
+                    args: vec![Expr::Var("inc".to_string())],
+                },
+                None,
+            ),
         ];
         let comp = component_with_effect_stmts("setN", stmts, Some(vec![Expr::StateVal(0)]));
         let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
@@ -938,14 +1042,17 @@ mod tests {
                 0,
                 BasicBlock {
                     id: 0,
-                    stmts: vec![Stmt::ExprStmt(Expr::Call {
-                        fn_: Box::new(Expr::Var("setN".to_string())),
-                        args: vec![Expr::BinOp {
-                            op: crate::ir::expr::BinOp::Add,
-                            lhs: Box::new(Expr::StateVal(0)),
-                            rhs: Box::new(Expr::Lit(Prim::Int(1))),
-                        }],
-                    })],
+                    stmts: vec![Stmt::ExprStmt(
+                        Expr::Call {
+                            fn_: Box::new(Expr::Var("setN".to_string())),
+                            args: vec![Expr::BinOp {
+                                op: crate::ir::expr::BinOp::Add,
+                                lhs: Box::new(Expr::StateVal(0)),
+                                rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                            }],
+                        },
+                        None,
+                    )],
                     term: Terminator::Return(Expr::Lit(Prim::Unit)),
                 },
             );
@@ -961,10 +1068,13 @@ mod tests {
                 0,
                 BasicBlock {
                     id: 0,
-                    stmts: vec![Stmt::ExprStmt(Expr::Call {
-                        fn_: Box::new(Expr::Var("setTimeout".to_string())),
-                        args: vec![Expr::Var("inner".to_string()), Expr::Lit(Prim::Int(100))],
-                    })],
+                    stmts: vec![Stmt::ExprStmt(
+                        Expr::Call {
+                            fn_: Box::new(Expr::Var("setTimeout".to_string())),
+                            args: vec![Expr::Var("inner".to_string()), Expr::Lit(Prim::Int(100))],
+                        },
+                        None,
+                    )],
                     term: Terminator::Return(Expr::Lit(Prim::Unit)),
                 },
             );
@@ -982,6 +1092,7 @@ mod tests {
                     params: vec![],
                     body_cfg: std::sync::Arc::new(inner_body_cfg),
                 },
+                span: None,
             },
             Stmt::Let {
                 var: "outer".to_string(),
@@ -990,11 +1101,15 @@ mod tests {
                     params: vec![],
                     body_cfg: std::sync::Arc::new(outer_body_cfg),
                 },
+                span: None,
             },
-            Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("outer".to_string())),
-                args: vec![],
-            }),
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("outer".to_string())),
+                    args: vec![],
+                },
+                None,
+            ),
         ];
         let comp = component_with_effect_stmts("setN", stmts, Some(vec![Expr::StateVal(0)]));
         let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
@@ -1005,6 +1120,102 @@ mod tests {
         assert!(
             !InfiniteLoop.check(&result).is_empty(),
             "outer() → setTimeout(inner) → setN(n+1) should be detected as infinite loop"
+        );
+    }
+
+    fn setter_cfg(setter_var: &str) -> CFG {
+        let mut blocks = HashMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![Stmt::ExprStmt(
+                    Expr::Call {
+                        fn_: Box::new(Expr::Var(setter_var.to_string())),
+                        args: vec![Expr::Lit(Prim::Int(1))],
+                    },
+                    None,
+                )],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        CFG {
+            entry: 0,
+            blocks,
+            edges: vec![],
+        }
+    }
+
+    #[test]
+    fn handler_note_attached_when_handler_calls_setter() {
+        // widened_labels = {0}, effect(1) calls setN, handler(2) also calls setN.
+        // Diagnostic must carry a note pointing to handler label 2.
+        let hooks = vec![
+            HookEntry::Effect {
+                label: 1,
+                body_cfg: setter_cfg("setN"),
+                deps: None,
+                span: None,
+            },
+            HookEntry::Handler {
+                label: 2,
+                event: "click".to_string(),
+                body_cfg: setter_cfg("setN"),
+                span: None,
+            },
+        ];
+        let render_stmts = vec![
+            Stmt::Let {
+                var: "n".to_string(),
+                rhs: Expr::StateVal(0),
+                span: None,
+            },
+            Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+                span: None,
+            },
+        ];
+        let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
+        let diags = InfiniteLoop.check(&result);
+
+        assert!(!diags.is_empty(), "should detect infinite loop");
+        assert_eq!(diags[0].notes.len(), 1, "one note for the handler");
+        assert_eq!(
+            diags[0].notes[0].hook_label,
+            Some(2),
+            "note → handler label 2"
+        );
+    }
+
+    #[test]
+    fn no_note_when_no_handler_calls_setter() {
+        // Effect alone — no handler.  notes must be empty.
+        let hooks = vec![HookEntry::Effect {
+            label: 1,
+            body_cfg: setter_cfg("setN"),
+            deps: None,
+            span: None,
+        }];
+        let render_stmts = vec![
+            Stmt::Let {
+                var: "n".to_string(),
+                rhs: Expr::StateVal(0),
+                span: None,
+            },
+            Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+                span: None,
+            },
+        ];
+        let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
+        let diags = InfiniteLoop.check(&result);
+
+        assert!(!diags.is_empty(), "should detect infinite loop");
+        assert!(
+            diags[0].notes.is_empty(),
+            "no handler — notes must be empty"
         );
     }
 }

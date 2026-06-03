@@ -32,6 +32,7 @@ impl Rule for SetterInRender {
                 if let Stmt::Let {
                     var,
                     rhs: Expr::StateSetter(_),
+                    ..
                 } = stmt
                 {
                     Some(var.clone())
@@ -122,6 +123,7 @@ mod tests {
         let render_stmts = vec![Stmt::Let {
             var: "setN".to_string(),
             rhs: Expr::StateSetter(0),
+            span: None,
         }];
         let result = make_result(vec![], render_stmts);
         assert!(SetterInRender.check(&result).is_empty());
@@ -133,11 +135,15 @@ mod tests {
             Stmt::Let {
                 var: "setN".to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
-            Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::Lit(Prim::Int(1))],
-            }),
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(1))],
+                },
+                None,
+            ),
         ];
         let result = make_result(vec![], render_stmts);
         let diags = SetterInRender.check(&result);
@@ -158,6 +164,7 @@ mod tests {
                 stmts: vec![Stmt::Let {
                     var: "setN".to_string(),
                     rhs: Expr::StateSetter(0),
+                    span: None,
                 }],
                 term: Terminator::Branch {
                     cond: Expr::Lit(Prim::Bool(true)),
@@ -170,10 +177,13 @@ mod tests {
             1,
             BasicBlock {
                 id: 1,
-                stmts: vec![Stmt::ExprStmt(Expr::Call {
-                    fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::Lit(Prim::Int(42))],
-                })],
+                stmts: vec![Stmt::ExprStmt(
+                    Expr::Call {
+                        fn_: Box::new(Expr::Var("setN".to_string())),
+                        args: vec![Expr::Lit(Prim::Int(42))],
+                    },
+                    None,
+                )],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
         );
@@ -222,19 +232,27 @@ mod tests {
             Stmt::Let {
                 var: "setA".to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
             Stmt::Let {
                 var: "setB".to_string(),
                 rhs: Expr::StateSetter(1),
+                span: None,
             },
-            Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setA".to_string())),
-                args: vec![Expr::Lit(Prim::Int(1))],
-            }),
-            Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setB".to_string())),
-                args: vec![Expr::Lit(Prim::Int(2))],
-            }),
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setA".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(1))],
+                },
+                None,
+            ),
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setB".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(2))],
+                },
+                None,
+            ),
         ];
         let result = make_result(vec![], render_stmts);
         let diags = SetterInRender.check(&result);
@@ -247,24 +265,30 @@ mod tests {
         let hooks = vec![HookEntry::State {
             label: 0,
             init: Expr::Lit(Prim::Int(0)),
+            span: None,
         }];
         let render_stmts = vec![
             Stmt::Let {
                 var: "count".to_string(),
                 rhs: Expr::StateVal(0),
+                span: None,
             },
             Stmt::Let {
                 var: "setCount".to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
-            Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setCount".to_string())),
-                args: vec![Expr::BinOp {
-                    op: BinOp::Add,
-                    lhs: Box::new(Expr::StateVal(0)),
-                    rhs: Box::new(Expr::Lit(Prim::Int(1))),
-                }],
-            }),
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setCount".to_string())),
+                    args: vec![Expr::BinOp {
+                        op: BinOp::Add,
+                        lhs: Box::new(Expr::StateVal(0)),
+                        rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                    }],
+                },
+                None,
+            ),
         ];
         let mut blocks = HashMap::new();
         blocks.insert(
@@ -299,10 +323,13 @@ mod tests {
             0,
             BasicBlock {
                 id: 0,
-                stmts: vec![Stmt::ExprStmt(Expr::Call {
-                    fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::Var("u".to_string())],
-                })],
+                stmts: vec![Stmt::ExprStmt(
+                    Expr::Call {
+                        fn_: Box::new(Expr::Var("setN".to_string())),
+                        args: vec![Expr::Var("u".to_string())],
+                    },
+                    None,
+                )],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
         );
@@ -316,16 +343,20 @@ mod tests {
             Stmt::Let {
                 var: "setN".to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
             // someCall(u => setN(u))
-            Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("someCall".to_string())),
-                args: vec![Expr::FnLit {
-                    id: crate::ir::types::ExprId(0),
-                    params: vec!["u".to_string()],
-                    body_cfg: std::sync::Arc::new(cb_cfg),
-                }],
-            }),
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("someCall".to_string())),
+                    args: vec![Expr::FnLit {
+                        id: crate::ir::types::ExprId(0),
+                        params: vec!["u".to_string()],
+                        body_cfg: std::sync::Arc::new(cb_cfg),
+                    }],
+                },
+                None,
+            ),
         ];
         let result = make_result(vec![], render_stmts);
         let diags = SetterInRender.check(&result);

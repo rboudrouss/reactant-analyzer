@@ -229,6 +229,7 @@ mod tests {
         let cfg = single_block_cfg(vec![Stmt::Let {
             var: "x".to_string(),
             rhs: Expr::Lit(Prim::Int(42)),
+            span: None,
         }]);
         let mut heap = Heap::new();
         let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
@@ -254,14 +255,18 @@ mod tests {
             Stmt::Let {
                 var: "setN".to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
-            Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::ObjectLit {
-                    id: crate::ir::types::ExprId(0),
-                    fields: vec![],
-                }],
-            }),
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::ObjectLit {
+                        id: crate::ir::types::ExprId(0),
+                        fields: vec![],
+                    }],
+                },
+                None,
+            ),
         ];
         let cfg = single_block_cfg(stmts);
         let mut heap = Heap::new();
@@ -294,6 +299,7 @@ mod tests {
                         id: crate::ir::types::ExprId(0),
                         fields: vec![],
                     },
+                    span: None,
                 }],
                 term: Terminator::Jump(1),
             },
@@ -359,6 +365,7 @@ mod tests {
                 stmts: vec![Stmt::Let {
                     var: "x".to_string(),
                     rhs: Expr::Lit(Prim::Int(1)),
+                    span: None,
                 }],
                 term: Terminator::Jump(3),
             },
@@ -373,6 +380,7 @@ mod tests {
                         id: crate::ir::types::ExprId(0),
                         fields: vec![],
                     },
+                    span: None,
                 }],
                 term: Terminator::Jump(3),
             },
@@ -442,6 +450,7 @@ mod tests {
                 stmts: vec![Stmt::Let {
                     var: "x".to_string(),
                     rhs: Expr::Lit(Prim::Int(0)), // will be in env, but we set it up via entry_env
+                    span: None,
                 }],
                 term: Terminator::Branch {
                     cond: Expr::BinOp {

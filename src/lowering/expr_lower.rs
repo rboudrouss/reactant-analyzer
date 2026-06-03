@@ -162,7 +162,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         Expression::ArrowFunctionExpression(arrow) => {
             let id = builder.next_expr_id();
             let params = lower_params(&arrow.params);
-            let body_cfg = build_cfg(&arrow.body);
+            let body_cfg = build_cfg(&arrow.body, &builder.line_starts.clone());
             Expr::FnLit {
                 id,
                 params,
@@ -175,7 +175,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
             let body_cfg = func
                 .body
                 .as_ref()
-                .map(|b| build_cfg(b))
+                .map(|b| build_cfg(b, &builder.line_starts.clone()))
                 .unwrap_or_else(empty_cfg);
             Expr::FnLit {
                 id,
@@ -258,6 +258,7 @@ fn lower_ternary(cond: &ConditionalExpression, builder: &mut BlockBuilder) -> Ex
     builder.push_stmt(Stmt::Let {
         var: tmp.clone(),
         rhs: cons,
+        span: None,
     });
     let t = builder.seal_with(Terminator::Jump(join_id));
     builder.add_edge(t, join_id, EdgeKind::Unconditional);
@@ -267,6 +268,7 @@ fn lower_ternary(cond: &ConditionalExpression, builder: &mut BlockBuilder) -> Ex
     builder.push_stmt(Stmt::Let {
         var: tmp.clone(),
         rhs: alt,
+        span: None,
     });
     let e = builder.seal_with(Terminator::Jump(join_id));
     builder.add_edge(e, join_id, EdgeKind::Unconditional);
@@ -294,6 +296,7 @@ fn lower_logical(log: &LogicalExpression, builder: &mut BlockBuilder) -> Expr {
     builder.push_stmt(Stmt::Let {
         var: tmp.clone(),
         rhs: left,
+        span: None,
     });
 
     let rhs_id = builder.new_block();
@@ -333,6 +336,7 @@ fn lower_logical(log: &LogicalExpression, builder: &mut BlockBuilder) -> Expr {
     builder.push_stmt(Stmt::Assign {
         var: tmp.clone(),
         rhs: right,
+        span: None,
     });
     let r = builder.seal_with(Terminator::Jump(join_id));
     builder.add_edge(r, join_id, EdgeKind::Unconditional);
@@ -512,7 +516,7 @@ mod tests {
             .parse();
         assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
         let func = ret.program.body.iter().find_map(|s| match s {
-            Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| build_cfg(b)),
+            Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| build_cfg(b, &[])),
             _ => None,
         });
         func.expect("no function found")

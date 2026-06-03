@@ -39,7 +39,7 @@ impl Rule for UnnecessaryRerender {
             .hooks
             .iter()
             .filter_map(|h| {
-                if let HookEntry::State { label, init } = h {
+                if let HookEntry::State { label, init, .. } = h {
                     let mut s = empty_state.clone();
                     let mut m = empty_memo.clone();
                     let mut h = crate::domains::Heap::new();
@@ -63,6 +63,7 @@ impl Rule for UnnecessaryRerender {
                     if let Stmt::Let {
                         var,
                         rhs: Expr::StateSetter(label),
+                        ..
                     } = stmt
                     {
                         map.entry(*label).or_default().insert(var.clone());
@@ -79,6 +80,7 @@ impl Rule for UnnecessaryRerender {
                 label: _eff_label,
                 body_cfg,
                 deps: Some(deps),
+                ..
             } = hook
             else {
                 continue;
@@ -96,7 +98,7 @@ impl Rule for UnnecessaryRerender {
             while let Some(bid) = queue.pop_front() {
                 if let Some(block) = body_cfg.blocks.get(&bid) {
                     for stmt in &block.stmts {
-                        let Stmt::ExprStmt(Expr::Call { fn_, args }) = stmt else {
+                        let Stmt::ExprStmt(Expr::Call { fn_, args }, _) = stmt else {
                             continue;
                         };
                         let Expr::Var(setter_name) = fn_.as_ref() else {
@@ -204,21 +206,28 @@ mod tests {
 
     fn component_with(init: Expr, effect_stmts: Vec<Stmt>, deps: Option<Vec<Expr>>) -> ComponentIR {
         let hooks = vec![
-            HookEntry::State { label: 0, init },
+            HookEntry::State {
+                label: 0,
+                init,
+                span: None,
+            },
             HookEntry::Effect {
                 label: 1,
                 body_cfg: effect_cfg(effect_stmts),
                 deps,
+                span: None,
             },
         ];
         let render_stmts = vec![
             Stmt::Let {
                 var: "x".to_string(),
                 rhs: Expr::StateVal(0),
+                span: None,
             },
             Stmt::Let {
                 var: "setX".to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
         ];
         let mut blocks = HashMap::new();
@@ -245,10 +254,13 @@ mod tests {
     #[test]
     fn mount_only_effect_different_constant_warns() {
         // useState("light"), useEffect(() => { setX("dark") }, [])
-        let eff_stmts = vec![Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::Var("setX".to_string())),
-            args: vec![Expr::Lit(Prim::String("dark".into()))],
-        })];
+        let eff_stmts = vec![Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setX".to_string())),
+                args: vec![Expr::Lit(Prim::String("dark".into()))],
+            },
+            None,
+        )];
         let comp = component_with(
             Expr::Lit(Prim::String("light".into())),
             eff_stmts,
@@ -264,10 +276,13 @@ mod tests {
     #[test]
     fn mount_only_effect_same_constant_no_warning() {
         // useState("light"), useEffect(() => { setX("light") }, []) → redundant, not this rule
-        let eff_stmts = vec![Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::Var("setX".to_string())),
-            args: vec![Expr::Lit(Prim::String("light".into()))],
-        })];
+        let eff_stmts = vec![Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setX".to_string())),
+                args: vec![Expr::Lit(Prim::String("light".into()))],
+            },
+            None,
+        )];
         let comp = component_with(
             Expr::Lit(Prim::String("light".into())),
             eff_stmts,
@@ -280,10 +295,13 @@ mod tests {
     #[test]
     fn non_mount_effect_no_warning() {
         // deps: None = runs every render — not a mount-only effect
-        let eff_stmts = vec![Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::Var("setX".to_string())),
-            args: vec![Expr::Lit(Prim::String("dark".into()))],
-        })];
+        let eff_stmts = vec![Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setX".to_string())),
+                args: vec![Expr::Lit(Prim::String("dark".into()))],
+            },
+            None,
+        )];
         let comp = component_with(Expr::Lit(Prim::String("light".into())), eff_stmts, None);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(UnnecessaryRerender.check(&result).is_empty());
@@ -292,10 +310,13 @@ mod tests {
     #[test]
     fn mount_only_effect_number_different_warns() {
         // useState(0), useEffect(() => { setX(42) }, [])
-        let eff_stmts = vec![Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::Var("setX".to_string())),
-            args: vec![Expr::Lit(Prim::Int(42))],
-        })];
+        let eff_stmts = vec![Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setX".to_string())),
+                args: vec![Expr::Lit(Prim::Int(42))],
+            },
+            None,
+        )];
         let comp = component_with(Expr::Lit(Prim::Int(0)), eff_stmts, Some(vec![]));
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(!UnnecessaryRerender.check(&result).is_empty());

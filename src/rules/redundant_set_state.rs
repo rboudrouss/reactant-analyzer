@@ -140,7 +140,7 @@ fn collect_setter_vals_in_stmt(
     tracker: &mut HashMap<HookLabel, (StateValue, bool)>,
 ) {
     match stmt {
-        Stmt::ExprStmt(e) | Stmt::Let { rhs: e, .. } | Stmt::Assign { rhs: e, .. } => {
+        Stmt::ExprStmt(e, _) | Stmt::Let { rhs: e, .. } | Stmt::Assign { rhs: e, .. } => {
             collect_setter_vals_in_expr(e, env, state, memo, transfer, tracker);
         }
     }
@@ -223,7 +223,7 @@ fn check_setter_calls(
     skip_labels: &HashSet<HookLabel>,
 ) {
     for stmt in stmts {
-        if let Stmt::ExprStmt(Expr::Call { fn_, args }) = stmt
+        if let Stmt::ExprStmt(Expr::Call { fn_, args }, _) = stmt
             && let Expr::Var(name) = fn_.as_ref()
             && let Some(label) = env.setter_label(name)
         {
@@ -341,11 +341,15 @@ mod tests {
             Stmt::Let {
                 var: "setN".to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
-            Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::Lit(Prim::Int(42))],
-            }),
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(42))],
+                },
+                None,
+            ),
         ];
         let result = make_result(
             vec![(0, stmts)],
@@ -364,14 +368,18 @@ mod tests {
             Stmt::Let {
                 var: "setN".to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
-            Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::ObjectLit {
-                    id: crate::ir::types::ExprId(0),
-                    fields: vec![],
-                }],
-            }),
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::ObjectLit {
+                        id: crate::ir::types::ExprId(0),
+                        fields: vec![],
+                    }],
+                },
+                None,
+            ),
         ];
         let result = make_result(
             vec![(0, stmts)],
@@ -388,11 +396,15 @@ mod tests {
             Stmt::Let {
                 var: "setN".to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
-            Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::Lit(Prim::Int(42))],
-            }),
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(42))],
+                },
+                None,
+            ),
         ];
         let result = make_result(
             vec![(0, stmts)],
@@ -404,10 +416,13 @@ mod tests {
 
     #[test]
     fn non_setter_call_no_warning() {
-        let stmts = vec![Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::Var("doSomething".to_string())),
-            args: vec![Expr::Lit(Prim::Int(1))],
-        })];
+        let stmts = vec![Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("doSomething".to_string())),
+                args: vec![Expr::Lit(Prim::Int(1))],
+            },
+            None,
+        )];
         let result = make_result(vec![(0, stmts)], vec![], vec![]);
         assert!(RedundantSetState.check(&result).is_empty());
     }
@@ -418,11 +433,15 @@ mod tests {
             Stmt::Let {
                 var: "setN".to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
-            Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::StateSetter(0)],
-            }),
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::StateSetter(0)],
+                },
+                None,
+            ),
         ];
         let result = make_result(
             vec![(0, stmts)],
@@ -505,6 +524,7 @@ mod tests {
                 label: 1,
                 body_cfg: eff_cfg,
                 deps: Some(vec![]),
+                span: None,
             }],
         }
     }
@@ -516,11 +536,15 @@ mod tests {
         let render_stmts = vec![Stmt::Let {
             var: "setN".to_string(),
             rhs: Expr::StateSetter(0),
+            span: None,
         }];
-        let effect_stmts = vec![Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::Var("setN".to_string())),
-            args: vec![Expr::Lit(Prim::Int(42))],
-        })];
+        let effect_stmts = vec![Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Lit(Prim::Int(42))],
+            },
+            None,
+        )];
         let result = make_result_with_effect(
             render_stmts,
             effect_stmts,
@@ -538,14 +562,18 @@ mod tests {
         let render_stmts = vec![Stmt::Let {
             var: "setN".to_string(),
             rhs: Expr::StateSetter(0),
+            span: None,
         }];
-        let effect_stmts = vec![Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::Var("setN".to_string())),
-            args: vec![Expr::ObjectLit {
-                id: crate::ir::types::ExprId(0),
-                fields: vec![],
-            }],
-        })];
+        let effect_stmts = vec![Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::ObjectLit {
+                    id: crate::ir::types::ExprId(0),
+                    fields: vec![],
+                }],
+            },
+            None,
+        )];
         let result = make_result_with_effect(
             render_stmts,
             effect_stmts,
@@ -561,14 +589,18 @@ mod tests {
         let render_stmts = vec![Stmt::Let {
             var: "setN".to_string(),
             rhs: Expr::StateSetter(0),
+            span: None,
         }];
-        let effect_stmts = vec![Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::Var("setN".to_string())),
-            args: vec![Expr::Call {
-                fn_: Box::new(Expr::Var("fetchData".to_string())),
-                args: vec![],
-            }],
-        })];
+        let effect_stmts = vec![Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Call {
+                    fn_: Box::new(Expr::Var("fetchData".to_string())),
+                    args: vec![],
+                }],
+            },
+            None,
+        )];
         let result = make_result_with_effect(
             render_stmts,
             effect_stmts,

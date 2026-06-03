@@ -75,7 +75,7 @@ fn exec_full_stmt<T: Transfer>(
 ) {
     let main_expr = match stmt {
         Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => rhs,
-        Stmt::ExprStmt(expr) => expr,
+        Stmt::ExprStmt(expr, _) => expr,
     };
     exec_callbacks_depth(transfer, main_expr, env, ctx, depth);
     exec_stmt_core(transfer, stmt, env, ctx, depth);
@@ -96,7 +96,7 @@ fn exec_stmt_core<T: Transfer>(
     depth: usize,
 ) {
     match stmt {
-        Stmt::Let { var, rhs } => {
+        Stmt::Let { var, rhs, .. } => {
             if let Expr::StateSetter(label) = rhs {
                 env.bind_setter(var.clone(), *label);
             }
@@ -118,7 +118,7 @@ fn exec_stmt_core<T: Transfer>(
             let val = transfer.eval_expr(rhs, env, ctx);
             env.extend(var.clone(), val);
         }
-        Stmt::Assign { var, rhs } => {
+        Stmt::Assign { var, rhs, .. } => {
             if let Expr::FnLit {
                 id,
                 params,
@@ -137,7 +137,7 @@ fn exec_stmt_core<T: Transfer>(
             let val = transfer.eval_expr(rhs, env, ctx);
             env.extend(var.clone(), val);
         }
-        Stmt::ExprStmt(expr) => {
+        Stmt::ExprStmt(expr, _) => {
             if let Expr::Call { fn_, args } = expr
                 && let Expr::Var(name) = fn_.as_ref()
                 && let Some(label) = env.setter_label(name)

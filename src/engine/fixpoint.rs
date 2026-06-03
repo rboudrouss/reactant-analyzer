@@ -71,7 +71,7 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
         let init_memo = MemoStore::new();
         let init_untyped = StateStore::bottom();
         for hook in &hooks {
-            if let HookEntry::State { label, init } = hook {
+            if let HookEntry::State { label, init, .. } = hook {
                 let init_val = {
                     let mut init_untyped_mut = init_untyped.clone();
                     let mut init_memo_mut = init_memo.clone();
@@ -318,7 +318,7 @@ fn hook_labels_in_stmt(stmt: &Stmt) -> Vec<HookLabel> {
         Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => {
             collect_hook_labels_expr(rhs, &mut out);
         }
-        Stmt::ExprStmt(e) => collect_hook_labels_expr(e, &mut out),
+        Stmt::ExprStmt(e, _) => collect_hook_labels_expr(e, &mut out),
     }
     out
 }
@@ -370,6 +370,7 @@ fn collect_effect_info(hooks: &[HookEntry]) -> HashMap<HookLabel, EffectInfo> {
                 label,
                 body_cfg,
                 deps,
+                ..
             } = h
             {
                 let free_vars = compute_free_vars(body_cfg);
@@ -400,6 +401,7 @@ fn collect_handler_info(hooks: &[HookEntry]) -> HashMap<HookLabel, HandlerInfo> 
                 label,
                 event,
                 body_cfg,
+                ..
             } = h
             {
                 Some((
@@ -425,15 +427,15 @@ fn compute_free_vars(cfg: &CFG) -> HashSet<Var> {
     for block in cfg.blocks.values() {
         for stmt in &block.stmts {
             match stmt {
-                Stmt::Let { var, rhs } => {
+                Stmt::Let { var, rhs, .. } => {
                     collect_used_vars(rhs, &mut used);
                     defined.insert(var.clone());
                 }
-                Stmt::Assign { var, rhs } => {
+                Stmt::Assign { var, rhs, .. } => {
                     collect_used_vars(rhs, &mut used);
                     defined.insert(var.clone());
                 }
-                Stmt::ExprStmt(e) => collect_used_vars(e, &mut used),
+                Stmt::ExprStmt(e, _) => collect_used_vars(e, &mut used),
             }
         }
     }
@@ -552,10 +554,12 @@ mod tests {
         let hooks = vec![HookEntry::State {
             label: 0,
             init: Expr::Lit(Prim::Int(0)),
+            span: None,
         }];
         let render_stmts = vec![Stmt::Let {
             var: "n".to_string(),
             rhs: Expr::StateVal(0),
+            span: None,
         }];
         let comp = component(hooks, render_stmts);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
@@ -579,11 +583,15 @@ mod tests {
                     Stmt::Let {
                         var: "setN".to_string(),
                         rhs: Expr::StateSetter(0),
+                        span: None,
                     },
-                    Stmt::ExprStmt(Expr::Call {
-                        fn_: Box::new(Expr::Var("setN".to_string())),
-                        args: vec![Expr::Lit(Prim::Int(42))],
-                    }),
+                    Stmt::ExprStmt(
+                        Expr::Call {
+                            fn_: Box::new(Expr::Var("setN".to_string())),
+                            args: vec![Expr::Lit(Prim::Int(42))],
+                        },
+                        None,
+                    ),
                 ],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
@@ -598,21 +606,25 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                span: None,
             },
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
                 deps: Some(vec![]),
+                span: None,
             },
         ];
         let render_stmts = vec![
             Stmt::Let {
                 var: "n".to_string(),
                 rhs: Expr::StateVal(0),
+                span: None,
             },
             Stmt::Let {
                 var: "setN".to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
         ];
         let comp = component(hooks, render_stmts);
@@ -639,14 +651,18 @@ mod tests {
                     Stmt::Let {
                         var: "setN".to_string(),
                         rhs: Expr::StateSetter(0),
+                        span: None,
                     },
-                    Stmt::ExprStmt(Expr::Call {
-                        fn_: Box::new(Expr::Var("setN".to_string())),
-                        args: vec![Expr::ObjectLit {
-                            id: crate::ir::types::ExprId(0),
-                            fields: vec![],
-                        }],
-                    }),
+                    Stmt::ExprStmt(
+                        Expr::Call {
+                            fn_: Box::new(Expr::Var("setN".to_string())),
+                            args: vec![Expr::ObjectLit {
+                                id: crate::ir::types::ExprId(0),
+                                fields: vec![],
+                            }],
+                        },
+                        None,
+                    ),
                 ],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
@@ -661,11 +677,13 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                span: None,
             },
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
                 deps: Some(vec![]),
+                span: None,
             },
         ];
         let comp = component(hooks, vec![]);
@@ -687,14 +705,18 @@ mod tests {
                     Stmt::Let {
                         var: "setN".to_string(),
                         rhs: Expr::StateSetter(0),
+                        span: None,
                     },
-                    Stmt::ExprStmt(Expr::Call {
-                        fn_: Box::new(Expr::Var("setN".to_string())),
-                        args: vec![Expr::ObjectLit {
-                            id: crate::ir::types::ExprId(0),
-                            fields: vec![],
-                        }],
-                    }),
+                    Stmt::ExprStmt(
+                        Expr::Call {
+                            fn_: Box::new(Expr::Var("setN".to_string())),
+                            args: vec![Expr::ObjectLit {
+                                id: crate::ir::types::ExprId(0),
+                                fields: vec![],
+                            }],
+                        },
+                        None,
+                    ),
                 ],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
@@ -709,11 +731,13 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                span: None,
             },
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
                 deps: Some(vec![]),
+                span: None,
             },
         ];
         let comp = component(hooks, vec![]);
@@ -729,15 +753,18 @@ mod tests {
             label: 0,
             body_cfg: trivial_cfg(),
             deps: vec![Expr::Var("x".to_string())],
+            span: None,
         }];
         let render_stmts = vec![
             Stmt::Let {
                 var: "x".to_string(),
                 rhs: Expr::Lit(Prim::Int(1)),
+                span: None,
             },
             Stmt::Let {
                 var: "val".to_string(),
                 rhs: Expr::MemoVal(0),
+                span: None,
             },
         ];
         let comp = component(hooks, render_stmts);
@@ -757,10 +784,13 @@ mod tests {
             0,
             BasicBlock {
                 id: 0,
-                stmts: vec![Stmt::ExprStmt(Expr::Call {
-                    fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::Var("n".to_string())],
-                })],
+                stmts: vec![Stmt::ExprStmt(
+                    Expr::Call {
+                        fn_: Box::new(Expr::Var("setN".to_string())),
+                        args: vec![Expr::Var("n".to_string())],
+                    },
+                    None,
+                )],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
         );
@@ -774,6 +804,7 @@ mod tests {
             label: 0,
             body_cfg: eff_cfg,
             deps: Some(vec![]),
+            span: None,
         }];
         let comp = component(hooks, vec![]);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
@@ -794,6 +825,7 @@ mod tests {
                 stmts: vec![Stmt::Let {
                     var: "x".to_string(),
                     rhs: Expr::Lit(Prim::Int(42)),
+                    span: None,
                 }],
                 term: Terminator::Jump(1),
             },
@@ -842,13 +874,16 @@ mod tests {
             0,
             BasicBlock {
                 id: 0,
-                stmts: vec![Stmt::ExprStmt(Expr::Call {
-                    fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::ObjectLit {
-                        id: ExprId(0),
-                        fields: vec![],
-                    }],
-                })],
+                stmts: vec![Stmt::ExprStmt(
+                    Expr::Call {
+                        fn_: Box::new(Expr::Var("setN".to_string())),
+                        args: vec![Expr::ObjectLit {
+                            id: ExprId(0),
+                            fields: vec![],
+                        }],
+                    },
+                    None,
+                )],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
         );
@@ -864,10 +899,13 @@ mod tests {
             0,
             BasicBlock {
                 id: 0,
-                stmts: vec![Stmt::ExprStmt(Expr::Call {
-                    fn_: Box::new(Expr::Var("setTimeout".to_string())),
-                    args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(0))],
-                })],
+                stmts: vec![Stmt::ExprStmt(
+                    Expr::Call {
+                        fn_: Box::new(Expr::Var("setTimeout".to_string())),
+                        args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(0))],
+                    },
+                    None,
+                )],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
         );
@@ -881,11 +919,13 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                span: None,
             },
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
                 deps: Some(vec![Expr::StateVal(0)]),
+                span: None,
             },
         ];
 
@@ -894,10 +934,12 @@ mod tests {
             Stmt::Let {
                 var: "n".to_string(),
                 rhs: Expr::StateVal(0),
+                span: None,
             },
             Stmt::Let {
                 var: "setN".to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
             Stmt::Let {
                 var: "cb".to_string(),
@@ -906,6 +948,7 @@ mod tests {
                     params: vec![],
                     body_cfg: cb_body,
                 },
+                span: None,
             },
         ];
 
@@ -943,21 +986,27 @@ mod tests {
             Stmt::Let {
                 var: "setN".to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
-            Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::Lit(Prim::Int(1))],
-            }),
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(1))],
+                },
+                None,
+            ),
         ]);
         let hooks = vec![
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                span: None,
             },
             HookEntry::Handler {
                 label: 1,
                 event: "click".to_string(),
                 body_cfg: body,
+                span: None,
             },
         ];
         let comp = component(
@@ -966,10 +1015,12 @@ mod tests {
                 Stmt::Let {
                     var: "n".to_string(),
                     rhs: Expr::StateVal(0),
+                    span: None,
                 },
                 Stmt::Let {
                     var: "setN".to_string(),
                     rhs: Expr::StateSetter(0),
+                    span: None,
                 },
             ],
         );
@@ -993,25 +1044,31 @@ mod tests {
             Stmt::Let {
                 var: "setN".to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
-            Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::BinOp {
-                    op: crate::ir::expr::BinOp::Add,
-                    lhs: Box::new(Expr::StateVal(0)),
-                    rhs: Box::new(Expr::Lit(Prim::Int(1))),
-                }],
-            }),
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::BinOp {
+                        op: crate::ir::expr::BinOp::Add,
+                        lhs: Box::new(Expr::StateVal(0)),
+                        rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                    }],
+                },
+                None,
+            ),
         ]);
         let hooks = vec![
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                span: None,
             },
             HookEntry::Handler {
                 label: 1,
                 event: "click".to_string(),
                 body_cfg: body,
+                span: None,
             },
         ];
         let comp = component(
@@ -1020,10 +1077,12 @@ mod tests {
                 Stmt::Let {
                     var: "n".to_string(),
                     rhs: Expr::StateVal(0),
+                    span: None,
                 },
                 Stmt::Let {
                     var: "setN".to_string(),
                     rhs: Expr::StateSetter(0),
+                    span: None,
                 },
             ],
         );
@@ -1050,21 +1109,27 @@ mod tests {
             Stmt::Let {
                 var: "setN".to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
-            Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::Lit(Prim::Int(99))],
-            }),
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(99))],
+                },
+                None,
+            ),
         ]);
         let hooks = vec![
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                span: None,
             },
             HookEntry::Handler {
                 label: 1,
                 event: "click".to_string(),
                 body_cfg: body,
+                span: None,
             },
         ];
         let comp = component(
@@ -1073,10 +1138,12 @@ mod tests {
                 Stmt::Let {
                     var: "n".to_string(),
                     rhs: Expr::StateVal(0),
+                    span: None,
                 },
                 Stmt::Let {
                     var: "setN".to_string(),
                     rhs: Expr::StateSetter(0),
+                    span: None,
                 },
             ],
         );
@@ -1124,14 +1191,17 @@ mod tests {
             1,
             BasicBlock {
                 id: 1,
-                stmts: vec![Stmt::ExprStmt(Expr::Call {
-                    fn_: Box::new(Expr::Var("setCount".to_string())),
-                    args: vec![Expr::BinOp {
-                        op: crate::ir::expr::BinOp::Add,
-                        lhs: Box::new(Expr::Var("count".to_string())),
-                        rhs: Box::new(Expr::Lit(Prim::Int(1))),
-                    }],
-                })],
+                stmts: vec![Stmt::ExprStmt(
+                    Expr::Call {
+                        fn_: Box::new(Expr::Var("setCount".to_string())),
+                        args: vec![Expr::BinOp {
+                            op: crate::ir::expr::BinOp::Add,
+                            lhs: Box::new(Expr::Var("count".to_string())),
+                            rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                        }],
+                    },
+                    None,
+                )],
                 term: Terminator::Jump(2),
             },
         );
@@ -1165,39 +1235,47 @@ mod tests {
             ],
         };
 
-        let h_cfg = handler_cfg(vec![Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::Var("setCount".to_string())),
-            args: vec![Expr::BinOp {
-                op: crate::ir::expr::BinOp::Add,
-                lhs: Box::new(Expr::Var("count".to_string())),
-                rhs: Box::new(Expr::Lit(Prim::Int(1))),
-            }],
-        })]);
+        let h_cfg = handler_cfg(vec![Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setCount".to_string())),
+                args: vec![Expr::BinOp {
+                    op: crate::ir::expr::BinOp::Add,
+                    lhs: Box::new(Expr::Var("count".to_string())),
+                    rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                }],
+            },
+            None,
+        )]);
 
         let hooks = vec![
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                span: None,
             },
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
                 deps: Some(vec![Expr::StateVal(0)]),
+                span: None,
             },
             HookEntry::Handler {
                 label: 2,
                 event: "click".to_string(),
                 body_cfg: h_cfg,
+                span: None,
             },
         ];
         let render_stmts = vec![
             Stmt::Let {
                 var: "count".to_string(),
                 rhs: Expr::StateVal(0),
+                span: None,
             },
             Stmt::Let {
                 var: "setCount".to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
         ];
         let comp = component(hooks, render_stmts);
@@ -1212,19 +1290,24 @@ mod tests {
     #[test]
     fn handler_info_event_and_free_vars() {
         // Handler reads "n" and calls setN — both are free vars.
-        let body = handler_cfg(vec![Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::Var("setN".to_string())),
-            args: vec![Expr::Var("n".to_string())],
-        })]);
+        let body = handler_cfg(vec![Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Var("n".to_string())],
+            },
+            None,
+        )]);
         let hooks = vec![
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                span: None,
             },
             HookEntry::Handler {
                 label: 1,
                 event: "click".to_string(),
                 body_cfg: body,
+                span: None,
             },
         ];
         let comp = component(hooks, vec![]);

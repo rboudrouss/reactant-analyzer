@@ -334,15 +334,19 @@ mod tests {
             &Stmt::Let {
                 var: "setN".to_string(),
                 rhs: Expr::StateSetter(0),
+                span: None,
             },
             &mut env,
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
         StateValueTransfer.exec_stmt(
-            &Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::Lit(Prim::Int(42))],
-            }),
+            &Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(42))],
+                },
+                None,
+            ),
             &mut env,
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
@@ -369,14 +373,17 @@ mod tests {
 
         let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
-            &Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::FnLit {
-                    id: crate::ir::types::ExprId(0),
-                    params: vec!["c".to_string()],
-                    body_cfg: Arc::new(body_cfg),
-                }],
-            }),
+            &Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::FnLit {
+                        id: crate::ir::types::ExprId(0),
+                        params: vec!["c".to_string()],
+                        body_cfg: Arc::new(body_cfg),
+                    }],
+                },
+                None,
+            ),
             &mut env,
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
@@ -442,14 +449,17 @@ mod tests {
 
         let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
-            &Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::FnLit {
-                    id: crate::ir::types::ExprId(0),
-                    params: vec!["c".to_string()],
-                    body_cfg: Arc::new(body_cfg),
-                }],
-            }),
+            &Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::FnLit {
+                        id: crate::ir::types::ExprId(0),
+                        params: vec!["c".to_string()],
+                        body_cfg: Arc::new(body_cfg),
+                    }],
+                },
+                None,
+            ),
             &mut env,
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
@@ -509,26 +519,32 @@ mod tests {
         );
 
         let cb_body = single_block_cfg(
-            vec![Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setUser".to_string())),
-                args: vec![Expr::Var("u".to_string())],
-            })],
+            vec![Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setUser".to_string())),
+                    args: vec![Expr::Var("u".to_string())],
+                },
+                None,
+            )],
             Expr::Lit(Prim::Unit),
         );
-        let stmt = Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::FieldAccess {
-                obj: Box::new(Expr::Call {
-                    fn_: Box::new(Expr::Var("fetch".to_string())),
-                    args: vec![],
+        let stmt = Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::FieldAccess {
+                    obj: Box::new(Expr::Call {
+                        fn_: Box::new(Expr::Var("fetch".to_string())),
+                        args: vec![],
+                    }),
+                    field: "then".to_string(),
                 }),
-                field: "then".to_string(),
-            }),
-            args: vec![Expr::FnLit {
-                id: crate::ir::types::ExprId(0),
-                params: vec!["u".to_string()],
-                body_cfg: Arc::new(cb_body),
-            }],
-        });
+                args: vec![Expr::FnLit {
+                    id: crate::ir::types::ExprId(0),
+                    params: vec!["u".to_string()],
+                    body_cfg: Arc::new(cb_body),
+                }],
+            },
+            None,
+        );
         let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
             &stmt,
@@ -546,23 +562,29 @@ mod tests {
         env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
 
         let cb_body = single_block_cfg(
-            vec![Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::Lit(Prim::Int(42))],
-            })],
+            vec![Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(42))],
+                },
+                None,
+            )],
             Expr::Lit(Prim::Unit),
         );
-        let stmt = Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::Var("setTimeout".to_string())),
-            args: vec![
-                Expr::FnLit {
-                    id: crate::ir::types::ExprId(0),
-                    params: vec![],
-                    body_cfg: Arc::new(cb_body),
-                },
-                Expr::Lit(Prim::Int(1000)),
-            ],
-        });
+        let stmt = Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setTimeout".to_string())),
+                args: vec![
+                    Expr::FnLit {
+                        id: crate::ir::types::ExprId(0),
+                        params: vec![],
+                        body_cfg: Arc::new(cb_body),
+                    },
+                    Expr::Lit(Prim::Int(1000)),
+                ],
+            },
+            None,
+        );
         let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
             &stmt,
@@ -582,17 +604,23 @@ mod tests {
         env.extend("setB".to_string(), StateValue::Reference(Stability::Stable));
 
         let cb_a = single_block_cfg(
-            vec![Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setA".to_string())),
-                args: vec![Expr::Lit(Prim::Int(1))],
-            })],
+            vec![Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setA".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(1))],
+                },
+                None,
+            )],
             Expr::Lit(Prim::Unit),
         );
         let cb_b = single_block_cfg(
-            vec![Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setB".to_string())),
-                args: vec![Expr::Lit(Prim::Int(2))],
-            })],
+            vec![Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setB".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(2))],
+                },
+                None,
+            )],
             Expr::Lit(Prim::Unit),
         );
         let inner = Expr::Call {
@@ -619,7 +647,7 @@ mod tests {
         };
         let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
-            &Stmt::ExprStmt(outer),
+            &Stmt::ExprStmt(outer, None),
             &mut env,
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
@@ -635,10 +663,13 @@ mod tests {
         env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
 
         let cb = single_block_cfg(
-            vec![Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::Lit(Prim::Int(7))],
-            })],
+            vec![Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(7))],
+                },
+                None,
+            )],
             Expr::Lit(Prim::Unit),
         );
         let stmt = Stmt::Let {
@@ -657,6 +688,7 @@ mod tests {
                     body_cfg: Arc::new(cb),
                 }],
             },
+            span: None,
         };
         let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
@@ -675,26 +707,32 @@ mod tests {
         env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
 
         let cb = single_block_cfg(
-            vec![Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::Lit(Prim::Int(99))],
-            })],
+            vec![Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(99))],
+                },
+                None,
+            )],
             Expr::Lit(Prim::Unit),
         );
-        let stmt = Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::FieldAccess {
-                obj: Box::new(Expr::Var("el".to_string())),
-                field: "addEventListener".to_string(),
-            }),
-            args: vec![
-                Expr::Lit(Prim::String("click".to_string())),
-                Expr::FnLit {
-                    id: crate::ir::types::ExprId(0),
-                    params: vec![],
-                    body_cfg: Arc::new(cb),
-                },
-            ],
-        });
+        let stmt = Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::FieldAccess {
+                    obj: Box::new(Expr::Var("el".to_string())),
+                    field: "addEventListener".to_string(),
+                }),
+                args: vec![
+                    Expr::Lit(Prim::String("click".to_string())),
+                    Expr::FnLit {
+                        id: crate::ir::types::ExprId(0),
+                        params: vec![],
+                        body_cfg: Arc::new(cb),
+                    },
+                ],
+            },
+            None,
+        );
         let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
             &stmt,
@@ -714,37 +752,46 @@ mod tests {
         env.extend("setB".to_string(), StateValue::Reference(Stability::Stable));
 
         let on_fulfilled = single_block_cfg(
-            vec![Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setA".to_string())),
-                args: vec![Expr::Lit(Prim::Int(1))],
-            })],
+            vec![Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setA".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(1))],
+                },
+                None,
+            )],
             Expr::Lit(Prim::Unit),
         );
         let on_rejected = single_block_cfg(
-            vec![Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setB".to_string())),
-                args: vec![Expr::Lit(Prim::Int(2))],
-            })],
+            vec![Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setB".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(2))],
+                },
+                None,
+            )],
             Expr::Lit(Prim::Unit),
         );
-        let stmt = Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::FieldAccess {
-                obj: Box::new(Expr::Var("p".to_string())),
-                field: "then".to_string(),
-            }),
-            args: vec![
-                Expr::FnLit {
-                    id: crate::ir::types::ExprId(0),
-                    params: vec![],
-                    body_cfg: Arc::new(on_fulfilled),
-                },
-                Expr::FnLit {
-                    id: crate::ir::types::ExprId(1),
-                    params: vec![],
-                    body_cfg: Arc::new(on_rejected),
-                },
-            ],
-        });
+        let stmt = Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::FieldAccess {
+                    obj: Box::new(Expr::Var("p".to_string())),
+                    field: "then".to_string(),
+                }),
+                args: vec![
+                    Expr::FnLit {
+                        id: crate::ir::types::ExprId(0),
+                        params: vec![],
+                        body_cfg: Arc::new(on_fulfilled),
+                    },
+                    Expr::FnLit {
+                        id: crate::ir::types::ExprId(1),
+                        params: vec![],
+                        body_cfg: Arc::new(on_rejected),
+                    },
+                ],
+            },
+            None,
+        );
         let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
             &stmt,
@@ -763,32 +810,38 @@ mod tests {
         env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
 
         let cb = single_block_cfg(
-            vec![Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::Lit(Prim::Int(42))],
-            })],
+            vec![Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(42))],
+                },
+                None,
+            )],
             Expr::Lit(Prim::Unit),
         );
-        let stmt = Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::FieldAccess {
-                obj: Box::new(Expr::Call {
-                    fn_: Box::new(Expr::FieldAccess {
-                        obj: Box::new(Expr::Var("Promise".to_string())),
-                        field: "allSettled".to_string(),
+        let stmt = Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::FieldAccess {
+                    obj: Box::new(Expr::Call {
+                        fn_: Box::new(Expr::FieldAccess {
+                            obj: Box::new(Expr::Var("Promise".to_string())),
+                            field: "allSettled".to_string(),
+                        }),
+                        args: vec![Expr::ArrayLit {
+                            id: crate::ir::types::ExprId(0),
+                            elems: vec![Expr::Var("p1".to_string())],
+                        }],
                     }),
-                    args: vec![Expr::ArrayLit {
-                        id: crate::ir::types::ExprId(0),
-                        elems: vec![Expr::Var("p1".to_string())],
-                    }],
+                    field: "then".to_string(),
                 }),
-                field: "then".to_string(),
-            }),
-            args: vec![Expr::FnLit {
-                id: crate::ir::types::ExprId(1),
-                params: vec!["results".to_string()],
-                body_cfg: Arc::new(cb),
-            }],
-        });
+                args: vec![Expr::FnLit {
+                    id: crate::ir::types::ExprId(1),
+                    params: vec!["results".to_string()],
+                    body_cfg: Arc::new(cb),
+                }],
+            },
+            None,
+        );
         let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
             &stmt,
@@ -808,10 +861,13 @@ mod tests {
         env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
 
         let cb_body = single_block_cfg(
-            vec![Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::Lit(Prim::Int(42))],
-            })],
+            vec![Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(42))],
+                },
+                None,
+            )],
             Expr::Lit(Prim::Unit),
         );
         let let_cb = Stmt::Let {
@@ -821,11 +877,15 @@ mod tests {
                 params: vec![],
                 body_cfg: Arc::new(cb_body),
             },
+            span: None,
         };
-        let call = Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::Var("setTimeout".to_string())),
-            args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(1000))],
-        });
+        let call = Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setTimeout".to_string())),
+                args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(1000))],
+            },
+            None,
+        );
 
         let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
@@ -849,18 +909,24 @@ mod tests {
         env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
 
         let cb_body = single_block_cfg(
-            vec![Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::Lit(Prim::Int(99))],
-            })],
+            vec![Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(99))],
+                },
+                None,
+            )],
             Expr::Lit(Prim::Unit),
         );
         env.extend("cb".to_string(), StateValue::Reference(Stability::Stable));
 
-        let call = Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::Var("myHelper".to_string())),
-            args: vec![Expr::Var("cb".to_string())],
-        });
+        let call = Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("myHelper".to_string())),
+                args: vec![Expr::Var("cb".to_string())],
+            },
+            None,
+        );
         let mut heap = Heap::new();
         heap.insert(
             crate::ir::types::ExprId(1),
@@ -890,10 +956,13 @@ mod tests {
         );
 
         let load_body = single_block_cfg(
-            vec![Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setUser".to_string())),
-                args: vec![Expr::Lit(Prim::Int(7))],
-            })],
+            vec![Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setUser".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(7))],
+                },
+                None,
+            )],
             Expr::Lit(Prim::Unit),
         );
         let let_load = Stmt::Let {
@@ -903,11 +972,15 @@ mod tests {
                 params: vec![],
                 body_cfg: Arc::new(load_body),
             },
+            span: None,
         };
-        let call_load = Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::Var("load".to_string())),
-            args: vec![],
-        });
+        let call_load = Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("load".to_string())),
+                args: vec![],
+            },
+            None,
+        );
 
         let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
@@ -931,10 +1004,13 @@ mod tests {
         env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
 
         let cb_body = single_block_cfg(
-            vec![Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::Lit(Prim::Int(5))],
-            })],
+            vec![Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(5))],
+                },
+                None,
+            )],
             Expr::Lit(Prim::Unit),
         );
         let let_cb = Stmt::Let {
@@ -944,11 +1020,15 @@ mod tests {
                 params: vec![],
                 body_cfg: Arc::new(cb_body),
             },
+            span: None,
         };
-        let call = Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::Var("setInterval".to_string())),
-            args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(1000))],
-        });
+        let call = Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setInterval".to_string())),
+                args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(1000))],
+            },
+            None,
+        );
         let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
             &let_cb,
@@ -970,10 +1050,13 @@ mod tests {
         env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
 
         let cb_body = single_block_cfg(
-            vec![Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::Lit(Prim::Int(3))],
-            })],
+            vec![Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(3))],
+                },
+                None,
+            )],
             Expr::Lit(Prim::Unit),
         );
         let let_update = Stmt::Let {
@@ -983,14 +1066,18 @@ mod tests {
                 params: vec![],
                 body_cfg: Arc::new(cb_body),
             },
+            span: None,
         };
-        let call = Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::FieldAccess {
-                obj: Box::new(Expr::Var("arr".to_string())),
-                field: "forEach".to_string(),
-            }),
-            args: vec![Expr::Var("update".to_string())],
-        });
+        let call = Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::FieldAccess {
+                    obj: Box::new(Expr::Var("arr".to_string())),
+                    field: "forEach".to_string(),
+                }),
+                args: vec![Expr::Var("update".to_string())],
+            },
+            None,
+        );
         let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
             &let_update,
@@ -1012,10 +1099,13 @@ mod tests {
         env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
 
         let inner_body = single_block_cfg(
-            vec![Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::Lit(Prim::Int(9))],
-            })],
+            vec![Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(9))],
+                },
+                None,
+            )],
             Expr::Lit(Prim::Unit),
         );
         let let_inner = Stmt::Let {
@@ -1025,13 +1115,17 @@ mod tests {
                 params: vec![],
                 body_cfg: Arc::new(inner_body),
             },
+            span: None,
         };
 
         let outer_body = single_block_cfg(
-            vec![Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setTimeout".to_string())),
-                args: vec![Expr::Var("inner".to_string()), Expr::Lit(Prim::Int(100))],
-            })],
+            vec![Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setTimeout".to_string())),
+                    args: vec![Expr::Var("inner".to_string()), Expr::Lit(Prim::Int(100))],
+                },
+                None,
+            )],
             Expr::Lit(Prim::Unit),
         );
         let let_outer = Stmt::Let {
@@ -1041,12 +1135,16 @@ mod tests {
                 params: vec![],
                 body_cfg: Arc::new(outer_body),
             },
+            span: None,
         };
 
-        let call_outer = Stmt::ExprStmt(Expr::Call {
-            fn_: Box::new(Expr::Var("outer".to_string())),
-            args: vec![],
-        });
+        let call_outer = Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("outer".to_string())),
+                args: vec![],
+            },
+            None,
+        );
 
         let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
@@ -1075,19 +1173,25 @@ mod tests {
 
         let make_body = |callee: &str| -> Arc<CFG> {
             Arc::new(single_block_cfg(
-                vec![Stmt::ExprStmt(Expr::Call {
-                    fn_: Box::new(Expr::Var(callee.to_string())),
-                    args: vec![],
-                })],
+                vec![Stmt::ExprStmt(
+                    Expr::Call {
+                        fn_: Box::new(Expr::Var(callee.to_string())),
+                        args: vec![],
+                    },
+                    None,
+                )],
                 Expr::Lit(Prim::Unit),
             ))
         };
 
         let setter_body = Arc::new(single_block_cfg(
-            vec![Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::Lit(Prim::Int(1))],
-            })],
+            vec![Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(1))],
+                },
+                None,
+            )],
             Expr::Lit(Prim::Unit),
         ));
 
@@ -1099,6 +1203,7 @@ mod tests {
                     params: vec![],
                     body_cfg: setter_body,
                 },
+                span: None,
             },
             Stmt::Let {
                 var: "f2".to_string(),
@@ -1107,6 +1212,7 @@ mod tests {
                     params: vec![],
                     body_cfg: make_body("f1"),
                 },
+                span: None,
             },
             Stmt::Let {
                 var: "f3".to_string(),
@@ -1115,6 +1221,7 @@ mod tests {
                     params: vec![],
                     body_cfg: make_body("f2"),
                 },
+                span: None,
             },
             Stmt::Let {
                 var: "f4".to_string(),
@@ -1123,11 +1230,15 @@ mod tests {
                     params: vec![],
                     body_cfg: make_body("f3"),
                 },
+                span: None,
             },
-            Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("f4".to_string())),
-                args: vec![],
-            }),
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("f4".to_string())),
+                    args: vec![],
+                },
+                None,
+            ),
         ];
 
         let mut heap = Heap::new();

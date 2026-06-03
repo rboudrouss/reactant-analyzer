@@ -27,10 +27,16 @@ useEffect(() => {
 
 ### Handlers JSX — limitations restantes *(ADR-009 migration, suite)*
 
-JSX `onX={fn}` handlers sont maintenant des points d'entrée de première classe (`HookEntry::Handler`, analysés post-convergence). Reste :
+JSX `onX={fn}` handlers sont maintenant des points d'entrée de première classe (`HookEntry::Handler`, dans le fixpoint loop — ADR-009 §5). Reste :
 
 1. **`addEventListener` dans les effects** — lowering depuis `body_cfg` d'un effect vers `HookEntry::Handler` avec env au site d'appel (stale-closure-in-handler débloqué).
 2. **Politique `Subscription`** — flip `classify_callee::Subscription` → `analyze-as-entry-point` pour les callbacks passés à `addEventListener` inline dans un effect.
+
+### Diagnostic notes pour autres règles *(ADR-011)*
+
+`Diagnostic.notes` et `HookEntry.span` sont implémentés. Reste :
+- Propager `effect.span` dans `missing-deps`, `unnecessary-rerender`, etc.
+- Handler span : extraire le range de la prop JSX `onX` depuis le lowering (pas de Stmt correspondant dans l'IR actuel).
 
 ### Analyse inter-composants
 
