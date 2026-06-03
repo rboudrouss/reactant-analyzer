@@ -12,7 +12,10 @@ use crate::{
 #[derive(Debug, Clone)]
 pub enum HeapValue {
     /// A function literal: its params and body CFG.
-    Fn { params: Vec<Var>, body_cfg: Arc<CFG> },
+    Fn {
+        params: Vec<Var>,
+        body_cfg: Arc<CFG>,
+    },
     /// Reserved for future object-field domain.
     Obj(HashMap<Symbol, StateValue>),
     /// Reserved for future array-index domain.

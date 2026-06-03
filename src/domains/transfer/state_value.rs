@@ -188,13 +188,28 @@ mod tests {
         StateStore<StateValue>,
         MemoStore<StateValue>,
     ) {
-        (AbstractEnv::bottom(), StateStore::bottom(), MemoStore::new())
+        (
+            AbstractEnv::bottom(),
+            StateStore::bottom(),
+            MemoStore::new(),
+        )
     }
 
     fn single_block_cfg(stmts: Vec<Stmt>, ret: Expr) -> CFG {
         let mut blocks = std::collections::HashMap::new();
-        blocks.insert(0, BasicBlock { id: 0, stmts, term: Terminator::Return(ret) });
-        CFG { entry: 0, blocks, edges: vec![] }
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts,
+                term: Terminator::Return(ret),
+            },
+        );
+        CFG {
+            entry: 0,
+            blocks,
+            edges: vec![],
+        }
     }
 
     // ── eval_expr ─────────────────────────────────────────────────────────────
@@ -236,7 +251,10 @@ mod tests {
         let (env, state, memo) = empty();
         assert_eq!(
             StateValueTransfer.eval_expr(
-                &Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] },
+                &Expr::ObjectLit {
+                    id: crate::ir::types::ExprId(0),
+                    fields: vec![]
+                },
                 &env,
                 &state,
                 &memo,
@@ -300,9 +318,8 @@ mod tests {
             &mut Heap::new(),
             &NullCtx,
         );
-        let expected = StateValue::StrConst(Arc::new(
-            std::iter::once("dark".to_string()).collect(),
-        ));
+        let expected =
+            StateValue::StrConst(Arc::new(std::iter::once("dark".to_string()).collect()));
         assert_eq!(v, expected);
     }
 
@@ -312,7 +329,10 @@ mod tests {
     fn exec_setter_call_updates_state() {
         let (mut env, mut state, mut memo) = empty();
         StateValueTransfer.exec_stmt(
-            &Stmt::Let { var: "setN".to_string(), rhs: Expr::StateSetter(0) },
+            &Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+            },
             &mut env,
             &mut state,
             &mut memo,
@@ -367,7 +387,10 @@ mod tests {
             &NullCtx,
         );
 
-        assert_eq!(state.get(0), StateValue::Number(Interval { lo: 5.0, hi: 6.0 }));
+        assert_eq!(
+            state.get(0),
+            StateValue::Number(Interval { lo: 5.0, hi: 6.0 })
+        );
     }
 
     #[test]
@@ -378,31 +401,48 @@ mod tests {
         env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
 
         let mut blocks = std::collections::HashMap::new();
-        blocks.insert(0, BasicBlock {
-            id: 0,
-            stmts: vec![],
-            term: Terminator::Branch {
-                cond: Expr::Lit(Prim::Bool(true)),
-                then_: 1,
-                else_: 2,
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![],
+                term: Terminator::Branch {
+                    cond: Expr::Lit(Prim::Bool(true)),
+                    then_: 1,
+                    else_: 2,
+                },
             },
-        });
-        blocks.insert(1, BasicBlock {
-            id: 1,
-            stmts: vec![],
-            term: Terminator::Return(Expr::Var("c".to_string())),
-        });
-        blocks.insert(2, BasicBlock {
-            id: 2,
-            stmts: vec![],
-            term: Terminator::Return(Expr::Lit(Prim::Int(0))),
-        });
+        );
+        blocks.insert(
+            1,
+            BasicBlock {
+                id: 1,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Var("c".to_string())),
+            },
+        );
+        blocks.insert(
+            2,
+            BasicBlock {
+                id: 2,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Int(0))),
+            },
+        );
         let body_cfg = CFG {
             entry: 0,
             blocks,
             edges: vec![
-                Edge { from: 0, to: 1, kind: EdgeKind::IfTrue },
-                Edge { from: 0, to: 2, kind: EdgeKind::IfFalse },
+                Edge {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::IfTrue,
+                },
+                Edge {
+                    from: 0,
+                    to: 2,
+                    kind: EdgeKind::IfFalse,
+                },
             ],
         };
 
@@ -422,21 +462,31 @@ mod tests {
             &NullCtx,
         );
 
-        assert_eq!(state.get(0), StateValue::Number(Interval { lo: 0.0, hi: 3.0 }));
+        assert_eq!(
+            state.get(0),
+            StateValue::Number(Interval { lo: 0.0, hi: 3.0 })
+        );
     }
 
     #[test]
     fn back_edge_in_fnlit_body_returns_top() {
         let mut blocks = std::collections::HashMap::new();
-        blocks.insert(0, BasicBlock {
-            id: 0,
-            stmts: vec![],
-            term: Terminator::Jump(0),
-        });
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![],
+                term: Terminator::Jump(0),
+            },
+        );
         let body_cfg = CFG {
             entry: 0,
             blocks,
-            edges: vec![Edge { from: 0, to: 0, kind: EdgeKind::Back }],
+            edges: vec![Edge {
+                from: 0,
+                to: 0,
+                kind: EdgeKind::Back,
+            }],
         };
 
         let mut entry_env = AbstractEnv::new();
@@ -463,7 +513,10 @@ mod tests {
         let (mut env, mut state, mut memo) = empty();
         state.update(0, StateValue::Number(Interval::point(0.0)));
         env.bind_setter("setUser".to_string(), 0);
-        env.extend("setUser".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend(
+            "setUser".to_string(),
+            StateValue::Reference(Stability::Stable),
+        );
 
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(Expr::Call {
@@ -486,7 +539,14 @@ mod tests {
                 body_cfg: Arc::new(cb_body),
             }],
         });
-        StateValueTransfer.exec_stmt(&stmt, &mut env, &mut state, &mut memo, &mut Heap::new(), &NullCtx);
+        StateValueTransfer.exec_stmt(
+            &stmt,
+            &mut env,
+            &mut state,
+            &mut memo,
+            &mut Heap::new(),
+            &NullCtx,
+        );
 
         assert_eq!(state.get(0), StateValue::Top);
     }
@@ -515,7 +575,14 @@ mod tests {
                 Expr::Lit(Prim::Int(1000)),
             ],
         });
-        StateValueTransfer.exec_stmt(&stmt, &mut env, &mut state, &mut memo, &mut Heap::new(), &NullCtx);
+        StateValueTransfer.exec_stmt(
+            &stmt,
+            &mut env,
+            &mut state,
+            &mut memo,
+            &mut Heap::new(),
+            &NullCtx,
+        );
 
         assert_eq!(state.get(0), StateValue::Number(Interval::point(42.0)));
     }
@@ -607,7 +674,14 @@ mod tests {
                 }],
             },
         };
-        StateValueTransfer.exec_stmt(&stmt, &mut env, &mut state, &mut memo, &mut Heap::new(), &NullCtx);
+        StateValueTransfer.exec_stmt(
+            &stmt,
+            &mut env,
+            &mut state,
+            &mut memo,
+            &mut Heap::new(),
+            &NullCtx,
+        );
 
         assert_eq!(state.get(0), StateValue::Number(Interval::point(7.0)));
     }
@@ -639,7 +713,14 @@ mod tests {
                 },
             ],
         });
-        StateValueTransfer.exec_stmt(&stmt, &mut env, &mut state, &mut memo, &mut Heap::new(), &NullCtx);
+        StateValueTransfer.exec_stmt(
+            &stmt,
+            &mut env,
+            &mut state,
+            &mut memo,
+            &mut Heap::new(),
+            &NullCtx,
+        );
 
         assert_eq!(state.get(0), StateValue::Bottom);
     }
@@ -672,11 +753,26 @@ mod tests {
                 field: "then".to_string(),
             }),
             args: vec![
-                Expr::FnLit { id: crate::ir::types::ExprId(0), params: vec![], body_cfg: Arc::new(on_fulfilled) },
-                Expr::FnLit { id: crate::ir::types::ExprId(1), params: vec![], body_cfg: Arc::new(on_rejected) },
+                Expr::FnLit {
+                    id: crate::ir::types::ExprId(0),
+                    params: vec![],
+                    body_cfg: Arc::new(on_fulfilled),
+                },
+                Expr::FnLit {
+                    id: crate::ir::types::ExprId(1),
+                    params: vec![],
+                    body_cfg: Arc::new(on_rejected),
+                },
             ],
         });
-        StateValueTransfer.exec_stmt(&stmt, &mut env, &mut state, &mut memo, &mut Heap::new(), &NullCtx);
+        StateValueTransfer.exec_stmt(
+            &stmt,
+            &mut env,
+            &mut state,
+            &mut memo,
+            &mut Heap::new(),
+            &NullCtx,
+        );
 
         assert_eq!(state.get(0), StateValue::Number(Interval::point(1.0)));
         assert_eq!(state.get(1), StateValue::Number(Interval::point(2.0)));
@@ -715,7 +811,14 @@ mod tests {
                 body_cfg: Arc::new(cb),
             }],
         });
-        StateValueTransfer.exec_stmt(&stmt, &mut env, &mut state, &mut memo, &mut Heap::new(), &NullCtx);
+        StateValueTransfer.exec_stmt(
+            &stmt,
+            &mut env,
+            &mut state,
+            &mut memo,
+            &mut Heap::new(),
+            &NullCtx,
+        );
 
         assert_eq!(state.get(0), StateValue::Number(Interval::point(42.0)));
     }
@@ -745,14 +848,13 @@ mod tests {
         };
         let call = Stmt::ExprStmt(Expr::Call {
             fn_: Box::new(Expr::Var("setTimeout".to_string())),
-            args: vec![
-                Expr::Var("cb".to_string()),
-                Expr::Lit(Prim::Int(1000)),
-            ],
+            args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(1000))],
         });
 
         let mut heap = Heap::new();
-        StateValueTransfer.exec_stmt(&let_cb, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+        StateValueTransfer.exec_stmt(
+            &let_cb, &mut env, &mut state, &mut memo, &mut heap, &NullCtx,
+        );
         StateValueTransfer.exec_stmt(&call, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
 
         assert_eq!(state.get(0), StateValue::Number(Interval::point(42.0)));
@@ -796,7 +898,10 @@ mod tests {
     fn direct_local_call_inlined() {
         let (mut env, mut state, mut memo) = empty();
         env.bind_setter("setUser".to_string(), 0);
-        env.extend("setUser".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend(
+            "setUser".to_string(),
+            StateValue::Reference(Stability::Stable),
+        );
 
         let load_body = single_block_cfg(
             vec![Stmt::ExprStmt(Expr::Call {
@@ -819,8 +924,12 @@ mod tests {
         });
 
         let mut heap = Heap::new();
-        StateValueTransfer.exec_stmt(&let_load, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
-        StateValueTransfer.exec_stmt(&call_load, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+        StateValueTransfer.exec_stmt(
+            &let_load, &mut env, &mut state, &mut memo, &mut heap, &NullCtx,
+        );
+        StateValueTransfer.exec_stmt(
+            &call_load, &mut env, &mut state, &mut memo, &mut heap, &NullCtx,
+        );
 
         assert_eq!(state.get(0), StateValue::Number(Interval::point(7.0)));
     }
@@ -851,7 +960,9 @@ mod tests {
             args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(1000))],
         });
         let mut heap = Heap::new();
-        StateValueTransfer.exec_stmt(&let_cb, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+        StateValueTransfer.exec_stmt(
+            &let_cb, &mut env, &mut state, &mut memo, &mut heap, &NullCtx,
+        );
         StateValueTransfer.exec_stmt(&call, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
         assert_eq!(state.get(0), StateValue::Number(Interval::point(5.0)));
     }
@@ -885,7 +996,14 @@ mod tests {
             args: vec![Expr::Var("update".to_string())],
         });
         let mut heap = Heap::new();
-        StateValueTransfer.exec_stmt(&let_update, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+        StateValueTransfer.exec_stmt(
+            &let_update,
+            &mut env,
+            &mut state,
+            &mut memo,
+            &mut heap,
+            &NullCtx,
+        );
         StateValueTransfer.exec_stmt(&call, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
         assert_eq!(state.get(0), StateValue::Number(Interval::point(3.0)));
     }
@@ -934,9 +1052,20 @@ mod tests {
         });
 
         let mut heap = Heap::new();
-        StateValueTransfer.exec_stmt(&let_inner, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
-        StateValueTransfer.exec_stmt(&let_outer, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
-        StateValueTransfer.exec_stmt(&call_outer, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+        StateValueTransfer.exec_stmt(
+            &let_inner, &mut env, &mut state, &mut memo, &mut heap, &NullCtx,
+        );
+        StateValueTransfer.exec_stmt(
+            &let_outer, &mut env, &mut state, &mut memo, &mut heap, &NullCtx,
+        );
+        StateValueTransfer.exec_stmt(
+            &call_outer,
+            &mut env,
+            &mut state,
+            &mut memo,
+            &mut heap,
+            &NullCtx,
+        );
         assert_eq!(state.get(0), StateValue::Number(Interval::point(9.0)));
     }
 
@@ -965,10 +1094,38 @@ mod tests {
         ));
 
         let stmts = vec![
-            Stmt::Let { var: "f1".to_string(), rhs: Expr::FnLit { id: crate::ir::types::ExprId(40), params: vec![], body_cfg: setter_body } },
-            Stmt::Let { var: "f2".to_string(), rhs: Expr::FnLit { id: crate::ir::types::ExprId(41), params: vec![], body_cfg: make_body("f1") } },
-            Stmt::Let { var: "f3".to_string(), rhs: Expr::FnLit { id: crate::ir::types::ExprId(42), params: vec![], body_cfg: make_body("f2") } },
-            Stmt::Let { var: "f4".to_string(), rhs: Expr::FnLit { id: crate::ir::types::ExprId(43), params: vec![], body_cfg: make_body("f3") } },
+            Stmt::Let {
+                var: "f1".to_string(),
+                rhs: Expr::FnLit {
+                    id: crate::ir::types::ExprId(40),
+                    params: vec![],
+                    body_cfg: setter_body,
+                },
+            },
+            Stmt::Let {
+                var: "f2".to_string(),
+                rhs: Expr::FnLit {
+                    id: crate::ir::types::ExprId(41),
+                    params: vec![],
+                    body_cfg: make_body("f1"),
+                },
+            },
+            Stmt::Let {
+                var: "f3".to_string(),
+                rhs: Expr::FnLit {
+                    id: crate::ir::types::ExprId(42),
+                    params: vec![],
+                    body_cfg: make_body("f2"),
+                },
+            },
+            Stmt::Let {
+                var: "f4".to_string(),
+                rhs: Expr::FnLit {
+                    id: crate::ir::types::ExprId(43),
+                    params: vec![],
+                    body_cfg: make_body("f3"),
+                },
+            },
             Stmt::ExprStmt(Expr::Call {
                 fn_: Box::new(Expr::Var("f4".to_string())),
                 args: vec![],
@@ -977,7 +1134,8 @@ mod tests {
 
         let mut heap = Heap::new();
         for stmt in &stmts {
-            StateValueTransfer.exec_stmt(stmt, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+            StateValueTransfer
+                .exec_stmt(stmt, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
         }
         assert_eq!(state.get(0), StateValue::Bottom);
     }

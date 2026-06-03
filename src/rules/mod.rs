@@ -81,7 +81,11 @@ fn collect_fn_bindings(cfg: &CFG) -> HashMap<Var, Arc<CFG>> {
     let mut map: HashMap<Var, Arc<CFG>> = HashMap::new();
     for block in cfg.blocks.values() {
         for stmt in &block.stmts {
-            if let Stmt::Let { var, rhs: Expr::FnLit { body_cfg, .. } } = stmt {
+            if let Stmt::Let {
+                var,
+                rhs: Expr::FnLit { body_cfg, .. },
+            } = stmt
+            {
                 map.insert(var.clone(), Arc::clone(body_cfg));
             }
         }
@@ -147,7 +151,13 @@ fn check_expr_for_setters(
                 // B6: direct call to a locally-bound function — descend its body.
                 if depth > 0 {
                     if let Some(body) = fn_bindings.get(name) {
-                        collect_setter_calls_inner(body, setter_vars, depth - 1, fn_bindings, found);
+                        collect_setter_calls_inner(
+                            body,
+                            setter_vars,
+                            depth - 1,
+                            fn_bindings,
+                            found,
+                        );
                     }
                 }
             }
@@ -155,14 +165,26 @@ fn check_expr_for_setters(
                 match arg {
                     // Inline FnLit arg — descend body (costs one depth level).
                     Expr::FnLit { body_cfg, .. } if depth > 0 => {
-                        collect_setter_calls_inner(body_cfg, setter_vars, depth - 1, fn_bindings, found);
+                        collect_setter_calls_inner(
+                            body_cfg,
+                            setter_vars,
+                            depth - 1,
+                            fn_bindings,
+                            found,
+                        );
                     }
                     // B5: variable arg — pointer-following, no depth cost.
                     // Resolving Var("cb") to its FnLit is just name resolution,
                     // not an extra call frame → same depth passes through.
                     Expr::Var(name) => {
                         if let Some(body) = fn_bindings.get(name) {
-                            collect_setter_calls_inner(body, setter_vars, depth, fn_bindings, found);
+                            collect_setter_calls_inner(
+                                body,
+                                setter_vars,
+                                depth,
+                                fn_bindings,
+                                found,
+                            );
                         }
                     }
                     _ => {}

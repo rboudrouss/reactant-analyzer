@@ -354,7 +354,10 @@ mod tests {
 
     #[test]
     fn interval_narrow_lt_caps_hi() {
-        let i = Interval { lo: 0.0, hi: f64::INFINITY };
+        let i = Interval {
+            lo: 0.0,
+            hi: f64::INFINITY,
+        };
         let n = i.narrow_lt(10.0);
         assert_eq!(n.lo, 0.0);
         assert_eq!(n.hi, 9.0);
@@ -362,7 +365,10 @@ mod tests {
 
     #[test]
     fn interval_narrow_geq_lifts_lo() {
-        let i = Interval { lo: 0.0, hi: f64::INFINITY };
+        let i = Interval {
+            lo: 0.0,
+            hi: f64::INFINITY,
+        };
         let n = i.narrow_geq(10.0);
         assert_eq!(n.lo, 10.0);
         assert!(n.hi.is_infinite());
@@ -382,7 +388,10 @@ mod tests {
 
     #[test]
     fn state_value_narrow_lt_on_number() {
-        let v = StateValue::Number(Interval { lo: 0.0, hi: f64::INFINITY });
+        let v = StateValue::Number(Interval {
+            lo: 0.0,
+            hi: f64::INFINITY,
+        });
         let n = v.narrow_lt(10.0);
         assert_eq!(n, StateValue::Number(Interval { lo: 0.0, hi: 9.0 }));
     }

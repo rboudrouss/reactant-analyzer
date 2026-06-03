@@ -250,7 +250,10 @@ mod tests {
     #[test]
     fn object_lit_is_unstable() {
         assert_eq!(
-            Stability::from_expr_static(&Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }),
+            Stability::from_expr_static(&Expr::ObjectLit {
+                id: crate::ir::types::ExprId(0),
+                fields: vec![]
+            }),
             Stability::Unstable
         );
     }
@@ -258,7 +261,10 @@ mod tests {
     #[test]
     fn array_lit_is_unstable() {
         assert_eq!(
-            Stability::from_expr_static(&Expr::ArrayLit { id: crate::ir::types::ExprId(0), elems: vec![] }),
+            Stability::from_expr_static(&Expr::ArrayLit {
+                id: crate::ir::types::ExprId(0),
+                elems: vec![]
+            }),
             Stability::Unstable
         );
     }

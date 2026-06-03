@@ -364,7 +364,9 @@ fn collect_used_vars(expr: &Expr, out: &mut HashSet<Var>) {
         Expr::Var(v) => {
             out.insert(v.clone());
         }
-        Expr::ObjectLit { fields, .. } => fields.iter().for_each(|(_, v)| collect_used_vars(v, out)),
+        Expr::ObjectLit { fields, .. } => {
+            fields.iter().for_each(|(_, v)| collect_used_vars(v, out))
+        }
         Expr::ArrayLit { elems, .. } => elems.iter().for_each(|e| collect_used_vars(e, out)),
         Expr::FnLit { body_cfg, .. } => {
             // Recurse into closures; their free vars are free in the outer CFG too.
@@ -556,7 +558,10 @@ mod tests {
                     },
                     Stmt::ExprStmt(Expr::Call {
                         fn_: Box::new(Expr::Var("setN".to_string())),
-                        args: vec![Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }],
+                        args: vec![Expr::ObjectLit {
+                            id: crate::ir::types::ExprId(0),
+                            fields: vec![],
+                        }],
                     }),
                 ],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
@@ -601,7 +606,10 @@ mod tests {
                     },
                     Stmt::ExprStmt(Expr::Call {
                         fn_: Box::new(Expr::Var("setN".to_string())),
-                        args: vec![Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }],
+                        args: vec![Expr::ObjectLit {
+                            id: crate::ir::types::ExprId(0),
+                            fields: vec![],
+                        }],
                     }),
                 ],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),

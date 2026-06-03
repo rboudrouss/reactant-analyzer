@@ -289,15 +289,22 @@ mod tests {
         // render body: someCall((u) => { setN(u) })
         // setN is inside a FnLit arg → must be detected via collect_setter_calls depth=1
         let mut cb_blocks = HashMap::new();
-        cb_blocks.insert(0, BasicBlock {
-            id: 0,
-            stmts: vec![Stmt::ExprStmt(Expr::Call {
-                fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::Var("u".to_string())],
-            })],
-            term: Terminator::Return(Expr::Lit(Prim::Unit)),
-        });
-        let cb_cfg = CFG { entry: 0, blocks: cb_blocks, edges: vec![] };
+        cb_blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![Stmt::ExprStmt(Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Var("u".to_string())],
+                })],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let cb_cfg = CFG {
+            entry: 0,
+            blocks: cb_blocks,
+            edges: vec![],
+        };
 
         let render_stmts = vec![
             Stmt::Let {
@@ -316,7 +323,11 @@ mod tests {
         ];
         let result = make_result(vec![], render_stmts);
         let diags = SetterInRender.check(&result);
-        assert_eq!(diags.len(), 1, "setter inside callback arg should be detected");
+        assert_eq!(
+            diags.len(),
+            1,
+            "setter inside callback arg should be detected"
+        );
         assert_eq!(diags[0].rule, "setter-in-render");
     }
 }

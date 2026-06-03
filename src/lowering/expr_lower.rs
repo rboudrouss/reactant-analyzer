@@ -163,7 +163,11 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
             let id = builder.next_expr_id();
             let params = lower_params(&arrow.params);
             let body_cfg = build_cfg(&arrow.body);
-            Expr::FnLit { id, params, body_cfg: Arc::new(body_cfg) }
+            Expr::FnLit {
+                id,
+                params,
+                body_cfg: Arc::new(body_cfg),
+            }
         }
         Expression::FunctionExpression(func) => {
             let id = builder.next_expr_id();
@@ -173,7 +177,11 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 .as_ref()
                 .map(|b| build_cfg(b))
                 .unwrap_or_else(empty_cfg);
-            Expr::FnLit { id, params, body_cfg: Arc::new(body_cfg) }
+            Expr::FnLit {
+                id,
+                params,
+                body_cfg: Arc::new(body_cfg),
+            }
         }
 
         // ── JSX ───────────────────────────────────────────────────────────────

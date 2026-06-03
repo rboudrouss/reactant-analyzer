@@ -115,22 +115,38 @@ fn exec_stmt_core<T: Transfer>(
             if let Expr::StateSetter(label) = rhs {
                 env.bind_setter(var.clone(), *label);
             }
-            if let Expr::FnLit { id, params, body_cfg } = rhs {
+            if let Expr::FnLit {
+                id,
+                params,
+                body_cfg,
+            } = rhs
+            {
                 env.extend_loc(var.clone(), *id);
                 heap.insert(
                     *id,
-                    HeapValue::Fn { params: params.clone(), body_cfg: Arc::clone(body_cfg) },
+                    HeapValue::Fn {
+                        params: params.clone(),
+                        body_cfg: Arc::clone(body_cfg),
+                    },
                 );
             }
             let val = transfer.eval_expr(rhs, env, state, memo, heap, ctx);
             env.extend(var.clone(), val);
         }
         Stmt::Assign { var, rhs } => {
-            if let Expr::FnLit { id, params, body_cfg } = rhs {
+            if let Expr::FnLit {
+                id,
+                params,
+                body_cfg,
+            } = rhs
+            {
                 env.extend_loc(var.clone(), *id);
                 heap.insert(
                     *id,
-                    HeapValue::Fn { params: params.clone(), body_cfg: Arc::clone(body_cfg) },
+                    HeapValue::Fn {
+                        params: params.clone(),
+                        body_cfg: Arc::clone(body_cfg),
+                    },
                 );
             }
             let val = transfer.eval_expr(rhs, env, state, memo, heap, ctx);
@@ -142,7 +158,9 @@ fn exec_stmt_core<T: Transfer>(
                 && let Some(label) = env.setter_label(name)
             {
                 let arg_val = match args.first() {
-                    Some(Expr::FnLit { params, body_cfg, .. }) => {
+                    Some(Expr::FnLit {
+                        params, body_cfg, ..
+                    }) => {
                         let mut sub_env = env.clone();
                         if let Some(param) = params.first() {
                             sub_env.extend(param.clone(), state.get(label));
@@ -193,7 +211,10 @@ fn exec_body_impl<T: Transfer>(
 
     for bid in order {
         let env = if bid == cfg.entry {
-            env_at.get(&bid).cloned().unwrap_or_else(AbstractEnv::bottom)
+            env_at
+                .get(&bid)
+                .cloned()
+                .unwrap_or_else(AbstractEnv::bottom)
         } else {
             cfg.predecessors(bid)
                 .iter()
@@ -263,7 +284,9 @@ fn exec_callbacks_depth<T: Transfer>(
             exec_callbacks_depth(transfer, fn_, env, state, memo, heap, ctx, depth);
             for arg in args {
                 match arg {
-                    Expr::FnLit { params, body_cfg, .. } if class == TriggerClass::InCycle => {
+                    Expr::FnLit {
+                        params, body_cfg, ..
+                    } if class == TriggerClass::InCycle => {
                         let mut sub_env = env.clone();
                         for p in params {
                             sub_env.extend(p.clone(), T::Domain::top());
@@ -325,7 +348,9 @@ fn exec_callbacks_depth<T: Transfer>(
         Expr::CompApp { props, .. } => {
             exec_callbacks_depth(transfer, props, env, state, memo, heap, ctx, depth);
         }
-        Expr::NativeElem { props, children, .. } => {
+        Expr::NativeElem {
+            props, children, ..
+        } => {
             exec_callbacks_depth(transfer, props, env, state, memo, heap, ctx, depth);
             for c in children {
                 exec_callbacks_depth(transfer, c, env, state, memo, heap, ctx, depth);
@@ -360,8 +385,16 @@ fn exec_var_callback<T: Transfer>(
                 for p in &params {
                     sub_env.extend(p.clone(), T::Domain::top());
                 }
-                let _ =
-                    exec_body_depth(transfer, &body_cfg, &sub_env, state, memo, heap, ctx, depth + 1);
+                let _ = exec_body_depth(
+                    transfer,
+                    &body_cfg,
+                    &sub_env,
+                    state,
+                    memo,
+                    heap,
+                    ctx,
+                    depth + 1,
+                );
             }
         }
     }

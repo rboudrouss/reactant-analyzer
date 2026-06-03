@@ -58,7 +58,14 @@ pub fn analyze_cfg<T: Transfer>(
 
         if let Some(block) = cfg.blocks.get(&b) {
             for stmt in &block.stmts {
-                transfer.exec_stmt(stmt, &mut env_out, &mut state_out, &mut memo_local, &mut heap_out, ctx);
+                transfer.exec_stmt(
+                    stmt,
+                    &mut env_out,
+                    &mut state_out,
+                    &mut memo_local,
+                    &mut heap_out,
+                    ctx,
+                );
             }
         }
 
@@ -242,7 +249,10 @@ mod tests {
             },
             Stmt::ExprStmt(Expr::Call {
                 fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }],
+                args: vec![Expr::ObjectLit {
+                    id: crate::ir::types::ExprId(0),
+                    fields: vec![],
+                }],
             }),
         ];
         let cfg = single_block_cfg(stmts);
@@ -270,7 +280,10 @@ mod tests {
                 id: 0,
                 stmts: vec![Stmt::Let {
                     var: "x".to_string(),
-                    rhs: Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] },
+                    rhs: Expr::ObjectLit {
+                        id: crate::ir::types::ExprId(0),
+                        fields: vec![],
+                    },
                 }],
                 term: Terminator::Jump(1),
             },
@@ -344,7 +357,10 @@ mod tests {
                 id: 2,
                 stmts: vec![Stmt::Let {
                     var: "x".to_string(),
-                    rhs: Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] },
+                    rhs: Expr::ObjectLit {
+                        id: crate::ir::types::ExprId(0),
+                        fields: vec![],
+                    },
                 }],
                 term: Terminator::Jump(3),
             },

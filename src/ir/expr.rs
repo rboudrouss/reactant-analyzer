@@ -45,9 +45,19 @@ pub enum Expr {
     Lit(Prim),
 
     // Composites — each allocating node carries an ExprId (allocation-site key for the heap).
-    ObjectLit { id: ExprId, fields: Vec<(Symbol, Expr)> },
-    ArrayLit { id: ExprId, elems: Vec<Expr> },
-    FnLit { id: ExprId, params: Vec<Var>, body_cfg: Arc<CFG> },
+    ObjectLit {
+        id: ExprId,
+        fields: Vec<(Symbol, Expr)>,
+    },
+    ArrayLit {
+        id: ExprId,
+        elems: Vec<Expr>,
+    },
+    FnLit {
+        id: ExprId,
+        params: Vec<Var>,
+        body_cfg: Arc<CFG>,
+    },
 
     // Vars
     Var(Symbol),

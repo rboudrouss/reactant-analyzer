@@ -33,16 +33,18 @@ pub fn classify_callee<D: AbstractDomain>(fn_: &Expr, env: &AbstractEnv<D>) -> T
                 TriggerClass::Setter
             } else {
                 match name.as_str() {
-                    "setTimeout" | "setInterval" | "queueMicrotask"
-                    | "requestAnimationFrame" => TriggerClass::InCycle,
+                    "setTimeout" | "setInterval" | "queueMicrotask" | "requestAnimationFrame" => {
+                        TriggerClass::InCycle
+                    }
                     _ => TriggerClass::Unknown,
                 }
             }
         }
         Expr::FieldAccess { field, .. } => match field.as_str() {
             "then" | "catch" | "finally" | "allSettled" | "any" => TriggerClass::InCycle,
-            "map" | "forEach" | "reduce" | "filter" | "find" | "flatMap" | "some"
-            | "every" => TriggerClass::InCycle,
+            "map" | "forEach" | "reduce" | "filter" | "find" | "flatMap" | "some" | "every" => {
+                TriggerClass::InCycle
+            }
             "addEventListener" | "removeEventListener" => TriggerClass::Subscription,
             _ => TriggerClass::Unknown,
         },

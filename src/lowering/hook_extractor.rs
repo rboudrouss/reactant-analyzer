@@ -273,11 +273,17 @@ fn rewrite_expr(expr: Expr, state_temps: &HashMap<String, HookLabel>) -> Expr {
         },
         Expr::ArrayLit { id, elems } => Expr::ArrayLit {
             id,
-            elems: elems.into_iter().map(|e| rewrite_expr(e, state_temps)).collect(),
+            elems: elems
+                .into_iter()
+                .map(|e| rewrite_expr(e, state_temps))
+                .collect(),
         },
         Expr::ObjectLit { id, fields } => Expr::ObjectLit {
             id,
-            fields: fields.into_iter().map(|(k, v)| (k, rewrite_expr(v, state_temps))).collect(),
+            fields: fields
+                .into_iter()
+                .map(|(k, v)| (k, rewrite_expr(v, state_temps)))
+                .collect(),
         },
         Expr::TSAnnotated(inner, ty) => {
             Expr::TSAnnotated(Box::new(rewrite_expr(*inner, state_temps)), ty)

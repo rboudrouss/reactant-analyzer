@@ -28,9 +28,7 @@ impl<D: AbstractDomain> EnvVal<D> {
     fn join(&self, other: &Self) -> Self {
         match (self, other) {
             (EnvVal::Val(a), EnvVal::Val(b)) => EnvVal::Val(a.join(b)),
-            (EnvVal::Loc(s1), EnvVal::Loc(s2)) => {
-                EnvVal::Loc(s1.union(s2).cloned().collect())
-            }
+            (EnvVal::Loc(s1), EnvVal::Loc(s2)) => EnvVal::Loc(s1.union(s2).cloned().collect()),
             // Different shapes → lose location info, fall back to top.
             _ => EnvVal::Val(D::top()),
         }
@@ -39,9 +37,7 @@ impl<D: AbstractDomain> EnvVal<D> {
     fn widen(&self, other: &Self) -> Self {
         match (self, other) {
             (EnvVal::Val(a), EnvVal::Val(b)) => EnvVal::Val(a.widen(b)),
-            (EnvVal::Loc(s1), EnvVal::Loc(s2)) => {
-                EnvVal::Loc(s1.union(s2).cloned().collect())
-            }
+            (EnvVal::Loc(s1), EnvVal::Loc(s2)) => EnvVal::Loc(s1.union(s2).cloned().collect()),
             _ => EnvVal::Val(D::top()),
         }
     }
@@ -49,7 +45,10 @@ impl<D: AbstractDomain> EnvVal<D> {
     fn leq(&self, other: &Self) -> bool {
         match (self, other) {
             (EnvVal::Val(a), EnvVal::Val(b)) => {
-                matches!(a.partial_cmp(b), Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal))
+                matches!(
+                    a.partial_cmp(b),
+                    Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)
+                )
             }
             (EnvVal::Loc(s1), EnvVal::Loc(s2)) => s1.is_subset(s2),
             // Cross-type: Loc is not ⊑ Val or vice-versa.
@@ -163,7 +162,11 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         for (k, &v) in &other.setter_bindings {
             setter_bindings.entry(k.clone()).or_insert(v);
         }
-        AbstractEnv { stabs, locs, setter_bindings }
+        AbstractEnv {
+            stabs,
+            locs,
+            setter_bindings,
+        }
     }
 
     /// Pointwise widening. Used for back-edge merging in `analyze_cfg`.
@@ -183,7 +186,11 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         for (k, &v) in &other.setter_bindings {
             setter_bindings.entry(k.clone()).or_insert(v);
         }
-        AbstractEnv { stabs, locs, setter_bindings }
+        AbstractEnv {
+            stabs,
+            locs,
+            setter_bindings,
+        }
     }
 
     /// Empty env — lattice bottom.
@@ -195,7 +202,10 @@ impl<D: AbstractDomain> AbstractEnv<D> {
     pub fn leq(&self, other: &Self) -> bool {
         for (k, a) in &self.stabs {
             let b = other.stabs.get(k).cloned().unwrap_or_else(D::bottom);
-            if !matches!(a.partial_cmp(&b), Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)) {
+            if !matches!(
+                a.partial_cmp(&b),
+                Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)
+            ) {
                 return false;
             }
         }

@@ -99,7 +99,6 @@ fn build_setter_map(result: &AnalysisResult<StateValue>) -> HashMap<HookLabel, H
     map
 }
 
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -187,7 +186,10 @@ mod tests {
                 id: 0,
                 stmts: vec![Stmt::ExprStmt(Expr::Call {
                     fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }],
+                    args: vec![Expr::ObjectLit {
+                        id: crate::ir::types::ExprId(0),
+                        fields: vec![],
+                    }],
                 })],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
@@ -242,7 +244,10 @@ mod tests {
                 id: 0,
                 stmts: vec![Stmt::ExprStmt(Expr::Call {
                     fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }],
+                    args: vec![Expr::ObjectLit {
+                        id: crate::ir::types::ExprId(0),
+                        fields: vec![],
+                    }],
                 })],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
@@ -278,7 +283,10 @@ mod tests {
                 id: 0,
                 stmts: vec![Stmt::ExprStmt(Expr::Call {
                     fn_: Box::new(Expr::Var("setOther".to_string())),
-                    args: vec![Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }],
+                    args: vec![Expr::ObjectLit {
+                        id: crate::ir::types::ExprId(0),
+                        fields: vec![],
+                    }],
                 })],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
@@ -320,7 +328,10 @@ mod tests {
                     },
                     Stmt::ExprStmt(Expr::Call {
                         fn_: Box::new(Expr::Var("setN".to_string())),
-                        args: vec![Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }],
+                        args: vec![Expr::ObjectLit {
+                            id: crate::ir::types::ExprId(0),
+                            fields: vec![],
+                        }],
                     }),
                 ],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
@@ -482,7 +493,10 @@ mod tests {
                 id: 1,
                 stmts: vec![Stmt::ExprStmt(Expr::Call {
                     fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }],
+                    args: vec![Expr::ObjectLit {
+                        id: crate::ir::types::ExprId(0),
+                        fields: vec![],
+                    }],
                 })],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
@@ -747,25 +761,49 @@ mod tests {
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
         );
-        let eff_cfg = CFG { entry: 0, blocks: eff_blocks, edges: vec![] };
+        let eff_cfg = CFG {
+            entry: 0,
+            blocks: eff_blocks,
+            edges: vec![],
+        };
         let hooks = vec![
-            HookEntry::State { label: 0, init: Expr::Lit(Prim::Int(0)) },
-            HookEntry::Effect { label: 1, body_cfg: eff_cfg, deps },
+            HookEntry::State {
+                label: 0,
+                init: Expr::Lit(Prim::Int(0)),
+            },
+            HookEntry::Effect {
+                label: 1,
+                body_cfg: eff_cfg,
+                deps,
+            },
         ];
         let render_stmts = vec![
-            Stmt::Let { var: "n".to_string(), rhs: Expr::StateVal(0) },
-            Stmt::Let { var: setter_name.to_string(), rhs: Expr::StateSetter(0) },
+            Stmt::Let {
+                var: "n".to_string(),
+                rhs: Expr::StateVal(0),
+            },
+            Stmt::Let {
+                var: setter_name.to_string(),
+                rhs: Expr::StateSetter(0),
+            },
         ];
         let mut blocks = HashMap::new();
-        blocks.insert(0, BasicBlock {
-            id: 0,
-            stmts: render_stmts,
-            term: Terminator::Return(Expr::Lit(Prim::Unit)),
-        });
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: render_stmts,
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
         ComponentIR {
             name: "C".to_string(),
             param: "props".to_string(),
-            render_cfg: CFG { entry: 0, blocks, edges: vec![] },
+            render_cfg: CFG {
+                entry: 0,
+                blocks,
+                edges: vec![],
+            },
             hooks,
         }
     }
@@ -777,19 +815,26 @@ mod tests {
         use crate::ir::types::ExprId;
         let cb_body_cfg = {
             let mut b = HashMap::new();
-            b.insert(0, BasicBlock {
-                id: 0,
-                stmts: vec![Stmt::ExprStmt(Expr::Call {
-                    fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::BinOp {
-                        op: crate::ir::expr::BinOp::Add,
-                        lhs: Box::new(Expr::StateVal(0)),
-                        rhs: Box::new(Expr::Lit(Prim::Int(1))),
-                    }],
-                })],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            });
-            CFG { entry: 0, blocks: b, edges: vec![] }
+            b.insert(
+                0,
+                BasicBlock {
+                    id: 0,
+                    stmts: vec![Stmt::ExprStmt(Expr::Call {
+                        fn_: Box::new(Expr::Var("setN".to_string())),
+                        args: vec![Expr::BinOp {
+                            op: crate::ir::expr::BinOp::Add,
+                            lhs: Box::new(Expr::StateVal(0)),
+                            rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                        }],
+                    })],
+                    term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                },
+            );
+            CFG {
+                entry: 0,
+                blocks: b,
+                edges: vec![],
+            }
         };
         let stmts = vec![
             Stmt::Let {
@@ -802,10 +847,7 @@ mod tests {
             },
             Stmt::ExprStmt(Expr::Call {
                 fn_: Box::new(Expr::Var("setTimeout".to_string())),
-                args: vec![
-                    Expr::Var("cb".to_string()),
-                    Expr::Lit(Prim::Int(1000)),
-                ],
+                args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(1000))],
             }),
         ];
         let comp = component_with_effect_stmts("setN", stmts, Some(vec![Expr::StateVal(0)]));
@@ -827,19 +869,26 @@ mod tests {
         use crate::ir::types::ExprId;
         let cb_body_cfg = {
             let mut b = HashMap::new();
-            b.insert(0, BasicBlock {
-                id: 0,
-                stmts: vec![Stmt::ExprStmt(Expr::Call {
-                    fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::BinOp {
-                        op: crate::ir::expr::BinOp::Add,
-                        lhs: Box::new(Expr::StateVal(0)),
-                        rhs: Box::new(Expr::Lit(Prim::Int(1))),
-                    }],
-                })],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            });
-            CFG { entry: 0, blocks: b, edges: vec![] }
+            b.insert(
+                0,
+                BasicBlock {
+                    id: 0,
+                    stmts: vec![Stmt::ExprStmt(Expr::Call {
+                        fn_: Box::new(Expr::Var("setN".to_string())),
+                        args: vec![Expr::BinOp {
+                            op: crate::ir::expr::BinOp::Add,
+                            lhs: Box::new(Expr::StateVal(0)),
+                            rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                        }],
+                    })],
+                    term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                },
+            );
+            CFG {
+                entry: 0,
+                blocks: b,
+                edges: vec![],
+            }
         };
         let stmts = vec![
             Stmt::Let {
@@ -882,40 +931,62 @@ mod tests {
         use crate::ir::types::ExprId;
         let inner_body_cfg = {
             let mut b = HashMap::new();
-            b.insert(0, BasicBlock {
-                id: 0,
-                stmts: vec![Stmt::ExprStmt(Expr::Call {
-                    fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::BinOp {
-                        op: crate::ir::expr::BinOp::Add,
-                        lhs: Box::new(Expr::StateVal(0)),
-                        rhs: Box::new(Expr::Lit(Prim::Int(1))),
-                    }],
-                })],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            });
-            CFG { entry: 0, blocks: b, edges: vec![] }
+            b.insert(
+                0,
+                BasicBlock {
+                    id: 0,
+                    stmts: vec![Stmt::ExprStmt(Expr::Call {
+                        fn_: Box::new(Expr::Var("setN".to_string())),
+                        args: vec![Expr::BinOp {
+                            op: crate::ir::expr::BinOp::Add,
+                            lhs: Box::new(Expr::StateVal(0)),
+                            rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                        }],
+                    })],
+                    term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                },
+            );
+            CFG {
+                entry: 0,
+                blocks: b,
+                edges: vec![],
+            }
         };
         let outer_body_cfg = {
             let mut b = HashMap::new();
-            b.insert(0, BasicBlock {
-                id: 0,
-                stmts: vec![Stmt::ExprStmt(Expr::Call {
-                    fn_: Box::new(Expr::Var("setTimeout".to_string())),
-                    args: vec![Expr::Var("inner".to_string()), Expr::Lit(Prim::Int(100))],
-                })],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            });
-            CFG { entry: 0, blocks: b, edges: vec![] }
+            b.insert(
+                0,
+                BasicBlock {
+                    id: 0,
+                    stmts: vec![Stmt::ExprStmt(Expr::Call {
+                        fn_: Box::new(Expr::Var("setTimeout".to_string())),
+                        args: vec![Expr::Var("inner".to_string()), Expr::Lit(Prim::Int(100))],
+                    })],
+                    term: Terminator::Return(Expr::Lit(Prim::Unit)),
+                },
+            );
+            CFG {
+                entry: 0,
+                blocks: b,
+                edges: vec![],
+            }
         };
         let stmts = vec![
             Stmt::Let {
                 var: "inner".to_string(),
-                rhs: Expr::FnLit { id: ExprId(50), params: vec![], body_cfg: std::sync::Arc::new(inner_body_cfg) },
+                rhs: Expr::FnLit {
+                    id: ExprId(50),
+                    params: vec![],
+                    body_cfg: std::sync::Arc::new(inner_body_cfg),
+                },
             },
             Stmt::Let {
                 var: "outer".to_string(),
-                rhs: Expr::FnLit { id: ExprId(51), params: vec![], body_cfg: std::sync::Arc::new(outer_body_cfg) },
+                rhs: Expr::FnLit {
+                    id: ExprId(51),
+                    params: vec![],
+                    body_cfg: std::sync::Arc::new(outer_body_cfg),
+                },
             },
             Stmt::ExprStmt(Expr::Call {
                 fn_: Box::new(Expr::Var("outer".to_string())),

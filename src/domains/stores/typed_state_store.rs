@@ -288,11 +288,17 @@ mod tests {
     #[test]
     fn infer_object_is_reference() {
         assert_eq!(
-            infer_state_type(&Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }),
+            infer_state_type(&Expr::ObjectLit {
+                id: crate::ir::types::ExprId(0),
+                fields: vec![]
+            }),
             StateType::Reference
         );
         assert_eq!(
-            infer_state_type(&Expr::ArrayLit { id: crate::ir::types::ExprId(0), elems: vec![] }),
+            infer_state_type(&Expr::ArrayLit {
+                id: crate::ir::types::ExprId(0),
+                elems: vec![]
+            }),
             StateType::Reference
         );
     }
