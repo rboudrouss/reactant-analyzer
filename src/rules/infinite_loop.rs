@@ -187,7 +187,7 @@ mod tests {
                 id: 0,
                 stmts: vec![Stmt::ExprStmt(Expr::Call {
                     fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::ObjectLit(vec![])],
+                    args: vec![Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }],
                 })],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
@@ -242,7 +242,7 @@ mod tests {
                 id: 0,
                 stmts: vec![Stmt::ExprStmt(Expr::Call {
                     fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::ObjectLit(vec![])],
+                    args: vec![Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }],
                 })],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
@@ -278,7 +278,7 @@ mod tests {
                 id: 0,
                 stmts: vec![Stmt::ExprStmt(Expr::Call {
                     fn_: Box::new(Expr::Var("setOther".to_string())),
-                    args: vec![Expr::ObjectLit(vec![])],
+                    args: vec![Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }],
                 })],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
@@ -320,7 +320,7 @@ mod tests {
                     },
                     Stmt::ExprStmt(Expr::Call {
                         fn_: Box::new(Expr::Var("setN".to_string())),
-                        args: vec![Expr::ObjectLit(vec![])],
+                        args: vec![Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }],
                     }),
                 ],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
@@ -482,7 +482,7 @@ mod tests {
                 id: 1,
                 stmts: vec![Stmt::ExprStmt(Expr::Call {
                     fn_: Box::new(Expr::Var("setN".to_string())),
-                    args: vec![Expr::ObjectLit(vec![])],
+                    args: vec![Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }],
                 })],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
@@ -604,8 +604,9 @@ mod tests {
             },
         );
         Expr::FnLit {
+            id: crate::ir::types::ExprId(0),
             params: vec![],
-            body_cfg: Box::new(CFG {
+            body_cfg: std::sync::Arc::new(CFG {
                 entry: 0,
                 blocks: b,
                 edges: vec![],
@@ -699,8 +700,9 @@ mod tests {
             },
         );
         let cb = Expr::FnLit {
+            id: crate::ir::types::ExprId(0),
             params: vec![],
-            body_cfg: Box::new(CFG {
+            body_cfg: std::sync::Arc::new(CFG {
                 entry: 0,
                 blocks: cb_blocks,
                 edges: vec![crate::ir::cfg::Edge {
@@ -722,6 +724,152 @@ mod tests {
         assert!(
             !result.widened_labels.contains(&0),
             "back-edge in callback body → conservative bail → no widening (known FN)"
+        );
+    }
+
+    /// Build a ComponentIR whose effect body has multiple statements.
+    fn component_with_effect_stmts(
+        setter_name: &str,
+        stmts: Vec<Stmt>,
+        deps: Option<Vec<Expr>>,
+    ) -> ComponentIR {
+        let mut eff_blocks = HashMap::new();
+        let mut all_stmts = vec![Stmt::Let {
+            var: setter_name.to_string(),
+            rhs: Expr::StateSetter(0),
+        }];
+        all_stmts.extend(stmts);
+        eff_blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: all_stmts,
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let eff_cfg = CFG { entry: 0, blocks: eff_blocks, edges: vec![] };
+        let hooks = vec![
+            HookEntry::State { label: 0, init: Expr::Lit(Prim::Int(0)) },
+            HookEntry::Effect { label: 1, body_cfg: eff_cfg, deps },
+        ];
+        let render_stmts = vec![
+            Stmt::Let { var: "n".to_string(), rhs: Expr::StateVal(0) },
+            Stmt::Let { var: setter_name.to_string(), rhs: Expr::StateSetter(0) },
+        ];
+        let mut blocks = HashMap::new();
+        blocks.insert(0, BasicBlock {
+            id: 0,
+            stmts: render_stmts,
+            term: Terminator::Return(Expr::Lit(Prim::Unit)),
+        });
+        ComponentIR {
+            name: "C".to_string(),
+            param: "props".to_string(),
+            render_cfg: CFG { entry: 0, blocks, edges: vec![] },
+            hooks,
+        }
+    }
+
+    #[test]
+    fn var_callback_setter_triggers_infinite_loop() {
+        // const cb = () => setN(n + 1); setTimeout(cb, 1000)  — deps: [n]
+        // B5: cb resolved via heap → setN executed → n grows → widening → InfiniteLoop.
+        use crate::ir::types::ExprId;
+        let cb_body_cfg = {
+            let mut b = HashMap::new();
+            b.insert(0, BasicBlock {
+                id: 0,
+                stmts: vec![Stmt::ExprStmt(Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::BinOp {
+                        op: crate::ir::expr::BinOp::Add,
+                        lhs: Box::new(Expr::StateVal(0)),
+                        rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                    }],
+                })],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            });
+            CFG { entry: 0, blocks: b, edges: vec![] }
+        };
+        let stmts = vec![
+            Stmt::Let {
+                var: "cb".to_string(),
+                rhs: Expr::FnLit {
+                    id: ExprId(10),
+                    params: vec![],
+                    body_cfg: std::sync::Arc::new(cb_body_cfg),
+                },
+            },
+            Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setTimeout".to_string())),
+                args: vec![
+                    Expr::Var("cb".to_string()),
+                    Expr::Lit(Prim::Int(1000)),
+                ],
+            }),
+        ];
+        let comp = component_with_effect_stmts("setN", stmts, Some(vec![Expr::StateVal(0)]));
+        let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
+        assert!(
+            result.widened_labels.contains(&0),
+            "n should widen via the variable callback"
+        );
+        assert!(
+            !InfiniteLoop.check(&result).is_empty(),
+            "setN(n+1) inside cb → setTimeout(cb) should be detected as infinite loop"
+        );
+    }
+
+    #[test]
+    fn var_callback_then_setter_triggers_infinite_loop() {
+        // const inc = () => setN(n + 1); fetch().then(inc)  — deps: [n]
+        // B5: inc resolved via heap from .then arg → n grows → widening → InfiniteLoop.
+        use crate::ir::types::ExprId;
+        let cb_body_cfg = {
+            let mut b = HashMap::new();
+            b.insert(0, BasicBlock {
+                id: 0,
+                stmts: vec![Stmt::ExprStmt(Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::BinOp {
+                        op: crate::ir::expr::BinOp::Add,
+                        lhs: Box::new(Expr::StateVal(0)),
+                        rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                    }],
+                })],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            });
+            CFG { entry: 0, blocks: b, edges: vec![] }
+        };
+        let stmts = vec![
+            Stmt::Let {
+                var: "inc".to_string(),
+                rhs: Expr::FnLit {
+                    id: ExprId(11),
+                    params: vec![],
+                    body_cfg: std::sync::Arc::new(cb_body_cfg),
+                },
+            },
+            Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::FieldAccess {
+                    obj: Box::new(Expr::Call {
+                        fn_: Box::new(Expr::Var("fetch".to_string())),
+                        args: vec![],
+                    }),
+                    field: "then".to_string(),
+                }),
+                args: vec![Expr::Var("inc".to_string())],
+            }),
+        ];
+        let comp = component_with_effect_stmts("setN", stmts, Some(vec![Expr::StateVal(0)]));
+        let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
+        assert!(
+            result.widened_labels.contains(&0),
+            "n should widen via the variable .then callback"
+        );
+        assert!(
+            !InfiniteLoop.check(&result).is_empty(),
+            "setN(n+1) inside inc → fetch().then(inc) should be detected as infinite loop"
         );
     }
 }

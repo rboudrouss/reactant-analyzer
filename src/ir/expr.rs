@@ -1,6 +1,8 @@
+use std::sync::Arc;
+
 use crate::ir::{
     cfg::CFG,
-    types::{HookLabel, Symbol, Var},
+    types::{ExprId, HookLabel, Symbol, Var},
 };
 
 #[derive(Debug, Clone)]
@@ -42,13 +44,10 @@ pub enum Expr {
     // Primitive literals
     Lit(Prim),
 
-    // Composites
-    ObjectLit(Vec<(Symbol, Expr)>),
-    ArrayLit(Vec<Expr>),
-    FnLit {
-        params: Vec<Var>,
-        body_cfg: Box<CFG>,
-    },
+    // Composites — each allocating node carries an ExprId (allocation-site key for the heap).
+    ObjectLit { id: ExprId, fields: Vec<(Symbol, Expr)> },
+    ArrayLit { id: ExprId, elems: Vec<Expr> },
+    FnLit { id: ExprId, params: Vec<Var>, body_cfg: Arc<CFG> },
 
     // Vars
     Var(Symbol),

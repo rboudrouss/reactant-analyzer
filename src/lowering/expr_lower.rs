@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use oxc_ast::ast::*;
 
+use std::sync::Arc;
+
 use crate::ir::{
     cfg::{BasicBlock, CFG, EdgeKind, Terminator},
     expr::{BinOp as IrBinOp, Expr, Prim, UnaryOp as IrUnaryOp},
@@ -128,13 +130,14 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
 
         // ── Composites ────────────────────────────────────────────────────────
         Expression::ObjectExpression(obj) => {
-            let props = obj
+            let id = builder.next_expr_id();
+            let fields = obj
                 .properties
                 .iter()
                 .filter_map(|prop| match prop {
                     ObjectPropertyKind::ObjectProperty(p) => {
                         let key = match &p.key {
-                            PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+                            PropertyKey::StaticIdentifier(ident) => ident.name.to_string(),
                             PropertyKey::StringLiteral(s) => s.value.to_string(),
                             _ => return None,
                         };
@@ -143,42 +146,40 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                     _ => None,
                 })
                 .collect();
-            Expr::ObjectLit(props)
+            Expr::ObjectLit { id, fields }
         }
         Expression::ArrayExpression(arr) => {
+            let id = builder.next_expr_id();
             let elems = arr
                 .elements
                 .iter()
                 .filter_map(|el| el.as_expression().map(|e| lower_expr(e, builder)))
                 .collect();
-            Expr::ArrayLit(elems)
+            Expr::ArrayLit { id, elems }
         }
 
         // ── Functions ─────────────────────────────────────────────────────────
         Expression::ArrowFunctionExpression(arrow) => {
+            let id = builder.next_expr_id();
             let params = lower_params(&arrow.params);
             let body_cfg = build_cfg(&arrow.body);
-            Expr::FnLit {
-                params,
-                body_cfg: Box::new(body_cfg),
-            }
+            Expr::FnLit { id, params, body_cfg: Arc::new(body_cfg) }
         }
         Expression::FunctionExpression(func) => {
+            let id = builder.next_expr_id();
             let params = lower_params(&func.params);
             let body_cfg = func
                 .body
                 .as_ref()
                 .map(|b| build_cfg(b))
                 .unwrap_or_else(empty_cfg);
-            Expr::FnLit {
-                params,
-                body_cfg: Box::new(body_cfg),
-            }
+            Expr::FnLit { id, params, body_cfg: Arc::new(body_cfg) }
         }
 
         // ── JSX ───────────────────────────────────────────────────────────────
         Expression::JSXElement(jsx) => lower_jsx_element(jsx, builder),
         Expression::JSXFragment(frag) => {
+            let id = builder.next_expr_id();
             let children = frag
                 .children
                 .iter()
@@ -186,7 +187,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 .collect();
             Expr::NativeElem {
                 tag: "Fragment".to_string(),
-                props: Box::new(Expr::ObjectLit(vec![])),
+                props: Box::new(Expr::ObjectLit { id, fields: vec![] }),
                 children,
             }
         }
@@ -358,12 +359,13 @@ fn lower_jsx_element(jsx: &JSXElement, builder: &mut BlockBuilder) -> Expr {
 }
 
 fn lower_jsx_props(attrs: &[JSXAttributeItem], builder: &mut BlockBuilder) -> Expr {
-    let props: Vec<(String, Expr)> = attrs
+    let id = builder.next_expr_id();
+    let fields: Vec<(String, Expr)> = attrs
         .iter()
         .filter_map(|attr| match attr {
             JSXAttributeItem::Attribute(a) => {
                 let key = match &a.name {
-                    JSXAttributeName::Identifier(id) => id.name.to_string(),
+                    JSXAttributeName::Identifier(ident) => ident.name.to_string(),
                     JSXAttributeName::NamespacedName(n) => {
                         format!("{}:{}", n.namespace.name, n.name.name)
                     }
@@ -386,7 +388,7 @@ fn lower_jsx_props(attrs: &[JSXAttributeItem], builder: &mut BlockBuilder) -> Ex
             JSXAttributeItem::SpreadAttribute(_) => None,
         })
         .collect();
-    Expr::ObjectLit(props)
+    Expr::ObjectLit { id, fields }
 }
 
 fn jsx_element_name(name: &JSXElementName) -> String {
@@ -415,6 +417,7 @@ fn lower_jsx_child(child: &JSXChild, builder: &mut BlockBuilder) -> Option<Expr>
     match child {
         JSXChild::Element(el) => Some(lower_jsx_element(el, builder)),
         JSXChild::Fragment(frag) => {
+            let id = builder.next_expr_id();
             let children = frag
                 .children
                 .iter()
@@ -422,7 +425,7 @@ fn lower_jsx_child(child: &JSXChild, builder: &mut BlockBuilder) -> Option<Expr>
                 .collect();
             Some(Expr::NativeElem {
                 tag: "Fragment".to_string(),
-                props: Box::new(Expr::ObjectLit(vec![])),
+                props: Box::new(Expr::ObjectLit { id, fields: vec![] }),
                 children,
             })
         }

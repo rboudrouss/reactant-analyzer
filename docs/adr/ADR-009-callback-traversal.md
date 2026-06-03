@@ -1,7 +1,8 @@
 # ADR-009 : Traversée sémantique des callbacks — points d'entrée + classe de déclenchement
 
-- **Statut** : Accepté — implémentation en attente
+- **Statut** : Accepté — implémenté
 - **Date** : 2026-06-02
+- **Mis à jour** : 2026-06-03 — étendu par [ADR-010](ADR-010-heap-model.md) (B5 callbacks par variable, B6 inlining appels locaux)
 - **Contexte** : [ADR-008](ADR-008-value-domain.md) (domaine de valeurs / fixpoint), [ADR-004](ADR-004-component-structure.md) (render_cfg + effect_cfg), [ADR-005](ADR-005-analysis-scope.md) (scope intra-procédural)
 
 ## Contexte

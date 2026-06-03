@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::{
-    domains::{AbstractDomain, AbstractEnv, MemoStore, QueryContext, StateStore, Transfer},
+    domains::{AbstractDomain, AbstractEnv, Heap, HeapValue, MemoStore, QueryContext, StateStore, Transfer},
     ir::{
         cfg::{CFG, EdgeKind, Terminator},
         expr::{BinOp, Expr, Prim, UnaryOp},
@@ -68,7 +68,7 @@ impl StateValue {
             Expr::Lit(Prim::String(s)) => str_const(std::iter::once(s.to_string()).collect()),
             Expr::Lit(Prim::Null) => StateValue::Null,
             Expr::Lit(Prim::Unit) => StateValue::Undefined,
-            Expr::ObjectLit(_) | Expr::ArrayLit(_) | Expr::FnLit { .. } => {
+            Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::FnLit { .. } => {
                 StateValue::Reference(Stability::Unstable)
             }
             _ => StateValue::Top,
@@ -263,6 +263,7 @@ impl Transfer for StateValueTransfer {
         env: &AbstractEnv<StateValue>,
         state: &StateStore<StateValue>,
         memo: &MemoStore<StateValue>,
+        _heap: &mut Heap,
         _ctx: &dyn QueryContext,
     ) -> StateValue {
         eval_state_value(expr, env, state, memo)
@@ -274,9 +275,10 @@ impl Transfer for StateValueTransfer {
         env: &mut AbstractEnv<StateValue>,
         state: &mut StateStore<StateValue>,
         memo: &mut MemoStore<StateValue>,
+        heap: &mut Heap,
         _ctx: &dyn QueryContext,
     ) {
-        exec_state_value(stmt, env, state, memo);
+        exec_state_value(stmt, env, state, memo, heap);
     }
 
     fn recompute_memo(
@@ -319,8 +321,8 @@ fn eval_state_value(
         Expr::StateSetter(_) => StateValue::Reference(Stability::Stable),
         Expr::MemoVal(label) | Expr::CallbackVal(label) => memo.get(*label),
 
-        Expr::ObjectLit(_) => StateValue::Reference(Stability::Unstable),
-        Expr::ArrayLit(_) => StateValue::Reference(Stability::Unstable),
+        Expr::ObjectLit { .. } => StateValue::Reference(Stability::Unstable),
+        Expr::ArrayLit { .. } => StateValue::Reference(Stability::Unstable),
         Expr::FnLit { .. } => StateValue::Reference(Stability::Unstable),
         Expr::CompApp { .. } | Expr::NativeElem { .. } => {
             StateValue::Reference(Stability::Unstable)
@@ -432,7 +434,7 @@ fn classify_callee(fn_: &Expr, env: &AbstractEnv<StateValue>) -> TriggerClass {
             }
         }
         Expr::FieldAccess { field, .. } => match field.as_str() {
-            "then" | "catch" | "finally" => TriggerClass::InCycle,
+            "then" | "catch" | "finally" | "allSettled" | "any" => TriggerClass::InCycle,
             "map" | "forEach" | "reduce" | "filter" | "find" | "flatMap" | "some"
             | "every" => TriggerClass::InCycle,
             "addEventListener" | "removeEventListener" => TriggerClass::Subscription,
@@ -452,64 +454,116 @@ fn classify_callee(fn_: &Expr, env: &AbstractEnv<StateValue>) -> TriggerClass {
 /// `exec_body → exec_state_value → exec_callbacks_in_expr` would double-execute
 /// them. Nesting (`.then(() => other.map(cb2))`) is handled by that recursion.
 /// See [ADR-009].
+const MAX_INLINE_DEPTH: usize = 3;
+
+/// Resolve a variable to its heap-stored Fn bodies and execute each for side effects.
+/// Used for B5 (variable callbacks: `setTimeout(cb)`) and B6 (direct calls: `load()`).
+fn exec_var_callback(
+    name: &str,
+    env: &AbstractEnv<StateValue>,
+    state: &mut StateStore<StateValue>,
+    memo: &mut MemoStore<StateValue>,
+    heap: &mut Heap,
+    depth: usize,
+) {
+    use crate::domains::stores::EnvVal;
+    if let Some(EnvVal::Loc(ids)) = env.lookup_env_val(name) {
+        let ids: Vec<_> = ids.iter().copied().collect();
+        for id in ids {
+            if let Some(HeapValue::Fn { params, body_cfg }) = heap.get(id) {
+                let params = params.clone();
+                let body_cfg = Arc::clone(&body_cfg);
+                let mut sub_env = env.clone();
+                for p in &params {
+                    sub_env.extend(p.clone(), StateValue::Top);
+                }
+                let _ = exec_body_depth(&body_cfg, &sub_env, state, memo, heap, depth + 1);
+            }
+        }
+    }
+}
+
 fn exec_callbacks_in_expr(
     expr: &Expr,
     env: &AbstractEnv<StateValue>,
     state: &mut StateStore<StateValue>,
     memo: &mut MemoStore<StateValue>,
+    heap: &mut Heap,
 ) {
+    exec_callbacks_depth(expr, env, state, memo, heap, 0);
+}
+
+fn exec_callbacks_depth(
+    expr: &Expr,
+    env: &AbstractEnv<StateValue>,
+    state: &mut StateStore<StateValue>,
+    memo: &mut MemoStore<StateValue>,
+    heap: &mut Heap,
+    depth: usize,
+) {
+    if depth >= MAX_INLINE_DEPTH {
+        return;
+    }
     match expr {
         Expr::Call { fn_, args } => {
             let class = classify_callee(fn_, env);
             // Descend the receiver too — handles chains like `a.then(x).then(y)`
             // and nested calls like `foo(bar().then(cb))`.
-            exec_callbacks_in_expr(fn_, env, state, memo);
+            exec_callbacks_depth(fn_, env, state, memo, heap, depth);
             for arg in args {
                 match arg {
-                    Expr::FnLit { params, body_cfg } if class == TriggerClass::InCycle => {
+                    Expr::FnLit { params, body_cfg, .. } if class == TriggerClass::InCycle => {
                         let mut sub_env = env.clone();
                         for p in params {
-                            // Callback params (resolved promise value, list element,
-                            // …) are unknown → Top.
                             sub_env.extend(p.clone(), StateValue::Top);
                         }
-                        // Side effects only; return value irrelevant here.
-                        let _ = exec_body(body_cfg, &sub_env, state, memo);
+                        let _ = exec_body_depth(body_cfg, &sub_env, state, memo, heap, depth + 1);
                     }
-                    // Setter/Subscription/Unknown closures are not descended (ADR-009).
+                    // B5: variable callback — resolve Identifier to heap Fn and execute.
+                    Expr::Var(name) if class == TriggerClass::InCycle => {
+                        exec_var_callback(name, env, state, memo, heap, depth);
+                    }
+                    // Setter/Subscription/Unknown inline closures not descended (ADR-009).
                     Expr::FnLit { .. } => {}
-                    other => exec_callbacks_in_expr(other, env, state, memo),
+                    other => exec_callbacks_depth(other, env, state, memo, heap, depth),
+                }
+            }
+            // B6: direct local call inlining — Unknown callee that resolves to a heap Fn.
+            // External/imported functions have no Loc → skipped (no FP).
+            if class == TriggerClass::Unknown {
+                if let Expr::Var(name) = fn_.as_ref() {
+                    exec_var_callback(name, env, state, memo, heap, depth);
                 }
             }
         }
         Expr::BinOp { lhs, rhs, .. } => {
-            exec_callbacks_in_expr(lhs, env, state, memo);
-            exec_callbacks_in_expr(rhs, env, state, memo);
+            exec_callbacks_depth(lhs, env, state, memo, heap, depth);
+            exec_callbacks_depth(rhs, env, state, memo, heap, depth);
         }
-        Expr::UnaryOp { arg, .. } => exec_callbacks_in_expr(arg, env, state, memo),
-        Expr::FieldAccess { obj, .. } => exec_callbacks_in_expr(obj, env, state, memo),
+        Expr::UnaryOp { arg, .. } => exec_callbacks_depth(arg, env, state, memo, heap, depth),
+        Expr::FieldAccess { obj, .. } => exec_callbacks_depth(obj, env, state, memo, heap, depth),
         Expr::IndexAccess { arr, idx } => {
-            exec_callbacks_in_expr(arr, env, state, memo);
-            exec_callbacks_in_expr(idx, env, state, memo);
+            exec_callbacks_depth(arr, env, state, memo, heap, depth);
+            exec_callbacks_depth(idx, env, state, memo, heap, depth);
         }
-        Expr::ObjectLit(fields) => {
+        Expr::ObjectLit { fields, .. } => {
             for (_, v) in fields {
-                exec_callbacks_in_expr(v, env, state, memo);
+                exec_callbacks_depth(v, env, state, memo, heap, depth);
             }
         }
-        Expr::ArrayLit(items) => {
-            for item in items {
-                exec_callbacks_in_expr(item, env, state, memo);
+        Expr::ArrayLit { elems, .. } => {
+            for item in elems {
+                exec_callbacks_depth(item, env, state, memo, heap, depth);
             }
         }
-        Expr::CompApp { props, .. } => exec_callbacks_in_expr(props, env, state, memo),
+        Expr::CompApp { props, .. } => exec_callbacks_depth(props, env, state, memo, heap, depth),
         Expr::NativeElem { props, children, .. } => {
-            exec_callbacks_in_expr(props, env, state, memo);
+            exec_callbacks_depth(props, env, state, memo, heap, depth);
             for c in children {
-                exec_callbacks_in_expr(c, env, state, memo);
+                exec_callbacks_depth(c, env, state, memo, heap, depth);
             }
         }
-        Expr::TSAnnotated(inner, _) => exec_callbacks_in_expr(inner, env, state, memo),
+        Expr::TSAnnotated(inner, _) => exec_callbacks_depth(inner, env, state, memo, heap, depth),
         _ => {}
     }
 }
@@ -519,6 +573,7 @@ fn exec_state_value(
     env: &mut AbstractEnv<StateValue>,
     state: &mut StateStore<StateValue>,
     memo: &mut MemoStore<StateValue>,
+    heap: &mut Heap,
 ) {
     // Side-effect pre-pass: descend into in-cycle callbacks (`.then`, timers, HOFs)
     // so setters called inside them update `state`. Runs before the main match so
@@ -529,17 +584,27 @@ fn exec_state_value(
         Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => rhs,
         Stmt::ExprStmt(expr) => expr,
     };
-    exec_callbacks_in_expr(main_expr, env, state, memo);
+    exec_callbacks_depth(main_expr, env, state, memo, heap, 0);
 
     match stmt {
         Stmt::Let { var, rhs } => {
             if let Expr::StateSetter(label) = rhs {
                 env.bind_setter(var.clone(), *label);
             }
+            // Populate the heap for allocating expressions so that later
+            // variable-callback resolution can find their bodies.
+            if let Expr::FnLit { id, params, body_cfg } = rhs {
+                env.extend_loc(var.clone(), *id);
+                heap.insert(*id, HeapValue::Fn { params: params.clone(), body_cfg: Arc::clone(body_cfg) });
+            }
             let val = eval_state_value(rhs, env, state, memo);
             env.extend(var.clone(), val);
         }
         Stmt::Assign { var, rhs } => {
+            if let Expr::FnLit { id, params, body_cfg } = rhs {
+                env.extend_loc(var.clone(), *id);
+                heap.insert(*id, HeapValue::Fn { params: params.clone(), body_cfg: Arc::clone(body_cfg) });
+            }
             let val = eval_state_value(rhs, env, state, memo);
             env.extend(var.clone(), val);
         }
@@ -549,12 +614,70 @@ fn exec_state_value(
                 && let Some(label) = env.setter_label(name)
             {
                 let arg_val = match args.first() {
-                    Some(Expr::FnLit { params, body_cfg }) => {
+                    Some(Expr::FnLit { params, body_cfg, .. }) => {
                         let mut sub_env = env.clone();
                         if let Some(param) = params.first() {
                             sub_env.extend(param.clone(), state.get(label));
                         }
-                        exec_body(body_cfg, &sub_env, state, memo)
+                        exec_body(body_cfg, &sub_env, state, memo, heap)
+                    }
+                    Some(a) => eval_state_value(a, env, state, memo),
+                    None => StateValue::Top,
+                };
+                state.update(label, arg_val);
+            }
+        }
+    }
+}
+
+/// Depth-propagating variant of `exec_state_value`. Used inside `exec_body_impl` so that
+/// the inlining depth is preserved across callback-body boundaries.
+fn exec_state_value_depth(
+    stmt: &Stmt,
+    env: &mut AbstractEnv<StateValue>,
+    state: &mut StateStore<StateValue>,
+    memo: &mut MemoStore<StateValue>,
+    heap: &mut Heap,
+    depth: usize,
+) {
+    let main_expr = match stmt {
+        Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => rhs,
+        Stmt::ExprStmt(expr) => expr,
+    };
+    exec_callbacks_depth(main_expr, env, state, memo, heap, depth);
+
+    match stmt {
+        Stmt::Let { var, rhs } => {
+            if let Expr::StateSetter(label) = rhs {
+                env.bind_setter(var.clone(), *label);
+            }
+            if let Expr::FnLit { id, params, body_cfg } = rhs {
+                env.extend_loc(var.clone(), *id);
+                heap.insert(*id, HeapValue::Fn { params: params.clone(), body_cfg: Arc::clone(body_cfg) });
+            }
+            let val = eval_state_value(rhs, env, state, memo);
+            env.extend(var.clone(), val);
+        }
+        Stmt::Assign { var, rhs } => {
+            if let Expr::FnLit { id, params, body_cfg } = rhs {
+                env.extend_loc(var.clone(), *id);
+                heap.insert(*id, HeapValue::Fn { params: params.clone(), body_cfg: Arc::clone(body_cfg) });
+            }
+            let val = eval_state_value(rhs, env, state, memo);
+            env.extend(var.clone(), val);
+        }
+        Stmt::ExprStmt(expr) => {
+            if let Expr::Call { fn_, args } = expr
+                && let Expr::Var(name) = fn_.as_ref()
+                && let Some(label) = env.setter_label(name)
+            {
+                let arg_val = match args.first() {
+                    Some(Expr::FnLit { params, body_cfg, .. }) => {
+                        let mut sub_env = env.clone();
+                        if let Some(param) = params.first() {
+                            sub_env.extend(param.clone(), state.get(label));
+                        }
+                        exec_body_depth(body_cfg, &sub_env, state, memo, heap, depth + 1)
                     }
                     Some(a) => eval_state_value(a, env, state, memo),
                     None => StateValue::Top,
@@ -567,6 +690,18 @@ fn exec_state_value(
 
 /// Execute a FnLit body CFG with `entry_env` as starting environment.
 ///
+/// Depth-aware variant: called from `exec_var_callback` to propagate the inlining depth.
+fn exec_body_depth(
+    cfg: &CFG,
+    entry_env: &AbstractEnv<StateValue>,
+    state: &mut StateStore<StateValue>,
+    memo: &mut MemoStore<StateValue>,
+    heap: &mut Heap,
+    depth: usize,
+) -> StateValue {
+    exec_body_impl(cfg, entry_env, state, memo, heap, depth)
+}
+
 /// Processes blocks in topological order (no back-edge loops — conservative
 /// fallback to `Reference(Unstable)` if any back edge is present). At branches,
 /// both paths are executed and their environments are joined (over-approximate).
@@ -576,6 +711,18 @@ pub(crate) fn exec_body(
     entry_env: &AbstractEnv<StateValue>,
     state: &mut StateStore<StateValue>,
     memo: &mut MemoStore<StateValue>,
+    heap: &mut Heap,
+) -> StateValue {
+    exec_body_impl(cfg, entry_env, state, memo, heap, 0)
+}
+
+fn exec_body_impl(
+    cfg: &CFG,
+    entry_env: &AbstractEnv<StateValue>,
+    state: &mut StateStore<StateValue>,
+    memo: &mut MemoStore<StateValue>,
+    heap: &mut Heap,
+    depth: usize,
 ) -> StateValue {
     if cfg.edges.iter().any(|e| matches!(e.kind, EdgeKind::Back)) {
         return StateValue::Reference(Stability::Unstable);
@@ -602,7 +749,7 @@ pub(crate) fn exec_body(
 
         if let Some(block) = cfg.blocks.get(&bid) {
             for stmt in &block.stmts {
-                exec_state_value(stmt, &mut env, state, memo);
+                exec_state_value_depth(stmt, &mut env, state, memo, heap, depth);
             }
             match &block.term {
                 Terminator::Return(expr) => {
@@ -731,7 +878,7 @@ mod tests {
     fn eval_int_literal() {
         let (env, state, memo) = empty();
         assert_eq!(
-            StateValueTransfer.eval_expr(&Expr::Lit(Prim::Int(5)), &env, &state, &memo, &NullCtx),
+            StateValueTransfer.eval_expr(&Expr::Lit(Prim::Int(5)), &env, &state, &memo, &mut crate::domains::Heap::new(), &NullCtx),
             StateValue::Number(Interval::point(5.0))
         );
     }
@@ -745,6 +892,7 @@ mod tests {
                 &env,
                 &state,
                 &memo,
+                &mut crate::domains::Heap::new(),
                 &NullCtx
             ),
             StateValue::Boolean(BoolVal::True)
@@ -755,7 +903,7 @@ mod tests {
     fn eval_object_is_unstable_reference() {
         let (env, state, memo) = empty();
         assert_eq!(
-            StateValueTransfer.eval_expr(&Expr::ObjectLit(vec![]), &env, &state, &memo, &NullCtx),
+            StateValueTransfer.eval_expr(&Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }, &env, &state, &memo, &mut crate::domains::Heap::new(), &NullCtx),
             StateValue::Reference(Stability::Unstable)
         );
     }
@@ -769,7 +917,7 @@ mod tests {
             rhs: Box::new(Expr::Lit(Prim::Int(4))),
         };
         assert_eq!(
-            StateValueTransfer.eval_expr(&expr, &env, &state, &memo, &NullCtx),
+            StateValueTransfer.eval_expr(&expr, &env, &state, &memo, &mut crate::domains::Heap::new(), &NullCtx),
             StateValue::Number(Interval::point(7.0))
         );
     }
@@ -784,7 +932,7 @@ mod tests {
             rhs: Box::new(Expr::Lit(Prim::Int(1))),
         };
         assert_eq!(
-            StateValueTransfer.eval_expr(&expr, &env, &state, &memo, &NullCtx),
+            StateValueTransfer.eval_expr(&expr, &env, &state, &memo, &mut crate::domains::Heap::new(), &NullCtx),
             StateValue::Number(Interval::point(3.0))
         );
     }
@@ -797,7 +945,7 @@ mod tests {
             arg: Box::new(Expr::Lit(Prim::Bool(true))),
         };
         assert_eq!(
-            StateValueTransfer.eval_expr(&expr, &env, &state, &memo, &NullCtx),
+            StateValueTransfer.eval_expr(&expr, &env, &state, &memo, &mut crate::domains::Heap::new(), &NullCtx),
             StateValue::Boolean(BoolVal::False)
         );
     }
@@ -813,6 +961,7 @@ mod tests {
             &mut env,
             &mut state,
             &mut memo,
+            &mut crate::domains::Heap::new(),
             &NullCtx,
         );
         StateValueTransfer.exec_stmt(
@@ -823,6 +972,7 @@ mod tests {
             &mut env,
             &mut state,
             &mut memo,
+            &mut crate::domains::Heap::new(),
             &NullCtx,
         );
         assert_eq!(state.get(0), StateValue::Number(Interval::point(42.0)));
@@ -847,7 +997,7 @@ mod tests {
     #[test]
     fn from_init_object_gives_unstable_reference() {
         assert_eq!(
-            StateValue::from_init(&Expr::ObjectLit(vec![])),
+            StateValue::from_init(&Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }),
             StateValue::Reference(Stability::Unstable)
         );
     }
@@ -985,6 +1135,7 @@ mod tests {
             &env,
             &state,
             &memo,
+            &mut crate::domains::Heap::new(),
             &NullCtx,
         );
         assert_eq!(v, str_singleton("dark"));
@@ -1020,13 +1171,15 @@ mod tests {
             &Stmt::ExprStmt(Expr::Call {
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::FnLit {
+                    id: crate::ir::types::ExprId(0),
                     params: vec!["c".to_string()],
-                    body_cfg: Box::new(body_cfg),
+                    body_cfg: std::sync::Arc::new(body_cfg),
                 }],
             }),
             &mut env,
             &mut state,
             &mut memo,
+            &mut crate::domains::Heap::new(),
             &NullCtx,
         );
 
@@ -1079,13 +1232,15 @@ mod tests {
             &Stmt::ExprStmt(Expr::Call {
                 fn_: Box::new(Expr::Var("setN".to_string())),
                 args: vec![Expr::FnLit {
+                    id: crate::ir::types::ExprId(0),
                     params: vec!["c".to_string()],
-                    body_cfg: Box::new(body_cfg),
+                    body_cfg: std::sync::Arc::new(body_cfg),
                 }],
             }),
             &mut env,
             &mut state,
             &mut memo,
+            &mut crate::domains::Heap::new(),
             &NullCtx,
         );
 
@@ -1116,7 +1271,7 @@ mod tests {
         let mut state = StateStore::bottom();
         let mut memo = MemoStore::new();
 
-        let result = exec_body(&body_cfg, &entry_env, &mut state, &mut memo);
+        let result = exec_body(&body_cfg, &entry_env, &mut state, &mut memo, &mut crate::domains::Heap::new());
         assert_eq!(result, StateValue::Reference(Stability::Unstable));
     }
 
@@ -1180,11 +1335,12 @@ mod tests {
                 field: "then".to_string(),
             }),
             args: vec![Expr::FnLit {
+                id: crate::ir::types::ExprId(0),
                 params: vec!["u".to_string()],
-                body_cfg: Box::new(cb_body),
+                body_cfg: std::sync::Arc::new(cb_body),
             }],
         });
-        StateValueTransfer.exec_stmt(&stmt, &mut env, &mut state, &mut memo, &NullCtx);
+        StateValueTransfer.exec_stmt(&stmt, &mut env, &mut state, &mut memo, &mut crate::domains::Heap::new(), &NullCtx);
 
         // u is unknown (Top); Number([0,0]) ⊔ Top = Top.
         assert_eq!(state.get(0), StateValue::Top);
@@ -1208,13 +1364,14 @@ mod tests {
             fn_: Box::new(Expr::Var("setTimeout".to_string())),
             args: vec![
                 Expr::FnLit {
+                    id: crate::ir::types::ExprId(0),
                     params: vec![],
-                    body_cfg: Box::new(cb_body),
+                    body_cfg: std::sync::Arc::new(cb_body),
                 },
                 Expr::Lit(Prim::Int(1000)),
             ],
         });
-        StateValueTransfer.exec_stmt(&stmt, &mut env, &mut state, &mut memo, &NullCtx);
+        StateValueTransfer.exec_stmt(&stmt, &mut env, &mut state, &mut memo, &mut crate::domains::Heap::new(), &NullCtx);
 
         assert_eq!(state.get(0), StateValue::Number(Interval::point(42.0)));
     }
@@ -1248,8 +1405,9 @@ mod tests {
                 field: "then".to_string(),
             }),
             args: vec![Expr::FnLit {
+                id: crate::ir::types::ExprId(0),
                 params: vec![],
-                body_cfg: Box::new(cb_a),
+                body_cfg: std::sync::Arc::new(cb_a),
             }],
         };
         let outer = Expr::Call {
@@ -1258,8 +1416,9 @@ mod tests {
                 field: "then".to_string(),
             }),
             args: vec![Expr::FnLit {
+                id: crate::ir::types::ExprId(1),
                 params: vec![],
-                body_cfg: Box::new(cb_b),
+                body_cfg: std::sync::Arc::new(cb_b),
             }],
         };
         StateValueTransfer.exec_stmt(
@@ -1267,6 +1426,7 @@ mod tests {
             &mut env,
             &mut state,
             &mut memo,
+            &mut crate::domains::Heap::new(),
             &NullCtx,
         );
 
@@ -1299,12 +1459,13 @@ mod tests {
                     field: "then".to_string(),
                 }),
                 args: vec![Expr::FnLit {
+                    id: crate::ir::types::ExprId(0),
                     params: vec![],
-                    body_cfg: Box::new(cb),
+                    body_cfg: std::sync::Arc::new(cb),
                 }],
             },
         };
-        StateValueTransfer.exec_stmt(&stmt, &mut env, &mut state, &mut memo, &NullCtx);
+        StateValueTransfer.exec_stmt(&stmt, &mut env, &mut state, &mut memo, &mut crate::domains::Heap::new(), &NullCtx);
 
         assert_eq!(state.get(0), StateValue::Number(Interval::point(7.0)));
     }
@@ -1331,14 +1492,214 @@ mod tests {
             args: vec![
                 Expr::Lit(Prim::String("click".to_string())),
                 Expr::FnLit {
+                    id: crate::ir::types::ExprId(0),
                     params: vec![],
-                    body_cfg: Box::new(cb),
+                    body_cfg: std::sync::Arc::new(cb),
                 },
             ],
         });
-        StateValueTransfer.exec_stmt(&stmt, &mut env, &mut state, &mut memo, &NullCtx);
+        StateValueTransfer.exec_stmt(&stmt, &mut env, &mut state, &mut memo, &mut crate::domains::Heap::new(), &NullCtx);
 
         // Subscription handler not descended → no state update.
         assert_eq!(state.get(0), StateValue::Bottom);
+    }
+
+    #[test]
+    fn classify_callee_recognizes_allsettled_and_any() {
+        let env: AbstractEnv<StateValue> = AbstractEnv::bottom();
+        let field = |f: &str| Expr::FieldAccess {
+            obj: Box::new(Expr::Var("Promise".to_string())),
+            field: f.to_string(),
+        };
+        assert_eq!(classify_callee(&field("allSettled"), &env), TriggerClass::InCycle);
+        assert_eq!(classify_callee(&field("any"), &env), TriggerClass::InCycle);
+    }
+
+    #[test]
+    fn then_both_args_descended() {
+        // p.then(onFulfilled, onRejected) — both FnLit args are descended when class=InCycle.
+        let (mut env, mut state, mut memo) = empty();
+        env.bind_setter("setA".to_string(), 0);
+        env.extend("setA".to_string(), StateValue::Reference(Stability::Stable));
+        env.bind_setter("setB".to_string(), 1);
+        env.extend("setB".to_string(), StateValue::Reference(Stability::Stable));
+
+        let on_fulfilled = single_block_cfg(
+            vec![Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setA".to_string())),
+                args: vec![Expr::Lit(Prim::Int(1))],
+            })],
+            Expr::Lit(Prim::Unit),
+        );
+        let on_rejected = single_block_cfg(
+            vec![Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setB".to_string())),
+                args: vec![Expr::Lit(Prim::Int(2))],
+            })],
+            Expr::Lit(Prim::Unit),
+        );
+        let stmt = Stmt::ExprStmt(Expr::Call {
+            fn_: Box::new(Expr::FieldAccess {
+                obj: Box::new(Expr::Var("p".to_string())),
+                field: "then".to_string(),
+            }),
+            args: vec![
+                Expr::FnLit { id: crate::ir::types::ExprId(0), params: vec![], body_cfg: std::sync::Arc::new(on_fulfilled) },
+                Expr::FnLit { id: crate::ir::types::ExprId(1), params: vec![], body_cfg: std::sync::Arc::new(on_rejected) },
+            ],
+        });
+        StateValueTransfer.exec_stmt(&stmt, &mut env, &mut state, &mut memo, &mut crate::domains::Heap::new(), &NullCtx);
+
+        assert_eq!(state.get(0), StateValue::Number(Interval::point(1.0)));
+        assert_eq!(state.get(1), StateValue::Number(Interval::point(2.0)));
+    }
+
+    #[test]
+    fn promise_all_settled_then_cb_descended() {
+        // Promise.allSettled([...]).then(cb) — `.then` is InCycle, cb body executed.
+        let (mut env, mut state, mut memo) = empty();
+        env.bind_setter("setN".to_string(), 0);
+        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+
+        let cb = single_block_cfg(
+            vec![Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Lit(Prim::Int(42))],
+            })],
+            Expr::Lit(Prim::Unit),
+        );
+        // Promise.allSettled([p1]).then(results => setN(42))
+        let stmt = Stmt::ExprStmt(Expr::Call {
+            fn_: Box::new(Expr::FieldAccess {
+                obj: Box::new(Expr::Call {
+                    fn_: Box::new(Expr::FieldAccess {
+                        obj: Box::new(Expr::Var("Promise".to_string())),
+                        field: "allSettled".to_string(),
+                    }),
+                    args: vec![Expr::ArrayLit { id: crate::ir::types::ExprId(0), elems: vec![Expr::Var("p1".to_string())] }],
+                }),
+                field: "then".to_string(),
+            }),
+            args: vec![Expr::FnLit { id: crate::ir::types::ExprId(1), params: vec!["results".to_string()], body_cfg: std::sync::Arc::new(cb) }],
+        });
+        StateValueTransfer.exec_stmt(&stmt, &mut env, &mut state, &mut memo, &mut crate::domains::Heap::new(), &NullCtx);
+
+        assert_eq!(state.get(0), StateValue::Number(Interval::point(42.0)));
+    }
+
+    // ── B5: variable callback resolution ────────────────────────────────────────
+
+    #[test]
+    fn var_callback_updates_state() {
+        // const cb = () => setN(42); setTimeout(cb, 1000) → state[0] = Number([42,42])
+        let (mut env, mut state, mut memo) = empty();
+        env.bind_setter("setN".to_string(), 0);
+        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+
+        let cb_body = single_block_cfg(
+            vec![Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Lit(Prim::Int(42))],
+            })],
+            Expr::Lit(Prim::Unit),
+        );
+        // let cb = FnLit{id=1, ...}
+        let let_cb = Stmt::Let {
+            var: "cb".to_string(),
+            rhs: Expr::FnLit {
+                id: crate::ir::types::ExprId(1),
+                params: vec![],
+                body_cfg: std::sync::Arc::new(cb_body),
+            },
+        };
+        // setTimeout(cb, 1000)  — cb is an Identifier
+        let call = Stmt::ExprStmt(Expr::Call {
+            fn_: Box::new(Expr::Var("setTimeout".to_string())),
+            args: vec![
+                Expr::Var("cb".to_string()),
+                Expr::Lit(Prim::Int(1000)),
+            ],
+        });
+
+        let mut heap = crate::domains::Heap::new();
+        StateValueTransfer.exec_stmt(&let_cb, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+        StateValueTransfer.exec_stmt(&call, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+
+        assert_eq!(state.get(0), StateValue::Number(Interval::point(42.0)));
+    }
+
+    #[test]
+    fn var_callback_not_descended_without_loc() {
+        // myHelper(cb) where cb is NOT in env as Loc → state stays Bottom (Unknown callee, no Loc).
+        let (mut env, mut state, mut memo) = empty();
+        env.bind_setter("setN".to_string(), 0);
+        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+
+        let cb_body = single_block_cfg(
+            vec![Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Lit(Prim::Int(99))],
+            })],
+            Expr::Lit(Prim::Unit),
+        );
+        // cb is NOT bound as Loc in env — simulates external/imported callback
+        env.extend("cb".to_string(), StateValue::Reference(Stability::Stable));
+        // (deliberately NOT calling env.extend_loc)
+
+        let call = Stmt::ExprStmt(Expr::Call {
+            fn_: Box::new(Expr::Var("myHelper".to_string())),
+            args: vec![Expr::Var("cb".to_string())],
+        });
+        let mut heap = crate::domains::Heap::new();
+        // Give the heap a function at ExprId(1) but cb is not linked to it in env
+        heap.insert(
+            crate::ir::types::ExprId(1),
+            crate::domains::HeapValue::Fn {
+                params: vec![],
+                body_cfg: std::sync::Arc::new(cb_body),
+            },
+        );
+        StateValueTransfer.exec_stmt(&call, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+
+        // No Loc for cb → not descended → state stays Bottom.
+        assert_eq!(state.get(0), StateValue::Bottom);
+    }
+
+    // ── B6: direct local call inlining ──────────────────────────────────────────
+
+    #[test]
+    fn direct_local_call_inlined() {
+        // function load() { setUser(data); }  load()  → state[0] updated.
+        let (mut env, mut state, mut memo) = empty();
+        env.bind_setter("setUser".to_string(), 0);
+        env.extend("setUser".to_string(), StateValue::Reference(Stability::Stable));
+
+        let load_body = single_block_cfg(
+            vec![Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setUser".to_string())),
+                args: vec![Expr::Lit(Prim::Int(7))],
+            })],
+            Expr::Lit(Prim::Unit),
+        );
+        // let load = FnLit{id=2}
+        let let_load = Stmt::Let {
+            var: "load".to_string(),
+            rhs: Expr::FnLit {
+                id: crate::ir::types::ExprId(2),
+                params: vec![],
+                body_cfg: std::sync::Arc::new(load_body),
+            },
+        };
+        // load()  — direct call to local function (Unknown callee with Loc)
+        let call_load = Stmt::ExprStmt(Expr::Call {
+            fn_: Box::new(Expr::Var("load".to_string())),
+            args: vec![],
+        });
+
+        let mut heap = crate::domains::Heap::new();
+        StateValueTransfer.exec_stmt(&let_load, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+        StateValueTransfer.exec_stmt(&call_load, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+
+        assert_eq!(state.get(0), StateValue::Number(Interval::point(7.0)));
     }
 }

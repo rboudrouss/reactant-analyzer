@@ -308,8 +308,9 @@ mod tests {
             Stmt::ExprStmt(Expr::Call {
                 fn_: Box::new(Expr::Var("someCall".to_string())),
                 args: vec![Expr::FnLit {
+                    id: crate::ir::types::ExprId(0),
                     params: vec!["u".to_string()],
-                    body_cfg: Box::new(cb_cfg),
+                    body_cfg: std::sync::Arc::new(cb_cfg),
                 }],
             }),
         ];

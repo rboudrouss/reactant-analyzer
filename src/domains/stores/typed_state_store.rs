@@ -34,7 +34,7 @@ pub fn infer_state_type(init: &Expr) -> StateType {
         Expr::Lit(Prim::Int(_) | Prim::Float(_)) => StateType::Number,
         Expr::Lit(Prim::Bool(_)) => StateType::Boolean,
         Expr::Lit(Prim::String(_)) => StateType::Str,
-        Expr::ObjectLit(_) | Expr::ArrayLit(_) | Expr::FnLit { .. } => StateType::Reference,
+        Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::FnLit { .. } => StateType::Reference,
         _ => StateType::Unknown, // null, undefined, complex expressions
     }
 }
@@ -288,11 +288,11 @@ mod tests {
     #[test]
     fn infer_object_is_reference() {
         assert_eq!(
-            infer_state_type(&Expr::ObjectLit(vec![])),
+            infer_state_type(&Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }),
             StateType::Reference
         );
         assert_eq!(
-            infer_state_type(&Expr::ArrayLit(vec![])),
+            infer_state_type(&Expr::ArrayLit { id: crate::ir::types::ExprId(0), elems: vec![] }),
             StateType::Reference
         );
     }

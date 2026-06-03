@@ -198,14 +198,18 @@ fn hook_result_expr(name: &str, label: HookLabel) -> Expr {
 
 fn expr_into_cfg(expr: Expr) -> Option<CFG> {
     match expr {
-        Expr::FnLit { body_cfg, .. } => Some(*body_cfg),
+        Expr::FnLit { body_cfg, .. } => {
+            // Arc::try_unwrap succeeds if this is the sole owner (always true here since
+            // the Expr was just produced by lowering). Fall back to clone for safety.
+            Some(std::sync::Arc::try_unwrap(body_cfg).unwrap_or_else(|arc| (*arc).clone()))
+        }
         _ => None,
     }
 }
 
 fn expr_into_deps(expr: Expr) -> Option<Vec<Expr>> {
     match expr {
-        Expr::ArrayLit(elems) => Some(elems),
+        Expr::ArrayLit { elems, .. } => Some(elems),
         _ => None,
     }
 }
@@ -267,18 +271,14 @@ fn rewrite_expr(expr: Expr, state_temps: &HashMap<String, HookLabel>) -> Expr {
                 .map(|a| rewrite_expr(a, state_temps))
                 .collect(),
         },
-        Expr::ArrayLit(elems) => Expr::ArrayLit(
-            elems
-                .into_iter()
-                .map(|e| rewrite_expr(e, state_temps))
-                .collect(),
-        ),
-        Expr::ObjectLit(props) => Expr::ObjectLit(
-            props
-                .into_iter()
-                .map(|(k, v)| (k, rewrite_expr(v, state_temps)))
-                .collect(),
-        ),
+        Expr::ArrayLit { id, elems } => Expr::ArrayLit {
+            id,
+            elems: elems.into_iter().map(|e| rewrite_expr(e, state_temps)).collect(),
+        },
+        Expr::ObjectLit { id, fields } => Expr::ObjectLit {
+            id,
+            fields: fields.into_iter().map(|(k, v)| (k, rewrite_expr(v, state_temps))).collect(),
+        },
         Expr::TSAnnotated(inner, ty) => {
             Expr::TSAnnotated(Box::new(rewrite_expr(*inner, state_temps)), ty)
         }

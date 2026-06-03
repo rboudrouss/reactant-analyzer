@@ -45,6 +45,7 @@ impl Rule for UnnecessaryRerender {
                         &empty_env,
                         &empty_state,
                         &empty_memo,
+                        &mut crate::domains::Heap::new(),
                         &NullCtx,
                     );
                     Some((*label, val))
@@ -126,6 +127,7 @@ impl Rule for UnnecessaryRerender {
                                     &empty_env,
                                     &result.state_store,
                                     &result.memo_store,
+                                    &mut crate::domains::Heap::new(),
                                     &NullCtx,
                                 )
                             })

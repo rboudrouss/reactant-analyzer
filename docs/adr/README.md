@@ -10,4 +10,5 @@
 | [ADR-006](ADR-006-rule-integration.md) | Règles post-pass sur AnalysisResult | Accepté |
 | [ADR-007](ADR-007-cross-domain-queries.md) | Cross-domain queries — AnalysisCtx now, typed Manager later | Accepté |
 | [ADR-008](ADR-008-value-domain.md) | Domaine de valeurs StateValue pour fixpoint SCC (infinite loop) | Accepté |
-| [ADR-009](ADR-009-callback-traversal.md) | Traversée sémantique des callbacks — points d'entrée + classe de déclenchement | Accepté — impl. en attente |
+| [ADR-009](ADR-009-callback-traversal.md) | Traversée sémantique des callbacks — points d'entrée + classe de déclenchement | Accepté |
+| [ADR-010](ADR-010-heap-model.md) | Heap model — ExprId, allocation-site heap, callbacks par variable (B5), inlining local (B6) | Accepté |

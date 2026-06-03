@@ -66,8 +66,14 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
         let init_untyped = StateStore::bottom();
         for hook in &hooks {
             if let HookEntry::State { label, init } = hook {
-                let init_val =
-                    transfer.eval_expr(init, &init_env, &init_untyped, &init_memo, &NullCtx);
+                let init_val = transfer.eval_expr(
+                    init,
+                    &init_env,
+                    &init_untyped,
+                    &init_memo,
+                    &mut crate::domains::Heap::new(),
+                    &NullCtx,
+                );
                 typed_state.update(*label, init_val);
             }
         }
@@ -78,7 +84,7 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
         let state_store = typed_state.to_untyped();
 
         // ── Render pass ───────────────────────────────────────────────────────
-        let (bs, state_from_render) = {
+        let (bs, state_from_render, _) = {
             let ctx = FixpointCtx {
                 state: &state_store,
                 memo: &memo_store,
@@ -113,7 +119,7 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
         let mut state_from_effects = StateStore::bottom();
         for hook in &hooks {
             if let HookEntry::Effect { body_cfg, .. } = hook {
-                let (_, eff_state) = {
+                let (_, eff_state, _) = {
                     let ctx = FixpointCtx {
                         state: &state_store,
                         memo: &memo_store,
@@ -266,10 +272,10 @@ fn collect_hook_labels_expr(expr: &Expr, out: &mut Vec<HookLabel>) {
         Expr::StateVal(l) | Expr::StateSetter(l) | Expr::MemoVal(l) | Expr::CallbackVal(l) => {
             out.push(*l);
         }
-        Expr::ObjectLit(fields) => fields
+        Expr::ObjectLit { fields, .. } => fields
             .iter()
             .for_each(|(_, v)| collect_hook_labels_expr(v, out)),
-        Expr::ArrayLit(elems) => elems.iter().for_each(|e| collect_hook_labels_expr(e, out)),
+        Expr::ArrayLit { elems, .. } => elems.iter().for_each(|e| collect_hook_labels_expr(e, out)),
         Expr::FnLit { .. } => {}
         Expr::FieldAccess { obj, .. } => collect_hook_labels_expr(obj, out),
         Expr::IndexAccess { arr, idx } => {
@@ -358,8 +364,8 @@ fn collect_used_vars(expr: &Expr, out: &mut HashSet<Var>) {
         Expr::Var(v) => {
             out.insert(v.clone());
         }
-        Expr::ObjectLit(fields) => fields.iter().for_each(|(_, v)| collect_used_vars(v, out)),
-        Expr::ArrayLit(elems) => elems.iter().for_each(|e| collect_used_vars(e, out)),
+        Expr::ObjectLit { fields, .. } => fields.iter().for_each(|(_, v)| collect_used_vars(v, out)),
+        Expr::ArrayLit { elems, .. } => elems.iter().for_each(|e| collect_used_vars(e, out)),
         Expr::FnLit { body_cfg, .. } => {
             // Recurse into closures; their free vars are free in the outer CFG too.
             out.extend(compute_free_vars(body_cfg));
@@ -550,7 +556,7 @@ mod tests {
                     },
                     Stmt::ExprStmt(Expr::Call {
                         fn_: Box::new(Expr::Var("setN".to_string())),
-                        args: vec![Expr::ObjectLit(vec![])],
+                        args: vec![Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }],
                     }),
                 ],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
@@ -595,7 +601,7 @@ mod tests {
                     },
                     Stmt::ExprStmt(Expr::Call {
                         fn_: Box::new(Expr::Var("setN".to_string())),
-                        args: vec![Expr::ObjectLit(vec![])],
+                        args: vec![Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }],
                     }),
                 ],
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),

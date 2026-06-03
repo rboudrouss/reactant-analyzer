@@ -32,10 +32,12 @@ pub fn analyze_cfg<T: Transfer>(
 ) -> (
     HashMap<BlockId, AbstractEnv<T::Domain>>,
     StateStore<T::Domain>,
+    crate::domains::Heap,
 ) {
     let mut entry_envs: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
     let mut exit_envs: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
     let mut state_out = state.clone();
+    let mut heap_out = crate::domains::Heap::new();
 
     entry_envs.insert(cfg.entry, entry_env);
 
@@ -56,7 +58,7 @@ pub fn analyze_cfg<T: Transfer>(
 
         if let Some(block) = cfg.blocks.get(&b) {
             for stmt in &block.stmts {
-                transfer.exec_stmt(stmt, &mut env_out, &mut state_out, &mut memo_local, ctx);
+                transfer.exec_stmt(stmt, &mut env_out, &mut state_out, &mut memo_local, &mut heap_out, ctx);
             }
         }
 
@@ -113,7 +115,7 @@ pub fn analyze_cfg<T: Transfer>(
         }
     }
 
-    (exit_envs, state_out)
+    (exit_envs, state_out, heap_out)
 }
 
 // ── Branch narrowing ──────────────────────────────────────────────────────────
@@ -196,7 +198,7 @@ mod tests {
     #[test]
     fn empty_cfg_entry_env_preserved() {
         let cfg = single_block_cfg(vec![]);
-        let (exit_envs, state_out) = analyze_cfg::<StateValueTransfer>(
+        let (exit_envs, state_out, _heap) = analyze_cfg::<StateValueTransfer>(
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
@@ -215,7 +217,7 @@ mod tests {
             var: "x".to_string(),
             rhs: Expr::Lit(Prim::Int(42)),
         }]);
-        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
+        let (exit_envs, _, _) = analyze_cfg::<StateValueTransfer>(
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
@@ -240,11 +242,11 @@ mod tests {
             },
             Stmt::ExprStmt(Expr::Call {
                 fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::ObjectLit(vec![])],
+                args: vec![Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }],
             }),
         ];
         let cfg = single_block_cfg(stmts);
-        let (_, state_out) = analyze_cfg::<StateValueTransfer>(
+        let (_, state_out, _) = analyze_cfg::<StateValueTransfer>(
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
@@ -268,7 +270,7 @@ mod tests {
                 id: 0,
                 stmts: vec![Stmt::Let {
                     var: "x".to_string(),
-                    rhs: Expr::ObjectLit(vec![]),
+                    rhs: Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] },
                 }],
                 term: Terminator::Jump(1),
             },
@@ -291,7 +293,7 @@ mod tests {
             }],
         };
 
-        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
+        let (exit_envs, _, _) = analyze_cfg::<StateValueTransfer>(
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
@@ -342,7 +344,7 @@ mod tests {
                 id: 2,
                 stmts: vec![Stmt::Let {
                     var: "x".to_string(),
-                    rhs: Expr::ObjectLit(vec![]),
+                    rhs: Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] },
                 }],
                 term: Terminator::Jump(3),
             },
@@ -382,7 +384,7 @@ mod tests {
             ],
         };
 
-        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
+        let (exit_envs, _, _) = analyze_cfg::<StateValueTransfer>(
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
@@ -465,7 +467,7 @@ mod tests {
             }),
         );
 
-        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
+        let (exit_envs, _, _) = analyze_cfg::<StateValueTransfer>(
             &cfg,
             entry_env,
             &StateStore::bottom(),

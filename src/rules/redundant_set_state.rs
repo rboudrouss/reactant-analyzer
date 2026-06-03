@@ -161,7 +161,7 @@ fn collect_setter_vals_in_expr(
             {
                 let arg_val = args
                     .first()
-                    .map(|a| transfer.eval_expr(a, env, state, memo, &NullCtx))
+                    .map(|a| transfer.eval_expr(a, env, state, memo, &mut crate::domains::Heap::new(), &NullCtx))
                     .unwrap_or(StateValue::Top);
                 match tracker.entry(label) {
                     std::collections::hash_map::Entry::Vacant(e) => {
@@ -193,12 +193,12 @@ fn collect_setter_vals_in_expr(
         Expr::UnaryOp { arg, .. } => {
             collect_setter_vals_in_expr(arg, env, state, memo, transfer, tracker);
         }
-        Expr::ArrayLit(items) => {
-            for item in items {
+        Expr::ArrayLit { elems, .. } => {
+            for item in elems {
                 collect_setter_vals_in_expr(item, env, state, memo, transfer, tracker);
             }
         }
-        Expr::ObjectLit(fields) => {
+        Expr::ObjectLit { fields, .. } => {
             for (_, val) in fields {
                 collect_setter_vals_in_expr(val, env, state, memo, transfer, tracker);
             }
@@ -228,7 +228,7 @@ fn check_setter_calls(
 
             let arg_val = args
                 .first()
-                .map(|a| transfer.eval_expr(a, env, state, memo, &NullCtx))
+                .map(|a| transfer.eval_expr(a, env, state, memo, &mut crate::domains::Heap::new(), &NullCtx))
                 .unwrap_or(StateValue::Top);
 
             let current_val = state.get(label);
@@ -354,7 +354,7 @@ mod tests {
             },
             Stmt::ExprStmt(Expr::Call {
                 fn_: Box::new(Expr::Var("setN".to_string())),
-                args: vec![Expr::ObjectLit(vec![])],
+                args: vec![Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }],
             }),
         ];
         let result = make_result(
@@ -522,7 +522,7 @@ mod tests {
         }];
         let effect_stmts = vec![Stmt::ExprStmt(Expr::Call {
             fn_: Box::new(Expr::Var("setN".to_string())),
-            args: vec![Expr::ObjectLit(vec![])],
+            args: vec![Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }],
         })];
         let result = make_result_with_effect(
             render_stmts,

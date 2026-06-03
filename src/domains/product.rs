@@ -108,6 +108,7 @@ where
         _env: &AbstractEnv<Self::Domain>,
         _state: &StateStore<Self::Domain>,
         _memo: &MemoStore<Self::Domain>,
+        _heap: &mut crate::domains::Heap,
         _ctx: &dyn QueryContext,
     ) -> Self::Domain {
         // TODO: implement full projection/injection when fused fixpoint is needed.
@@ -121,6 +122,7 @@ where
         _env: &mut AbstractEnv<Self::Domain>,
         _state: &mut StateStore<Self::Domain>,
         _memo: &mut MemoStore<Self::Domain>,
+        _heap: &mut crate::domains::Heap,
         _ctx: &dyn QueryContext,
     ) {
         // TODO: implement full projection/injection when fused fixpoint is needed.

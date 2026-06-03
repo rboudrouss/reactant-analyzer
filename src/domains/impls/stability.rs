@@ -95,8 +95,8 @@ impl Stability {
     pub fn from_expr_static(expr: &Expr) -> Stability {
         match expr {
             Expr::Lit(_) => Stability::Stable,
-            Expr::ObjectLit(_) => Stability::Unstable,
-            Expr::ArrayLit(_) => Stability::Unstable,
+            Expr::ObjectLit { .. } => Stability::Unstable,
+            Expr::ArrayLit { .. } => Stability::Unstable,
             Expr::FnLit { .. } => Stability::Unstable,
             Expr::StateSetter(_) => Stability::Stable,
             _ => Stability::Unknown,
@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn object_lit_is_unstable() {
         assert_eq!(
-            Stability::from_expr_static(&Expr::ObjectLit(vec![])),
+            Stability::from_expr_static(&Expr::ObjectLit { id: crate::ir::types::ExprId(0), fields: vec![] }),
             Stability::Unstable
         );
     }
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn array_lit_is_unstable() {
         assert_eq!(
-            Stability::from_expr_static(&Expr::ArrayLit(vec![])),
+            Stability::from_expr_static(&Expr::ArrayLit { id: crate::ir::types::ExprId(0), elems: vec![] }),
             Stability::Unstable
         );
     }
@@ -282,8 +282,9 @@ mod tests {
         };
         assert_eq!(
             Stability::from_expr_static(&Expr::FnLit {
+                id: crate::ir::types::ExprId(0),
                 params: vec![],
-                body_cfg: Box::new(cfg)
+                body_cfg: std::sync::Arc::new(cfg)
             }),
             Stability::Unstable
         );

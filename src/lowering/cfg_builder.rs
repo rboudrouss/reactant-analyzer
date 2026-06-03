@@ -7,7 +7,7 @@ use crate::{
         cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator},
         expr::{Expr, Prim},
         stmt::Stmt,
-        types::BlockId,
+        types::{BlockId, ExprId},
     },
     lowering::expr_lower::{empty_cfg, lower_expr},
 };
@@ -22,6 +22,7 @@ pub(super) struct BlockBuilder {
     current_stmts: Vec<Stmt>,
     terminated: bool,
     temp_counter: usize,
+    expr_counter: usize,
 }
 
 impl BlockBuilder {
@@ -34,6 +35,7 @@ impl BlockBuilder {
             current_stmts: Vec::new(),
             terminated: false,
             temp_counter: 0,
+            expr_counter: 0,
         }
     }
 
@@ -41,6 +43,12 @@ impl BlockBuilder {
         let id = self.counter;
         self.counter += 1;
         id
+    }
+
+    pub(super) fn next_expr_id(&mut self) -> ExprId {
+        let id = self.expr_counter;
+        self.expr_counter += 1;
+        ExprId(id)
     }
 
     pub(super) fn push_stmt(&mut self, stmt: Stmt) {
@@ -232,11 +240,13 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
                     .as_ref()
                     .map(|b| build_cfg(b))
                     .unwrap_or_else(empty_cfg);
+                let expr_id = builder.next_expr_id();
                 builder.push_stmt(Stmt::Let {
                     var: id.name.to_string(),
                     rhs: Expr::FnLit {
+                        id: expr_id,
                         params,
-                        body_cfg: Box::new(body_cfg),
+                        body_cfg: std::sync::Arc::new(body_cfg),
                     },
                 });
             }

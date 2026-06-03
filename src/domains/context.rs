@@ -54,6 +54,7 @@ impl QueryContext for FixpointCtx<'_> {
             &AbstractEnv::bottom(),
             self.state,
             self.memo,
+            &mut crate::domains::Heap::new(),
             &NullCtx,
         )
     }
@@ -73,6 +74,7 @@ impl QueryContext for AnalysisQueryCtx<'_> {
             &self.result.exit_env(),
             &self.result.state_store,
             &self.result.memo_store,
+            &mut crate::domains::Heap::new(),
             &NullCtx,
         )
     }

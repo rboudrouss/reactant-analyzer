@@ -8,7 +8,7 @@ pub use context::{AnalysisQueryCtx, FixpointCtx, NullCtx, QueryContext};
 pub use impls::{BoolVal, Interval, Stability, StateValue, StateValueTransfer};
 pub use product::{ProductDomain, ProductTransfer};
 pub use query::{DomainQuery, Queryable};
-pub use stores::{AbstractEnv, MemoStore, StateStore};
+pub use stores::{AbstractEnv, EnvVal, Heap, HeapValue, MemoStore, StateStore};
 
 use crate::ir::{Expr, Stmt};
 
@@ -72,16 +72,18 @@ pub trait Transfer {
         env: &AbstractEnv<Self::Domain>,
         state: &StateStore<Self::Domain>,
         memo: &MemoStore<Self::Domain>,
+        heap: &mut Heap,
         ctx: &dyn QueryContext,
     ) -> Self::Domain;
 
-    /// Execute a statement, updating `env`, `state`, and `memo` in place.
+    /// Execute a statement, updating `env`, `state`, `memo`, and `heap` in place.
     fn exec_stmt(
         &self,
         stmt: &Stmt,
         env: &mut AbstractEnv<Self::Domain>,
         state: &mut StateStore<Self::Domain>,
         memo: &mut MemoStore<Self::Domain>,
+        heap: &mut Heap,
         ctx: &dyn QueryContext,
     );
 

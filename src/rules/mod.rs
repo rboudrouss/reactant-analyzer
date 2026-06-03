@@ -12,7 +12,8 @@ pub use redundant_set_state::RedundantSetState;
 pub use setter_in_render::SetterInRender;
 pub use unnecessary_rerender::UnnecessaryRerender;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use crate::{
     domains::StateValue,
@@ -66,17 +67,33 @@ pub trait Rule {
 }
 
 /// Collect all setter variable names called in `cfg`, descending into FnLit
-/// argument bodies up to `max_depth` levels. Returns deduplicated names.
+/// argument bodies and variable-bound FnLits up to `max_depth` levels.
 pub fn collect_setter_calls(cfg: &CFG, setter_vars: &HashSet<Var>, max_depth: usize) -> Vec<Var> {
+    // Pre-scan: build var → FnLit body map for `let cb = () => ...` patterns (B5/B6).
+    let fn_bindings = collect_fn_bindings(cfg);
     let mut found: HashSet<Var> = HashSet::new();
-    collect_setter_calls_inner(cfg, setter_vars, max_depth, &mut found);
+    collect_setter_calls_inner(cfg, setter_vars, max_depth, &fn_bindings, &mut found);
     found.into_iter().collect()
+}
+
+/// Scan all Let stmts in `cfg` for `let X = FnLit{...}` and return X → body_cfg.
+fn collect_fn_bindings(cfg: &CFG) -> HashMap<Var, Arc<CFG>> {
+    let mut map: HashMap<Var, Arc<CFG>> = HashMap::new();
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            if let Stmt::Let { var, rhs: Expr::FnLit { body_cfg, .. } } = stmt {
+                map.insert(var.clone(), Arc::clone(body_cfg));
+            }
+        }
+    }
+    map
 }
 
 fn collect_setter_calls_inner(
     cfg: &CFG,
     setter_vars: &HashSet<Var>,
     depth: usize,
+    fn_bindings: &HashMap<Var, Arc<CFG>>,
     found: &mut HashSet<Var>,
 ) {
     let mut visited = HashSet::new();
@@ -87,7 +104,7 @@ fn collect_setter_calls_inner(
     while let Some(bid) = queue.pop_front() {
         if let Some(block) = cfg.blocks.get(&bid) {
             for stmt in &block.stmts {
-                check_stmt_for_setters(stmt, setter_vars, depth, found);
+                check_stmt_for_setters(stmt, setter_vars, depth, fn_bindings, found);
             }
             for succ in cfg.successors(bid) {
                 if visited.insert(succ) {
@@ -102,30 +119,52 @@ fn check_stmt_for_setters(
     stmt: &Stmt,
     setter_vars: &HashSet<Var>,
     depth: usize,
+    fn_bindings: &HashMap<Var, Arc<CFG>>,
     found: &mut HashSet<Var>,
 ) {
-    if let Stmt::ExprStmt(expr) = stmt {
-        check_expr_for_setters(expr, setter_vars, depth, found);
-    }
+    let expr = match stmt {
+        Stmt::ExprStmt(e) => e,
+        // Also descend into Let rhs that are FnLit — direct setter call at top level of a closure.
+        Stmt::Let { rhs, .. } => rhs,
+        Stmt::Assign { rhs, .. } => rhs,
+    };
+    check_expr_for_setters(expr, setter_vars, depth, fn_bindings, found);
 }
 
 fn check_expr_for_setters(
     expr: &Expr,
     setter_vars: &HashSet<Var>,
     depth: usize,
+    fn_bindings: &HashMap<Var, Arc<CFG>>,
     found: &mut HashSet<Var>,
 ) {
     match expr {
         Expr::Call { fn_, args } => {
-            if let Expr::Var(name) = fn_.as_ref()
-                && setter_vars.contains(name)
-            {
-                found.insert(name.clone());
+            if let Expr::Var(name) = fn_.as_ref() {
+                if setter_vars.contains(name) {
+                    found.insert(name.clone());
+                }
+                // B6: direct call to a locally-bound function — descend its body.
+                if depth > 0 {
+                    if let Some(body) = fn_bindings.get(name) {
+                        collect_setter_calls_inner(body, setter_vars, depth - 1, fn_bindings, found);
+                    }
+                }
             }
             if depth > 0 {
                 for arg in args {
-                    if let Expr::FnLit { body_cfg, .. } = arg {
-                        collect_setter_calls_inner(body_cfg, setter_vars, depth - 1, found);
+                    match arg {
+                        // Inline FnLit arg — existing behaviour.
+                        Expr::FnLit { body_cfg, .. } => {
+                            collect_setter_calls_inner(body_cfg, setter_vars, depth - 1, fn_bindings, found);
+                        }
+                        // B5: variable arg — resolve to a locally-bound FnLit.
+                        Expr::Var(name) => {
+                            if let Some(body) = fn_bindings.get(name) {
+                                collect_setter_calls_inner(body, setter_vars, depth - 1, fn_bindings, found);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
