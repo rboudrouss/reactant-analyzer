@@ -1,8 +1,5 @@
-pub mod core;
-pub mod diagnostics;
 pub mod domains;
 pub mod engine;
-pub mod events;
 pub mod ir;
 pub mod lowering;
 pub mod registry;
