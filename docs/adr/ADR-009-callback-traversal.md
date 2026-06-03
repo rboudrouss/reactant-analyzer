@@ -4,6 +4,7 @@
 - **Date** : 2026-06-02
 - **Mis à jour** : 2026-06-03 — étendu par [ADR-010](ADR-010-heap-model.md) (B5 callbacks par variable, B6 inlining appels locaux)
 - **Mis à jour** : 2026-06-03 — migration §1-3 implémentée : `HookEntry::Handler`, `extract_handlers` (lowering JSX `onX`), passes post-convergence dans `analyze_component`, `handler_block_states` + `handler_info` dans `AnalysisResult`. Étapes restantes : §4 `addEventListener` depuis effects, §5 multiplicité fixpoint.
+- **Mis à jour** : 2026-06-03 — §5 (multiplicité) implémenté : handlers dans le fixpoint loop, `state_from_handlers` joint dans `new_untyped_full` pour la convergence, `widened_labels` calculé depuis `state_from_render ⊔ state_from_effects` uniquement (pas les handlers). Reste : §4 `addEventListener`.
 - **Contexte** : [ADR-008](ADR-008-value-domain.md) (domaine de valeurs / fixpoint), [ADR-004](ADR-004-component-structure.md) (render_cfg + effect_cfg), [ADR-005](ADR-005-analysis-scope.md) (scope intra-procédural)
 
 ## Contexte

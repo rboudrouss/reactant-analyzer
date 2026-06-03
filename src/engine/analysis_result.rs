@@ -71,7 +71,7 @@ pub struct AnalysisResult<D: AbstractDomain> {
     pub hook_calls: Vec<HookCallInfo>,
     pub effect_info: HashMap<HookLabel, EffectInfo>,
     /// Abstract environment at the *exit* of each block, per JSX handler body CFG.
-    /// Populated post-convergence (single pass, not part of the fixpoint loop).
+    /// Populated at each fixpoint iteration; last iteration's values survive (ADR-009 §5).
     pub handler_block_states: HashMap<HookLabel, HashMap<BlockId, AbstractEnv<D>>>,
     pub handler_info: HashMap<HookLabel, HandlerInfo>,
     /// Labels whose state was widened to force convergence.

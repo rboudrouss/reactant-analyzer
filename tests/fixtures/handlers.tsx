@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 
 // ✅ onClick handler normal — pas d'InfiniteLoop (le handler ne tourne que sur
 // input externe, il n'est pas dans le cycle render→effect→setState→render).

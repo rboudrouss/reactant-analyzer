@@ -150,41 +150,43 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
             }
         }
 
+        // ── Handler passes (in-cycle — ADR-009 §5) ───────────────────────────
+        // Handlers run 0..N times → include in fixpoint for sound range approx.
+        // State joined into new_untyped_full for convergence, but NOT tracked in
+        // widened_labels (handler-caused widening is not an InfiniteLoop bug).
+        let mut state_from_handlers = StateStore::bottom();
+        for hook in &hooks {
+            if let HookEntry::Handler {
+                label, body_cfg, ..
+            } = hook
+            {
+                let (h_bs, h_state) = {
+                    let ctx = FixpointCtx {
+                        state: &state_store,
+                        memo: &memo_store,
+                    };
+                    analyze_cfg::<T>(
+                        body_cfg,
+                        env_exit.clone(),
+                        &state_store,
+                        &memo_store,
+                        transfer,
+                        config.widen_threshold,
+                        &mut heap,
+                        &ctx,
+                    )
+                };
+                handler_block_states.insert(*label, h_bs);
+                state_from_handlers = state_from_handlers.join(&h_state);
+            }
+        }
+
         // ── Convergence check (per-sub-store precision) ───────────────────────
-        let new_untyped = state_from_render.join(&state_from_effects);
-        let new_typed = typed_state.from_untyped(&new_untyped);
+        let new_untyped_incycle = state_from_render.join(&state_from_effects);
+        let new_untyped_full = new_untyped_incycle.join(&state_from_handlers);
+        let new_typed = typed_state.from_untyped(&new_untyped_full);
 
         if new_typed.leq(&typed_state) {
-            // ── Handler passes (post-convergence, excluded from fixpoint) ─────
-            // Handlers are analyzed once with the converged render exit env and
-            // final state.  Their state deltas are intentionally NOT joined into
-            // typed_state — event handlers are not part of the render→effect cycle
-            // and must not contribute to widened_labels (ADR-009 §3).
-            let final_state = typed_state.to_untyped();
-            for hook in &hooks {
-                if let HookEntry::Handler {
-                    label, body_cfg, ..
-                } = hook
-                {
-                    let (h_bs, _) = {
-                        let ctx = FixpointCtx {
-                            state: &final_state,
-                            memo: &memo_store,
-                        };
-                        analyze_cfg::<T>(
-                            body_cfg,
-                            env_exit.clone(),
-                            &final_state,
-                            &memo_store,
-                            transfer,
-                            config.widen_threshold,
-                            &mut heap,
-                            &ctx,
-                        )
-                    };
-                    handler_block_states.insert(*label, h_bs);
-                }
-            }
             break;
         }
 
@@ -195,7 +197,9 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
         );
 
         if iteration >= config.widen_threshold {
-            for label in new_typed.changed_labels(&typed_state) {
+            // widened_labels: render+effects only — handler widening is not a bug.
+            let incycle_typed = typed_state.from_untyped(&new_untyped_incycle);
+            for label in incycle_typed.changed_labels(&typed_state) {
                 widened_labels.insert(label);
             }
             typed_state = typed_state.widen(&new_typed);
@@ -983,8 +987,8 @@ mod tests {
 
     #[test]
     fn handler_does_not_drive_widening() {
-        // Handler with setN(n+1) — if it were in the fixpoint loop it would cause widening.
-        // Being post-convergence, it must NOT contribute to widened_labels.
+        // Handler with setN(n+1) is now in the fixpoint loop (ADR-009 §5).
+        // incycle_typed (render+effects only) never grows → widened_labels stays empty.
         let body = handler_cfg(vec![
             Stmt::Let {
                 var: "setN".to_string(),
@@ -1037,10 +1041,11 @@ mod tests {
     }
 
     #[test]
-    fn handler_state_not_joined_into_typed_state() {
+    fn handler_state_joins_fixpoint() {
         // Handler does setN(99); init = 0.
-        // State converges at Number([0,0]) (no effect in the render-effect cycle).
-        // Handler pass is post-convergence — its state delta is discarded.
+        // §5: handler is IN the fixpoint loop → setN(99) joins into typed_state.
+        // State converges at Number([0,99]): init=0 seeds the store, handler
+        // contributes 99 via join (state_out starts as the current state, not bottom).
         let body = handler_cfg(vec![
             Stmt::Let {
                 var: "setN".to_string(),
@@ -1079,8 +1084,128 @@ mod tests {
 
         assert_eq!(
             result.state_store.get(0),
-            StateValue::Number(Interval::point(0.0)),
-            "handler's setN(99) must not be joined into state_store (handler is not part of the fixpoint)"
+            StateValue::Number(Interval { lo: 0.0, hi: 99.0 }),
+            "handler's setN(99) must be joined into state_store (ADR-009 §5: handler in fixpoint)"
+        );
+    }
+
+    #[test]
+    fn handler_enables_infinite_loop_detection() {
+        // InfiniteLoop pattern: `if count > 1 { setCount(count+1) }` in an effect
+        // with deps [count], plus `onClick: setCount(count+1)`.
+        //
+        // Without §5: fixpoint seeds count=[0,0], the branch is abstractly dead
+        // (narrow_gt(1) on [0,0] = bottom), engine converges without widening → FN.
+        // With §5 (handlers in loop): the handler gradually grows count across
+        // iterations until the branch becomes reachable, the effect fires, and
+        // widened_labels gets label 0 → InfiniteLoop detected.
+        //
+        // CFG: effect block 0 → Branch(count>1, then=1, else=2)
+        //       block 1 → setCount(count+1); Jump(2)
+        //       block 2 → Return
+        let mut eff_blocks = HashMap::new();
+        eff_blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![],
+                term: Terminator::Branch {
+                    cond: Expr::BinOp {
+                        op: crate::ir::expr::BinOp::Gt,
+                        lhs: Box::new(Expr::Var("count".to_string())),
+                        rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                    },
+                    then_: 1,
+                    else_: 2,
+                },
+            },
+        );
+        eff_blocks.insert(
+            1,
+            BasicBlock {
+                id: 1,
+                stmts: vec![Stmt::ExprStmt(Expr::Call {
+                    fn_: Box::new(Expr::Var("setCount".to_string())),
+                    args: vec![Expr::BinOp {
+                        op: crate::ir::expr::BinOp::Add,
+                        lhs: Box::new(Expr::Var("count".to_string())),
+                        rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                    }],
+                })],
+                term: Terminator::Jump(2),
+            },
+        );
+        eff_blocks.insert(
+            2,
+            BasicBlock {
+                id: 2,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let eff_cfg = CFG {
+            entry: 0,
+            blocks: eff_blocks,
+            edges: vec![
+                Edge {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::IfTrue,
+                },
+                Edge {
+                    from: 0,
+                    to: 2,
+                    kind: EdgeKind::IfFalse,
+                },
+                Edge {
+                    from: 1,
+                    to: 2,
+                    kind: EdgeKind::Unconditional,
+                },
+            ],
+        };
+
+        let h_cfg = handler_cfg(vec![Stmt::ExprStmt(Expr::Call {
+            fn_: Box::new(Expr::Var("setCount".to_string())),
+            args: vec![Expr::BinOp {
+                op: crate::ir::expr::BinOp::Add,
+                lhs: Box::new(Expr::Var("count".to_string())),
+                rhs: Box::new(Expr::Lit(Prim::Int(1))),
+            }],
+        })]);
+
+        let hooks = vec![
+            HookEntry::State {
+                label: 0,
+                init: Expr::Lit(Prim::Int(0)),
+            },
+            HookEntry::Effect {
+                label: 1,
+                body_cfg: eff_cfg,
+                deps: Some(vec![Expr::StateVal(0)]),
+            },
+            HookEntry::Handler {
+                label: 2,
+                event: "click".to_string(),
+                body_cfg: h_cfg,
+            },
+        ];
+        let render_stmts = vec![
+            Stmt::Let {
+                var: "count".to_string(),
+                rhs: Expr::StateVal(0),
+            },
+            Stmt::Let {
+                var: "setCount".to_string(),
+                rhs: Expr::StateSetter(0),
+            },
+        ];
+        let comp = component(hooks, render_stmts);
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+
+        assert!(
+            result.widened_labels.contains(&0),
+            "state label 0 must widen: conditional effect + handler causes InfiniteLoop"
         );
     }
 

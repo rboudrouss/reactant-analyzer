@@ -30,8 +30,7 @@ useEffect(() => {
 JSX `onX={fn}` handlers sont maintenant des points d'entrée de première classe (`HookEntry::Handler`, analysés post-convergence). Reste :
 
 1. **`addEventListener` dans les effects** — lowering depuis `body_cfg` d'un effect vers `HookEntry::Handler` avec env au site d'appel (stale-closure-in-handler débloqué).
-2. **Multiplicité** — handler tourne 0..N fois → fixpoint sur ces racines aussi (actuellement : passe unique post-convergence, imprécis mais sans FP).
-3. **Politique `Subscription`** — flip `classify_callee::Subscription` → `analyze-as-entry-point` pour les callbacks passés à `addEventListener` inline dans un effect.
+2. **Politique `Subscription`** — flip `classify_callee::Subscription` → `analyze-as-entry-point` pour les callbacks passés à `addEventListener` inline dans un effect.
 
 ### Analyse inter-composants
 
