@@ -5,6 +5,7 @@
 - **Mis à jour** : 2026-06-03 — étendu par [ADR-010](ADR-010-heap-model.md) (B5 callbacks par variable, B6 inlining appels locaux)
 - **Mis à jour** : 2026-06-03 — migration §1-3 implémentée : `HookEntry::Handler`, `extract_handlers` (lowering JSX `onX`), passes post-convergence dans `analyze_component`, `handler_block_states` + `handler_info` dans `AnalysisResult`. Étapes restantes : §4 `addEventListener` depuis effects, §5 multiplicité fixpoint.
 - **Mis à jour** : 2026-06-03 — §5 (multiplicité) implémenté : handlers dans le fixpoint loop, `state_from_handlers` joint dans `new_untyped_full` pour la convergence, `widened_labels` calculé depuis `state_from_render ⊔ state_from_effects` uniquement (pas les handlers). Reste : §4 `addEventListener`.
+- **Mis à jour** : 2026-06-03 — back-edge bail levé : `exec_body` traverse le corps pour ses effets de bord même avec une boucle (les setters dans une boucle fire désormais) ; seule la valeur de retour est jointe à `Top`. FN « setter dans une boucle » résolu (cf. « Limites »).
 - **Contexte** : [ADR-008](ADR-008-value-domain.md) (domaine de valeurs / fixpoint), [ADR-004](ADR-004-component-structure.md) (render_cfg + effect_cfg), [ADR-005](ADR-005-analysis-scope.md) (scope intra-procédural)
 
 ## Contexte
@@ -125,10 +126,13 @@ exécute, **avant** l'éval de valeur normale, une *pré-passe* qui :
 - **Valeur de retour** ignorée pour la descente d'effet de bord.
 - **Weak-update** : les setters internes appellent `state.update`, déjà un join
   monotone → sémantique « may run » correcte (le callback *peut* tourner).
-- **Back-edge dans le corps du callback** : on réutilise le comportement
-  conservateur actuel d'`exec_body` (bail → `Reference(Unstable)`). **FN connu** :
-  un setter à l'intérieur d'une boucle dans le callback n'est pas propagé. À
-  raffiner plus tard (traversée pour effets de bord même en présence de back-edge).
+- **Back-edge dans le corps du callback** *(résolu)* : `exec_body` ne bail plus.
+  La passe forward ignore les back-edges pour la propagation d'env (jointure des
+  prédécesseurs *forward* seulement, `topo_sort` émettant le header avant sa source
+  de back-edge) mais exécute chaque statement une fois → les setters dans une boucle
+  fire (`state.update` capturé). La valeur de retour est jointe à `Top` si une
+  back-edge est présente. **FN résiduel** (sur la *valeur*) : les valeurs
+  loop-carried sont vues à leur 1ʳᵉ itération, jamais de FP.
 - **`.then(onF, onR)`** (deux callbacks) : les deux args `FnLit` sont descendus.
 
 ### Pourquoi pas de provenance / 2e store maintenant
@@ -174,14 +178,15 @@ cœur du moteur :
 
 ## Conséquences
 
-- `src/domains/impls/state_value.rs` — nouveau `classify_callee` + pré-passe
-  d'effets de bord dans `exec_state_value` ; `exec_body` réutilisé/généralisé pour
-  la descente « effets de bord, retour ignoré ».
+- `src/domains/interp/callbacks.rs` — `classify_callee` + `TriggerClass`.
+- `src/domains/interp/interpreter.rs` — pré-passe d'effets de bord
+  (`exec_callbacks_depth`) dans `exec_full_stmt` ; `exec_body`/`exec_body_impl`
+  pour la descente « effets de bord, retour ignoré ».
 - `TriggerClass` (enum) + table de politique `classe → action`.
 - API publique (`Transfer`, règles, `AnalysisResult`) **inchangée** pour ce
   premier incrément.
 - Limites connues acceptées :
-  - **FN** : setter dans une boucle à l'intérieur d'un callback (back-edge → bail).
+  - ~~**FN** : setter dans une boucle à l'intérieur d'un callback (back-edge → bail).~~ **Résolu** (traversée side-effect-only) ; FN résiduel sur la *valeur* loop-carried uniquement.
   - **FN** : callee `Unknown` non descendu (wrappers custom).
   - Multiplicité (`setInterval` ∞, handlers N×) non modélisée tant que les
     handlers ne sont pas des racines.

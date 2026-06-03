@@ -472,6 +472,9 @@ mod tests {
 
     #[test]
     fn back_edge_in_fnlit_body_returns_top() {
+        // A back edge no longer bails the whole body; instead the return value is
+        // conservatively joined to Top. This empty self-loop has no statements, so
+        // it exercises the forced-Top-on-back-edge path with no side effects.
         let mut blocks = std::collections::HashMap::new();
         blocks.insert(
             0,
@@ -504,6 +507,273 @@ mod tests {
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
         assert_eq!(result, StateValue::Top);
+    }
+
+    /// Build a `while`-shaped body CFG (`pre → header ⇄ body`; `header → exit`)
+    /// whose loop body runs `body_stmts`.
+    fn while_loop_body(body_stmts: Vec<Stmt>) -> CFG {
+        let mut blocks = std::collections::HashMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![],
+                term: Terminator::Jump(1),
+            },
+        );
+        blocks.insert(
+            1,
+            BasicBlock {
+                id: 1,
+                stmts: vec![],
+                term: Terminator::Branch {
+                    cond: Expr::Lit(Prim::Bool(true)),
+                    then_: 2,
+                    else_: 3,
+                },
+            },
+        );
+        blocks.insert(
+            2,
+            BasicBlock {
+                id: 2,
+                stmts: body_stmts,
+                term: Terminator::Jump(1), // back to header
+            },
+        );
+        blocks.insert(
+            3,
+            BasicBlock {
+                id: 3,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        CFG {
+            entry: 0,
+            blocks,
+            edges: vec![
+                Edge {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::Unconditional,
+                },
+                Edge {
+                    from: 1,
+                    to: 2,
+                    kind: EdgeKind::IfTrue,
+                },
+                Edge {
+                    from: 1,
+                    to: 3,
+                    kind: EdgeKind::IfFalse,
+                },
+                Edge {
+                    from: 2,
+                    to: 1,
+                    kind: EdgeKind::Back,
+                },
+            ],
+        }
+    }
+
+    fn setter_call(name: &str, arg: Expr) -> Stmt {
+        Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var(name.to_string())),
+                args: vec![arg],
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn setter_in_while_loop_in_body_fires() {
+        // A setter inside a while-loop body must fire (side-effect traversal) even
+        // though the body has a back edge; the body's return value is Top.
+        let (mut env, mut state, mut memo) = empty();
+        state.update(0, StateValue::Number(Interval::point(0.0)));
+        env.bind_setter("setN".to_string(), 0);
+        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+
+        let body_cfg = while_loop_body(vec![setter_call(
+            "setN",
+            Expr::BinOp {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::StateVal(0)),
+                rhs: Box::new(Expr::Lit(Prim::Int(1))),
+            },
+        )]);
+
+        let mut heap = Heap::new();
+        let ret = exec_body(
+            &StateValueTransfer,
+            &body_cfg,
+            &env,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+        );
+
+        // setN(state[0] + 1) fired once → state[0] grew off the initial point.
+        assert_eq!(
+            state.get(0),
+            StateValue::Number(Interval { lo: 0.0, hi: 1.0 })
+        );
+        // Back edge present → return value conservatively Top.
+        assert_eq!(ret, StateValue::Top);
+    }
+
+    #[test]
+    fn setter_in_for_loop_in_body_fires() {
+        // `for`-shaped body (pre → header ⇄ body → update → header; header → exit).
+        // The setter in the body block must fire despite the back edge.
+        let (mut env, mut state, mut memo) = empty();
+        state.update(0, StateValue::Number(Interval::point(0.0)));
+        env.bind_setter("setN".to_string(), 0);
+        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+
+        let mut blocks = std::collections::HashMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![],
+                term: Terminator::Jump(1),
+            },
+        );
+        blocks.insert(
+            1,
+            BasicBlock {
+                id: 1,
+                stmts: vec![],
+                term: Terminator::Branch {
+                    cond: Expr::Lit(Prim::Bool(true)),
+                    then_: 2,
+                    else_: 4,
+                },
+            },
+        );
+        blocks.insert(
+            2,
+            BasicBlock {
+                id: 2,
+                stmts: vec![setter_call(
+                    "setN",
+                    Expr::BinOp {
+                        op: BinOp::Add,
+                        lhs: Box::new(Expr::StateVal(0)),
+                        rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                    },
+                )],
+                term: Terminator::Jump(3),
+            },
+        );
+        blocks.insert(
+            3,
+            BasicBlock {
+                id: 3,
+                stmts: vec![],
+                term: Terminator::Jump(1), // update → header
+            },
+        );
+        blocks.insert(
+            4,
+            BasicBlock {
+                id: 4,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let body_cfg = CFG {
+            entry: 0,
+            blocks,
+            edges: vec![
+                Edge {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::Unconditional,
+                },
+                Edge {
+                    from: 1,
+                    to: 2,
+                    kind: EdgeKind::IfTrue,
+                },
+                Edge {
+                    from: 1,
+                    to: 4,
+                    kind: EdgeKind::IfFalse,
+                },
+                Edge {
+                    from: 2,
+                    to: 3,
+                    kind: EdgeKind::Unconditional,
+                },
+                Edge {
+                    from: 3,
+                    to: 1,
+                    kind: EdgeKind::Back,
+                },
+            ],
+        };
+
+        let mut heap = Heap::new();
+        let ret = exec_body(
+            &StateValueTransfer,
+            &body_cfg,
+            &env,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+        );
+
+        assert_eq!(
+            state.get(0),
+            StateValue::Number(Interval { lo: 0.0, hi: 1.0 })
+        );
+        assert_eq!(ret, StateValue::Top);
+    }
+
+    #[test]
+    fn functional_updater_with_loop_returns_top_and_inner_setter_fires() {
+        // setN(c => { while (..) { setOther(1) }; return c + 1 })
+        // The body has a back edge → the functional-updater result is Top (state 0
+        // → Top), but the inner setOther for state 1 still fires.
+        let (mut env, mut state, mut memo) = empty();
+        state.update(0, StateValue::Number(Interval::point(5.0)));
+        env.bind_setter("setN".to_string(), 0);
+        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+        env.bind_setter("setOther".to_string(), 1);
+        env.extend(
+            "setOther".to_string(),
+            StateValue::Reference(Stability::Stable),
+        );
+
+        // Reuse the while shape but give block 3 (exit) a real `c + 1` return.
+        let mut body_cfg = while_loop_body(vec![setter_call("setOther", Expr::Lit(Prim::Int(1)))]);
+        body_cfg.blocks.get_mut(&3).unwrap().term = Terminator::Return(Expr::BinOp {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::Var("c".to_string())),
+            rhs: Box::new(Expr::Lit(Prim::Int(1))),
+        });
+
+        let mut heap = Heap::new();
+        StateValueTransfer.exec_stmt(
+            &Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::FnLit {
+                        id: crate::ir::types::ExprId(0),
+                        params: vec!["c".to_string()],
+                        body_cfg: Arc::new(body_cfg),
+                    }],
+                },
+                None,
+            ),
+            &mut env,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+        );
+
+        // Functional updater body has a back edge → its return value is Top.
+        assert_eq!(state.get(0), StateValue::Top);
+        // The inner setOther(1) fired during the side-effect traversal.
+        assert_eq!(state.get(1), StateValue::Number(Interval::point(1.0)));
     }
 
     // ── callback traversal (ADR-009) ─────────────────────────────────────────
@@ -1229,6 +1499,87 @@ mod tests {
                     id: crate::ir::types::ExprId(43),
                     params: vec![],
                     body_cfg: make_body("f3"),
+                },
+                span: None,
+            },
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("f4".to_string())),
+                    args: vec![],
+                },
+                None,
+            ),
+        ];
+
+        let mut heap = Heap::new();
+        for stmt in &stmts {
+            StateValueTransfer.exec_stmt(
+                stmt,
+                &mut env,
+                &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            );
+        }
+        assert_eq!(state.get(0), StateValue::Bottom);
+    }
+
+    #[test]
+    fn depth_guard_still_holds_with_back_edge() {
+        // Same f4 → f3 → f2 → f1 → setN chain as above, but every wrapper body is
+        // a loop (back edge). Removing the bail means loop bodies are now traversed,
+        // so the test confirms (a) it terminates and (b) MAX_INLINE_DEPTH still caps
+        // the chain: setN at depth 4 is never reached → state stays Bottom.
+        let (mut env, mut state, mut memo) = empty();
+        env.bind_setter("setN".to_string(), 0);
+        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+
+        // A loop body whose single body-block statement calls `callee()`.
+        let make_loop_wrapper = |callee: &str| -> Arc<CFG> {
+            Arc::new(while_loop_body(vec![Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var(callee.to_string())),
+                    args: vec![],
+                },
+                None,
+            )]))
+        };
+
+        let stmts = vec![
+            Stmt::Let {
+                var: "f1".to_string(),
+                rhs: Expr::FnLit {
+                    id: crate::ir::types::ExprId(40),
+                    params: vec![],
+                    body_cfg: Arc::new(single_block_cfg(
+                        vec![setter_call("setN", Expr::Lit(Prim::Int(1)))],
+                        Expr::Lit(Prim::Unit),
+                    )),
+                },
+                span: None,
+            },
+            Stmt::Let {
+                var: "f2".to_string(),
+                rhs: Expr::FnLit {
+                    id: crate::ir::types::ExprId(41),
+                    params: vec![],
+                    body_cfg: make_loop_wrapper("f1"),
+                },
+                span: None,
+            },
+            Stmt::Let {
+                var: "f3".to_string(),
+                rhs: Expr::FnLit {
+                    id: crate::ir::types::ExprId(42),
+                    params: vec![],
+                    body_cfg: make_loop_wrapper("f2"),
+                },
+                span: None,
+            },
+            Stmt::Let {
+                var: "f4".to_string(),
+                rhs: Expr::FnLit {
+                    id: crate::ir::types::ExprId(43),
+                    params: vec![],
+                    body_cfg: make_loop_wrapper("f3"),
                 },
                 span: None,
             },

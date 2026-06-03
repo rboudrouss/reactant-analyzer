@@ -1099,6 +1099,138 @@ mod tests {
         );
     }
 
+    /// A `while`-shaped handler body (`pre → header ⇄ body`; `header → exit`)
+    /// running `body_stmts` in the loop body.
+    fn handler_loop_cfg(body_stmts: Vec<Stmt>) -> CFG {
+        let mut blocks = HashMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![],
+                term: Terminator::Jump(1),
+            },
+        );
+        blocks.insert(
+            1,
+            BasicBlock {
+                id: 1,
+                stmts: vec![],
+                term: Terminator::Branch {
+                    cond: Expr::Lit(Prim::Bool(true)),
+                    then_: 2,
+                    else_: 3,
+                },
+            },
+        );
+        blocks.insert(
+            2,
+            BasicBlock {
+                id: 2,
+                stmts: body_stmts,
+                term: Terminator::Jump(1),
+            },
+        );
+        blocks.insert(
+            3,
+            BasicBlock {
+                id: 3,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        CFG {
+            entry: 0,
+            blocks,
+            edges: vec![
+                Edge {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::Unconditional,
+                },
+                Edge {
+                    from: 1,
+                    to: 2,
+                    kind: EdgeKind::IfTrue,
+                },
+                Edge {
+                    from: 1,
+                    to: 3,
+                    kind: EdgeKind::IfFalse,
+                },
+                Edge {
+                    from: 2,
+                    to: 1,
+                    kind: EdgeKind::Back,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn setter_in_loop_in_handler_does_not_drive_widening() {
+        // onClick={() => { while (..) { setN(n + 1) } }}
+        // The handler body's loop is now traversed (bail removed) → setN fires and
+        // grows handler state, but handler state is excluded from incycle_typed →
+        // widened_labels stays empty (anti-FP), even with widen_threshold = 1.
+        let body = handler_loop_cfg(vec![
+            Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+                span: None,
+            },
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::BinOp {
+                        op: crate::ir::expr::BinOp::Add,
+                        lhs: Box::new(Expr::StateVal(0)),
+                        rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                    }],
+                },
+                None,
+            ),
+        ]);
+        let hooks = vec![
+            HookEntry::State {
+                label: 0,
+                init: Expr::Lit(Prim::Int(0)),
+                span: None,
+            },
+            HookEntry::Handler {
+                label: 1,
+                event: "click".to_string(),
+                body_cfg: body,
+                span: None,
+            },
+        ];
+        let comp = component(
+            hooks,
+            vec![
+                Stmt::Let {
+                    var: "n".to_string(),
+                    rhs: Expr::StateVal(0),
+                    span: None,
+                },
+                Stmt::Let {
+                    var: "setN".to_string(),
+                    rhs: Expr::StateSetter(0),
+                    span: None,
+                },
+            ],
+        );
+        let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 1 });
+
+        assert!(
+            !result.widened_labels.contains(&0),
+            "handler loop setter must not widen state 0 (would be false positive)"
+        );
+        assert!(
+            !result.widened_labels.contains(&1),
+            "handler label itself must not appear in widened_labels"
+        );
+    }
+
     #[test]
     fn handler_state_joins_fixpoint() {
         // Handler does setN(99); init = 0.

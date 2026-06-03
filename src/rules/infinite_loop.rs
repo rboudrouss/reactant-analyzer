@@ -778,10 +778,11 @@ mod tests {
     }
 
     #[test]
-    fn back_edge_in_then_callback_is_conservative() {
+    fn back_edge_in_then_callback_now_detected() {
         // useEffect(() => { p.then(() => { loop { setN(n+1) } }) })  (deps: None)
-        // exec_body bails on the callback's back edge → setN not propagated → no widening.
-        // Known FN documented in ADR-009 (conservative, not a bug).
+        // The callback body has a back edge. exec_body no longer bails: it traverses
+        // the body for side effects, so setN(n+1) fires → n grows → widening →
+        // InfiniteLoop. (Previously a known FN — the bail dropped the setter.)
         let mut cb_blocks = HashMap::new();
         cb_blocks.insert(
             0,
@@ -824,8 +825,109 @@ mod tests {
         let comp = component_with_effect_call("setN", call, None);
         let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
         assert!(
+            result.widened_labels.contains(&0),
+            "back-edge in callback body → side-effect traversal → setN fires → widening"
+        );
+        assert!(
+            !InfiniteLoop.check(&result).is_empty(),
+            "the loop setter in the .then callback must now be flagged"
+        );
+    }
+
+    #[test]
+    fn setter_in_loop_in_then_does_not_loop_when_bounded() {
+        // useEffect(() => { p.then(() => { while (..) { setN(0) } }) }, [n])
+        // The loop body is now traversed, but the setter writes a constant → the
+        // value stabilises → no widening → NO false positive.
+        let mut cb_blocks = HashMap::new();
+        cb_blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![],
+                term: Terminator::Jump(1),
+            },
+        );
+        cb_blocks.insert(
+            1,
+            BasicBlock {
+                id: 1,
+                stmts: vec![],
+                term: Terminator::Branch {
+                    cond: Expr::Lit(Prim::Bool(true)),
+                    then_: 2,
+                    else_: 3,
+                },
+            },
+        );
+        cb_blocks.insert(
+            2,
+            BasicBlock {
+                id: 2,
+                stmts: vec![Stmt::ExprStmt(
+                    Expr::Call {
+                        fn_: Box::new(Expr::Var("setN".to_string())),
+                        args: vec![Expr::Lit(Prim::Int(0))],
+                    },
+                    None,
+                )],
+                term: Terminator::Jump(1), // back to header
+            },
+        );
+        cb_blocks.insert(
+            3,
+            BasicBlock {
+                id: 3,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let cb = Expr::FnLit {
+            id: crate::ir::types::ExprId(0),
+            params: vec![],
+            body_cfg: std::sync::Arc::new(CFG {
+                entry: 0,
+                blocks: cb_blocks,
+                edges: vec![
+                    crate::ir::cfg::Edge {
+                        from: 0,
+                        to: 1,
+                        kind: crate::ir::cfg::EdgeKind::Unconditional,
+                    },
+                    crate::ir::cfg::Edge {
+                        from: 1,
+                        to: 2,
+                        kind: crate::ir::cfg::EdgeKind::IfTrue,
+                    },
+                    crate::ir::cfg::Edge {
+                        from: 1,
+                        to: 3,
+                        kind: crate::ir::cfg::EdgeKind::IfFalse,
+                    },
+                    crate::ir::cfg::Edge {
+                        from: 2,
+                        to: 1,
+                        kind: crate::ir::cfg::EdgeKind::Back,
+                    },
+                ],
+            }),
+        };
+        let call = Expr::Call {
+            fn_: Box::new(Expr::FieldAccess {
+                obj: Box::new(Expr::Var("p".to_string())),
+                field: "then".to_string(),
+            }),
+            args: vec![cb],
+        };
+        let comp = component_with_effect_call("setN", call, Some(vec![Expr::StateVal(0)]));
+        let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
+        assert!(
             !result.widened_labels.contains(&0),
-            "back-edge in callback body → conservative bail → no widening (known FN)"
+            "bounded setter in a loop stabilises → must not widen"
+        );
+        assert!(
+            InfiniteLoop.check(&result).is_empty(),
+            "bounded loop setter must not be flagged (anti-FP)"
         );
     }
 

@@ -161,10 +161,15 @@ fn exec_stmt_core<T: Transfer>(
     }
 }
 
-/// Processes blocks in topological order (no back-edge loops — conservative
-/// fallback to `T::Domain::top()` if any back edge is present). At branches,
-/// both paths are executed and their environments are joined (over-approximate).
-/// Return values from all `Terminator::Return` blocks are joined.
+/// Processes blocks in topological order. Back edges are ignored for env
+/// propagation (forward-predecessor join only, since `topo_sort` emits a loop
+/// header before its back-edge source); statements still execute once, so
+/// loop-body side effects (setter `state.update`s) are captured even when the
+/// body contains a loop. At branches, both paths are executed and their
+/// environments are joined (over-approximate). Return values from all
+/// `Terminator::Return` blocks are joined; if the body contains any back edge
+/// the return value is conservatively joined to Top (loop-carried return values
+/// are not widened in-body — see ADR-009 "Limites").
 fn exec_body_impl<T: Transfer>(
     transfer: &T,
     cfg: &CFG,
@@ -172,9 +177,7 @@ fn exec_body_impl<T: Transfer>(
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) -> T::Domain {
-    if cfg.edges.iter().any(|e| matches!(e.kind, EdgeKind::Back)) {
-        return T::Domain::top();
-    }
+    let has_back_edge = cfg.edges.iter().any(|e| matches!(e.kind, EdgeKind::Back));
 
     let order = topo_sort(cfg);
     let mut env_at: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
@@ -226,6 +229,12 @@ fn exec_body_impl<T: Transfer>(
         }
     }
 
+    // A loop body's return value cannot be precisely computed in a single
+    // forward pass (loop-carried values are not widened here); be conservative.
+    // Side effects above already fired regardless.
+    if has_back_edge {
+        return_val = return_val.join(&T::Domain::top());
+    }
     return_val
 }
 
