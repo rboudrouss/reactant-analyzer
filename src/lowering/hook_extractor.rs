@@ -8,6 +8,79 @@ use crate::ir::{
     types::{BlockId, HookLabel},
 };
 
+// ── Handler extraction ────────────────────────────────────────────────────────
+
+/// Scan `cfg` for JSX `onX={fn}` event handler props and append each as
+/// `HookEntry::Handler` to `hooks`.  Labels continue from `*next_label`.
+///
+/// Scans both block statements and `Terminator::Return` expressions (JSX is
+/// typically in the return of the render function).  Only `NativeElem` props
+/// are inspected — `CompApp` props carry React component props, not DOM events.
+pub fn extract_handlers(cfg: &CFG, hooks: &mut Vec<HookEntry>, next_label: &mut HookLabel) {
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            let expr = match stmt {
+                Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => rhs,
+                Stmt::ExprStmt(e) => e,
+            };
+            collect_handlers_in_expr(expr, hooks, next_label);
+        }
+        if let Terminator::Return(e) = &block.term {
+            collect_handlers_in_expr(e, hooks, next_label);
+        }
+    }
+}
+
+fn collect_handlers_in_expr(expr: &Expr, hooks: &mut Vec<HookEntry>, next_label: &mut HookLabel) {
+    match expr {
+        Expr::NativeElem {
+            props, children, ..
+        } => {
+            if let Expr::ObjectLit { fields, .. } = props.as_ref() {
+                for (name, val) in fields {
+                    if is_event_prop(name) {
+                        if let Expr::FnLit { body_cfg, .. } = val {
+                            let label = *next_label;
+                            *next_label += 1;
+                            hooks.push(HookEntry::Handler {
+                                label,
+                                event: prop_to_event(name),
+                                body_cfg: (**body_cfg).clone(),
+                            });
+                        }
+                        // Non-FnLit onX props (e.g. onX={someVar}) are not analysed.
+                    } else {
+                        collect_handlers_in_expr(val, hooks, next_label);
+                    }
+                }
+            }
+            for child in children {
+                collect_handlers_in_expr(child, hooks, next_label);
+            }
+        }
+        // Don't scan CompApp props — those are React component props, not DOM events.
+        Expr::TSAnnotated(e, _) => collect_handlers_in_expr(e, hooks, next_label),
+        _ => {}
+    }
+}
+
+fn is_event_prop(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next() == Some('o')
+        && chars.next() == Some('n')
+        && chars.next().is_some_and(|c| c.is_ascii_uppercase())
+}
+
+fn prop_to_event(name: &str) -> String {
+    // "onClick" → "click",  "onChange" → "change"
+    let rest = &name[2..];
+    let mut s = rest.to_string();
+    if let Some(first) = s.get_mut(0..1) {
+        first.make_ascii_lowercase();
+    }
+    s
+}
+
 /// Walk `cfg` in block-id order, extract all top-level hook calls into a
 /// `Vec<HookEntry>`, and rewrite the affected statements in-place.
 ///
@@ -16,7 +89,10 @@ use crate::ir::{
 ///
 /// Destructuring of useState/useReducer is resolved:
 ///   `__arr_N[0]` → `StateVal(L)`, `__arr_N[1]` → `StateSetter(L)`
-pub fn extract_hooks(cfg: &mut CFG) -> Vec<HookEntry> {
+/// Returns `(hooks, next_label)` where `next_label` is the first available
+/// label after all extracted hooks.  Pass `next_label` to `extract_handlers`
+/// so that handler labels don't collide with hook labels.
+pub fn extract_hooks(cfg: &mut CFG) -> (Vec<HookEntry>, HookLabel) {
     let mut label: HookLabel = 0;
     let mut hooks: Vec<HookEntry> = Vec::new();
     // Maps array-destructuring temps (e.g. "__arr_42") → hook label, for useState/useReducer.
@@ -36,7 +112,7 @@ pub fn extract_hooks(cfg: &mut CFG) -> Vec<HookEntry> {
         cfg.blocks.get_mut(&id).unwrap().stmts = new;
     }
 
-    hooks
+    (hooks, label)
 }
 
 fn process_stmt(
@@ -319,7 +395,7 @@ mod tests {
                 _ => None,
             })
             .expect("no function found");
-        let hooks = extract_hooks(&mut cfg);
+        let (hooks, _) = extract_hooks(&mut cfg);
         (cfg, hooks)
     }
 
@@ -538,6 +614,124 @@ mod tests {
             find_let_rhs(stmts, "setV"),
             Some(Expr::StateSetter(0))
         ));
+    }
+
+    // ── extract_handlers ─────────────────────────────────────────────────────
+
+    fn parse_and_extract_with_handlers(src: &str) -> (CFG, Vec<HookEntry>) {
+        let alloc = Allocator::default();
+        let ret = Parser::new(&alloc, src, SourceType::tsx())
+            .with_options(ParseOptions::default())
+            .parse();
+        assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
+        let mut cfg = ret
+            .program
+            .body
+            .iter()
+            .find_map(|s| match s {
+                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| build_cfg(b)),
+                _ => None,
+            })
+            .expect("no function found");
+        let (mut hooks, mut next_label) = extract_hooks(&mut cfg);
+        extract_handlers(&cfg, &mut hooks, &mut next_label);
+        (cfg, hooks)
+    }
+
+    #[test]
+    fn onclick_handler_extracted() {
+        let (_, hooks) = parse_and_extract_with_handlers(
+            "function Btn() {
+                const [n, setN] = useState(0);
+                return <button onClick={() => setN(n + 1)}>{n}</button>;
+            }",
+        );
+        // useState is label 0; onClick handler is label 1
+        assert_eq!(hooks.len(), 2);
+        assert!(matches!(
+            &hooks[1],
+            HookEntry::Handler { label: 1, event, .. } if event == "click"
+        ));
+    }
+
+    #[test]
+    fn non_fn_event_prop_not_extracted() {
+        // onClick={someVar} — value is a Var, not FnLit → no Handler entry
+        let (_, hooks) = parse_and_extract_with_handlers(
+            "function Btn({ onClick }) { return <button onClick={onClick}/>; }",
+        );
+        assert!(
+            hooks
+                .iter()
+                .all(|h| !matches!(h, HookEntry::Handler { .. }))
+        );
+    }
+
+    #[test]
+    fn multiple_handlers_labeled_in_order() {
+        let (_, hooks) = parse_and_extract_with_handlers(
+            "function F() {
+                return <div onMouseEnter={() => {}} onMouseLeave={() => {}}/>;
+            }",
+        );
+        let handlers: Vec<_> = hooks
+            .iter()
+            .filter(|h| matches!(h, HookEntry::Handler { .. }))
+            .collect();
+        assert_eq!(handlers.len(), 2);
+        assert!(
+            matches!(handlers[0], HookEntry::Handler { label: 0, event, .. } if event == "mouseEnter")
+        );
+        assert!(
+            matches!(handlers[1], HookEntry::Handler { label: 1, event, .. } if event == "mouseLeave")
+        );
+    }
+
+    #[test]
+    fn handler_in_nested_jsx() {
+        let (_, hooks) = parse_and_extract_with_handlers(
+            "function F() {
+                return <div><button onClick={() => {}}/></div>;
+            }",
+        );
+        assert_eq!(
+            hooks
+                .iter()
+                .filter(|h| matches!(h, HookEntry::Handler { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            hooks.iter().find(|h| matches!(h, HookEntry::Handler { .. })).unwrap(),
+            HookEntry::Handler { event, .. } if event == "click"
+        ));
+    }
+
+    #[test]
+    fn on_change_event_name() {
+        let (_, hooks) = parse_and_extract_with_handlers(
+            "function F() { return <input onChange={() => {}}/>; }",
+        );
+        assert!(matches!(
+            hooks.iter().find(|h| matches!(h, HookEntry::Handler { .. })).unwrap(),
+            HookEntry::Handler { event, .. } if event == "change"
+        ));
+    }
+
+    #[test]
+    fn handler_labels_continue_after_hooks() {
+        // useState gets label 0, handler gets label 1
+        let (_, hooks) = parse_and_extract_with_handlers(
+            "function F() {
+                const [x, setX] = useState(0);
+                return <button onClick={() => setX(1)}/>;
+            }",
+        );
+        let handler = hooks
+            .iter()
+            .find(|h| matches!(h, HookEntry::Handler { .. }))
+            .unwrap();
+        assert!(matches!(handler, HookEntry::Handler { label: 1, .. }));
     }
 
     // ── useReducer ────────────────────────────────────────────────────────────

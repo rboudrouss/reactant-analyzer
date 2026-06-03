@@ -80,6 +80,8 @@ mod tests {
             effect_block_states: HashMap::new(),
             hook_calls,
             effect_info: HashMap::new(),
+            handler_block_states: HashMap::new(),
+            handler_info: HashMap::new(),
             widened_labels: HashSet::new(),
             render_cfg,
             hooks: vec![],

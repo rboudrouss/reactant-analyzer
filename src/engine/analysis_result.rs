@@ -21,6 +21,7 @@ pub enum HookKind {
     Callback,
     Ref,
     Custom,
+    Handler,
 }
 
 /// Where a hook was called in the render CFG.
@@ -33,6 +34,16 @@ pub struct HookCallInfo {
     pub label: HookLabel,
     pub kind: HookKind,
     pub block_id: BlockId,
+}
+
+/// Captured information about a JSX event handler entry point.
+#[derive(Debug, Clone)]
+pub struct HandlerInfo {
+    pub label: HookLabel,
+    /// DOM event name without "on" prefix, lowercased: "click", "change"…
+    pub event: String,
+    /// Variables used in the handler body but not locally defined within it.
+    pub free_vars: HashSet<Var>,
 }
 
 /// Captured information about a useEffect hook for dep-checking rules.
@@ -59,6 +70,10 @@ pub struct AnalysisResult<D: AbstractDomain> {
     pub effect_block_states: HashMap<HookLabel, HashMap<BlockId, AbstractEnv<D>>>,
     pub hook_calls: Vec<HookCallInfo>,
     pub effect_info: HashMap<HookLabel, EffectInfo>,
+    /// Abstract environment at the *exit* of each block, per JSX handler body CFG.
+    /// Populated post-convergence (single pass, not part of the fixpoint loop).
+    pub handler_block_states: HashMap<HookLabel, HashMap<BlockId, AbstractEnv<D>>>,
+    pub handler_info: HashMap<HookLabel, HandlerInfo>,
     /// Labels whose state was widened to force convergence.
     pub widened_labels: HashSet<HookLabel>,
     pub render_cfg: CFG,

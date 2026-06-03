@@ -17,7 +17,7 @@ use crate::{
 };
 
 use super::{
-    analysis_result::{AnalysisResult, EffectInfo, HookCallInfo, HookKind},
+    analysis_result::{AnalysisResult, EffectInfo, HandlerInfo, HookCallInfo, HookKind},
     cfg_analyzer::analyze_cfg,
 };
 
@@ -59,7 +59,10 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
     let mut widened_labels: HashSet<HookLabel> = HashSet::new();
     let mut iteration: usize = 0;
     let mut block_states: HashMap<BlockId, AbstractEnv<StateValue>>;
+    let mut env_exit: AbstractEnv<StateValue> = AbstractEnv::bottom();
     let mut effect_block_states: HashMap<HookLabel, HashMap<BlockId, AbstractEnv<StateValue>>> =
+        HashMap::new();
+    let mut handler_block_states: HashMap<HookLabel, HashMap<BlockId, AbstractEnv<StateValue>>> =
         HashMap::new();
 
     // Seed each useState label with its init expression.
@@ -106,7 +109,7 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
         block_states = bs;
 
         // ── Recompute memo store from exit env ────────────────────────────────
-        let env_exit = exit_env(&render_cfg, &block_states);
+        env_exit = exit_env(&render_cfg, &block_states);
         for hook in &hooks {
             match hook {
                 HookEntry::Memo { label, deps, .. } => {
@@ -152,6 +155,36 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
         let new_typed = typed_state.from_untyped(&new_untyped);
 
         if new_typed.leq(&typed_state) {
+            // ── Handler passes (post-convergence, excluded from fixpoint) ─────
+            // Handlers are analyzed once with the converged render exit env and
+            // final state.  Their state deltas are intentionally NOT joined into
+            // typed_state — event handlers are not part of the render→effect cycle
+            // and must not contribute to widened_labels (ADR-009 §3).
+            let final_state = typed_state.to_untyped();
+            for hook in &hooks {
+                if let HookEntry::Handler {
+                    label, body_cfg, ..
+                } = hook
+                {
+                    let (h_bs, _) = {
+                        let ctx = FixpointCtx {
+                            state: &final_state,
+                            memo: &memo_store,
+                        };
+                        analyze_cfg::<T>(
+                            body_cfg,
+                            env_exit.clone(),
+                            &final_state,
+                            &memo_store,
+                            transfer,
+                            config.widen_threshold,
+                            &mut heap,
+                            &ctx,
+                        )
+                    };
+                    handler_block_states.insert(*label, h_bs);
+                }
+            }
             break;
         }
 
@@ -173,6 +206,7 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
 
     let hook_calls = collect_hook_calls(&hooks, &render_cfg);
     let effect_info = collect_effect_info(&hooks);
+    let handler_info = collect_handler_info(&hooks);
     let hooks_clone = hooks.clone();
 
     AnalysisResult {
@@ -182,6 +216,8 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
         effect_block_states,
         hook_calls,
         effect_info,
+        handler_block_states,
+        handler_info,
         widened_labels,
         render_cfg,
         hooks: hooks_clone,
@@ -219,25 +255,31 @@ fn collect_hook_calls(hooks: &[HookEntry], cfg: &CFG) -> Vec<HookCallInfo> {
             HookEntry::Callback { label, .. } => (*label, HookKind::Callback),
             HookEntry::Ref { label, .. } => (*label, HookKind::Ref),
             HookEntry::Custom { label, .. } => (*label, HookKind::Custom),
+            HookEntry::Handler { label, .. } => (*label, HookKind::Handler),
         })
         .collect();
 
-    // Effect hooks have no render-CFG binding; pre-populate with entry block.
+    // Effect and Handler hooks have no render-CFG binding stmt; pre-populate with entry block.
     let mut call_map: HashMap<HookLabel, HookCallInfo> = hooks
         .iter()
-        .filter_map(|h| {
-            if let HookEntry::Effect { label, .. } = h {
-                Some((
-                    *label,
-                    HookCallInfo {
-                        label: *label,
-                        kind: HookKind::Effect,
-                        block_id: cfg.entry,
-                    },
-                ))
-            } else {
-                None
-            }
+        .filter_map(|h| match h {
+            HookEntry::Effect { label, .. } => Some((
+                *label,
+                HookCallInfo {
+                    label: *label,
+                    kind: HookKind::Effect,
+                    block_id: cfg.entry,
+                },
+            )),
+            HookEntry::Handler { label, .. } => Some((
+                *label,
+                HookCallInfo {
+                    label: *label,
+                    kind: HookKind::Handler,
+                    block_id: cfg.entry,
+                },
+            )),
+            _ => None,
         })
         .collect();
 
@@ -336,6 +378,32 @@ fn collect_effect_info(hooks: &[HookEntry]) -> HashMap<HookLabel, EffectInfo> {
                         free_vars,
                         declared_deps,
                         has_deps_array,
+                    },
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Build `HandlerInfo` for each JSX event handler entry point.
+fn collect_handler_info(hooks: &[HookEntry]) -> HashMap<HookLabel, HandlerInfo> {
+    hooks
+        .iter()
+        .filter_map(|h| {
+            if let HookEntry::Handler {
+                label,
+                event,
+                body_cfg,
+            } = h
+            {
+                Some((
+                    *label,
+                    HandlerInfo {
+                        label: *label,
+                        event: event.clone(),
+                        free_vars: compute_free_vars(body_cfg),
                     },
                 ))
             } else {
@@ -842,5 +910,207 @@ mod tests {
 
         // setN({}) fires via cb → Reference(Unstable) joins Number([0,0]) → Top.
         assert_eq!(result.state_store.get(0), StateValue::Top);
+    }
+
+    // ── Handler entry point tests ─────────────────────────────────────────────
+
+    fn handler_cfg(stmts: Vec<Stmt>) -> CFG {
+        let mut blocks = HashMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts,
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        CFG {
+            entry: 0,
+            blocks,
+            edges: vec![],
+        }
+    }
+
+    #[test]
+    fn handler_block_states_populated_after_convergence() {
+        // Component: useState(0), onClick handler with setN(1).
+        // After convergence, handler_block_states[1] must contain the exit env.
+        let body = handler_cfg(vec![
+            Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+            },
+            Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Lit(Prim::Int(1))],
+            }),
+        ]);
+        let hooks = vec![
+            HookEntry::State {
+                label: 0,
+                init: Expr::Lit(Prim::Int(0)),
+            },
+            HookEntry::Handler {
+                label: 1,
+                event: "click".to_string(),
+                body_cfg: body,
+            },
+        ];
+        let comp = component(
+            hooks,
+            vec![
+                Stmt::Let {
+                    var: "n".to_string(),
+                    rhs: Expr::StateVal(0),
+                },
+                Stmt::Let {
+                    var: "setN".to_string(),
+                    rhs: Expr::StateSetter(0),
+                },
+            ],
+        );
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+
+        assert!(
+            result.handler_block_states.contains_key(&1),
+            "handler_block_states must contain label 1"
+        );
+        assert!(
+            !result.handler_block_states.contains_key(&0),
+            "state hook has no handler_block_states entry"
+        );
+    }
+
+    #[test]
+    fn handler_does_not_drive_widening() {
+        // Handler with setN(n+1) — if it were in the fixpoint loop it would cause widening.
+        // Being post-convergence, it must NOT contribute to widened_labels.
+        let body = handler_cfg(vec![
+            Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+            },
+            Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::BinOp {
+                    op: crate::ir::expr::BinOp::Add,
+                    lhs: Box::new(Expr::StateVal(0)),
+                    rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                }],
+            }),
+        ]);
+        let hooks = vec![
+            HookEntry::State {
+                label: 0,
+                init: Expr::Lit(Prim::Int(0)),
+            },
+            HookEntry::Handler {
+                label: 1,
+                event: "click".to_string(),
+                body_cfg: body,
+            },
+        ];
+        let comp = component(
+            hooks,
+            vec![
+                Stmt::Let {
+                    var: "n".to_string(),
+                    rhs: Expr::StateVal(0),
+                },
+                Stmt::Let {
+                    var: "setN".to_string(),
+                    rhs: Expr::StateSetter(0),
+                },
+            ],
+        );
+        let config = Config { widen_threshold: 1 };
+        let result = analyze_component(comp, &StateValueTransfer, &config);
+
+        assert!(
+            !result.widened_labels.contains(&0),
+            "handler's setN(n+1) must not cause widening of state 0 (would be false positive InfiniteLoop)"
+        );
+        assert!(
+            !result.widened_labels.contains(&1),
+            "handler label itself must not appear in widened_labels"
+        );
+    }
+
+    #[test]
+    fn handler_state_not_joined_into_typed_state() {
+        // Handler does setN(99); init = 0.
+        // State converges at Number([0,0]) (no effect in the render-effect cycle).
+        // Handler pass is post-convergence — its state delta is discarded.
+        let body = handler_cfg(vec![
+            Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+            },
+            Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Lit(Prim::Int(99))],
+            }),
+        ]);
+        let hooks = vec![
+            HookEntry::State {
+                label: 0,
+                init: Expr::Lit(Prim::Int(0)),
+            },
+            HookEntry::Handler {
+                label: 1,
+                event: "click".to_string(),
+                body_cfg: body,
+            },
+        ];
+        let comp = component(
+            hooks,
+            vec![
+                Stmt::Let {
+                    var: "n".to_string(),
+                    rhs: Expr::StateVal(0),
+                },
+                Stmt::Let {
+                    var: "setN".to_string(),
+                    rhs: Expr::StateSetter(0),
+                },
+            ],
+        );
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+
+        assert_eq!(
+            result.state_store.get(0),
+            StateValue::Number(Interval::point(0.0)),
+            "handler's setN(99) must not be joined into state_store (handler is not part of the fixpoint)"
+        );
+    }
+
+    #[test]
+    fn handler_info_event_and_free_vars() {
+        // Handler reads "n" and calls setN — both are free vars.
+        let body = handler_cfg(vec![Stmt::ExprStmt(Expr::Call {
+            fn_: Box::new(Expr::Var("setN".to_string())),
+            args: vec![Expr::Var("n".to_string())],
+        })]);
+        let hooks = vec![
+            HookEntry::State {
+                label: 0,
+                init: Expr::Lit(Prim::Int(0)),
+            },
+            HookEntry::Handler {
+                label: 1,
+                event: "click".to_string(),
+                body_cfg: body,
+            },
+        ];
+        let comp = component(hooks, vec![]);
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+
+        let info = result
+            .handler_info
+            .get(&1)
+            .expect("handler_info must have entry for label 1");
+        assert_eq!(info.event, "click");
+        assert!(info.free_vars.contains("n"), "n should be a free var");
+        assert!(info.free_vars.contains("setN"), "setN should be a free var");
     }
 }

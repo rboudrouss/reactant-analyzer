@@ -159,6 +159,8 @@ mod tests {
             effect_block_states: HashMap::new(),
             hook_calls: vec![],
             effect_info: HashMap::new(),
+            handler_block_states: HashMap::new(),
+            handler_info: HashMap::new(),
             widened_labels: widened,
             render_cfg: CFG {
                 entry: 0,

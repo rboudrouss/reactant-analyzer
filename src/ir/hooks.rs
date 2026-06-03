@@ -35,4 +35,10 @@ pub enum HookEntry {
         args: Vec<Expr>,
         deps: Option<Vec<Expr>>,
     },
+    Handler {
+        label: HookLabel,
+        /// DOM event name without the "on" prefix, lowercased: "click", "change", "submit"…
+        event: String,
+        body_cfg: CFG,
+    },
 }

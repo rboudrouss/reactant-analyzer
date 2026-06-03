@@ -1,8 +1,9 @@
 # ADR-009 : Traversée sémantique des callbacks — points d'entrée + classe de déclenchement
 
-- **Statut** : Accepté — implémenté
+- **Statut** : Accepté — implémenté (partiellement)
 - **Date** : 2026-06-02
 - **Mis à jour** : 2026-06-03 — étendu par [ADR-010](ADR-010-heap-model.md) (B5 callbacks par variable, B6 inlining appels locaux)
+- **Mis à jour** : 2026-06-03 — migration §1-3 implémentée : `HookEntry::Handler`, `extract_handlers` (lowering JSX `onX`), passes post-convergence dans `analyze_component`, `handler_block_states` + `handler_info` dans `AnalysisResult`. Étapes restantes : §4 `addEventListener` depuis effects, §5 multiplicité fixpoint.
 - **Contexte** : [ADR-008](ADR-008-value-domain.md) (domaine de valeurs / fixpoint), [ADR-004](ADR-004-component-structure.md) (render_cfg + effect_cfg), [ADR-005](ADR-005-analysis-scope.md) (scope intra-procédural)
 
 ## Contexte

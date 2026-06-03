@@ -25,16 +25,13 @@ useEffect(() => {
 
 ## Infrastructure
 
-### Analyse des event handlers comme points d'entrée *(ADR-009)*
+### Handlers JSX — limitations restantes *(ADR-009 migration, suite)*
 
-Handlers (`onClick={}`, `addEventListener`) actuellement skippés (`Subscription`/`Unknown`) pour éviter FP `infinite-loop`. Migration actée dans ADR-009 :
+JSX `onX={fn}` handlers sont maintenant des points d'entrée de première classe (`HookEntry::Handler`, analysés post-convergence). Reste :
 
-1. **Lowering** — lifter les handlers JSX `onX` + `addEventListener` en racines de première classe avec leur env de binding.
-2. **Engine** — analyser via `analyze_cfg` ; weak-join des effets taggés provenance `event`, **exclus de `widened_labels`**.
-3. **Politique** — flip `Subscription`/`Unknown` → `analyze-as-entry-point` dans `classify_callee`.
-4. **Multiplicité** — handler tourne 0..N fois → fixpoint sur ces racines aussi.
-
-Débloque : **stale-closure-in-handler**, **missing-cleanup** (`addEventListener` sans `removeEventListener`).
+1. **`addEventListener` dans les effects** — lowering depuis `body_cfg` d'un effect vers `HookEntry::Handler` avec env au site d'appel (stale-closure-in-handler débloqué).
+2. **Multiplicité** — handler tourne 0..N fois → fixpoint sur ces racines aussi (actuellement : passe unique post-convergence, imprécis mais sans FP).
+3. **Politique `Subscription`** — flip `classify_callee::Subscription` → `analyze-as-entry-point` pour les callbacks passés à `addEventListener` inline dans un effect.
 
 ### Analyse inter-composants
 
