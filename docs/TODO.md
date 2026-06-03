@@ -7,16 +7,6 @@
 - **Valeurs loop-carried dans un corps de callback** → vues à leur valeur de **première itération**. `exec_body` traverse le corps pour ses effets de bord même avec une back-edge (les setters dans une boucle fire), mais ne widen pas les back-edges → `setX(arr[i])` enregistre une valeur partielle. FN mineur sur la *valeur*, jamais de FP.
 - **Callees inconnus sans `Loc`** (`myHelper(() => setX())`) → FN sur helpers externes/wrappers qui exécutent le callback en synchrone.
 
-### Functional updaters `(n) => n + 1` ne déclenchent pas de widening
-
-```js
-useEffect(() => {
-  setCount(c => c + 1)  // FnLit → Reference(Unstable) → join Top → converge sans widening
-}, [])
-```
-
-`FnLit` évalué à `Reference(Unstable)` → cross-type join avec `Number([init])` → `Top`. Converge en 2 itérations sans déclencher `widened_labels`. Fix : signal spécifique pour les functional updaters dont le corps appelle le setter de façon non-identité.
-
 ---
 
 ## Infrastructure
@@ -67,4 +57,4 @@ const [data, setData] = useState(expensiveCompute())  // recalculé chaque rende
 
 Effect dont les deps sont `[stateA]`, appelle `setB(expr)` inconditionnellement où `expr` est call-free et ne lit que des `StateVal` sources, et `setB` n'est appelé nulle part ailleurs.
 
-Bloqué par : `Expr::Call` opaque (pas de support fonctions pures), functional updaters non analysés. (`effect_block_states` désormais disponible.)
+Bloqué par : `Expr::Call` opaque (pas de support fonctions pures). (`effect_block_states` et l'analyse des functional updaters désormais disponibles.)

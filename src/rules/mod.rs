@@ -20,7 +20,7 @@ use crate::{
     engine::AnalysisResult,
     ir::{
         SourceRange,
-        cfg::CFG,
+        cfg::{CFG, Terminator},
         expr::Expr,
         stmt::Stmt,
         types::{HookLabel, Var},
@@ -146,6 +146,11 @@ fn collect_setter_calls_inner(
         if let Some(block) = cfg.blocks.get(&bid) {
             for stmt in &block.stmts {
                 check_stmt_for_setters(stmt, setter_vars, depth, fn_bindings, found);
+            }
+            // Concise arrow bodies (`() => setX(...)`) carry their call in the
+            // Return terminator, not a statement — scan it too.
+            if let Terminator::Return(expr) = &block.term {
+                check_expr_for_setters(expr, setter_vars, depth, fn_bindings, found);
             }
             for succ in cfg.successors(bid) {
                 if visited.insert(succ) {

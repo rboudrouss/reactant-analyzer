@@ -10,7 +10,7 @@ use crate::ir::{
     stmt::Stmt,
 };
 
-use super::cfg_builder::{BlockBuilder, build_cfg};
+use super::cfg_builder::{BlockBuilder, build_cfg, build_expr_body_cfg};
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -162,7 +162,14 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         Expression::ArrowFunctionExpression(arrow) => {
             let id = builder.next_expr_id();
             let params = lower_params(&arrow.params);
-            let body_cfg = build_cfg(&arrow.body, &builder.line_starts.clone());
+            let line_starts = builder.line_starts.clone();
+            // Concise body (`x => expr`) carries an implicit return; block body
+            // (`x => { ... }`) lowers like any function body.
+            let body_cfg = if arrow.expression {
+                build_expr_body_cfg(&arrow.body, &line_starts)
+            } else {
+                build_cfg(&arrow.body, &line_starts)
+            };
             Expr::FnLit {
                 id,
                 params,
@@ -590,6 +597,30 @@ mod tests {
         assert!(
             branches >= 2,
             "expected ≥2 branches for nested ternary, got {branches}"
+        );
+    }
+
+    #[test]
+    fn concise_arrow_body_returns_its_expression() {
+        // Regression: a concise-body arrow (`c => c + 1`) must lower its implicit
+        // return into a `Return` terminator carrying the expression. The old bug
+        // lowered it as a value-discarding `ExprStmt` (terminator `Unreachable`),
+        // so the body evaluated to Bottom and functional-updater infinite loops
+        // (`setCount(c => c + 1)`) went undetected.
+        let cfg = build("function f() { const cb = (c) => c + 1; return cb; }");
+        let entry = cfg.blocks.get(&cfg.entry).unwrap();
+        let body = match entry.stmts.first() {
+            Some(Stmt::Let {
+                rhs: Expr::FnLit { body_cfg, .. },
+                ..
+            }) => body_cfg,
+            other => panic!("expected `const cb = FnLit`, got {other:?}"),
+        };
+        let body_entry = body.blocks.get(&body.entry).expect("body entry block");
+        assert!(
+            matches!(body_entry.term, Terminator::Return(Expr::BinOp { .. })),
+            "concise arrow body must Return its expression, got {:?}",
+            body_entry.term
         );
     }
 

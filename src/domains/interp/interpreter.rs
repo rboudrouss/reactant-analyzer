@@ -138,26 +138,43 @@ fn exec_stmt_core<T: Transfer>(
             env.extend(var.clone(), val);
         }
         Stmt::ExprStmt(expr, _) => {
-            if let Expr::Call { fn_, args } = expr
-                && let Expr::Var(name) = fn_.as_ref()
-                && let Some(label) = env.setter_label(name)
-            {
-                let arg_val = match args.first() {
-                    Some(Expr::FnLit {
-                        params, body_cfg, ..
-                    }) => {
-                        let mut sub_env = env.clone();
-                        if let Some(param) = params.first() {
-                            sub_env.extend(param.clone(), ctx.state.get(label));
-                        }
-                        exec_body_depth(transfer, body_cfg, &sub_env, ctx, depth + 1)
-                    }
-                    Some(a) => transfer.eval_expr(a, env, ctx),
-                    None => T::Domain::top(),
-                };
-                ctx.state.update(label, arg_val);
-            }
+            // Callback pre-pass already ran in `exec_full_stmt`; fire the setter.
+            exec_setter_call(transfer, expr, env, ctx, depth);
         }
+    }
+}
+
+/// If `expr` is a setter call `setX(arg)`, weak-update the corresponding state
+/// label. Handles functional updaters (`setX(c => …)`: the `FnLit` arg runs via
+/// `exec_body_depth` with `c` bound to the current state value).
+///
+/// Shared by `ExprStmt` statements and concise-arrow implicit returns (the
+/// latter behave like a side-effecting statement *and* yield a value).
+fn exec_setter_call<T: Transfer>(
+    transfer: &T,
+    expr: &Expr,
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    depth: usize,
+) {
+    if let Expr::Call { fn_, args } = expr
+        && let Expr::Var(name) = fn_.as_ref()
+        && let Some(label) = env.setter_label(name)
+    {
+        let arg_val = match args.first() {
+            Some(Expr::FnLit {
+                params, body_cfg, ..
+            }) => {
+                let mut sub_env = env.clone();
+                if let Some(param) = params.first() {
+                    sub_env.extend(param.clone(), ctx.state.get(label));
+                }
+                exec_body_depth(transfer, body_cfg, &sub_env, ctx, depth + 1)
+            }
+            Some(a) => transfer.eval_expr(a, env, ctx),
+            None => T::Domain::top(),
+        };
+        ctx.state.update(label, arg_val);
     }
 }
 
@@ -207,6 +224,13 @@ fn exec_body_impl<T: Transfer>(
             }
             match &block.term {
                 Terminator::Return(expr) => {
+                    // A concise arrow body (`() => EXPR`) lowers EXPR to this
+                    // Return. EXPR may carry side effects (`() => setN(c => c+1)`,
+                    // `() => arr.map(cb)`): fire them as a statement would, then
+                    // take EXPR's value as the return. `eval_expr` alone is pure
+                    // and would silently drop those effects.
+                    exec_callbacks_depth(transfer, expr, &env, ctx, depth);
+                    exec_setter_call(transfer, expr, &env, ctx, depth);
                     let v = transfer.eval_expr(expr, &env, ctx);
                     return_val = return_val.join(&v);
                 }

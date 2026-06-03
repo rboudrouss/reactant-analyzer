@@ -118,16 +118,23 @@ function LocalHelperMountOk() {
   return <div>{n}</div>;
 }
 
-// ── Functional updater does not trigger widening — known FN ──────────────────
-// `setCount(c => c + 1)` evaluates the FnLit to Reference(Unstable), which
-// cross-type-joins with Number([0,0]) → Top. Converges in 2 iterations without
-// widening widened_labels → InfiniteLoop does not fire even though it should.
-// Documented in TODO.md → "Functional updaters ne déclenchent pas de widening".
+// ── Functional updater IS detected (concise-arrow lowering fix) ──────────────
+// Concise-body arrows (`c => c + 1`) now lower their implicit return correctly,
+// so the functional-updater form widens state just like `setCount(count + 1)`.
 
-function FunctionalUpdaterBug() {
+function FunctionalUpdaterLoop() {
   const [count, setCount] = useState(0);
   useEffect(() => {
-    setCount((c) => c + 1); // ❌ should be infinite-loop but NOT detected (known FN)
+    setCount((c) => c + 1); // ⚠ infinite-loop — re-runs on every count change
+  }, [count]);
+  return <div>{count}</div>;
+}
+
+// Mount-only functional updater: runs once, no cycle → correctly clean.
+function FunctionalUpdaterMountOnly() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    setCount((c) => c + 1); // ✓ one-shot on mount, not a loop
   }, []);
   return <div>{count}</div>;
 }
