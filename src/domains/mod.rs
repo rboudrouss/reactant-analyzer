@@ -1,14 +1,17 @@
 pub mod context;
 pub mod impls;
+pub mod interp;
 pub mod product;
 pub mod query;
 pub mod stores;
+pub mod transfer;
 
 pub use context::{AnalysisQueryCtx, FixpointCtx, NullCtx, QueryContext};
-pub use impls::{BoolVal, Interval, Stability, StateValue, StateValueTransfer};
+pub use impls::{BoolVal, Interval, Stability, StateValue};
 pub use product::{ProductDomain, ProductTransfer};
 pub use query::{DomainQuery, Queryable};
 pub use stores::{AbstractEnv, EnvVal, Heap, HeapValue, MemoStore, StateStore};
+pub use transfer::StateValueTransfer;
 
 use crate::ir::{Expr, Stmt};
 
