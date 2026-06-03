@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::{
     domains::{
-        AbstractDomain, AnalysisCtx, QueryContext, Transfer,
+        AbstractDomain, AnalysisCtx, Heap, QueryContext, Transfer,
         stores::{AbstractEnv, MemoStore, StateStore},
     },
     ir::{
@@ -18,9 +18,15 @@ use crate::{
 /// - `exit_envs[b]` — abstract environment at the *exit* of block `b`.
 /// - `state_out` — outer state + all `setState` discoveries from this pass.
 ///
+/// `heap` is mutated in-place (insert-only) as `FnLit`/`ObjectLit`/`ArrayLit`
+/// nodes are encountered. Callers pass and accumulate the same heap across
+/// render and effect passes so that closures allocated in render are visible
+/// when resolving variable callbacks in effects (B5 pattern).
+///
 /// Internally maintains `entry_envs[b]` (join of all predecessor exit envs).
 /// `state` is the outer state from the previous fixpoint iteration; new
 /// `setState` calls are accumulated on top of it.
+#[allow(clippy::too_many_arguments)]
 pub fn analyze_cfg<T: Transfer>(
     cfg: &CFG,
     entry_env: AbstractEnv<T::Domain>,
@@ -28,16 +34,15 @@ pub fn analyze_cfg<T: Transfer>(
     memo: &MemoStore<T::Domain>,
     transfer: &T,
     widen_threshold: usize,
+    heap: &mut Heap,
     ctx: &dyn QueryContext,
 ) -> (
     HashMap<BlockId, AbstractEnv<T::Domain>>,
     StateStore<T::Domain>,
-    crate::domains::Heap,
 ) {
     let mut entry_envs: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
     let mut exit_envs: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
     let mut state_out = state.clone();
-    let mut heap_out = crate::domains::Heap::new();
 
     entry_envs.insert(cfg.entry, entry_env);
 
@@ -60,7 +65,7 @@ pub fn analyze_cfg<T: Transfer>(
             let mut ac = AnalysisCtx {
                 state: &mut state_out,
                 memo: &mut memo_local,
-                heap: &mut heap_out,
+                heap,
                 query: ctx,
             };
             for stmt in &block.stmts {
@@ -121,7 +126,7 @@ pub fn analyze_cfg<T: Transfer>(
         }
     }
 
-    (exit_envs, state_out, heap_out)
+    (exit_envs, state_out)
 }
 
 // ── Branch narrowing ──────────────────────────────────────────────────────────
@@ -174,7 +179,7 @@ mod tests {
     use super::*;
     use crate::{
         domains::{
-            Interval, NullCtx, Stability, StateValue, StateValueTransfer,
+            Heap, Interval, NullCtx, Stability, StateValue, StateValueTransfer,
             stores::{AbstractEnv, MemoStore, StateStore},
         },
         ir::{
@@ -204,13 +209,15 @@ mod tests {
     #[test]
     fn empty_cfg_entry_env_preserved() {
         let cfg = single_block_cfg(vec![]);
-        let (exit_envs, state_out, _heap) = analyze_cfg::<StateValueTransfer>(
+        let mut heap = Heap::new();
+        let (exit_envs, state_out) = analyze_cfg::<StateValueTransfer>(
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
             &MemoStore::new(),
             &StateValueTransfer,
             3,
+            &mut heap,
             &NullCtx,
         );
         assert!(exit_envs.contains_key(&0));
@@ -223,13 +230,15 @@ mod tests {
             var: "x".to_string(),
             rhs: Expr::Lit(Prim::Int(42)),
         }]);
-        let (exit_envs, _, _) = analyze_cfg::<StateValueTransfer>(
+        let mut heap = Heap::new();
+        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
             &MemoStore::new(),
             &StateValueTransfer,
             3,
+            &mut heap,
             &NullCtx,
         );
         assert_eq!(
@@ -255,13 +264,15 @@ mod tests {
             }),
         ];
         let cfg = single_block_cfg(stmts);
-        let (_, state_out, _) = analyze_cfg::<StateValueTransfer>(
+        let mut heap = Heap::new();
+        let (_, state_out) = analyze_cfg::<StateValueTransfer>(
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
             &MemoStore::new(),
             &StateValueTransfer,
             3,
+            &mut heap,
             &NullCtx,
         );
         assert_eq!(state_out.get(0), StateValue::Reference(Stability::Unstable));
@@ -305,13 +316,15 @@ mod tests {
             }],
         };
 
-        let (exit_envs, _, _) = analyze_cfg::<StateValueTransfer>(
+        let mut heap = Heap::new();
+        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
             &MemoStore::new(),
             &StateValueTransfer,
             3,
+            &mut heap,
             &NullCtx,
         );
         assert_eq!(
@@ -399,13 +412,15 @@ mod tests {
             ],
         };
 
-        let (exit_envs, _, _) = analyze_cfg::<StateValueTransfer>(
+        let mut heap = Heap::new();
+        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
             &MemoStore::new(),
             &StateValueTransfer,
             3,
+            &mut heap,
             &NullCtx,
         );
         // join(Number([1,1]), Reference(Unstable)) = Top at merge block 3
@@ -482,13 +497,15 @@ mod tests {
             }),
         );
 
-        let (exit_envs, _, _) = analyze_cfg::<StateValueTransfer>(
+        let mut heap = Heap::new();
+        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
             &cfg,
             entry_env,
             &StateStore::bottom(),
             &MemoStore::new(),
             &StateValueTransfer,
             3,
+            &mut heap,
             &NullCtx,
         );
 

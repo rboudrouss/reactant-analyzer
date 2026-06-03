@@ -210,16 +210,24 @@ function DeepHelperOk() {
   return <div>{n}</div>;
 }
 
-// ── Heap not persisted across passes — render-defined cb used in effect (FN) ──
-// `cb` is defined in the render body and used in the effect.
-// The heap from the render pass is not carried into the effect pass (known limit).
-// Fix tracked in TODO.md → "Heap — passer à travers le fixpoint".
+// ── B5 cross-pass: callback defined in render, used in effect ────────────────
+// The heap is now persisted from the render pass into effect passes (fixed).
+// `cb` allocated in render → heap; effect resolves via heap.get(id) → body runs.
 
-function RenderCbInEffectOk() {
+function RenderCbInEffectLoop() {
   const [n, setN] = useState(0);
-  const cb = () => setN(n + 1); // FnLit in render body — heap not visible in effect
+  const cb = () => setN(n + 1); // FnLit in render → ExprId in heap
   useEffect(() => {
-    setTimeout(cb, 1000); // ✓ NOT detected — cross-pass heap limit (known FN)
+    setTimeout(cb, 1000); // ❌ infinite-loop — cb resolved via heap
   }, [n]);
   return <div>{n}</div>;
+}
+
+function RenderCbInEffectOk() {
+  const [data, setData] = useState(null);
+  const cb = () => setData({ loaded: true }); // converges — stable constant
+  useEffect(() => {
+    fetch("/api").then(cb); // ✓ no infinite-loop — value stabilises
+  }, []);
+  return <div>{data?.loaded ? "ok" : "loading"}</div>;
 }

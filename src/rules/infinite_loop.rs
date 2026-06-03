@@ -156,6 +156,7 @@ mod tests {
             state_store: StateStore::bottom(),
             memo_store: MemoStore::new(),
             block_states: HashMap::new(),
+            effect_block_states: HashMap::new(),
             hook_calls: vec![],
             effect_info: HashMap::new(),
             widened_labels: widened,

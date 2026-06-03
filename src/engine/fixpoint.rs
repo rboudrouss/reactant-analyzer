@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     domains::{
-        AbstractDomain, AnalysisCtx, FixpointCtx, NullCtx, Transfer,
+        AbstractDomain, AnalysisCtx, FixpointCtx, Heap, NullCtx, Transfer,
         impls::StateValue,
         stores::{AbstractEnv, MemoStore, StateStore, TypedStateStore},
     },
@@ -55,9 +55,12 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
 
     let mut typed_state = TypedStateStore::from_component(&hooks);
     let mut memo_store: MemoStore<StateValue> = MemoStore::new();
+    let mut heap = Heap::new();
     let mut widened_labels: HashSet<HookLabel> = HashSet::new();
     let mut iteration: usize = 0;
     let mut block_states: HashMap<BlockId, AbstractEnv<StateValue>>;
+    let mut effect_block_states: HashMap<HookLabel, HashMap<BlockId, AbstractEnv<StateValue>>> =
+        HashMap::new();
 
     // Seed each useState label with its init expression.
     {
@@ -84,7 +87,7 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
         let state_store = typed_state.to_untyped();
 
         // ── Render pass ───────────────────────────────────────────────────────
-        let (bs, state_from_render, _) = {
+        let (bs, state_from_render) = {
             let ctx = FixpointCtx {
                 state: &state_store,
                 memo: &memo_store,
@@ -96,6 +99,7 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
                 &memo_store,
                 transfer,
                 config.widen_threshold,
+                &mut heap,
                 &ctx,
             )
         };
@@ -118,8 +122,11 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
         // ── Effect passes ─────────────────────────────────────────────────────
         let mut state_from_effects = StateStore::bottom();
         for hook in &hooks {
-            if let HookEntry::Effect { body_cfg, .. } = hook {
-                let (_, eff_state, _) = {
+            if let HookEntry::Effect {
+                label, body_cfg, ..
+            } = hook
+            {
+                let (eff_bs, eff_state) = {
                     let ctx = FixpointCtx {
                         state: &state_store,
                         memo: &memo_store,
@@ -131,9 +138,11 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
                         &memo_store,
                         transfer,
                         config.widen_threshold,
+                        &mut heap,
                         &ctx,
                     )
                 };
+                effect_block_states.insert(*label, eff_bs);
                 state_from_effects = state_from_effects.join(&eff_state);
             }
         }
@@ -170,6 +179,7 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
         state_store: typed_state.to_untyped(),
         memo_store,
         block_states,
+        effect_block_states,
         hook_calls,
         effect_info,
         widened_labels,
@@ -411,8 +421,10 @@ mod tests {
             expr::{Expr, Prim},
             hooks::HookEntry,
             stmt::Stmt,
+            types::ExprId,
         },
     };
+    use std::sync::Arc;
 
     fn trivial_cfg() -> CFG {
         let mut blocks = HashMap::new();
@@ -741,5 +753,94 @@ mod tests {
             result.block_states[&1].lookup("x"),
             StateValue::Number(Interval::point(42.0))
         );
+    }
+
+    #[test]
+    fn heap_persists_across_render_and_effect_passes() {
+        // B5 cross-pass: `let cb = () => setN({})` in render (FnLit → heap),
+        // `setTimeout(cb)` in effect (Var("cb") → exec_var_callback → heap lookup).
+        //
+        // Without heap persistence: heap.get(ExprId(1)) = None in the effect pass
+        // → setter call invisible → state_store.get(0) stays at Number([0,0]) (FN).
+        // With heap persistence: setter fires → cross-type join → Top.
+
+        // cb body CFG: ExprStmt(setN({}))
+        let mut cb_blocks = HashMap::new();
+        cb_blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![Stmt::ExprStmt(Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::ObjectLit {
+                        id: ExprId(0),
+                        fields: vec![],
+                    }],
+                })],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let cb_body = Arc::new(CFG {
+            entry: 0,
+            blocks: cb_blocks,
+            edges: vec![],
+        });
+
+        // Effect body CFG: ExprStmt(setTimeout(cb, 0))
+        let mut eff_blocks = HashMap::new();
+        eff_blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![Stmt::ExprStmt(Expr::Call {
+                    fn_: Box::new(Expr::Var("setTimeout".to_string())),
+                    args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(0))],
+                })],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let eff_cfg = CFG {
+            entry: 0,
+            blocks: eff_blocks,
+            edges: vec![],
+        };
+
+        let hooks = vec![
+            HookEntry::State {
+                label: 0,
+                init: Expr::Lit(Prim::Int(0)),
+            },
+            HookEntry::Effect {
+                label: 1,
+                body_cfg: eff_cfg,
+                deps: Some(vec![Expr::StateVal(0)]),
+            },
+        ];
+
+        // Render: bind n, setN, cb (FnLit → ExprId(1) → heap)
+        let render_stmts = vec![
+            Stmt::Let {
+                var: "n".to_string(),
+                rhs: Expr::StateVal(0),
+            },
+            Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+            },
+            Stmt::Let {
+                var: "cb".to_string(),
+                rhs: Expr::FnLit {
+                    id: ExprId(1),
+                    params: vec![],
+                    body_cfg: cb_body,
+                },
+            },
+        ];
+
+        let comp = component(hooks, render_stmts);
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+
+        // setN({}) fires via cb → Reference(Unstable) joins Number([0,0]) → Top.
+        assert_eq!(result.state_store.get(0), StateValue::Top);
     }
 }

@@ -54,6 +54,9 @@ pub struct AnalysisResult<D: AbstractDomain> {
     pub memo_store: MemoStore<D>,
     /// Abstract environment at the *exit* of each render-CFG block.
     pub block_states: HashMap<BlockId, AbstractEnv<D>>,
+    /// Abstract environment at the *exit* of each block, per effect body CFG.
+    /// Populated at convergence (overwritten each iteration; last write is final).
+    pub effect_block_states: HashMap<HookLabel, HashMap<BlockId, AbstractEnv<D>>>,
     pub hook_calls: Vec<HookCallInfo>,
     pub effect_info: HashMap<HookLabel, EffectInfo>,
     /// Labels whose state was widened to force convergence.

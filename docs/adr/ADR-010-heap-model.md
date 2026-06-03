@@ -80,7 +80,7 @@ Le heap est ainsi peuplé dès la première rencontre du `let cb = () => ...` da
 
 ### 5. Transfer trait — heap en paramètre
 
-`heap: &mut Heap` ajouté à `exec_stmt` et `eval_expr` dans le trait `Transfer`. `analyze_cfg` maintient un `heap_out: Heap` local accumulé sur tous les blocs. La fonction retourne `(exit_envs, state_out, heap_out)`.
+`heap: &mut Heap` ajouté à `exec_stmt` et `eval_expr` dans le trait `Transfer`. `analyze_cfg` accepte `heap: &mut Heap` et mute le heap in-place. La fonction retourne `(exit_envs, state_out)` — le heap n'est plus retourné mais accumulé directement. Dans `fixpoint.rs`, un seul `heap` est créé avant la outer loop et passé à toutes les passes render et effect : le heap survit d'une itération à l'autre et entre passes render→effect (B5 cross-pass corrigé).
 
 ### 6. B5 — résolution callback par variable
 
@@ -119,7 +119,6 @@ if class == TriggerClass::Unknown {
 ## Limites connues
 
 - **Back-edge dans un corps de callback** → FN (documenté ADR-009, inchangé).
-- **Heap non persisté entre les passes fixpoint** : `analyze_cfg` crée un `Heap::new()` à chaque appel. Si le `let cb = ...` est dans le `render_cfg` et `setTimeout(cb)` dans un `effect_cfg`, le heap du render n'est pas visible dans l'effect. Fix futur : passer le heap accumulé du render dans les effect passes dans `fixpoint.rs`.
 - **Domaines objet/tableau** (`HeapValue::Obj`/`Arr`) réservés — non utilisés jusqu'à l'implémentation d'un domaine de champs.
 - **Multi-site join** : `locs` peut contenir plusieurs ExprIds pour une même variable (branches ternaires). Tous les corps sont exécutés et leurs effets joints — correct par over-approximation.
 
@@ -132,7 +131,9 @@ if class == TriggerClass::Unknown {
 - `src/domains/stores/abstract_env.rs` — `locs: HashMap<Var, HashSet<ExprId>>`, `extend_loc`, `lookup_env_val`, join/widen/leq des locs.
 - `src/domains/stores/heap.rs` — **nouveau** fichier.
 - `src/domains/mod.rs` — `Transfer` étendu avec `heap: &mut Heap`.
-- `src/engine/cfg_analyzer.rs` — `heap_out` accumulé, retourné.
+- `src/engine/cfg_analyzer.rs` — accepte `heap: &mut Heap` (plus de création interne), retourne `(exit_envs, state_out)`.
+- `src/engine/fixpoint.rs` — `heap` créé une fois avant la outer loop, passé à toutes les passes render et effect ; `effect_block_states: HashMap<HookLabel, HashMap<BlockId, AbstractEnv<D>>>` ajouté à `AnalysisResult`.
+- `src/engine/analysis_result.rs` — champ `effect_block_states` ajouté.
 - `src/domains/impls/state_value.rs` — `exec_var_callback`, `exec_callbacks_depth`, `exec_body_depth`, `exec_state_value_depth`.
 - `src/rules/mod.rs` — `collect_setter_calls` étendu : pré-scan du CFG pour `let X = FnLit{...}` → résolution des args `Var("X")` (B5) et des callees directs `Call{ fn_: Var("X") }` (B6) dans la vérification structurelle. Nécessaire pour que `InfiniteLoop` tire sur les patterns variable-callback même quand l'analyse sémantique widen.
 - Blast radius IR : tous les match sur `ObjectLit`/`ArrayLit`/`FnLit` mis à jour (wildcard `{ .. }` ou nommage des champs).

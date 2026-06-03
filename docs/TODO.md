@@ -6,7 +6,6 @@
 
 - **Back-edge dans un corps de callback** → `exec_body` bail conservateur (`Reference(Unstable)`) → setter dans une boucle `for`/`while` interne non propagé (FN). Fix : traversée *side-effect-only* même en présence de back-edge.
 - **Callees inconnus sans `Loc`** (`myHelper(() => setX())`) → FN sur helpers externes/wrappers qui exécutent le callback en synchrone.
-- **Heap non persisté entre les passes fixpoint** → `analyze_cfg` repart avec `Heap::new()` à chaque appel. Pattern `let cb = ...` dans `render_cfg` puis `setTimeout(cb)` dans `effect_cfg` : le heap du render n'est pas visible dans l'effect. Fix : accumuler et passer `heap` à travers les itérations dans `fixpoint.rs`.
 
 ### Functional updaters `(n) => n + 1` ne déclenchent pas de widening
 
@@ -25,10 +24,6 @@ useEffect(() => {
 ---
 
 ## Infrastructure
-
-### Heap — passer à travers le fixpoint
-
-Actuellement `fixpoint.rs` crée `Heap::new()` à chaque appel à `analyze_cfg`. Le heap devrait survivre d'une itération à l'autre (monotone, insert-only). Fix dans `fixpoint.rs` : accumuler `heap_render` et le passer aux effect passes.
 
 ### Analyse des event handlers comme points d'entrée *(ADR-009)*
 
