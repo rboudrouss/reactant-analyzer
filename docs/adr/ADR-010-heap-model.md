@@ -134,4 +134,5 @@ if class == TriggerClass::Unknown {
 - `src/domains/mod.rs` — `Transfer` étendu avec `heap: &mut Heap`.
 - `src/engine/cfg_analyzer.rs` — `heap_out` accumulé, retourné.
 - `src/domains/impls/state_value.rs` — `exec_var_callback`, `exec_callbacks_depth`, `exec_body_depth`, `exec_state_value_depth`.
+- `src/rules/mod.rs` — `collect_setter_calls` étendu : pré-scan du CFG pour `let X = FnLit{...}` → résolution des args `Var("X")` (B5) et des callees directs `Call{ fn_: Var("X") }` (B6) dans la vérification structurelle. Nécessaire pour que `InfiniteLoop` tire sur les patterns variable-callback même quand l'analyse sémantique widen.
 - Blast radius IR : tous les match sur `ObjectLit`/`ArrayLit`/`FnLit` mis à jour (wildcard `{ .. }` ou nommage des champs).
