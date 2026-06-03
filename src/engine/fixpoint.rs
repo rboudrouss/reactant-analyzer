@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     domains::{
-        AbstractDomain, FixpointCtx, NullCtx, Transfer,
+        AbstractDomain, AnalysisCtx, FixpointCtx, NullCtx, Transfer,
         impls::StateValue,
         stores::{AbstractEnv, MemoStore, StateStore, TypedStateStore},
     },
@@ -66,14 +66,14 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
         let init_untyped = StateStore::bottom();
         for hook in &hooks {
             if let HookEntry::State { label, init } = hook {
-                let init_val = transfer.eval_expr(
-                    init,
-                    &init_env,
-                    &init_untyped,
-                    &init_memo,
-                    &mut crate::domains::Heap::new(),
-                    &NullCtx,
-                );
+                let init_val = {
+                    let mut init_untyped_mut = init_untyped.clone();
+                    let mut init_memo_mut = init_memo.clone();
+                    let mut heap = crate::domains::Heap::new();
+                    let mut ac =
+                        AnalysisCtx::null(&mut init_untyped_mut, &mut init_memo_mut, &mut heap);
+                    transfer.eval_expr(init, &init_env, &mut ac)
+                };
                 typed_state.update(*label, init_val);
             }
         }

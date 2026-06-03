@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
 
-use crate::domains::{AbstractDomain, AbstractEnv, MemoStore, QueryContext, StateStore, Transfer};
+use crate::domains::{
+    AbstractDomain, AbstractEnv, AnalysisCtx, MemoStore, QueryContext, StateStore, Transfer,
+};
 
 use super::query::{DomainQuery, Queryable};
 
@@ -106,10 +108,7 @@ where
         &self,
         _expr: &crate::ir::expr::Expr,
         _env: &AbstractEnv<Self::Domain>,
-        _state: &StateStore<Self::Domain>,
-        _memo: &MemoStore<Self::Domain>,
-        _heap: &mut crate::domains::Heap,
-        _ctx: &dyn QueryContext,
+        _ctx: &mut AnalysisCtx<Self::Domain>,
     ) -> Self::Domain {
         // TODO: implement full projection/injection when fused fixpoint is needed.
         // For now ProductTransfer exists for Queryable delegation only.
@@ -120,10 +119,7 @@ where
         &self,
         _stmt: &crate::ir::stmt::Stmt,
         _env: &mut AbstractEnv<Self::Domain>,
-        _state: &mut StateStore<Self::Domain>,
-        _memo: &mut MemoStore<Self::Domain>,
-        _heap: &mut crate::domains::Heap,
-        _ctx: &dyn QueryContext,
+        _ctx: &mut AnalysisCtx<Self::Domain>,
     ) {
         // TODO: implement full projection/injection when fused fixpoint is needed.
     }

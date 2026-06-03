@@ -1,7 +1,7 @@
 use crate::{
     domains::{
-        StateValue, StateValueTransfer, Transfer,
-        stores::{AbstractEnv, MemoStore, StateStore},
+        AbstractDomain, StateValue, StateValueTransfer, Transfer,
+        stores::{AbstractEnv, Heap, MemoStore, StateStore},
     },
     engine::AnalysisResult,
     ir::expr::Expr,
@@ -35,6 +35,37 @@ impl QueryContext for NullCtx {
     }
 }
 
+// ── AnalysisCtx ───────────────────────────────────────────────────────────────
+
+/// Bundle of mutable analysis state threaded through `Transfer` methods.
+///
+/// Replaces the five separate `(env, state, memo, heap, ctx)` parameters.
+/// `env` is kept as a separate parameter since its mutability and lifetime
+/// differ between `eval_expr` (`&`) and `exec_stmt` (`&mut`).
+pub struct AnalysisCtx<'a, D: AbstractDomain> {
+    pub state: &'a mut StateStore<D>,
+    pub memo: &'a mut MemoStore<D>,
+    pub heap: &'a mut Heap,
+    pub query: &'a dyn QueryContext,
+}
+
+impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
+    /// Construct with `NullCtx` as the query context (tests, simple impls).
+    pub fn null(
+        state: &'a mut StateStore<D>,
+        memo: &'a mut MemoStore<D>,
+        heap: &'a mut Heap,
+    ) -> Self {
+        static NULL: NullCtx = NullCtx;
+        AnalysisCtx {
+            state,
+            memo,
+            heap,
+            query: &NULL,
+        }
+    }
+}
+
 // ── FixpointCtx ───────────────────────────────────────────────────────────────
 
 /// Mid-fixpoint context: evaluates `expr` against the current iteration's state.
@@ -49,14 +80,11 @@ pub struct FixpointCtx<'a> {
 
 impl QueryContext for FixpointCtx<'_> {
     fn state_value_of(&self, expr: &Expr) -> StateValue {
-        StateValueTransfer.eval_expr(
-            expr,
-            &AbstractEnv::bottom(),
-            self.state,
-            self.memo,
-            &mut crate::domains::Heap::new(),
-            &NullCtx,
-        )
+        let mut state = self.state.clone();
+        let mut memo = self.memo.clone();
+        let mut heap = Heap::new();
+        let mut ctx = AnalysisCtx::null(&mut state, &mut memo, &mut heap);
+        StateValueTransfer.eval_expr(expr, &AbstractEnv::bottom(), &mut ctx)
     }
 }
 
@@ -69,13 +97,10 @@ pub struct AnalysisQueryCtx<'a> {
 
 impl QueryContext for AnalysisQueryCtx<'_> {
     fn state_value_of(&self, expr: &Expr) -> StateValue {
-        StateValueTransfer.eval_expr(
-            expr,
-            &self.result.exit_env(),
-            &self.result.state_store,
-            &self.result.memo_store,
-            &mut crate::domains::Heap::new(),
-            &NullCtx,
-        )
+        let mut state = self.result.state_store.clone();
+        let mut memo = self.result.memo_store.clone();
+        let mut heap = Heap::new();
+        let mut ctx = AnalysisCtx::null(&mut state, &mut memo, &mut heap);
+        StateValueTransfer.eval_expr(expr, &self.result.exit_env(), &mut ctx)
     }
 }

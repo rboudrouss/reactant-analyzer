@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::{
     domains::{
-        AbstractDomain, QueryContext, Transfer,
+        AbstractDomain, AnalysisCtx, QueryContext, Transfer,
         stores::{AbstractEnv, MemoStore, StateStore},
     },
     ir::{
@@ -57,15 +57,14 @@ pub fn analyze_cfg<T: Transfer>(
         let mut memo_local = memo.clone();
 
         if let Some(block) = cfg.blocks.get(&b) {
+            let mut ac = AnalysisCtx {
+                state: &mut state_out,
+                memo: &mut memo_local,
+                heap: &mut heap_out,
+                query: ctx,
+            };
             for stmt in &block.stmts {
-                transfer.exec_stmt(
-                    stmt,
-                    &mut env_out,
-                    &mut state_out,
-                    &mut memo_local,
-                    &mut heap_out,
-                    ctx,
-                );
+                transfer.exec_stmt(stmt, &mut env_out, &mut ac);
             }
         }
 

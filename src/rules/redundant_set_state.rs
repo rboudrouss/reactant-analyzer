@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     domains::{
-        AbstractEnv, MemoStore, NullCtx, StateStore, StateValue, StateValueTransfer, Transfer,
+        AbstractEnv, AnalysisCtx, MemoStore, StateStore, StateValue, StateValueTransfer, Transfer,
     },
     engine::AnalysisResult,
     ir::{cfg::CFG, expr::Expr, hooks::HookEntry, stmt::Stmt, types::HookLabel},
@@ -162,14 +162,10 @@ fn collect_setter_vals_in_expr(
                 let arg_val = args
                     .first()
                     .map(|a| {
-                        transfer.eval_expr(
-                            a,
-                            env,
-                            state,
-                            memo,
-                            &mut crate::domains::Heap::new(),
-                            &NullCtx,
-                        )
+                        let mut s = state.clone();
+                        let mut m = memo.clone();
+                        let mut h = crate::domains::Heap::new();
+                        transfer.eval_expr(a, env, &mut AnalysisCtx::null(&mut s, &mut m, &mut h))
                     })
                     .unwrap_or(StateValue::Top);
                 match tracker.entry(label) {
@@ -238,14 +234,10 @@ fn check_setter_calls(
             let arg_val = args
                 .first()
                 .map(|a| {
-                    transfer.eval_expr(
-                        a,
-                        env,
-                        state,
-                        memo,
-                        &mut crate::domains::Heap::new(),
-                        &NullCtx,
-                    )
+                    let mut s = state.clone();
+                    let mut m = memo.clone();
+                    let mut h = crate::domains::Heap::new();
+                    transfer.eval_expr(a, env, &mut AnalysisCtx::null(&mut s, &mut m, &mut h))
                 })
                 .unwrap_or(StateValue::Top);
 

@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use crate::{
     domains::{
-        AbstractDomain, QueryContext, Transfer,
-        stores::{AbstractEnv, EnvVal, Heap, HeapValue, MemoStore, StateStore},
+        AbstractDomain, AnalysisCtx, Transfer,
+        stores::{AbstractEnv, EnvVal, HeapValue},
     },
     ir::{
         cfg::{CFG, EdgeKind, Terminator},
@@ -30,12 +30,9 @@ pub(crate) fn exec_stmt_with_callbacks<T: Transfer>(
     transfer: &T,
     stmt: &Stmt,
     env: &mut AbstractEnv<T::Domain>,
-    state: &mut StateStore<T::Domain>,
-    memo: &mut MemoStore<T::Domain>,
-    heap: &mut Heap,
-    ctx: &dyn QueryContext,
+    ctx: &mut AnalysisCtx<T::Domain>,
 ) {
-    exec_full_stmt(transfer, stmt, env, state, memo, heap, ctx, 0);
+    exec_full_stmt(transfer, stmt, env, ctx, 0);
 }
 
 /// Execute a FnLit body CFG and return its abstract return value.
@@ -46,12 +43,9 @@ pub(crate) fn exec_body<T: Transfer>(
     transfer: &T,
     cfg: &CFG,
     entry_env: &AbstractEnv<T::Domain>,
-    state: &mut StateStore<T::Domain>,
-    memo: &mut MemoStore<T::Domain>,
-    heap: &mut Heap,
-    ctx: &dyn QueryContext,
+    ctx: &mut AnalysisCtx<T::Domain>,
 ) -> T::Domain {
-    exec_body_impl(transfer, cfg, entry_env, state, memo, heap, ctx, 0)
+    exec_body_impl(transfer, cfg, entry_env, ctx, 0)
 }
 
 /// Depth-propagating variant of [`exec_body`]. Used inside callbacks/bodies so
@@ -60,13 +54,10 @@ pub(crate) fn exec_body_depth<T: Transfer>(
     transfer: &T,
     cfg: &CFG,
     entry_env: &AbstractEnv<T::Domain>,
-    state: &mut StateStore<T::Domain>,
-    memo: &mut MemoStore<T::Domain>,
-    heap: &mut Heap,
-    ctx: &dyn QueryContext,
+    ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) -> T::Domain {
-    exec_body_impl(transfer, cfg, entry_env, state, memo, heap, ctx, depth)
+    exec_body_impl(transfer, cfg, entry_env, ctx, depth)
 }
 
 // ── Internal ──────────────────────────────────────────────────────────────────
@@ -79,18 +70,15 @@ fn exec_full_stmt<T: Transfer>(
     transfer: &T,
     stmt: &Stmt,
     env: &mut AbstractEnv<T::Domain>,
-    state: &mut StateStore<T::Domain>,
-    memo: &mut MemoStore<T::Domain>,
-    heap: &mut Heap,
-    ctx: &dyn QueryContext,
+    ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) {
     let main_expr = match stmt {
         Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => rhs,
         Stmt::ExprStmt(expr) => expr,
     };
-    exec_callbacks_depth(transfer, main_expr, env, state, memo, heap, ctx, depth);
-    exec_stmt_core(transfer, stmt, env, state, memo, heap, ctx, depth);
+    exec_callbacks_depth(transfer, main_expr, env, ctx, depth);
+    exec_stmt_core(transfer, stmt, env, ctx, depth);
 }
 
 /// Generic core statement semantics (no callback traversal).
@@ -104,10 +92,7 @@ fn exec_stmt_core<T: Transfer>(
     transfer: &T,
     stmt: &Stmt,
     env: &mut AbstractEnv<T::Domain>,
-    state: &mut StateStore<T::Domain>,
-    memo: &mut MemoStore<T::Domain>,
-    heap: &mut Heap,
-    ctx: &dyn QueryContext,
+    ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) {
     match stmt {
@@ -122,7 +107,7 @@ fn exec_stmt_core<T: Transfer>(
             } = rhs
             {
                 env.extend_loc(var.clone(), *id);
-                heap.insert(
+                ctx.heap.insert(
                     *id,
                     HeapValue::Fn {
                         params: params.clone(),
@@ -130,7 +115,7 @@ fn exec_stmt_core<T: Transfer>(
                     },
                 );
             }
-            let val = transfer.eval_expr(rhs, env, state, memo, heap, ctx);
+            let val = transfer.eval_expr(rhs, env, ctx);
             env.extend(var.clone(), val);
         }
         Stmt::Assign { var, rhs } => {
@@ -141,7 +126,7 @@ fn exec_stmt_core<T: Transfer>(
             } = rhs
             {
                 env.extend_loc(var.clone(), *id);
-                heap.insert(
+                ctx.heap.insert(
                     *id,
                     HeapValue::Fn {
                         params: params.clone(),
@@ -149,7 +134,7 @@ fn exec_stmt_core<T: Transfer>(
                     },
                 );
             }
-            let val = transfer.eval_expr(rhs, env, state, memo, heap, ctx);
+            let val = transfer.eval_expr(rhs, env, ctx);
             env.extend(var.clone(), val);
         }
         Stmt::ExprStmt(expr) => {
@@ -163,23 +148,14 @@ fn exec_stmt_core<T: Transfer>(
                     }) => {
                         let mut sub_env = env.clone();
                         if let Some(param) = params.first() {
-                            sub_env.extend(param.clone(), state.get(label));
+                            sub_env.extend(param.clone(), ctx.state.get(label));
                         }
-                        exec_body_depth(
-                            transfer,
-                            body_cfg,
-                            &sub_env,
-                            state,
-                            memo,
-                            heap,
-                            ctx,
-                            depth + 1,
-                        )
+                        exec_body_depth(transfer, body_cfg, &sub_env, ctx, depth + 1)
                     }
-                    Some(a) => transfer.eval_expr(a, env, state, memo, heap, ctx),
+                    Some(a) => transfer.eval_expr(a, env, ctx),
                     None => T::Domain::top(),
                 };
-                state.update(label, arg_val);
+                ctx.state.update(label, arg_val);
             }
         }
     }
@@ -193,10 +169,7 @@ fn exec_body_impl<T: Transfer>(
     transfer: &T,
     cfg: &CFG,
     entry_env: &AbstractEnv<T::Domain>,
-    state: &mut StateStore<T::Domain>,
-    memo: &mut MemoStore<T::Domain>,
-    heap: &mut Heap,
-    ctx: &dyn QueryContext,
+    ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) -> T::Domain {
     if cfg.edges.iter().any(|e| matches!(e.kind, EdgeKind::Back)) {
@@ -227,11 +200,11 @@ fn exec_body_impl<T: Transfer>(
 
         if let Some(block) = cfg.blocks.get(&bid) {
             for stmt in &block.stmts {
-                exec_full_stmt(transfer, stmt, &mut env, state, memo, heap, ctx, depth);
+                exec_full_stmt(transfer, stmt, &mut env, ctx, depth);
             }
             match &block.term {
                 Terminator::Return(expr) => {
-                    let v = transfer.eval_expr(expr, &env, state, memo, heap, ctx);
+                    let v = transfer.eval_expr(expr, &env, ctx);
                     return_val = return_val.join(&v);
                 }
                 Terminator::Jump(next) => {
@@ -268,10 +241,7 @@ fn exec_callbacks_depth<T: Transfer>(
     transfer: &T,
     expr: &Expr,
     env: &AbstractEnv<T::Domain>,
-    state: &mut StateStore<T::Domain>,
-    memo: &mut MemoStore<T::Domain>,
-    heap: &mut Heap,
-    ctx: &dyn QueryContext,
+    ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) {
     if depth >= MAX_INLINE_DEPTH {
@@ -281,7 +251,7 @@ fn exec_callbacks_depth<T: Transfer>(
         Expr::Call { fn_, args } => {
             let class = classify_callee(fn_, env);
             // Descend the receiver: handles chains like `a.then(x).then(y)`.
-            exec_callbacks_depth(transfer, fn_, env, state, memo, heap, ctx, depth);
+            exec_callbacks_depth(transfer, fn_, env, ctx, depth);
             for arg in args {
                 match arg {
                     Expr::FnLit {
@@ -291,25 +261,16 @@ fn exec_callbacks_depth<T: Transfer>(
                         for p in params {
                             sub_env.extend(p.clone(), T::Domain::top());
                         }
-                        let _ = exec_body_depth(
-                            transfer,
-                            body_cfg,
-                            &sub_env,
-                            state,
-                            memo,
-                            heap,
-                            ctx,
-                            depth + 1,
-                        );
+                        let _ = exec_body_depth(transfer, body_cfg, &sub_env, ctx, depth + 1);
                     }
                     // B5: variable callback — resolve Identifier to heap Fn and execute.
                     Expr::Var(name) if class == TriggerClass::InCycle => {
-                        exec_var_callback(transfer, name, env, state, memo, heap, ctx, depth);
+                        exec_var_callback(transfer, name, env, ctx, depth);
                     }
                     // Setter/Subscription/Unknown inline closures not descended (ADR-009).
                     Expr::FnLit { .. } => {}
                     other => {
-                        exec_callbacks_depth(transfer, other, env, state, memo, heap, ctx, depth);
+                        exec_callbacks_depth(transfer, other, env, ctx, depth);
                     }
                 }
             }
@@ -317,47 +278,47 @@ fn exec_callbacks_depth<T: Transfer>(
             // External/imported functions have no Loc → skipped (no FP).
             if class == TriggerClass::Unknown {
                 if let Expr::Var(name) = fn_.as_ref() {
-                    exec_var_callback(transfer, name, env, state, memo, heap, ctx, depth);
+                    exec_var_callback(transfer, name, env, ctx, depth);
                 }
             }
         }
         Expr::BinOp { lhs, rhs, .. } => {
-            exec_callbacks_depth(transfer, lhs, env, state, memo, heap, ctx, depth);
-            exec_callbacks_depth(transfer, rhs, env, state, memo, heap, ctx, depth);
+            exec_callbacks_depth(transfer, lhs, env, ctx, depth);
+            exec_callbacks_depth(transfer, rhs, env, ctx, depth);
         }
         Expr::UnaryOp { arg, .. } => {
-            exec_callbacks_depth(transfer, arg, env, state, memo, heap, ctx, depth);
+            exec_callbacks_depth(transfer, arg, env, ctx, depth);
         }
         Expr::FieldAccess { obj, .. } => {
-            exec_callbacks_depth(transfer, obj, env, state, memo, heap, ctx, depth);
+            exec_callbacks_depth(transfer, obj, env, ctx, depth);
         }
         Expr::IndexAccess { arr, idx } => {
-            exec_callbacks_depth(transfer, arr, env, state, memo, heap, ctx, depth);
-            exec_callbacks_depth(transfer, idx, env, state, memo, heap, ctx, depth);
+            exec_callbacks_depth(transfer, arr, env, ctx, depth);
+            exec_callbacks_depth(transfer, idx, env, ctx, depth);
         }
         Expr::ObjectLit { fields, .. } => {
             for (_, v) in fields {
-                exec_callbacks_depth(transfer, v, env, state, memo, heap, ctx, depth);
+                exec_callbacks_depth(transfer, v, env, ctx, depth);
             }
         }
         Expr::ArrayLit { elems, .. } => {
             for item in elems {
-                exec_callbacks_depth(transfer, item, env, state, memo, heap, ctx, depth);
+                exec_callbacks_depth(transfer, item, env, ctx, depth);
             }
         }
         Expr::CompApp { props, .. } => {
-            exec_callbacks_depth(transfer, props, env, state, memo, heap, ctx, depth);
+            exec_callbacks_depth(transfer, props, env, ctx, depth);
         }
         Expr::NativeElem {
             props, children, ..
         } => {
-            exec_callbacks_depth(transfer, props, env, state, memo, heap, ctx, depth);
+            exec_callbacks_depth(transfer, props, env, ctx, depth);
             for c in children {
-                exec_callbacks_depth(transfer, c, env, state, memo, heap, ctx, depth);
+                exec_callbacks_depth(transfer, c, env, ctx, depth);
             }
         }
         Expr::TSAnnotated(inner, _) => {
-            exec_callbacks_depth(transfer, inner, env, state, memo, heap, ctx, depth);
+            exec_callbacks_depth(transfer, inner, env, ctx, depth);
         }
         _ => {}
     }
@@ -369,32 +330,20 @@ fn exec_var_callback<T: Transfer>(
     transfer: &T,
     name: &str,
     env: &AbstractEnv<T::Domain>,
-    state: &mut StateStore<T::Domain>,
-    memo: &mut MemoStore<T::Domain>,
-    heap: &mut Heap,
-    ctx: &dyn QueryContext,
+    ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) {
     if let Some(EnvVal::Loc(ids)) = env.lookup_env_val(name) {
         let ids: Vec<_> = ids.iter().copied().collect();
         for id in ids {
-            if let Some(HeapValue::Fn { params, body_cfg }) = heap.get(id) {
+            if let Some(HeapValue::Fn { params, body_cfg }) = ctx.heap.get(id) {
                 let params = params.clone();
                 let body_cfg = Arc::clone(&body_cfg);
                 let mut sub_env = env.clone();
                 for p in &params {
                     sub_env.extend(p.clone(), T::Domain::top());
                 }
-                let _ = exec_body_depth(
-                    transfer,
-                    &body_cfg,
-                    &sub_env,
-                    state,
-                    memo,
-                    heap,
-                    ctx,
-                    depth + 1,
-                );
+                let _ = exec_body_depth(transfer, &body_cfg, &sub_env, ctx, depth + 1);
             }
         }
     }

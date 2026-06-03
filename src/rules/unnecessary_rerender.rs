@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::{
     domains::{
-        AbstractEnv, MemoStore, NullCtx, StateStore, StateValue, StateValueTransfer, Transfer,
+        AbstractEnv, AnalysisCtx, MemoStore, StateStore, StateValue, StateValueTransfer, Transfer,
     },
     engine::AnalysisResult,
     ir::{
@@ -40,13 +40,13 @@ impl Rule for UnnecessaryRerender {
             .iter()
             .filter_map(|h| {
                 if let HookEntry::State { label, init } = h {
+                    let mut s = empty_state.clone();
+                    let mut m = empty_memo.clone();
+                    let mut h = crate::domains::Heap::new();
                     let val = StateValueTransfer.eval_expr(
                         init,
                         &empty_env,
-                        &empty_state,
-                        &empty_memo,
-                        &mut crate::domains::Heap::new(),
-                        &NullCtx,
+                        &mut AnalysisCtx::null(&mut s, &mut m, &mut h),
                     );
                     Some((*label, val))
                 } else {
@@ -122,13 +122,13 @@ impl Rule for UnnecessaryRerender {
                         let arg_val = args
                             .first()
                             .map(|a| {
+                                let mut s = result.state_store.clone();
+                                let mut m = result.memo_store.clone();
+                                let mut h = crate::domains::Heap::new();
                                 StateValueTransfer.eval_expr(
                                     a,
                                     &empty_env,
-                                    &result.state_store,
-                                    &result.memo_store,
-                                    &mut crate::domains::Heap::new(),
-                                    &NullCtx,
+                                    &mut AnalysisCtx::null(&mut s, &mut m, &mut h),
                                 )
                             })
                             .unwrap_or(StateValue::Top);

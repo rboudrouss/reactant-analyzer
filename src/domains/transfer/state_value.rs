@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use crate::{
     domains::{
-        QueryContext, Transfer,
+        AnalysisCtx, QueryContext, Transfer,
         impls::{BoolVal, Interval, Stability, StateValue},
         interp::exec_stmt_with_callbacks,
-        stores::{AbstractEnv, Heap, MemoStore, StateStore},
+        stores::{AbstractEnv, MemoStore, StateStore},
     },
     ir::{
         expr::{BinOp, Expr, Prim, UnaryOp},
@@ -36,24 +36,18 @@ impl Transfer for StateValueTransfer {
         &self,
         expr: &Expr,
         env: &AbstractEnv<StateValue>,
-        state: &StateStore<StateValue>,
-        memo: &MemoStore<StateValue>,
-        _heap: &mut Heap,
-        _ctx: &dyn QueryContext,
+        ctx: &mut AnalysisCtx<StateValue>,
     ) -> StateValue {
-        eval_state_value(expr, env, state, memo)
+        eval_state_value(expr, env, ctx.state, ctx.memo)
     }
 
     fn exec_stmt(
         &self,
         stmt: &Stmt,
         env: &mut AbstractEnv<StateValue>,
-        state: &mut StateStore<StateValue>,
-        memo: &mut MemoStore<StateValue>,
-        heap: &mut Heap,
-        ctx: &dyn QueryContext,
+        ctx: &mut AnalysisCtx<StateValue>,
     ) {
-        exec_stmt_with_callbacks(self, stmt, env, state, memo, heap, ctx);
+        exec_stmt_with_callbacks(self, stmt, env, ctx);
     }
 
     fn recompute_memo(
@@ -174,9 +168,9 @@ fn eval_unary(op: &UnaryOp, val: StateValue) -> StateValue {
 mod tests {
     use super::*;
     use crate::domains::{
-        NullCtx,
+        AnalysisCtx,
         interp::exec_body,
-        stores::{AbstractEnv, MemoStore, StateStore},
+        stores::{AbstractEnv, Heap, MemoStore, StateStore},
     };
     use crate::ir::{
         cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator},
@@ -216,15 +210,13 @@ mod tests {
 
     #[test]
     fn eval_int_literal() {
-        let (env, state, memo) = empty();
+        let (env, mut state, mut memo) = empty();
+        let mut heap = Heap::new();
         assert_eq!(
             StateValueTransfer.eval_expr(
                 &Expr::Lit(Prim::Int(5)),
                 &env,
-                &state,
-                &memo,
-                &mut Heap::new(),
-                &NullCtx,
+                &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
             ),
             StateValue::Number(Interval::point(5.0))
         );
@@ -232,15 +224,13 @@ mod tests {
 
     #[test]
     fn eval_bool_literal() {
-        let (env, state, memo) = empty();
+        let (env, mut state, mut memo) = empty();
+        let mut heap = Heap::new();
         assert_eq!(
             StateValueTransfer.eval_expr(
                 &Expr::Lit(Prim::Bool(true)),
                 &env,
-                &state,
-                &memo,
-                &mut Heap::new(),
-                &NullCtx,
+                &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
             ),
             StateValue::Boolean(BoolVal::True)
         );
@@ -248,7 +238,8 @@ mod tests {
 
     #[test]
     fn eval_object_is_unstable_reference() {
-        let (env, state, memo) = empty();
+        let (env, mut state, mut memo) = empty();
+        let mut heap = Heap::new();
         assert_eq!(
             StateValueTransfer.eval_expr(
                 &Expr::ObjectLit {
@@ -256,10 +247,7 @@ mod tests {
                     fields: vec![]
                 },
                 &env,
-                &state,
-                &memo,
-                &mut Heap::new(),
-                &NullCtx,
+                &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
             ),
             StateValue::Reference(Stability::Unstable)
         );
@@ -267,56 +255,69 @@ mod tests {
 
     #[test]
     fn eval_binop_add_numbers() {
-        let (env, state, memo) = empty();
+        let (env, mut state, mut memo) = empty();
+        let mut heap = Heap::new();
         let expr = Expr::BinOp {
             op: BinOp::Add,
             lhs: Box::new(Expr::Lit(Prim::Int(3))),
             rhs: Box::new(Expr::Lit(Prim::Int(4))),
         };
         assert_eq!(
-            StateValueTransfer.eval_expr(&expr, &env, &state, &memo, &mut Heap::new(), &NullCtx),
+            StateValueTransfer.eval_expr(
+                &expr,
+                &env,
+                &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap)
+            ),
             StateValue::Number(Interval::point(7.0))
         );
     }
 
     #[test]
     fn eval_binop_add_state_plus_one_uses_state_interval() {
-        let (env, mut state, memo) = empty();
+        let (env, mut state, mut memo) = empty();
         state.update(0, StateValue::Number(Interval::point(2.0)));
+        let mut heap = Heap::new();
         let expr = Expr::BinOp {
             op: BinOp::Add,
             lhs: Box::new(Expr::StateVal(0)),
             rhs: Box::new(Expr::Lit(Prim::Int(1))),
         };
         assert_eq!(
-            StateValueTransfer.eval_expr(&expr, &env, &state, &memo, &mut Heap::new(), &NullCtx),
+            StateValueTransfer.eval_expr(
+                &expr,
+                &env,
+                &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap)
+            ),
             StateValue::Number(Interval::point(3.0))
         );
     }
 
     #[test]
     fn eval_unary_not_true_is_false() {
-        let (env, state, memo) = empty();
+        let (env, mut state, mut memo) = empty();
+        let mut heap = Heap::new();
         let expr = Expr::UnaryOp {
             op: UnaryOp::Not,
             arg: Box::new(Expr::Lit(Prim::Bool(true))),
         };
         assert_eq!(
-            StateValueTransfer.eval_expr(&expr, &env, &state, &memo, &mut Heap::new(), &NullCtx),
+            StateValueTransfer.eval_expr(
+                &expr,
+                &env,
+                &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap)
+            ),
             StateValue::Boolean(BoolVal::False)
         );
     }
 
     #[test]
     fn eval_string_literal_gives_singleton() {
-        let (env, state, memo) = empty();
+        let (env, mut state, mut memo) = empty();
+        let mut heap = Heap::new();
         let v = StateValueTransfer.eval_expr(
             &Expr::Lit(Prim::String("dark".into())),
             &env,
-            &state,
-            &memo,
-            &mut Heap::new(),
-            &NullCtx,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
         let expected =
             StateValue::StrConst(Arc::new(std::iter::once("dark".to_string()).collect()));
@@ -328,16 +329,14 @@ mod tests {
     #[test]
     fn exec_setter_call_updates_state() {
         let (mut env, mut state, mut memo) = empty();
+        let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
             &Stmt::Let {
                 var: "setN".to_string(),
                 rhs: Expr::StateSetter(0),
             },
             &mut env,
-            &mut state,
-            &mut memo,
-            &mut Heap::new(),
-            &NullCtx,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
         StateValueTransfer.exec_stmt(
             &Stmt::ExprStmt(Expr::Call {
@@ -345,10 +344,7 @@ mod tests {
                 args: vec![Expr::Lit(Prim::Int(42))],
             }),
             &mut env,
-            &mut state,
-            &mut memo,
-            &mut Heap::new(),
-            &NullCtx,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
         assert_eq!(state.get(0), StateValue::Number(Interval::point(42.0)));
     }
@@ -371,6 +367,7 @@ mod tests {
             },
         );
 
+        let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
             &Stmt::ExprStmt(Expr::Call {
                 fn_: Box::new(Expr::Var("setN".to_string())),
@@ -381,10 +378,7 @@ mod tests {
                 }],
             }),
             &mut env,
-            &mut state,
-            &mut memo,
-            &mut Heap::new(),
-            &NullCtx,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(
@@ -446,6 +440,7 @@ mod tests {
             ],
         };
 
+        let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
             &Stmt::ExprStmt(Expr::Call {
                 fn_: Box::new(Expr::Var("setN".to_string())),
@@ -456,10 +451,7 @@ mod tests {
                 }],
             }),
             &mut env,
-            &mut state,
-            &mut memo,
-            &mut Heap::new(),
-            &NullCtx,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(
@@ -494,14 +486,12 @@ mod tests {
         let mut state = StateStore::bottom();
         let mut memo = MemoStore::new();
 
+        let mut heap = Heap::new();
         let result = exec_body(
             &StateValueTransfer,
             &body_cfg,
             &entry_env,
-            &mut state,
-            &mut memo,
-            &mut Heap::new(),
-            &NullCtx,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
         assert_eq!(result, StateValue::Top);
     }
@@ -539,13 +529,11 @@ mod tests {
                 body_cfg: Arc::new(cb_body),
             }],
         });
+        let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
             &stmt,
             &mut env,
-            &mut state,
-            &mut memo,
-            &mut Heap::new(),
-            &NullCtx,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::Top);
@@ -575,13 +563,11 @@ mod tests {
                 Expr::Lit(Prim::Int(1000)),
             ],
         });
+        let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
             &stmt,
             &mut env,
-            &mut state,
-            &mut memo,
-            &mut Heap::new(),
-            &NullCtx,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::Number(Interval::point(42.0)));
@@ -631,13 +617,11 @@ mod tests {
                 body_cfg: Arc::new(cb_b),
             }],
         };
+        let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
             &Stmt::ExprStmt(outer),
             &mut env,
-            &mut state,
-            &mut memo,
-            &mut Heap::new(),
-            &NullCtx,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::Number(Interval::point(1.0)));
@@ -674,13 +658,11 @@ mod tests {
                 }],
             },
         };
+        let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
             &stmt,
             &mut env,
-            &mut state,
-            &mut memo,
-            &mut Heap::new(),
-            &NullCtx,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::Number(Interval::point(7.0)));
@@ -713,13 +695,11 @@ mod tests {
                 },
             ],
         });
+        let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
             &stmt,
             &mut env,
-            &mut state,
-            &mut memo,
-            &mut Heap::new(),
-            &NullCtx,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::Bottom);
@@ -765,13 +745,11 @@ mod tests {
                 },
             ],
         });
+        let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
             &stmt,
             &mut env,
-            &mut state,
-            &mut memo,
-            &mut Heap::new(),
-            &NullCtx,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::Number(Interval::point(1.0)));
@@ -811,13 +789,11 @@ mod tests {
                 body_cfg: Arc::new(cb),
             }],
         });
+        let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
             &stmt,
             &mut env,
-            &mut state,
-            &mut memo,
-            &mut Heap::new(),
-            &NullCtx,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::Number(Interval::point(42.0)));
@@ -853,9 +829,15 @@ mod tests {
 
         let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
-            &let_cb, &mut env, &mut state, &mut memo, &mut heap, &NullCtx,
+            &let_cb,
+            &mut env,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
-        StateValueTransfer.exec_stmt(&call, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+        StateValueTransfer.exec_stmt(
+            &call,
+            &mut env,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+        );
 
         assert_eq!(state.get(0), StateValue::Number(Interval::point(42.0)));
     }
@@ -887,7 +869,11 @@ mod tests {
                 body_cfg: Arc::new(cb_body),
             },
         );
-        StateValueTransfer.exec_stmt(&call, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+        StateValueTransfer.exec_stmt(
+            &call,
+            &mut env,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+        );
 
         assert_eq!(state.get(0), StateValue::Bottom);
     }
@@ -925,10 +911,14 @@ mod tests {
 
         let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
-            &let_load, &mut env, &mut state, &mut memo, &mut heap, &NullCtx,
+            &let_load,
+            &mut env,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
         StateValueTransfer.exec_stmt(
-            &call_load, &mut env, &mut state, &mut memo, &mut heap, &NullCtx,
+            &call_load,
+            &mut env,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::Number(Interval::point(7.0)));
@@ -961,9 +951,15 @@ mod tests {
         });
         let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
-            &let_cb, &mut env, &mut state, &mut memo, &mut heap, &NullCtx,
+            &let_cb,
+            &mut env,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
-        StateValueTransfer.exec_stmt(&call, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+        StateValueTransfer.exec_stmt(
+            &call,
+            &mut env,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+        );
         assert_eq!(state.get(0), StateValue::Number(Interval::point(5.0)));
     }
 
@@ -999,12 +995,13 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &let_update,
             &mut env,
-            &mut state,
-            &mut memo,
-            &mut heap,
-            &NullCtx,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
-        StateValueTransfer.exec_stmt(&call, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+        StateValueTransfer.exec_stmt(
+            &call,
+            &mut env,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+        );
         assert_eq!(state.get(0), StateValue::Number(Interval::point(3.0)));
     }
 
@@ -1053,18 +1050,19 @@ mod tests {
 
         let mut heap = Heap::new();
         StateValueTransfer.exec_stmt(
-            &let_inner, &mut env, &mut state, &mut memo, &mut heap, &NullCtx,
+            &let_inner,
+            &mut env,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
         StateValueTransfer.exec_stmt(
-            &let_outer, &mut env, &mut state, &mut memo, &mut heap, &NullCtx,
+            &let_outer,
+            &mut env,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
         StateValueTransfer.exec_stmt(
             &call_outer,
             &mut env,
-            &mut state,
-            &mut memo,
-            &mut heap,
-            &NullCtx,
+            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
         assert_eq!(state.get(0), StateValue::Number(Interval::point(9.0)));
     }
@@ -1134,8 +1132,11 @@ mod tests {
 
         let mut heap = Heap::new();
         for stmt in &stmts {
-            StateValueTransfer
-                .exec_stmt(stmt, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+            StateValueTransfer.exec_stmt(
+                stmt,
+                &mut env,
+                &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            );
         }
         assert_eq!(state.get(0), StateValue::Bottom);
     }

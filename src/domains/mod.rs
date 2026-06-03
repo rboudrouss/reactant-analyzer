@@ -6,7 +6,7 @@ pub mod query;
 pub mod stores;
 pub mod transfer;
 
-pub use context::{AnalysisQueryCtx, FixpointCtx, NullCtx, QueryContext};
+pub use context::{AnalysisCtx, AnalysisQueryCtx, FixpointCtx, NullCtx, QueryContext};
 pub use impls::{BoolVal, Interval, Stability, StateValue};
 pub use product::{ProductDomain, ProductTransfer};
 pub use query::{DomainQuery, Queryable};
@@ -73,10 +73,7 @@ pub trait Transfer {
         &self,
         expr: &Expr,
         env: &AbstractEnv<Self::Domain>,
-        state: &StateStore<Self::Domain>,
-        memo: &MemoStore<Self::Domain>,
-        heap: &mut Heap,
-        ctx: &dyn QueryContext,
+        ctx: &mut context::AnalysisCtx<Self::Domain>,
     ) -> Self::Domain;
 
     /// Execute a statement, updating `env`, `state`, `memo`, and `heap` in place.
@@ -84,10 +81,7 @@ pub trait Transfer {
         &self,
         stmt: &Stmt,
         env: &mut AbstractEnv<Self::Domain>,
-        state: &mut StateStore<Self::Domain>,
-        memo: &mut MemoStore<Self::Domain>,
-        heap: &mut Heap,
-        ctx: &dyn QueryContext,
+        ctx: &mut context::AnalysisCtx<Self::Domain>,
     );
 
     /// Compute the abstract value for a memoized hook from its dependency list.
