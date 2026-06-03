@@ -157,3 +157,69 @@ function AsyncHelperLoop() {
   }, []);
   return <div>{data ? "loaded" : "loading"}</div>;
 }
+
+// ── B5: variable callback in setInterval — loop detected ─────────────────────
+
+function VarCallbackIntervalLoop() {
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const cb = () => setTick(tick + 1);
+    setInterval(cb, 500); // ❌ infinite-loop (B5)
+  }, [tick]);
+  return <div>{tick}</div>;
+}
+
+// ── B5: variable callback in sync HOF (forEach) — loop detected ──────────────
+
+function VarCallbackForEachLoop() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const update = () => setN(n + 1);
+    [1, 2, 3].forEach(update); // ❌ infinite-loop (B5: forEach is InCycle)
+  }, [n]);
+  return <div>{n}</div>;
+}
+
+// ── B6→B5: nested helpers — outer calls inner via timer ──────────────────────
+// B6 inlines the direct call to `outer()`, whose body calls setTimeout(inner).
+// B5 then resolves `inner` from the heap and executes it.
+
+function NestedHelperLoop() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const inner = () => setN(n + 1);   // FnLit bound to `inner`
+    const outer = () => setTimeout(inner, 100); // FnLit whose body uses `inner`
+    outer(); // ❌ infinite-loop (B6 → B5 through nested resolution)
+  }, [n]);
+  return <div>{n}</div>;
+}
+
+// ── Depth limit — deeply nested chain NOT detected (known FN) ────────────────
+// Four levels of direct calls exceed MAX_INLINE_DEPTH=3 → analysis bails.
+// Documented limit: ADR-010.
+
+function DeepHelperOk() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const f1 = () => setN(n + 1);
+    const f2 = () => f1();
+    const f3 = () => f2();
+    const f4 = () => f3();
+    f4(); // ✓ not detected — depth 4 > MAX_INLINE_DEPTH=3 (known FN)
+  }, [n]);
+  return <div>{n}</div>;
+}
+
+// ── Heap not persisted across passes — render-defined cb used in effect (FN) ──
+// `cb` is defined in the render body and used in the effect.
+// The heap from the render pass is not carried into the effect pass (known limit).
+// Fix tracked in TODO.md → "Heap — passer à travers le fixpoint".
+
+function RenderCbInEffectOk() {
+  const [n, setN] = useState(0);
+  const cb = () => setN(n + 1); // FnLit in render body — heap not visible in effect
+  useEffect(() => {
+    setTimeout(cb, 1000); // ✓ NOT detected — cross-pass heap limit (known FN)
+  }, [n]);
+  return <div>{n}</div>;
+}

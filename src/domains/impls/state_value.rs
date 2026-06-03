@@ -1702,4 +1702,157 @@ mod tests {
 
         assert_eq!(state.get(0), StateValue::Number(Interval::point(7.0)));
     }
+
+    #[test]
+    fn set_interval_var_callback_updates_state() {
+        // const cb = () => setN(5); setInterval(cb, 1000) — mirrors setTimeout B5.
+        let (mut env, mut state, mut memo) = empty();
+        env.bind_setter("setN".to_string(), 0);
+        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+
+        let cb_body = single_block_cfg(
+            vec![Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Lit(Prim::Int(5))],
+            })],
+            Expr::Lit(Prim::Unit),
+        );
+        let let_cb = Stmt::Let {
+            var: "cb".to_string(),
+            rhs: Expr::FnLit { id: crate::ir::types::ExprId(20), params: vec![], body_cfg: std::sync::Arc::new(cb_body) },
+        };
+        let call = Stmt::ExprStmt(Expr::Call {
+            fn_: Box::new(Expr::Var("setInterval".to_string())),
+            args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(1000))],
+        });
+        let mut heap = crate::domains::Heap::new();
+        StateValueTransfer.exec_stmt(&let_cb, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+        StateValueTransfer.exec_stmt(&call, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+        assert_eq!(state.get(0), StateValue::Number(Interval::point(5.0)));
+    }
+
+    #[test]
+    fn for_each_var_callback_updates_state() {
+        // const update = () => setN(3); arr.forEach(update) — B5 in sync HOF.
+        let (mut env, mut state, mut memo) = empty();
+        env.bind_setter("setN".to_string(), 0);
+        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+
+        let cb_body = single_block_cfg(
+            vec![Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Lit(Prim::Int(3))],
+            })],
+            Expr::Lit(Prim::Unit),
+        );
+        let let_update = Stmt::Let {
+            var: "update".to_string(),
+            rhs: Expr::FnLit { id: crate::ir::types::ExprId(21), params: vec![], body_cfg: std::sync::Arc::new(cb_body) },
+        };
+        // arr.forEach(update) — forEach is InCycle, update is Var → B5
+        let call = Stmt::ExprStmt(Expr::Call {
+            fn_: Box::new(Expr::FieldAccess {
+                obj: Box::new(Expr::Var("arr".to_string())),
+                field: "forEach".to_string(),
+            }),
+            args: vec![Expr::Var("update".to_string())],
+        });
+        let mut heap = crate::domains::Heap::new();
+        StateValueTransfer.exec_stmt(&let_update, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+        StateValueTransfer.exec_stmt(&call, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+        assert_eq!(state.get(0), StateValue::Number(Interval::point(3.0)));
+    }
+
+    #[test]
+    fn nested_var_callbacks_both_executed() {
+        // const inner = () => setN(9);
+        // const outer = () => setTimeout(inner, 100);
+        // outer()  — B6 inlines outer, which runs setTimeout(inner) → B5 resolves inner.
+        let (mut env, mut state, mut memo) = empty();
+        env.bind_setter("setN".to_string(), 0);
+        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+
+        let inner_body = single_block_cfg(
+            vec![Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Lit(Prim::Int(9))],
+            })],
+            Expr::Lit(Prim::Unit),
+        );
+        let let_inner = Stmt::Let {
+            var: "inner".to_string(),
+            rhs: Expr::FnLit { id: crate::ir::types::ExprId(30), params: vec![], body_cfg: std::sync::Arc::new(inner_body) },
+        };
+
+        // outer = () => setTimeout(inner, 100) — body calls setTimeout(Var("inner")).
+        // sub_env at call site already contains inner's Loc (closure capture).
+        let outer_body = single_block_cfg(
+            vec![Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setTimeout".to_string())),
+                args: vec![Expr::Var("inner".to_string()), Expr::Lit(Prim::Int(100))],
+            })],
+            Expr::Lit(Prim::Unit),
+        );
+        let let_outer = Stmt::Let {
+            var: "outer".to_string(),
+            rhs: Expr::FnLit { id: crate::ir::types::ExprId(31), params: vec![], body_cfg: std::sync::Arc::new(outer_body) },
+        };
+
+        // outer() — B6 direct call
+        let call_outer = Stmt::ExprStmt(Expr::Call {
+            fn_: Box::new(Expr::Var("outer".to_string())),
+            args: vec![],
+        });
+
+        let mut heap = crate::domains::Heap::new();
+        StateValueTransfer.exec_stmt(&let_inner, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+        StateValueTransfer.exec_stmt(&let_outer, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+        StateValueTransfer.exec_stmt(&call_outer, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+        assert_eq!(state.get(0), StateValue::Number(Interval::point(9.0)));
+    }
+
+    #[test]
+    fn depth_limit_stops_deep_inlining() {
+        // f1() → f2() → f3() → f4() → setN(1): depth=4 > MAX_INLINE_DEPTH=3 → not reached.
+        let (mut env, mut state, mut memo) = empty();
+        env.bind_setter("setN".to_string(), 0);
+        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+
+        let make_body = |id: usize, callee: &str| -> std::sync::Arc<crate::ir::cfg::CFG> {
+            std::sync::Arc::new(single_block_cfg(
+                vec![Stmt::ExprStmt(Expr::Call {
+                    fn_: Box::new(Expr::Var(callee.to_string())),
+                    args: vec![],
+                })],
+                Expr::Lit(Prim::Unit),
+            ))
+        };
+
+        let setter_body = std::sync::Arc::new(single_block_cfg(
+            vec![Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Lit(Prim::Int(1))],
+            })],
+            Expr::Lit(Prim::Unit),
+        ));
+
+        let stmts = vec![
+            Stmt::Let { var: "f1".to_string(), rhs: Expr::FnLit { id: crate::ir::types::ExprId(40), params: vec![], body_cfg: setter_body } },
+            Stmt::Let { var: "f2".to_string(), rhs: Expr::FnLit { id: crate::ir::types::ExprId(41), params: vec![], body_cfg: make_body(41, "f1") } },
+            Stmt::Let { var: "f3".to_string(), rhs: Expr::FnLit { id: crate::ir::types::ExprId(42), params: vec![], body_cfg: make_body(42, "f2") } },
+            Stmt::Let { var: "f4".to_string(), rhs: Expr::FnLit { id: crate::ir::types::ExprId(43), params: vec![], body_cfg: make_body(43, "f3") } },
+            Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("f4".to_string())),
+                args: vec![],
+            }),
+        ];
+
+        let mut heap = crate::domains::Heap::new();
+        for stmt in &stmts {
+            StateValueTransfer.exec_stmt(stmt, &mut env, &mut state, &mut memo, &mut heap, &NullCtx);
+        }
+        // f4() → f3() → f2() → f1() → setN(1): chain length = 4 > MAX_INLINE_DEPTH=3.
+        // Depth guard fires before f1 executes → state stays Bottom.
+        assert_eq!(state.get(0), StateValue::Bottom);
+    }
 }

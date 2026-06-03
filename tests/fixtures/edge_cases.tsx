@@ -89,3 +89,59 @@ function SwitchExample({ mode }: { mode: string }) {
 
   return <div>{count}</div>;
 }
+
+// ── B5 anti-FP: variable passed to unknown callee without Loc ─────────────────
+// `external` has no Loc (it's imported/external) → exec_var_callback for the
+// callee returns early → `cb` arg is never descended → no false positive.
+
+function ExternalHelperOk() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const cb = () => setN(n + 1);
+    externalUtil(cb); // ✓ no infinite-loop (externalUtil is Unknown, no Loc)
+  });
+  return <div>{n}</div>;
+}
+
+// ── B6: local helper called directly, mount-only deps → no loop ───────────────
+// B6 inlines `reset()` so `setN(0)` is visible. But deps=[] → mount-only →
+// InfiniteLoop rule skips it. Setter is visible to other rules (e.g. unnecessary-rerender).
+
+function LocalHelperMountOk() {
+  const [n, setN] = useState(42);
+  useEffect(() => {
+    function reset() {
+      setN(0); // visible via B6
+    }
+    reset(); // ✓ no infinite-loop — mount-only effect
+  }, []);
+  return <div>{n}</div>;
+}
+
+// ── Functional updater does not trigger widening — known FN ──────────────────
+// `setCount(c => c + 1)` evaluates the FnLit to Reference(Unstable), which
+// cross-type-joins with Number([0,0]) → Top. Converges in 2 iterations without
+// widening widened_labels → InfiniteLoop does not fire even though it should.
+// Documented in TODO.md → "Functional updaters ne déclenchent pas de widening".
+
+function FunctionalUpdaterBug() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    setCount((c) => c + 1); // ❌ should be infinite-loop but NOT detected (known FN)
+  }, []);
+  return <div>{count}</div>;
+}
+
+// ── Multi-state: only widened label fires InfiniteLoop ────────────────────────
+// setA grows (n+1 each cycle) → widening. setB is constant (always 0) → converges.
+// Only label A should appear in widened_labels.
+
+function PartialWideningLoop() {
+  const [a, setA] = useState(0);
+  const [b, setB] = useState(0);
+  useEffect(() => {
+    setA(a + 1); // ❌ infinite-loop on label A
+    setB(0);     // ✓ converges — always same value
+  }, [a]);
+  return <div>{a} {b}</div>;
+}

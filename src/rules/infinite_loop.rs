@@ -872,4 +872,65 @@ mod tests {
             "setN(n+1) inside inc → fetch().then(inc) should be detected as infinite loop"
         );
     }
+
+    #[test]
+    fn nested_var_callback_chain_triggers_infinite_loop() {
+        // const inner = () => setN(n + 1);
+        // const outer = () => setTimeout(inner, 100);
+        // outer()  — deps: [n]
+        // B6 inlines outer(), B5 resolves inner from .setTimeout arg → InfiniteLoop.
+        use crate::ir::types::ExprId;
+        let inner_body_cfg = {
+            let mut b = HashMap::new();
+            b.insert(0, BasicBlock {
+                id: 0,
+                stmts: vec![Stmt::ExprStmt(Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::BinOp {
+                        op: crate::ir::expr::BinOp::Add,
+                        lhs: Box::new(Expr::StateVal(0)),
+                        rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                    }],
+                })],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            });
+            CFG { entry: 0, blocks: b, edges: vec![] }
+        };
+        let outer_body_cfg = {
+            let mut b = HashMap::new();
+            b.insert(0, BasicBlock {
+                id: 0,
+                stmts: vec![Stmt::ExprStmt(Expr::Call {
+                    fn_: Box::new(Expr::Var("setTimeout".to_string())),
+                    args: vec![Expr::Var("inner".to_string()), Expr::Lit(Prim::Int(100))],
+                })],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            });
+            CFG { entry: 0, blocks: b, edges: vec![] }
+        };
+        let stmts = vec![
+            Stmt::Let {
+                var: "inner".to_string(),
+                rhs: Expr::FnLit { id: ExprId(50), params: vec![], body_cfg: std::sync::Arc::new(inner_body_cfg) },
+            },
+            Stmt::Let {
+                var: "outer".to_string(),
+                rhs: Expr::FnLit { id: ExprId(51), params: vec![], body_cfg: std::sync::Arc::new(outer_body_cfg) },
+            },
+            Stmt::ExprStmt(Expr::Call {
+                fn_: Box::new(Expr::Var("outer".to_string())),
+                args: vec![],
+            }),
+        ];
+        let comp = component_with_effect_stmts("setN", stmts, Some(vec![Expr::StateVal(0)]));
+        let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
+        assert!(
+            result.widened_labels.contains(&0),
+            "n should widen via B6→B5 nested chain"
+        );
+        assert!(
+            !InfiniteLoop.check(&result).is_empty(),
+            "outer() → setTimeout(inner) → setN(n+1) should be detected as infinite loop"
+        );
+    }
 }

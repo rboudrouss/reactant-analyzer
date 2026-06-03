@@ -151,21 +151,21 @@ fn check_expr_for_setters(
                     }
                 }
             }
-            if depth > 0 {
-                for arg in args {
-                    match arg {
-                        // Inline FnLit arg — existing behaviour.
-                        Expr::FnLit { body_cfg, .. } => {
-                            collect_setter_calls_inner(body_cfg, setter_vars, depth - 1, fn_bindings, found);
-                        }
-                        // B5: variable arg — resolve to a locally-bound FnLit.
-                        Expr::Var(name) => {
-                            if let Some(body) = fn_bindings.get(name) {
-                                collect_setter_calls_inner(body, setter_vars, depth - 1, fn_bindings, found);
-                            }
-                        }
-                        _ => {}
+            for arg in args {
+                match arg {
+                    // Inline FnLit arg — descend body (costs one depth level).
+                    Expr::FnLit { body_cfg, .. } if depth > 0 => {
+                        collect_setter_calls_inner(body_cfg, setter_vars, depth - 1, fn_bindings, found);
                     }
+                    // B5: variable arg — pointer-following, no depth cost.
+                    // Resolving Var("cb") to its FnLit is just name resolution,
+                    // not an extra call frame → same depth passes through.
+                    Expr::Var(name) => {
+                        if let Some(body) = fn_bindings.get(name) {
+                            collect_setter_calls_inner(body, setter_vars, depth, fn_bindings, found);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
