@@ -2,6 +2,7 @@
 
 - **Statut** : Implémenté (B3 actif, B1 groundwork en place)
 - **Date** : 2026-06-02
+- **Mise à jour** : 2026-06-03 — `AnalysisCtx<D>` bundle `(state, memo, heap, query)` ; `Transfer` réduit à 3 params.
 
 ## Contexte
 
@@ -33,7 +34,16 @@ Le type de retour est polymorphe (`'r`) et statiquement sûr grâce aux GADTs OC
 
 Le trait `Transfer` prend `ctx: &dyn QueryContext` — `dyn` (pas `impl`) pour garder `Transfer` object-safe (pas de paramètre générique dans les méthodes).
 
+`(state, memo, heap, query)` sont maintenant bundlés dans `AnalysisCtx<D>`, réduisant chaque méthode de 6 → 3 params. `env` reste séparé (mutabilité incompatible entre `eval_expr` `&` et `exec_stmt` `&mut`). `recompute_memo` garde `ctx: &dyn QueryContext` — il n'a pas besoin de state/memo/heap.
+
 ```rust
+pub struct AnalysisCtx<'a, D: AbstractDomain> {
+    pub state: &'a mut StateStore<D>,
+    pub memo:  &'a mut MemoStore<D>,
+    pub heap:  &'a mut Heap,
+    pub query: &'a dyn QueryContext,
+}
+
 pub trait QueryContext {
     fn state_value_of(&self, expr: &Expr) -> StateValue;
 }
@@ -45,19 +55,22 @@ pub trait Transfer {
         &self,
         expr: &Expr,
         env: &AbstractEnv<Self::Domain>,
-        state: &StateStore<Self::Domain>,
-        memo: &MemoStore<Self::Domain>,
-        ctx: &dyn QueryContext,
+        ctx: &mut AnalysisCtx<Self::Domain>,
     ) -> Self::Domain;
 
     fn exec_stmt(
         &self,
         stmt: &Stmt,
         env: &mut AbstractEnv<Self::Domain>,
-        state: &mut StateStore<Self::Domain>,
-        memo: &mut MemoStore<Self::Domain>,
-        ctx: &dyn QueryContext,
+        ctx: &mut AnalysisCtx<Self::Domain>,
     );
+
+    fn recompute_memo(
+        &self,
+        deps: &[Expr],
+        env: &AbstractEnv<Self::Domain>,
+        ctx: &dyn QueryContext,
+    ) -> Self::Domain;
 }
 ```
 
@@ -142,9 +155,12 @@ Le groundwork existe déjà : `DomainQuery` et `Queryable<Q>` sont définis dans
 ## Conséquences
 
 **Actuel** :
-- `Transfer` prend `ctx: &dyn QueryContext`. `SetterEffect` appelle `ctx.state_value_of(expr)`.
-- `NullCtx` / `FixpointCtx` / `AnalysisQueryCtx` couvrent les trois phases d'utilisation.
-- `dyn` assure l'object-safety de `Transfer` (pas de monomorphisation par contexte).
+- `Transfer::eval_expr` / `exec_stmt` prennent `ctx: &mut AnalysisCtx<D>` (3 params au lieu de 6).
+- `AnalysisCtx<D>` contient `state`, `memo`, `heap`, et `query: &dyn QueryContext`.
+- `recompute_memo` prend encore `ctx: &dyn QueryContext` directement (pas besoin de state/memo/heap).
+- `NullCtx` / `FixpointCtx` / `AnalysisQueryCtx` couvrent les trois phases ; accessible via `ctx.query`.
+- `AnalysisCtx::null(state, memo, heap)` est un constructeur pratique pour tests et impls simples.
+- `dyn QueryContext` assure l'object-safety de `Transfer` (pas de monomorphisation par contexte).
 
 **Reste à faire** :
 - Définir des types de query concrets (`StabilityOf`, etc.) pour les requêtes cross-domaine au-delà de `state_value_of`.

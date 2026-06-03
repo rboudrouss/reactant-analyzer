@@ -49,10 +49,6 @@ Intra-procédural uniquement. Props parent→enfant non tracées. Nécessite gra
 
 `AnalysisResult::block_states` ne contient que les états du render CFG. Ajouter `effect_block_states: HashMap<HookLabel, HashMap<BlockId, AbstractEnv<D>>>`.
 
-### AnalysisCtx
-
-`Transfer` prend encore 5 params séparés (`env, state, memo, heap, ctx`). Bundler en `AnalysisCtx<D>` pour nettoyer les signatures.
-
 ---
 
 ## Nouvelles règles
