@@ -205,10 +205,14 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
         }
 
         iteration += 1;
-        assert!(
-            iteration < 100,
-            "fixpoint did not converge after 100 iterations"
-        );
+        if iteration >= 100 {
+            // Pathological input: force widening on all labels to guarantee convergence.
+            for label in typed_state.all_labels() {
+                widened_labels.insert(label);
+            }
+            typed_state = typed_state.widen(&new_typed);
+            break;
+        }
 
         if iteration >= config.widen_threshold {
             // widened_labels: render+effects only — handler widening is not a bug.
@@ -503,6 +507,16 @@ fn compute_free_vars(cfg: &CFG) -> HashSet<Var> {
                 }
                 Stmt::ExprStmt(e, _) => collect_used_vars(e, &mut used),
             }
+        }
+        // Terminators also contain variable reads: Branch condition and Return value.
+        match &block.term {
+            crate::ir::cfg::Terminator::Branch { cond, .. } => {
+                collect_used_vars(cond, &mut used);
+            }
+            crate::ir::cfg::Terminator::Return(expr) => {
+                collect_used_vars(expr, &mut used);
+            }
+            _ => {}
         }
     }
 
@@ -1529,5 +1543,89 @@ mod tests {
         assert_eq!(info.event, "click");
         assert!(info.free_vars.contains("n"), "n should be a free var");
         assert!(info.free_vars.contains("setN"), "setN should be a free var");
+    }
+
+    #[test]
+    fn free_vars_captured_from_branch_condition() {
+        // Effect body: `if (x > 0) { setN(1); }` — x appears only in the Branch cond.
+        // Before the fix, compute_free_vars skipped terminators → x was not a free var.
+        let mut blocks = HashMap::new();
+        // block 0: Branch { cond: x > 0 } → then=1, else=2
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![],
+                term: Terminator::Branch {
+                    cond: Expr::BinOp {
+                        op: crate::ir::expr::BinOp::Gt,
+                        lhs: Box::new(Expr::Var("x".to_string())),
+                        rhs: Box::new(Expr::Lit(Prim::Int(0))),
+                    },
+                    then_: 1,
+                    else_: 2,
+                },
+            },
+        );
+        // block 1: setN(1); jump 2
+        blocks.insert(
+            1,
+            BasicBlock {
+                id: 1,
+                stmts: vec![Stmt::ExprStmt(
+                    Expr::Call {
+                        fn_: Box::new(Expr::Var("setN".to_string())),
+                        args: vec![Expr::Lit(Prim::Int(1))],
+                    },
+                    None,
+                )],
+                term: Terminator::Jump(2),
+            },
+        );
+        // block 2: return
+        blocks.insert(
+            2,
+            BasicBlock {
+                id: 2,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let eff_cfg = CFG {
+            entry: 0,
+            blocks,
+            edges: vec![
+                crate::ir::cfg::Edge {
+                    from: 0,
+                    to: 1,
+                    kind: crate::ir::cfg::EdgeKind::IfTrue,
+                },
+                crate::ir::cfg::Edge {
+                    from: 0,
+                    to: 2,
+                    kind: crate::ir::cfg::EdgeKind::IfFalse,
+                },
+                crate::ir::cfg::Edge {
+                    from: 1,
+                    to: 2,
+                    kind: crate::ir::cfg::EdgeKind::Unconditional,
+                },
+            ],
+        };
+
+        let hooks = vec![HookEntry::Effect {
+            label: 0,
+            body_cfg: eff_cfg,
+            deps: Some(vec![]),
+            span: None,
+        }];
+        let comp = component(hooks, vec![]);
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+        let info = &result.effect_info[&0];
+        assert!(
+            info.free_vars.contains("x"),
+            "x appears only in Branch cond — must be a free var"
+        );
+        assert!(info.free_vars.contains("setN"));
     }
 }

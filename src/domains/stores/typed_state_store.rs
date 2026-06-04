@@ -208,6 +208,10 @@ impl TypedStateStore {
         result
     }
 
+    pub fn all_labels(&self) -> impl Iterator<Item = HookLabel> + '_ {
+        self.type_map.keys().copied()
+    }
+
     /// `self ⊑ other` per sub-store (more precise than StateValue::leq for typed labels).
     pub fn leq(&self, other: &Self) -> bool {
         self.number_store.leq(&other.number_store)

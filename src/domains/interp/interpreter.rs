@@ -119,6 +119,9 @@ fn exec_stmt_core<T: Transfer>(
             env.extend(var.clone(), val);
         }
         Stmt::Assign { var, rhs, .. } => {
+            if let Expr::StateSetter(label) = rhs {
+                env.bind_setter(var.clone(), *label);
+            }
             if let Expr::FnLit {
                 id,
                 params,

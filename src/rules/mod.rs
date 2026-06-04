@@ -222,18 +222,31 @@ fn collect_setter_calls_inner(
             for stmt in &block.stmts {
                 check_stmt_for_setters(stmt, block_id, setter_vars, depth, fn_bindings, found);
             }
-            // Concise arrow bodies (`() => setX(...)`) carry their call in the
-            // Return terminator, not a statement — scan it too.
-            if let Terminator::Return(expr) = &block.term {
-                check_expr_for_setters(
-                    expr,
-                    None,
-                    block_id,
-                    setter_vars,
-                    depth,
-                    fn_bindings,
-                    found,
-                );
+            // Terminators also carry expressions: scan Return value and Branch condition.
+            match &block.term {
+                Terminator::Return(expr) => {
+                    check_expr_for_setters(
+                        expr,
+                        None,
+                        block_id,
+                        setter_vars,
+                        depth,
+                        fn_bindings,
+                        found,
+                    );
+                }
+                Terminator::Branch { cond, .. } => {
+                    check_expr_for_setters(
+                        cond,
+                        None,
+                        block_id,
+                        setter_vars,
+                        depth,
+                        fn_bindings,
+                        found,
+                    );
+                }
+                _ => {}
             }
             for succ in cfg.successors(bid) {
                 if visited.insert(succ) {
