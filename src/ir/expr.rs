@@ -39,7 +39,7 @@ pub enum UnaryOp {
     Not,
 }
 
-type TSType = String; // TODO
+pub type TSType = String; // TODO
 
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -111,4 +111,30 @@ pub enum Expr {
     StateSetter(HookLabel),
     MemoVal(HookLabel),
     CallbackVal(HookLabel),
+}
+
+impl Expr {
+    /// Returns `true` iff the expression tree contains no `Call` or `CompApp` node.
+    /// Used to guard the `derived-state` rule: if the setter arg is call-free, the
+    /// derivation is a pure data transformation and replacing the effect with `useMemo`
+    /// is always safe.
+    pub fn is_call_free(&self) -> bool {
+        match self {
+            Expr::Call { .. } | Expr::CompApp { .. } | Expr::NativeElem { .. } => false,
+            Expr::Lit(_)
+            | Expr::Var(_)
+            | Expr::StateVal(_)
+            | Expr::StateSetter(_)
+            | Expr::MemoVal(_)
+            | Expr::CallbackVal(_) => true,
+            Expr::ObjectLit { fields, .. } => fields.iter().all(|(_, v)| v.is_call_free()),
+            Expr::ArrayLit { elems, .. } => elems.iter().all(|e| e.is_call_free()),
+            Expr::FnLit { .. } => true,
+            Expr::FieldAccess { obj, .. } => obj.is_call_free(),
+            Expr::IndexAccess { arr, idx } => arr.is_call_free() && idx.is_call_free(),
+            Expr::BinOp { lhs, rhs, .. } => lhs.is_call_free() && rhs.is_call_free(),
+            Expr::UnaryOp { arg, .. } => arg.is_call_free(),
+            Expr::TSAnnotated(inner, _) => inner.is_call_free(),
+        }
+    }
 }

@@ -11,10 +11,6 @@
 
 ## Infrastructure
 
-### Span call-site pour `setter-in-render` *(ADR-011)*
-
-Spans implémentés partout sauf : span côté setter/state au niveau des statements (pour `setter-in-render` côté call site, pas declaration site).
-
 ### Analyse inter-composants
 
 Intra-procédural uniquement. Props parent→enfant non tracées. Nécessite graphe de composants + analyse inter-procédurale (complexité O(n²)).
@@ -44,8 +40,10 @@ const [data, setData] = useState(expensiveCompute())  // recalculé chaque rende
 
 `HookEntry::State { init: Expr::Call { .. } }` → warn. Règle structurelle pure, pas de fixpoint.
 
-### `derived-state` *(bloqué)*
+### `derived-state` *(implémenté — 2026-06-04)*
 
-Effect dont les deps sont `[stateA]`, appelle `setB(expr)` inconditionnellement où `expr` est call-free et ne lit que des `StateVal` sources, et `setB` n'est appelé nulle part ailleurs.
+Détecte les effets dont les deps sont `[stateA]`, qui appellent `setB(expr)` inconditionnellement où `expr` est call-free, et `setB` n'est appelé nulle part ailleurs.
 
-Bloqué par : `Expr::Call` opaque (pas de support fonctions pures). (`effect_block_states` et l'analyse des functional updaters désormais disponibles.)
+`Expr::is_call_free()` ajouté dans `src/ir/expr.rs`. Règle dans `src/rules/derived_state.rs`.
+
+**Limite connue** : détection linéaire uniquement (corps d'effet à ≤2 blocs). Corps avec branches conditionnelles → FN conservatif.

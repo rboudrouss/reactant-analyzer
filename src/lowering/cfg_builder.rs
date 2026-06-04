@@ -263,20 +263,12 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
         // Hoisted declarations: bind name but emit no CFG node
         Statement::FunctionDeclaration(func) => {
             if let Some(id) = &func.id {
-                let params: Vec<String> = func
-                    .params
-                    .items
-                    .iter()
-                    .filter_map(|p| match &p.pattern {
-                        BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
-                        _ => None,
-                    })
-                    .collect();
-                let body_cfg = func
-                    .body
-                    .as_ref()
-                    .map(|b| build_cfg(b, &builder.line_starts.clone()))
-                    .unwrap_or_else(empty_cfg);
+                let line_starts = builder.line_starts.clone();
+                let (params, body_cfg) = if let Some(body) = func.body.as_deref() {
+                    build_fn_body_cfg(&func.params, body, &line_starts)
+                } else {
+                    (vec![], empty_cfg())
+                };
                 let expr_id = builder.next_expr_id();
                 builder.push_stmt(Stmt::Let {
                     var: id.name.to_string(),
@@ -490,60 +482,48 @@ fn lower_var_declarator(vd: &VariableDeclarator, builder: &mut BlockBuilder) {
         Some(e) => lower_expr(e, builder),
         None => Expr::Lit(Prim::Unit),
     };
+    let span = builder.span_at(vd.span.start);
+    lower_binding_pattern(&vd.id, rhs, span, builder);
+}
 
-    match &vd.id {
+/// Recursively lower a binding pattern into Let stmts, emitting `rhs` under `span`
+/// for the root binding and `None` for all nested ones.
+fn lower_binding_pattern(
+    pat: &BindingPattern,
+    rhs: Expr,
+    span: Option<crate::ir::SourceRange>,
+    builder: &mut BlockBuilder,
+) {
+    match pat {
         BindingPattern::BindingIdentifier(id) => {
             builder.push_stmt(Stmt::Let {
                 var: id.name.to_string(),
                 rhs,
-                span: builder.span_at(vd.span.start),
+                span,
             });
         }
         BindingPattern::ArrayPattern(arr) => {
-            // const [a, b] = rhs
             let temp = format!("__arr_{}", arr.span.start);
             builder.push_stmt(Stmt::Let {
                 var: temp.clone(),
                 rhs,
-                span: builder.span_at(vd.span.start),
+                span,
             });
             for (i, elem) in arr.elements.iter().enumerate() {
                 let Some(elem) = elem else { continue };
-                match elem {
-                    BindingPattern::BindingIdentifier(id) => {
-                        builder.push_stmt(Stmt::Let {
-                            var: id.name.to_string(),
-                            rhs: Expr::IndexAccess {
-                                arr: Box::new(Expr::Var(temp.clone())),
-                                idx: Box::new(Expr::Lit(Prim::Int(i as i32))),
-                            },
-                            span: None,
-                        });
-                    }
-                    BindingPattern::AssignmentPattern(ap) => {
-                        // const [x = default] = rhs — use the target name, ignore default
-                        if let BindingPattern::BindingIdentifier(id) = &ap.left {
-                            builder.push_stmt(Stmt::Let {
-                                var: id.name.to_string(),
-                                rhs: Expr::IndexAccess {
-                                    arr: Box::new(Expr::Var(temp.clone())),
-                                    idx: Box::new(Expr::Lit(Prim::Int(i as i32))),
-                                },
-                                span: None,
-                            });
-                        }
-                    }
-                    _ => {} // Nested destructuring: todo!
-                }
+                let elem_rhs = Expr::IndexAccess {
+                    arr: Box::new(Expr::Var(temp.clone())),
+                    idx: Box::new(Expr::Lit(Prim::Int(i as i32))),
+                };
+                lower_binding_pattern(elem, elem_rhs, None, builder);
             }
         }
         BindingPattern::ObjectPattern(obj) => {
-            // const { a, b: c } = rhs
             let temp = format!("__obj_{}", obj.span.start);
             builder.push_stmt(Stmt::Let {
                 var: temp.clone(),
                 rhs,
-                span: None,
+                span,
             });
             for prop in &obj.properties {
                 let field = match &prop.key {
@@ -551,33 +531,71 @@ fn lower_var_declarator(vd: &VariableDeclarator, builder: &mut BlockBuilder) {
                     PropertyKey::StringLiteral(s) => s.value.to_string(),
                     _ => continue,
                 };
-                match &prop.value {
-                    BindingPattern::BindingIdentifier(id) => {
-                        builder.push_stmt(Stmt::Let {
-                            var: id.name.to_string(),
-                            rhs: Expr::FieldAccess {
-                                obj: Box::new(Expr::Var(temp.clone())),
-                                field,
-                            },
-                            span: None,
-                        });
-                    }
-                    BindingPattern::AssignmentPattern(ap) => {
-                        if let BindingPattern::BindingIdentifier(id) = &ap.left {
-                            builder.push_stmt(Stmt::Let {
-                                var: id.name.to_string(),
-                                rhs: Expr::FieldAccess {
-                                    obj: Box::new(Expr::Var(temp.clone())),
-                                    field,
-                                },
-                                span: None,
-                            });
-                        }
-                    }
-                    _ => {}
-                }
+                let field_rhs = Expr::FieldAccess {
+                    obj: Box::new(Expr::Var(temp.clone())),
+                    field,
+                };
+                lower_binding_pattern(&prop.value, field_rhs, None, builder);
             }
         }
-        BindingPattern::AssignmentPattern(_) => {}
+        BindingPattern::AssignmentPattern(ap) => {
+            // Ignore the default expression — conservative (use rhs as-is)
+            lower_binding_pattern(&ap.left, rhs, span, builder);
+        }
     }
+}
+
+/// Emit preamble Let stmts for every formal parameter, returning the list of
+/// param names suitable for `FnLit.params`.  Destructured params get a fresh
+/// temp name (`__pN`) and their bindings are unpacked into the current block.
+pub(super) fn inject_param_preamble(
+    params: &FormalParameters,
+    builder: &mut BlockBuilder,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    for (i, p) in params.items.iter().enumerate() {
+        match &p.pattern {
+            BindingPattern::BindingIdentifier(id) => {
+                names.push(id.name.to_string());
+            }
+            other => {
+                let temp = format!("__p{}", i);
+                names.push(temp.clone());
+                lower_binding_pattern(other, Expr::Var(temp), None, builder);
+            }
+        }
+    }
+    names
+}
+
+/// Build a function body CFG, prepending Let stmts for destructured params.
+/// Returns `(param_names, body_cfg)`.
+pub fn build_fn_body_cfg(
+    params: &FormalParameters,
+    body: &FunctionBody,
+    line_starts: &[u32],
+) -> (Vec<String>, CFG) {
+    let mut builder = BlockBuilder::new_with_line_starts(line_starts);
+    builder.start_block(0);
+    let param_names = inject_param_preamble(params, &mut builder);
+    lower_stmts(&body.statements, &mut builder);
+    (param_names, builder.into_cfg(0))
+}
+
+/// Like [`build_fn_body_cfg`] but for concise arrow bodies (`x => expr`).
+pub fn build_expr_fn_body_cfg(
+    params: &FormalParameters,
+    body: &FunctionBody,
+    line_starts: &[u32],
+) -> (Vec<String>, CFG) {
+    let mut builder = BlockBuilder::new_with_line_starts(line_starts);
+    builder.start_block(0);
+    let param_names = inject_param_preamble(params, &mut builder);
+    if let Some(Statement::ExpressionStatement(es)) = body.statements.first() {
+        let expr = lower_expr(&es.expression, &mut builder);
+        if !builder.is_terminated() {
+            builder.seal_with(Terminator::Return(expr));
+        }
+    }
+    (param_names, builder.into_cfg(0))
 }

@@ -1,4 +1,5 @@
 pub mod conditional_hook;
+pub mod derived_state;
 pub mod infinite_loop;
 pub mod missing_deps;
 pub mod redundant_set_state;
@@ -6,6 +7,7 @@ pub mod setter_in_render;
 pub mod unnecessary_rerender;
 
 pub use conditional_hook::ConditionalHook;
+pub use derived_state::DerivedState;
 pub use infinite_loop::InfiniteLoop;
 pub use missing_deps::MissingDeps;
 pub use redundant_set_state::RedundantSetState;
@@ -102,12 +104,17 @@ pub trait Rule {
     fn check(&self, result: &AnalysisResult<StateValue>) -> Vec<Diagnostic>;
 }
 
-/// Collect all setter variable names called in `cfg`, descending into FnLit
-/// argument bodies and variable-bound FnLits up to `max_depth` levels.
-pub fn collect_setter_calls(cfg: &CFG, setter_vars: &HashSet<Var>, max_depth: usize) -> Vec<Var> {
+/// Collect all setter variable names called in `cfg` together with their
+/// call-site span, descending into FnLit argument bodies and variable-bound
+/// FnLits up to `max_depth` levels.
+pub fn collect_setter_calls(
+    cfg: &CFG,
+    setter_vars: &HashSet<Var>,
+    max_depth: usize,
+) -> Vec<(Var, Option<SourceRange>)> {
     // Pre-scan: build var → FnLit body map for `let cb = () => ...` patterns (B5/B6).
     let fn_bindings = collect_fn_bindings(cfg);
-    let mut found: HashSet<Var> = HashSet::new();
+    let mut found: HashMap<Var, Option<SourceRange>> = HashMap::new();
     collect_setter_calls_inner(cfg, setter_vars, max_depth, &fn_bindings, &mut found);
     found.into_iter().collect()
 }
@@ -135,7 +142,7 @@ fn collect_setter_calls_inner(
     setter_vars: &HashSet<Var>,
     depth: usize,
     fn_bindings: &HashMap<Var, Arc<CFG>>,
-    found: &mut HashSet<Var>,
+    found: &mut HashMap<Var, Option<SourceRange>>,
 ) {
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
@@ -150,7 +157,7 @@ fn collect_setter_calls_inner(
             // Concise arrow bodies (`() => setX(...)`) carry their call in the
             // Return terminator, not a statement — scan it too.
             if let Terminator::Return(expr) = &block.term {
-                check_expr_for_setters(expr, setter_vars, depth, fn_bindings, found);
+                check_expr_for_setters(expr, None, setter_vars, depth, fn_bindings, found);
             }
             for succ in cfg.successors(bid) {
                 if visited.insert(succ) {
@@ -166,28 +173,29 @@ fn check_stmt_for_setters(
     setter_vars: &HashSet<Var>,
     depth: usize,
     fn_bindings: &HashMap<Var, Arc<CFG>>,
-    found: &mut HashSet<Var>,
+    found: &mut HashMap<Var, Option<SourceRange>>,
 ) {
-    let expr = match stmt {
-        Stmt::ExprStmt(e, _) => e,
+    let (expr, span) = match stmt {
+        Stmt::ExprStmt(e, span) => (e, *span),
         // Also descend into Let rhs that are FnLit — direct setter call at top level of a closure.
-        Stmt::Let { rhs, .. } => rhs,
-        Stmt::Assign { rhs, .. } => rhs,
+        Stmt::Let { rhs, .. } => (rhs, None),
+        Stmt::Assign { rhs, .. } => (rhs, None),
     };
-    check_expr_for_setters(expr, setter_vars, depth, fn_bindings, found);
+    check_expr_for_setters(expr, span, setter_vars, depth, fn_bindings, found);
 }
 
 fn check_expr_for_setters(
     expr: &Expr,
+    stmt_span: Option<SourceRange>,
     setter_vars: &HashSet<Var>,
     depth: usize,
     fn_bindings: &HashMap<Var, Arc<CFG>>,
-    found: &mut HashSet<Var>,
+    found: &mut HashMap<Var, Option<SourceRange>>,
 ) {
     if let Expr::Call { fn_, args } = expr {
         if let Expr::Var(name) = fn_.as_ref() {
             if setter_vars.contains(name) {
-                found.insert(name.clone());
+                found.entry(name.clone()).or_insert(stmt_span);
             }
             // B6: direct call to a locally-bound function — descend its body.
             if depth > 0
@@ -231,5 +239,6 @@ pub fn all_rules() -> Vec<Box<dyn Rule>> {
         Box::new(UnnecessaryRerender),
         Box::new(SetterInRender),
         Box::new(InfiniteLoop),
+        Box::new(DerivedState),
     ]
 }

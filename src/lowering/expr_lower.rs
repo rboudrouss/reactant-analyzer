@@ -11,7 +11,7 @@ use crate::ir::{
     stmt::Stmt,
 };
 
-use super::cfg_builder::{BlockBuilder, build_cfg, build_expr_body_cfg};
+use super::cfg_builder::{BlockBuilder, build_expr_fn_body_cfg, build_fn_body_cfg};
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -162,14 +162,13 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         // ── Functions ─────────────────────────────────────────────────────────
         Expression::ArrowFunctionExpression(arrow) => {
             let id = builder.next_expr_id();
-            let params = lower_params(&arrow.params);
             let line_starts = builder.line_starts.clone();
             // Concise body (`x => expr`) carries an implicit return; block body
             // (`x => { ... }`) lowers like any function body.
-            let body_cfg = if arrow.expression {
-                build_expr_body_cfg(&arrow.body, &line_starts)
+            let (params, body_cfg) = if arrow.expression {
+                build_expr_fn_body_cfg(&arrow.params, &arrow.body, &line_starts)
             } else {
-                build_cfg(&arrow.body, &line_starts)
+                build_fn_body_cfg(&arrow.params, &arrow.body, &line_starts)
             };
             Expr::FnLit {
                 id,
@@ -179,12 +178,12 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         }
         Expression::FunctionExpression(func) => {
             let id = builder.next_expr_id();
-            let params = lower_params(&func.params);
-            let body_cfg = func
-                .body
-                .as_ref()
-                .map(|b| build_cfg(b, &builder.line_starts.clone()))
-                .unwrap_or_else(empty_cfg);
+            let line_starts = builder.line_starts.clone();
+            let (params, body_cfg) = if let Some(body) = func.body.as_deref() {
+                build_fn_body_cfg(&func.params, body, &line_starts)
+            } else {
+                (vec![], empty_cfg())
+            };
             Expr::FnLit {
                 id,
                 params,
@@ -500,17 +499,6 @@ fn lower_binop(op: BinaryOperator) -> IrBinOp {
 }
 
 // ── Shared helpers (used by cfg_builder.rs too) ───────────────────────────────
-
-pub(super) fn lower_params(params: &FormalParameters) -> Vec<String> {
-    params
-        .items
-        .iter()
-        .filter_map(|p| match &p.pattern {
-            BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
-            _ => None,
-        })
-        .collect()
-}
 
 pub(super) fn empty_cfg() -> CFG {
     let mut blocks = HashMap::new();

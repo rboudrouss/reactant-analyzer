@@ -77,18 +77,18 @@ impl Rule for SetterInRender {
 
         collect_setter_calls(&result.render_cfg, &setter_vars, 1)
             .into_iter()
-            .map(|name| {
+            .map(|(name, call_site_span)| {
                 let mut d = Diagnostic::new(
                     "setter-in-render",
                     format!(
                         "setter `{name}` called directly in the render body, move this call into a useEffect or an event handler"
                     ),
                 );
-                if let Some(&(label, span)) = setter_info.get(&name) {
+                if let Some(&(label, _decl_span)) = setter_info.get(&name) {
                     d = d.with_label(label);
-                    if let Some(r) = span {
-                        d = d.with_range(r);
-                    }
+                }
+                if let Some(r) = call_site_span {
+                    d = d.with_range(r);
                 }
                 d
             })
