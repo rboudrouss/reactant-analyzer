@@ -309,10 +309,10 @@ fn exec_callbacks_depth<T: Transfer>(
             }
             // B6: direct local call inlining — Unknown callee that resolves to a heap Fn.
             // External/imported functions have no Loc → skipped (no FP).
-            if class == TriggerClass::Unknown {
-                if let Expr::Var(name) = fn_.as_ref() {
-                    exec_var_callback(transfer, name, env, ctx, depth);
-                }
+            if class == TriggerClass::Unknown
+                && let Expr::Var(name) = fn_.as_ref()
+            {
+                exec_var_callback(transfer, name, env, ctx, depth);
             }
         }
         Expr::BinOp { lhs, rhs, .. } => {
@@ -371,7 +371,7 @@ fn exec_var_callback<T: Transfer>(
         for id in ids {
             if let Some(HeapValue::Fn { params, body_cfg }) = ctx.heap.get(id) {
                 let params = params.clone();
-                let body_cfg = Arc::clone(&body_cfg);
+                let body_cfg = Arc::clone(body_cfg);
                 let mut sub_env = env.clone();
                 for p in &params {
                     sub_env.extend(p.clone(), T::Domain::top());

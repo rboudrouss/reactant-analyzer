@@ -88,21 +88,19 @@ impl Rule for InfiniteLoop {
                                 body_cfg: h_cfg,
                                 ..
                             } = h
+                                && !collect_setter_calls(h_cfg, setter_vars, 1).is_empty()
                             {
-                                if !collect_setter_calls(h_cfg, setter_vars, 1).is_empty() {
-                                    let h_span =
-                                        result.handler_info.get(h_label).and_then(|i| i.span);
-                                    diag = diag.with_note(
-                                        format!(
-                                            "handler `on{}` also calls setter — \
+                                let h_span = result.handler_info.get(h_label).and_then(|i| i.span);
+                                diag = diag.with_note(
+                                    format!(
+                                        "handler `on{}` also calls setter — \
                                              grows state {} range across fixpoint iterations",
-                                            capitalize_first(event),
-                                            state_label
-                                        ),
-                                        Some(*h_label),
-                                        h_span,
-                                    );
-                                }
+                                        capitalize_first(event),
+                                        state_label
+                                    ),
+                                    Some(*h_label),
+                                    h_span,
+                                );
                             }
                         }
 
