@@ -1,19 +1,11 @@
 # TODO — améliorations futures
 
-## Précision d'analyse
+## Limites d'analyse connues
 
-### Callbacks in-cycle — limites connues *(ADR-009 + ADR-010)*
-
-- **Valeurs loop-carried dans un corps de callback** → vues à leur valeur de **première itération**. `exec_body` traverse le corps pour ses effets de bord même avec une back-edge (les setters dans une boucle fire), mais ne widen pas les back-edges → `setX(arr[i])` enregistre une valeur partielle. FN mineur sur la *valeur*, jamais de FP.
-- **Callees inconnus sans `Loc`** (`myHelper(() => setX())`) → FN sur helpers externes/wrappers qui exécutent le callback en synchrone.
-
----
-
-## Infrastructure
-
-### Analyse inter-composants
-
-Intra-procédural uniquement. Props parent→enfant non tracées. Nécessite graphe de composants + analyse inter-procédurale (complexité O(n²)).
+- **Valeurs loop-carried dans callback** — `exec_body` traverse le corps même avec une back-edge mais ne widen pas → `setX(arr[i])` enregistre valeur partielle. FN mineur sur la *valeur*, jamais de FP. *(ADR-009)*
+- **Callees inconnus sans `Loc`** — `myHelper(() => setX())` → FN sur helpers externes qui exécutent le callback en synchrone. *(ADR-010)*
+- **`derived-state` corps conditionnels** — détection linéaire uniquement (≤2 blocs). Effet avec branches conditionnelles → FN conservatif.
+- **Analyse inter-composants** — intra-procédural uniquement. Props parent→enfant non tracées. Nécessite graphe de composants + analyse inter-procédurale (O(n²)).
 
 ---
 
@@ -39,11 +31,3 @@ const [data, setData] = useState(expensiveCompute())  // recalculé chaque rende
 ```
 
 `HookEntry::State { init: Expr::Call { .. } }` → warn. Règle structurelle pure, pas de fixpoint.
-
-### `derived-state` *(implémenté — 2026-06-04)*
-
-Détecte les effets dont les deps sont `[stateA]`, qui appellent `setB(expr)` inconditionnellement où `expr` est call-free, et `setB` n'est appelé nulle part ailleurs.
-
-`Expr::is_call_free()` ajouté dans `src/ir/expr.rs`. Règle dans `src/rules/derived_state.rs`.
-
-**Limite connue** : détection linéaire uniquement (corps d'effet à ≤2 blocs). Corps avec branches conditionnelles → FN conservatif.
