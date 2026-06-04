@@ -1,6 +1,6 @@
 use crate::ir::{
     cfg::CFG,
-    expr::Expr,
+    expr::{Expr, TSType},
     source_range::SourceRange,
     types::{HookLabel, Symbol},
 };
@@ -10,6 +10,7 @@ pub enum HookEntry {
     State {
         label: HookLabel,
         init: Expr,
+        type_hint: Option<TSType>,
         span: Option<SourceRange>,
     },
     Effect {

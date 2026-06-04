@@ -3,13 +3,13 @@ use std::collections::{HashMap, HashSet};
 use crate::{
     domains::{
         AbstractDomain, AnalysisCtx, FixpointCtx, Heap, NullCtx, Transfer,
-        impls::StateValue,
+        impls::{StateValue, interval::Interval},
         stores::{AbstractEnv, MemoStore, StateStore, TypedStateStore},
     },
     ir::{
         cfg::CFG,
         component::ComponentIR,
-        expr::Expr,
+        expr::{Expr, TSType},
         hooks::HookEntry,
         stmt::Stmt,
         types::{BlockId, HookLabel, Var},
@@ -71,14 +71,28 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
         let init_memo = MemoStore::new();
         let init_untyped = StateStore::bottom();
         for hook in &hooks {
-            if let HookEntry::State { label, init, .. } = hook {
+            if let HookEntry::State {
+                label,
+                init,
+                type_hint,
+                ..
+            } = hook
+            {
                 let init_val = {
                     let mut init_untyped_mut = init_untyped.clone();
                     let mut init_memo_mut = init_memo.clone();
                     let mut heap = crate::domains::Heap::new();
                     let mut ac =
                         AnalysisCtx::null(&mut init_untyped_mut, &mut init_memo_mut, &mut heap);
-                    transfer.eval_expr(init, &init_env, &mut ac)
+                    let v = transfer.eval_expr(init, &init_env, &mut ac);
+                    // useState<number>(null): override Null/Undefined with Number([0,0])
+                    // so the interval domain tracks progression from the first setter call.
+                    match (&v, type_hint) {
+                        (StateValue::Null | StateValue::Undefined, Some(TSType::Number)) => {
+                            StateValue::Number(Interval::point(0.0))
+                        }
+                        _ => v,
+                    }
                 };
                 typed_state.update(*label, init_val);
             }
@@ -606,6 +620,7 @@ mod tests {
         let hooks = vec![HookEntry::State {
             label: 0,
             init: Expr::Lit(Prim::Int(0)),
+            type_hint: None,
             span: None,
         }];
         let render_stmts = vec![Stmt::Let {
@@ -658,6 +673,7 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                type_hint: None,
                 span: None,
             },
             HookEntry::Effect {
@@ -729,6 +745,7 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                type_hint: None,
                 span: None,
             },
             HookEntry::Effect {
@@ -783,6 +800,7 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                type_hint: None,
                 span: None,
             },
             HookEntry::Effect {
@@ -971,6 +989,7 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                type_hint: None,
                 span: None,
             },
             HookEntry::Effect {
@@ -1052,6 +1071,7 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                type_hint: None,
                 span: None,
             },
             HookEntry::Handler {
@@ -1114,6 +1134,7 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                type_hint: None,
                 span: None,
             },
             HookEntry::Handler {
@@ -1247,6 +1268,7 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                type_hint: None,
                 span: None,
             },
             HookEntry::Handler {
@@ -1307,6 +1329,7 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                type_hint: None,
                 span: None,
             },
             HookEntry::Handler {
@@ -1435,6 +1458,7 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                type_hint: None,
                 span: None,
             },
             HookEntry::Effect {
@@ -1485,6 +1509,7 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                type_hint: None,
                 span: None,
             },
             HookEntry::Handler {

@@ -39,7 +39,14 @@ pub enum UnaryOp {
     Not,
 }
 
-pub type TSType = String; // TODO
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TSType {
+    Number,
+    Boolean,
+    Str,
+    Reference,
+    Unknown,
+}
 
 #[derive(Debug, Clone)]
 pub enum Expr {

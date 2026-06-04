@@ -8,7 +8,7 @@ use crate::{
         stores::StateStore,
     },
     ir::{
-        expr::{Expr, Prim},
+        expr::{Expr, Prim, TSType},
         hooks::HookEntry,
         types::HookLabel,
     },
@@ -29,13 +29,28 @@ pub enum StateType {
 }
 
 /// Infer the domain type of a useState label from its init expression.
-pub fn infer_state_type(init: &Expr) -> StateType {
-    match init {
+///
+/// When the init is null/undefined (unknown from the expression alone), the
+/// optional `type_hint` from a TypeScript generic arg (e.g. `useState<number>`)
+/// overrides the result so the typed sub-store is used for that label.
+pub fn infer_state_type(init: &Expr, type_hint: Option<&TSType>) -> StateType {
+    let from_init = match init {
         Expr::Lit(Prim::Int(_) | Prim::Float(_)) => StateType::Number,
         Expr::Lit(Prim::Bool(_)) => StateType::Boolean,
         Expr::Lit(Prim::String(_)) => StateType::Str,
         Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::FnLit { .. } => StateType::Reference,
-        _ => StateType::Unknown, // null, undefined, complex expressions
+        _ => StateType::Unknown,
+    };
+    if from_init == StateType::Unknown {
+        match type_hint {
+            Some(TSType::Number) => StateType::Number,
+            Some(TSType::Boolean) => StateType::Boolean,
+            Some(TSType::Str) => StateType::Str,
+            Some(TSType::Reference) => StateType::Reference,
+            _ => StateType::Unknown,
+        }
+    } else {
+        from_init
     }
 }
 
@@ -83,8 +98,14 @@ impl TypedStateStore {
     pub fn from_component(hooks: &[HookEntry]) -> Self {
         let mut type_map = HashMap::new();
         for hook in hooks {
-            if let HookEntry::State { label, init, .. } = hook {
-                type_map.insert(*label, infer_state_type(init));
+            if let HookEntry::State {
+                label,
+                init,
+                type_hint,
+                ..
+            } = hook
+            {
+                type_map.insert(*label, infer_state_type(init, type_hint.as_ref()));
             }
         }
         Self::empty_with_types(type_map)
@@ -247,6 +268,7 @@ mod tests {
             .map(|(l, e)| HookEntry::State {
                 label: *l,
                 init: e.clone(),
+                type_hint: None,
                 span: None,
             })
             .collect()
@@ -255,11 +277,11 @@ mod tests {
     #[test]
     fn infer_int_literal_is_number() {
         assert_eq!(
-            infer_state_type(&Expr::Lit(Prim::Int(0))),
+            infer_state_type(&Expr::Lit(Prim::Int(0)), None),
             StateType::Number
         );
         assert_eq!(
-            infer_state_type(&Expr::Lit(Prim::Float(1.5))),
+            infer_state_type(&Expr::Lit(Prim::Float(1.5)), None),
             StateType::Number
         );
     }
@@ -267,7 +289,7 @@ mod tests {
     #[test]
     fn infer_bool_literal_is_boolean() {
         assert_eq!(
-            infer_state_type(&Expr::Lit(Prim::Bool(true))),
+            infer_state_type(&Expr::Lit(Prim::Bool(true)), None),
             StateType::Boolean
         );
     }
@@ -275,31 +297,43 @@ mod tests {
     #[test]
     fn infer_string_literal_is_str() {
         assert_eq!(
-            infer_state_type(&Expr::Lit(Prim::String("x".into()))),
+            infer_state_type(&Expr::Lit(Prim::String("x".into())), None),
             StateType::Str
         );
     }
 
     #[test]
     fn infer_null_is_unknown() {
-        assert_eq!(infer_state_type(&Expr::Lit(Prim::Null)), StateType::Unknown);
-        assert_eq!(infer_state_type(&Expr::Lit(Prim::Unit)), StateType::Unknown);
+        assert_eq!(
+            infer_state_type(&Expr::Lit(Prim::Null), None),
+            StateType::Unknown
+        );
+        assert_eq!(
+            infer_state_type(&Expr::Lit(Prim::Unit), None),
+            StateType::Unknown
+        );
     }
 
     #[test]
     fn infer_object_is_reference() {
         assert_eq!(
-            infer_state_type(&Expr::ObjectLit {
-                id: crate::ir::types::ExprId(0),
-                fields: vec![]
-            }),
+            infer_state_type(
+                &Expr::ObjectLit {
+                    id: crate::ir::types::ExprId(0),
+                    fields: vec![]
+                },
+                None
+            ),
             StateType::Reference
         );
         assert_eq!(
-            infer_state_type(&Expr::ArrayLit {
-                id: crate::ir::types::ExprId(0),
-                elems: vec![]
-            }),
+            infer_state_type(
+                &Expr::ArrayLit {
+                    id: crate::ir::types::ExprId(0),
+                    elems: vec![]
+                },
+                None
+            ),
             StateType::Reference
         );
     }

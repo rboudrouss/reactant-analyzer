@@ -170,3 +170,63 @@ fn always_true_guard_is_flagged() {
         "always-true guard does not restrict the interval — must still be flagged"
     );
 }
+
+// ── TypeScript type hint: useState<number>(null) — ADR-008 int|null FN fix ────
+
+#[test]
+fn null_init_with_number_hint_unbounded_is_flagged() {
+    // useState<number>(null) + setN(n + 1) in effect:
+    // type hint overrides null init → Number([0,0]) → interval grows → widening → flagged.
+    let hits = infinite_loop_hits(
+        r#"
+        import { useState, useEffect } from "react";
+        function C() {
+          const [n, setN] = useState<number>(null);
+          useEffect(() => { setN(n + 1); }, [n]);
+          return <div>{n}</div>;
+        }
+        "#,
+    );
+    assert_eq!(
+        hits, 1,
+        "useState<number>(null) + setN(n+1): type hint enables loop detection"
+    );
+}
+
+#[test]
+fn null_init_without_type_hint_does_not_crash() {
+    // useState(null) without type hint: init stays Null → StateType::Unknown.
+    // No loop because the setter never produces a growing number value.
+    let hits = infinite_loop_hits(
+        r#"
+        import { useState, useEffect } from "react";
+        function C() {
+          const [data, setData] = useState(null);
+          useEffect(() => { setData("loaded"); }, []);
+          return <div>{data}</div>;
+        }
+        "#,
+    );
+    assert_eq!(hits, 0, "useState(null) one-shot effect: no loop");
+}
+
+#[test]
+fn null_init_number_hint_guarded_converges() {
+    // useState<number>(null) + guarded increment: fixpoint converges, no flag.
+    let hits = infinite_loop_hits(
+        r#"
+        import { useState, useEffect } from "react";
+        function C() {
+          const [n, setN] = useState<number>(null);
+          useEffect(() => {
+            if (n < 10) setN(n + 1);
+          }, [n]);
+          return <div>{n}</div>;
+        }
+        "#,
+    );
+    assert_eq!(
+        hits, 0,
+        "guarded increment on useState<number>(null) must converge"
+    );
+}

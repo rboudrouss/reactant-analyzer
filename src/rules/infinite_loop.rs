@@ -432,6 +432,7 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                type_hint: None,
                 span: None,
             },
             // deps: None = no deps array = runs every render = can cycle
@@ -521,6 +522,7 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                type_hint: None,
                 span: None,
             },
             HookEntry::Effect {
@@ -664,6 +666,7 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                type_hint: None,
                 span: None,
             },
             HookEntry::Effect {
@@ -986,6 +989,7 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                type_hint: None,
                 span: None,
             },
             HookEntry::Effect {

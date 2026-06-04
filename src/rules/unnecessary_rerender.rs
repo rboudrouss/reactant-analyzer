@@ -212,6 +212,7 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init,
+                type_hint: None,
                 span: None,
             },
             HookEntry::Effect {
