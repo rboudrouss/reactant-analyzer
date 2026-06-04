@@ -223,13 +223,14 @@ fn callbacks_fixture_no_regression() {
     let src =
         std::fs::read_to_string("tests/fixtures/callbacks.tsx").expect("callbacks.tsx not found");
     let hits = infinite_loop_hits(&src);
-    // Nombre de vrais positifs connus dans callbacks.tsx (inchangé).
+    // Nombre de vrais positifs connus dans callbacks.tsx.
     // FetchThenLoop, TimeoutLoop, IntervalLoop, FetchWithErrorHandlerLoop,
     // AllSettledLoop, AnyLoop, VarCallbackLoop, VarCallbackThenLoop,
-    // VarCallbackIntervalLoop, VarCallbackForEachLoop, NestedHelperLoop = 11
+    // VarCallbackIntervalLoop, VarCallbackForEachLoop, NestedHelperLoop,
+    // RenderCbInEffectLoop (B5 cross-pass: cb défini en render, utilisé dans effect) = 12
     // Les 3 nouveaux (ResizeHandlerWithDepsOk, KeydownHandlerOk, MultiListenerOk) = 0.
     assert_eq!(
-        hits, 11,
-        "callbacks.tsx regression: expected 11 infinite-loop hits"
+        hits, 12,
+        "callbacks.tsx regression: expected 12 infinite-loop hits"
     );
 }

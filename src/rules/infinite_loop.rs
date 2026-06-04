@@ -1,14 +1,20 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::{
     domains::StateValue,
     engine::AnalysisResult,
     ir::{
+        cfg::CFG,
         expr::Expr,
         hooks::HookEntry,
         stmt::Stmt,
         types::{HookLabel, Var},
     },
+};
+
+use super::{
+    Diagnostic, Rule, collect_fn_bindings, collect_setter_calls, collect_setter_calls_with_extra,
 };
 
 fn capitalize_first(s: &str) -> String {
@@ -18,8 +24,6 @@ fn capitalize_first(s: &str) -> String {
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
     }
 }
-
-use super::{Diagnostic, Rule, collect_setter_calls};
 
 /// Fires when a state label required widening to converge AND there is an effect
 /// that unconditionally calls the corresponding setter — a potential infinite loop.
@@ -43,6 +47,11 @@ impl Rule for InfiniteLoop {
         // Gathered from all exit envs in block_states.
         let setters_for: HashMap<HookLabel, HashSet<Var>> = build_setter_map(result);
 
+        // FnLit bindings from the render body: variables like `const cb = () => setN(n+1)`
+        // defined in render but used via B5 inside effect bodies. Merged into the
+        // effect-local fn_bindings so cross-pass B5 variable callbacks are resolved.
+        let render_fn_bindings: HashMap<Var, Arc<CFG>> = collect_fn_bindings(&result.render_cfg);
+
         let mut diags = Vec::new();
 
         for &state_label in &result.widened_labels {
@@ -65,7 +74,14 @@ impl Rule for InfiniteLoop {
                         continue;
                     }
 
-                    if !collect_setter_calls(body_cfg, setter_vars, 1).is_empty() {
+                    if !collect_setter_calls_with_extra(
+                        body_cfg,
+                        setter_vars,
+                        1,
+                        &render_fn_bindings,
+                    )
+                    .is_empty()
+                    {
                         let mut diag = Diagnostic::new(
                             "infinite-loop",
                             format!(

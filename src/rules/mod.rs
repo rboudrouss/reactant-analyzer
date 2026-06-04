@@ -112,15 +112,31 @@ pub fn collect_setter_calls(
     setter_vars: &HashSet<Var>,
     max_depth: usize,
 ) -> Vec<(Var, Option<SourceRange>)> {
-    // Pre-scan: build var → FnLit body map for `let cb = () => ...` patterns (B5/B6).
-    let fn_bindings = collect_fn_bindings(cfg);
+    collect_setter_calls_with_extra(cfg, setter_vars, max_depth, &HashMap::new())
+}
+
+/// Like `collect_setter_calls` but merges `extra_fn_bindings` (e.g. from the
+/// render CFG) so that B5 variable callbacks defined outside `cfg` are resolved.
+/// Entries in `cfg` take precedence over `extra_fn_bindings`.
+pub fn collect_setter_calls_with_extra(
+    cfg: &CFG,
+    setter_vars: &HashSet<Var>,
+    max_depth: usize,
+    extra_fn_bindings: &HashMap<Var, Arc<CFG>>,
+) -> Vec<(Var, Option<SourceRange>)> {
+    let mut fn_bindings = collect_fn_bindings(cfg);
+    for (k, v) in extra_fn_bindings {
+        fn_bindings
+            .entry(k.clone())
+            .or_insert_with(|| Arc::clone(v));
+    }
     let mut found: HashMap<Var, Option<SourceRange>> = HashMap::new();
     collect_setter_calls_inner(cfg, setter_vars, max_depth, &fn_bindings, &mut found);
     found.into_iter().collect()
 }
 
 /// Scan all Let stmts in `cfg` for `let X = FnLit{...}` and return X → body_cfg.
-fn collect_fn_bindings(cfg: &CFG) -> HashMap<Var, Arc<CFG>> {
+pub(super) fn collect_fn_bindings(cfg: &CFG) -> HashMap<Var, Arc<CFG>> {
     let mut map: HashMap<Var, Arc<CFG>> = HashMap::new();
     for block in cfg.blocks.values() {
         for stmt in &block.stmts {

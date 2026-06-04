@@ -1,7 +1,8 @@
 # ADR-010 : Heap model — allocation-site abstraction pour la résolution des callbacks par variable
 
-- **Statut** : Accepté
+- **Statut** : Accepté — implémenté (complet)
 - **Date** : 2026-06-03
+- **Mis à jour** : 2026-06-04 — B5 cross-pass structural bug fixé : `collect_setter_calls` dans `InfiniteLoop` ne trouvait pas `setN` quand le FnLit était défini dans le render body (pas dans l'effect). Fix : `collect_setter_calls_with_extra` + `render_fn_bindings` mergé dans le check effect. `RenderCbInEffectLoop` désormais détecté.
 - **Contexte** : [ADR-009](ADR-009-callback-traversal.md) (traversée callbacks), [ADR-003](ADR-003-ir-design.md) (IR / FnLit), [ADR-005](ADR-005-analysis-scope.md) (scope intra-procédural)
 
 ## Contexte
