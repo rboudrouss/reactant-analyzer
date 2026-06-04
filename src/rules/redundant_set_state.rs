@@ -346,6 +346,7 @@ mod tests {
             render_cfg,
             hooks: vec![],
             iterations: 0,
+            effect_setter_writes: StateStore::bottom(),
         }
     }
 
@@ -542,6 +543,7 @@ mod tests {
                 span: None,
             }],
             iterations: 0,
+            effect_setter_writes: StateStore::bottom(),
         }
     }
 

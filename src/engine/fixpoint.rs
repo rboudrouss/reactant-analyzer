@@ -59,7 +59,7 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
     let mut widened_labels: HashSet<HookLabel> = HashSet::new();
     let mut iteration: usize = 0;
     let mut block_states: HashMap<BlockId, AbstractEnv<StateValue>>;
-    let mut env_exit: AbstractEnv<StateValue> = AbstractEnv::bottom();
+    let mut env_exit: AbstractEnv<StateValue>;
     let mut effect_block_states: HashMap<HookLabel, HashMap<BlockId, AbstractEnv<StateValue>>> =
         HashMap::new();
     let mut handler_block_states: HashMap<HookLabel, HashMap<BlockId, AbstractEnv<StateValue>>> =
@@ -208,13 +208,45 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
         }
     }
 
+    // ── Post-convergence: pure setter writes ──────────────────────────────────
+    // Re-run each effect with StateStore::bottom() as the accumulator base so
+    // that `state_out` contains only what the setters actually wrote, not the
+    // pre-existing fixpoint state.  The query context still uses the final
+    // state so that expression evaluation (StateVal reads, narrowing) is correct.
+    //
+    // This lets InfiniteLoop distinguish bounded growth (narrowing held it, e.g.
+    // `if (count < 10) setCount(count + 1)` writes [1,10]) from true divergence
+    // (`setCount(count + 1)` writes [1,+∞)).
+    let final_state = typed_state.to_untyped();
+    let final_ctx = FixpointCtx {
+        state: &final_state,
+        memo: &memo_store,
+    };
+    let bottom_state: StateStore<StateValue> = StateStore::bottom();
+    let mut effect_setter_writes: StateStore<StateValue> = StateStore::bottom();
+    for hook in &hooks {
+        if let HookEntry::Effect { body_cfg, .. } = hook {
+            let (_, pure_writes) = analyze_cfg::<T>(
+                body_cfg,
+                env_exit.clone(),
+                &bottom_state,
+                &memo_store,
+                transfer,
+                config.widen_threshold,
+                &mut heap,
+                &final_ctx,
+            );
+            effect_setter_writes = effect_setter_writes.join(&pure_writes);
+        }
+    }
+
     let hook_calls = collect_hook_calls(&hooks, &render_cfg);
     let effect_info = collect_effect_info(&hooks);
     let handler_info = collect_handler_info(&hooks);
     let hooks_clone = hooks.clone();
 
     AnalysisResult {
-        state_store: typed_state.to_untyped(),
+        state_store: final_state,
         memo_store,
         block_states,
         effect_block_states,
@@ -223,6 +255,7 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
         handler_block_states,
         handler_info,
         widened_labels,
+        effect_setter_writes,
         render_cfg,
         hooks: hooks_clone,
         iterations: iteration,

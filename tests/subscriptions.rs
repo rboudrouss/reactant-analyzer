@@ -13,7 +13,6 @@ use oxc_span::SourceType;
 use reactant::{
     domains::StateValueTransfer,
     engine::{Config, analyze_component},
-    ir::hooks::HookEntry,
     lowering::{compute_line_starts, lower_program},
     rules::{InfiniteLoop, Rule},
 };

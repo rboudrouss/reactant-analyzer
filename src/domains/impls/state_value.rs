@@ -86,6 +86,22 @@ impl StateValue {
         }
     }
 
+    /// True if this value represents unbounded growth in the fixpoint.
+    ///
+    /// Used by `InfiniteLoop` to distinguish a setter that writes a bounded value
+    /// (branch narrowing held the growth) from one that truly diverges:
+    /// - Infinite interval bounds → numeric counter without a binding guard
+    /// - `Reference(Unstable)` → new object/function literal every render
+    /// - `Top` → precision lost, conservatively unbounded
+    pub fn is_unbounded(&self) -> bool {
+        match self {
+            StateValue::Number(i) => i.lo.is_infinite() || i.hi.is_infinite(),
+            StateValue::Reference(Stability::Unstable) => true,
+            StateValue::Top => true,
+            _ => false,
+        }
+    }
+
     /// True if this value is definitively stable (won't cause a re-render).
     pub fn is_stable(&self) -> bool {
         matches!(self.to_stability(), Stability::Stable)

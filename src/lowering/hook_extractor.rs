@@ -866,6 +866,41 @@ mod tests {
         assert!(matches!(handler, HookEntry::Handler { label: 1, .. }));
     }
 
+    #[test]
+    fn handler_span_populated_with_real_line_starts() {
+        // Verify that handler spans are non-None when real line_starts are provided.
+        // Previously documented as a limitation (ADR-011 §2); resolved by
+        // lower_jsx_props capturing prop_spans before the AST is dropped.
+        let src = "function Btn() {\n  return <button onClick={() => {}} />;\n}";
+        let alloc = Allocator::default();
+        let ret = Parser::new(&alloc, src, SourceType::tsx())
+            .with_options(ParseOptions::default())
+            .parse();
+        assert!(ret.errors.is_empty());
+        let line_starts = crate::ir::compute_line_starts(src);
+        let mut cfg = ret
+            .program
+            .body
+            .iter()
+            .find_map(|s| match s {
+                Statement::FunctionDeclaration(f) => {
+                    f.body.as_ref().map(|b| build_cfg(b, &line_starts))
+                }
+                _ => None,
+            })
+            .expect("no function found");
+        let (mut hooks, mut next_label) = extract_hooks(&mut cfg);
+        extract_handlers(&cfg, &mut hooks, &mut next_label);
+        let handler = hooks
+            .iter()
+            .find(|h| matches!(h, HookEntry::Handler { .. }))
+            .expect("no handler found");
+        assert!(
+            matches!(handler, HookEntry::Handler { span: Some(_), .. }),
+            "handler span must be Some when line_starts is non-empty"
+        );
+    }
+
     // ── extract_subscriptions ─────────────────────────────────────────────────
 
     fn parse_and_extract_with_subscriptions(src: &str) -> (CFG, Vec<HookEntry>) {

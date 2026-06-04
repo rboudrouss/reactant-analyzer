@@ -66,5 +66,5 @@ La règle scanne maintenant `result.hooks` pour les `HookEntry::Handler` qui app
 
 - **Thread line_starts** : `lower_program`, `build_cfg`, `BlockBuilder` ont un paramètre `line_starts: &[u32]`. Les tests qui construisent l'IR à la main (fixpoint, rules) passent `&[]` ou `None`.
 - **Sites mécaniques** : `Stmt::ExprStmt(e)` → `ExprStmt(e, _)` dans tous les patterns ; `ExprStmt(e)` → `ExprStmt(e, None)` dans les constructions test. Idem pour `HookEntry` variants.
-- **Limitation handler span** : handlers JSX extraits de `NativeElem` props — pas de Stmt correspondant dans le lowered IR, donc span = None. Range absent de la note handler.
+- **Handler span** : résolu — `lower_jsx_props` capture `prop_spans: HashMap<String, Option<SourceRange>>` pour chaque prop `onX` avant que l'AST Oxc soit libéré. `collect_handlers_in_expr` lit `prop_spans.get(name)` lors de la construction du `HookEntry::Handler`. Span est `Some` en production et `None` uniquement dans les tests unitaires qui passent `&[]` comme `line_starts`.
 - **Règles non mises à jour** : seule `InfiniteLoop` génère des notes pour l'instant. Les autres règles (`missing-deps`, `stale-closure`, etc.) bénéficieront du `range` sur Diagnostic quand elles propageront leur Effect.span.

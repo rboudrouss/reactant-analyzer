@@ -37,8 +37,8 @@ pub(crate) fn exec_stmt_with_callbacks<T: Transfer>(
 
 /// Execute a FnLit body CFG and return its abstract return value.
 ///
-/// Callers that need to execute a body at a specific inlining depth (e.g. from
-/// within another body) should use [`exec_body_depth`] instead.
+/// Only used in tests; production callers go through [`exec_body_depth`].
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn exec_body<T: Transfer>(
     transfer: &T,
     cfg: &CFG,

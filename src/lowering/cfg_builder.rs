@@ -41,10 +41,6 @@ impl BlockBuilder {
         }
     }
 
-    pub(super) fn new() -> Self {
-        Self::new_with_line_starts(&[])
-    }
-
     pub(super) fn new_block(&mut self) -> BlockId {
         let id = self.counter;
         self.counter += 1;

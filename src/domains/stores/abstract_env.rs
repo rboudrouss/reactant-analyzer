@@ -24,37 +24,6 @@ impl<D: AbstractDomain> EnvVal<D> {
             EnvVal::Loc(_) => D::top(),
         }
     }
-
-    fn join(&self, other: &Self) -> Self {
-        match (self, other) {
-            (EnvVal::Val(a), EnvVal::Val(b)) => EnvVal::Val(a.join(b)),
-            (EnvVal::Loc(s1), EnvVal::Loc(s2)) => EnvVal::Loc(s1.union(s2).cloned().collect()),
-            // Different shapes → lose location info, fall back to top.
-            _ => EnvVal::Val(D::top()),
-        }
-    }
-
-    fn widen(&self, other: &Self) -> Self {
-        match (self, other) {
-            (EnvVal::Val(a), EnvVal::Val(b)) => EnvVal::Val(a.widen(b)),
-            (EnvVal::Loc(s1), EnvVal::Loc(s2)) => EnvVal::Loc(s1.union(s2).cloned().collect()),
-            _ => EnvVal::Val(D::top()),
-        }
-    }
-
-    fn leq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (EnvVal::Val(a), EnvVal::Val(b)) => {
-                matches!(
-                    a.partial_cmp(b),
-                    Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)
-                )
-            }
-            (EnvVal::Loc(s1), EnvVal::Loc(s2)) => s1.is_subset(s2),
-            // Cross-type: Loc is not ⊑ Val or vice-versa.
-            _ => false,
-        }
-    }
 }
 
 /// Per-variable abstract environment: maps each variable to a domain value.

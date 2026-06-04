@@ -169,6 +169,7 @@ mod tests {
             },
             hooks,
             iterations: 0,
+            effect_setter_writes: StateStore::bottom(),
         }
     }
 
@@ -268,6 +269,7 @@ mod tests {
             handler_block_states: HashMap::new(),
             handler_info: HashMap::new(),
             widened_labels: Default::default(),
+            effect_setter_writes: StateStore::bottom(),
             render_cfg: CFG {
                 entry: 0,
                 blocks,

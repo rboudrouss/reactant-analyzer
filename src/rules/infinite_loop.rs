@@ -82,6 +82,14 @@ impl Rule for InfiniteLoop {
                     )
                     .is_empty()
                     {
+                        // Precision check: if the setter's written value at the fixpoint
+                        // is bounded (no ±∞ in the interval), branch narrowing held the
+                        // growth → not a true infinite loop, skip.
+                        // Bottom = setter not reached in semantic analysis → conservative.
+                        let writes = result.effect_setter_writes.get(state_label);
+                        if writes != crate::domains::StateValue::Bottom && !writes.is_unbounded() {
+                            continue;
+                        }
                         let mut diag = Diagnostic::new(
                             "infinite-loop",
                             format!(
@@ -220,6 +228,7 @@ mod tests {
             },
             hooks,
             iterations: 0,
+            effect_setter_writes: StateStore::bottom(),
         }
     }
 

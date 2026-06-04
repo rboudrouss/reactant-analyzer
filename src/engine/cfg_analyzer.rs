@@ -653,7 +653,7 @@ mod tests {
     /// Mirrors `() => setN(c => c + 1)` concise-arrow body.
     #[test]
     fn functional_updater_in_return_terminator_fires() {
-        use crate::ir::{cfg::Edge, types::ExprId};
+        use crate::ir::types::ExprId;
         use std::sync::Arc;
 
         // FnLit body: Return(BinOp{StateVal(0), Add, Lit(1)})

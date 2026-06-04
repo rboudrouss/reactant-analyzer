@@ -83,6 +83,13 @@ pub struct AnalysisResult<D: AbstractDomain> {
     pub handler_info: HashMap<HookLabel, HandlerInfo>,
     /// Labels whose state was widened to force convergence.
     pub widened_labels: HashSet<HookLabel>,
+    /// Join of all values written to the state store by effects in the final fixpoint
+    /// iteration, starting from ⊥ (i.e. excludes the pre-existing state value).
+    ///
+    /// Used by `InfiniteLoop` to distinguish a setter that writes a bounded value
+    /// (branch narrowing held the growth) from one that truly diverges.
+    /// `Bottom` for a label = effect never called that setter in the semantic analysis.
+    pub effect_setter_writes: StateStore<D>,
     pub render_cfg: CFG,
     /// Original hook entries — needed by rules that inspect effect body CFGs.
     pub hooks: Vec<HookEntry>,
