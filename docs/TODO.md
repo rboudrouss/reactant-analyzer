@@ -1,15 +1,5 @@
 # TODO — améliorations futures
 
-## Limites d'analyse connues
-
-- **Valeurs loop-carried dans callback** — `exec_body` traverse le corps même avec une back-edge mais ne widen pas → `setX(arr[i])` enregistre valeur partielle. FN mineur sur la *valeur*, jamais de FP. *(ADR-009)*
-- **Callees inconnus sans `Loc`** — `myHelper(() => setX())` → FN sur helpers externes qui exécutent le callback en synchrone. *(ADR-010)*
-- **`missing-deps` FP sur variables fonction stables** — `const cb = () => setData({loaded: true})` → `Reference(Unstable)` → `missing-deps` fire même si `cb` ne capture aucune valeur mutable. Conservatif acceptable (cf. ESLint rules-of-hooks).
-- **`derived-state` corps conditionnels** — détection linéaire uniquement (≤2 blocs). Effet avec branches conditionnelles → FN conservatif.
-- **Analyse inter-composants** — intra-procédural uniquement. Props parent→enfant non tracées. Nécessite graphe de composants + analyse inter-procédurale (O(n²)).
-
----
-
 ## Nouvelles règles
 
 ### `missing-deps` pour `useCallback` et `useMemo`
@@ -32,3 +22,13 @@ const [data, setData] = useState(expensiveCompute())  // recalculé chaque rende
 ```
 
 `HookEntry::State { init: Expr::Call { .. } }` → warn. Règle structurelle pure, pas de fixpoint.
+
+---
+
+## Limites d'analyse connues
+
+- **Valeurs loop-carried dans callback** — `exec_body` traverse le corps même avec une back-edge mais ne widen pas → `setX(arr[i])` enregistre valeur partielle. FN mineur sur la *valeur*, jamais de FP. *(ADR-009)*
+- **Callees inconnus sans `Loc`** — `myHelper(() => setX())` → FN sur helpers externes qui exécutent le callback en synchrone. *(ADR-010)*
+- **`missing-deps` FP sur variables fonction stables** — `const cb = () => setData({loaded: true})` → `Reference(Unstable)` → `missing-deps` fire même si `cb` ne capture aucune valeur mutable. Conservatif acceptable (cf. ESLint rules-of-hooks).
+- **`derived-state` corps conditionnels** — détection linéaire uniquement (≤2 blocs). Effet avec branches conditionnelles → FN conservatif.
+- **Analyse inter-composants** — intra-procédural uniquement. Props parent→enfant non tracées. Nécessite graphe de composants + analyse inter-procédurale (O(n²)).

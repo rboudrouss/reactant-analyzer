@@ -31,7 +31,7 @@ La table `line_starts` est précalculée une fois en `O(n)` dans `analyze_file` 
 
 - **Stmts** : le `BlockBuilder` porte la table `line_starts` et expose `span_at(offset: u32)`. Chaque `Statement::ExpressionStatement` et `VariableDeclarator` principal reçoit son span à la construction.
 - **HookEntry** : `process_stmt` dans `hook_extractor.rs` lit le span du `Stmt` entrant et le propage via `make_hook_entry(..., span)`. Effect et State ainsi que les autres hooks héritent du span de leur statement de déclaration.
-- **Handler** : span reste `None` — les props JSX `onX` n'ont pas de Stmt correspondant dans l'IR lowered. À compléter en ADR-012 si nécessaire.
+- **Handler** : `lower_jsx_props` collecte `prop_spans: HashMap<String, Option<SourceRange>>` pour chaque prop `onX` pendant le lowering. `collect_handlers_in_expr` consomme ce map via `prop_spans.get(name)` — span est `Some` en production, `None` uniquement dans les tests qui passent `&[]` comme `line_starts`.
 
 ### 3. `Note` + `notes` sur `Diagnostic`
 
