@@ -11,14 +11,9 @@
 
 ## Infrastructure
 
-### Fix `analyze_cfg` pour les corps concis *(2026-06-04, résolu)*
+### Span call-site pour `setter-in-render` *(ADR-011)*
 
-`analyze_cfg` ne traitait pas les effets de bord de `Terminator::Return(expr)`. Les corps concis `() => setN(99)` placent l'appel dans le `Return`, pas dans les `stmts`. Corrigé : `exec_stmt(ExprStmt(return_expr))` ajouté après la boucle stmts dans `analyze_cfg`. Impact : handlers JSX concis et callbacks `addEventListener` mettent maintenant correctement à jour le `StateStore`.
-
-### Diagnostic notes pour autres règles *(ADR-011)*
-
-`Diagnostic.notes`, `HookEntry.span`, `EffectInfo.span`, `HandlerInfo.span` et `HookCallInfo.span` sont implémentés et propagés dans toutes les règles. Le lowering JSX capture les spans des props `onX` via `NativeElem::prop_spans`. Reste :
-- Span côté setter/state au niveau des statements (pour `setter-in-render` côté call site, pas declaration site).
+Spans implémentés partout sauf : span côté setter/state au niveau des statements (pour `setter-in-render` côté call site, pas declaration site).
 
 ### Analyse inter-composants
 
