@@ -2,6 +2,7 @@
 
 - **Statut** : Implémenté (Option A + Option B actifs)
 - **Date** : 2026-06-02
+- **Mis à jour** : 2026-06-04 — `TSType` promu en enum (`Number|Boolean|Str|Reference|Unknown`) ; `HookEntry::State` porte `type_hint: Option<TSType>` capturé depuis l'argument générique TypeScript (`useState<T>()`). `infer_state_type` et le fixpoint utilisent le hint pour surcharger `StateType::Unknown` quand l'init est `null`/`undefined`. Init nulle + hint `Number` → `Number([0,0])` → détection de boucle infinie opérationnelle. Voir section « Handling `int | null` » ci-dessous.
 - **Contexte** : [ADR-007](ADR-007-cross-domain-queries.md) (cross-domain), [ADR-002](ADR-002-abstract-domains.md) (Stability)
 
 ## Contexte
@@ -182,11 +183,14 @@ useEffect(() => { if (n !== null) setN(n + 1) }, [n]);
 - join(Null, Number([1,1])) = Top → on perd la progression [1,2,3,...]
 - Pas de signal widening → **faux négatif possible** (boucle non détectée)
 
-**Mitigations** :
-1. Si init = Null mais premier setter est `Number` → promouvoir le type à `Number` (flow-sensitive type refinement, complexe)
-2. Ou documenter comme limite connue et recommander annotation TypeScript dans un futur
+**Résolution (2026-06-04)** : l'annotation TypeScript `useState<number>(null)` est maintenant capturée.
 
-Pour l'instant : **connu et accepté**. L'annotation `useState<number>(null)` en TypeScript donne un hint de type que le lowering pourrait capturer (TODO futur).
+- Le lowering extrait `type_arguments[0]` sur `CallExpression` → `TSAnnotated(Call, TSType::Number)`.
+- `hook_extractor` lit le hint et le stocke dans `HookEntry::State { type_hint: Some(TSType::Number), .. }`.
+- `infer_state_type(Null, Some(TSType::Number))` retourne `StateType::Number` → label routé vers `number_store`.
+- Le fixpoint surcharge l'init : `(StateValue::Null, Some(TSType::Number))` → `Number([0,0])`. L'intervalle peut ensuite progresser et widener normalement.
+
+**Limite résiduelle** : `useState(null)` *sans* annotation TypeScript → init reste `Null` → `StateType::Unknown` → FN possible. Documenté dans TODO.md.
 
 ---
 
@@ -302,7 +306,9 @@ Précision par type :
 - `src/domains/impls/bool_val.rs` — type `BoolVal` extrait
 - `src/domains/impls/str_const.rs` — enum `StrConst { Bottom, Set(Arc<BTreeSet<String>>), Top }`, seuil widening = 4
 - `src/domains/stores/typed_state_store.rs` — `TypedStateStore`, interne à `analyze_component`
-- `HookEntry::State { init }` utilisé pour inférer `StateValue::init_value(init)` au démarrage du fixpoint SCC
+- `HookEntry::State { init, type_hint }` — `type_hint` capturé depuis `useState<T>()` par le lowering ; utilisé par `infer_state_type` et le fixpoint pour surcharger l'init nulle
+- `ir/expr.rs` — `TSType` enum (`Number|Boolean|Str|Reference|Unknown`) remplace l'alias `String`
+- `lowering/expr_lower.rs` — `CallExpression` avec `type_arguments` → `TSAnnotated(Call, TSType)`
 - Le fixpoint SCC est **distinct** du fixpoint Stability principal (cf. [ADR-007](ADR-007-cross-domain-queries.md), Option A post-pass)
 - `StateStore<StateValue>` utilisé dans l'API publique ; `TypedStateStore` transparent pour Transfer et les règles
-- Limite connue : états `T | null` initialisés à `null` peuvent produire des faux négatifs sur certains patterns
+- Limite résiduelle : `useState(null)` sans annotation TypeScript → `StateType::Unknown` → FN possible (voir TODO.md)

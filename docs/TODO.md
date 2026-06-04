@@ -32,3 +32,4 @@ const [data, setData] = useState(expensiveCompute())  // recalculé chaque rende
 - **`missing-deps` FP sur variables fonction stables** — `const cb = () => setData({loaded: true})` → `Reference(Unstable)` → `missing-deps` fire même si `cb` ne capture aucune valeur mutable. Conservatif acceptable (cf. ESLint rules-of-hooks).
 - **`derived-state` corps conditionnels** — détection linéaire uniquement (≤2 blocs). Effet avec branches conditionnelles → FN conservatif.
 - **Analyse inter-composants** — intra-procédural uniquement. Props parent→enfant non tracées. Nécessite graphe de composants + analyse inter-procédurale (O(n²)).
+- **`useState(null)` sans annotation TypeScript** — init Null sans type hint → `StateType::Unknown` → `join(Null, Number) = Top` → convergence immédiate → FN possible sur boucles. Atténué : `useState<number>(null)` détecté via le hint TS (voir ADR-008). Pattern non annoté reste un FN accepté.
