@@ -1,9 +1,13 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     domains::StateValue,
     engine::AnalysisResult,
-    ir::{expr::Expr, stmt::Stmt, types::Var},
+    ir::{
+        expr::Expr,
+        stmt::Stmt,
+        types::{HookLabel, Var},
+    },
 };
 
 use super::{Diagnostic, Rule, collect_setter_calls};
@@ -46,15 +50,47 @@ impl Rule for SetterInRender {
             return vec![];
         }
 
+        // Build setter name → (state label, hook call span) for richer diagnostics.
+        let setter_info: HashMap<Var, (HookLabel, Option<crate::ir::SourceRange>)> = result
+            .render_cfg
+            .blocks
+            .values()
+            .flat_map(|b| b.stmts.iter())
+            .filter_map(|stmt| {
+                if let Stmt::Let {
+                    var,
+                    rhs: Expr::StateSetter(label),
+                    ..
+                } = stmt
+                {
+                    let span = result
+                        .hook_calls
+                        .iter()
+                        .find(|c| c.label == *label)
+                        .and_then(|c| c.span);
+                    Some((var.clone(), (*label, span)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         collect_setter_calls(&result.render_cfg, &setter_vars, 1)
             .into_iter()
             .map(|name| {
-                Diagnostic::new(
+                let mut d = Diagnostic::new(
                     "setter-in-render",
                     format!(
                         "setter `{name}` called directly in the render body, move this call into a useEffect or an event handler"
                     ),
-                )
+                );
+                if let Some(&(label, span)) = setter_info.get(&name) {
+                    d = d.with_label(label);
+                    if let Some(r) = span {
+                        d = d.with_range(r);
+                    }
+                }
+                d
             })
             .collect()
     }

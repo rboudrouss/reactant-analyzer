@@ -20,9 +20,8 @@ JSX `onX={fn}` handlers sont maintenant des points d'entrée de première classe
 
 ### Diagnostic notes pour autres règles *(ADR-011)*
 
-`Diagnostic.notes` et `HookEntry.span` sont implémentés. Reste :
-- Propager `effect.span` dans `missing-deps`, `unnecessary-rerender`, etc.
-- Handler span : extraire le range de la prop JSX `onX` depuis le lowering (pas de Stmt correspondant dans l'IR actuel).
+`Diagnostic.notes`, `HookEntry.span`, `EffectInfo.span`, `HandlerInfo.span` et `HookCallInfo.span` sont implémentés et propagés dans toutes les règles. Le lowering JSX capture les spans des props `onX` via `NativeElem::prop_spans`. Reste :
+- Span côté setter/state au niveau des statements (pour `setter-in-render` côté call site, pas declaration site).
 
 ### Analyse inter-composants
 

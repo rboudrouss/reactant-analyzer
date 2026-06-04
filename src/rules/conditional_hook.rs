@@ -37,14 +37,18 @@ impl Rule for ConditionalHook {
                     .any(|&exit| !dominates(&result.render_cfg, call.block_id, exit))
             })
             .map(|call| {
-                Diagnostic::new(
+                let mut d = Diagnostic::new(
                     "conditional-hook",
                     format!(
                         "hook {} is called conditionally (not on every render path)",
                         call.label
                     ),
                 )
-                .with_label(call.label)
+                .with_label(call.label);
+                if let Some(r) = call.span {
+                    d = d.with_range(r);
+                }
+                d
             })
             .collect()
     }
@@ -192,6 +196,7 @@ mod tests {
                 label: 0,
                 kind: HookKind::State,
                 block_id: 0,
+                span: None,
             }],
         );
         assert!(ConditionalHook.check(&result).is_empty());
@@ -206,6 +211,7 @@ mod tests {
                 label: 0,
                 kind: HookKind::State,
                 block_id: 1,
+                span: None,
             }],
         );
         assert!(ConditionalHook.check(&result).is_empty());
@@ -220,6 +226,7 @@ mod tests {
                 label: 0,
                 kind: HookKind::State,
                 block_id: 1,
+                span: None,
             }],
         );
         let diags = ConditionalHook.check(&result);
@@ -236,6 +243,7 @@ mod tests {
                 label: 0,
                 kind: HookKind::State,
                 block_id: 3,
+                span: None,
             }],
         );
         assert!(ConditionalHook.check(&result).is_empty());
@@ -249,11 +257,13 @@ mod tests {
                 label: 0,
                 kind: HookKind::State,
                 block_id: 0,
+                span: None,
             }, // unconditional
             HookCallInfo {
                 label: 1,
                 kind: HookKind::State,
                 block_id: 1,
+                span: None,
             }, // conditional
         ];
         let result = make_result(cfg, hook_calls);

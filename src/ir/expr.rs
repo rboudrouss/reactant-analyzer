@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ir::{
     cfg::CFG,
+    source_range::SourceRange,
     types::{ExprId, HookLabel, Symbol, Var},
 };
 
@@ -96,6 +98,9 @@ pub enum Expr {
         tag: Symbol,
         props: Box<Expr>,
         children: Vec<Expr>,
+        /// Spans of JSX event-handler props (`onX={fn}`), keyed by prop name.
+        /// Populated during lowering; consumed by `hook_extractor` to set `HookEntry::Handler.span`.
+        prop_spans: HashMap<String, Option<SourceRange>>,
     },
 
     // TypeScript Annotations

@@ -35,7 +35,10 @@ pub fn extract_handlers(cfg: &CFG, hooks: &mut Vec<HookEntry>, next_label: &mut 
 fn collect_handlers_in_expr(expr: &Expr, hooks: &mut Vec<HookEntry>, next_label: &mut HookLabel) {
     match expr {
         Expr::NativeElem {
-            props, children, ..
+            props,
+            children,
+            prop_spans,
+            ..
         } => {
             if let Expr::ObjectLit { fields, .. } = props.as_ref() {
                 for (name, val) in fields {
@@ -47,7 +50,7 @@ fn collect_handlers_in_expr(expr: &Expr, hooks: &mut Vec<HookEntry>, next_label:
                                 label,
                                 event: prop_to_event(name),
                                 body_cfg: (**body_cfg).clone(),
-                                span: None,
+                                span: prop_spans.get(name).copied().flatten(),
                             });
                         }
                         // Non-FnLit onX props (e.g. onX={someVar}) are not analysed.

@@ -40,18 +40,20 @@ impl Rule for MissingDeps {
                 }
                 let val = env_exit.lookup(var);
                 if !val.is_stable() {
-                    diags.push(
-                        Diagnostic::new(
-                            "missing-deps",
-                            format!(
-                                "variable `{}` is used in effect {} but not in its deps array \
-                                 (value: {:?})",
-                                var, label, val
-                            ),
-                        )
-                        .with_label(*label)
-                        .with_var(var.clone()),
-                    );
+                    let mut d = Diagnostic::new(
+                        "missing-deps",
+                        format!(
+                            "variable `{}` is used in effect {} but not in its deps array \
+                             (value: {:?})",
+                            var, label, val
+                        ),
+                    )
+                    .with_label(*label)
+                    .with_var(var.clone());
+                    if let Some(r) = info.span {
+                        d = d.with_range(r);
+                    }
+                    diags.push(d);
                 }
             }
         }
@@ -147,6 +149,7 @@ mod tests {
                 free_vars: HashSet::from(["n".to_string()]),
                 declared_deps: vec![Expr::Lit(Prim::Bool(true))],
                 has_deps_array: true,
+                span: None,
             },
         );
         let mut block_states = HashMap::new();
@@ -171,6 +174,7 @@ mod tests {
                 free_vars: HashSet::from(["setN".to_string()]),
                 declared_deps: vec![Expr::Lit(Prim::Unit)],
                 has_deps_array: true,
+                span: None,
             },
         );
         let mut block_states = HashMap::new();
@@ -193,6 +197,7 @@ mod tests {
                 free_vars: HashSet::from(["n".to_string()]),
                 declared_deps: vec![Expr::Var("n".to_string())],
                 has_deps_array: true,
+                span: None,
             },
         );
         let mut block_states = HashMap::new();
@@ -216,6 +221,7 @@ mod tests {
                 free_vars: HashSet::from(["n".to_string()]),
                 declared_deps: vec![],
                 has_deps_array: false,
+                span: None,
             },
         );
         let mut block_states = HashMap::new();
@@ -241,6 +247,7 @@ mod tests {
                 free_vars: HashSet::from(["n".to_string()]),
                 declared_deps: vec![],
                 has_deps_array: true,
+                span: None,
             },
         );
         let mut block_states = HashMap::new();
@@ -269,6 +276,7 @@ mod tests {
                 free_vars: HashSet::from(["x".to_string()]),
                 declared_deps: vec![Expr::Lit(Prim::Unit)],
                 has_deps_array: true,
+                span: None,
             },
         );
         let mut block_states = HashMap::new();
@@ -290,6 +298,7 @@ mod tests {
                 free_vars: HashSet::from(["fetch".to_string()]),
                 declared_deps: vec![Expr::Lit(Prim::Unit)],
                 has_deps_array: true,
+                span: None,
             },
         );
         let mut block_states = HashMap::new();

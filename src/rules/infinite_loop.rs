@@ -57,7 +57,6 @@ impl Rule for InfiniteLoop {
                     label: eff_label,
                     body_cfg,
                     deps,
-                    span: eff_span,
                     ..
                 } = hook
                 {
@@ -77,8 +76,8 @@ impl Rule for InfiniteLoop {
                         )
                         .with_label(state_label);
 
-                        if let Some(r) = eff_span {
-                            diag = diag.with_range(*r);
+                        if let Some(r) = result.effect_info.get(eff_label).and_then(|i| i.span) {
+                            diag = diag.with_range(r);
                         }
 
                         // Attach a note for each handler that also calls this setter.
@@ -87,10 +86,12 @@ impl Rule for InfiniteLoop {
                                 label: h_label,
                                 event,
                                 body_cfg: h_cfg,
-                                span: h_span,
+                                ..
                             } = h
                             {
                                 if !collect_setter_calls(h_cfg, setter_vars, 1).is_empty() {
+                                    let h_span =
+                                        result.handler_info.get(h_label).and_then(|i| i.span);
                                     diag = diag.with_note(
                                         format!(
                                             "handler `on{}` also calls setter — \
@@ -99,7 +100,7 @@ impl Rule for InfiniteLoop {
                                             state_label
                                         ),
                                         Some(*h_label),
-                                        *h_span,
+                                        h_span,
                                     );
                                 }
                             }

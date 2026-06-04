@@ -52,7 +52,10 @@ fn functional_updater_with_state_dep_is_flagged() {
         }
         "#,
     );
-    assert_eq!(hits, 1, "functional updater with [count] dep must be flagged");
+    assert_eq!(
+        hits, 1,
+        "functional updater with [count] dep must be flagged"
+    );
 }
 
 #[test]
@@ -128,5 +131,8 @@ fn deferred_concise_callback_setter_fires() {
         }
         "#,
     );
-    assert_eq!(hits, 1, "deferred concise-body setter must widen and be flagged");
+    assert_eq!(
+        hits, 1,
+        "deferred concise-body setter must widen and be flagged"
+    );
 }

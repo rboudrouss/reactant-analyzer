@@ -6,6 +6,7 @@ use crate::{
         stores::{AbstractEnv, MemoStore, StateStore},
     },
     ir::{
+        SourceRange,
         cfg::{CFG, Terminator},
         expr::Expr,
         hooks::HookEntry,
@@ -34,6 +35,8 @@ pub struct HookCallInfo {
     pub label: HookLabel,
     pub kind: HookKind,
     pub block_id: BlockId,
+    /// Source location of the hook call site (e.g. `useState(0)`), if available.
+    pub span: Option<SourceRange>,
 }
 
 /// Captured information about a JSX event handler entry point.
@@ -44,6 +47,8 @@ pub struct HandlerInfo {
     pub event: String,
     /// Variables used in the handler body but not locally defined within it.
     pub free_vars: HashSet<Var>,
+    /// Source location of the JSX `onX={fn}` prop, if available.
+    pub span: Option<SourceRange>,
 }
 
 /// Captured information about a useEffect hook for dep-checking rules.
@@ -57,6 +62,8 @@ pub struct EffectInfo {
     /// `true` when caller wrote an explicit deps array (even `[]`).
     /// `false` when no deps argument was passed (`deps: None`).
     pub has_deps_array: bool,
+    /// Source location of the `useEffect(...)` call site, if available.
+    pub span: Option<SourceRange>,
 }
 
 #[derive(Debug)]

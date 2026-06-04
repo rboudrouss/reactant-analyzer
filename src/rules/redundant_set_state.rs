@@ -60,7 +60,13 @@ impl Rule for RedundantSetState {
         let env_exit = result.exit_env();
 
         for hook in &result.hooks {
-            if let HookEntry::Effect { body_cfg, .. } = hook {
+            if let HookEntry::Effect {
+                label: eff_label,
+                body_cfg,
+                ..
+            } = hook
+            {
+                let prev_len = diags.len();
                 check_cfg_for_redundant_sets(
                     body_cfg,
                     &env_exit,
@@ -69,6 +75,14 @@ impl Rule for RedundantSetState {
                     &transfer,
                     &mut diags,
                 );
+                // Attach effect source location to any diagnostics just emitted.
+                if let Some(r) = result.effect_info.get(eff_label).and_then(|i| i.span) {
+                    for d in &mut diags[prev_len..] {
+                        if d.range.is_none() {
+                            d.range = Some(r);
+                        }
+                    }
+                }
             }
         }
 

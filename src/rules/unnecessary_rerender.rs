@@ -77,7 +77,7 @@ impl Rule for UnnecessaryRerender {
 
         for hook in &result.hooks {
             let HookEntry::Effect {
-                label: _eff_label,
+                label: eff_label,
                 body_cfg,
                 deps: Some(deps),
                 ..
@@ -88,6 +88,7 @@ impl Rule for UnnecessaryRerender {
             if !deps.is_empty() {
                 continue; // only mount-only effects (deps = [])
             }
+            let eff_span = result.effect_info.get(eff_label).and_then(|i| i.span);
 
             // BFS through effect body for setter calls.
             let mut visited: HashSet<_> = HashSet::new();
@@ -142,17 +143,19 @@ impl Rule for UnnecessaryRerender {
                             continue; // same value as init → redundant-set-state, not this rule
                         }
 
-                        diags.push(
-                            Diagnostic::new(
-                                "unnecessary-rerender",
-                                format!(
-                                    "mount-only effect sets state {state_label} to a constant \
-                                     different from its initial value — causes one extra rerender on mount; \
-                                     consider initialising directly with the target value"
-                                ),
-                            )
-                            .with_label(state_label),
-                        );
+                        let mut d = Diagnostic::new(
+                            "unnecessary-rerender",
+                            format!(
+                                "mount-only effect sets state {state_label} to a constant \
+                                 different from its initial value — causes one extra rerender on mount; \
+                                 consider initialising directly with the target value"
+                            ),
+                        )
+                        .with_label(state_label);
+                        if let Some(r) = eff_span {
+                            d = d.with_range(r);
+                        }
+                        diags.push(d);
                     }
 
                     for succ in body_cfg.successors(bid) {

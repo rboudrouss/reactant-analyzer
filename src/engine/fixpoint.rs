@@ -249,7 +249,7 @@ fn exit_env<D: AbstractDomain>(
 /// render CFG.  Effect hooks emit no statement in the render CFG, so their
 /// `block_id` defaults to `cfg.entry`.
 fn collect_hook_calls(hooks: &[HookEntry], cfg: &CFG) -> Vec<HookCallInfo> {
-    // Build label → kind map
+    // Build label → kind and label → span maps from hook entries.
     let label_to_kind: HashMap<HookLabel, HookKind> = hooks
         .iter()
         .map(|h| match h {
@@ -263,6 +263,19 @@ fn collect_hook_calls(hooks: &[HookEntry], cfg: &CFG) -> Vec<HookCallInfo> {
         })
         .collect();
 
+    let label_to_span: HashMap<HookLabel, Option<crate::ir::SourceRange>> = hooks
+        .iter()
+        .map(|h| match h {
+            HookEntry::State { label, span, .. } => (*label, *span),
+            HookEntry::Effect { label, span, .. } => (*label, *span),
+            HookEntry::Memo { label, span, .. } => (*label, *span),
+            HookEntry::Callback { label, span, .. } => (*label, *span),
+            HookEntry::Ref { label, span, .. } => (*label, *span),
+            HookEntry::Custom { label, span, .. } => (*label, *span),
+            HookEntry::Handler { label, span, .. } => (*label, *span),
+        })
+        .collect();
+
     // Effect and Handler hooks have no render-CFG binding stmt; pre-populate with entry block.
     let mut call_map: HashMap<HookLabel, HookCallInfo> = hooks
         .iter()
@@ -273,6 +286,7 @@ fn collect_hook_calls(hooks: &[HookEntry], cfg: &CFG) -> Vec<HookCallInfo> {
                     label: *label,
                     kind: HookKind::Effect,
                     block_id: cfg.entry,
+                    span: label_to_span.get(label).copied().flatten(),
                 },
             )),
             HookEntry::Handler { label, .. } => Some((
@@ -281,6 +295,7 @@ fn collect_hook_calls(hooks: &[HookEntry], cfg: &CFG) -> Vec<HookCallInfo> {
                     label: *label,
                     kind: HookKind::Handler,
                     block_id: cfg.entry,
+                    span: label_to_span.get(label).copied().flatten(),
                 },
             )),
             _ => None,
@@ -300,6 +315,7 @@ fn collect_hook_calls(hooks: &[HookEntry], cfg: &CFG) -> Vec<HookCallInfo> {
                             label,
                             kind,
                             block_id,
+                            span: label_to_span.get(&label).copied().flatten(),
                         });
                     }
                 }
@@ -370,7 +386,7 @@ fn collect_effect_info(hooks: &[HookEntry]) -> HashMap<HookLabel, EffectInfo> {
                 label,
                 body_cfg,
                 deps,
-                ..
+                span,
             } = h
             {
                 let free_vars = compute_free_vars(body_cfg);
@@ -383,6 +399,7 @@ fn collect_effect_info(hooks: &[HookEntry]) -> HashMap<HookLabel, EffectInfo> {
                         free_vars,
                         declared_deps,
                         has_deps_array,
+                        span: *span,
                     },
                 ))
             } else {
@@ -401,7 +418,7 @@ fn collect_handler_info(hooks: &[HookEntry]) -> HashMap<HookLabel, HandlerInfo> 
                 label,
                 event,
                 body_cfg,
-                ..
+                span,
             } = h
             {
                 Some((
@@ -410,6 +427,7 @@ fn collect_handler_info(hooks: &[HookEntry]) -> HashMap<HookLabel, HandlerInfo> 
                         label: *label,
                         event: event.clone(),
                         free_vars: compute_free_vars(body_cfg),
+                        span: *span,
                     },
                 ))
             } else {

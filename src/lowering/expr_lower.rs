@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::ir::source_range::SourceRange;
 use oxc_ast::ast::*;
 
 use std::sync::Arc;
@@ -204,6 +205,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 tag: "Fragment".to_string(),
                 props: Box::new(Expr::ObjectLit { id, fields: vec![] }),
                 children,
+                prop_spans: HashMap::new(),
             }
         }
 
@@ -361,7 +363,7 @@ fn lower_jsx_element(jsx: &JSXElement, builder: &mut BlockBuilder) -> Expr {
         .iter()
         .filter_map(|c| lower_jsx_child(c, builder))
         .collect();
-    let props = lower_jsx_props(&jsx.opening_element.attributes, builder);
+    let (props, prop_spans) = lower_jsx_props(&jsx.opening_element.attributes, builder);
 
     if name.chars().next().is_some_and(|c| c.is_uppercase()) || name.contains('.') {
         Expr::CompApp {
@@ -373,12 +375,22 @@ fn lower_jsx_element(jsx: &JSXElement, builder: &mut BlockBuilder) -> Expr {
             tag: name,
             props: Box::new(props),
             children,
+            prop_spans,
         }
     }
 }
 
-fn lower_jsx_props(attrs: &[JSXAttributeItem], builder: &mut BlockBuilder) -> Expr {
+/// Lower JSX attributes to an `ObjectLit` and collect spans for `onX` event props.
+///
+/// Returns `(props_expr, prop_spans)` where `prop_spans` maps each event-handler
+/// prop name to its source location (used by `hook_extractor` to set
+/// `HookEntry::Handler.span`).
+fn lower_jsx_props(
+    attrs: &[JSXAttributeItem],
+    builder: &mut BlockBuilder,
+) -> (Expr, HashMap<String, Option<SourceRange>>) {
     let id = builder.next_expr_id();
+    let mut prop_spans: HashMap<String, Option<SourceRange>> = HashMap::new();
     let fields: Vec<(String, Expr)> = attrs
         .iter()
         .filter_map(|attr| match attr {
@@ -389,6 +401,11 @@ fn lower_jsx_props(attrs: &[JSXAttributeItem], builder: &mut BlockBuilder) -> Ex
                         format!("{}:{}", n.namespace.name, n.name.name)
                     }
                 };
+                // Capture span for event-handler props so hook_extractor can set
+                // HookEntry::Handler.span without needing the original Oxc AST.
+                if is_event_prop_key(&key) {
+                    prop_spans.insert(key.clone(), builder.span_at(a.span.start));
+                }
                 let val = match &a.value {
                     Some(JSXAttributeValue::StringLiteral(s)) => {
                         Expr::Lit(Prim::String(s.value.to_string()))
@@ -407,7 +424,14 @@ fn lower_jsx_props(attrs: &[JSXAttributeItem], builder: &mut BlockBuilder) -> Ex
             JSXAttributeItem::SpreadAttribute(_) => None,
         })
         .collect();
-    Expr::ObjectLit { id, fields }
+    (Expr::ObjectLit { id, fields }, prop_spans)
+}
+
+fn is_event_prop_key(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next() == Some('o')
+        && chars.next() == Some('n')
+        && chars.next().is_some_and(|c| c.is_ascii_uppercase())
 }
 
 fn jsx_element_name(name: &JSXElementName) -> String {
@@ -446,6 +470,7 @@ fn lower_jsx_child(child: &JSXChild, builder: &mut BlockBuilder) -> Option<Expr>
                 tag: "Fragment".to_string(),
                 props: Box::new(Expr::ObjectLit { id, fields: vec![] }),
                 children,
+                prop_spans: HashMap::new(),
             })
         }
         JSXChild::ExpressionContainer(ec) => ec
