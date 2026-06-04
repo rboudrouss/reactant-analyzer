@@ -2,22 +2,24 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     domains::StateValue,
-    engine::AnalysisResult,
+    engine::{AnalysisResult, dominates},
     ir::{
+        cfg::Terminator,
         expr::Expr,
         stmt::Stmt,
-        types::{HookLabel, Var},
+        types::{BlockId, HookLabel, Var},
     },
 };
 
-use super::{Diagnostic, Rule, collect_setter_calls};
+use super::{Diagnostic, Rule, Severity, collect_setter_calls};
 
 /// Fires when any state setter is called directly in the render body.
 ///
-/// Calling a setter during render is always a mistake — it should be moved
-/// into a `useEffect` or an event handler. Unlike `InfiniteLoop` (effect-cycle
-/// detection via widening), this rule is purely structural: the presence of
-/// any reachable setter call in the render CFG is enough to warn.
+/// Severity depends on path coverage:
+/// - `Error`   — setter's block dominates ALL exit blocks (executes on every
+///               render path → definitely a bug).
+/// - `Warning` — setter's block is on a conditional path, or the call is
+///               inside a nested FnLit (separate CFG; dominance unknowable).
 pub struct SetterInRender;
 
 impl Rule for SetterInRender {
@@ -75,19 +77,41 @@ impl Rule for SetterInRender {
             })
             .collect();
 
+        // Exit blocks — for dominance check.
+        let exits: Vec<BlockId> = result
+            .render_cfg
+            .blocks
+            .values()
+            .filter(|b| matches!(b.term, Terminator::Return(_)))
+            .map(|b| b.id)
+            .collect();
+
         collect_setter_calls(&result.render_cfg, &setter_vars, 1)
             .into_iter()
-            .map(|(name, call_site_span)| {
+            .map(|call| {
+                // Error iff setter's block dominates ALL exits (always executed).
+                // If block_id is None (nested FnLit), we can't prove it → Warning.
+                let severity = match call.block_id {
+                    Some(bid) if exits.iter().all(|&e| dominates(&result.render_cfg, bid, e)) => {
+                        Severity::Error
+                    }
+                    _ => Severity::Warning,
+                };
+
                 let mut d = Diagnostic::new(
                     "setter-in-render",
                     format!(
-                        "setter `{name}` called directly in the render body, move this call into a useEffect or an event handler"
+                        "setter `{}` called directly in the render body, \
+                         move this call into a useEffect or an event handler",
+                        call.var
                     ),
-                );
-                if let Some(&(label, _decl_span)) = setter_info.get(&name) {
+                )
+                .with_severity(severity);
+
+                if let Some(&(label, _)) = setter_info.get(&call.var) {
                     d = d.with_label(label);
                 }
-                if let Some(r) = call_site_span {
+                if let Some(r) = call.span {
                     d = d.with_range(r);
                 }
                 d
@@ -144,6 +168,7 @@ mod tests {
                 edges: vec![],
             },
             hooks,
+            iterations: 0,
         }
     }
 
@@ -166,7 +191,8 @@ mod tests {
     }
 
     #[test]
-    fn setter_called_in_render_warns() {
+    fn setter_called_in_render_is_error() {
+        // Single block (entry = exit) → setter block dominates all exits → Error.
         let render_stmts = vec![
             Stmt::Let {
                 var: "setN".to_string(),
@@ -185,12 +211,13 @@ mod tests {
         let diags = SetterInRender.check(&result);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].rule, "setter-in-render");
+        assert_eq!(diags[0].severity, Severity::Error);
     }
 
     #[test]
-    fn setter_in_branch_block_warns() {
+    fn setter_in_branch_block_is_warning() {
         // block 0: let setN = StateSetter(0); branch → 1 / 2
-        // block 1: setN(42)
+        // block 1: setN(42)   ← conditional path → Warning
         // block 2: return
         let mut blocks = HashMap::new();
         blocks.insert(
@@ -258,8 +285,11 @@ mod tests {
                 ],
             },
             hooks: vec![],
+            iterations: 0,
         };
-        assert!(!SetterInRender.check(&result).is_empty());
+        let diags = SetterInRender.check(&result);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Severity::Warning);
     }
 
     #[test]
@@ -296,8 +326,8 @@ mod tests {
     }
 
     #[test]
-    fn via_analyze_component_count_plus_one_warns() {
-        // setCount(count + 1) directly in render body → SetterInRender fires.
+    fn via_analyze_component_count_plus_one_is_error() {
+        // setCount(count + 1) directly in render body → Error (unconditional).
         let hooks = vec![HookEntry::State {
             label: 0,
             init: Expr::Lit(Prim::Int(0)),
@@ -348,12 +378,13 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         let diags = SetterInRender.check(&result);
         assert!(!diags.is_empty(), "setter in render body should warn");
+        assert_eq!(diags[0].severity, Severity::Error);
     }
 
     #[test]
-    fn setter_inside_callback_arg_warns() {
+    fn setter_inside_callback_arg_is_warning() {
         // render body: someCall((u) => { setN(u) })
-        // setN is inside a FnLit arg → must be detected via collect_setter_calls depth=1
+        // setN is inside a FnLit arg → block_id = None → Warning.
         let mut cb_blocks = HashMap::new();
         cb_blocks.insert(
             0,
@@ -402,5 +433,6 @@ mod tests {
             "setter inside callback arg should be detected"
         );
         assert_eq!(diags[0].rule, "setter-in-render");
+        assert_eq!(diags[0].severity, Severity::Warning);
     }
 }

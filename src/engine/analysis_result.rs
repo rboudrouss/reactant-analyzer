@@ -86,6 +86,9 @@ pub struct AnalysisResult<D: AbstractDomain> {
     pub render_cfg: CFG,
     /// Original hook entries — needed by rules that inspect effect body CFGs.
     pub hooks: Vec<HookEntry>,
+    /// Number of outer fixpoint iterations before convergence.  Useful for
+    /// --verbose output and for Info diagnostics about analysis depth.
+    pub iterations: usize,
 }
 
 impl<D: AbstractDomain> AnalysisResult<D> {

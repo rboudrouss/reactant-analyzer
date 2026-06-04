@@ -345,6 +345,7 @@ mod tests {
             widened_labels: HashSet::new(),
             render_cfg,
             hooks: vec![],
+            iterations: 0,
         }
     }
 
@@ -540,6 +541,7 @@ mod tests {
                 deps: Some(vec![]),
                 span: None,
             }],
+            iterations: 0,
         }
     }
 

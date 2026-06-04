@@ -4,7 +4,7 @@ use crate::{
     ir::cfg::Terminator,
 };
 
-use super::{Diagnostic, Rule};
+use super::{Diagnostic, Rule, Severity};
 
 /// Fires when a hook is called inside a conditional branch.
 ///
@@ -44,6 +44,7 @@ impl Rule for ConditionalHook {
                         call.label
                     ),
                 )
+                .with_severity(Severity::Error)
                 .with_label(call.label);
                 if let Some(r) = call.span {
                     d = d.with_range(r);
@@ -89,6 +90,7 @@ mod tests {
             widened_labels: HashSet::new(),
             render_cfg,
             hooks: vec![],
+            iterations: 0,
         }
     }
 

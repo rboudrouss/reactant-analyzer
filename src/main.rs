@@ -1,53 +1,74 @@
 use std::{fs, path::Path};
 
+use clap::Parser;
 use oxc_allocator::Allocator;
-use oxc_parser::{ParseOptions, Parser};
+use oxc_parser::{ParseOptions, Parser as OxcParser};
 use oxc_span::SourceType;
 
 use reactant::{
     domains::StateValueTransfer,
     engine::{Config, analyze_component},
     lowering::{compute_line_starts, lower_program},
-    rules::all_rules,
+    rules::{Severity, all_rules},
 };
 
-fn main() {
-    let paths: Vec<String> = std::env::args().skip(1).collect();
+#[derive(Parser)]
+#[command(name = "reactant", about = "Sound static analyzer for React hooks")]
+struct Args {
+    /// Files to analyze (.tsx / .ts / .jsx / .js)
+    files: Vec<String>,
 
-    if paths.is_empty() {
-        eprintln!("Usage: reactant <file.tsx> [file.tsx ...]");
-        eprintln!("       reactant tests/fixtures/*.tsx");
+    /// Show Info diagnostics (known analysis limitations, e.g. widening)
+    #[arg(long)]
+    info: bool,
+
+    /// Show verbose debug output (abstract state, iteration count) on stderr
+    #[arg(long)]
+    verbose: bool,
+}
+
+fn main() {
+    let args = Args::parse();
+
+    if args.files.is_empty() {
+        eprintln!("Usage: reactant [--info] [--verbose] <file.tsx> [file.tsx ...]");
         std::process::exit(1);
     }
 
     let mut total_files = 0usize;
-    let mut total_issues = 0usize;
+    let mut total_errors = 0usize;
+    let mut total_warnings = 0usize;
 
-    for path in &paths {
-        let issues = analyze_file(Path::new(path));
+    for path in &args.files {
+        let (errors, warnings) = analyze_file(Path::new(path), &args);
         total_files += 1;
-        total_issues += issues;
+        total_errors += errors;
+        total_warnings += warnings;
     }
 
     println!();
-    if total_issues == 0 {
+    if total_errors == 0 && total_warnings == 0 {
         println!("✓  {} file(s) — no issues found.", total_files);
     } else {
-        println!(
-            "⚠  {} issue(s) across {} file(s).",
-            total_issues, total_files
-        );
+        let parts: Vec<String> = [
+            (total_errors > 0).then(|| format!("{} error(s)", total_errors)),
+            (total_warnings > 0).then(|| format!("{} warning(s)", total_warnings)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        println!("⚠  {} across {} file(s).", parts.join(", "), total_files);
         std::process::exit(1);
     }
 }
 
-/// Returns the number of diagnostics emitted for this file.
-fn analyze_file(path: &Path) -> usize {
+/// Returns `(error_count, warning_count)` for this file.
+fn analyze_file(path: &Path, args: &Args) -> (usize, usize) {
     let source = match fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[error] {}: {}", path.display(), e);
-            return 0;
+            return (0, 0);
         }
     };
 
@@ -59,7 +80,7 @@ fn analyze_file(path: &Path) -> usize {
         _ => SourceType::cjs(),
     };
 
-    let ret = Parser::new(&alloc, &source, source_type)
+    let ret = OxcParser::new(&alloc, &source, source_type)
         .with_options(ParseOptions::default())
         .parse();
 
@@ -67,19 +88,20 @@ fn analyze_file(path: &Path) -> usize {
 
     if !ret.errors.is_empty() {
         eprintln!("  [parse error] {}", ret.errors[0].message);
-        return 0;
+        return (0, 0);
     }
 
     let line_starts = compute_line_starts(&source);
     let components = lower_program(&ret.program, &line_starts);
     if components.is_empty() {
         println!("  (no components detected)");
-        return 0;
+        return (0, 0);
     }
 
     let rules = all_rules();
     let config = Config::default();
-    let mut file_issues = 0usize;
+    let mut file_errors = 0usize;
+    let mut file_warnings = 0usize;
 
     for comp in components {
         let name = comp.name.clone();
@@ -87,14 +109,46 @@ fn analyze_file(path: &Path) -> usize {
 
         let result = analyze_component(comp, &StateValueTransfer, &config);
 
-        let mut diags: Vec<_> = rules.iter().flat_map(|r| r.check(&result)).collect();
-        diags.sort_by_key(|d| d.rule);
+        if args.verbose {
+            eprintln!(
+                "  [verbose] {name}: {} iteration(s), widened: {:?}",
+                result.iterations,
+                {
+                    let mut labels: Vec<_> = result.widened_labels.iter().copied().collect();
+                    labels.sort_unstable();
+                    labels
+                }
+            );
+        }
 
-        if diags.is_empty() {
+        let mut diags: Vec<_> = rules.iter().flat_map(|r| r.check(&result)).collect();
+        diags.sort_by_key(|d| (d.rule, d.severity as u8));
+
+        // Partition: visible (Error/Warning always; Info only with --info).
+        let visible: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity != Severity::Info || args.info)
+            .collect();
+
+        let comp_errors = visible
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count();
+        let comp_warnings = visible
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .count();
+
+        if visible.is_empty() {
             println!("  {name}  ({hook_count} hooks)  ✓");
         } else {
             println!("  {name}  ({hook_count} hooks)");
-            for d in &diags {
+            for d in &visible {
+                let sev_tag = match d.severity {
+                    Severity::Error => "error",
+                    Severity::Warning => "warn ",
+                    Severity::Info => "info ",
+                };
                 let label_info = d
                     .hook_label
                     .map(|l| format!("  [hook:{l}]"))
@@ -109,7 +163,7 @@ fn analyze_file(path: &Path) -> usize {
                     .map(|r| format!("  (line {}:{})", r.line, r.col))
                     .unwrap_or_default();
                 println!(
-                    "    ⚠  {}{}{}{}  — {}",
+                    "    {sev_tag}  {}{}{}{}  — {}",
                     d.rule, label_info, var_info, range_info, d.message
                 );
                 for note in &d.notes {
@@ -124,9 +178,11 @@ fn analyze_file(path: &Path) -> usize {
                     println!("       → {}{}{}", note.message, note_hook, note_range);
                 }
             }
-            file_issues += diags.len();
         }
+
+        file_errors += comp_errors;
+        file_warnings += comp_warnings;
     }
 
-    file_issues
+    (file_errors, file_warnings)
 }

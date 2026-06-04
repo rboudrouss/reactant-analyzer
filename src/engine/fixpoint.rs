@@ -225,6 +225,7 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
         widened_labels,
         render_cfg,
         hooks: hooks_clone,
+        iterations: iteration,
     }
 }
 

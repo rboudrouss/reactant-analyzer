@@ -128,6 +128,7 @@ mod tests {
             widened_labels: HashSet::new(),
             render_cfg,
             hooks: vec![],
+            iterations: 0,
         }
     }
 

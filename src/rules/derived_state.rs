@@ -65,7 +65,7 @@ impl Rule for DerivedState {
         let render_setters: HashSet<Var> =
             collect_setter_calls(&result.render_cfg, &setter_vars, 1)
                 .into_iter()
-                .map(|(v, _)| v)
+                .map(|c| c.var)
                 .collect();
 
         let mut diags = Vec::new();
@@ -121,7 +121,7 @@ impl Rule for DerivedState {
                     }
                     collect_setter_calls(other_cfg, &setter_vars, 1)
                         .iter()
-                        .any(|(v, _)| v == &setter_name)
+                        .any(|c| c.var == setter_name)
                 } else {
                     false
                 }

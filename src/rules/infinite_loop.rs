@@ -219,6 +219,7 @@ mod tests {
                 edges: vec![],
             },
             hooks,
+            iterations: 0,
         }
     }
 
