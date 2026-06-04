@@ -2,13 +2,13 @@ use std::collections::HashSet;
 
 use crate::{
     domains::StateValue,
-    engine::AnalysisResult,
+    engine::{AnalysisResult, ProgramAnalysisResult},
     ir::{
         cfg::{CFG, Terminator},
         expr::Expr,
         hooks::HookEntry,
         stmt::Stmt,
-        types::Var,
+        types::{Symbol, Var},
     },
 };
 
@@ -30,7 +30,8 @@ impl Rule for DerivedState {
         "derived-state"
     }
 
-    fn check(&self, result: &AnalysisResult<StateValue>) -> Vec<Diagnostic> {
+    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+        let result = &result.components[component];
         // Build set of all state setter vars.
         let mut setter_vars: HashSet<Var> = HashSet::new();
         let mut state_var_names: HashSet<Var> = HashSet::new();

@@ -19,6 +19,21 @@ use reactant::{
     rules::{InfiniteLoop, Rule},
 };
 
+fn make_prog(
+    name: &str,
+    result: reactant::engine::AnalysisResult<reactant::domains::StateValue>,
+) -> reactant::engine::ProgramAnalysisResult {
+    let mut components = std::collections::HashMap::new();
+    components.insert(name.to_string(), result);
+    reactant::engine::ProgramAnalysisResult {
+        components,
+        shared_state: reactant::domains::stores::SharedStateStore::new(),
+        call_graph: reactant::engine::ComponentCallGraph::new(),
+        recursive_components: std::collections::HashSet::new(),
+        stats: reactant::engine::AnalysisStats::default(),
+    }
+}
+
 /// Run the full pipeline over `src` and return the total number of
 /// `infinite-loop` diagnostics across its components.
 fn infinite_loop_hits(src: &str) -> usize {
@@ -33,8 +48,10 @@ fn infinite_loop_hits(src: &str) -> usize {
     components
         .into_iter()
         .map(|comp| {
+            let name = comp.name.clone();
             let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-            InfiniteLoop.check(&result).len()
+            let prog = make_prog(&name, result);
+            InfiniteLoop.check(&prog, &name).len()
         })
         .sum()
 }

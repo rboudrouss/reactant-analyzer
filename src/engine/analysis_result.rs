@@ -66,7 +66,7 @@ pub struct EffectInfo {
     pub span: Option<SourceRange>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AnalysisResult<D: AbstractDomain> {
     pub state_store: StateStore<D>,
     pub memo_store: MemoStore<D>,

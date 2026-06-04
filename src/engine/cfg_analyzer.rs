@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::{
     domains::{
-        AbstractDomain, AnalysisCtx, Heap, QueryContext, Transfer,
+        AbstractDomain, AnalysisCtx, Heap, InterCtx, QueryContext, Transfer,
         stores::{AbstractEnv, MemoStore, StateStore},
     },
     ir::{
@@ -28,7 +28,7 @@ use crate::{
 /// `state` is the outer state from the previous fixpoint iteration; new
 /// `setState` calls are accumulated on top of it.
 #[allow(clippy::too_many_arguments)]
-pub fn analyze_cfg<T: Transfer>(
+pub fn analyze_cfg<'inter, T: Transfer>(
     cfg: &CFG,
     entry_env: AbstractEnv<T::Domain>,
     state: &StateStore<T::Domain>,
@@ -37,6 +37,7 @@ pub fn analyze_cfg<T: Transfer>(
     widen_threshold: usize,
     heap: &mut Heap,
     ctx: &dyn QueryContext,
+    inter: Option<&'inter InterCtx<'inter>>,
 ) -> (
     HashMap<BlockId, AbstractEnv<T::Domain>>,
     StateStore<T::Domain>,
@@ -68,6 +69,7 @@ pub fn analyze_cfg<T: Transfer>(
                 memo: &mut memo_local,
                 heap,
                 query: ctx,
+                inter,
             };
             for stmt in &block.stmts {
                 transfer.exec_stmt(stmt, &mut env_out, &mut ac);
@@ -232,6 +234,7 @@ mod tests {
             3,
             &mut heap,
             &NullCtx,
+            None,
         );
         assert!(exit_envs.contains_key(&0));
         assert_eq!(state_out, StateStore::bottom());
@@ -254,6 +257,7 @@ mod tests {
             3,
             &mut heap,
             &NullCtx,
+            None,
         );
         assert_eq!(
             exit_envs[&0].lookup("x"),
@@ -292,6 +296,7 @@ mod tests {
             3,
             &mut heap,
             &NullCtx,
+            None,
         );
         assert_eq!(state_out.get(0), StateValue::Reference(Stability::Unstable));
     }
@@ -345,6 +350,7 @@ mod tests {
             3,
             &mut heap,
             &NullCtx,
+            None,
         );
         assert_eq!(
             exit_envs[&1].lookup("x"),
@@ -443,6 +449,7 @@ mod tests {
             3,
             &mut heap,
             &NullCtx,
+            None,
         );
         // join(Number([1,1]), Reference(Unstable)) = Top at merge block 3
         assert_eq!(exit_envs[&3].lookup("x"), StateValue::Top);
@@ -529,6 +536,7 @@ mod tests {
             3,
             &mut heap,
             &NullCtx,
+            None,
         );
 
         // then-branch: x < 10 → x ∈ [0, 9]  (after block 0's let x=0 re-binds to Number([0,0]),
@@ -595,6 +603,7 @@ mod tests {
             3,
             &mut heap,
             &NullCtx,
+            None,
         );
 
         // Before fix: state_out.get(0) = Bottom (setter call never executed).
@@ -638,6 +647,7 @@ mod tests {
             3,
             &mut heap,
             &NullCtx,
+            None,
         );
 
         // StateSetter in a Let stmt does NOT call the setter (only a Call does).
@@ -716,6 +726,7 @@ mod tests {
             3,
             &mut heap,
             &NullCtx,
+            None,
         );
 
         // c=5, c+1=6 → state[0] = join(5, 6) = [5,6].

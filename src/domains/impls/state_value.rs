@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::ir::expr::{Expr, Prim};
+use crate::ir::types::{HookLabel, Symbol};
 
 use super::Stability;
 pub use super::bool_val::BoolVal;
@@ -44,6 +45,9 @@ pub enum StateValue {
     Str,
     /// Object / array / function — track reference stability.
     Reference(Stability),
+    /// A specific `useState` setter from another component.
+    /// React guarantees setter identity across renders → always `Stable`.
+    ComponentSetter { component: Symbol, label: HookLabel },
     /// ⊤ — any JS value, precision lost.
     Top,
 }
@@ -82,6 +86,7 @@ impl StateValue {
             StateValue::StrConst(_) => Stability::Unknown,
             StateValue::Str => Stability::Unknown,
             StateValue::Reference(s) => *s,
+            StateValue::ComponentSetter { .. } => Stability::Stable,
             StateValue::Top => Stability::Unknown,
         }
     }
@@ -140,6 +145,15 @@ impl PartialOrd for StateValue {
             (StateValue::Null, StateValue::Null) => Some(Ordering::Equal),
             (StateValue::Undefined, StateValue::Undefined) => Some(Ordering::Equal),
             (StateValue::Str, StateValue::Str) => Some(Ordering::Equal),
+            // ComponentSetter ⊑ Reference(Stable) ⊑ Reference(Unknown)
+            (
+                StateValue::ComponentSetter { .. },
+                StateValue::Reference(Stability::Stable | Stability::Unknown),
+            ) => Some(Ordering::Less),
+            (
+                StateValue::Reference(Stability::Stable | Stability::Unknown),
+                StateValue::ComponentSetter { .. },
+            ) => Some(Ordering::Greater),
             _ => None,
         }
     }
@@ -156,6 +170,14 @@ impl AbstractDomain for StateValue {
     }
     fn is_bottom(&self) -> bool {
         matches!(self, StateValue::Bottom)
+    }
+
+    fn as_state_value(&self) -> Option<StateValue> {
+        Some(self.clone())
+    }
+
+    fn from_state_value(sv: StateValue) -> Self {
+        sv
     }
 
     fn narrow_lt(self, v: f64) -> Self {
@@ -213,6 +235,15 @@ impl AbstractDomain for StateValue {
             (StateValue::StrConst(_), StateValue::Str)
             | (StateValue::Str, StateValue::StrConst(_))
             | (StateValue::Str, StateValue::Str) => StateValue::Str,
+            // Different ComponentSetters are both stable references
+            (StateValue::ComponentSetter { .. }, StateValue::ComponentSetter { .. }) => {
+                StateValue::Reference(Stability::Stable)
+            }
+            // ComponentSetter joined with a Reference: join stabilities
+            (StateValue::ComponentSetter { .. }, StateValue::Reference(s))
+            | (StateValue::Reference(s), StateValue::ComponentSetter { .. }) => {
+                StateValue::Reference(s.join(&Stability::Stable))
+            }
             _ => StateValue::Top,
         }
     }
@@ -244,6 +275,19 @@ impl AbstractDomain for StateValue {
             }
             (StateValue::StrConst(a), StateValue::Str)
             | (StateValue::Str, StateValue::StrConst(a)) => StateValue::StrConst(a.clone()),
+            // ComponentSetter ⊑ Reference(Stable|Unknown): meet = ComponentSetter
+            (
+                cs @ StateValue::ComponentSetter { .. },
+                StateValue::Reference(Stability::Stable | Stability::Unknown),
+            ) => cs.clone(),
+            (
+                StateValue::Reference(Stability::Stable | Stability::Unknown),
+                cs @ StateValue::ComponentSetter { .. },
+            ) => cs.clone(),
+            // Different ComponentSetters: incompatible
+            (StateValue::ComponentSetter { .. }, StateValue::ComponentSetter { .. }) => {
+                StateValue::Bottom
+            }
             _ => StateValue::Bottom,
         }
     }
@@ -472,5 +516,125 @@ mod tests {
         let b = str_pair("y", "z");
         let m = a.meet(&b);
         assert_eq!(m, str_singleton("y"));
+    }
+
+    // ── ComponentSetter ───────────────────────────────────────────────────────
+
+    fn cs(comp: &str, label: usize) -> StateValue {
+        StateValue::ComponentSetter {
+            component: comp.to_string(),
+            label,
+        }
+    }
+
+    #[test]
+    fn component_setter_is_stable() {
+        assert!(cs("Foo", 0).is_stable());
+        assert!(!cs("Foo", 0).is_unstable());
+        assert!(!cs("Foo", 0).is_unbounded());
+        assert!(!cs("Foo", 0).is_bottom());
+    }
+
+    #[test]
+    fn component_setter_to_stability_is_stable() {
+        assert_eq!(cs("Foo", 0).to_stability(), Stability::Stable);
+    }
+
+    #[test]
+    fn component_setter_join_same_is_identity() {
+        assert_eq!(cs("Foo", 0).join(&cs("Foo", 0)), cs("Foo", 0));
+    }
+
+    #[test]
+    fn component_setter_join_different_comp_gives_ref_stable() {
+        let j = cs("Foo", 0).join(&cs("Bar", 0));
+        assert_eq!(j, StateValue::Reference(Stability::Stable));
+    }
+
+    #[test]
+    fn component_setter_join_different_label_gives_ref_stable() {
+        let j = cs("Foo", 0).join(&cs("Foo", 1));
+        assert_eq!(j, StateValue::Reference(Stability::Stable));
+    }
+
+    #[test]
+    fn component_setter_join_with_ref_stable_is_ref_stable() {
+        let j = cs("Foo", 0).join(&StateValue::Reference(Stability::Stable));
+        assert_eq!(j, StateValue::Reference(Stability::Stable));
+    }
+
+    #[test]
+    fn component_setter_join_with_ref_unstable_gives_unknown() {
+        let j = cs("Foo", 0).join(&StateValue::Reference(Stability::Unstable));
+        assert_eq!(j, StateValue::Reference(Stability::Unknown));
+    }
+
+    #[test]
+    fn component_setter_join_with_top_gives_top() {
+        assert_eq!(cs("Foo", 0).join(&StateValue::Top), StateValue::Top);
+    }
+
+    #[test]
+    fn component_setter_join_with_bottom_gives_self() {
+        assert_eq!(cs("Foo", 0).join(&StateValue::Bottom), cs("Foo", 0));
+    }
+
+    #[test]
+    fn component_setter_leq_ref_stable() {
+        assert!(cs("Foo", 0) <= StateValue::Reference(Stability::Stable));
+        assert!(cs("Foo", 0) <= StateValue::Reference(Stability::Unknown));
+        assert!(cs("Foo", 0) <= StateValue::Top);
+        assert!(StateValue::Bottom <= cs("Foo", 0));
+    }
+
+    #[test]
+    fn component_setter_not_leq_ref_unstable() {
+        use std::cmp::Ordering;
+        let cmp = cs("Foo", 0).partial_cmp(&StateValue::Reference(Stability::Unstable));
+        assert!(
+            cmp.is_none(),
+            "ComponentSetter vs Unstable should be incomparable"
+        );
+    }
+
+    #[test]
+    fn different_component_setters_incomparable() {
+        let cmp = cs("Foo", 0).partial_cmp(&cs("Bar", 0));
+        assert!(cmp.is_none());
+    }
+
+    #[test]
+    fn component_setter_meet_same_is_identity() {
+        assert_eq!(cs("Foo", 0).meet(&cs("Foo", 0)), cs("Foo", 0));
+    }
+
+    #[test]
+    fn component_setter_meet_different_is_bottom() {
+        assert_eq!(cs("Foo", 0).meet(&cs("Bar", 0)), StateValue::Bottom);
+    }
+
+    #[test]
+    fn component_setter_meet_ref_stable_is_setter() {
+        assert_eq!(
+            cs("Foo", 0).meet(&StateValue::Reference(Stability::Stable)),
+            cs("Foo", 0)
+        );
+        assert_eq!(
+            StateValue::Reference(Stability::Stable).meet(&cs("Foo", 0)),
+            cs("Foo", 0)
+        );
+    }
+
+    #[test]
+    fn component_setter_widen_same_is_identity() {
+        assert_eq!(cs("Foo", 0).widen(&cs("Foo", 0)), cs("Foo", 0));
+    }
+
+    #[test]
+    fn component_setter_as_state_value_roundtrip() {
+        use crate::domains::AbstractDomain;
+        let sv = cs("Foo", 0);
+        assert_eq!(sv.as_state_value(), Some(sv.clone()));
+        assert_eq!(StateValue::from_state_value(sv.clone()), sv);
     }
 }

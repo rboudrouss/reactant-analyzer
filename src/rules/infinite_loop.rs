@@ -3,13 +3,13 @@ use std::sync::Arc;
 
 use crate::{
     domains::StateValue,
-    engine::AnalysisResult,
+    engine::{AnalysisResult, ProgramAnalysisResult},
     ir::{
         cfg::CFG,
         expr::Expr,
         hooks::HookEntry,
         stmt::Stmt,
-        types::{HookLabel, Var},
+        types::{HookLabel, Symbol, Var},
     },
 };
 
@@ -38,7 +38,8 @@ impl Rule for InfiniteLoop {
         "infinite-loop"
     }
 
-    fn check(&self, result: &AnalysisResult<StateValue>) -> Vec<Diagnostic> {
+    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+        let result = &result.components[component];
         if result.widened_labels.is_empty() {
             return vec![];
         }
@@ -168,7 +169,7 @@ mod tests {
             StateValue, StateValueTransfer,
             stores::{MemoStore, StateStore},
         },
-        engine::{AnalysisResult, Config, analyze_component},
+        engine::{AnalysisResult, Config, ProgramAnalysisResult, analyze_component},
         ir::{
             cfg::{BasicBlock, CFG, Terminator},
             component::ComponentIR,
@@ -179,6 +180,20 @@ mod tests {
         rules::Rule,
     };
     use std::collections::{HashMap, HashSet};
+
+    fn prog(name: &str, r: &AnalysisResult<StateValue>) -> ProgramAnalysisResult {
+        use crate::domains::stores::SharedStateStore;
+        use crate::engine::program_result::{AnalysisStats, ComponentCallGraph};
+        let mut components = HashMap::new();
+        components.insert(name.to_string(), r.clone());
+        ProgramAnalysisResult {
+            components,
+            shared_state: SharedStateStore::default(),
+            call_graph: ComponentCallGraph::new(),
+            recursive_components: HashSet::new(),
+            stats: AnalysisStats::default(),
+        }
+    }
 
     fn trivial_cfg() -> CFG {
         let mut blocks = HashMap::new();
@@ -235,7 +250,11 @@ mod tests {
     #[test]
     fn no_widened_labels_no_warning() {
         let result = make_result_with_widened(HashSet::new(), vec![], vec![]);
-        assert!(InfiniteLoop.check(&result).is_empty());
+        assert!(
+            InfiniteLoop
+                .check(&prog("C", &result), &"C".to_string())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -281,7 +300,7 @@ mod tests {
         }];
 
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
-        let diags = InfiniteLoop.check(&result);
+        let diags = InfiniteLoop.check(&prog("C", &result), &"C".to_string());
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].hook_label, Some(0));
     }
@@ -302,7 +321,11 @@ mod tests {
             span: None,
         }];
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
-        assert!(InfiniteLoop.check(&result).is_empty());
+        assert!(
+            InfiniteLoop
+                .check(&prog("C", &result), &"C".to_string())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -344,7 +367,9 @@ mod tests {
         }];
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
         assert!(
-            InfiniteLoop.check(&result).is_empty(),
+            InfiniteLoop
+                .check(&prog("C", &result), &"C".to_string())
+                .is_empty(),
             "deps:[] = one-shot, never infinite"
         );
     }
@@ -390,7 +415,11 @@ mod tests {
         }];
         // widened = {0} but effect calls setOther which isn't mapped to 0
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
-        assert!(InfiniteLoop.check(&result).is_empty());
+        assert!(
+            InfiniteLoop
+                .check(&prog("C", &result), &"C".to_string())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -476,7 +505,7 @@ mod tests {
         };
         let config = Config { widen_threshold: 1 };
         let result = analyze_component(comp, &StateValueTransfer, &config);
-        let diags = InfiniteLoop.check(&result);
+        let diags = InfiniteLoop.check(&prog("C", &result), &"C".to_string());
         assert!(!diags.is_empty(), "expected InfiniteLoop warning");
     }
 
@@ -566,7 +595,7 @@ mod tests {
         let config = Config { widen_threshold: 3 };
         let result = analyze_component(comp, &StateValueTransfer, &config);
         assert!(result.widened_labels.contains(&0), "count should widen");
-        let diags = InfiniteLoop.check(&result);
+        let diags = InfiniteLoop.check(&prog("Counter", &result), &"Counter".to_string());
         assert!(
             !diags.is_empty(),
             "setState(count+1) should be detected as infinite loop"
@@ -625,7 +654,7 @@ mod tests {
             span: None,
         }];
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
-        let diags = InfiniteLoop.check(&result);
+        let diags = InfiniteLoop.check(&prog("C", &result), &"C".to_string());
         assert!(
             !diags.is_empty(),
             "setter in block 1 should be detected via BFS"
@@ -759,7 +788,9 @@ mod tests {
             "n should widen via the .then callback"
         );
         assert!(
-            !InfiniteLoop.check(&result).is_empty(),
+            !InfiniteLoop
+                .check(&prog("C", &result), &"C".to_string())
+                .is_empty(),
             "setN(n+1) inside .then should be detected as infinite loop"
         );
     }
@@ -786,7 +817,9 @@ mod tests {
             "event handler must not widen state (would be a false positive)"
         );
         assert!(
-            InfiniteLoop.check(&result).is_empty(),
+            InfiniteLoop
+                .check(&prog("C", &result), &"C".to_string())
+                .is_empty(),
             "addEventListener handler must not trigger InfiniteLoop"
         );
     }
@@ -802,7 +835,11 @@ mod tests {
         let comp = component_with_effect_call("setN", call, None);
         let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
         assert!(!result.widened_labels.contains(&0));
-        assert!(InfiniteLoop.check(&result).is_empty());
+        assert!(
+            InfiniteLoop
+                .check(&prog("C", &result), &"C".to_string())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -857,7 +894,9 @@ mod tests {
             "back-edge in callback body → side-effect traversal → setN fires → widening"
         );
         assert!(
-            !InfiniteLoop.check(&result).is_empty(),
+            !InfiniteLoop
+                .check(&prog("C", &result), &"C".to_string())
+                .is_empty(),
             "the loop setter in the .then callback must now be flagged"
         );
     }
@@ -954,7 +993,9 @@ mod tests {
             "bounded setter in a loop stabilises → must not widen"
         );
         assert!(
-            InfiniteLoop.check(&result).is_empty(),
+            InfiniteLoop
+                .check(&prog("C", &result), &"C".to_string())
+                .is_empty(),
             "bounded loop setter must not be flagged (anti-FP)"
         );
     }
@@ -1088,7 +1129,9 @@ mod tests {
             "n should widen via the variable callback"
         );
         assert!(
-            !InfiniteLoop.check(&result).is_empty(),
+            !InfiniteLoop
+                .check(&prog("C", &result), &"C".to_string())
+                .is_empty(),
             "setN(n+1) inside cb → setTimeout(cb) should be detected as infinite loop"
         );
     }
@@ -1155,7 +1198,9 @@ mod tests {
             "n should widen via the variable .then callback"
         );
         assert!(
-            !InfiniteLoop.check(&result).is_empty(),
+            !InfiniteLoop
+                .check(&prog("C", &result), &"C".to_string())
+                .is_empty(),
             "setN(n+1) inside inc → fetch().then(inc) should be detected as infinite loop"
         );
     }
@@ -1249,7 +1294,9 @@ mod tests {
             "n should widen via B6→B5 nested chain"
         );
         assert!(
-            !InfiniteLoop.check(&result).is_empty(),
+            !InfiniteLoop
+                .check(&prog("C", &result), &"C".to_string())
+                .is_empty(),
             "outer() → setTimeout(inner) → setN(n+1) should be detected as infinite loop"
         );
     }
@@ -1308,7 +1355,7 @@ mod tests {
             },
         ];
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
-        let diags = InfiniteLoop.check(&result);
+        let diags = InfiniteLoop.check(&prog("C", &result), &"C".to_string());
 
         assert!(!diags.is_empty(), "should detect infinite loop");
         assert_eq!(diags[0].notes.len(), 1, "one note for the handler");
@@ -1341,7 +1388,7 @@ mod tests {
             },
         ];
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
-        let diags = InfiniteLoop.check(&result);
+        let diags = InfiniteLoop.check(&prog("C", &result), &"C".to_string());
 
         assert!(!diags.is_empty(), "should detect infinite loop");
         assert!(

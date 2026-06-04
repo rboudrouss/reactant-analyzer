@@ -1,4 +1,8 @@
-use crate::{domains::StateValue, engine::AnalysisResult};
+use crate::{
+    domains::StateValue,
+    engine::{AnalysisResult, ProgramAnalysisResult},
+    ir::types::Symbol,
+};
 
 use super::{Diagnostic, Rule, Severity};
 
@@ -12,7 +16,8 @@ impl Rule for WideningInfo {
         "widening-info"
     }
 
-    fn check(&self, result: &AnalysisResult<StateValue>) -> Vec<Diagnostic> {
+    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+        let result = &result.components[component];
         let mut labels: Vec<_> = result.widened_labels.iter().copied().collect();
         labels.sort_unstable();
         labels

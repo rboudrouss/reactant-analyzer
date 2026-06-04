@@ -1,11 +1,25 @@
+use std::cell::RefCell;
+
 use crate::{
     domains::{
         AbstractDomain, StateValue, StateValueTransfer, Transfer,
-        stores::{AbstractEnv, Heap, MemoStore, StateStore},
+        stores::{AbstractEnv, Heap, MemoStore, SharedStateStore, StateStore},
     },
-    engine::AnalysisResult,
-    ir::expr::Expr,
+    engine::{
+        AnalysisResult, AnalysisStats, ComponentCache, ComponentCallGraph, ComponentRegistry,
+        fixpoint::Config,
+    },
+    ir::{component::ComponentIR, expr::Expr, types::Symbol},
 };
+
+// ── AnalyzeChildFn ─────────────────────────────────────────────────────────────
+
+/// Function pointer type for inlining a child component's analysis.
+/// Provided by `engine::fixpoint` at `InterCtx` creation time to break the
+/// circular dependency between `domains::transfer` and `engine::fixpoint`.
+/// `initial_heap` carries pre-populated heap entries (props abstract object) for the child.
+pub type AnalyzeChildFn =
+    fn(&ComponentIR, AbstractEnv<StateValue>, Heap, &InterCtx<'_>) -> AnalysisResult<StateValue>;
 
 // ── QueryContext trait ────────────────────────────────────────────────────────
 
@@ -35,6 +49,82 @@ impl QueryContext for NullCtx {
     }
 }
 
+// ── InterCtx ──────────────────────────────────────────────────────────────────
+
+/// Inter-component analysis context, threaded through the analysis when doing
+/// top-down inlining across component boundaries.
+///
+/// Uses `RefCell` for all mutable shared state so that `InterCtx` can be passed
+/// as a shared `&InterCtx` reference — avoiding nested `&mut` lifetime issues while
+/// still allowing mutation through `borrow_mut()`.
+pub struct InterCtx<'a> {
+    pub registry: &'a ComponentRegistry,
+    pub cache: &'a RefCell<ComponentCache>,
+    pub shared_state: &'a RefCell<SharedStateStore>,
+    pub call_graph: &'a RefCell<ComponentCallGraph>,
+    pub stats: &'a RefCell<AnalysisStats>,
+    /// All analysis results accumulated across the entire program analysis.
+    pub results: &'a RefCell<std::collections::HashMap<Symbol, AnalysisResult<StateValue>>>,
+    /// Components currently being analyzed (for recursion detection).
+    pub call_stack: RefCell<Vec<Symbol>>,
+    /// Name of the component being analyzed at this level.
+    pub component_name: Symbol,
+    /// Analysis config (widen_threshold etc.).
+    pub config: &'a Config,
+    /// Callback provided by `engine::fixpoint` to inline a child component's analysis.
+    pub analyze_child: AnalyzeChildFn,
+}
+
+impl<'a> InterCtx<'a> {
+    pub fn new(
+        registry: &'a ComponentRegistry,
+        cache: &'a RefCell<ComponentCache>,
+        shared_state: &'a RefCell<SharedStateStore>,
+        call_graph: &'a RefCell<ComponentCallGraph>,
+        stats: &'a RefCell<AnalysisStats>,
+        results: &'a RefCell<std::collections::HashMap<Symbol, AnalysisResult<StateValue>>>,
+        component_name: Symbol,
+        config: &'a Config,
+        analyze_child: AnalyzeChildFn,
+    ) -> Self {
+        InterCtx {
+            registry,
+            cache,
+            shared_state,
+            call_graph,
+            stats,
+            results,
+            call_stack: RefCell::new(vec![]),
+            component_name,
+            config,
+            analyze_child,
+        }
+    }
+
+    /// Create a child context for inlining a nested component.
+    /// Shares all RefCell state; new call_stack with parent pushed.
+    pub fn child(&self, child_name: Symbol) -> InterCtx<'a> {
+        let mut new_stack = self.call_stack.borrow().clone();
+        new_stack.push(self.component_name.clone());
+        InterCtx {
+            registry: self.registry,
+            cache: self.cache,
+            shared_state: self.shared_state,
+            call_graph: self.call_graph,
+            stats: self.stats,
+            results: self.results,
+            call_stack: RefCell::new(new_stack),
+            component_name: child_name,
+            config: self.config,
+            analyze_child: self.analyze_child,
+        }
+    }
+
+    pub fn is_recursive(&self, name: &Symbol) -> bool {
+        self.call_stack.borrow().contains(name) || &self.component_name == name
+    }
+}
+
 // ── AnalysisCtx ───────────────────────────────────────────────────────────────
 
 /// Bundle of mutable analysis state threaded through `Transfer` methods.
@@ -47,6 +137,8 @@ pub struct AnalysisCtx<'a, D: AbstractDomain> {
     pub memo: &'a mut MemoStore<D>,
     pub heap: &'a mut Heap,
     pub query: &'a dyn QueryContext,
+    /// Optional inter-component context. `None` = intra-component analysis only.
+    pub inter: Option<&'a InterCtx<'a>>,
 }
 
 impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
@@ -62,6 +154,7 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
             memo,
             heap,
             query: &NULL,
+            inter: None,
         }
     }
 }

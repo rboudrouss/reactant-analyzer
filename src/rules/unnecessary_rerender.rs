@@ -4,12 +4,12 @@ use crate::{
     domains::{
         AbstractEnv, AnalysisCtx, MemoStore, StateStore, StateValue, StateValueTransfer, Transfer,
     },
-    engine::AnalysisResult,
+    engine::{AnalysisResult, ProgramAnalysisResult},
     ir::{
         expr::Expr,
         hooks::HookEntry,
         stmt::Stmt,
-        types::{HookLabel, Var},
+        types::{HookLabel, Symbol, Var},
     },
 };
 
@@ -29,7 +29,8 @@ impl Rule for UnnecessaryRerender {
         "unnecessary-rerender"
     }
 
-    fn check(&self, result: &AnalysisResult<StateValue>) -> Vec<Diagnostic> {
+    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+        let result = &result.components[component];
         // Evaluate each useState init to its abstract value (same as fixpoint seed).
         let empty_env = AbstractEnv::bottom();
         let empty_state = StateStore::bottom();
@@ -178,7 +179,7 @@ mod tests {
     use super::*;
     use crate::{
         domains::StateValueTransfer,
-        engine::{Config, analyze_component},
+        engine::{Config, ProgramAnalysisResult, analyze_component},
         ir::{
             cfg::{BasicBlock, CFG, Terminator},
             component::ComponentIR,
@@ -188,7 +189,23 @@ mod tests {
         },
         rules::Rule,
     };
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
+
+    fn prog(
+        r: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+    ) -> ProgramAnalysisResult {
+        use crate::domains::stores::SharedStateStore;
+        use crate::engine::program_result::{AnalysisStats, ComponentCallGraph};
+        let mut components = HashMap::new();
+        components.insert("C".to_string(), r.clone());
+        ProgramAnalysisResult {
+            components,
+            shared_state: SharedStateStore::default(),
+            call_graph: ComponentCallGraph::new(),
+            recursive_components: HashSet::new(),
+            stats: AnalysisStats::default(),
+        }
+    }
 
     fn effect_cfg(stmts: Vec<Stmt>) -> CFG {
         let mut blocks = HashMap::new();
@@ -271,7 +288,7 @@ mod tests {
             Some(vec![]),
         );
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let diags = UnnecessaryRerender.check(&result);
+        let diags = UnnecessaryRerender.check(&prog(&result), &"C".to_string());
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].rule, "unnecessary-rerender");
         assert_eq!(diags[0].hook_label, Some(0));
@@ -293,7 +310,11 @@ mod tests {
             Some(vec![]),
         );
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        assert!(UnnecessaryRerender.check(&result).is_empty());
+        assert!(
+            UnnecessaryRerender
+                .check(&prog(&result), &"C".to_string())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -308,7 +329,11 @@ mod tests {
         )];
         let comp = component_with(Expr::Lit(Prim::String("light".into())), eff_stmts, None);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        assert!(UnnecessaryRerender.check(&result).is_empty());
+        assert!(
+            UnnecessaryRerender
+                .check(&prog(&result), &"C".to_string())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -323,6 +348,10 @@ mod tests {
         )];
         let comp = component_with(Expr::Lit(Prim::Int(0)), eff_stmts, Some(vec![]));
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        assert!(!UnnecessaryRerender.check(&result).is_empty());
+        assert!(
+            !UnnecessaryRerender
+                .check(&prog(&result), &"C".to_string())
+                .is_empty()
+        );
     }
 }

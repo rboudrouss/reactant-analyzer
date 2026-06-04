@@ -21,13 +21,13 @@ use std::sync::Arc;
 
 use crate::{
     domains::StateValue,
-    engine::AnalysisResult,
+    engine::{AnalysisResult, ProgramAnalysisResult},
     ir::{
         SourceRange,
         cfg::{CFG, Terminator},
         expr::Expr,
         stmt::Stmt,
-        types::{BlockId, HookLabel, Var},
+        types::{BlockId, HookLabel, Symbol, Var},
     },
 };
 
@@ -127,7 +127,7 @@ impl Diagnostic {
 /// Rules are stateless; adding a new rule = new struct + `impl Rule`.
 pub trait Rule {
     fn name(&self) -> &'static str;
-    fn check(&self, result: &AnalysisResult<StateValue>) -> Vec<Diagnostic>;
+    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic>;
 }
 
 /// A setter call found by `collect_setter_calls`.

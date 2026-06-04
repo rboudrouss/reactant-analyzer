@@ -4,8 +4,14 @@ use crate::{
     domains::{
         AbstractEnv, AnalysisCtx, MemoStore, StateStore, StateValue, StateValueTransfer, Transfer,
     },
-    engine::AnalysisResult,
-    ir::{cfg::CFG, expr::Expr, hooks::HookEntry, stmt::Stmt, types::HookLabel},
+    engine::{AnalysisResult, ProgramAnalysisResult},
+    ir::{
+        cfg::CFG,
+        expr::Expr,
+        hooks::HookEntry,
+        stmt::Stmt,
+        types::{HookLabel, Symbol},
+    },
 };
 
 use super::{Diagnostic, Rule};
@@ -26,7 +32,8 @@ impl Rule for RedundantSetState {
         "redundant-set-state"
     }
 
-    fn check(&self, result: &AnalysisResult<StateValue>) -> Vec<Diagnostic> {
+    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+        let result = &result.components[component];
         let transfer = StateValueTransfer;
         let mut diags = Vec::new();
 
@@ -284,7 +291,7 @@ mod tests {
             Stability, StateValue,
             stores::{AbstractEnv, MemoStore, StateStore},
         },
-        engine::AnalysisResult,
+        engine::{AnalysisResult, ProgramAnalysisResult},
         ir::{
             cfg::{BasicBlock, CFG, Terminator},
             expr::{Expr, Prim},
@@ -294,6 +301,20 @@ mod tests {
         rules::Rule,
     };
     use std::collections::{HashMap, HashSet};
+
+    fn prog(r: &AnalysisResult<StateValue>) -> ProgramAnalysisResult {
+        use crate::domains::stores::SharedStateStore;
+        use crate::engine::program_result::{AnalysisStats, ComponentCallGraph};
+        let mut components = HashMap::new();
+        components.insert("C".to_string(), r.clone());
+        ProgramAnalysisResult {
+            components,
+            shared_state: SharedStateStore::default(),
+            call_graph: ComponentCallGraph::new(),
+            recursive_components: HashSet::new(),
+            stats: AnalysisStats::default(),
+        }
+    }
 
     fn make_result(
         render_blocks: Vec<(u32, Vec<Stmt>)>,
@@ -372,7 +393,7 @@ mod tests {
             vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
             vec![(0, StateValue::Reference(Stability::Stable))],
         );
-        let diags = RedundantSetState.check(&result);
+        let diags = RedundantSetState.check(&prog(&result), &"C".to_string());
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].hook_label, Some(0));
     }
@@ -402,7 +423,11 @@ mod tests {
             vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
             vec![(0, StateValue::Reference(Stability::Stable))],
         );
-        assert!(RedundantSetState.check(&result).is_empty());
+        assert!(
+            RedundantSetState
+                .check(&prog(&result), &"C".to_string())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -427,7 +452,11 @@ mod tests {
             vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
             vec![(0, StateValue::Reference(Stability::Unstable))],
         );
-        assert!(RedundantSetState.check(&result).is_empty());
+        assert!(
+            RedundantSetState
+                .check(&prog(&result), &"C".to_string())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -440,7 +469,11 @@ mod tests {
             None,
         )];
         let result = make_result(vec![(0, stmts)], vec![], vec![]);
-        assert!(RedundantSetState.check(&result).is_empty());
+        assert!(
+            RedundantSetState
+                .check(&prog(&result), &"C".to_string())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -464,7 +497,12 @@ mod tests {
             vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
             vec![(0, StateValue::Reference(Stability::Stable))],
         );
-        assert_eq!(RedundantSetState.check(&result).len(), 1);
+        assert_eq!(
+            RedundantSetState
+                .check(&prog(&result), &"C".to_string())
+                .len(),
+            1
+        );
     }
 
     // ── Effect body tests ─────────────────────────────────────────────────────
@@ -569,7 +607,7 @@ mod tests {
             vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
             vec![(0, StateValue::Reference(Stability::Stable))],
         );
-        let diags = RedundantSetState.check(&result);
+        let diags = RedundantSetState.check(&prog(&result), &"C".to_string());
         assert_eq!(diags.len(), 1, "effect body setter should be checked");
         assert_eq!(diags[0].hook_label, Some(0));
     }
@@ -598,7 +636,11 @@ mod tests {
             vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
             vec![(0, StateValue::Reference(Stability::Stable))],
         );
-        assert!(RedundantSetState.check(&result).is_empty());
+        assert!(
+            RedundantSetState
+                .check(&prog(&result), &"C".to_string())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -625,6 +667,10 @@ mod tests {
             vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
             vec![(0, StateValue::Reference(Stability::Stable))],
         );
-        assert!(RedundantSetState.check(&result).is_empty());
+        assert!(
+            RedundantSetState
+                .check(&prog(&result), &"C".to_string())
+                .is_empty()
+        );
     }
 }

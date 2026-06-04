@@ -9,6 +9,7 @@ use crate::{
     ir::{
         cfg::{CFG, EdgeKind, Terminator},
         expr::Expr,
+        free_vars::compute_free_vars,
         stmt::Stmt,
         types::BlockId,
     },
@@ -79,6 +80,12 @@ fn exec_full_stmt<T: Transfer>(
     };
     exec_callbacks_depth(transfer, main_expr, env, ctx, depth);
     exec_stmt_core(transfer, stmt, env, ctx, depth);
+    // `CompApp` in ExprStmt position (including Return-turned-ExprStmt by cfg_analyzer)
+    // must also go through eval_expr so that inter-component analysis fires.
+    // exec_stmt_core only handles setter calls; eval_comp_app lives in eval_expr.
+    if let Stmt::ExprStmt(Expr::CompApp { .. }, _) = stmt {
+        transfer.eval_expr(main_expr, env, ctx);
+    }
 }
 
 /// Generic core statement semantics (no callback traversal).
@@ -107,13 +114,31 @@ fn exec_stmt_core<T: Transfer>(
             } = rhs
             {
                 env.extend_loc(var.clone(), *id);
+                let free = compute_free_vars(body_cfg);
+                let captured = free
+                    .iter()
+                    .filter_map(|v| env.lookup(v).as_state_value().map(|sv| (v.clone(), sv)))
+                    .collect();
                 ctx.heap.insert(
                     *id,
                     HeapValue::Fn {
                         params: params.clone(),
                         body_cfg: Arc::clone(body_cfg),
+                        captured,
                     },
                 );
+            }
+            // Propagate heap locs for variable aliases (e.g. destructuring preamble:
+            // `let __obj = __p0` where __p0 carries the props heap location).
+            if let Expr::Var(src) = rhs {
+                if let Some(EnvVal::Loc(ids)) = env.lookup_env_val(src) {
+                    for &id in ids.iter().collect::<Vec<_>>() {
+                        env.extend_loc(var.clone(), id);
+                    }
+                }
+                if let Some(label) = env.setter_label(src) {
+                    env.bind_setter(var.clone(), label);
+                }
             }
             let val = transfer.eval_expr(rhs, env, ctx);
             env.extend(var.clone(), val);
@@ -129,11 +154,17 @@ fn exec_stmt_core<T: Transfer>(
             } = rhs
             {
                 env.extend_loc(var.clone(), *id);
+                let free = compute_free_vars(body_cfg);
+                let captured = free
+                    .iter()
+                    .filter_map(|v| env.lookup(v).as_state_value().map(|sv| (v.clone(), sv)))
+                    .collect();
                 ctx.heap.insert(
                     *id,
                     HeapValue::Fn {
                         params: params.clone(),
                         body_cfg: Arc::clone(body_cfg),
+                        captured,
                     },
                 );
             }
@@ -178,6 +209,37 @@ fn exec_setter_call<T: Transfer>(
             None => T::Domain::top(),
         };
         ctx.state.update(label, arg_val);
+    }
+
+    // Cross-component ComponentSetter call.
+    // Handles fn_ = Var(name), FieldAccess { obj: Var, field }, or any other expr
+    // that evaluates to ComponentSetter { component, label }.
+    if let Expr::Call { fn_, args } = expr {
+        let comp_setter =
+            transfer
+                .eval_expr(fn_, env, ctx)
+                .as_state_value()
+                .and_then(|sv| match sv {
+                    crate::domains::StateValue::ComponentSetter { component, label } => {
+                        Some((component, label))
+                    }
+                    _ => None,
+                });
+        if let Some((component, label)) = comp_setter {
+            if ctx.inter.is_some() {
+                let arg_val = args
+                    .first()
+                    .map(|a| transfer.eval_expr(a, env, ctx))
+                    .and_then(|v| v.as_state_value())
+                    .unwrap_or(crate::domains::StateValue::Top);
+                if let Some(inter) = &ctx.inter {
+                    inter
+                        .shared_state
+                        .borrow_mut()
+                        .update(&component, label, arg_val);
+                }
+            }
+        }
     }
 }
 
@@ -344,6 +406,10 @@ fn exec_callbacks_depth<T: Transfer>(
         }
         Expr::CompApp { props, .. } => {
             exec_callbacks_depth(transfer, props, env, ctx, depth);
+            // Evaluate the CompApp itself so inter-component inlining fires for
+            // CompApp nodes inside NativeElem children, ObjectLit fields, etc.
+            // (Return(CompApp) is already handled by exec_full_stmt; cache hit = no-op.)
+            transfer.eval_expr(expr, env, ctx);
         }
         Expr::NativeElem {
             props, children, ..
@@ -372,10 +438,20 @@ fn exec_var_callback<T: Transfer>(
     if let Some(EnvVal::Loc(ids)) = env.lookup_env_val(name) {
         let ids: Vec<_> = ids.iter().copied().collect();
         for id in ids {
-            if let Some(HeapValue::Fn { params, body_cfg }) = ctx.heap.get(id) {
+            if let Some(HeapValue::Fn {
+                params,
+                body_cfg,
+                captured,
+            }) = ctx.heap.get(id)
+            {
                 let params = params.clone();
                 let body_cfg = Arc::clone(body_cfg);
+                let captured = captured.clone();
                 let mut sub_env = env.clone();
+                // Restore captured environment at closure creation time.
+                for (var, val) in captured {
+                    sub_env.extend(var, T::Domain::from_state_value(val));
+                }
                 for p in &params {
                     sub_env.extend(p.clone(), T::Domain::top());
                 }

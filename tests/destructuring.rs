@@ -19,6 +19,21 @@ use reactant::{
     rules::{InfiniteLoop, Rule, SetterInRender, all_rules},
 };
 
+fn make_prog(
+    name: &str,
+    result: reactant::engine::AnalysisResult<reactant::domains::StateValue>,
+) -> reactant::engine::ProgramAnalysisResult {
+    let mut components = std::collections::HashMap::new();
+    components.insert(name.to_string(), result);
+    reactant::engine::ProgramAnalysisResult {
+        components,
+        shared_state: reactant::domains::stores::SharedStateStore::new(),
+        call_graph: reactant::engine::ComponentCallGraph::new(),
+        recursive_components: std::collections::HashSet::new(),
+        stats: reactant::engine::AnalysisStats::default(),
+    }
+}
+
 fn run(src: &str) -> Vec<reactant::engine::AnalysisResult<reactant::domains::StateValue>> {
     let alloc = Allocator::default();
     let ret = Parser::new(&alloc, src, SourceType::tsx())
@@ -35,12 +50,25 @@ fn run(src: &str) -> Vec<reactant::engine::AnalysisResult<reactant::domains::Sta
 }
 
 fn any_diags(src: &str) -> usize {
-    run(src)
-        .iter()
-        .flat_map(|r| {
+    let alloc = oxc_allocator::Allocator::default();
+    let ret = oxc_parser::Parser::new(&alloc, src, oxc_span::SourceType::tsx())
+        .with_options(oxc_parser::ParseOptions::default())
+        .parse();
+    let line_starts = reactant::lowering::compute_line_starts(src);
+    let components = reactant::lowering::lower_program(&ret.program, &line_starts);
+    components
+        .into_iter()
+        .flat_map(|comp| {
+            let name = comp.name.clone();
+            let result = reactant::engine::analyze_component(
+                comp,
+                &reactant::domains::StateValueTransfer,
+                &reactant::engine::Config::default(),
+            );
+            let prog = make_prog(&name, result);
             all_rules()
                 .iter()
-                .flat_map(|rule| rule.check(r))
+                .flat_map(|rule| rule.check(&prog, &name))
                 .collect::<Vec<_>>()
         })
         .count()
@@ -131,17 +159,33 @@ fn nested_array_destr_no_false_positive() {
 #[test]
 fn destructured_state_setter_detected() {
     // setter extracted via nested destr must be caught by setter-in-render
-    let diags: usize = run(r#"
+    let src = r#"
         import { useState } from "react";
         function C() {
             const [[count, setCount]] = [useState(0)];
             setCount(count + 1); // setter-in-render
             return <div>{count}</div>;
         }
-        "#)
-    .iter()
-    .map(|r| SetterInRender.check(r).len())
-    .sum();
+        "#;
+    let alloc = oxc_allocator::Allocator::default();
+    let ret = oxc_parser::Parser::new(&alloc, src, oxc_span::SourceType::tsx())
+        .with_options(oxc_parser::ParseOptions::default())
+        .parse();
+    let line_starts = reactant::lowering::compute_line_starts(src);
+    let components = reactant::lowering::lower_program(&ret.program, &line_starts);
+    let diags: usize = components
+        .into_iter()
+        .map(|comp| {
+            let name = comp.name.clone();
+            let result = reactant::engine::analyze_component(
+                comp,
+                &reactant::domains::StateValueTransfer,
+                &reactant::engine::Config::default(),
+            );
+            let prog = make_prog(&name, result);
+            SetterInRender.check(&prog, &name).len()
+        })
+        .sum();
     // The setter is inside a nested array destr — it must still be recognized.
     // (This is an intentional FP-check: we're verifying the rule fires, not that it doesn't.)
     // Acceptable either way — the key test is "no panic".
@@ -155,10 +199,39 @@ fn nested_destr_fixture_no_false_positive() {
     let src = std::fs::read_to_string("tests/fixtures/nested_destr.tsx")
         .expect("nested_destr.tsx not found");
     // No infinite-loop or setter-in-render hits expected in the clean fixture.
-    let il: usize = run(&src).iter().map(|r| InfiniteLoop.check(r).len()).sum();
-    let sir: usize = run(&src)
-        .iter()
-        .map(|r| SetterInRender.check(r).len())
+    let make_results = || {
+        let alloc = oxc_allocator::Allocator::default();
+        let ret = oxc_parser::Parser::new(&alloc, &src, oxc_span::SourceType::tsx())
+            .with_options(oxc_parser::ParseOptions::default())
+            .parse();
+        let line_starts = reactant::lowering::compute_line_starts(&src);
+        reactant::lowering::lower_program(&ret.program, &line_starts)
+    };
+    let il: usize = make_results()
+        .into_iter()
+        .map(|comp| {
+            let name = comp.name.clone();
+            let result = reactant::engine::analyze_component(
+                comp,
+                &reactant::domains::StateValueTransfer,
+                &reactant::engine::Config::default(),
+            );
+            let prog = make_prog(&name, result);
+            InfiniteLoop.check(&prog, &name).len()
+        })
+        .sum();
+    let sir: usize = make_results()
+        .into_iter()
+        .map(|comp| {
+            let name = comp.name.clone();
+            let result = reactant::engine::analyze_component(
+                comp,
+                &reactant::domains::StateValueTransfer,
+                &reactant::engine::Config::default(),
+            );
+            let prog = make_prog(&name, result);
+            SetterInRender.check(&prog, &name).len()
+        })
         .sum();
     assert_eq!(il, 0, "nested_destr.tsx: no infinite-loop expected");
     assert_eq!(sir, 0, "nested_destr.tsx: no setter-in-render expected");

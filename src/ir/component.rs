@@ -4,7 +4,7 @@ use crate::ir::{
     types::{Symbol, Var},
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ComponentIR {
     pub name: Symbol,
     pub param: Var,

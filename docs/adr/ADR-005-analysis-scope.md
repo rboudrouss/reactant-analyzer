@@ -15,6 +15,10 @@ Chaque composant et chaque custom hook est analysé indépendamment.
 Un appel à un hook non reconnu → retour `Unknown` pour toutes les valeurs.  
 Les bugs DANS les custom hooks sont détectés quand on analyse le hook directement.
 
+### Phase inter-composant (implémentée — ADR-012)
+
+Analyse top-down avec inlining de composants enfants, `ComponentSetter` comme valeur abstraite, `SharedStateStore` pour la propagation bidirectionnelle. Voir ADR-012 pour l'architecture complète.
+
 ### Phase 2 (future) : inlining call-string-1
 
 À chaque appel `useX(args)`, substituer le corps du hook dans le CFG du composant appelant avec les arguments substitués. Depth = 1 (pas d'inlining récursif).

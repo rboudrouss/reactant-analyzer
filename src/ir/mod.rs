@@ -1,6 +1,7 @@
 pub mod cfg;
 pub mod component;
 pub mod expr;
+pub mod free_vars;
 pub mod hooks;
 pub mod source_range;
 pub mod stmt;

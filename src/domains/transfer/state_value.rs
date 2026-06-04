@@ -1,16 +1,19 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
 use crate::{
     domains::{
-        AnalysisCtx, QueryContext, Transfer,
+        AbstractDomain, AnalysisCtx, QueryContext, Transfer,
         impls::{BoolVal, Interval, Stability, StateValue},
         interp::exec_stmt_with_callbacks,
-        stores::{AbstractEnv, MemoStore, StateStore},
+        stores::{AbstractEnv, EnvVal, Heap, HeapValue, MemoStore, StateStore},
     },
     ir::{
         expr::{BinOp, Expr, Prim, UnaryOp},
         stmt::Stmt,
+        types::{ExprId, Symbol},
     },
 };
 
@@ -38,7 +41,7 @@ impl Transfer for StateValueTransfer {
         env: &AbstractEnv<StateValue>,
         ctx: &mut AnalysisCtx<StateValue>,
     ) -> StateValue {
-        eval_state_value(expr, env, ctx.state, ctx.memo)
+        eval_state_value(expr, env, ctx)
     }
 
     fn exec_stmt(
@@ -60,7 +63,11 @@ impl Transfer for StateValueTransfer {
             return StateValue::Reference(Stability::Stable);
         }
         let stability = deps.iter().fold(Stability::Bottom, |acc, dep| {
-            let val = eval_state_value(dep, env, &StateStore::bottom(), &MemoStore::new());
+            let mut s = StateStore::bottom();
+            let mut m = MemoStore::new();
+            let mut h = crate::domains::stores::Heap::new();
+            let mut tmp_ctx = AnalysisCtx::null(&mut s, &mut m, &mut h);
+            let val = eval_state_value(dep, env, &mut tmp_ctx);
             acc.join(&val.to_stability())
         });
         StateValue::Reference(stability)
@@ -72,8 +79,7 @@ impl Transfer for StateValueTransfer {
 fn eval_state_value(
     expr: &Expr,
     env: &AbstractEnv<StateValue>,
-    state: &StateStore<StateValue>,
-    memo: &MemoStore<StateValue>,
+    ctx: &mut AnalysisCtx<StateValue>,
 ) -> StateValue {
     match expr {
         Expr::Lit(Prim::Int(n)) => StateValue::Number(Interval::point(*n as f64)),
@@ -86,33 +92,163 @@ fn eval_state_value(
         Expr::Lit(Prim::Unit) => StateValue::Undefined,
 
         Expr::Var(v) => env.lookup(v),
-        Expr::StateVal(label) => state.get(*label),
-        Expr::StateSetter(_) => StateValue::Reference(Stability::Stable),
-        Expr::MemoVal(label) | Expr::CallbackVal(label) => memo.get(*label),
+        Expr::StateVal(label) => ctx.state.get(*label),
+        Expr::StateSetter(label) => {
+            if let Some(inter) = &ctx.inter {
+                StateValue::ComponentSetter {
+                    component: inter.component_name.clone(),
+                    label: *label,
+                }
+            } else {
+                StateValue::Reference(Stability::Stable)
+            }
+        }
+        Expr::MemoVal(label) | Expr::CallbackVal(label) => ctx.memo.get(*label),
 
         Expr::ObjectLit { .. } => StateValue::Reference(Stability::Unstable),
         Expr::ArrayLit { .. } => StateValue::Reference(Stability::Unstable),
         Expr::FnLit { .. } => StateValue::Reference(Stability::Unstable),
-        Expr::CompApp { .. } | Expr::NativeElem { .. } => {
-            StateValue::Reference(Stability::Unstable)
-        }
+        Expr::NativeElem { .. } => StateValue::Reference(Stability::Stable),
+
+        Expr::CompApp { name, props } => eval_comp_app(name, props, env, ctx),
 
         Expr::BinOp { op, lhs, rhs } => {
-            let l = eval_state_value(lhs, env, state, memo);
-            let r = eval_state_value(rhs, env, state, memo);
+            let l = eval_state_value(lhs, env, ctx);
+            let r = eval_state_value(rhs, env, ctx);
             eval_binop(op, l, r)
         }
 
         Expr::UnaryOp { op, arg } => {
-            let v = eval_state_value(arg, env, state, memo);
+            let v = eval_state_value(arg, env, ctx);
             eval_unary(op, v)
         }
 
         Expr::Call { .. } => StateValue::Top,
-        Expr::FieldAccess { .. } | Expr::IndexAccess { .. } => StateValue::Top,
 
-        Expr::TSAnnotated(inner, _) => eval_state_value(inner, env, state, memo),
+        Expr::FieldAccess { obj, field } => eval_field_access(obj, field, env, ctx),
+        Expr::IndexAccess { .. } => StateValue::Top,
+
+        Expr::TSAnnotated(inner, _) => eval_state_value(inner, env, ctx),
     }
+}
+
+/// Evaluate a component application: inline child analysis if inter-component context present.
+fn eval_comp_app(
+    name: &Symbol,
+    props_expr: &Expr,
+    env: &AbstractEnv<StateValue>,
+    ctx: &mut AnalysisCtx<StateValue>,
+) -> StateValue {
+    let Some(inter) = ctx.inter else {
+        return StateValue::Reference(Stability::Stable);
+    };
+
+    // Recursion guard
+    if inter.is_recursive(name) {
+        inter.stats.borrow_mut().recursion_cutoffs += 1;
+        return StateValue::Reference(Stability::Stable);
+    }
+
+    // Registry lookup
+    let Some(child_ir) = inter.registry.get(name).cloned() else {
+        return StateValue::Reference(Stability::Stable);
+    };
+
+    // Evaluate props → abstract map
+    let abstract_props = eval_props_map(props_expr, env, ctx);
+
+    // Cache lookup (strict equality)
+    if inter.cache.borrow().lookup(name, &abstract_props).is_some() {
+        inter.stats.borrow_mut().cache_hits += 1;
+        record_call_site(inter, name.clone(), abstract_props, None);
+        return StateValue::Reference(Stability::Stable);
+    }
+    inter.stats.borrow_mut().cache_misses += 1;
+
+    // Build child initial env + heap: bind param loc to abstract props object.
+    // The props heap entry goes into initial_heap (not the parent heap), so the
+    // child's fresh heap starts with it and eval_field_access can resolve it.
+    let mut child_env = AbstractEnv::bottom();
+    let props_id = ExprId::fresh();
+    let mut initial_heap = crate::domains::stores::Heap::new();
+    initial_heap.insert(props_id, HeapValue::Obj(abstract_props.clone()));
+    child_env.extend_loc(child_ir.param.clone(), props_id);
+
+    // Create child inter context and analyze
+    let child_inter = inter.child(name.clone());
+    let analyze_child = inter.analyze_child;
+    let child_result = analyze_child(&child_ir, child_env, initial_heap, &child_inter);
+
+    // Store result in the program-level results map and cache
+    inter
+        .results
+        .borrow_mut()
+        .insert(name.clone(), child_result.clone());
+    inter
+        .cache
+        .borrow_mut()
+        .insert(name.clone(), abstract_props.clone(), child_result);
+    record_call_site(inter, name.clone(), abstract_props, None);
+
+    StateValue::Reference(Stability::Stable)
+}
+
+/// Evaluate field access: look up heap if obj is a variable with known locations.
+fn eval_field_access(
+    obj: &Expr,
+    field: &Symbol,
+    env: &AbstractEnv<StateValue>,
+    ctx: &mut AnalysisCtx<StateValue>,
+) -> StateValue {
+    if let Expr::Var(v) = obj {
+        if let Some(EnvVal::Loc(ids)) = env.lookup_env_val(v) {
+            let ids: Vec<ExprId> = ids.iter().copied().collect();
+            let vals: Vec<StateValue> = ids
+                .iter()
+                .filter_map(|id| ctx.heap.get(*id))
+                .filter_map(|hv| match hv {
+                    HeapValue::Obj(fields) => fields.get(field).cloned(),
+                    _ => None,
+                })
+                .collect();
+            if !vals.is_empty() {
+                return vals.into_iter().reduce(|a, b| a.join(&b)).unwrap();
+            }
+        }
+    }
+    StateValue::Top
+}
+
+/// Extract per-field abstract values from a props expression.
+fn eval_props_map(
+    props_expr: &Expr,
+    env: &AbstractEnv<StateValue>,
+    ctx: &mut AnalysisCtx<StateValue>,
+) -> HashMap<Symbol, StateValue> {
+    match props_expr {
+        Expr::ObjectLit { fields, .. } => fields
+            .iter()
+            .map(|(k, v)| (k.clone(), eval_state_value(v, env, ctx)))
+            .collect(),
+        _ => HashMap::new(),
+    }
+}
+
+fn record_call_site(
+    inter: &crate::domains::InterCtx<'_>,
+    callee: Symbol,
+    props: HashMap<Symbol, StateValue>,
+    location: Option<crate::ir::SourceRange>,
+) {
+    use crate::engine::program_result::CallSite;
+    inter.call_graph.borrow_mut().add_edge(
+        inter.component_name.clone(),
+        CallSite {
+            callee,
+            props,
+            location,
+        },
+    );
 }
 
 fn eval_binop(op: &BinOp, lhs: StateValue, rhs: StateValue) -> StateValue {
@@ -1203,6 +1339,7 @@ mod tests {
             crate::domains::HeapValue::Fn {
                 params: vec![],
                 body_cfg: Arc::new(cb_body),
+                captured: std::collections::HashMap::new(),
             },
         );
         StateValueTransfer.exec_stmt(

@@ -6,7 +6,9 @@ pub mod query;
 pub mod stores;
 pub mod transfer;
 
-pub use context::{AnalysisCtx, AnalysisQueryCtx, FixpointCtx, NullCtx, QueryContext};
+pub use context::{
+    AnalysisCtx, AnalysisQueryCtx, AnalyzeChildFn, FixpointCtx, InterCtx, NullCtx, QueryContext,
+};
 pub use impls::{BoolVal, Interval, Stability, StateValue};
 pub use product::{ProductDomain, ProductTransfer};
 pub use query::{DomainQuery, Queryable};
@@ -31,6 +33,21 @@ pub trait AbstractDomain: Clone + PartialEq + PartialOrd + std::fmt::Debug {
     fn join(&self, other: &Self) -> Self;
     fn meet(&self, other: &Self) -> Self;
     fn widen(&self, other: &Self) -> Self;
+
+    /// Try to recover the underlying `StateValue`, if this domain IS `StateValue`.
+    /// Default returns `None` (other domains). Used when the heap needs to store
+    /// a captured environment with `StateValue` type (e.g. closure capture at FnLit creation).
+    fn as_state_value(&self) -> Option<StateValue> {
+        None
+    }
+
+    /// Convert a `StateValue` back to this domain.
+    /// Default returns `Self::bottom()` (other domains drop the value conservatively).
+    /// `StateValue` overrides to return itself. Used when restoring captured closure env.
+    fn from_state_value(sv: StateValue) -> Self {
+        let _ = sv;
+        Self::bottom()
+    }
 
     // Branch narrowing: default = identity (sound, imprecise).
     // Override for numeric domains to refine interval bounds on branch conditions.

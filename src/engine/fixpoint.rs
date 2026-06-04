@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     domains::{
-        AbstractDomain, AnalysisCtx, FixpointCtx, Heap, NullCtx, Transfer,
+        AbstractDomain, AnalysisCtx, AnalyzeChildFn, FixpointCtx, Heap, InterCtx, NullCtx,
+        Transfer,
         impls::{StateValue, interval::Interval},
         stores::{AbstractEnv, MemoStore, StateStore, TypedStateStore},
     },
@@ -10,16 +11,22 @@ use crate::{
         cfg::CFG,
         component::ComponentIR,
         expr::{Expr, TSType},
+        free_vars::compute_free_vars,
         hooks::HookEntry,
         stmt::Stmt,
-        types::{BlockId, HookLabel, Var},
+        types::{BlockId, HookLabel},
     },
 };
 
 use super::{
     analysis_result::{AnalysisResult, EffectInfo, HandlerInfo, HookCallInfo, HookKind},
     cfg_analyzer::analyze_cfg,
+    component_cache::ComponentCache,
+    component_registry::ComponentRegistry,
+    program_result::{AnalysisStats, ComponentCallGraph, ProgramAnalysisResult},
+    root_detector::RootStrategy,
 };
+use crate::domains::{stores::SharedStateStore, transfer::StateValueTransfer};
 
 pub struct Config {
     pub widen_threshold: usize,
@@ -31,31 +38,69 @@ impl Default for Config {
     }
 }
 
-/// Run the full fixpoint analysis for one component.
-///
-/// Outer loop:
-///   1. Render pass: analyze `render_cfg` with the current `state_store`.
-///   2. Recompute memo store from exit env.
-///   3. Effect passes: analyze each effect body with exit env + current state.
-///   4. Convergence check: if `new_state ⊑ state_store`, done.
-///   5. Otherwise widen (after `config.widen_threshold` iterations) and repeat.
-///
-/// Internally uses `TypedStateStore` (ADR-008 Option B) for per-label precision:
-/// numeric labels widen via `Interval`, boolean labels stay in `BoolVal`, etc.
-/// The `Transfer` trait is unchanged; `StateStore<StateValue>` is projected in
-/// and out of `TypedStateStore` at each iteration boundary.
+/// `AnalyzeChildFn` callback — called from `eval_comp_app` to inline a child component.
+/// Provided to `InterCtx` at creation time to break the circular dep between
+/// `domains::transfer` and `engine::fixpoint`.
+pub fn analyze_component_inter(
+    comp: &ComponentIR,
+    initial_env: AbstractEnv<StateValue>,
+    initial_heap: Heap,
+    inter: &InterCtx<'_>,
+) -> AnalysisResult<StateValue> {
+    analyze_component_impl(
+        comp.clone(),
+        &crate::domains::transfer::StateValueTransfer,
+        inter.config,
+        initial_env,
+        initial_heap,
+        Some(inter),
+    )
+}
+
+/// Public entry point — intra-component analysis only (no inter-component context).
 pub fn analyze_component<T: Transfer<Domain = StateValue>>(
     comp: ComponentIR,
     transfer: &T,
     config: &Config,
 ) -> AnalysisResult<StateValue> {
+    analyze_component_impl(
+        comp,
+        transfer,
+        config,
+        AbstractEnv::bottom(),
+        Heap::new(),
+        None,
+    )
+}
+
+/// Core fixpoint loop.  Called by `analyze_component` and `analyze_component_inter`.
+///
+/// Outer loop:
+///   1. Import cross-component state from `SharedStateStore` (if `inter` is set).
+///   2. Render pass: analyze `render_cfg`.
+///   3. Recompute memo store from exit env.
+///   4. Effect passes.
+///   5. Handler passes (in-cycle — ADR-009 §5).
+///   6. Convergence check.
+///   7. Widen after `config.widen_threshold` iterations.
+fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
+    comp: ComponentIR,
+    transfer: &T,
+    config: &Config,
+    initial_env: AbstractEnv<StateValue>,
+    initial_heap: Heap,
+    inter: Option<&InterCtx<'_>>,
+) -> AnalysisResult<StateValue> {
     let ComponentIR {
-        render_cfg, hooks, ..
+        name: comp_name,
+        render_cfg,
+        hooks,
+        ..
     } = comp;
 
     let mut typed_state = TypedStateStore::from_component(&hooks);
     let mut memo_store: MemoStore<StateValue> = MemoStore::new();
-    let mut heap = Heap::new();
+    let mut heap = initial_heap;
     let mut widened_labels: HashSet<HookLabel> = HashSet::new();
     let mut iteration: usize = 0;
     let mut block_states: HashMap<BlockId, AbstractEnv<StateValue>>;
@@ -104,6 +149,7 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
         let state_store = typed_state.to_untyped();
 
         // ── Render pass ───────────────────────────────────────────────────────
+        // Use initial_env as entry: child analyses start with props bound.
         let (bs, state_from_render) = {
             let ctx = FixpointCtx {
                 state: &state_store,
@@ -111,13 +157,14 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
             };
             analyze_cfg::<T>(
                 &render_cfg,
-                AbstractEnv::bottom(),
+                initial_env.clone(),
                 &state_store,
                 &memo_store,
                 transfer,
                 config.widen_threshold,
                 &mut heap,
                 &ctx,
+                inter,
             )
         };
         block_states = bs;
@@ -157,6 +204,7 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
                         config.widen_threshold,
                         &mut heap,
                         &ctx,
+                        inter,
                     )
                 };
                 effect_block_states.insert(*label, eff_bs);
@@ -188,6 +236,7 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
                         config.widen_threshold,
                         &mut heap,
                         &ctx,
+                        inter,
                     )
                 };
                 handler_block_states.insert(*label, h_bs);
@@ -197,7 +246,13 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
 
         // ── Convergence check (per-sub-store precision) ───────────────────────
         let new_untyped_incycle = state_from_render.join(&state_from_effects);
-        let new_untyped_full = new_untyped_incycle.join(&state_from_handlers);
+        // Include cross-component state updates made by child effects/callbacks.
+        let external_updates = inter
+            .map(|i| i.shared_state.borrow().slice(&comp_name))
+            .unwrap_or_else(StateStore::bottom);
+        let new_untyped_full = new_untyped_incycle
+            .join(&state_from_handlers)
+            .join(&external_updates);
         let new_typed = typed_state.from_untyped(&new_untyped_full);
 
         if new_typed.leq(&typed_state) {
@@ -253,6 +308,7 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
                 config.widen_threshold,
                 &mut heap,
                 &final_ctx,
+                None,
             );
             effect_setter_writes = effect_setter_writes.join(&pure_writes);
         }
@@ -277,6 +333,77 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
         render_cfg,
         hooks: hooks_clone,
         iterations: iteration,
+    }
+}
+
+// ── Program-level analysis ────────────────────────────────────────────────────
+
+/// Analyze all components in `registry` together, propagating props and
+/// callbacks across component boundaries (top-down inlining, ADR-012).
+pub fn analyze_program(
+    registry: ComponentRegistry,
+    strategy: RootStrategy,
+    config: &Config,
+) -> ProgramAnalysisResult {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    let cache = RefCell::new(ComponentCache::new());
+    let shared_state = RefCell::new(SharedStateStore::new());
+    let call_graph = RefCell::new(ComponentCallGraph::new());
+    let stats = RefCell::new(AnalysisStats::default());
+    let results: RefCell<HashMap<String, AnalysisResult<crate::domains::StateValue>>> =
+        RefCell::new(HashMap::new());
+
+    let roots = strategy.detect(&registry);
+
+    // Phase 1: analyze roots top-down (children inlined via eval_comp_app).
+    for root_name in &roots {
+        if let Some(root_ir) = registry.get(root_name).cloned() {
+            let inter = InterCtx::new(
+                &registry,
+                &cache,
+                &shared_state,
+                &call_graph,
+                &stats,
+                &results,
+                root_name.clone(),
+                config,
+                analyze_component_inter as AnalyzeChildFn,
+            );
+            let result = analyze_component_impl(
+                root_ir,
+                &StateValueTransfer,
+                config,
+                AbstractEnv::bottom(),
+                Heap::new(),
+                Some(&inter),
+            );
+            stats.borrow_mut().components_analyzed += 1;
+            results.borrow_mut().insert(root_name.clone(), result);
+        }
+    }
+
+    // Phase 2: analyze any component not yet reached (props = ⊤, intra only).
+    let remaining: Vec<String> = registry
+        .all_names()
+        .filter(|n| !results.borrow().contains_key(*n))
+        .cloned()
+        .collect();
+    for name in remaining {
+        if let Some(ir) = registry.get(&name).cloned() {
+            let result = analyze_component(ir, &StateValueTransfer, config);
+            stats.borrow_mut().components_analyzed += 1;
+            results.borrow_mut().insert(name, result);
+        }
+    }
+
+    ProgramAnalysisResult {
+        components: results.into_inner(),
+        shared_state: shared_state.into_inner(),
+        call_graph: call_graph.into_inner(),
+        recursive_components: std::collections::HashSet::new(),
+        stats: stats.into_inner(),
     }
 }
 
@@ -487,79 +614,6 @@ fn collect_handler_info(hooks: &[HookEntry]) -> HashMap<HookLabel, HandlerInfo> 
             }
         })
         .collect()
-}
-
-/// `free_vars(cfg)` = variables read anywhere in cfg − variables locally defined.
-fn compute_free_vars(cfg: &CFG) -> HashSet<Var> {
-    let mut used: HashSet<Var> = HashSet::new();
-    let mut defined: HashSet<Var> = HashSet::new();
-
-    for block in cfg.blocks.values() {
-        for stmt in &block.stmts {
-            match stmt {
-                Stmt::Let { var, rhs, .. } => {
-                    collect_used_vars(rhs, &mut used);
-                    defined.insert(var.clone());
-                }
-                Stmt::Assign { var, rhs, .. } => {
-                    collect_used_vars(rhs, &mut used);
-                    defined.insert(var.clone());
-                }
-                Stmt::ExprStmt(e, _) => collect_used_vars(e, &mut used),
-            }
-        }
-        // Terminators also contain variable reads: Branch condition and Return value.
-        match &block.term {
-            crate::ir::cfg::Terminator::Branch { cond, .. } => {
-                collect_used_vars(cond, &mut used);
-            }
-            crate::ir::cfg::Terminator::Return(expr) => {
-                collect_used_vars(expr, &mut used);
-            }
-            _ => {}
-        }
-    }
-
-    used.difference(&defined).cloned().collect()
-}
-
-fn collect_used_vars(expr: &Expr, out: &mut HashSet<Var>) {
-    match expr {
-        Expr::Var(v) => {
-            out.insert(v.clone());
-        }
-        Expr::ObjectLit { fields, .. } => {
-            fields.iter().for_each(|(_, v)| collect_used_vars(v, out))
-        }
-        Expr::ArrayLit { elems, .. } => elems.iter().for_each(|e| collect_used_vars(e, out)),
-        Expr::FnLit { body_cfg, .. } => {
-            // Recurse into closures; their free vars are free in the outer CFG too.
-            out.extend(compute_free_vars(body_cfg));
-        }
-        Expr::FieldAccess { obj, .. } => collect_used_vars(obj, out),
-        Expr::IndexAccess { arr, idx } => {
-            collect_used_vars(arr, out);
-            collect_used_vars(idx, out);
-        }
-        Expr::BinOp { lhs, rhs, .. } => {
-            collect_used_vars(lhs, out);
-            collect_used_vars(rhs, out);
-        }
-        Expr::UnaryOp { arg, .. } => collect_used_vars(arg, out),
-        Expr::Call { fn_, args } => {
-            collect_used_vars(fn_, out);
-            args.iter().for_each(|a| collect_used_vars(a, out));
-        }
-        Expr::CompApp { props, .. } => collect_used_vars(props, out),
-        Expr::NativeElem {
-            props, children, ..
-        } => {
-            collect_used_vars(props, out);
-            children.iter().for_each(|c| collect_used_vars(c, out));
-        }
-        Expr::TSAnnotated(e, _) => collect_used_vars(e, out),
-        _ => {}
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

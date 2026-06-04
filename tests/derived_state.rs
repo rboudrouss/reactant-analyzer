@@ -15,6 +15,21 @@ use reactant::{
     rules::{DerivedState, Rule},
 };
 
+fn make_prog(
+    name: &str,
+    result: reactant::engine::AnalysisResult<reactant::domains::StateValue>,
+) -> reactant::engine::ProgramAnalysisResult {
+    let mut components = std::collections::HashMap::new();
+    components.insert(name.to_string(), result);
+    reactant::engine::ProgramAnalysisResult {
+        components,
+        shared_state: reactant::domains::stores::SharedStateStore::new(),
+        call_graph: reactant::engine::ComponentCallGraph::new(),
+        recursive_components: std::collections::HashSet::new(),
+        stats: reactant::engine::AnalysisStats::default(),
+    }
+}
+
 fn run(src: &str) -> Vec<reactant::engine::AnalysisResult<reactant::domains::StateValue>> {
     let alloc = Allocator::default();
     let ret = Parser::new(&alloc, src, SourceType::tsx())
@@ -31,7 +46,25 @@ fn run(src: &str) -> Vec<reactant::engine::AnalysisResult<reactant::domains::Sta
 }
 
 fn derived_state_hits(src: &str) -> usize {
-    run(src).iter().map(|r| DerivedState.check(r).len()).sum()
+    let alloc = oxc_allocator::Allocator::default();
+    let ret = oxc_parser::Parser::new(&alloc, src, oxc_span::SourceType::tsx())
+        .with_options(oxc_parser::ParseOptions::default())
+        .parse();
+    let line_starts = reactant::lowering::compute_line_starts(src);
+    let components = reactant::lowering::lower_program(&ret.program, &line_starts);
+    components
+        .into_iter()
+        .map(|comp| {
+            let name = comp.name.clone();
+            let result = reactant::engine::analyze_component(
+                comp,
+                &reactant::domains::StateValueTransfer,
+                &reactant::engine::Config::default(),
+            );
+            let prog = make_prog(&name, result);
+            DerivedState.check(&prog, &name).len()
+        })
+        .sum()
 }
 
 // ── True positives ────────────────────────────────────────────────────────────

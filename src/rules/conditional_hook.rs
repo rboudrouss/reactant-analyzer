@@ -1,7 +1,7 @@
 use crate::{
     domains::StateValue,
-    engine::{AnalysisResult, dominates},
-    ir::cfg::Terminator,
+    engine::{AnalysisResult, ProgramAnalysisResult, dominates},
+    ir::{cfg::Terminator, types::Symbol},
 };
 
 use super::{Diagnostic, Rule, Severity};
@@ -18,7 +18,8 @@ impl Rule for ConditionalHook {
         "conditional-hook"
     }
 
-    fn check(&self, result: &AnalysisResult<StateValue>) -> Vec<Diagnostic> {
+    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+        let result = &result.components[component];
         let exits: Vec<_> = result
             .render_cfg
             .blocks
@@ -65,7 +66,10 @@ mod tests {
             StateValue, StateValueTransfer,
             stores::{MemoStore, StateStore},
         },
-        engine::{AnalysisResult, Config, HookCallInfo, HookKind, analyze_component},
+        engine::{
+            AnalysisResult, Config, HookCallInfo, HookKind, ProgramAnalysisResult,
+            analyze_component,
+        },
         ir::{
             cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator},
             component::ComponentIR,
@@ -76,6 +80,20 @@ mod tests {
         rules::Rule,
     };
     use std::collections::{HashMap, HashSet};
+
+    fn prog(r: &AnalysisResult<StateValue>) -> ProgramAnalysisResult {
+        use crate::domains::stores::SharedStateStore;
+        use crate::engine::program_result::{AnalysisStats, ComponentCallGraph};
+        let mut components = HashMap::new();
+        components.insert("C".to_string(), r.clone());
+        ProgramAnalysisResult {
+            components,
+            shared_state: SharedStateStore::default(),
+            call_graph: ComponentCallGraph::new(),
+            recursive_components: HashSet::new(),
+            stats: AnalysisStats::default(),
+        }
+    }
 
     fn make_result(render_cfg: CFG, hook_calls: Vec<HookCallInfo>) -> AnalysisResult<StateValue> {
         AnalysisResult {
@@ -202,7 +220,11 @@ mod tests {
                 span: None,
             }],
         );
-        assert!(ConditionalHook.check(&result).is_empty());
+        assert!(
+            ConditionalHook
+                .check(&prog(&result), &"C".to_string())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -217,7 +239,11 @@ mod tests {
                 span: None,
             }],
         );
-        assert!(ConditionalHook.check(&result).is_empty());
+        assert!(
+            ConditionalHook
+                .check(&prog(&result), &"C".to_string())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -232,7 +258,7 @@ mod tests {
                 span: None,
             }],
         );
-        let diags = ConditionalHook.check(&result);
+        let diags = ConditionalHook.check(&prog(&result), &"C".to_string());
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].hook_label, Some(0));
     }
@@ -249,7 +275,11 @@ mod tests {
                 span: None,
             }],
         );
-        assert!(ConditionalHook.check(&result).is_empty());
+        assert!(
+            ConditionalHook
+                .check(&prog(&result), &"C".to_string())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -270,7 +300,7 @@ mod tests {
             }, // conditional
         ];
         let result = make_result(cfg, hook_calls);
-        let diags = ConditionalHook.check(&result);
+        let diags = ConditionalHook.check(&prog(&result), &"C".to_string());
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].hook_label, Some(1));
     }
@@ -307,7 +337,11 @@ mod tests {
             hooks,
         };
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        assert!(ConditionalHook.check(&result).is_empty());
+        assert!(
+            ConditionalHook
+                .check(&prog(&result), &"C".to_string())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -399,6 +433,10 @@ mod tests {
             hooks,
         };
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        assert!(!ConditionalHook.check(&result).is_empty());
+        assert!(
+            !ConditionalHook
+                .check(&prog(&result), &"C".to_string())
+                .is_empty()
+        );
     }
 }

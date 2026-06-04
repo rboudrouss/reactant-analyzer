@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     domains::StateValue,
-    engine::{AnalysisResult, dominates},
+    engine::{AnalysisResult, ProgramAnalysisResult, dominates},
     ir::{
         cfg::Terminator,
         expr::Expr,
         stmt::Stmt,
-        types::{BlockId, HookLabel, Var},
+        types::{BlockId, HookLabel, Symbol, Var},
     },
 };
 
@@ -27,7 +27,8 @@ impl Rule for SetterInRender {
         "setter-in-render"
     }
 
-    fn check(&self, result: &AnalysisResult<StateValue>) -> Vec<Diagnostic> {
+    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+        let result = &result.components[component];
         // Collect setter variable names from render CFG (let setX = StateSetter(label)).
         let setter_vars: HashSet<Var> = result
             .render_cfg
@@ -130,7 +131,7 @@ mod tests {
             StateValue, StateValueTransfer,
             stores::{MemoStore, StateStore},
         },
-        engine::{AnalysisResult, Config, analyze_component},
+        engine::{AnalysisResult, Config, ProgramAnalysisResult, analyze_component},
         ir::{
             cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator},
             component::ComponentIR,
@@ -140,7 +141,21 @@ mod tests {
         },
         rules::Rule,
     };
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
+
+    fn prog(name: &str, r: &AnalysisResult<StateValue>) -> ProgramAnalysisResult {
+        use crate::domains::stores::SharedStateStore;
+        use crate::engine::program_result::{AnalysisStats, ComponentCallGraph};
+        let mut components = HashMap::new();
+        components.insert(name.to_string(), r.clone());
+        ProgramAnalysisResult {
+            components,
+            shared_state: SharedStateStore::default(),
+            call_graph: ComponentCallGraph::new(),
+            recursive_components: HashSet::new(),
+            stats: AnalysisStats::default(),
+        }
+    }
 
     fn make_result(hooks: Vec<HookEntry>, render_stmts: Vec<Stmt>) -> AnalysisResult<StateValue> {
         let mut blocks = HashMap::new();
@@ -176,7 +191,11 @@ mod tests {
     #[test]
     fn no_setter_no_warning() {
         let result = make_result(vec![], vec![]);
-        assert!(SetterInRender.check(&result).is_empty());
+        assert!(
+            SetterInRender
+                .check(&prog("C", &result), &"C".to_string())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -188,7 +207,11 @@ mod tests {
             span: None,
         }];
         let result = make_result(vec![], render_stmts);
-        assert!(SetterInRender.check(&result).is_empty());
+        assert!(
+            SetterInRender
+                .check(&prog("C", &result), &"C".to_string())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -209,7 +232,7 @@ mod tests {
             ),
         ];
         let result = make_result(vec![], render_stmts);
-        let diags = SetterInRender.check(&result);
+        let diags = SetterInRender.check(&prog("C", &result), &"C".to_string());
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].rule, "setter-in-render");
         assert_eq!(diags[0].severity, Severity::Error);
@@ -289,7 +312,7 @@ mod tests {
             hooks: vec![],
             iterations: 0,
         };
-        let diags = SetterInRender.check(&result);
+        let diags = SetterInRender.check(&prog("C", &result), &"C".to_string());
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].severity, Severity::Warning);
     }
@@ -323,7 +346,7 @@ mod tests {
             ),
         ];
         let result = make_result(vec![], render_stmts);
-        let diags = SetterInRender.check(&result);
+        let diags = SetterInRender.check(&prog("C", &result), &"C".to_string());
         assert_eq!(diags.len(), 2, "both setA and setB should be reported");
     }
 
@@ -379,7 +402,7 @@ mod tests {
             hooks,
         };
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let diags = SetterInRender.check(&result);
+        let diags = SetterInRender.check(&prog("Counter", &result), &"Counter".to_string());
         assert!(!diags.is_empty(), "setter in render body should warn");
         assert_eq!(diags[0].severity, Severity::Error);
     }
@@ -429,7 +452,7 @@ mod tests {
             ),
         ];
         let result = make_result(vec![], render_stmts);
-        let diags = SetterInRender.check(&result);
+        let diags = SetterInRender.check(&prog("C", &result), &"C".to_string());
         assert_eq!(
             diags.len(),
             1,

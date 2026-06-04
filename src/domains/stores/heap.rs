@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    domains::impls::StateValue,
+    domains::{AbstractDomain, impls::StateValue},
     ir::{
         cfg::CFG,
         types::{ExprId, Symbol, Var},
@@ -11,10 +11,12 @@ use crate::{
 /// Value stored at a heap location (indexed by `ExprId` allocation site).
 #[derive(Debug, Clone)]
 pub enum HeapValue {
-    /// A function literal: its params and body CFG.
+    /// A function literal: its params, body CFG, and captured environment at creation site.
     Fn {
         params: Vec<Var>,
         body_cfg: Arc<CFG>,
+        /// Free variables captured from the enclosing scope when this function was created.
+        captured: HashMap<Symbol, StateValue>,
     },
     /// Reserved for future object-field domain.
     Obj(HashMap<Symbol, StateValue>),
@@ -44,12 +46,45 @@ impl Heap {
     }
 
     /// Pointwise join: union of keys, join values at shared keys.
-    /// For `Fn` entries, the body CFG is structural (same site → same body);
-    /// we keep one copy. For `Obj`/`Arr`, values are joined per element.
+    /// For `Fn` entries: body CFG is structural (same site → same body); captured is joined.
+    /// For `Obj`/`Arr`, values are joined per element.
     pub fn join(&self, other: &Self) -> Self {
         let mut result = self.0.clone();
         for (id, val) in &other.0 {
-            result.entry(*id).or_insert_with(|| val.clone());
+            match result.get(id) {
+                None => {
+                    result.insert(*id, val.clone());
+                }
+                Some(HeapValue::Fn {
+                    params,
+                    body_cfg,
+                    captured: cap_self,
+                }) => {
+                    if let HeapValue::Fn {
+                        captured: cap_other,
+                        ..
+                    } = val
+                    {
+                        let mut joined_cap = cap_self.clone();
+                        for (k, v) in cap_other {
+                            let cur = joined_cap
+                                .get(k)
+                                .cloned()
+                                .unwrap_or_else(StateValue::bottom);
+                            joined_cap.insert(k.clone(), cur.join(v));
+                        }
+                        result.insert(
+                            *id,
+                            HeapValue::Fn {
+                                params: params.clone(),
+                                body_cfg: Arc::clone(body_cfg),
+                                captured: joined_cap,
+                            },
+                        );
+                    }
+                }
+                Some(_) => {} // Obj/Arr: keep self (structural)
+            }
         }
         Heap(result)
     }

@@ -2,8 +2,11 @@ use std::collections::HashSet;
 
 use crate::{
     domains::StateValue,
-    engine::AnalysisResult,
-    ir::{expr::Expr, types::Var},
+    engine::{AnalysisResult, ProgramAnalysisResult},
+    ir::{
+        expr::Expr,
+        types::{Symbol, Var},
+    },
 };
 
 use super::{Diagnostic, Rule};
@@ -17,7 +20,8 @@ impl Rule for MissingDeps {
         "missing-deps"
     }
 
-    fn check(&self, result: &AnalysisResult<StateValue>) -> Vec<Diagnostic> {
+    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+        let result = &result.components[component];
         let env_exit = result.exit_env();
         let mut diags = Vec::new();
 
@@ -84,7 +88,7 @@ mod tests {
             Stability, StateValue,
             stores::{AbstractEnv, MemoStore, StateStore},
         },
-        engine::{AnalysisResult, EffectInfo},
+        engine::{AnalysisResult, EffectInfo, ProgramAnalysisResult},
         ir::{
             cfg::{BasicBlock, CFG, Terminator},
             expr::{Expr, Prim},
@@ -93,6 +97,20 @@ mod tests {
         rules::Rule,
     };
     use std::collections::{HashMap, HashSet};
+
+    fn prog(r: &AnalysisResult<StateValue>) -> ProgramAnalysisResult {
+        use crate::domains::stores::SharedStateStore;
+        use crate::engine::program_result::{AnalysisStats, ComponentCallGraph};
+        let mut components = HashMap::new();
+        components.insert("C".to_string(), r.clone());
+        ProgramAnalysisResult {
+            components,
+            shared_state: SharedStateStore::default(),
+            call_graph: ComponentCallGraph::new(),
+            recursive_components: HashSet::new(),
+            stats: AnalysisStats::default(),
+        }
+    }
 
     fn trivial_cfg() -> CFG {
         let mut blocks = HashMap::new();
@@ -161,7 +179,7 @@ mod tests {
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
-        let diags = MissingDeps.check(&result);
+        let diags = MissingDeps.check(&prog(&result), &"C".to_string());
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].var.as_deref(), Some("n"));
     }
@@ -186,7 +204,11 @@ mod tests {
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
-        assert!(MissingDeps.check(&result).is_empty());
+        assert!(
+            MissingDeps
+                .check(&prog(&result), &"C".to_string())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -209,7 +231,11 @@ mod tests {
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
-        assert!(MissingDeps.check(&result).is_empty());
+        assert!(
+            MissingDeps
+                .check(&prog(&result), &"C".to_string())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -233,7 +259,11 @@ mod tests {
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
-        assert!(MissingDeps.check(&result).is_empty());
+        assert!(
+            MissingDeps
+                .check(&prog(&result), &"C".to_string())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -259,7 +289,7 @@ mod tests {
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
-        let diags = MissingDeps.check(&result);
+        let diags = MissingDeps.check(&prog(&result), &"C".to_string());
         assert_eq!(
             diags.len(),
             1,
@@ -285,7 +315,7 @@ mod tests {
         block_states.insert(0, env_with(&[("x", StateValue::Top)]));
 
         let result = make_result(block_states, effect_info, trivial_cfg());
-        let diags = MissingDeps.check(&result);
+        let diags = MissingDeps.check(&prog(&result), &"C".to_string());
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].var.as_deref(), Some("x"));
     }
@@ -307,6 +337,10 @@ mod tests {
         block_states.insert(0, env_with(&[]));
 
         let result = make_result(block_states, effect_info, trivial_cfg());
-        assert!(MissingDeps.check(&result).is_empty());
+        assert!(
+            MissingDeps
+                .check(&prog(&result), &"C".to_string())
+                .is_empty()
+        );
     }
 }
