@@ -51,6 +51,40 @@ function ResizeHandlerOk() {
   return <div>{width}</div>;
 }
 
+// ── addEventListener avec deps — toujours pas une boucle ─────────────────────
+// Même si width est dans les deps (effect re-run quand width change), le handler
+// tourne sur événement externe. La valeur de width croît dans le state abstrait
+// (le handler est analysé comme entry point) mais ce n'est pas un cycle automatique.
+
+function ResizeHandlerWithDepsOk() {
+  const [width, setWidth] = useState(0);
+  useEffect(() => {
+    window.addEventListener("resize", () => setWidth(width + 1)); // ✓ no infinite-loop
+  }, [width]);
+  return <div>{width}</div>;
+}
+
+// ── document.addEventListener — même traitement que window ───────────────────
+
+function KeydownHandlerOk() {
+  const [key, setKey] = useState("");
+  useEffect(() => {
+    document.addEventListener("keydown", () => setKey("pressed")); // ✓ no infinite-loop
+  });
+  return <div>{key}</div>;
+}
+
+// ── Deux listeners dans le même effect — aucun ne cause de boucle ────────────
+
+function MultiListenerOk() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    window.addEventListener("mousedown", () => setN(1)); // ✓
+    window.addEventListener("mouseup", () => setN(0));   // ✓
+  }, []);
+  return <div>{n}</div>;
+}
+
 // ── Canonical async data fetch — traversed but correctly not a loop ───────────
 // `.then` is descended (setUser is recognised and updates state) but the value
 // converges (the resolved value is unknown, not a growing increment) → no loop.

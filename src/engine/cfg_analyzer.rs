@@ -8,6 +8,7 @@ use crate::{
     ir::{
         cfg::{CFG, EdgeKind, Terminator},
         expr::{BinOp, Expr, Prim},
+        stmt::Stmt,
         types::BlockId,
     },
 };
@@ -70,6 +71,18 @@ pub fn analyze_cfg<T: Transfer>(
             };
             for stmt in &block.stmts {
                 transfer.exec_stmt(stmt, &mut env_out, &mut ac);
+            }
+            // Concise-arrow bodies (`() => expr`) lower `expr` to Terminator::Return
+            // rather than an ExprStmt. Process it for setter side effects so that
+            // e.g. `onClick={() => setN(1)}` or `addEventListener("e", () => setN(1))`
+            // correctly updates the state store. Block bodies return `Lit(Unit)`,
+            // for which exec_stmt is a no-op, so this is safe for all CFGs.
+            if let Terminator::Return(return_expr) = &block.term {
+                transfer.exec_stmt(
+                    &Stmt::ExprStmt(return_expr.clone(), None),
+                    &mut env_out,
+                    &mut ac,
+                );
             }
         }
 
@@ -534,6 +547,182 @@ mod tests {
         assert!(
             matches!(else_x, StateValue::Number(i) if i.is_bottom())
                 || else_x == StateValue::Bottom
+        );
+    }
+
+    // ── Regression: concise-arrow Return side effects ─────────────────────────
+    //
+    // Before the fix, `Terminator::Return(expr)` was never passed to
+    // `transfer.exec_stmt`, so setter calls in concise-arrow bodies
+    // (`() => setN(99)` lowered to `Return(Call{setN, [99]})`) were silently
+    // dropped and the state was never updated.
+
+    /// Setter call in Terminator::Return fires and updates state_out.
+    /// Mirrors a concise-arrow handler body `() => setN(99)`:
+    ///   block 0: stmts=[], Terminator::Return(Call{Var("setN"), [Lit(99)]})
+    #[test]
+    fn setter_in_return_terminator_updates_state() {
+        // Build a one-block CFG where the only setter call is in Return.
+        let mut blocks = std::collections::HashMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(99))],
+                }),
+            },
+        );
+        let cfg = CFG {
+            entry: 0,
+            blocks,
+            edges: vec![],
+        };
+
+        // Entry env has setN bound as StateSetter for label 0.
+        let mut entry_env = AbstractEnv::bottom();
+        entry_env.bind_setter("setN".to_string(), 0);
+
+        let mut heap = Heap::new();
+        let (_, state_out) = analyze_cfg::<StateValueTransfer>(
+            &cfg,
+            entry_env,
+            &StateStore::bottom(),
+            &MemoStore::new(),
+            &StateValueTransfer,
+            3,
+            &mut heap,
+            &NullCtx,
+        );
+
+        // Before fix: state_out.get(0) = Bottom (setter call never executed).
+        // After fix:  state_out.get(0) = Number([99,99]).
+        assert_eq!(
+            state_out.get(0),
+            StateValue::Number(Interval::point(99.0)),
+            "setter in Return terminator must update state (concise-arrow regression)"
+        );
+    }
+
+    /// Block-body Return (Lit::Unit) is a no-op — no spurious state changes.
+    #[test]
+    fn unit_return_terminator_is_noop() {
+        let mut blocks = std::collections::HashMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![Stmt::Let {
+                    var: "setN".to_string(),
+                    rhs: Expr::StateSetter(0),
+                    span: None,
+                }],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let cfg = CFG {
+            entry: 0,
+            blocks,
+            edges: vec![],
+        };
+
+        let mut heap = Heap::new();
+        let (_, state_out) = analyze_cfg::<StateValueTransfer>(
+            &cfg,
+            AbstractEnv::bottom(),
+            &StateStore::bottom(),
+            &MemoStore::new(),
+            &StateValueTransfer,
+            3,
+            &mut heap,
+            &NullCtx,
+        );
+
+        // StateSetter in a Let stmt does NOT call the setter (only a Call does).
+        // Return(Lit(Unit)) must not cause any spurious state update.
+        assert_eq!(
+            state_out.get(0),
+            StateValue::Bottom,
+            "Return(Lit(Unit)) must be a no-op for state"
+        );
+    }
+
+    /// Setter call in Return with functional updater fires correctly.
+    /// Mirrors `() => setN(c => c + 1)` concise-arrow body.
+    #[test]
+    fn functional_updater_in_return_terminator_fires() {
+        use crate::ir::{cfg::Edge, types::ExprId};
+        use std::sync::Arc;
+
+        // FnLit body: Return(BinOp{StateVal(0), Add, Lit(1)})
+        let mut updater_blocks = std::collections::HashMap::new();
+        updater_blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![],
+                term: Terminator::Return(Expr::BinOp {
+                    op: crate::ir::expr::BinOp::Add,
+                    lhs: Box::new(Expr::StateVal(0)),
+                    rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                }),
+            },
+        );
+        let updater_cfg = Arc::new(CFG {
+            entry: 0,
+            blocks: updater_blocks,
+            edges: vec![],
+        });
+
+        // Handler body: Return(Call{Var("setN"), [FnLit{c => c+1}]})
+        let mut blocks = std::collections::HashMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::FnLit {
+                        id: ExprId(0),
+                        params: vec!["c".to_string()],
+                        body_cfg: updater_cfg,
+                    }],
+                }),
+            },
+        );
+        let cfg = CFG {
+            entry: 0,
+            blocks,
+            edges: vec![],
+        };
+
+        let mut entry_env = AbstractEnv::bottom();
+        entry_env.bind_setter("setN".to_string(), 0);
+
+        // Seed state[0] = Number([5,5]) so c+1 = 6.
+        let mut initial_state = StateStore::bottom();
+        initial_state.update(0, StateValue::Number(Interval::point(5.0)));
+
+        let mut heap = Heap::new();
+        let (_, state_out) = analyze_cfg::<StateValueTransfer>(
+            &cfg,
+            entry_env,
+            &initial_state,
+            &MemoStore::new(),
+            &StateValueTransfer,
+            3,
+            &mut heap,
+            &NullCtx,
+        );
+
+        // c=5, c+1=6 → state[0] = join(5, 6) = [5,6].
+        assert_eq!(
+            state_out.get(0),
+            StateValue::Number(Interval { lo: 5.0, hi: 6.0 }),
+            "functional updater in Return terminator must fire"
         );
     }
 }

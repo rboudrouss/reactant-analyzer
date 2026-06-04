@@ -11,12 +11,9 @@
 
 ## Infrastructure
 
-### Handlers JSX — limitations restantes *(ADR-009 migration, suite)*
+### Fix `analyze_cfg` pour les corps concis *(2026-06-04, résolu)*
 
-JSX `onX={fn}` handlers sont maintenant des points d'entrée de première classe (`HookEntry::Handler`, dans le fixpoint loop — ADR-009 §5). Reste :
-
-1. **`addEventListener` dans les effects** — lowering depuis `body_cfg` d'un effect vers `HookEntry::Handler` avec env au site d'appel (stale-closure-in-handler débloqué).
-2. **Politique `Subscription`** — flip `classify_callee::Subscription` → `analyze-as-entry-point` pour les callbacks passés à `addEventListener` inline dans un effect.
+`analyze_cfg` ne traitait pas les effets de bord de `Terminator::Return(expr)`. Les corps concis `() => setN(99)` placent l'appel dans le `Return`, pas dans les `stmts`. Corrigé : `exec_stmt(ExprStmt(return_expr))` ajouté après la boucle stmts dans `analyze_cfg`. Impact : handlers JSX concis et callbacks `addEventListener` mettent maintenant correctement à jour le `StateStore`.
 
 ### Diagnostic notes pour autres règles *(ADR-011)*
 

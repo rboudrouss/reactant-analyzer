@@ -1,10 +1,11 @@
 # ADR-009 : Traversée sémantique des callbacks — points d'entrée + classe de déclenchement
 
-- **Statut** : Accepté — implémenté (partiellement)
+- **Statut** : Accepté — implémenté (complet)
 - **Date** : 2026-06-02
 - **Mis à jour** : 2026-06-03 — étendu par [ADR-010](ADR-010-heap-model.md) (B5 callbacks par variable, B6 inlining appels locaux)
 - **Mis à jour** : 2026-06-03 — migration §1-3 implémentée : `HookEntry::Handler`, `extract_handlers` (lowering JSX `onX`), passes post-convergence dans `analyze_component`, `handler_block_states` + `handler_info` dans `AnalysisResult`. Étapes restantes : §4 `addEventListener` depuis effects, §5 multiplicité fixpoint.
 - **Mis à jour** : 2026-06-03 — §5 (multiplicité) implémenté : handlers dans le fixpoint loop, `state_from_handlers` joint dans `new_untyped_full` pour la convergence, `widened_labels` calculé depuis `state_from_render ⊔ state_from_effects` uniquement (pas les handlers). Reste : §4 `addEventListener`.
+- **Mis à jour** : 2026-06-04 — §4 implémenté : `extract_subscriptions` dans `src/lowering/hook_extractor.rs` scanne les `body_cfg` des `HookEntry::Effect` pour `addEventListener(str, FnLit)` et émet des `HookEntry::Handler`. Politique `Subscription` interpreter-side inchangée (le callback est analysé comme entry point séparé, pas inliné). ADR-009 entièrement implémenté.
 - **Mis à jour** : 2026-06-03 — back-edge bail levé : `exec_body` traverse le corps pour ses effets de bord même avec une boucle (les setters dans une boucle fire désormais) ; seule la valeur de retour est jointe à `Top`. FN « setter dans une boucle » résolu (cf. « Limites »).
 - **Contexte** : [ADR-008](ADR-008-value-domain.md) (domaine de valeurs / fixpoint), [ADR-004](ADR-004-component-structure.md) (render_cfg + effect_cfg), [ADR-005](ADR-005-analysis-scope.md) (scope intra-procédural)
 

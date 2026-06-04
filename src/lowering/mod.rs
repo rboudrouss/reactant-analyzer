@@ -6,7 +6,7 @@ pub mod hook_extractor;
 pub use crate::ir::{compute_line_starts, offset_to_range};
 pub use cfg_builder::build_cfg;
 pub use component_detector::{ComponentCandidate, detect_components};
-pub use hook_extractor::{extract_handlers, extract_hooks};
+pub use hook_extractor::{extract_handlers, extract_hooks, extract_subscriptions};
 
 use oxc_ast::ast::Program;
 
@@ -20,6 +20,7 @@ pub fn lower_program(program: &Program, line_starts: &[u32]) -> Vec<ComponentIR>
             let mut render_cfg = build_cfg(candidate.body, line_starts);
             let (mut hooks, mut next_label) = extract_hooks(&mut render_cfg);
             extract_handlers(&render_cfg, &mut hooks, &mut next_label);
+            extract_subscriptions(&mut hooks, &mut next_label);
             let params = expr_lower::lower_params(candidate.params);
             let param = params
                 .into_iter()

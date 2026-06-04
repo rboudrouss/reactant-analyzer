@@ -9,6 +9,114 @@ use crate::ir::{
     types::{BlockId, HookLabel},
 };
 
+// ── Subscription extraction (addEventListener in effect bodies) ───────────────
+
+/// Scan every `HookEntry::Effect` body_cfg for `addEventListener(str, FnLit)`
+/// calls and append a `HookEntry::Handler` for each one found.
+/// Labels continue from `*next_label`.
+///
+/// Only inline `FnLit` callbacks with a string-literal event name are lifted;
+/// variable callbacks or dynamic event names are skipped (acceptable FN).
+/// FnLit bodies are not recursed into — nested addEventListener is pathological.
+pub fn extract_subscriptions(hooks: &mut Vec<HookEntry>, next_label: &mut HookLabel) {
+    let n = hooks.len();
+    let mut new_handlers: Vec<HookEntry> = Vec::new();
+    for i in 0..n {
+        if let HookEntry::Effect { body_cfg, .. } = &hooks[i] {
+            collect_subscriptions_in_cfg(body_cfg, &mut new_handlers, next_label);
+        }
+    }
+    hooks.extend(new_handlers);
+}
+
+fn collect_subscriptions_in_cfg(cfg: &CFG, out: &mut Vec<HookEntry>, next_label: &mut HookLabel) {
+    let mut ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
+    ids.sort_unstable();
+    for id in ids {
+        let block = &cfg.blocks[&id];
+        for stmt in &block.stmts {
+            let (expr, span) = match stmt {
+                Stmt::Let { rhs, span, .. } => (rhs, *span),
+                Stmt::Assign { rhs, span, .. } => (rhs, *span),
+                Stmt::ExprStmt(e, span) => (e, *span),
+            };
+            collect_subscriptions_in_expr(expr, span, out, next_label);
+        }
+        // Terminator::Return not scanned — addEventListener is never a return expr.
+    }
+}
+
+fn collect_subscriptions_in_expr(
+    expr: &Expr,
+    stmt_span: Option<SourceRange>,
+    out: &mut Vec<HookEntry>,
+    next_label: &mut HookLabel,
+) {
+    match expr {
+        Expr::Call { fn_, args } => {
+            if let Expr::FieldAccess { field, .. } = fn_.as_ref() {
+                if field == "addEventListener" {
+                    if let (
+                        Some(Expr::Lit(Prim::String(event_name))),
+                        Some(Expr::FnLit { body_cfg, .. }),
+                    ) = (args.first(), args.get(1))
+                    {
+                        let label = *next_label;
+                        *next_label += 1;
+                        out.push(HookEntry::Handler {
+                            label,
+                            event: event_name.clone(),
+                            body_cfg: (**body_cfg).clone(),
+                            span: stmt_span,
+                        });
+                        // Recurse into callee receiver and remaining args (skip arg[1] FnLit body).
+                        collect_subscriptions_in_expr(fn_, stmt_span, out, next_label);
+                        for arg in args.iter().skip(2) {
+                            collect_subscriptions_in_expr(arg, stmt_span, out, next_label);
+                        }
+                        return;
+                    }
+                }
+            }
+            // Not an addEventListener match — recurse into all sub-expressions.
+            collect_subscriptions_in_expr(fn_, stmt_span, out, next_label);
+            for arg in args {
+                collect_subscriptions_in_expr(arg, stmt_span, out, next_label);
+            }
+        }
+        Expr::FieldAccess { obj, .. } => {
+            collect_subscriptions_in_expr(obj, stmt_span, out, next_label);
+        }
+        Expr::BinOp { lhs, rhs, .. } => {
+            collect_subscriptions_in_expr(lhs, stmt_span, out, next_label);
+            collect_subscriptions_in_expr(rhs, stmt_span, out, next_label);
+        }
+        Expr::UnaryOp { arg, .. } => {
+            collect_subscriptions_in_expr(arg, stmt_span, out, next_label);
+        }
+        Expr::IndexAccess { arr, idx } => {
+            collect_subscriptions_in_expr(arr, stmt_span, out, next_label);
+            collect_subscriptions_in_expr(idx, stmt_span, out, next_label);
+        }
+        Expr::ArrayLit { elems, .. } => {
+            for e in elems {
+                collect_subscriptions_in_expr(e, stmt_span, out, next_label);
+            }
+        }
+        Expr::ObjectLit { fields, .. } => {
+            for (_, v) in fields {
+                collect_subscriptions_in_expr(v, stmt_span, out, next_label);
+            }
+        }
+        Expr::TSAnnotated(inner, _) => {
+            collect_subscriptions_in_expr(inner, stmt_span, out, next_label);
+        }
+        // FnLit, Lit, Var, StateVal, StateSetter, MemoVal, CallbackVal, CompApp,
+        // NativeElem: leaf or irrelevant in an effect body.
+        _ => {}
+    }
+}
+
 // ── Handler extraction ────────────────────────────────────────────────────────
 
 /// Scan `cfg` for JSX `onX={fn}` event handler props and append each as
@@ -758,6 +866,146 @@ mod tests {
             .find(|h| matches!(h, HookEntry::Handler { .. }))
             .unwrap();
         assert!(matches!(handler, HookEntry::Handler { label: 1, .. }));
+    }
+
+    // ── extract_subscriptions ─────────────────────────────────────────────────
+
+    fn parse_and_extract_with_subscriptions(src: &str) -> (CFG, Vec<HookEntry>) {
+        let alloc = Allocator::default();
+        let ret = Parser::new(&alloc, src, SourceType::tsx())
+            .with_options(ParseOptions::default())
+            .parse();
+        assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
+        let mut cfg = ret
+            .program
+            .body
+            .iter()
+            .find_map(|s| match s {
+                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| build_cfg(b, &[])),
+                _ => None,
+            })
+            .expect("no function found");
+        let (mut hooks, mut next_label) = extract_hooks(&mut cfg);
+        extract_handlers(&cfg, &mut hooks, &mut next_label);
+        extract_subscriptions(&mut hooks, &mut next_label);
+        (cfg, hooks)
+    }
+
+    #[test]
+    fn addeventlistener_inline_fnlit_extracted() {
+        let (_, hooks) = parse_and_extract_with_subscriptions(
+            "function C() {
+                const [count, setCount] = useState(0);
+                useEffect(() => {
+                    document.addEventListener('click', () => setCount(count + 1));
+                }, [count]);
+                return <div/>;
+            }",
+        );
+        let handlers: Vec<_> = hooks
+            .iter()
+            .filter(|h| matches!(h, HookEntry::Handler { .. }))
+            .collect();
+        assert_eq!(handlers.len(), 1);
+        assert!(matches!(
+            handlers[0],
+            HookEntry::Handler { event, .. } if event == "click"
+        ));
+    }
+
+    #[test]
+    fn subscription_labels_continue_after_hooks() {
+        // useState=0, useEffect=1, subscription handler=2
+        let (_, hooks) = parse_and_extract_with_subscriptions(
+            "function C() {
+                const [n, setN] = useState(0);
+                useEffect(() => {
+                    window.addEventListener('resize', () => setN(1));
+                }, []);
+                return <div/>;
+            }",
+        );
+        let handler = hooks
+            .iter()
+            .find(|h| matches!(h, HookEntry::Handler { .. }))
+            .expect("no handler found");
+        assert!(matches!(handler, HookEntry::Handler { label: 2, event, .. } if event == "resize"));
+    }
+
+    #[test]
+    fn addeventlistener_var_event_not_extracted() {
+        // Dynamic event name (Var) → acceptable FN, no handler emitted.
+        let (_, hooks) = parse_and_extract_with_subscriptions(
+            "function C() {
+                useEffect(() => {
+                    document.addEventListener(eventName, () => {});
+                }, []);
+                return <div/>;
+            }",
+        );
+        assert!(
+            hooks
+                .iter()
+                .all(|h| !matches!(h, HookEntry::Handler { .. }))
+        );
+    }
+
+    #[test]
+    fn addeventlistener_var_callback_not_extracted() {
+        // Callback is a Var, not FnLit → acceptable FN, no handler emitted.
+        let (_, hooks) = parse_and_extract_with_subscriptions(
+            "function C() {
+                useEffect(() => {
+                    document.addEventListener('click', handler);
+                }, []);
+                return <div/>;
+            }",
+        );
+        assert!(
+            hooks
+                .iter()
+                .all(|h| !matches!(h, HookEntry::Handler { .. }))
+        );
+    }
+
+    #[test]
+    fn multiple_subscriptions_both_extracted() {
+        let (_, hooks) = parse_and_extract_with_subscriptions(
+            "function C() {
+                const [n, setN] = useState(0);
+                useEffect(() => {
+                    window.addEventListener('mousedown', () => setN(1));
+                    window.addEventListener('mouseup', () => setN(0));
+                }, []);
+                return <div/>;
+            }",
+        );
+        let handlers: Vec<_> = hooks
+            .iter()
+            .filter(|h| matches!(h, HookEntry::Handler { .. }))
+            .collect();
+        assert_eq!(handlers.len(), 2);
+    }
+
+    #[test]
+    fn nested_addeventlistener_in_callback_not_extracted() {
+        // addEventListener inside a FnLit body (setTimeout callback) → FnLit is a leaf,
+        // not recursed, so the inner addEventListener is not extracted.
+        let (_, hooks) = parse_and_extract_with_subscriptions(
+            "function C() {
+                useEffect(() => {
+                    setTimeout(() => {
+                        document.addEventListener('click', () => {});
+                    }, 100);
+                }, []);
+                return <div/>;
+            }",
+        );
+        assert!(
+            hooks
+                .iter()
+                .all(|h| !matches!(h, HookEntry::Handler { .. }))
+        );
     }
 
     // ── useReducer ────────────────────────────────────────────────────────────
