@@ -54,29 +54,27 @@ fn collect_subscriptions_in_expr(
 ) {
     match expr {
         Expr::Call { fn_, args } => {
-            if let Expr::FieldAccess { field, .. } = fn_.as_ref() {
-                if field == "addEventListener" {
-                    if let (
-                        Some(Expr::Lit(Prim::String(event_name))),
-                        Some(Expr::FnLit { body_cfg, .. }),
-                    ) = (args.first(), args.get(1))
-                    {
-                        let label = *next_label;
-                        *next_label += 1;
-                        out.push(HookEntry::Handler {
-                            label,
-                            event: event_name.clone(),
-                            body_cfg: (**body_cfg).clone(),
-                            span: stmt_span,
-                        });
-                        // Recurse into callee receiver and remaining args (skip arg[1] FnLit body).
-                        collect_subscriptions_in_expr(fn_, stmt_span, out, next_label);
-                        for arg in args.iter().skip(2) {
-                            collect_subscriptions_in_expr(arg, stmt_span, out, next_label);
-                        }
-                        return;
-                    }
+            if let Expr::FieldAccess { field, .. } = fn_.as_ref()
+                && field == "addEventListener"
+                && let (
+                    Some(Expr::Lit(Prim::String(event_name))),
+                    Some(Expr::FnLit { body_cfg, .. }),
+                ) = (args.first(), args.get(1))
+            {
+                let label = *next_label;
+                *next_label += 1;
+                out.push(HookEntry::Handler {
+                    label,
+                    event: event_name.clone(),
+                    body_cfg: (**body_cfg).clone(),
+                    span: stmt_span,
+                });
+                // Recurse into callee receiver and remaining args (skip arg[1] FnLit body).
+                collect_subscriptions_in_expr(fn_, stmt_span, out, next_label);
+                for arg in args.iter().skip(2) {
+                    collect_subscriptions_in_expr(arg, stmt_span, out, next_label);
                 }
+                return;
             }
             // Not an addEventListener match — recurse into all sub-expressions.
             collect_subscriptions_in_expr(fn_, stmt_span, out, next_label);
