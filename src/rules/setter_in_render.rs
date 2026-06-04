@@ -1,8 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    domains::StateValue,
-    engine::{AnalysisResult, ProgramAnalysisResult, dominates},
+    engine::{ProgramAnalysisResult, dominates},
     ir::{
         cfg::Terminator,
         expr::Expr,

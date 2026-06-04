@@ -245,3 +245,63 @@ export const Section15_Parent = () => {
     const [n, setN] = React.useState(5);
     return <Section15_Child total={n} />;
 };
+
+// ── SECTION 16: missing-deps on useCallback capturing unstable prop ───────────
+// Child's useCallback reads `data.x` but has empty deps. `data` is unstable
+// (Parent passes a useState({...}) → Reference(Unstable) reference).
+// MissingDeps must fire on Section16_Child for `data`.
+
+export const Section16_Child = ({ data }) => {
+    const cb = React.useCallback(() => data.x, []); // ❌ missing-deps: data
+    return <button onClick={cb}>x</button>;
+};
+
+export const Section16_Parent = () => {
+    const [data, setData] = React.useState({ x: 1 });
+    return <Section16_Child data={data} />;
+};
+
+// ── SECTION 17: missing-deps on useMemo — INTER-SPECIFIC FP suppression ───────
+// Child's useMemo reads `label.length` but doesn't declare `label`.
+// Parent passes a string literal → StrConst("hello"), Stability::Stable.
+// Intra analysis: label = Top → unstable-ish (Unknown via to_stability) → may fire.
+// Inter analysis: label = StrConst("hello") (stable) → MissingDeps suppressed.
+// Tests that the missing-deps extension to useMemo benefits from inter precision.
+
+export const Section17_Child = ({ label }) => {
+    const v = React.useMemo(() => label.length, []); // stable prop ⇒ no warning inter
+    return <p>{v}</p>;
+};
+
+export const Section17_Parent = () => {
+    return <Section17_Child label="hello" />;
+};
+
+// ── SECTION 18: always-unstable-deps — child's useEffect with unstable prop ──
+// Parent passes an inline object literal as `config` prop, child uses it as
+// the only dep. Inline ObjectLit → Reference(Unstable) propagated via inter.
+// AlwaysUnstableDeps must fire on Section18_Child: [config] is entirely unstable.
+
+export const Section18_Child = ({ config }) => {
+    React.useEffect(() => {
+        console.log(config);
+    }, [config]); // ❌ always-unstable-deps: config is Reference(Unstable)
+    return <div/>;
+};
+
+export const Section18_Parent = () => {
+    return <Section18_Child config={{ x: 1 }} />;
+};
+
+// ── SECTION 19: lazy-init in a child component ───────────────────────────────
+// Child uses `useState(expensive(seed))` — structural rule, fires regardless
+// of inter vs intra. Verifies the rule works on lowered children.
+
+export const Section19_Child = ({ seed }) => {
+    const [v, setV] = React.useState(expensive(seed)); // ❌ lazy-init
+    return <p>{v}</p>;
+};
+
+export const Section19_Parent = () => {
+    return <Section19_Child seed={42} />;
+};

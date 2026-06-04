@@ -225,19 +225,19 @@ fn exec_setter_call<T: Transfer>(
                     }
                     _ => None,
                 });
-        if let Some((component, label)) = comp_setter {
-            if ctx.inter.is_some() {
-                let arg_val = args
-                    .first()
-                    .map(|a| transfer.eval_expr(a, env, ctx))
-                    .and_then(|v| v.as_state_value())
-                    .unwrap_or(crate::domains::StateValue::Top);
-                if let Some(inter) = &ctx.inter {
-                    inter
-                        .shared_state
-                        .borrow_mut()
-                        .update(&component, label, arg_val);
-                }
+        if let Some((component, label)) = comp_setter
+            && ctx.inter.is_some()
+        {
+            let arg_val = args
+                .first()
+                .map(|a| transfer.eval_expr(a, env, ctx))
+                .and_then(|v| v.as_state_value())
+                .unwrap_or(crate::domains::StateValue::Top);
+            if let Some(inter) = &ctx.inter {
+                inter
+                    .shared_state
+                    .borrow_mut()
+                    .update(&component, label, arg_val);
             }
         }
     }

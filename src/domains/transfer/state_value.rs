@@ -8,7 +8,7 @@ use crate::{
         AbstractDomain, AnalysisCtx, QueryContext, Transfer,
         impls::{BoolVal, Interval, Stability, StateValue},
         interp::exec_stmt_with_callbacks,
-        stores::{AbstractEnv, EnvVal, Heap, HeapValue, MemoStore, StateStore},
+        stores::{AbstractEnv, EnvVal, HeapValue, MemoStore, StateStore},
     },
     ir::{
         expr::{BinOp, Expr, Prim, UnaryOp},
@@ -200,20 +200,20 @@ fn eval_field_access(
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> StateValue {
-    if let Expr::Var(v) = obj {
-        if let Some(EnvVal::Loc(ids)) = env.lookup_env_val(v) {
-            let ids: Vec<ExprId> = ids.iter().copied().collect();
-            let vals: Vec<StateValue> = ids
-                .iter()
-                .filter_map(|id| ctx.heap.get(*id))
-                .filter_map(|hv| match hv {
-                    HeapValue::Obj(fields) => fields.get(field).cloned(),
-                    _ => None,
-                })
-                .collect();
-            if !vals.is_empty() {
-                return vals.into_iter().reduce(|a, b| a.join(&b)).unwrap();
-            }
+    if let Expr::Var(v) = obj
+        && let Some(EnvVal::Loc(ids)) = env.lookup_env_val(v)
+    {
+        let ids: Vec<ExprId> = ids.iter().copied().collect();
+        let vals: Vec<StateValue> = ids
+            .iter()
+            .filter_map(|id| ctx.heap.get(*id))
+            .filter_map(|hv| match hv {
+                HeapValue::Obj(fields) => fields.get(field).cloned(),
+                _ => None,
+            })
+            .collect();
+        if !vals.is_empty() {
+            return vals.into_iter().reduce(|a, b| a.join(&b)).unwrap();
         }
     }
     StateValue::Top

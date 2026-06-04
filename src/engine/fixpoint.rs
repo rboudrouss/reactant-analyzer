@@ -556,34 +556,63 @@ fn collect_hook_labels_expr(expr: &Expr, out: &mut Vec<HookLabel>) {
     }
 }
 
-/// Build `EffectInfo` for each `useEffect` hook.
+/// Build `EffectInfo` for each `useEffect`, `useMemo`, and `useCallback` hook.
+///
+/// Memo/Callback bodies are also captured for dep-checking rules
+/// (missing-deps fires on the same closure-capture logic).
 fn collect_effect_info(hooks: &[HookEntry]) -> HashMap<HookLabel, EffectInfo> {
     hooks
         .iter()
-        .filter_map(|h| {
-            if let HookEntry::Effect {
+        .filter_map(|h| match h {
+            HookEntry::Effect {
                 label,
                 body_cfg,
                 deps,
                 span,
-            } = h
-            {
-                let free_vars = compute_free_vars(body_cfg);
-                let has_deps_array = deps.is_some();
-                let declared_deps = deps.clone().unwrap_or_default();
-                Some((
-                    *label,
-                    EffectInfo {
-                        label: *label,
-                        free_vars,
-                        declared_deps,
-                        has_deps_array,
-                        span: *span,
-                    },
-                ))
-            } else {
-                None
-            }
+            } => Some((
+                *label,
+                EffectInfo {
+                    label: *label,
+                    kind: HookKind::Effect,
+                    free_vars: compute_free_vars(body_cfg),
+                    has_deps_array: deps.is_some(),
+                    declared_deps: deps.clone().unwrap_or_default(),
+                    span: *span,
+                },
+            )),
+            HookEntry::Memo {
+                label,
+                body_cfg,
+                deps,
+                span,
+            } => Some((
+                *label,
+                EffectInfo {
+                    label: *label,
+                    kind: HookKind::Memo,
+                    free_vars: compute_free_vars(body_cfg),
+                    has_deps_array: true,
+                    declared_deps: deps.clone(),
+                    span: *span,
+                },
+            )),
+            HookEntry::Callback {
+                label,
+                body_cfg,
+                deps,
+                span,
+            } => Some((
+                *label,
+                EffectInfo {
+                    label: *label,
+                    kind: HookKind::Callback,
+                    free_vars: compute_free_vars(body_cfg),
+                    has_deps_array: true,
+                    declared_deps: deps.clone(),
+                    span: *span,
+                },
+            )),
+            _ => None,
         })
         .collect()
 }

@@ -1,8 +1,7 @@
 use std::collections::HashSet;
 
 use crate::{
-    domains::StateValue,
-    engine::{AnalysisResult, ProgramAnalysisResult},
+    engine::{HookKind, ProgramAnalysisResult},
     ir::{
         expr::Expr,
         types::{Symbol, Var},
@@ -11,8 +10,9 @@ use crate::{
 
 use super::{Diagnostic, Rule};
 
-/// Fires when a useEffect free variable is not listed in the deps array
-/// and is not stable (would cause stale-closure bugs).
+/// Fires when a `useEffect`, `useMemo`, or `useCallback` body captures a free
+/// variable that is not listed in the deps array and is not stable (stale-closure
+/// bug).
 pub struct MissingDeps;
 
 impl Rule for MissingDeps {
@@ -47,9 +47,12 @@ impl Rule for MissingDeps {
                     let mut d = Diagnostic::new(
                         "missing-deps",
                         format!(
-                            "variable `{}` is used in effect {} but not in its deps array \
+                            "variable `{}` is used in {} {} but not in its deps array \
                              (value: {:?})",
-                            var, label, val
+                            var,
+                            hook_kind_word(info.kind),
+                            label,
+                            val
                         ),
                     )
                     .with_label(*label)
@@ -63,6 +66,15 @@ impl Rule for MissingDeps {
         }
 
         diags
+    }
+}
+
+fn hook_kind_word(kind: HookKind) -> &'static str {
+    match kind {
+        HookKind::Effect => "effect",
+        HookKind::Memo => "memo",
+        HookKind::Callback => "callback",
+        _ => "hook",
     }
 }
 
@@ -88,7 +100,7 @@ mod tests {
             Stability, StateValue,
             stores::{AbstractEnv, MemoStore, StateStore},
         },
-        engine::{AnalysisResult, EffectInfo, ProgramAnalysisResult},
+        engine::{AnalysisResult, EffectInfo, HookKind, ProgramAnalysisResult},
         ir::{
             cfg::{BasicBlock, CFG, Terminator},
             expr::{Expr, Prim},
@@ -166,6 +178,7 @@ mod tests {
             0,
             EffectInfo {
                 label: 0,
+                kind: HookKind::Effect,
                 free_vars: HashSet::from(["n".to_string()]),
                 declared_deps: vec![Expr::Lit(Prim::Bool(true))],
                 has_deps_array: true,
@@ -191,6 +204,7 @@ mod tests {
             0,
             EffectInfo {
                 label: 0,
+                kind: HookKind::Effect,
                 free_vars: HashSet::from(["setN".to_string()]),
                 declared_deps: vec![Expr::Lit(Prim::Unit)],
                 has_deps_array: true,
@@ -218,6 +232,7 @@ mod tests {
             0,
             EffectInfo {
                 label: 0,
+                kind: HookKind::Effect,
                 free_vars: HashSet::from(["n".to_string()]),
                 declared_deps: vec![Expr::Var("n".to_string())],
                 has_deps_array: true,
@@ -246,6 +261,7 @@ mod tests {
             0,
             EffectInfo {
                 label: 0,
+                kind: HookKind::Effect,
                 free_vars: HashSet::from(["n".to_string()]),
                 declared_deps: vec![],
                 has_deps_array: false,
@@ -276,6 +292,7 @@ mod tests {
             0,
             EffectInfo {
                 label: 0,
+                kind: HookKind::Effect,
                 free_vars: HashSet::from(["n".to_string()]),
                 declared_deps: vec![],
                 has_deps_array: true,
@@ -305,6 +322,7 @@ mod tests {
             0,
             EffectInfo {
                 label: 0,
+                kind: HookKind::Effect,
                 free_vars: HashSet::from(["x".to_string()]),
                 declared_deps: vec![Expr::Lit(Prim::Unit)],
                 has_deps_array: true,
@@ -321,12 +339,103 @@ mod tests {
     }
 
     #[test]
+    fn callback_with_missing_unstable_dep_warns() {
+        // useCallback(() => doX(n), []) — n is captured, unstable, not declared.
+        let mut effect_info = HashMap::new();
+        effect_info.insert(
+            0,
+            EffectInfo {
+                label: 0,
+                kind: HookKind::Callback,
+                free_vars: HashSet::from(["n".to_string()]),
+                declared_deps: vec![],
+                has_deps_array: true,
+                span: None,
+            },
+        );
+        let mut block_states = HashMap::new();
+        block_states.insert(
+            0,
+            env_with(&[("n", StateValue::Reference(Stability::Unstable))]),
+        );
+
+        let result = make_result(block_states, effect_info, trivial_cfg());
+        let diags = MissingDeps.check(&prog(&result), &"C".to_string());
+        assert_eq!(diags.len(), 1);
+        assert!(
+            diags[0].message.contains("callback"),
+            "message should mention callback: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn memo_with_missing_unstable_dep_warns() {
+        // useMemo(() => compute(n), []) — n captured, unstable, not declared.
+        let mut effect_info = HashMap::new();
+        effect_info.insert(
+            0,
+            EffectInfo {
+                label: 0,
+                kind: HookKind::Memo,
+                free_vars: HashSet::from(["n".to_string()]),
+                declared_deps: vec![],
+                has_deps_array: true,
+                span: None,
+            },
+        );
+        let mut block_states = HashMap::new();
+        block_states.insert(
+            0,
+            env_with(&[("n", StateValue::Reference(Stability::Unstable))]),
+        );
+
+        let result = make_result(block_states, effect_info, trivial_cfg());
+        let diags = MissingDeps.check(&prog(&result), &"C".to_string());
+        assert_eq!(diags.len(), 1);
+        assert!(
+            diags[0].message.contains("memo"),
+            "message should mention memo: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn callback_with_declared_dep_no_warning() {
+        let mut effect_info = HashMap::new();
+        effect_info.insert(
+            0,
+            EffectInfo {
+                label: 0,
+                kind: HookKind::Callback,
+                free_vars: HashSet::from(["n".to_string()]),
+                declared_deps: vec![Expr::Var("n".to_string())],
+                has_deps_array: true,
+                span: None,
+            },
+        );
+        let mut block_states = HashMap::new();
+        block_states.insert(
+            0,
+            env_with(&[("n", StateValue::Reference(Stability::Unstable))]),
+        );
+
+        let result = make_result(block_states, effect_info, trivial_cfg());
+        assert!(
+            MissingDeps
+                .check(&prog(&result), &"C".to_string())
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn untracked_global_not_warned() {
         let mut effect_info = HashMap::new();
         effect_info.insert(
             0,
             EffectInfo {
                 label: 0,
+                kind: HookKind::Effect,
                 free_vars: HashSet::from(["fetch".to_string()]),
                 declared_deps: vec![Expr::Lit(Prim::Unit)],
                 has_deps_array: true,

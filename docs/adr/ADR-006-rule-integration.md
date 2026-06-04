@@ -25,8 +25,8 @@ struct AnalysisResult {
     // Localisation des hooks (pour hook conditionnel)
     hook_calls:     Vec<HookCall>,   // { label, kind, block_id, span }
 
-    // Infos effets (pour deps manquantes)
-    effect_info:    HashMap<HookLabel, EffectInfo>,  // free_vars + declared_deps
+    // Infos corps avec deps (useEffect, useMemo, useCallback)
+    effect_info:    HashMap<HookLabel, EffectInfo>,  // kind + free_vars + declared_deps
 
     // Métadonnée widening (pour infinite loop)
     widened_labels: HashSet<HookLabel>,
@@ -50,8 +50,13 @@ trait Rule: Send + Sync {
 | Règle | Données utilisées |
 |---|---|
 | Hook conditionnel | `hook_calls[i].block_id` + dominance sur `render_cfg` |
-| Deps manquantes | `effect_info[ℓ].free_vars` - `effect_info[ℓ].declared_deps` + stability |
+| Deps manquantes (`useEffect`/`useMemo`/`useCallback`) | `effect_info[ℓ].free_vars` - `effect_info[ℓ].declared_deps` + stability ; le champ `kind` distingue le message |
+| Deps entièrement instables | `effect_info[ℓ].declared_deps` évalué via `eval_expr` sur exit env ; fire si tous `is_unstable()` |
+| `useState` lazy init manquant | `hooks` — match `HookEntry::State { init: Expr::Call, .. }` (struct pur, pas de fixpoint) |
 | setState redondant | `state_store[ℓ]` vs args du setter dans `block_states` |
+| Re-render inutile | `state_store[ℓ]` init vs setter dans effect mount-only |
+| Setter en render | `block_states` + dominance sur `render_cfg` |
+| État dérivé | `hooks` + dominance sur `render_cfg` |
 | Boucle infinie | `widened_labels` + `effect_info[ℓ]` appelle setter de ℓ inconditionnellement |
 
 ### Exception : métadonnée de widening

@@ -1,6 +1,5 @@
 use crate::{
-    domains::StateValue,
-    engine::{AnalysisResult, ProgramAnalysisResult, dominates},
+    engine::{ProgramAnalysisResult, dominates},
     ir::{cfg::Terminator, types::Symbol},
 };
 

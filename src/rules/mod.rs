@@ -1,15 +1,19 @@
+pub mod always_unstable_deps;
 pub mod conditional_hook;
 pub mod derived_state;
 pub mod infinite_loop;
+pub mod lazy_init;
 pub mod missing_deps;
 pub mod redundant_set_state;
 pub mod setter_in_render;
 pub mod unnecessary_rerender;
 pub mod widening_info;
 
+pub use always_unstable_deps::AlwaysUnstableDeps;
 pub use conditional_hook::ConditionalHook;
 pub use derived_state::DerivedState;
 pub use infinite_loop::InfiniteLoop;
+pub use lazy_init::LazyInit;
 pub use missing_deps::MissingDeps;
 pub use redundant_set_state::RedundantSetState;
 pub use setter_in_render::SetterInRender;
@@ -20,8 +24,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::{
-    domains::StateValue,
-    engine::{AnalysisResult, ProgramAnalysisResult},
+    engine::ProgramAnalysisResult,
     ir::{
         SourceRange,
         cfg::{CFG, Terminator},
@@ -337,6 +340,8 @@ pub fn all_rules() -> Vec<Box<dyn Rule>> {
     vec![
         Box::new(ConditionalHook),
         Box::new(MissingDeps),
+        Box::new(AlwaysUnstableDeps),
+        Box::new(LazyInit),
         Box::new(RedundantSetState),
         Box::new(UnnecessaryRerender),
         Box::new(SetterInRender),

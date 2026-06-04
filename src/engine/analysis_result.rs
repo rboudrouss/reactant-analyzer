@@ -51,18 +51,22 @@ pub struct HandlerInfo {
     pub span: Option<SourceRange>,
 }
 
-/// Captured information about a useEffect hook for dep-checking rules.
+/// Captured information about a hook body with deps (useEffect, useMemo, useCallback)
+/// for dep-checking rules.
 #[derive(Debug, Clone)]
 pub struct EffectInfo {
     pub label: HookLabel,
-    /// Variables used in the effect body but not locally defined within it.
+    /// Which hook this info came from (Effect / Memo / Callback).
+    pub kind: HookKind,
+    /// Variables used in the body but not locally defined within it.
     pub free_vars: HashSet<Var>,
     /// Deps array as declared by the caller (`[]` = empty, `None` = absent).
     pub declared_deps: Vec<Expr>,
     /// `true` when caller wrote an explicit deps array (even `[]`).
     /// `false` when no deps argument was passed (`deps: None`).
+    /// Always `true` for Memo/Callback (their deps array is mandatory).
     pub has_deps_array: bool,
-    /// Source location of the `useEffect(...)` call site, if available.
+    /// Source location of the hook call site, if available.
     pub span: Option<SourceRange>,
 }
 

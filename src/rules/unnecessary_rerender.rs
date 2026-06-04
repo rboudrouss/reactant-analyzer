@@ -4,7 +4,7 @@ use crate::{
     domains::{
         AbstractEnv, AnalysisCtx, MemoStore, StateStore, StateValue, StateValueTransfer, Transfer,
     },
-    engine::{AnalysisResult, ProgramAnalysisResult},
+    engine::ProgramAnalysisResult,
     ir::{
         expr::Expr,
         hooks::HookEntry,

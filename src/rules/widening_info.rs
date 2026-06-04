@@ -1,8 +1,4 @@
-use crate::{
-    domains::StateValue,
-    engine::{AnalysisResult, ProgramAnalysisResult},
-    ir::types::Symbol,
-};
+use crate::{engine::ProgramAnalysisResult, ir::types::Symbol};
 
 use super::{Diagnostic, Rule, Severity};
 

@@ -1,30 +1,5 @@
 # TODO — améliorations futures
 
-## Nouvelles règles
-
-### `missing-deps` pour `useCallback` et `useMemo`
-
-Même logique que `missing-deps` existant, appliquée aux `HookEntry::Callback` et `HookEntry::Memo`. Étendre `collect_effect_info`.
-
-### `always-unstable-deps`
-
-```js
-useEffect(() => { doX() }, [{}])       // {} = Reference(Unstable) chaque render
-useEffect(() => { doX() }, [someObj])  // someObj = Reference(Unstable)
-```
-
-Toutes les deps évaluées à `is_unstable()` → effect tourne chaque render. Détection : `eval_expr` sur chaque dep, vérifier `is_unstable()`.
-
-### `useState-lazy-init`
-
-```js
-const [data, setData] = useState(expensiveCompute())  // recalculé chaque render
-```
-
-`HookEntry::State { init: Expr::Call { .. } }` → warn. Règle structurelle pure, pas de fixpoint.
-
----
-
 ## Limites d'analyse connues
 
 - **Valeurs loop-carried dans callback** — `exec_body` traverse le corps même avec une back-edge mais ne widen pas → `setX(arr[i])` enregistre valeur partielle. FN mineur sur la *valeur*, jamais de FP. *(ADR-009)*
@@ -33,3 +8,5 @@ const [data, setData] = useState(expensiveCompute())  // recalculé chaque rende
 - **`derived-state` corps conditionnels** — détection linéaire uniquement (≤2 blocs). Effet avec branches conditionnelles → FN conservatif.
 - **Analyse inter-composants** — implémentée (ADR-012). Limites acceptées : résolution d'imports hors scope, composants dynamiques (`const C = cond ? A : B`) non tracés, plugin système (Next.js/TanStack) futur.
 - **`useState(null)` sans annotation TypeScript** — init Null sans type hint → `StateType::Unknown` → `join(Null, Number) = Top` → convergence immédiate → FN possible sur boucles. Atténué : `useState<number>(null)` détecté via le hint TS (voir ADR-008). Pattern non annoté reste un FN accepté.
+- **`useState({...})` retourne `Reference(Unstable)`** — l'analyseur ne distingue pas la première création de l'objet (mount) de sa réutilisation cross-render (cached). Conséquence : `[obj]` dans un deps array passe pour entièrement instable et peut déclencher `always-unstable-deps`. Conservatif acceptable.
+- **`lazy-init` top-level uniquement** — détecte `useState(call())` mais pas `useState(1 + call())` (call imbriqué). Évite des FP sur `useState(a + 1)` si un futur `+` devenait un call. FN accepté.

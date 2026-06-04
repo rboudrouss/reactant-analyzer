@@ -847,6 +847,103 @@ fn derived_state_fires_on_child_mirroring_parent_state() {
     }
 }
 
+// ── Section 16: missing-deps fires on useCallback in child ────────────────────
+
+#[test]
+fn missing_deps_fires_on_callback_in_child() {
+    use reactant::rules::{MissingDeps, Rule};
+
+    let src = std::fs::read_to_string("tests/fixtures/inter_component.tsx")
+        .expect("inter_component.tsx not found");
+    let result = parse_and_analyze(&src);
+
+    // Section16_Child has useCallback(() => data.x, []) capturing unstable data.
+    let child_name = "Section16_Child".to_string();
+    if result.components.contains_key(&child_name) {
+        let diags = MissingDeps.check(&result, &child_name);
+        assert!(
+            diags.iter().any(|d| d.var.as_deref() == Some("data")),
+            "MissingDeps should fire on Section16_Child for `data` in useCallback. \
+             Got diags: {:?}",
+            diags
+                .iter()
+                .map(|d| (&d.var, &d.message))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+// ── Section 17: missing-deps SUPPRESSED for useMemo with stable string prop ───
+// INTER-SPECIFIC FP suppression: intra would treat `label` as Top → fires;
+// inter knows `label` = StrConst("hello") → stable → no warning.
+
+#[test]
+fn missing_deps_no_fire_on_memo_with_stable_string_prop_inter() {
+    use reactant::rules::{MissingDeps, Rule};
+
+    let src = std::fs::read_to_string("tests/fixtures/inter_component.tsx")
+        .expect("inter_component.tsx not found");
+    let result_inter = parse_and_analyze(&src);
+
+    let child_name = "Section17_Child".to_string();
+    if result_inter.components.contains_key(&child_name) {
+        let diags = MissingDeps.check(&result_inter, &child_name);
+        let fp_inter: Vec<_> = diags
+            .iter()
+            .filter(|d| d.var.as_deref() == Some("label"))
+            .collect();
+        assert!(
+            fp_inter.is_empty(),
+            "Inter analysis: `label` resolved to StrConst(\"hello\") (stable) — \
+             MissingDeps must not fire on useMemo body."
+        );
+    }
+}
+
+// ── Section 18: always-unstable-deps fires on child with inline-object prop ───
+
+#[test]
+fn always_unstable_deps_fires_on_child_inline_object_prop() {
+    use reactant::rules::{AlwaysUnstableDeps, Rule};
+
+    let src = std::fs::read_to_string("tests/fixtures/inter_component.tsx")
+        .expect("inter_component.tsx not found");
+    let result = parse_and_analyze(&src);
+
+    // Section18_Child uses [config], where config is an inline {x:1} from the parent.
+    // Inline ObjectLit → Reference(Unstable) propagated via inter → fires.
+    let child_name = "Section18_Child".to_string();
+    if result.components.contains_key(&child_name) {
+        let diags = AlwaysUnstableDeps.check(&result, &child_name);
+        assert!(
+            !diags.is_empty(),
+            "AlwaysUnstableDeps should fire on Section18_Child: \
+             [config] is an inline-object prop → Reference(Unstable)."
+        );
+    }
+}
+
+// ── Section 19: lazy-init fires on child with direct-call init ────────────────
+
+#[test]
+fn lazy_init_fires_on_child_state() {
+    use reactant::rules::{LazyInit, Rule};
+
+    let src = std::fs::read_to_string("tests/fixtures/inter_component.tsx")
+        .expect("inter_component.tsx not found");
+    let result = parse_and_analyze(&src);
+
+    // Section19_Child has useState(expensive(seed)) → structural Expr::Call init.
+    let child_name = "Section19_Child".to_string();
+    if result.components.contains_key(&child_name) {
+        let diags = LazyInit.check(&result, &child_name);
+        assert!(
+            !diags.is_empty(),
+            "LazyInit should fire on Section19_Child: useState init is Expr::Call."
+        );
+    }
+}
+
 /// Verifies the inter-specific FALSE POSITIVE SUPPRESSION for MissingDeps.
 /// Intra analysis: onUpdate = Top → not stable → missing_deps FIRES (FP).
 /// Inter analysis: onUpdate = ComponentSetter (stable) → missing_deps SUPPRESSED (correct).
