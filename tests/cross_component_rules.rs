@@ -293,3 +293,63 @@ fn neither_rule_fires_on_clean_component() {
         );
     }
 }
+
+// ── analysis-limit Info diagnostics ──────────────────────────────────────────
+
+use reactant::rules::AnalysisLimitInfo;
+
+/// An unknown component (not in registry) referenced from a parent emits Info.
+#[test]
+fn unknown_component_emits_info() {
+    // Parent references `Unknown` which is not in the source → not in registry.
+    let src = r#"
+        import React, { useState } from 'react';
+        function Parent() {
+            const [n, setN] = useState(0);
+            return <Unknown value={n} />;
+        }
+    "#;
+    let result = parse_and_analyze(src);
+    let diags = AnalysisLimitInfo.check(&result, &"Parent".to_string());
+    assert!(
+        diags.iter().any(|d| d.message.contains("Unknown")),
+        "should emit Info for missing component `Unknown`, got: {:?}",
+        diags
+    );
+    assert!(
+        diags.iter().all(|d| d.severity == Severity::Info),
+        "all analysis-limit diags must be Info"
+    );
+}
+
+/// A recursive component reference emits Info on the parent that first inlines it.
+///
+/// `Heuristic` root detection: `Tree` appears as a callee so it is NOT a root.
+/// `App` is the root → top-down analysis inlines `Tree`, which then references
+/// itself → recursion guard fires → Info recorded on `Tree` (the caller at that point).
+#[test]
+fn recursive_component_emits_info() {
+    let src = r#"
+        import React, { useState } from 'react';
+        function App() {
+            return <Tree depth={5} />;
+        }
+        function Tree({ depth }) {
+            const [open, setOpen] = useState(false);
+            return <Tree depth={depth - 1} />;
+        }
+    "#;
+    let result = parse_and_analyze(src);
+    // The recursion fires while analyzing Tree (it calls itself).
+    // Stats record (caller="Tree", callee="Tree").
+    let diags = AnalysisLimitInfo.check(&result, &"Tree".to_string());
+    assert!(
+        diags.iter().any(|d| d.message.contains("Tree")),
+        "should emit Info for recursive cutoff of `Tree`, got: {:?}",
+        diags
+    );
+    assert!(
+        diags.iter().all(|d| d.severity == Severity::Info),
+        "all analysis-limit diags must be Info"
+    );
+}

@@ -18,7 +18,7 @@ use crate::{
 use super::callbacks::{TriggerClass, classify_callee};
 use super::cfg::topo_sort;
 
-pub(crate) const MAX_INLINE_DEPTH: usize = 3;
+pub const MAX_INLINE_DEPTH: usize = 3;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -375,6 +375,13 @@ fn exec_callbacks_depth<T: Transfer>(
     depth: usize,
 ) {
     if depth >= MAX_INLINE_DEPTH {
+        if let Some(inter) = ctx.inter {
+            inter
+                .stats
+                .borrow_mut()
+                .callback_depth_capped
+                .insert(inter.component_name.clone());
+        }
         return;
     }
     match expr {

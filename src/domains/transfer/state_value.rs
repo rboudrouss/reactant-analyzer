@@ -145,12 +145,21 @@ fn eval_comp_app(
 
     // Recursion guard
     if inter.is_recursive(name) {
-        inter.stats.borrow_mut().recursion_cutoffs += 1;
+        let mut stats = inter.stats.borrow_mut();
+        stats.recursion_cutoffs += 1;
+        stats
+            .recursive_component_refs
+            .insert((inter.component_name.clone(), name.clone()));
         return StateValue::Reference(Stability::Stable);
     }
 
     // Registry lookup
     let Some(child_ir) = inter.registry.get(name).cloned() else {
+        inter
+            .stats
+            .borrow_mut()
+            .unknown_component_refs
+            .insert((inter.component_name.clone(), name.clone()));
         return StateValue::Reference(Stability::Stable);
     };
 

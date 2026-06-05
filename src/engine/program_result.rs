@@ -6,6 +6,8 @@ use crate::{
     ir::{source_range::SourceRange, types::Symbol},
 };
 
+pub type SymbolPair = (Symbol, Symbol);
+
 /// Program-level analysis result spanning all components.
 /// Rules receive `&ProgramAnalysisResult` and access per-component data via `components`.
 #[derive(Debug)]
@@ -62,4 +64,10 @@ pub struct AnalysisStats {
     pub recursion_cutoffs: usize,
     /// Number of components analyzed (including re-analyses due to fixpoint).
     pub components_analyzed: usize,
+    /// (caller, callee) pairs where a recursive component reference was cut to ⊤.
+    pub recursive_component_refs: HashSet<SymbolPair>,
+    /// (caller, callee) pairs where the callee was not found in the registry.
+    pub unknown_component_refs: HashSet<SymbolPair>,
+    /// Components whose callback traversal hit the inline depth cap.
+    pub callback_depth_capped: HashSet<Symbol>,
 }

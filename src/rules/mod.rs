@@ -1,4 +1,5 @@
 pub mod always_unstable_deps;
+pub mod analysis_limit_info;
 pub mod conditional_hook;
 pub mod derived_state;
 pub mod infinite_loop;
@@ -10,6 +11,7 @@ pub mod unnecessary_rerender;
 pub mod widening_info;
 
 pub use always_unstable_deps::AlwaysUnstableDeps;
+pub use analysis_limit_info::AnalysisLimitInfo;
 pub use conditional_hook::ConditionalHook;
 pub use derived_state::DerivedState;
 pub use infinite_loop::InfiniteLoop;
@@ -446,5 +448,6 @@ pub fn all_rules() -> Vec<Box<dyn Rule>> {
         Box::new(InfiniteLoop),
         Box::new(DerivedState),
         Box::new(WideningInfo),
+        Box::new(AnalysisLimitInfo),
     ]
 }

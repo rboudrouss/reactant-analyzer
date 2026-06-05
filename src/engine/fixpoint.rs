@@ -399,12 +399,19 @@ pub fn analyze_program(
         }
     }
 
+    let final_stats = stats.into_inner();
+    let recursive_components = final_stats
+        .recursive_component_refs
+        .iter()
+        .map(|(_, callee)| callee.clone())
+        .collect();
+
     ProgramAnalysisResult {
         components: results.into_inner(),
         shared_state: shared_state.into_inner(),
         call_graph: call_graph.into_inner(),
-        recursive_components: std::collections::HashSet::new(),
-        stats: stats.into_inner(),
+        recursive_components,
+        stats: final_stats,
     }
 }
 
