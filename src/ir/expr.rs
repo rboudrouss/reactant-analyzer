@@ -118,6 +118,23 @@ pub enum Expr {
     StateSetter(HookLabel),
     MemoVal(HookLabel),
     CallbackVal(HookLabel),
+
+    /// Injected by `expand_custom_hooks` for library hooks with a `HookSummary`.
+    /// Evaluates directly to the encoded abstract value without going through the
+    /// concrete expression language (avoids a circular dep between `ir` and `domains`).
+    SummaryVal(SummaryValue),
+}
+
+/// Coarse abstract return-value hint for library hooks.
+/// Lives in `ir` to avoid a circular dependency between `ir` and `domains`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SummaryValue {
+    /// ⊤ — completely unknown; default for hooks without a precise summary.
+    Top,
+    /// Hook returns a reference-stable value (safe as a `useEffect` dep).
+    StableRef,
+    /// Hook returns a reference-unstable value (new object/array every render).
+    UnstableRef,
 }
 
 impl Expr {
@@ -142,6 +159,7 @@ impl Expr {
             Expr::BinOp { lhs, rhs, .. } => lhs.is_call_free() && rhs.is_call_free(),
             Expr::UnaryOp { arg, .. } => arg.is_call_free(),
             Expr::TSAnnotated(inner, _) => inner.is_call_free(),
+            Expr::SummaryVal(_) => true,
         }
     }
 }

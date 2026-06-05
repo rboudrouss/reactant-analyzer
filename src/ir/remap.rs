@@ -87,7 +87,7 @@ pub fn remap_expr(expr: Expr, offset: HookLabel) -> Expr {
         Expr::TSAnnotated(inner, ts) => Expr::TSAnnotated(Box::new(remap_expr(*inner, offset)), ts),
 
         // Leaves with no HookLabel or sub-Expr.
-        leaf @ (Expr::Lit(_) | Expr::Var(_)) => leaf,
+        leaf @ (Expr::Lit(_) | Expr::Var(_) | Expr::SummaryVal(_)) => leaf,
     }
 }
 

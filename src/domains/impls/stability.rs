@@ -1,6 +1,9 @@
 use std::cmp::Ordering;
 
-use crate::{domains::AbstractDomain, ir::expr::Expr};
+use crate::{
+    domains::AbstractDomain,
+    ir::expr::{Expr, SummaryValue},
+};
 
 /// Stability lattice — tracks whether a value's reference is stable across renders.
 ///
@@ -99,6 +102,9 @@ impl Stability {
             Expr::ArrayLit { .. } => Stability::Unstable,
             Expr::FnLit { .. } => Stability::Unstable,
             Expr::StateSetter(_) => Stability::Stable,
+            Expr::SummaryVal(SummaryValue::StableRef) => Stability::Stable,
+            Expr::SummaryVal(SummaryValue::UnstableRef) => Stability::Unstable,
+            Expr::SummaryVal(SummaryValue::Top) => Stability::Unknown,
             _ => Stability::Unknown,
         }
     }

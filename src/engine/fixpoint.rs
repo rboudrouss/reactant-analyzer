@@ -10,7 +10,7 @@ use crate::{
     ir::{
         cfg::CFG,
         component::ComponentIR,
-        expr::{Expr, TSType},
+        expr::{Expr, SummaryValue, TSType},
         free_vars::compute_free_vars,
         hooks::HookEntry,
         stmt::Stmt,
@@ -477,8 +477,28 @@ fn expand_custom_hooks(
             // Not in HookRegistry — check SummaryRegistry as fallback.
             // Known library hooks (TanStack, React Router, etc.) are removed from the
             // hooks vec so they don't generate opaque Custom diagnostics.
-            // The render_cfg binding stays as Lit(Unit) — sound conservative FN.
-            if inter.config.summary_registry.contains(&name) {
+            // Call summarize() to get the abstract return value and patch the
+            // render_cfg binding so the fixpoint sees the right abstraction.
+            if let Some(summary) = inter.config.summary_registry.get(&name) {
+                let sv = summary.summarize(&[]);
+                let summary_val = state_value_to_summary_value(sv);
+                if let HookEntry::Custom {
+                    binding: Some(ref bind_var),
+                    ..
+                } = hooks[i]
+                {
+                    let bind_var = bind_var.clone();
+                    if let Some(entry) = render_cfg.blocks.get_mut(&render_cfg.entry) {
+                        for stmt in &mut entry.stmts {
+                            if let Stmt::Let { var, rhs, .. } = stmt {
+                                if *var == bind_var {
+                                    *rhs = Expr::SummaryVal(summary_val);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
                 hooks.remove(i);
                 // Don't increment i — it now points to the next entry.
                 continue;
@@ -556,6 +576,18 @@ fn expand_custom_hooks(
             hooks.insert(i + j, h);
         }
         // Don't increment i — re-examine position i (first inlined entry, may itself be Custom).
+    }
+}
+
+/// Map a `StateValue` returned by `HookSummary::summarize` to the coarse `SummaryValue`
+/// enum that lives in `ir` (no circular dep).  Only three distinctions matter for rules:
+/// stable reference, unstable reference, or unknown (⊤).
+fn state_value_to_summary_value(v: StateValue) -> SummaryValue {
+    use crate::domains::impls::Stability;
+    match v {
+        StateValue::Reference(Stability::Stable) => SummaryValue::StableRef,
+        StateValue::Reference(Stability::Unstable) => SummaryValue::UnstableRef,
+        _ => SummaryValue::Top,
     }
 }
 

@@ -129,6 +129,14 @@ fn eval_state_value(
         Expr::IndexAccess { .. } => StateValue::Top,
 
         Expr::TSAnnotated(inner, _) => eval_state_value(inner, env, ctx),
+
+        Expr::SummaryVal(sv) => match sv {
+            crate::ir::expr::SummaryValue::Top => StateValue::Top,
+            crate::ir::expr::SummaryValue::StableRef => StateValue::Reference(Stability::Stable),
+            crate::ir::expr::SummaryValue::UnstableRef => {
+                StateValue::Reference(Stability::Unstable)
+            }
+        },
     }
 }
 
