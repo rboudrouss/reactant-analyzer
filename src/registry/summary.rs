@@ -39,8 +39,22 @@ pub trait HookSummary: Send + Sync {
 
 // ── SummaryRegistry ───────────────────────────────────────────────────────────
 
+/// Key: `(package, hook_name)`.  `package = None` for unscoped registrations
+/// that match any import source (or hooks defined locally).
+type SummaryKey = (Option<String>, String);
+
+/// Registry mapping library hooks to their abstract summaries.
+///
+/// Lookup is import-source-aware: a hook imported from `@tanstack/react-query`
+/// only matches summaries registered for that exact package, preventing
+/// accidental shadowing when a user defines their own `useQuery`.
+///
+/// # Lookup order
+///
+/// 1. `(Some(import_source), name)` — exact package match.
+/// 2. `(None, name)` — unscoped fallback (matches any import source or none).
 pub struct SummaryRegistry {
-    summaries: HashMap<String, Box<dyn HookSummary>>,
+    summaries: HashMap<SummaryKey, Box<dyn HookSummary>>,
 }
 
 impl SummaryRegistry {
@@ -50,30 +64,55 @@ impl SummaryRegistry {
         }
     }
 
-    /// Pre-populate with common TanStack Query and React Router hooks.
+    /// Pre-populate with common TanStack Query and React Router hooks,
+    /// scoped to their respective NPM packages so they only match hooks
+    /// that were actually imported from those packages.
     pub fn new_with_common() -> Self {
         let mut r = Self::new();
-        r.register_many(TANSTACK_HOOKS);
-        r.register_many(REACT_ROUTER_HOOKS);
+        r.register_many_for_package("@tanstack/react-query", TANSTACK_HOOKS);
+        r.register_many_for_package("react-router-dom", REACT_ROUTER_HOOKS);
+        r.register_many_for_package("react-router", REACT_ROUTER_HOOKS);
         r
     }
 
+    /// Register a hook summary scoped to a specific NPM package.
+    /// Only matches hooks whose import source equals `package`.
+    pub fn register_for_package(&mut self, package: impl Into<String>, s: Box<dyn HookSummary>) {
+        let key = (Some(package.into()), s.name().to_string());
+        self.summaries.insert(key, s);
+    }
+
+    /// Register an unscoped hook summary that matches any import source (or none).
+    /// Use for hooks defined locally or when the source package is unknown.
     pub fn register(&mut self, s: Box<dyn HookSummary>) {
-        self.summaries.insert(s.name().to_string(), s);
+        let key = (None, s.name().to_string());
+        self.summaries.insert(key, s);
     }
 
-    pub fn get(&self, name: &str) -> Option<&dyn HookSummary> {
-        self.summaries.get(name).map(|s| s.as_ref())
+    /// Look up a summary for `name` imported from `import_source`.
+    /// Tries the scoped entry first, then the unscoped fallback.
+    pub fn get(&self, name: &str, import_source: Option<&str>) -> Option<&dyn HookSummary> {
+        if let Some(src) = import_source {
+            let scoped: SummaryKey = (Some(src.to_string()), name.to_string());
+            if let Some(s) = self.summaries.get(&scoped) {
+                return Some(s.as_ref());
+            }
+        }
+        let unscoped: SummaryKey = (None, name.to_string());
+        self.summaries.get(&unscoped).map(|s| s.as_ref())
     }
 
-    pub fn contains(&self, name: &str) -> bool {
-        self.summaries.contains_key(name)
+    /// Returns `true` if a summary exists for `name` / `import_source` (same lookup order as `get`).
+    pub fn contains(&self, name: &str, import_source: Option<&str>) -> bool {
+        self.get(name, import_source).is_some()
     }
 
-    fn register_many(&mut self, names: &[&'static str]) {
+    fn register_many_for_package(&mut self, package: &'static str, names: &[&'static str]) {
         for &name in names {
-            self.summaries
-                .insert(name.to_string(), Box::new(TopSummary(name)));
+            self.summaries.insert(
+                (Some(package.to_string()), name.to_string()),
+                Box::new(TopSummary(name)),
+            );
         }
     }
 }
@@ -149,12 +188,12 @@ mod tests {
     #[test]
     fn empty_registry_contains_nothing() {
         let r = SummaryRegistry::new();
-        assert!(!r.contains("useQuery"));
-        assert!(r.get("useQuery").is_none());
+        assert!(!r.contains("useQuery", None));
+        assert!(r.get("useQuery", None).is_none());
     }
 
     #[test]
-    fn register_and_get() {
+    fn register_unscoped_and_get() {
         struct Fixed;
         impl HookSummary for Fixed {
             fn name(&self) -> &str {
@@ -166,16 +205,63 @@ mod tests {
         }
         let mut r = SummaryRegistry::new();
         r.register(Box::new(Fixed));
-        assert!(r.contains("useFixed"));
-        let s = r.get("useFixed").unwrap();
+        // Unscoped entry matches any import source.
+        assert!(r.contains("useFixed", None));
+        assert!(r.contains("useFixed", Some("some-package")));
+        let s = r.get("useFixed", None).unwrap();
         assert_eq!(s.summarize(&[]), StateValue::Null);
+    }
+
+    #[test]
+    fn register_for_package_only_matches_that_package() {
+        struct Fixed;
+        impl HookSummary for Fixed {
+            fn name(&self) -> &str {
+                "useData"
+            }
+        }
+        let mut r = SummaryRegistry::new();
+        r.register_for_package("my-lib", Box::new(Fixed));
+        assert!(r.contains("useData", Some("my-lib")));
+        assert!(!r.contains("useData", Some("other-lib")));
+        assert!(!r.contains("useData", None));
+    }
+
+    #[test]
+    fn scoped_takes_priority_over_unscoped() {
+        struct Scoped;
+        impl HookSummary for Scoped {
+            fn name(&self) -> &str {
+                "useX"
+            }
+            fn summarize(&self, _: &[StateValue]) -> StateValue {
+                StateValue::Null
+            }
+        }
+        struct Unscoped;
+        impl HookSummary for Unscoped {
+            fn name(&self) -> &str {
+                "useX"
+            }
+            fn summarize(&self, _: &[StateValue]) -> StateValue {
+                StateValue::Top
+            }
+        }
+        let mut r = SummaryRegistry::new();
+        r.register_for_package("pkg", Box::new(Scoped));
+        r.register(Box::new(Unscoped));
+        assert_eq!(
+            r.get("useX", Some("pkg")).unwrap().summarize(&[]),
+            StateValue::Null
+        );
+        assert_eq!(r.get("useX", None).unwrap().summarize(&[]), StateValue::Top);
     }
 
     #[test]
     fn default_summarize_returns_top() {
         let mut r = SummaryRegistry::new();
-        r.register_many(&["useTopHook"]);
-        let s = r.get("useTopHook").unwrap();
+        r.register_many_for_package("my-pkg", &["useTopHook"]);
+        let s = r.get("useTopHook", Some("my-pkg")).unwrap();
         assert_eq!(s.summarize(&[]), StateValue::Top);
     }
 
@@ -188,7 +274,15 @@ mod tests {
             "useInfiniteQuery",
             "useQueryClient",
         ] {
-            assert!(r.contains(name), "missing TanStack hook: {name}");
+            assert!(
+                r.contains(name, Some("@tanstack/react-query")),
+                "missing TanStack hook: {name}"
+            );
+            // Must NOT match without correct package.
+            assert!(
+                !r.contains(name, Some("something-else")),
+                "should not match wrong package: {name}"
+            );
         }
     }
 
@@ -196,13 +290,18 @@ mod tests {
     fn common_router_hooks_registered() {
         let r = SummaryRegistry::new_with_common();
         for name in ["useNavigate", "useParams", "useLocation", "useSearchParams"] {
-            assert!(r.contains(name), "missing React Router hook: {name}");
+            assert!(
+                r.contains(name, Some("react-router-dom"))
+                    || r.contains(name, Some("react-router")),
+                "missing React Router hook: {name}"
+            );
         }
     }
 
     #[test]
     fn unknown_hook_not_in_common() {
         let r = SummaryRegistry::new_with_common();
-        assert!(!r.contains("useMyCustomHook"));
+        assert!(!r.contains("useMyCustomHook", None));
+        assert!(!r.contains("useMyCustomHook", Some("@tanstack/react-query")));
     }
 }

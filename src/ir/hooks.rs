@@ -43,6 +43,10 @@ pub enum HookEntry {
         deps: Option<Vec<Expr>>,
         /// Variable in the caller's render CFG that receives the hook's return value.
         binding: Option<Var>,
+        /// NPM package the hook was imported from, if determinable at parse time.
+        /// E.g. `"@tanstack/react-query"` for `import { useQuery } from '@tanstack/react-query'`.
+        /// `None` when the hook is defined locally or the import source is unknown.
+        import_source: Option<String>,
         span: Option<SourceRange>,
     },
     Handler {

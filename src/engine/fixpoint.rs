@@ -459,8 +459,13 @@ fn expand_custom_hooks(
 
     let mut i = 0;
     while i < hooks.len() {
-        let (name, call_args) = match &hooks[i] {
-            HookEntry::Custom { name, args, .. } => (name.clone(), args.clone()),
+        let (name, call_args, import_source) = match &hooks[i] {
+            HookEntry::Custom {
+                name,
+                args,
+                import_source,
+                ..
+            } => (name.clone(), args.clone(), import_source.clone()),
             _ => {
                 i += 1;
                 continue;
@@ -479,7 +484,11 @@ fn expand_custom_hooks(
             // hooks vec so they don't generate opaque Custom diagnostics.
             // Call summarize() to get the abstract return value and patch the
             // render_cfg binding so the fixpoint sees the right abstraction.
-            if let Some(summary) = inter.config.summary_registry.get(&name) {
+            if let Some(summary) = inter
+                .config
+                .summary_registry
+                .get(&name, import_source.as_deref())
+            {
                 let sv = summary.summarize(&[]);
                 let summary_val = state_value_to_summary_value(sv);
                 if let HookEntry::Custom {

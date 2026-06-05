@@ -203,7 +203,13 @@ fn prop_to_event(name: &str) -> String {
 /// Returns `(hooks, next_label)` where `next_label` is the first available
 /// label after all extracted hooks.  Pass `next_label` to `extract_handlers`
 /// so that handler labels don't collide with hook labels.
-pub fn extract_hooks(cfg: &mut CFG) -> (Vec<HookEntry>, HookLabel) {
+/// `import_map` maps each locally-bound hook name to its NPM package source, e.g.
+/// `{"useQuery" → "@tanstack/react-query"}`.  Built from `import` declarations before
+/// lowering so `HookEntry::Custom::import_source` can be set at extraction time.
+pub fn extract_hooks(
+    cfg: &mut CFG,
+    import_map: &HashMap<String, String>,
+) -> (Vec<HookEntry>, HookLabel) {
     let mut label: HookLabel = 0;
     let mut hooks: Vec<HookEntry> = Vec::new();
     // Maps array-destructuring temps (e.g. "__arr_42") → hook label, for useState/useReducer.
@@ -217,7 +223,14 @@ pub fn extract_hooks(cfg: &mut CFG) -> (Vec<HookEntry>, HookLabel) {
         let mut new: Vec<Stmt> = Vec::with_capacity(old.len());
 
         for stmt in old {
-            process_stmt(stmt, &mut new, &mut hooks, &mut label, &mut state_temps);
+            process_stmt(
+                stmt,
+                &mut new,
+                &mut hooks,
+                &mut label,
+                &mut state_temps,
+                import_map,
+            );
         }
 
         cfg.blocks.get_mut(&id).unwrap().stmts = new;
@@ -232,6 +245,7 @@ fn process_stmt(
     hooks: &mut Vec<HookEntry>,
     label: &mut HookLabel,
     state_temps: &mut HashMap<String, HookLabel>,
+    import_map: &HashMap<String, String>,
 ) {
     match stmt {
         Stmt::Let {
@@ -249,11 +263,16 @@ fn process_stmt(
                     hooks.push(entry);
                 }
 
-                // Record the binding variable for Custom hooks so the fixpoint
-                // can bind the hook's return value to the caller's variable.
+                // Record the binding variable and import source for Custom hooks.
                 if !is_arr_temp {
-                    if let Some(HookEntry::Custom { binding, .. }) = hooks.last_mut() {
+                    if let Some(HookEntry::Custom {
+                        binding,
+                        import_source,
+                        ..
+                    }) = hooks.last_mut()
+                    {
                         *binding = Some(var.clone());
+                        *import_source = import_map.get(&name).cloned();
                     }
                 }
 
@@ -433,6 +452,7 @@ fn make_hook_entry(
                 args,
                 deps: None,
                 binding: None,
+                import_source: None,
                 span,
             })
         }
@@ -575,7 +595,7 @@ mod tests {
                 _ => None,
             })
             .expect("no function found");
-        let (hooks, _) = extract_hooks(&mut cfg);
+        let (hooks, _) = extract_hooks(&mut cfg, &HashMap::new());
         (cfg, hooks)
     }
 
@@ -818,7 +838,7 @@ mod tests {
                 _ => None,
             })
             .expect("no function found");
-        let (mut hooks, mut next_label) = extract_hooks(&mut cfg);
+        let (mut hooks, mut next_label) = extract_hooks(&mut cfg, &HashMap::new());
         extract_handlers(&cfg, &mut hooks, &mut next_label);
         (cfg, hooks)
     }
@@ -942,7 +962,7 @@ mod tests {
                 _ => None,
             })
             .expect("no function found");
-        let (mut hooks, mut next_label) = extract_hooks(&mut cfg);
+        let (mut hooks, mut next_label) = extract_hooks(&mut cfg, &HashMap::new());
         extract_handlers(&cfg, &mut hooks, &mut next_label);
         let handler = hooks
             .iter()
@@ -971,7 +991,7 @@ mod tests {
                 _ => None,
             })
             .expect("no function found");
-        let (mut hooks, mut next_label) = extract_hooks(&mut cfg);
+        let (mut hooks, mut next_label) = extract_hooks(&mut cfg, &HashMap::new());
         extract_handlers(&cfg, &mut hooks, &mut next_label);
         extract_subscriptions(&mut hooks, &mut next_label);
         (cfg, hooks)
