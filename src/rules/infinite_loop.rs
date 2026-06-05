@@ -93,10 +93,10 @@ impl Rule for InfiniteLoop {
                 continue;
             }
             // Non-empty deps with at least one stable value genuinely gate the effect.
-            if let Some(dep_exprs) = deps {
-                if !all_deps_unstable(dep_exprs, comp_result) {
-                    continue;
-                }
+            if let Some(dep_exprs) = deps
+                && !all_deps_unstable(dep_exprs, comp_result)
+            {
+                continue;
             }
 
             let calls =
