@@ -134,8 +134,8 @@ fn object_lit_init_no_fire() {
 }
 
 #[test]
-fn nested_call_in_binop_no_fire() {
-    // Nested call (1 + compute()) — top-level rule, no fire by design.
+fn nested_call_in_binop_fires() {
+    // Nested call (1 + compute()) — the call runs on every render.
     let h = hits(
         r#"
         function C() {
@@ -144,7 +144,34 @@ fn nested_call_in_binop_no_fire() {
         }
         "#,
     );
-    assert_eq!(h, 0, "nested call in BinOp must not fire (top-level only)");
+    assert_eq!(h, 1, "nested call inside BinOp must fire lazy-init");
+}
+
+#[test]
+fn nested_call_in_object_lit_fires() {
+    let h = hits(
+        r#"
+        function C() {
+            const [v, setV] = useState({ key: getValue() });
+            return <p/>;
+        }
+        "#,
+    );
+    assert_eq!(h, 1, "call inside ObjectLit init must fire lazy-init");
+}
+
+#[test]
+fn binop_no_call_no_fire() {
+    // `a + 1` is a BinOp with no Call node — must not fire.
+    let h = hits(
+        r#"
+        function C({ offset }) {
+            const [v, setV] = useState(offset + 1);
+            return <p>{v}</p>;
+        }
+        "#,
+    );
+    assert_eq!(h, 0, "BinOp with no call must not fire lazy-init");
 }
 
 // ── Fixture regression ────────────────────────────────────────────────────────

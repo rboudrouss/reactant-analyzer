@@ -122,6 +122,7 @@ if class == TriggerClass::Unknown {
 - **Back-edge dans un corps de callback** → FN (documenté ADR-009, inchangé).
 - **Domaines objet/tableau** (`HeapValue::Obj`/`Arr`) réservés — non utilisés jusqu'à l'implémentation d'un domaine de champs.
 - **Multi-site join** : `locs` peut contenir plusieurs ExprIds pour une même variable (branches ternaires). Tous les corps sont exécutés et leurs effets joints — correct par over-approximation.
+- **Callee inconnu sans `Loc`** (helper externe) → bail immédiat → FN. Quand `depth >= MAX_INLINE_DEPTH`, la règle `analysis-limit` émet un `Info` (visible avec `--info`) signalant que des chaînes de callbacks n'ont pas été descendues.
 
 ## Conséquences
 

@@ -1,26 +1,29 @@
 use crate::{
     engine::ProgramAnalysisResult,
-    ir::{expr::Expr, hooks::HookEntry, types::Symbol},
+    ir::{hooks::HookEntry, types::Symbol},
 };
 
 use super::{Diagnostic, Rule};
 
-/// Fires when `useState(...)` is initialised with a direct function call
-/// (e.g. `useState(expensiveCompute())`). React evaluates the init argument
-/// on every render but only uses the result on mount — so the call is wasted
-/// work on every render after mount.  The fix is the lazy-initialiser form:
-/// `useState(() => expensiveCompute())`.
+/// Fires when `useState(...)` is initialised with an expression that contains
+/// any function call (e.g. `useState(expensiveCompute())`, `useState(1 + f())`).
+/// React evaluates the init argument on every render but only uses the result
+/// on mount — so the call is wasted work on every render after mount.
+/// The fix is the lazy-initialiser form: `useState(() => expensiveCompute())`.
 ///
-/// Patterns matched:
+/// Patterns matched (any call anywhere in the init expression):
 /// ```js
-/// useState(expensiveCompute())          // ❌
-/// useState<number>(Date.now())          // ❌ (looks through TSAnnotated)
+/// useState(expensiveCompute())          // ❌  top-level call
+/// useState<number>(Date.now())          // ❌  looks through TSAnnotated
+/// useState(1 + expensive())            // ❌  nested call inside BinOp
+/// useState({ key: getValue() })        // ❌  call inside ObjectLit
 /// ```
 ///
 /// Non-matched:
-/// - `useState(0)` — literal.
+/// - `useState(0)` — literal, call-free.
+/// - `useState(a + 1)` — BinOp with no call node.
 /// - `useState(() => expensiveCompute())` — already lazy (FnLit, not Call).
-/// - `useState(props.value)` — Var / FieldAccess, no call.
+/// - `useState(props.value)` — FieldAccess, call-free.
 pub struct LazyInit;
 
 impl Rule for LazyInit {
@@ -39,7 +42,7 @@ impl Rule for LazyInit {
             else {
                 continue;
             };
-            if !contains_top_level_call(init) {
+            if init.is_call_free() {
                 continue;
             }
             let mut d = Diagnostic::new(
@@ -58,20 +61,6 @@ impl Rule for LazyInit {
         }
 
         diags
-    }
-}
-
-/// True if `expr` is a direct function call (looking through `TSAnnotated`).
-///
-/// We intentionally only inspect the *top-level* node — e.g. `useState(x + f())`
-/// is not flagged because the call is nested in a BinOp.  In practice the lazy-init
-/// pattern is overwhelmingly a direct `useState(expensive())` call, and flagging
-/// nested cases produces false positives (`useState(a + 1)` if `+` were a call).
-fn contains_top_level_call(expr: &Expr) -> bool {
-    match expr {
-        Expr::Call { .. } | Expr::CompApp { .. } => true,
-        Expr::TSAnnotated(inner, _) => contains_top_level_call(inner),
-        _ => false,
     }
 }
 
@@ -253,8 +242,8 @@ mod tests {
     }
 
     #[test]
-    fn nested_call_in_binop_no_warning() {
-        // useState(1 + compute()) — nested call, conservatively skipped.
+    fn nested_call_in_binop_fires() {
+        // useState(1 + compute()) — call nested inside BinOp → must fire.
         let hooks = vec![HookEntry::State {
             label: 0,
             init: Expr::BinOp {
@@ -269,6 +258,6 @@ mod tests {
             span: None,
         }];
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
-        assert!(LazyInit.check(&prog(&result), &"C".to_string()).is_empty());
+        assert_eq!(LazyInit.check(&prog(&result), &"C".to_string()).len(), 1);
     }
 }

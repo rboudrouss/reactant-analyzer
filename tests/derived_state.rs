@@ -235,3 +235,55 @@ fn derived_state_fixture() {
         "derived_state.tsx: expected exactly 2 derived-state hits"
     );
 }
+
+// ── Conditional body ──────────────────────────────────────────────────────────
+
+#[test]
+fn conditional_body_fires() {
+    // Both branches always call setB → must detect as derived state.
+    let hits = derived_state_hits(
+        r#"
+        import { useState, useEffect } from "react";
+        function C() {
+            const [a, setA] = useState(0);
+            const [b, setB] = useState(0);
+            useEffect(() => {
+                if (a > 0) {
+                    setB(a * 2);
+                } else {
+                    setB(a + 1);
+                }
+            }, [a]);
+            return <div>{a} {b}</div>;
+        }
+        "#,
+    );
+    assert_eq!(
+        hits, 1,
+        "conditional body where both branches always call setB must fire"
+    );
+}
+
+#[test]
+fn conditional_body_partial_no_fire() {
+    // Only the `then` branch calls setB → conditional, not unconditional.
+    let hits = derived_state_hits(
+        r#"
+        import { useState, useEffect } from "react";
+        function C() {
+            const [a, setA] = useState(0);
+            const [b, setB] = useState(0);
+            useEffect(() => {
+                if (a > 0) {
+                    setB(a * 2);
+                }
+            }, [a]);
+            return <div>{a} {b}</div>;
+        }
+        "#,
+    );
+    assert_eq!(
+        hits, 0,
+        "partial conditional (setter only on one branch) must not fire"
+    );
+}

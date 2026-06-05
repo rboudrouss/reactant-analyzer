@@ -123,10 +123,10 @@ Les règles reçoivent `&ProgramAnalysisResult`. Règles intra-composant accède
 
 ## Limites acceptées
 
-- Résolution d'imports hors scope (Phase suivante).
-- Récursion profonde → `⊤` (profondeur fixée à 1 pour l'instant, configurable plus tard).
-- Dynamique (`const Comp = cond ? A : B; <Comp />`) → `CompApp` non généré, non analysé.
-- Plugin système (Next.js, TanStack) → future extension de `RootDetector`.
+- **Résolution d'imports hors scope** — composant absent du registry → résultat `⊤` + `Info` `analysis-limit` émis (`--info` pour voir). Phase suivante.
+- **Récursion profonde** → `⊤` (profondeur 1) + `Info` `analysis-limit` émis sur le composant appelant.
+- **Dynamique** (`const Comp = cond ? A : B; <Comp />`) → `CompApp` non généré, non analysé.
+- **Plugin système** (Next.js, TanStack) → future extension de `RootDetector`.
 
 ## Conséquences
 

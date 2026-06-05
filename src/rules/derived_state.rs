@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     engine::ProgramAnalysisResult,
@@ -7,7 +7,7 @@ use crate::{
         expr::Expr,
         hooks::HookEntry,
         stmt::Stmt,
-        types::{Symbol, Var},
+        types::{BlockId, Symbol, Var},
     },
 };
 
@@ -91,17 +91,10 @@ impl Rule for DerivedState {
                 _ => continue,
             };
 
-            // Effect body must make exactly 1 setter call unconditionally (linear body).
-            let Some((setter_name, setter_arg)) =
-                find_single_linear_setter_call(body_cfg, &setter_vars)
-            else {
+            // Effect body must unconditionally call exactly one setter with a call-free arg.
+            let Some(setter_name) = find_uncond_setter_call(body_cfg, &setter_vars) else {
                 continue;
             };
-
-            // Setter arg must be call-free.
-            if !setter_arg.is_call_free() {
-                continue;
-            }
 
             // The same setter must not be called in the render body.
             if render_setters.contains(&setter_name) {
@@ -149,39 +142,99 @@ impl Rule for DerivedState {
     }
 }
 
-/// Return `Some((setter_var, &arg_expr))` if `cfg` is a linear (no-branch) body
-/// containing exactly one setter call, or `None` otherwise.
-fn find_single_linear_setter_call<'a>(
-    cfg: &'a CFG,
-    setter_vars: &HashSet<Var>,
-) -> Option<(Var, &'a Expr)> {
-    // Require no branching: cfg has at most 2 blocks (entry + implicit return).
-    if cfg.blocks.len() > 2 {
-        return None;
-    }
-    let mut found: Option<(Var, &Expr)> = None;
-
-    for block in cfg.blocks.values() {
+/// Return `Some(setter_var)` if `cfg` unconditionally calls exactly one setter
+/// (the same var on all paths) with call-free arguments.
+///
+/// Uses a must-forward dataflow: `must_out[B] = (∩ must_out[preds]) || called_in[B]`.
+/// The setter is unconditional iff every return block has `must_out = true`.
+fn find_uncond_setter_call(cfg: &CFG, setter_vars: &HashSet<Var>) -> Option<Var> {
+    // Collect all call sites: (block_id, setter_var, arg).
+    let mut call_sites: Vec<(BlockId, Var, Expr)> = vec![];
+    for (bid, block) in &cfg.blocks {
         for stmt in &block.stmts {
             if let Stmt::ExprStmt(expr, _) = stmt
-                && let Some(pair) = try_extract_setter_call(expr, setter_vars)
+                && let Some((var, arg)) = try_extract_setter_call(expr, setter_vars)
             {
-                if found.is_some() {
-                    return None;
-                }
-                found = Some(pair);
+                call_sites.push((*bid, var, arg.clone()));
             }
         }
         if let Terminator::Return(expr) = &block.term
-            && let Some(pair) = try_extract_setter_call(expr, setter_vars)
+            && let Some((var, arg)) = try_extract_setter_call(expr, setter_vars)
         {
-            if found.is_some() {
-                return None;
-            }
-            found = Some(pair);
+            call_sites.push((*bid, var, arg.clone()));
         }
     }
-    found
+
+    if call_sites.is_empty() {
+        return None;
+    }
+
+    // All call sites must target the same setter var.
+    let target = call_sites[0].1.clone();
+    if !call_sites.iter().all(|(_, v, _)| v == &target) {
+        return None;
+    }
+
+    // All args must be call-free.
+    if !call_sites.iter().all(|(_, _, arg)| arg.is_call_free()) {
+        return None;
+    }
+
+    // Must-forward dataflow: does the target setter fire on EVERY path to every return?
+    //   must_in[B]  = AND of must_out[pred] for each pred
+    //   must_out[B] = must_in[B] || called_in[B]
+    //   Initial: must_out[entry] = called_in[entry]; must_out[others] = true (top)
+    let called_in: HashMap<BlockId, bool> = cfg
+        .blocks
+        .keys()
+        .map(|&bid| {
+            let hits = call_sites.iter().any(|(b, _, _)| b == &bid);
+            (bid, hits)
+        })
+        .collect();
+
+    let mut must_out: HashMap<BlockId, bool> = cfg.blocks.keys().map(|&bid| (bid, true)).collect();
+    *must_out.get_mut(&cfg.entry)? = called_in[&cfg.entry];
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &bid in cfg.blocks.keys() {
+            if bid == cfg.entry {
+                continue;
+            }
+            let preds = cfg.predecessors(bid);
+            if preds.is_empty() {
+                continue;
+            }
+            let must_in = preds.iter().all(|&p| *must_out.get(&p).unwrap_or(&false));
+            let new_val = must_in || called_in[&bid];
+            if must_out[&bid] != new_val {
+                must_out.insert(bid, new_val);
+                changed = true;
+            }
+        }
+    }
+
+    // Every exit block (Return or Unreachable — effect bodies end with Unreachable
+    // because they are void: `into_cfg` uses Unreachable for unterminated blocks)
+    // must have must_out = true.  The iterator must be non-empty to avoid the
+    // vacuously-true case where a CFG has no exit blocks at all.
+    let exit_blocks: Vec<_> = cfg
+        .blocks
+        .values()
+        .filter(|b| matches!(b.term, Terminator::Return(_) | Terminator::Unreachable))
+        .collect();
+
+    if exit_blocks.is_empty() {
+        return None;
+    }
+
+    let all_covered = exit_blocks
+        .iter()
+        .all(|b| *must_out.get(&b.id).unwrap_or(&false));
+
+    if all_covered { Some(target) } else { None }
 }
 
 fn try_extract_setter_call<'a>(
