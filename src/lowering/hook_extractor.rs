@@ -249,6 +249,14 @@ fn process_stmt(
                     hooks.push(entry);
                 }
 
+                // Record the binding variable for Custom hooks so the fixpoint
+                // can bind the hook's return value to the caller's variable.
+                if !is_arr_temp {
+                    if let Some(HookEntry::Custom { binding, .. }) = hooks.last_mut() {
+                        *binding = Some(var.clone());
+                    }
+                }
+
                 if is_state_like && is_arr_temp {
                     // Array-destructured useState/useReducer: drop the temp Let,
                     // subsequent IndexAccess stmts will be rewritten by rewrite_expr.
@@ -394,6 +402,29 @@ fn make_hook_entry(
             let init = it.next().unwrap_or(Expr::Lit(Prim::Null));
             Some(HookEntry::Ref { label, init, span })
         }
+        "useReducer" => {
+            let _reducer = it.next(); // skip reducer fn
+            let init = it.next().unwrap_or(Expr::Lit(Prim::Unit));
+            Some(HookEntry::State {
+                label,
+                init,
+                type_hint,
+                span,
+            })
+        }
+        "useLayoutEffect" | "useInsertionEffect" => {
+            let body_cfg = it
+                .next()
+                .and_then(expr_into_cfg)
+                .unwrap_or_else(fallback_cfg);
+            let deps = it.next().and_then(expr_into_deps);
+            Some(HookEntry::Effect {
+                label,
+                body_cfg,
+                deps,
+                span,
+            })
+        }
         _ if name.starts_with("use") => {
             let args: Vec<Expr> = it.collect();
             Some(HookEntry::Custom {
@@ -401,6 +432,7 @@ fn make_hook_entry(
                 name: name.to_string(),
                 args,
                 deps: None,
+                binding: None,
                 span,
             })
         }
@@ -1073,9 +1105,7 @@ mod tests {
             }",
         );
         assert_eq!(hooks.len(), 1);
-        assert!(
-            matches!(&hooks[0], HookEntry::Custom { label: 0, name, .. } if name == "useReducer")
-        );
+        assert!(matches!(&hooks[0], HookEntry::State { label: 0, .. }));
         let stmts = entry_stmts(&cfg);
         assert!(matches!(
             find_let_rhs(stmts, "state"),

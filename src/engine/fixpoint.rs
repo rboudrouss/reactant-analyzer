@@ -23,10 +23,14 @@ use super::{
     cfg_analyzer::analyze_cfg,
     component_cache::ComponentCache,
     component_registry::ComponentRegistry,
+    hook_registry::HookRegistry,
     program_result::{AnalysisStats, ComponentCallGraph, ProgramAnalysisResult},
     root_detector::RootStrategy,
 };
-use crate::domains::{stores::SharedStateStore, transfer::StateValueTransfer};
+use crate::{
+    domains::{stores::SharedStateStore, transfer::StateValueTransfer},
+    ir::remap::{remap_cfg, remap_hooks},
+};
 
 pub struct Config {
     pub widen_threshold: usize,
@@ -93,10 +97,15 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 ) -> AnalysisResult<StateValue> {
     let ComponentIR {
         name: comp_name,
-        render_cfg,
+        render_cfg: mut render_cfg,
         hooks,
         ..
     } = comp;
+
+    // Expand HookEntry::Custom entries by inlining sub-hooks with remapped labels.
+    // Must happen before TypedStateStore::from_component so inlined State entries are seeded.
+    let mut hooks = hooks;
+    expand_custom_hooks(&mut hooks, &mut render_cfg, inter);
 
     let mut typed_state = TypedStateStore::from_component(&hooks);
     let mut memo_store: MemoStore<StateValue> = MemoStore::new();
@@ -343,6 +352,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 /// callbacks across component boundaries (top-down inlining, ADR-012).
 pub fn analyze_program(
     registry: ComponentRegistry,
+    hook_registry: HookRegistry,
     strategy: RootStrategy,
     config: &Config,
 ) -> ProgramAnalysisResult {
@@ -371,6 +381,7 @@ pub fn analyze_program(
                 root_name.clone(),
                 config,
                 analyze_component_inter as AnalyzeChildFn,
+                Some(&hook_registry),
             );
             let result = analyze_component_impl(
                 root_ir,
@@ -412,6 +423,145 @@ pub fn analyze_program(
         call_graph: call_graph.into_inner(),
         recursive_components,
         stats: final_stats,
+    }
+}
+
+// ── Custom hook expansion ─────────────────────────────────────────────────────
+
+/// Replace each `HookEntry::Custom` that is found in the `HookRegistry` with the
+/// hook's own sub-entries (remapped to avoid label collisions with the component's
+/// existing labels).  Nested custom hooks are expanded recursively via the `while`
+/// loop; the recursion guard prevents infinite expansion.
+///
+/// Guard strategy: a local `expanding` set tracks every hook name whose entries
+/// have been inserted into `hooks` in this call.  Once a name is in the set, any
+/// further `Custom` entry with that name is skipped (cut to ⊤).  This is correct
+/// for self-recursive hooks and sound for the rare case of a hook called twice in
+/// the same component (second call stays opaque — FN, not FP).
+fn expand_custom_hooks(
+    hooks: &mut Vec<HookEntry>,
+    render_cfg: &mut CFG,
+    inter: Option<&InterCtx<'_>>,
+) {
+    let Some(inter) = inter else { return };
+    let Some(reg) = inter.hook_registry else {
+        return;
+    };
+
+    let mut expanding: HashSet<String> = HashSet::new();
+
+    let mut i = 0;
+    while i < hooks.len() {
+        let (name, call_args) = match &hooks[i] {
+            HookEntry::Custom { name, args, .. } => (name.clone(), args.clone()),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        // Recursion guard: skip if we already started expanding this hook.
+        if expanding.contains(&name) {
+            i += 1;
+            continue;
+        }
+
+        let Some(hook_ir) = reg.get(&name) else {
+            i += 1;
+            continue;
+        };
+
+        // Offset = first available label after all current entries.
+        let offset: HookLabel = hooks.iter().map(|h| h.label() + 1).max().unwrap_or(0);
+
+        // Build param→arg substitution map so State inits that reference hook params
+        // (e.g. `useState(initial)`) resolve to concrete call-site values.
+        let param_subst: HashMap<String, Expr> = hook_ir
+            .params
+            .iter()
+            .zip(call_args.iter())
+            .map(|(p, a)| (p.clone(), a.clone()))
+            .collect();
+
+        let remapped = remap_hooks(hook_ir.hooks.clone(), offset);
+
+        // Substitute call-site args for hook params in State init expressions so that
+        // `TypedStateStore::from_component` seeds the correct initial value rather than Bottom.
+        let remapped: Vec<HookEntry> = remapped
+            .into_iter()
+            .map(|h| match h {
+                HookEntry::State {
+                    label,
+                    init,
+                    type_hint,
+                    span,
+                } => HookEntry::State {
+                    label,
+                    init: subst_vars(init, &param_subst),
+                    type_hint,
+                    span,
+                },
+                other => other,
+            })
+            .collect();
+
+        // Inject the hook's body_cfg entry-block stmts (remapped) into the component's
+        // render_cfg entry block, preceded by param-binding stmts so that any expr in the
+        // body that references a hook param resolves correctly during the render pass.
+        let remapped_body = remap_cfg(hook_ir.body_cfg.clone(), offset);
+        let body_stmts = remapped_body
+            .blocks
+            .get(&remapped_body.entry)
+            .map(|b| b.stmts.clone())
+            .unwrap_or_default();
+        let param_stmts: Vec<crate::ir::stmt::Stmt> = hook_ir
+            .params
+            .iter()
+            .zip(call_args.iter())
+            .map(|(p, a)| crate::ir::stmt::Stmt::Let {
+                var: p.clone(),
+                rhs: a.clone(),
+                span: None,
+            })
+            .collect();
+        if let Some(entry_block) = render_cfg.blocks.get_mut(&render_cfg.entry) {
+            let mut new_stmts = param_stmts;
+            new_stmts.extend(body_stmts);
+            new_stmts.extend(std::mem::take(&mut entry_block.stmts));
+            entry_block.stmts = new_stmts;
+        }
+
+        // Mark before inserting so re-encountered Custom entries for this hook are guarded.
+        expanding.insert(name.clone());
+
+        // Replace the Custom entry with the hook's remapped sub-entries.
+        hooks.remove(i);
+        for (j, h) in remapped.into_iter().enumerate() {
+            hooks.insert(i + j, h);
+        }
+        // Don't increment i — re-examine position i (first inlined entry, may itself be Custom).
+    }
+}
+
+/// Shallow variable substitution for hook-param→call-arg replacement in State init exprs.
+/// Only descends into compound exprs that can plausibly appear in a useState initializer.
+fn subst_vars(expr: Expr, subst: &HashMap<String, Expr>) -> Expr {
+    if subst.is_empty() {
+        return expr;
+    }
+    match expr {
+        Expr::Var(ref name) => subst.get(name).cloned().unwrap_or(expr),
+        Expr::BinOp { op, lhs, rhs } => Expr::BinOp {
+            op,
+            lhs: Box::new(subst_vars(*lhs, subst)),
+            rhs: Box::new(subst_vars(*rhs, subst)),
+        },
+        Expr::UnaryOp { op, arg } => Expr::UnaryOp {
+            op,
+            arg: Box::new(subst_vars(*arg, subst)),
+        },
+        Expr::TSAnnotated(inner, t) => Expr::TSAnnotated(Box::new(subst_vars(*inner, subst)), t),
+        other => other,
     }
 }
 

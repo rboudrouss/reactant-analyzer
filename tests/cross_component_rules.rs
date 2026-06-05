@@ -6,7 +6,10 @@
 /// with the Heuristic root strategy so children are analysed top-down (inter),
 /// giving their block_states ComponentSetter values from parent props.
 use reactant::{
-    engine::{ComponentRegistry, Config, ProgramAnalysisResult, RootStrategy, analyze_program},
+    engine::{
+        ComponentRegistry, Config, HookRegistry, ProgramAnalysisResult, RootStrategy,
+        analyze_program,
+    },
     rules::{InfiniteLoop, Rule, SetterInRender, Severity},
 };
 
@@ -26,7 +29,12 @@ fn parse_and_analyze(src: &str) -> ProgramAnalysisResult {
     let line_starts = compute_line_starts(src);
     let components = lower_program(&ret.program, &line_starts);
     let reg = ComponentRegistry::from_components(components);
-    analyze_program(reg, RootStrategy::Heuristic, &Config::default())
+    analyze_program(
+        reg,
+        HookRegistry::new(),
+        RootStrategy::Heuristic,
+        &Config::default(),
+    )
 }
 
 fn fixture() -> String {

@@ -17,7 +17,7 @@ use reactant::{
         stores::{AbstractEnv, EnvVal, MemoStore, SharedStateStore, StateStore},
     },
     engine::{
-        AnalysisResult, AnalysisStats, ComponentCallGraph, ComponentRegistry, Config,
+        AnalysisResult, AnalysisStats, ComponentCallGraph, ComponentRegistry, Config, HookRegistry,
         ProgramAnalysisResult, RootStrategy, analyze_component, analyze_program,
     },
     ir::{
@@ -112,7 +112,12 @@ fn heuristic_detects_parent_not_child_as_root() {
 fn analyze_program_two_isolated_components() {
     let reg =
         ComponentRegistry::from_components(vec![leaf_component("CompA"), leaf_component("CompB")]);
-    let result = analyze_program(reg, RootStrategy::AllComponents, &Config::default());
+    let result = analyze_program(
+        reg,
+        HookRegistry::new(),
+        RootStrategy::AllComponents,
+        &Config::default(),
+    );
     assert!(result.components.contains_key("CompA"));
     assert!(result.components.contains_key("CompB"));
 }
@@ -146,7 +151,12 @@ fn analyze_program_populates_call_graph_for_parent_child() {
     };
     let child = leaf_component("Child");
     let reg = ComponentRegistry::from_components(vec![parent, child]);
-    let result = analyze_program(reg, RootStrategy::Heuristic, &Config::default());
+    let result = analyze_program(
+        reg,
+        HookRegistry::new(),
+        RootStrategy::Heuristic,
+        &Config::default(),
+    );
 
     // Call graph must record Parent → Child edge.
     let edges = result.call_graph.callees_of(&"Parent".to_string());
@@ -279,7 +289,12 @@ fn setter_prop_propagates_to_shared_state() {
     };
 
     let reg = ComponentRegistry::from_components(vec![parent, child]);
-    let result = analyze_program(reg, RootStrategy::Heuristic, &Config::default());
+    let result = analyze_program(
+        reg,
+        HookRegistry::new(),
+        RootStrategy::Heuristic,
+        &Config::default(),
+    );
 
     // SharedStateStore must have been updated: Child called Parent's setter with 42.
     let parent_count = result.shared_state.get(&"Parent".to_string(), 0);
@@ -321,7 +336,12 @@ fn recursive_component_does_not_crash() {
     };
     let reg = ComponentRegistry::from_components(vec![tree_node]);
     // Must not panic, must return a result.
-    let result = analyze_program(reg, RootStrategy::AllComponents, &Config::default());
+    let result = analyze_program(
+        reg,
+        HookRegistry::new(),
+        RootStrategy::AllComponents,
+        &Config::default(),
+    );
     assert!(result.components.contains_key("TreeNode"));
     assert!(
         result.stats.recursion_cutoffs >= 1,
@@ -424,7 +444,7 @@ fn parse_and_analyze_with_strategy(src: &str, strategy: RootStrategy) -> Program
     let line_starts = compute_line_starts(src);
     let components = lower_program(&ret.program, &line_starts);
     let reg = ComponentRegistry::from_components(components);
-    analyze_program(reg, strategy, &Config::default())
+    analyze_program(reg, HookRegistry::new(), strategy, &Config::default())
 }
 
 #[test]
@@ -633,7 +653,12 @@ fn prop_drilling_direct_ir() {
     };
 
     let reg = ComponentRegistry::from_components(vec![root, middle, leaf]);
-    let result = analyze_program(reg, RootStrategy::Heuristic, &Config::default());
+    let result = analyze_program(
+        reg,
+        HookRegistry::new(),
+        RootStrategy::Heuristic,
+        &Config::default(),
+    );
 
     let root_state = result.shared_state.get(&"Root".to_string(), 0);
     assert_eq!(
@@ -991,7 +1016,12 @@ fn missing_deps_inter_specific_fp_suppression() {
     if !isolated.is_empty() {
         let reg = ComponentRegistry::from_components(isolated);
         // AllComponents = each component analyzed as root (no parent inlining).
-        let result_intra = analyze_program(reg, RootStrategy::AllComponents, &Config::default());
+        let result_intra = analyze_program(
+            reg,
+            HookRegistry::new(),
+            RootStrategy::AllComponents,
+            &Config::default(),
+        );
         let diags_intra = MissingDeps.check(&result_intra, &"Section6_Child".to_string());
         let fp_intra: Vec<_> = diags_intra
             .iter()

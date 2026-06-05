@@ -6,8 +6,8 @@ use oxc_parser::{ParseOptions, Parser as OxcParser};
 use oxc_span::SourceType;
 
 use reactant::{
-    engine::{ComponentRegistry, Config, RootStrategy, analyze_program},
-    lowering::{compute_line_starts, lower_program},
+    engine::{ComponentRegistry, Config, HookRegistry, RootStrategy, analyze_program},
+    lowering::{compute_line_starts, lower_custom_hooks, lower_program},
     rules::{Severity, all_rules},
 };
 
@@ -44,8 +44,9 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Phase 1: parse all files and collect all ComponentIRs.
+    // Phase 1: parse all files and collect ComponentIRs + HookIRs.
     let mut all_components = Vec::new();
+    let mut all_hook_irs = Vec::new();
     let mut file_count = 0usize;
 
     for path in &args.files {
@@ -72,6 +73,7 @@ fn main() {
         }
         let line_starts = compute_line_starts(&source);
         all_components.extend(lower_program(&ret.program, &line_starts));
+        all_hook_irs.extend(lower_custom_hooks(&ret.program, &line_starts));
         file_count += 1;
     }
 
@@ -87,6 +89,7 @@ fn main() {
         .collect();
 
     let registry = ComponentRegistry::from_components(all_components);
+    let hook_registry = HookRegistry::from_hooks(all_hook_irs);
     let strategy = if let Some(entry) = &args.entry {
         RootStrategy::Explicit(entry.split(',').map(|s| s.trim().to_string()).collect())
     } else if args.all_roots {
@@ -98,7 +101,7 @@ fn main() {
     let config = Config::default();
 
     // Phase 3: inter-component analysis.
-    let program_result = analyze_program(registry, strategy, &config);
+    let program_result = analyze_program(registry, hook_registry, strategy, &config);
 
     if args.verbose {
         eprintln!(
