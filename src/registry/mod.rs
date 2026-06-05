@@ -1,6 +1,8 @@
 pub mod builtins;
+pub mod summary;
 
 pub use builtins::register_all;
+pub use summary::{HookSummary, SummaryRegistry};
 
 use std::collections::HashMap;
 

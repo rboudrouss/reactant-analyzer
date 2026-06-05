@@ -30,15 +30,22 @@ use super::{
 use crate::{
     domains::{stores::SharedStateStore, transfer::StateValueTransfer},
     ir::remap::{remap_cfg, remap_hooks},
+    registry::SummaryRegistry,
 };
 
 pub struct Config {
     pub widen_threshold: usize,
+    /// Known library hooks (TanStack, React Router, etc.) without source.
+    /// Used in `expand_custom_hooks` as a fallback when a hook is not in the `HookRegistry`.
+    pub summary_registry: SummaryRegistry,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { widen_threshold: 3 }
+        Config {
+            widen_threshold: 3,
+            summary_registry: SummaryRegistry::new(),
+        }
     }
 }
 
@@ -467,6 +474,15 @@ fn expand_custom_hooks(
         }
 
         let Some(hook_ir) = reg.get(&name) else {
+            // Not in HookRegistry — check SummaryRegistry as fallback.
+            // Known library hooks (TanStack, React Router, etc.) are removed from the
+            // hooks vec so they don't generate opaque Custom diagnostics.
+            // The render_cfg binding stays as Lit(Unit) — sound conservative FN.
+            if inter.config.summary_registry.contains(&name) {
+                hooks.remove(i);
+                // Don't increment i — it now points to the next entry.
+                continue;
+            }
             i += 1;
             continue;
         };
@@ -1066,7 +1082,10 @@ mod tests {
             },
         ];
         let comp = component(hooks, vec![]);
-        let config = Config { widen_threshold: 1 };
+        let config = Config {
+            widen_threshold: 1,
+            ..Default::default()
+        };
         let result = analyze_component(comp, &StateValueTransfer, &config);
         assert!(result.widened_labels.contains(&0));
     }
@@ -1414,7 +1433,10 @@ mod tests {
                 },
             ],
         );
-        let config = Config { widen_threshold: 1 };
+        let config = Config {
+            widen_threshold: 1,
+            ..Default::default()
+        };
         let result = analyze_component(comp, &StateValueTransfer, &config);
 
         assert!(
@@ -1548,7 +1570,14 @@ mod tests {
                 },
             ],
         );
-        let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 1 });
+        let result = analyze_component(
+            comp,
+            &StateValueTransfer,
+            &Config {
+                widen_threshold: 1,
+                ..Default::default()
+            },
+        );
 
         assert!(
             !result.widened_labels.contains(&0),

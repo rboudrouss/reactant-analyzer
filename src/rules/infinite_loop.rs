@@ -573,7 +573,10 @@ mod tests {
             },
             hooks,
         };
-        let config = Config { widen_threshold: 1 };
+        let config = Config {
+            widen_threshold: 1,
+            ..Default::default()
+        };
         let result = analyze_component(comp, &StateValueTransfer, &config);
         let diags = InfiniteLoop.check(&prog("C", &result), &"C".to_string());
         assert!(!diags.is_empty(), "expected InfiniteLoop warning");
@@ -662,7 +665,10 @@ mod tests {
             },
             hooks,
         };
-        let config = Config { widen_threshold: 3 };
+        let config = Config {
+            widen_threshold: 3,
+            ..Default::default()
+        };
         let result = analyze_component(comp, &StateValueTransfer, &config);
         assert!(result.widened_labels.contains(&0), "count should widen");
         let diags = InfiniteLoop.check(&prog("Counter", &result), &"Counter".to_string());
@@ -852,7 +858,14 @@ mod tests {
             args: vec![incrementing_setter_cb("setN")],
         };
         let comp = component_with_effect_call("setN", call, Some(vec![Expr::StateVal(0)]));
-        let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
+        let result = analyze_component(
+            comp,
+            &StateValueTransfer,
+            &Config {
+                widen_threshold: 3,
+                ..Default::default()
+            },
+        );
         assert!(
             result.widened_labels.contains(&0),
             "n should widen via the .then callback"
@@ -881,7 +894,14 @@ mod tests {
             ],
         };
         let comp = component_with_effect_call("setN", call, None);
-        let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
+        let result = analyze_component(
+            comp,
+            &StateValueTransfer,
+            &Config {
+                widen_threshold: 3,
+                ..Default::default()
+            },
+        );
         assert!(
             !result.widened_labels.contains(&0),
             "event handler must not widen state (would be a false positive)"
@@ -903,7 +923,14 @@ mod tests {
             args: vec![incrementing_setter_cb("setN")],
         };
         let comp = component_with_effect_call("setN", call, None);
-        let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
+        let result = analyze_component(
+            comp,
+            &StateValueTransfer,
+            &Config {
+                widen_threshold: 3,
+                ..Default::default()
+            },
+        );
         assert!(!result.widened_labels.contains(&0));
         assert!(
             InfiniteLoop
@@ -958,7 +985,14 @@ mod tests {
             args: vec![cb],
         };
         let comp = component_with_effect_call("setN", call, None);
-        let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
+        let result = analyze_component(
+            comp,
+            &StateValueTransfer,
+            &Config {
+                widen_threshold: 3,
+                ..Default::default()
+            },
+        );
         assert!(
             result.widened_labels.contains(&0),
             "back-edge in callback body → side-effect traversal → setN fires → widening"
@@ -1057,7 +1091,14 @@ mod tests {
             args: vec![cb],
         };
         let comp = component_with_effect_call("setN", call, Some(vec![Expr::StateVal(0)]));
-        let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
+        let result = analyze_component(
+            comp,
+            &StateValueTransfer,
+            &Config {
+                widen_threshold: 3,
+                ..Default::default()
+            },
+        );
         assert!(
             !result.widened_labels.contains(&0),
             "bounded setter in a loop stabilises → must not widen"
@@ -1193,7 +1234,14 @@ mod tests {
             ),
         ];
         let comp = component_with_effect_stmts("setN", stmts, Some(vec![Expr::StateVal(0)]));
-        let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
+        let result = analyze_component(
+            comp,
+            &StateValueTransfer,
+            &Config {
+                widen_threshold: 3,
+                ..Default::default()
+            },
+        );
         assert!(
             result.widened_labels.contains(&0),
             "n should widen via the variable callback"
@@ -1262,7 +1310,14 @@ mod tests {
             ),
         ];
         let comp = component_with_effect_stmts("setN", stmts, Some(vec![Expr::StateVal(0)]));
-        let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
+        let result = analyze_component(
+            comp,
+            &StateValueTransfer,
+            &Config {
+                widen_threshold: 3,
+                ..Default::default()
+            },
+        );
         assert!(
             result.widened_labels.contains(&0),
             "n should widen via the variable .then callback"
@@ -1358,7 +1413,14 @@ mod tests {
             ),
         ];
         let comp = component_with_effect_stmts("setN", stmts, Some(vec![Expr::StateVal(0)]));
-        let result = analyze_component(comp, &StateValueTransfer, &Config { widen_threshold: 3 });
+        let result = analyze_component(
+            comp,
+            &StateValueTransfer,
+            &Config {
+                widen_threshold: 3,
+                ..Default::default()
+            },
+        );
         assert!(
             result.widened_labels.contains(&0),
             "n should widen via B6→B5 nested chain"

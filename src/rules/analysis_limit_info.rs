@@ -1,11 +1,14 @@
-use crate::{engine::ProgramAnalysisResult, ir::types::Symbol};
+use crate::{
+    engine::{HookKind, ProgramAnalysisResult},
+    ir::{hooks::HookEntry, types::Symbol},
+};
 
 use super::{Diagnostic, Rule, Severity};
 
 /// Emits `Info` diagnostics when the analyser deliberately truncates analysis
 /// to preserve soundness.  Each site is a potential source of false negatives.
 ///
-/// Three cases:
+/// Four cases:
 /// - `recursion-cutoff`    — component references itself (directly or transitively);
 ///                           the recursive call is resolved to ⊤.
 /// - `unknown-component`   — component instantiates a child not found in the
@@ -13,6 +16,8 @@ use super::{Diagnostic, Rule, Severity};
 ///                           props and effects of that child are treated as ⊤.
 /// - `callback-depth-cap`  — callback inlining reached MAX_INLINE_DEPTH; deeper
 ///                           HOF chains (`.then(() => .then(…))`) not descended.
+/// - `unknown-hook`        — custom hook call whose source is not in the registry
+///                           and has no `HookSummary`; its internals are opaque (FN possible).
 pub struct AnalysisLimitInfo;
 
 impl Rule for AnalysisLimitInfo {
@@ -66,6 +71,35 @@ impl Rule for AnalysisLimitInfo {
                 )
                 .with_severity(Severity::Info),
             );
+        }
+
+        // Unknown custom hooks — survived expand_custom_hooks (not in HookRegistry or SummaryRegistry).
+        if let Some(comp_result) = result.components.get(component) {
+            for call in &comp_result.hook_calls {
+                if call.kind != HookKind::Custom {
+                    continue;
+                }
+                let name = comp_result.hooks.iter().find_map(|h| match h {
+                    HookEntry::Custom { label, name, .. } if *label == call.label => {
+                        Some(name.clone())
+                    }
+                    _ => None,
+                });
+                let name = name.unwrap_or_else(|| format!("<hook:{}>", call.label));
+                let mut d = Diagnostic::new(
+                    "analysis-limit",
+                    format!(
+                        "hook `{name}` not found in registry — \
+                         pass its source file or add a HookSummary to analyse it (FN possible)"
+                    ),
+                )
+                .with_severity(Severity::Info)
+                .with_label(call.label);
+                if let Some(span) = call.span {
+                    d = d.with_range(span);
+                }
+                diags.push(d);
+            }
         }
 
         diags
