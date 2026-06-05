@@ -368,6 +368,7 @@ mod tests {
             hooks: vec![],
             iterations: 0,
             effect_setter_writes: StateStore::bottom(),
+            heap: crate::domains::stores::Heap::new(),
         }
     }
 
@@ -582,6 +583,7 @@ mod tests {
             }],
             iterations: 0,
             effect_setter_writes: StateStore::bottom(),
+            heap: crate::domains::stores::Heap::new(),
         }
     }
 

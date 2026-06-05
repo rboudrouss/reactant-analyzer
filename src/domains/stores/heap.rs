@@ -8,6 +8,8 @@ use crate::{
     },
 };
 
+use super::EnvVal;
+
 /// Value stored at a heap location (indexed by `ExprId` allocation site).
 #[derive(Debug, Clone)]
 pub enum HeapValue {
@@ -18,8 +20,8 @@ pub enum HeapValue {
         /// Free variables captured from the enclosing scope when this function was created.
         captured: HashMap<Symbol, StateValue>,
     },
-    /// Reserved for future object-field domain.
-    Obj(HashMap<Symbol, StateValue>),
+    /// An abstract object: fields may be plain values or heap locations (for FnLit props).
+    Obj(HashMap<Symbol, EnvVal<StateValue>>),
     /// Reserved for future array-index domain.
     Arr(Vec<StateValue>),
 }

@@ -333,6 +333,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         render_cfg,
         hooks: hooks_clone,
         iterations: iteration,
+        heap,
     }
 }
 

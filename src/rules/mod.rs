@@ -24,7 +24,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::{
-    engine::ProgramAnalysisResult,
+    domains::{
+        AbstractEnv, AnalysisCtx, StateValue, StateValueTransfer, Transfer,
+        stores::{EnvVal, Heap, HeapValue, MemoStore, StateStore},
+    },
+    engine::{AnalysisResult, ProgramAnalysisResult},
     ir::{
         SourceRange,
         cfg::{CFG, Terminator},
@@ -183,6 +187,63 @@ pub fn collect_setter_calls_with_extra(
         .collect()
 }
 
+/// Collect variables in `cfg` whose abstract value at any block exit is
+/// `ComponentSetter { component, label }`, or whose Loc in the heap points to a
+/// FnLit that captures a ComponentSetter (e.g. `() => setCount(0)` passed as prop).
+///
+/// Returns `var → (component, label)`.
+///
+/// Used by cross-component rules to find props that are parent setters.
+pub(super) fn collect_component_setter_vars(
+    cfg: &CFG,
+    block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
+    heap: &Heap,
+) -> HashMap<Var, (Symbol, HookLabel)> {
+    let mut var_names: HashSet<Var> = HashSet::new();
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Let { var, .. } | Stmt::Assign { var, .. } => {
+                    var_names.insert(var.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut result: HashMap<Var, (Symbol, HookLabel)> = HashMap::new();
+    for env in block_states.values() {
+        for var in &var_names {
+            if result.contains_key(var) {
+                continue;
+            }
+            // Direct ComponentSetter stab value.
+            if let StateValue::ComponentSetter { component, label } = env.lookup(var) {
+                result.insert(var.clone(), (component, label));
+                continue;
+            }
+            // Loc pointing to a FnLit that captures a ComponentSetter
+            // (e.g. the parent passed `() => setCount(0)` as a prop).
+            if let Some(EnvVal::Loc(ids)) = env.lookup_env_val(var) {
+                for id in ids {
+                    if let Some(HeapValue::Fn { captured, .. }) = heap.get(id) {
+                        for val in captured.values() {
+                            if let StateValue::ComponentSetter { component, label } = val {
+                                result.insert(var.clone(), (component.clone(), *label));
+                                break;
+                            }
+                        }
+                    }
+                    if result.contains_key(var) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
 /// Scan all Let stmts in `cfg` for `let X = FnLit{...}` and return X → body_cfg.
 pub(super) fn collect_fn_bindings(cfg: &CFG) -> HashMap<Var, Arc<CFG>> {
     let mut map: HashMap<Var, Arc<CFG>> = HashMap::new();
@@ -292,11 +353,24 @@ fn check_expr_for_setters(
                 found.entry(name.clone()).or_insert((stmt_span, block_id));
             }
             // B6: direct call to a locally-bound function — descend its body.
-            // That body is a nested FnLit CFG → top_level = false.
+            // The call site IS in the top-level CFG, so propagate the outer block_id to
+            // any setters found inside the body (enables Error severity when unconditional).
             if depth > 0
                 && let Some(body) = fn_bindings.get(name)
             {
-                collect_setter_calls_inner(body, setter_vars, depth - 1, fn_bindings, found, false);
+                let mut inner: HashMap<Var, (Option<SourceRange>, Option<BlockId>)> =
+                    HashMap::new();
+                collect_setter_calls_inner(
+                    body,
+                    setter_vars,
+                    depth - 1,
+                    fn_bindings,
+                    &mut inner,
+                    false,
+                );
+                for (var, (span, _)) in inner {
+                    found.entry(var).or_insert((span, block_id));
+                }
             }
         }
         for arg in args {
@@ -333,6 +407,30 @@ fn check_expr_for_setters(
             }
         }
     }
+}
+
+/// Returns `true` when every expression in `deps` evaluates to an unstable abstract
+/// value in the render-exit env.  An entirely-unstable deps array does not scope the
+/// hook — it runs on every render, equivalent to having no deps argument at all.
+///
+/// An empty `deps` slice returns `false` (mount-only `[]` is not "all-unstable").
+pub(super) fn all_deps_unstable(deps: &[Expr], result: &AnalysisResult<StateValue>) -> bool {
+    if deps.is_empty() {
+        return false;
+    }
+    let exit_env = result.exit_env();
+    let transfer = StateValueTransfer;
+    deps.iter().all(|dep| {
+        let mut s: StateStore<StateValue> = result.state_store.clone();
+        let mut m: MemoStore<StateValue> = result.memo_store.clone();
+        let mut h = Heap::new();
+        let val = transfer.eval_expr(
+            dep,
+            &exit_env,
+            &mut AnalysisCtx::null(&mut s, &mut m, &mut h),
+        );
+        val.is_unstable()
+    })
 }
 
 /// Instantiate all built-in rules.

@@ -10,15 +10,18 @@ use crate::{
     },
 };
 
-use super::{Diagnostic, Rule, Severity, collect_setter_calls};
+use super::{Diagnostic, Rule, Severity, collect_component_setter_vars, collect_setter_calls};
 
-/// Fires when any state setter is called directly in the render body.
+/// Fires when a state setter is called directly in the render body — either a
+/// local setter (`StateSetter`) or a parent-component setter passed as a prop.
 ///
-/// Severity depends on path coverage:
-/// - `Error`   — setter's block dominates ALL exit blocks (executes on every
-///               render path → definitely a bug).
-/// - `Warning` — setter's block is on a conditional path, or the call is
-///               inside a nested FnLit (separate CFG; dominance unknowable).
+/// Rule names emitted in diagnostics:
+/// - `"setter-in-render"`        — local `useState` setter called in render.
+/// - `"cross-setter-in-render"`  — parent's setter (prop) called in render.
+///
+/// Severity:
+/// - `Error`   — call block dominates all render exits (unconditional).
+/// - `Warning` — conditional path or nested FnLit (dominance unknowable).
 pub struct SetterInRender;
 
 impl Rule for SetterInRender {
@@ -27,58 +30,56 @@ impl Rule for SetterInRender {
     }
 
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
-        let result = &result.components[component];
-        // Collect setter variable names from render CFG (let setX = StateSetter(label)).
-        let setter_vars: HashSet<Var> = result
-            .render_cfg
-            .blocks
-            .values()
-            .flat_map(|b| b.stmts.iter())
-            .filter_map(|stmt| {
-                if let Stmt::Let {
-                    var,
-                    rhs: Expr::StateSetter(_),
-                    ..
-                } = stmt
-                {
-                    Some(var.clone())
-                } else {
-                    None
-                }
-            })
+        let comp_result = &result.components[component];
+
+        // Local setters: `let setX = StateSetter(label)` bindings.
+        let local_setter_info: HashMap<Var, (HookLabel, Option<crate::ir::SourceRange>)> =
+            comp_result
+                .render_cfg
+                .blocks
+                .values()
+                .flat_map(|b| b.stmts.iter())
+                .filter_map(|stmt| {
+                    if let Stmt::Let {
+                        var,
+                        rhs: Expr::StateSetter(label),
+                        ..
+                    } = stmt
+                    {
+                        let span = comp_result
+                            .hook_calls
+                            .iter()
+                            .find(|c| c.label == *label)
+                            .and_then(|c| c.span);
+                        Some((var.clone(), (*label, span)))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+        // Cross-component setters: props whose abstract value is ComponentSetter
+        // (direct or via a FnLit wrapping one).
+        // Filter out self-references: StateSetter evaluates to ComponentSetter{component:self}
+        // in inter context, so local setters (and FnLits capturing them) must be excluded.
+        let cs_vars: HashMap<Var, (crate::ir::types::Symbol, crate::ir::types::HookLabel)> =
+            collect_component_setter_vars(
+                &comp_result.render_cfg,
+                &comp_result.block_states,
+                &comp_result.heap,
+            )
+            .into_iter()
+            .filter(|(_, (parent_comp, _))| parent_comp != component)
             .collect();
 
-        if setter_vars.is_empty() {
+        let mut all_setter_vars: HashSet<Var> = local_setter_info.keys().cloned().collect();
+        all_setter_vars.extend(cs_vars.keys().cloned());
+
+        if all_setter_vars.is_empty() {
             return vec![];
         }
 
-        // Build setter name → (state label, hook call span) for richer diagnostics.
-        let setter_info: HashMap<Var, (HookLabel, Option<crate::ir::SourceRange>)> = result
-            .render_cfg
-            .blocks
-            .values()
-            .flat_map(|b| b.stmts.iter())
-            .filter_map(|stmt| {
-                if let Stmt::Let {
-                    var,
-                    rhs: Expr::StateSetter(label),
-                    ..
-                } = stmt
-                {
-                    let span = result
-                        .hook_calls
-                        .iter()
-                        .find(|c| c.label == *label)
-                        .and_then(|c| c.span);
-                    Some((var.clone(), (*label, span)))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Exit blocks — for dominance check.
-        let exits: Vec<BlockId> = result
+        let exits: Vec<BlockId> = comp_result
             .render_cfg
             .blocks
             .values()
@@ -86,31 +87,50 @@ impl Rule for SetterInRender {
             .map(|b| b.id)
             .collect();
 
-        collect_setter_calls(&result.render_cfg, &setter_vars, 1)
+        collect_setter_calls(&comp_result.render_cfg, &all_setter_vars, 2)
             .into_iter()
             .map(|call| {
-                // Error iff setter's block dominates ALL exits (always executed).
-                // If block_id is None (nested FnLit), we can't prove it → Warning.
                 let severity = match call.block_id {
-                    Some(bid) if exits.iter().all(|&e| dominates(&result.render_cfg, bid, e)) => {
+                    Some(bid)
+                        if exits
+                            .iter()
+                            .all(|&e| dominates(&comp_result.render_cfg, bid, e)) =>
+                    {
                         Severity::Error
                     }
                     _ => Severity::Warning,
                 };
 
-                let mut d = Diagnostic::new(
-                    "setter-in-render",
-                    format!(
-                        "setter `{}` called directly in the render body, \
-                         move this call into a useEffect or an event handler",
-                        call.var
-                    ),
-                )
-                .with_severity(severity);
+                let mut d = if let Some(&(label, _)) = local_setter_info.get(&call.var) {
+                    Diagnostic::new(
+                        "setter-in-render",
+                        format!(
+                            "setter `{}` called directly in the render body, \
+                             move this call into a useEffect or an event handler",
+                            call.var
+                        ),
+                    )
+                    .with_severity(severity)
+                    .with_label(label)
+                } else if let Some((parent_comp, parent_label)) = cs_vars.get(&call.var) {
+                    Diagnostic::new(
+                        "cross-setter-in-render",
+                        format!(
+                            "prop `{}` (setter for `{}` state #{}) called during render of `{}` — \
+                             triggers parent re-render on every render",
+                            call.var, parent_comp, parent_label, component
+                        ),
+                    )
+                    .with_severity(severity)
+                    .with_var(call.var.clone())
+                } else {
+                    Diagnostic::new(
+                        "setter-in-render",
+                        format!("setter `{}` called in the render body", call.var),
+                    )
+                    .with_severity(severity)
+                };
 
-                if let Some(&(label, _)) = setter_info.get(&call.var) {
-                    d = d.with_label(label);
-                }
                 if let Some(r) = call.span {
                     d = d.with_range(r);
                 }
@@ -184,6 +204,7 @@ mod tests {
             hooks,
             iterations: 0,
             effect_setter_writes: StateStore::bottom(),
+            heap: crate::domains::stores::Heap::new(),
         }
     }
 
@@ -310,6 +331,7 @@ mod tests {
             },
             hooks: vec![],
             iterations: 0,
+            heap: crate::domains::stores::Heap::new(),
         };
         let diags = SetterInRender.check(&prog("C", &result), &"C".to_string());
         assert_eq!(diags.len(), 1);

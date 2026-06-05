@@ -154,8 +154,14 @@ fn eval_comp_app(
         return StateValue::Reference(Stability::Stable);
     };
 
-    // Evaluate props → abstract map
-    let abstract_props = eval_props_map(props_expr, env, ctx);
+    // Evaluate props → abstract map (EnvVals, preserving heap Locs for FnLit props)
+    let abstract_props_full = eval_props_map(props_expr, env, ctx);
+
+    // Flatten to StateValues for cache lookup and call graph recording
+    let abstract_props: HashMap<Symbol, StateValue> = abstract_props_full
+        .iter()
+        .map(|(k, ev)| (k.clone(), ev.as_val()))
+        .collect();
 
     // Cache lookup (strict equality)
     if inter.cache.borrow().lookup(name, &abstract_props).is_some() {
@@ -165,13 +171,22 @@ fn eval_comp_app(
     }
     inter.stats.borrow_mut().cache_misses += 1;
 
-    // Build child initial env + heap: bind param loc to abstract props object.
-    // The props heap entry goes into initial_heap (not the parent heap), so the
-    // child's fresh heap starts with it and eval_field_access can resolve it.
+    // Build child initial env + heap:
+    // - copy heap entries for any Loc-valued props (FnLit bodies) into child's heap
+    // - insert the Obj (with full EnvVals) so the child can resolve FieldAccess → Loc
     let mut child_env = AbstractEnv::bottom();
     let props_id = ExprId::fresh();
     let mut initial_heap = crate::domains::stores::Heap::new();
-    initial_heap.insert(props_id, HeapValue::Obj(abstract_props.clone()));
+    for ev in abstract_props_full.values() {
+        if let EnvVal::Loc(ids) = ev {
+            for &id in ids {
+                if let Some(hv) = ctx.heap.get(id) {
+                    initial_heap.insert(id, hv.clone());
+                }
+            }
+        }
+    }
+    initial_heap.insert(props_id, HeapValue::Obj(abstract_props_full.clone()));
     child_env.extend_loc(child_ir.param.clone(), props_id);
 
     // Create child inter context and analyze
@@ -208,7 +223,9 @@ fn eval_field_access(
             .iter()
             .filter_map(|id| ctx.heap.get(*id))
             .filter_map(|hv| match hv {
-                HeapValue::Obj(fields) => fields.get(field).cloned(),
+                HeapValue::Obj(fields) => {
+                    fields.get(field).map(|ev| env_val_to_state_value(ev, ctx))
+                }
                 _ => None,
             })
             .collect();
@@ -219,16 +236,63 @@ fn eval_field_access(
     StateValue::Top
 }
 
+/// Convert an `EnvVal` stored in a heap `Obj` field to a `StateValue`.
+///
+/// For `Val(sv)` → `sv` directly.
+/// For `Loc(ids)` → `Top` (the Loc represents a FnLit; its stability is unknown
+/// without further analysis; callers that need to resolve the Loc should use
+/// `env.lookup_env_val` and the Loc propagation in `exec_stmt_core`).
+fn env_val_to_state_value(ev: &EnvVal<StateValue>, _ctx: &AnalysisCtx<StateValue>) -> StateValue {
+    ev.as_val()
+}
+
 /// Extract per-field abstract values from a props expression.
+/// Returns `EnvVal`s so that heap locations (FnLit props) can be propagated into the child.
+///
+/// Three cases for each field value:
+/// 1. `Var(x)` → forward the Loc (and setter binding) from the parent's env if available.
+/// 2. `FnLit { id, .. }` → allocate a heap entry and return `EnvVal::Loc(id)` so the child
+///    can inline the callback body (important for `CrossSetterInRender` and similar rules).
+/// 3. Everything else → plain `EnvVal::Val`.
 fn eval_props_map(
     props_expr: &Expr,
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
-) -> HashMap<Symbol, StateValue> {
+) -> HashMap<Symbol, EnvVal<StateValue>> {
+    use crate::ir::free_vars::compute_free_vars;
     match props_expr {
         Expr::ObjectLit { fields, .. } => fields
             .iter()
-            .map(|(k, v)| (k.clone(), eval_state_value(v, env, ctx)))
+            .map(|(k, v)| {
+                let env_val = if let Expr::Var(var_name) = v {
+                    env.lookup_env_val(var_name)
+                        .unwrap_or_else(|| EnvVal::Val(eval_state_value(v, env, ctx)))
+                } else if let Expr::FnLit {
+                    id,
+                    params,
+                    body_cfg,
+                } = v
+                {
+                    // Inline FnLit prop: allocate a heap entry so the child can inline it.
+                    let free = compute_free_vars(body_cfg);
+                    let captured = free
+                        .iter()
+                        .filter_map(|v| env.lookup(v).as_state_value().map(|sv| (v.clone(), sv)))
+                        .collect();
+                    ctx.heap.insert(
+                        *id,
+                        HeapValue::Fn {
+                            params: params.clone(),
+                            body_cfg: std::sync::Arc::clone(body_cfg),
+                            captured,
+                        },
+                    );
+                    EnvVal::Loc(std::iter::once(*id).collect())
+                } else {
+                    EnvVal::Val(eval_state_value(v, env, ctx))
+                };
+                (k.clone(), env_val)
+            })
             .collect(),
         _ => HashMap::new(),
     }

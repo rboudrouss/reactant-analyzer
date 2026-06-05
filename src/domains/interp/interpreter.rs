@@ -140,6 +140,23 @@ fn exec_stmt_core<T: Transfer>(
                     env.bind_setter(var.clone(), label);
                 }
             }
+            // Propagate heap locs from field access (e.g. `let f = props.onClick`
+            // where onClick is a FnLit stored in the parent's heap under the Obj).
+            if let Expr::FieldAccess { obj, field } = rhs {
+                if let Expr::Var(v) = obj.as_ref() {
+                    if let Some(EnvVal::Loc(obj_ids)) = env.lookup_env_val(v) {
+                        for obj_id in obj_ids.iter().copied().collect::<Vec<_>>() {
+                            if let Some(HeapValue::Obj(fields)) = ctx.heap.get(obj_id) {
+                                if let Some(EnvVal::Loc(field_ids)) = fields.get(field) {
+                                    for &fid in field_ids {
+                                        env.extend_loc(var.clone(), fid);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let val = transfer.eval_expr(rhs, env, ctx);
             env.extend(var.clone(), val);
         }
@@ -167,6 +184,23 @@ fn exec_stmt_core<T: Transfer>(
                         captured,
                     },
                 );
+            }
+            // Propagate heap locs from field access (e.g. `let f = props.onClick`
+            // where onClick is a FnLit stored in the parent's heap under the Obj).
+            if let Expr::FieldAccess { obj, field } = rhs {
+                if let Expr::Var(v) = obj.as_ref() {
+                    if let Some(EnvVal::Loc(obj_ids)) = env.lookup_env_val(v) {
+                        for obj_id in obj_ids.iter().copied().collect::<Vec<_>>() {
+                            if let Some(HeapValue::Obj(fields)) = ctx.heap.get(obj_id) {
+                                if let Some(EnvVal::Loc(field_ids)) = fields.get(field) {
+                                    for &fid in field_ids {
+                                        env.extend_loc(var.clone(), fid);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             let val = transfer.eval_expr(rhs, env, ctx);
             env.extend(var.clone(), val);

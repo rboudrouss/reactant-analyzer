@@ -14,7 +14,7 @@ use reactant::{
     domains::{
         InterCtx,
         impls::{Stability, StateValue, interval::Interval},
-        stores::{AbstractEnv, MemoStore, SharedStateStore, StateStore},
+        stores::{AbstractEnv, EnvVal, MemoStore, SharedStateStore, StateStore},
     },
     engine::{
         AnalysisResult, AnalysisStats, ComponentCallGraph, ComponentRegistry, Config,
@@ -343,10 +343,10 @@ fn field_access_resolves_abstract_object_in_heap() {
     let mut fields = HashMap::new();
     fields.insert(
         "onClick".to_string(),
-        StateValue::ComponentSetter {
+        EnvVal::Val(StateValue::ComponentSetter {
             component: "Parent".to_string(),
             label: 0,
-        },
+        }),
     );
     heap.insert(ExprId(1), reactant::domains::stores::HeapValue::Obj(fields));
 
@@ -384,7 +384,7 @@ fn field_access_unknown_field_returns_top() {
     let mut fields = HashMap::new();
     fields.insert(
         "onClick".to_string(),
-        StateValue::Reference(Stability::Stable),
+        EnvVal::Val(StateValue::Reference(Stability::Stable)),
     );
     heap.insert(ExprId(1), reactant::domains::stores::HeapValue::Obj(fields));
 

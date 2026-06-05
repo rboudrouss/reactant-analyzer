@@ -14,7 +14,8 @@ use crate::{
 };
 
 use super::{
-    Diagnostic, Rule, collect_fn_bindings, collect_setter_calls, collect_setter_calls_with_extra,
+    Diagnostic, Rule, all_deps_unstable, collect_component_setter_vars, collect_fn_bindings,
+    collect_setter_calls, collect_setter_calls_with_extra,
 };
 
 fn capitalize_first(s: &str) -> String {
@@ -25,12 +26,21 @@ fn capitalize_first(s: &str) -> String {
     }
 }
 
-/// Fires when a state label required widening to converge AND there is an effect
-/// that unconditionally calls the corresponding setter — a potential infinite loop.
+/// Fires when an effect causes an infinite render loop — either intra-component
+/// (local state widens) or cross-component (parent state widens via a setter prop).
 ///
-/// "Unconditionally calls setter" = the entry block of the effect body contains
-/// `ExprStmt(Call(Var(setter_name), [...])) where setter_name is a setter for
-/// the widened state label.
+/// Rule names emitted:
+/// - `"infinite-loop"`               — local state loops.
+/// - `"cross-component-infinite-loop"` — parent's state loops via ComponentSetter prop.
+///
+/// Trigger (applies to both):
+/// - Effect with no deps (`deps: None`) — runs every render.
+/// - Effect with all-unstable deps — equivalent to no-deps.
+/// - Effect with `deps: []` — mount-only, excluded.
+///
+/// Intra confirmation: `widened_labels` non-empty + write unbounded.
+/// Cross confirmation: parent's `widened_labels` contains the setter's label.
+/// If parent not in results (external), cross fires as a Warning heuristic.
 pub struct InfiniteLoop;
 
 impl Rule for InfiniteLoop {
@@ -39,98 +49,159 @@ impl Rule for InfiniteLoop {
     }
 
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
-        let result = &result.components[component];
-        if result.widened_labels.is_empty() {
+        let comp_result = &result.components[component];
+
+        // var → state label for local setters
+        let local_setter_labels: HashMap<Var, HookLabel> = build_setter_var_to_label(comp_result);
+
+        // ComponentSetter-valued props (direct or FnLit-wrapped).
+        // Exclude self-references: StateSetter evaluates to ComponentSetter{component:self}
+        // in inter context, so local setters must stay in local_setter_labels only.
+        let cs_vars: HashMap<Var, (Symbol, HookLabel)> = collect_component_setter_vars(
+            &comp_result.render_cfg,
+            &comp_result.block_states,
+            &comp_result.heap,
+        )
+        .into_iter()
+        .filter(|(_, (parent_comp, _))| parent_comp != component)
+        .collect();
+
+        let mut all_setter_vars: HashSet<Var> = local_setter_labels.keys().cloned().collect();
+        all_setter_vars.extend(cs_vars.keys().cloned());
+
+        if all_setter_vars.is_empty() {
             return vec![];
         }
 
-        // Build map: state_label → set of setter variable names
-        // Gathered from all exit envs in block_states.
-        let setters_for: HashMap<HookLabel, HashSet<Var>> = build_setter_map(result);
-
-        // FnLit bindings from the render body: variables like `const cb = () => setN(n+1)`
-        // defined in render but used via B5 inside effect bodies. Merged into the
-        // effect-local fn_bindings so cross-pass B5 variable callbacks are resolved.
-        let render_fn_bindings: HashMap<Var, Arc<CFG>> = collect_fn_bindings(&result.render_cfg);
-
+        let render_fn_bindings: HashMap<Var, Arc<CFG>> =
+            collect_fn_bindings(&comp_result.render_cfg);
         let mut diags = Vec::new();
 
-        for &state_label in &result.widened_labels {
-            let empty = HashSet::new();
-            let setter_vars = setters_for.get(&state_label).unwrap_or(&empty);
-            if setter_vars.is_empty() {
+        for hook in &comp_result.hooks {
+            let HookEntry::Effect {
+                label: eff_label,
+                body_cfg,
+                deps,
+                ..
+            } = hook
+            else {
+                continue;
+            };
+
+            // Mount-only: fires once, no loop.
+            if matches!(deps, Some(d) if d.is_empty()) {
                 continue;
             }
+            // Non-empty deps with at least one stable value genuinely gate the effect.
+            if let Some(dep_exprs) = deps {
+                if !all_deps_unstable(dep_exprs, comp_result) {
+                    continue;
+                }
+            }
 
-            for hook in &result.hooks {
-                if let HookEntry::Effect {
-                    label: eff_label,
-                    body_cfg,
-                    deps,
-                    ..
-                } = hook
-                {
-                    // deps: Some(vec![]) = runs once on mount only → no cycle possible.
-                    if matches!(deps, Some(d) if d.is_empty()) {
-                        continue;
+            let calls =
+                collect_setter_calls_with_extra(body_cfg, &all_setter_vars, 1, &render_fn_bindings);
+
+            for call in &calls {
+                if let Some(&state_label) = local_setter_labels.get(&call.var) {
+                    // ── Intra ─────────────────────────────────────────────────
+                    if !comp_result.widened_labels.contains(&state_label) {
+                        continue; // state didn't diverge → bounded
+                    }
+                    let writes = comp_result.effect_setter_writes.get(state_label);
+                    if writes != crate::domains::StateValue::Bottom && !writes.is_unbounded() {
+                        continue; // write bounded → narrowing held the growth
                     }
 
-                    if !collect_setter_calls_with_extra(
-                        body_cfg,
-                        setter_vars,
-                        1,
-                        &render_fn_bindings,
+                    let deps_note = if deps.is_some() {
+                        " (all deps unstable — effect runs every render)"
+                    } else {
+                        ""
+                    };
+                    let mut diag = Diagnostic::new(
+                        "infinite-loop",
+                        format!(
+                            "effect {} sets state {}{} which needed widening \
+                             — potential infinite render loop",
+                            eff_label, state_label, deps_note
+                        ),
                     )
-                    .is_empty()
-                    {
-                        // Precision check: if the setter's written value at the fixpoint
-                        // is bounded (no ±∞ in the interval), branch narrowing held the
-                        // growth → not a true infinite loop, skip.
-                        // Bottom = setter not reached in semantic analysis → conservative.
-                        let writes = result.effect_setter_writes.get(state_label);
-                        if writes != crate::domains::StateValue::Bottom && !writes.is_unbounded() {
-                            continue;
-                        }
-                        let mut diag = Diagnostic::new(
-                            "infinite-loop",
-                            format!(
-                                "effect {} sets state {} which needed widening \
-                                 — potential infinite render loop",
-                                eff_label, state_label
-                            ),
-                        )
-                        .with_label(state_label);
+                    .with_label(state_label);
 
-                        if let Some(r) = result.effect_info.get(eff_label).and_then(|i| i.span) {
-                            diag = diag.with_range(r);
-                        }
-
-                        // Attach a note for each handler that also calls this setter.
-                        for h in &result.hooks {
-                            if let HookEntry::Handler {
-                                label: h_label,
-                                event,
-                                body_cfg: h_cfg,
-                                ..
-                            } = h
-                                && !collect_setter_calls(h_cfg, setter_vars, 1).is_empty()
-                            {
-                                let h_span = result.handler_info.get(h_label).and_then(|i| i.span);
-                                diag = diag.with_note(
-                                    format!(
-                                        "handler `on{}` also calls setter — \
-                                             grows state {} range across fixpoint iterations",
-                                        capitalize_first(event),
-                                        state_label
-                                    ),
-                                    Some(*h_label),
-                                    h_span,
-                                );
-                            }
-                        }
-
-                        diags.push(diag);
+                    if let Some(r) = comp_result.effect_info.get(eff_label).and_then(|i| i.span) {
+                        diag = diag.with_range(r);
                     }
+
+                    // Note: handlers also calling this setter.
+                    let setter_vars_for_label: HashSet<Var> = local_setter_labels
+                        .iter()
+                        .filter(|&(_, l)| *l == state_label)
+                        .map(|(v, _)| v.clone())
+                        .collect();
+                    for h in &comp_result.hooks {
+                        if let HookEntry::Handler {
+                            label: h_label,
+                            event,
+                            body_cfg: h_cfg,
+                            ..
+                        } = h
+                            && !collect_setter_calls(h_cfg, &setter_vars_for_label, 1).is_empty()
+                        {
+                            let h_span = comp_result.handler_info.get(h_label).and_then(|i| i.span);
+                            diag = diag.with_note(
+                                format!(
+                                    "handler `on{}` also calls setter — \
+                                     grows state {} range across fixpoint iterations",
+                                    capitalize_first(event),
+                                    state_label
+                                ),
+                                Some(*h_label),
+                                h_span,
+                            );
+                        }
+                    }
+
+                    diags.push(diag);
+                } else if let Some((parent_comp, parent_label)) = cs_vars.get(&call.var) {
+                    // ── Cross-component ────────────────────────────────────────
+                    // Use SharedStateStore as the proof signal: if the child's calls to
+                    // this setter produced an unbounded abstract value, the parent's state
+                    // diverges → proven infinite loop.
+                    // A bounded write (e.g. always `setN(1)`) terminates — React bails out
+                    // when new state equals old state.
+                    let shared_write = result.shared_state.get(parent_comp, *parent_label);
+                    if shared_write == crate::domains::StateValue::Bottom {
+                        continue; // setter not reached in semantic analysis
+                    }
+                    if !shared_write.is_unbounded() {
+                        continue; // write is bounded → no divergence
+                    }
+
+                    let deps_note = if deps.is_some() {
+                        " (all deps unstable — effect runs every render)"
+                    } else {
+                        ""
+                    };
+                    let msg = format!(
+                        "effect {} calls `{}` — setter #{} of parent `{}`{} — \
+                         parent re-renders → child re-renders → effect fires again: infinite loop",
+                        eff_label, call.var, parent_label, parent_comp, deps_note
+                    );
+                    let mut diag = Diagnostic::new("cross-component-infinite-loop", msg)
+                        .with_label(*eff_label);
+
+                    if let Some(r) = comp_result.effect_info.get(eff_label).and_then(|i| i.span) {
+                        diag = diag.with_range(r);
+                    }
+                    diag = diag.with_note(
+                        format!(
+                            "state #{} belongs to parent `{}`",
+                            parent_label, parent_comp
+                        ),
+                        None,
+                        None,
+                    );
+                    diags.push(diag);
                 }
             }
         }
@@ -139,11 +210,9 @@ impl Rule for InfiniteLoop {
     }
 }
 
-/// Collect `state_label → {setter_var_name, ...}` from all exit envs.
-fn build_setter_map(result: &AnalysisResult<StateValue>) -> HashMap<HookLabel, HashSet<Var>> {
-    let mut map: HashMap<HookLabel, HashSet<Var>> = HashMap::new();
-    // Also scan hooks directly for Stability's setter bindings from StateSetter exprs.
-    // The render_cfg contains the setter bindings via `let setN = StateSetter(0)` stmts.
+/// Collect `var → state_label` for all `let var = StateSetter(label)` in render.
+fn build_setter_var_to_label(result: &AnalysisResult<StateValue>) -> HashMap<Var, HookLabel> {
+    let mut map = HashMap::new();
     for block in result.render_cfg.blocks.values() {
         for stmt in &block.stmts {
             if let Stmt::Let {
@@ -152,7 +221,7 @@ fn build_setter_map(result: &AnalysisResult<StateValue>) -> HashMap<HookLabel, H
                 ..
             } = stmt
             {
-                map.entry(*label).or_default().insert(var.clone());
+                map.insert(var.clone(), *label);
             }
         }
     }
@@ -244,6 +313,7 @@ mod tests {
             hooks,
             iterations: 0,
             effect_setter_writes: StateStore::bottom(),
+            heap: crate::domains::stores::Heap::new(),
         }
     }
 

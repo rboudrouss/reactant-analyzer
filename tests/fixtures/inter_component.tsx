@@ -123,11 +123,9 @@ export const Section8_App = () => {
     );
 };
 
-// ── SECTION 9: Setter-in-render via prop (limitation test) ───────────────────
+// ── SECTION 9: cross-setter-in-render — unconditional call ───────────────────
 // Child receives a ComponentSetter as prop and calls it unconditionally in render.
-// Current limitation: setter_in_render rule uses setter_bindings (not ComponentSetter
-// stabs) → rule does NOT fire cross-component. Documents known gap.
-// Expected: no crash, analysis completes normally.
+// cross-setter-in-render must fire on Section9_Child (Error: call dominates all exits).
 
 export const Section9_Child = ({ reset }) => {
     reset(0); // unconditional call in render via ComponentSetter prop
@@ -136,14 +134,13 @@ export const Section9_Child = ({ reset }) => {
 
 export const Section9_Parent = () => {
     const [count, setCount] = React.useState(0);
-    return <Section9_Child reset={setCount} />;
+    return <Section9_Child reset={() => setCount(0)} />;
 };
 
-// ── SECTION 10: No-deps effect calling parent setter (potential infinite loop) ─
-// Child's no-deps effect calls parent's setter every render.
-// Tests that SharedStateStore is updated and parent state re-converges.
-// Note: InfiniteLoop rule may or may not fire depending on widening; key test is
-// that analysis terminates (widening ensures convergence).
+// ── SECTION 10: cross-component-infinite-loop — no-deps effect ───────────────
+// Child's no-deps effect calls parent's setter every render → infinite loop.
+// cross-component-infinite-loop must fire on Section10_InfiniteChild.
+// Analysis must terminate (widening ensures convergence).
 
 export const Section10_InfiniteChild = ({ bump }) => {
     React.useEffect(() => {
@@ -155,6 +152,135 @@ export const Section10_InfiniteChild = ({ bump }) => {
 export const Section10_Parent = () => {
     const [n, setN] = React.useState(0);
     return <Section10_InfiniteChild bump={setN} />;
+};
+
+// ── SECTION 20: cross-setter-in-render — no fire (setter only in event handler)
+// Child receives a ComponentSetter as prop but only uses it in a JSX onClick
+// callback, never calls it directly in the render body.
+// cross-setter-in-render must NOT fire.
+
+export const Section20_SafeChild = ({ onSubmit }) => {
+    return <button onClick={() => onSubmit(1)}>Submit</button>;
+};
+
+export const Section20_Parent = () => {
+    const [submitted, setSubmitted] = React.useState(false);
+    return <Section20_SafeChild onSubmit={setSubmitted} />;
+};
+
+// ── SECTION 21: cross-setter-in-render — conditional call (Warning) ───────────
+// Child calls the ComponentSetter prop only on a conditional path.
+// cross-setter-in-render fires with Warning (not Error): call is conditional.
+
+export const Section21_Child = ({ reset, active }) => {
+    if (active) {
+        reset(0); // conditional call → Warning
+    }
+    return <span/>;
+};
+
+export const Section21_Parent = () => {
+    const [count, setCount] = React.useState(0);
+    return <Section21_Child reset={setCount} active={count > 0} />;
+};
+
+// ── SECTION 22: cross-component-infinite-loop — no fire (mount-only effect) ──
+// Child's effect has deps: [] → fires once on mount, not on every render.
+// cross-component-infinite-loop must NOT fire.
+
+export const Section22_Child = ({ onMount }) => {
+    React.useEffect(() => {
+        onMount(1); // mount-only: deps []
+    }, []);
+    return <span/>;
+};
+
+export const Section22_Parent = () => {
+    const [n, setN] = React.useState(0);
+    return <Section22_Child onMount={setN} />;
+};
+
+// ── SECTION 23: cross-component-infinite-loop — fires (all deps unstable) ─────
+// Child writes n+1 to parent's state via onChange.
+// Parent's n widens → [0,+inf] (unbounded in SharedStateStore).
+// [value] is entirely unstable (Number widens) → effect runs every render.
+// cross-component-infinite-loop must fire.
+
+export const Section23_Child = ({ onChange, value }) => {
+    React.useEffect(() => {
+        onChange(value + 1);
+    }, [value]);
+    return <span/>;
+};
+
+export const Section23_Parent = () => {
+    const [n, setN] = React.useState(0);
+    return <Section23_Child onChange={setN} value={n} />;
+};
+
+// ── SECTION 28: cross-component-infinite-loop — fires (no deps, unbounded write)
+// Child no-deps effect writes `n+1` to parent's state every render.
+// SharedStateStore grows without bound → proven infinite loop.
+
+export const Section28_Child = ({ bump, n }) => {
+    React.useEffect(() => {
+        bump(n + 1); // unbounded increment via no-deps effect
+    });
+    return <span/>;
+};
+
+export const Section28_Parent = () => {
+    const [n, setN] = React.useState(0);
+    return <Section28_Child bump={setN} n={n} />;
+};
+
+// ── SECTION 24: setter-in-render via local wrapper function ──────────────────
+// Component defines a local helper that calls its own setter, then calls
+// that helper unconditionally in render.
+// setter-in-render must fire (Error: unconditional, block_id propagated from B6).
+
+export const Section24_Counter = () => {
+    const [count, setCount] = React.useState(0);
+    const doReset = () => setCount(0); // local wrapper
+    doReset(); // ❌ calls setter indirectly in render
+    return <span>{count}</span>;
+};
+
+// ── SECTION 25: cross-setter-in-render via local wrapper in child ─────────────
+// Child wraps the ComponentSetter prop in a local function, then calls it in render.
+// cross-setter-in-render must fire (Error: unconditional + outer block_id propagated).
+
+export const Section25_Child = ({ reset }) => {
+    const handleReset = () => reset(0); // wraps parent's setter
+    handleReset(); // ❌ calls ComponentSetter indirectly in render
+    return <span/>;
+};
+
+export const Section25_Parent = () => {
+    const [count, setCount] = React.useState(0);
+    return <Section25_Child reset={setCount} />;
+};
+
+// ── SECTION 26: setter-in-render via two-level wrapper (depth=2) ─────────────
+// Two levels of indirection: render calls wrapper1 → wrapper2 → setter.
+// setter-in-render must fire (depth=2 catches it).
+
+export const Section26_Counter = () => {
+    const [n, setN] = React.useState(0);
+    const inner = () => setN(0);
+    const outer = () => inner(); // two-level wrapper
+    outer(); // ❌ setter reached via two B6 steps
+    return <span/>;
+};
+
+// ── SECTION 27: no fire — local wrapper only called in event handler ──────────
+// Local wrapper calls setter, but only from a JSX onClick, not in render body.
+// setter-in-render must NOT fire.
+
+export const Section27_Safe = () => {
+    const [n, setN] = React.useState(0);
+    const handleClick = () => setN(n + 1); // wrapper — only used in onClick
+    return <button onClick={handleClick}>{n}</button>;
 };
 
 // ── SECTION 11: conditional-hook — hook inside condition based on prop ────────

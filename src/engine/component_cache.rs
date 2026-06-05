@@ -166,6 +166,7 @@ mod tests {
             },
             hooks: vec![],
             iterations: 1,
+            heap: crate::domains::stores::Heap::new(),
         }
     }
 

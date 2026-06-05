@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::{
     domains::{
         AbstractDomain,
-        stores::{AbstractEnv, MemoStore, StateStore},
+        stores::{AbstractEnv, Heap, MemoStore, StateStore},
     },
     ir::{
         SourceRange,
@@ -100,6 +100,12 @@ pub struct AnalysisResult<D: AbstractDomain> {
     /// Number of outer fixpoint iterations before convergence.  Useful for
     /// --verbose output and for Info diagnostics about analysis depth.
     pub iterations: usize,
+    /// Final heap after convergence: allocation-site → HeapValue (Fn/Obj/Arr).
+    ///
+    /// Primarily used by rules (e.g. `CrossSetterInRender`) to resolve Loc
+    /// variables in `block_states` to their function bodies and captured envs.
+    /// Defaults to `Heap::new()` for components analyzed without initial heap context.
+    pub heap: Heap,
 }
 
 impl<D: AbstractDomain> AnalysisResult<D> {
