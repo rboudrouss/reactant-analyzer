@@ -18,6 +18,10 @@
 
 ## Périmètre hors scope (futur)
 
-- **Résolution d'imports** — `import { Button } from './Button'` non tracé ; composant absent du registry → `⊤` + Info `analysis-limit` émis. *(ADR-012)*
+- **Analyse cross-fichier (ADR-013)** — résolution d'imports relatifs, symbol graph, module-scoped keying. Couvre les sous-cas suivants :
+  - **Résolution d'imports** — `import { Button } from './Button'` non tracé ; composant absent du registry → `⊤` + Info `analysis-limit` émis. *(ADR-012)*
+  - **Re-export de hook tiers non tracé** — `export let useMyQuery = useQuery` (depuis `@tanstack/react-query`) : le lowering ne reconnaît pas `useMyQuery` comme définition de hook (pas de corps de fonction) → absent du HookRegistry ; import source = fichier local → ne matche pas la SummaryRegistry du package d'origine → `analysis-limit/unknown-hook` Info émis, binding = `⊤`. Fix nécessite résolution d'imports + suivi des alias de re-export.
+  - **Collision de noms** — deux composants `Page` dans deux fichiers distincts (ex. Next.js) → écrasement dans le flat-merge → analyse incorrecte. Fix : keying `(FilePath, Name)`.
+  - **Utilities cross-fichier** — `doOrNot(setX(...))` où `doOrNot` est importé depuis `./helper.ts` → opaque → FP possible sur règles effets. Fix : inlining des utilities dont la source est disponible.
 - **Composants dynamiques** — `const C = cond ? A : B; <C />` → `CompApp` non généré, non analysé.
-- **Plugin système** — Next.js (`pages/`), TanStack (route components) → future extension de `RootDetector`.
+- **Plugin système** — Next.js (`pages/`), TanStack (route components) → future extension de `RootDetector` + `FileDiscoverer`. *(ADR-013)*

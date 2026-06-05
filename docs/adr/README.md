@@ -14,3 +14,4 @@
 | [ADR-010](ADR-010-heap-model.md) | Heap model — ExprId, allocation-site heap, callbacks par variable (B5), inlining local (B6) | Accepté |
 | [ADR-011](ADR-011-source-ranges-diagnostics.md) | Plages source pour diagnostics — `SourceRange` propagé du parse à la sortie | Accepté |
 | [ADR-012](ADR-012-inter-component-analysis.md) | Analyse inter-composants — inlining top-down + `SharedStateStore` | Accepté |
+| [ADR-013](ADR-013-cross-file-analysis.md) | Analyse cross-fichier — résolution d'imports + symbol graph | Proposé |
