@@ -1,90 +1,90 @@
-# ADR-013 : Analyse cross-fichier — résolution d'imports + symbol graph
+# ADR-013: Cross-file analysis — import resolution + symbol graph
 
-- **Statut** : Accepté — Phases 1-4 implémentées (2026-06-06)
-- **Date** : 2026-06-05
+- **Status**: Accepted — Phases 1-4 implemented (2026-06-06)
+- **Date**: 2026-06-05
 
-## Contexte
+## Context
 
-L'analyseur actuel opère en **flat-merge** : l'utilisateur passe explicitement les fichiers à analyser, tous les composants et hooks extraits sont mergés dans un namespace unique keyed par `String`. Cette approche a trois limites concrètes :
+The current analyzer operates as a **flat-merge**: the user explicitly passes the files to analyze, all extracted components and hooks are merged into a single namespace keyed by `String`. This approach has three concrete limits:
 
-1. **Collision de noms** — deux composants `Page()` dans deux fichiers différents (pattern Next.js courant) s'écrasent mutuellement dans le registry → analyse incorrecte ou silencieusement fausse.
-2. **Découverte manuelle** — l'utilisateur doit lister tous les fichiers à la main ou utiliser un glob shell. Un projet de 50 fichiers nécessite un glob fragile.
-3. **Utilities cross-fichier opaques** — `doOrNot(setX(...))` où `doOrNot` provient de `./helper.ts` est modélisé comme un appel opaque → l'analyseur sur-approxime → FP possible (ex. fausse boucle infinie si la utility contient un guard `if (LAUNCH) ...`).
+1. **Name collision** — two `Page()` components in two different files (common Next.js pattern) overwrite each other in the registry → incorrect or silently wrong analysis.
+2. **Manual discovery** — the user must list all files by hand or use a shell glob. A 50-file project requires a fragile glob.
+3. **Cross-file utilities opaque** — `doOrNot(setX(...))` where `doOrNot` comes from `./helper.ts` is modeled as an opaque call → the analyzer over-approximates → possible FP (e.g. false infinite loop if the utility contains a `if (LAUNCH) ...` guard).
 
-L'ADR-012 (inter-component) a explicitement mis la résolution d'imports hors scope. Cet ADR en fait la cible principale.
+ADR-012 (inter-component) explicitly put import resolution out of scope. This ADR makes it the main target.
 
-## Décisions
+## Decisions
 
-### 1. Module-scoped keying : `(PathBuf, String)` au lieu de `String`
+### 1. Module-scoped keying: `(PathBuf, String)` instead of `String`
 
-Tous les registries passent à une clé composite :
+All registries move to a composite key:
 
 ```rust
-// Avant
+// Before
 ComponentRegistry: HashMap<String, ComponentIR>
 HookRegistry:      HashMap<String, HookIR>
 
-// Après
+// After
 ComponentRegistry: HashMap<(PathBuf, String), ComponentIR>
 HookRegistry:      HashMap<(PathBuf, String), HookIR>
-FunctionRegistry:  HashMap<(PathBuf, String), FunctionIR>  // nouveau (§5)
+FunctionRegistry:  HashMap<(PathBuf, String), FunctionIR>  // new (§5)
 ```
 
-`ComponentIR` et `HookIR` reçoivent un champ `file: PathBuf`. Les lookups dans l'engine passent du nom seul à `(file_of_caller, resolved_import_path, name)`.
+`ComponentIR` and `HookIR` receive a `file: PathBuf` field. Lookups in the engine move from name alone to `(file_of_caller, resolved_import_path, name)`.
 
-### 2. Deux traits séparés pour la résolution
+### 2. Two separate traits for resolution
 
 ```rust
-/// Découverte des fichiers à analyser depuis une racine.
+/// Discovery of the files to analyze from a root.
 pub trait FileDiscoverer: Send + Sync {
     fn discover(&self, root: &Path) -> Vec<PathBuf>;
 }
 
-/// Résolution d'un specifier d'import relatif en chemin absolu.
+/// Resolution of a relative import specifier into an absolute path.
 pub trait ImportResolver: Send + Sync {
     fn resolve(&self, from: &Path, specifier: &str) -> Option<PathBuf>;
 }
 ```
 
-Implémentations par défaut :
+Default implementations:
 
-- **`DefaultFileDiscoverer`** : glob récursif `*.ts` / `*.tsx`, exclut `node_modules/`, `*.test.*`, `*.spec.*`, `*.d.ts`.
-- **`DefaultImportResolver`** : tente `<specifier>.ts`, `<specifier>.tsx`, `<specifier>/index.ts`, `<specifier>/index.tsx`. Imports relatifs seulement (starts with `.`). Non-relatifs → `None` (gérés par `SummaryRegistry` via `import_source`).
+- **`DefaultFileDiscoverer`**: recursive glob `*.ts` / `*.tsx`, excludes `node_modules/`, `*.test.*`, `*.spec.*`, `*.d.ts`.
+- **`DefaultImportResolver`**: tries `<specifier>.ts`, `<specifier>.tsx`, `<specifier>/index.ts`, `<specifier>/index.tsx`. Relative imports only (starts with `.`). Non-relative → `None` (handled by `SummaryRegistry` via `import_source`).
 
-Les deux traits peuvent être overridés par un plugin Rust (crate externe implémentant les traits). Pas de config file dans cette phase — si un pattern récurrent émerge (ex. tsconfig `paths` alias), un ADR-014 peut ajouter `ImportResolverConfig`.
+Both traits can be overridden by a Rust plugin (external crate implementing the traits). No config file in this phase — if a recurring pattern emerges (e.g. tsconfig `paths` alias), an ADR-014 can add `ImportResolverConfig`.
 
-### 3. CLI : directory input
+### 3. CLI: directory input
 
 ```
-# Avant : liste explicite de fichiers
+# Before: explicit list of files
 reactant src/app/page.tsx src/components/Button.tsx
 
-# Après : répertoire racine (B) ou fichiers explicites (A)
-reactant src/           # découverte automatique via FileDiscoverer
-reactant src/app/page.tsx src/components/Button.tsx  # conservé, sans découverte
+# After: root directory (B) or explicit files (A)
+reactant src/           # automatic discovery via FileDiscoverer
+reactant src/app/page.tsx src/components/Button.tsx  # preserved, no discovery
 ```
 
-Quand un répertoire est passé : `FileDiscoverer::discover(root)` → liste de fichiers. Quand des fichiers sont passés explicitement : utilisés tels quels, sans découverte supplémentaire. `ImportResolver` est toujours actif pour résoudre les imports dans les fichiers fournis.
+When a directory is passed: `FileDiscoverer::discover(root)` → list of files. When files are passed explicitly: used as-is, without additional discovery. `ImportResolver` is always active to resolve the imports in the provided files.
 
-### 4. Symbol graph (pas file graph)
+### 4. Symbol graph (not file graph)
 
-Le graphe de dépendances est construit au niveau des **symboles** (composants, hooks, fonctions), pas des fichiers. Raison : les imports circulaires entre fichiers sont courants en TypeScript mais les dépendances circulaires entre fonctions React sont quasi-inexistantes (violerait les règles des hooks).
+The dependency graph is built at the **symbol** level (components, hooks, functions), not at the file level. Reason: circular imports between files are common in TypeScript but circular dependencies between React functions are nearly nonexistent (would violate the rules of hooks).
 
-**Pre-pass léger** (sans lowering complet) : pour chaque fichier, scan des `CallExpression` et `Identifier` pour extraire les dépendances directes de chaque fonction :
+**Lightweight pre-pass** (without full lowering): for each file, scan `CallExpression` and `Identifier` to extract each function's direct dependencies:
 
 ```
 SymbolNode = (PathBuf, String, SymbolKind)
 SymbolKind = Component | Hook | Utility
-SymbolGraph: DAG de SymbolNode → Vec<SymbolNode>
+SymbolGraph: DAG of SymbolNode → Vec<SymbolNode>
 ```
 
-**Topo sort** sur le symbol graph → ordre d'analyse. Les feuilles (fonctions sans dépendances dans les registries) sont analysées en premier.
+**Topo sort** on the symbol graph → analysis order. The leaves (functions with no dependencies in the registries) are analyzed first.
 
-**Cycles** : si détectés (ex. deux hooks qui s'appellent mutuellement), traités par le fixpoint existant (même mécanisme que `ComponentCache` pour la récursion composant).
+**Cycles**: if detected (e.g. two hooks calling each other), handled by the existing fixpoint (same mechanism as `ComponentCache` for component recursion).
 
-### 5. FunctionIR et inlining des utilities
+### 5. FunctionIR and utility inlining
 
-Les fonctions utilitaires dont la source est disponible (dans les fichiers découverts) sont lowered en `FunctionIR` :
+Utility functions whose source is available (in the discovered files) are lowered to `FunctionIR`:
 
 ```rust
 pub struct FunctionIR {
@@ -95,76 +95,76 @@ pub struct FunctionIR {
 }
 ```
 
-Dans le fixpoint, les `Call { fn_: Var("doOrNot"), args }` sont résolus via `FunctionRegistry` : si présent, le body CFG est inliné au call site (même mécanisme que `expand_custom_hooks`). Si absent (utility externe, non résolue), comportement actuel : appel opaque → `Top`.
+In the fixpoint, `Call { fn_: Var("doOrNot"), args }` is resolved via `FunctionRegistry`: if present, the body CFG is inlined at the call site (same mechanism as `expand_custom_hooks`). If absent (external utility, unresolved), current behavior: opaque call → `Top`.
 
-Ceci corrige le FP `doOrNot(setX(...))` : le guard `if (LAUNCH) return` est visible dans le body inliné → l'analyseur voit le branchement → `setX` sur chemin mort → pas de mise à jour de state → convergence correcte.
+This fixes the `doOrNot(setX(...))` FP: the `if (LAUNCH) return` guard is visible in the inlined body → the analyzer sees the branching → `setX` on dead path → no state update → correct convergence.
 
-### 6. Analyse eager (pas lazy)
+### 6. Eager analysis (not lazy)
 
-Le graphe complet est construit avant le début de l'analyse :
+The full graph is built before analysis starts:
 
 ```
 1. FileDiscoverer → Vec<PathBuf>
-2. Parse tous les fichiers (rapide — pas de lowering)
-3. Pre-pass symbol extractor → dépendances par symbole
+2. Parse all files (fast — no lowering)
+3. Symbol-extractor pre-pass → dependencies per symbol
 4. Build SymbolGraph + topo sort
-5. Lower + analyser dans l'ordre topo
+5. Lower + analyze in topo order
 ```
 
-Raison : modèle batch actuel conservé, ordre déterministe, cycles gérables avant l'analyse. Le lowering complet (CFG + hooks extraction) n'est fait que pour les fichiers contenant des composants/hooks/utilities React détectés.
+Reason: current batch model preserved, deterministic order, cycles handled before analysis. Full lowering (CFG + hooks extraction) is only done for files containing detected React components/hooks/utilities.
 
-### 7. Imports non résolus
+### 7. Unresolved imports
 
-Si `ImportResolver` retourne `None` pour un specifier :
-- Symbol attendu → `Top` dans le registry
-- `Info` `analysis-limit/unresolved-import` émis (visible avec `--info`)
-- Analyse continue (FP possibles, FN interdits — même politique que l'existant)
+If `ImportResolver` returns `None` for a specifier:
+- Expected symbol → `Top` in the registry
+- `Info` `analysis-limit/unresolved-import` emitted (visible with `--info`)
+- Analysis continues (FPs possible, FNs forbidden — same policy as the existing)
 
-Pas d'erreur fatale : un projet réel peut avoir des imports non résolus (tsconfig aliases, monorepo links) qui ne concernent pas les composants analysés.
+No fatal error: a real project may have unresolved imports (tsconfig aliases, monorepo links) that don't concern the analyzed components.
 
-## Phases d'implémentation
+## Implementation phases
 
-### Phase 1 — Foundation (≈ 2 sem)
-- `src/resolver/` : traits `FileDiscoverer` + `ImportResolver` + implémentations par défaut
-- CLI : accepte directory, utilise `FileDiscoverer`
-- Multi-file parsing eager (fichiers découverts parsés en batch)
-- Flat-merge conservé — régression zéro, comportement inchangé si un seul fichier
+### Phase 1 — Foundation (~2 wk)
+- `src/resolver/`: `FileDiscoverer` + `ImportResolver` traits + default implementations
+- CLI: accepts directory, uses `FileDiscoverer`
+- Eager multi-file parsing (discovered files parsed in batch)
+- Flat-merge preserved — zero regression, unchanged behavior for a single file
 
-### Phase 2 — Module-scoped keying (≈ 2 sem)
-- `file: PathBuf` sur `ComponentIR` / `HookIR`
+### Phase 2 — Module-scoped keying (~2 wk)
+- `file: PathBuf` on `ComponentIR` / `HookIR`
 - Registries → `(PathBuf, String)` keys
-- `ImportResolver` actif pour résoudre les `import { X } from './file'` → `(resolved_path, X)`
+- `ImportResolver` active to resolve the `import { X } from './file'` → `(resolved_path, X)`
 - Symbol graph pre-pass + topo sort
-- Fix collision `Page()` Next.js
+- Fix Next.js `Page()` collision
 
-### Phase 3 — Utility inlining (≈ 1-2 sem)
+### Phase 3 — Utility inlining (~1-2 wk)
 - `FunctionIR` + `FunctionRegistry`
-- Pre-pass étendu aux utilities (non-hook, non-component)
-- Inlining dans le fixpoint via `FunctionRegistry`
+- Pre-pass extended to utilities (non-hook, non-component)
+- Inlining in the fixpoint via `FunctionRegistry`
 
-### Phase 4 — Plugin interface (futur)
-- Exposition publique des traits `FileDiscoverer` + `ImportResolver`
-- Exemple plugin Next.js : `FileDiscoverer` qui trouve tous les `page.tsx` dans `app/`
+### Phase 4 — Plugin interface (future)
+- Public exposure of the `FileDiscoverer` + `ImportResolver` traits
+- Next.js plugin example: `FileDiscoverer` that finds every `page.tsx` in `app/`
 
-## Limites acceptées
+## Accepted limits
 
-Liste consolidée dans [docs/TODO.md](../TODO.md#adr-013--limites-de-lanalyse-cross-fichier). Résumé :
+Consolidated list in [docs/TODO.md](../TODO.md#adr-013--cross-file-analysis-limits). Summary:
 
-- **tsconfig `paths` aliases** — non résolus par `DefaultImportResolver` (`@/components/Button` → `None`). Contournement : `ImportResolver` custom passé à `analyze_with_resolvers` (voir [docs/plugins.md](../plugins.md)).
-- **Re-exports en chaîne** — `export { useMyQuery } from './hooks'` → tracé un niveau si `./hooks` est dans les fichiers découverts ; chaînes profondes peuvent manquer.
-- **`node_modules` utilities/hooks/components** — jamais lowerés (non dans les fichiers découverts) → fallback `SummaryRegistry` pour les hooks, `⊤` pour le reste.
-- **Inlining statement-level uniquement** — calls en position expression restent opaques. Cas typiques : `if (util(x))`, `setX(util(y))`, `arr.map(util)`.
-- **Récursion d'utility** — inlining au plus une fois par CFG (recursion guard).
-- **Closures imbriquées** — seules les fonctions top-level sont lowerées.
-- **`get_by_name` fallback** — quand `resolved_file` est `None`, premier match par ordre de path retenu → résultat non déterministe en cas de collision sans import.
+- **tsconfig `paths` aliases** — not resolved by `DefaultImportResolver` (`@/components/Button` → `None`). Workaround: custom `ImportResolver` passed to `analyze_with_resolvers` (see [docs/plugins.md](../plugins.md)).
+- **Chain re-exports** — `export { useMyQuery } from './hooks'` → traced one level if `./hooks` is in the discovered files; deep chains can be missed.
+- **`node_modules` utilities/hooks/components** — never lowered (not in discovered files) → fallback `SummaryRegistry` for hooks, `⊤` for the rest.
+- **Statement-level inlining only** — calls in expression position stay opaque. Typical cases: `if (util(x))`, `setX(util(y))`, `arr.map(util)`.
+- **Utility recursion** — inlining at most once per CFG (recursion guard).
+- **Nested closures** — only top-level functions are lowered.
+- **`get_by_name` fallback** — when `resolved_file` is `None`, first match by path order kept → non-deterministic result on collision without import.
 
-## Conséquences
+## Consequences
 
-- `src/resolver/` : nouveau module avec traits + implémentations par défaut
-- `src/engine/symbol_graph.rs` : nouveau — symbol graph + topo sort
-- `src/lowering/symbol_extractor.rs` : nouveau — pre-pass léger
-- `src/ir/component.rs`, `src/ir/hook_ir.rs` : ajout `file: PathBuf`
-- `src/ir/function_ir.rs` : nouveau
-- `src/engine/component_registry.rs`, `src/engine/hook_registry.rs` : keys `(PathBuf, String)`
-- `src/engine/fixpoint.rs` : utility inlining, lookups module-scoped
-- `src/main.rs` : directory input, `FileDiscoverer`, pipeline eager
+- `src/resolver/`: new module with traits + default implementations
+- `src/engine/symbol_graph.rs`: new — symbol graph + topo sort
+- `src/lowering/symbol_extractor.rs`: new — lightweight pre-pass
+- `src/ir/component.rs`, `src/ir/hook_ir.rs`: `file: PathBuf` added
+- `src/ir/function_ir.rs`: new
+- `src/engine/component_registry.rs`, `src/engine/hook_registry.rs`: keys `(PathBuf, String)`
+- `src/engine/fixpoint.rs`: utility inlining, module-scoped lookups
+- `src/main.rs`: directory input, `FileDiscoverer`, eager pipeline

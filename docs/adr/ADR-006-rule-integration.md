@@ -1,42 +1,42 @@
-# ADR-006 : Règles comme requêtes post-pass sur AnalysisResult
+# ADR-006: Rules as post-pass queries on AnalysisResult
 
-- **Statut** : Accepté
-- **Date** : 2026-05-29
+- **Status**: Accepted
+- **Date**: 2026-05-29
 
-## Contexte
+## Context
 
-Les règles peuvent être intégrées soit (A) inline pendant le traversal du CFG, soit (B) en post-pass sur le résultat du fixpoint. L'option inline couple les règles aux fonctions de transfert, rendant difficile l'activation/désactivation et les tests indépendants.
+Rules can be integrated either (A) inline during CFG traversal, or (B) as a post-pass on the fixpoint result. The inline option couples rules to transfer functions, making enable/disable and independent testing hard.
 
-## Décision
+## Decision
 
-Les règles sont des fonctions pures `(&AnalysisResult) -> Vec<Warning>`, appliquées après que le fixpoint est atteint.
+Rules are pure functions `(&AnalysisResult) -> Vec<Warning>`, applied after the fixpoint is reached.
 
 ### AnalysisResult
 
 ```rust
 struct AnalysisResult {
-    // Fixpoint final
+    // Final fixpoint
     state_store:    HashMap<HookLabel, AVal>,
     memo_store:     HashMap<HookLabel, MemoState>,
 
-    // État abstrait par bloc (pour règles path-sensitive)
+    // Abstract state per block (for path-sensitive rules)
     block_states:   HashMap<BlockId, AbstractEnv>,
 
-    // Localisation des hooks (pour hook conditionnel)
+    // Hook localization (for conditional hook)
     hook_calls:     Vec<HookCall>,   // { label, kind, block_id, span }
 
-    // Infos corps avec deps (useEffect, useMemo, useCallback)
+    // Body info with deps (useEffect, useMemo, useCallback)
     effect_info:    HashMap<HookLabel, EffectInfo>,  // kind + free_vars + declared_deps
 
-    // Métadonnée widening (pour infinite loop)
+    // Widening metadata (for infinite loop)
     widened_labels: HashSet<HookLabel>,
 
-    // Structure CFG (pour dominance analysis)
+    // CFG structure (for dominance analysis)
     render_cfg:     CFG,
 }
 ```
 
-### Trait Rule
+### Rule trait
 
 ```rust
 trait Rule: Send + Sync {
@@ -45,28 +45,28 @@ trait Rule: Send + Sync {
 }
 ```
 
-### Règles et leur base dans AnalysisResult
+### Rules and their basis in AnalysisResult
 
-| Règle | Données utilisées |
+| Rule | Data used |
 |---|---|
-| Hook conditionnel | `hook_calls[i].block_id` + dominance sur `render_cfg` |
-| Deps manquantes (`useEffect`/`useMemo`/`useCallback`) | `effect_info[ℓ].free_vars` - `effect_info[ℓ].declared_deps` + stability ; le champ `kind` distingue le message |
-| Deps entièrement instables | `effect_info[ℓ].declared_deps` évalué via `eval_expr` sur exit env ; fire si tous `is_unstable()` |
-| `useState` lazy init manquant | `hooks` — match `HookEntry::State { init: Expr::Call, .. }` (struct pur, pas de fixpoint) |
-| setState redondant | `state_store[ℓ]` vs args du setter dans `block_states` |
-| Re-render inutile | `state_store[ℓ]` init vs setter dans effect mount-only |
-| Setter en render | `block_states` + dominance sur `render_cfg` |
-| État dérivé | `hooks` + dominance sur `render_cfg` |
-| Boucle infinie | `widened_labels` + `effect_info[ℓ]` appelle setter de ℓ inconditionnellement |
+| Conditional hook | `hook_calls[i].block_id` + dominance on `render_cfg` |
+| Missing deps (`useEffect`/`useMemo`/`useCallback`) | `effect_info[ℓ].free_vars` - `effect_info[ℓ].declared_deps` + stability; the `kind` field distinguishes the message |
+| Entirely unstable deps | `effect_info[ℓ].declared_deps` evaluated via `eval_expr` on exit env; fires if all `is_unstable()` |
+| Missing `useState` lazy init | `hooks` — match `HookEntry::State { init: Expr::Call, .. }` (pure struct, no fixpoint) |
+| Redundant setState | `state_store[ℓ]` vs setter args in `block_states` |
+| Unnecessary re-render | `state_store[ℓ]` init vs setter in mount-only effect |
+| Setter in render | `block_states` + dominance on `render_cfg` |
+| Derived state | `hooks` + dominance on `render_cfg` |
+| Infinite loop | `widened_labels` + `effect_info[ℓ]` calls setter of ℓ unconditionally |
 
-### Exception : métadonnée de widening
+### Exception: widening metadata
 
-Le seul fait "inline" nécessaire : pendant l'itération du fixpoint, **enregistrer** (pas émettre de warning) si le widening a été appliqué sur un label donné. Ce flag est stocké dans `AnalysisResult.widened_labels`. Le warning final est produit en post-pass par la règle `InfiniteLoop`.
+The only "inline" fact needed: during the fixpoint iteration, **record** (don't emit a warning) whether widening was applied to a given label. This flag is stored in `AnalysisResult.widened_labels`. The final warning is produced in post-pass by the `InfiniteLoop` rule.
 
-## Conséquences
+## Consequences
 
-- `src/rules/` contient une règle par fichier, chacune implémentant `trait Rule`.
-- Les règles sont activables/désactivables indépendamment via config.
-- Chaque règle est testable unitairement avec un `AnalysisResult` fabriqué à la main.
-- L'engine (`src/engine/`) produit `AnalysisResult` et ne connaît pas les règles.
-- L'ajout d'une règle = nouveau fichier dans `src/rules/`, zéro modification de l'engine.
+- `src/rules/` contains one rule per file, each implementing `trait Rule`.
+- Rules can be enabled/disabled independently via config.
+- Each rule is unit-testable with a hand-crafted `AnalysisResult`.
+- The engine (`src/engine/`) produces `AnalysisResult` and doesn't know about rules.
+- Adding a rule = new file in `src/rules/`, zero engine modification.

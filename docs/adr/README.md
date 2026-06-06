@@ -1,17 +1,17 @@
 # ADRs — reactant-analyzer
 
-| ADR | Titre | Statut |
+| ADR | Title | Status |
 |---|---|---|
-| [ADR-001](ADR-001-concrete-semantics.md) | React-tRace comme sémantique concrète | Accepté |
-| [ADR-002](ADR-002-abstract-domains.md) | Stability lattice + 3 stores | Accepté |
-| [ADR-003](ADR-003-ir-design.md) | IR dédié basé sur CFG | Accepté |
-| [ADR-004](ADR-004-component-structure.md) | render_cfg + effect_cfg séparés | Accepté |
-| [ADR-005](ADR-005-analysis-scope.md) | Scope intra-procédural + hook registry | Accepté |
-| [ADR-006](ADR-006-rule-integration.md) | Règles post-pass sur AnalysisResult | Accepté |
-| [ADR-007](ADR-007-cross-domain-queries.md) | Cross-domain queries — AnalysisCtx now, typed Manager later | Accepté |
-| [ADR-008](ADR-008-value-domain.md) | Domaine de valeurs StateValue pour fixpoint SCC (infinite loop) | Accepté |
-| [ADR-009](ADR-009-callback-traversal.md) | Traversée sémantique des callbacks — points d'entrée + classe de déclenchement | Accepté |
-| [ADR-010](ADR-010-heap-model.md) | Heap model — ExprId, allocation-site heap, callbacks par variable (B5), inlining local (B6) | Accepté |
-| [ADR-011](ADR-011-source-ranges-diagnostics.md) | Plages source pour diagnostics — `SourceRange` propagé du parse à la sortie | Accepté |
-| [ADR-012](ADR-012-inter-component-analysis.md) | Analyse inter-composants — inlining top-down + `SharedStateStore` | Accepté |
-| [ADR-013](ADR-013-cross-file-analysis.md) | Analyse cross-fichier — résolution d'imports + symbol graph | Proposé |
+| [ADR-001](ADR-001-concrete-semantics.md) | React-tRace as concrete semantics | Accepted |
+| [ADR-002](ADR-002-abstract-domains.md) | Stability lattice + 3 stores | Accepted |
+| [ADR-003](ADR-003-ir-design.md) | Dedicated CFG-based IR | Accepted |
+| [ADR-004](ADR-004-component-structure.md) | Separate render_cfg + effect_cfg | Accepted |
+| [ADR-005](ADR-005-analysis-scope.md) | Intra-procedural scope + hook registry | Accepted |
+| [ADR-006](ADR-006-rule-integration.md) | Post-pass rules on AnalysisResult | Accepted |
+| [ADR-007](ADR-007-cross-domain-queries.md) | Cross-domain queries — AnalysisCtx now, typed Manager later | Accepted |
+| [ADR-008](ADR-008-value-domain.md) | StateValue value domain for the SCC fixpoint (infinite loop) | Accepted |
+| [ADR-009](ADR-009-callback-traversal.md) | Semantic callback traversal — entry points + trigger class | Accepted |
+| [ADR-010](ADR-010-heap-model.md) | Heap model — ExprId, allocation-site heap, callbacks by variable (B5), local inlining (B6) | Accepted |
+| [ADR-011](ADR-011-source-ranges-diagnostics.md) | Source ranges for diagnostics — `SourceRange` propagated from parse to output | Accepted |
+| [ADR-012](ADR-012-inter-component-analysis.md) | Inter-component analysis — top-down inlining + `SharedStateStore` | Accepted |
+| [ADR-013](ADR-013-cross-file-analysis.md) | Cross-file analysis — import resolution + symbol graph | Accepted |

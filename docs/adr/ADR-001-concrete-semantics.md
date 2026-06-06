@@ -1,33 +1,33 @@
-# ADR-001 : React-tRace comme sémantique concrète de référence
+# ADR-001: React-tRace as reference concrete semantics
 
-- **Statut** : Accepté
-- **Date** : 2026-05-29
+- **Status**: Accepted
+- **Date**: 2026-05-29
 
-## Contexte
+## Context
 
-Un analyseur basé sur l'interprétation abstraite nécessite une sémantique concrète C dont on dérive la sémantique abstraite C#. Sans C explicite, la correction (soundness) de l'analyseur ne peut pas être établie formellement, et les fonctions de transfert sont écrites "au jugé".
+An analyzer based on abstract interpretation requires a concrete semantics C from which one derives the abstract semantics C#. Without an explicit C, the soundness of the analyzer cannot be established formally, and the transfer functions are written by guesswork.
 
-Le papier React-tRace (Lee, Ahn, Yi — OOPSLA 2025) fournit une sémantique opérationnelle formelle des hooks React (`useState`, `useEffect`), prouvée conforme au comportement de React sur une suite de tests empiriques.
+The React-tRace paper (Lee, Ahn, Yi — OOPSLA 2025) provides a formal operational semantics of React hooks (`useState`, `useEffect`), proven conformant with React's behavior on an empirical test suite.
 
-## Décision
+## Decision
 
-React-tRace est adopté comme sémantique concrète C de référence. Les fonctions de transfert abstraites sont dérivées des règles de React-tRace. Les extensions nécessaires (dependency arrays, `useMemo`, `useCallback`, `useRef`, objets) sont spécifiées comme extensions de React-tRace dans `docs/semantics.md`.
+React-tRace is adopted as reference concrete semantics C. The abstract transfer functions are derived from React-tRace's rules. The necessary extensions (dependency arrays, `useMemo`, `useCallback`, `useRef`, objects) are specified as extensions of React-tRace in `docs/semantics.md`.
 
 ## Justification
 
-- React-tRace est la seule formalisation React publiquement disponible avec preuve de conformance.
-- Le modèle Tree Memory + render loop (StepInit → StepEffect → StepCheck) correspond directement à l'itération de fixpoint de notre interpréteur abstrait.
-- Les règles clés (SttReBind, CheckEffect, CheckNoEffect) définissent exactement les conditions de re-render détectables par notre analyse.
-- L'interpréteur React-tRace (OCaml, dépôt `react-trace/`) sert d'oracle de tests.
+- React-tRace is the only publicly available React formalization with a conformance proof.
+- The Tree Memory + render loop model (StepInit → StepEffect → StepCheck) directly corresponds to the fixpoint iteration of our abstract interpreter.
+- The key rules (SttReBind, CheckEffect, CheckNoEffect) define exactly the re-render conditions detectable by our analysis.
+- The React-tRace interpreter (OCaml, `react-trace/` repo) serves as a test oracle.
 
-## Limites acceptées
+## Accepted limits
 
-- React-tRace couvre uniquement `useState` et `useEffect` sans dependency arrays.
-- Leur langage minimal ≠ JS/TS complet — on travaille sur un sous-ensemble maîtrisé.
-- Les extensions hors scope React-tRace sont spécifiées localement sans garantie formelle équivalente.
+- React-tRace only covers `useState` and `useEffect` without dependency arrays.
+- Their minimal language ≠ full JS/TS — we work on a controlled subset.
+- Extensions outside the React-tRace scope are specified locally without an equivalent formal guarantee.
 
-## Conséquences
+## Consequences
 
-- `docs/semantics.md` spécifie les extensions de React-tRace.
-- Les fonctions de transfert dans `src/domains/` citent la règle React-tRace correspondante.
-- Les tests de régression vérifient que l'analyseur abstrait sur-approxime les traces de l'interpréteur React-tRace sur les exemples du papier.
+- `docs/semantics.md` specifies the React-tRace extensions.
+- The transfer functions in `src/domains/` cite the corresponding React-tRace rule.
+- Regression tests verify that the abstract analyzer over-approximates the React-tRace interpreter's traces on the paper's examples.

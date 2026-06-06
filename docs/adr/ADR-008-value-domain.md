@@ -1,76 +1,76 @@
-# ADR-008 : Domaine de valeurs pour le fixpoint SCC — StateValue enum + TypedStateStore
+# ADR-008: Value domain for the SCC fixpoint — StateValue enum + TypedStateStore
 
-- **Statut** : Implémenté (Option A + Option B actifs)
-- **Date** : 2026-06-02
-- **Mis à jour** : 2026-06-04 — `TSType` promu en enum (`Number|Boolean|Str|Reference|Unknown`) ; `HookEntry::State` porte `type_hint: Option<TSType>` capturé depuis l'argument générique TypeScript (`useState<T>()`). `infer_state_type` et le fixpoint utilisent le hint pour surcharger `StateType::Unknown` quand l'init est `null`/`undefined`. Init nulle + hint `Number` → `Number([0,0])` → détection de boucle infinie opérationnelle. Voir section « Handling `int | null` » ci-dessous.
-- **Contexte** : [ADR-007](ADR-007-cross-domain-queries.md) (cross-domain), [ADR-002](ADR-002-abstract-domains.md) (Stability)
+- **Status**: Implemented (Option A + Option B active)
+- **Date**: 2026-06-02
+- **Updated**: 2026-06-04 — `TSType` promoted to an enum (`Number|Boolean|Str|Reference|Unknown`); `HookEntry::State` carries `type_hint: Option<TSType>` captured from the TypeScript generic argument (`useState<T>()`). `infer_state_type` and the fixpoint use the hint to override `StateType::Unknown` when the init is `null`/`undefined`. Null init + `Number` hint → `Number([0,0])` → infinite-loop detection operational. See "Handling `int | null`" section below.
+- **Context**: [ADR-007](ADR-007-cross-domain-queries.md) (cross-domain), [ADR-002](ADR-002-abstract-domains.md) (Stability)
 
-## Contexte
+## Context
 
-La détection de boucles infinies repose sur un fixpoint sur le SCC du graphe
-`Effect → State → Effect`. Le domaine `Stability` ne suffit pas : il converge
-toujours en ≤2 itérations et ne peut pas distinguer `setState(count + 1)`
-(boucle infinie) de `setState(42)` (convergent). Il faut un domaine qui track
-la valeur concrète du state afin de détecter si le fixpoint **widen ou
-converge**.
+Infinite loop detection relies on a fixpoint over the SCC of the
+`Effect → State → Effect` graph. The `Stability` domain isn't enough: it always
+converges in ≤2 iterations and cannot distinguish `setState(count + 1)`
+(infinite loop) from `setState(42)` (convergent). We need a domain that tracks
+the concrete value of the state in order to detect whether the fixpoint
+**widens or converges**.
 
-L'init du useState est déjà présente dans l'IR (`HookEntry::State { init: Expr, .. }`),
-ce qui permet d'inférer le type du state sans annotation supplémentaire.
+The useState init is already present in the IR (`HookEntry::State { init: Expr, .. }`),
+which allows inferring the state's type without additional annotation.
 
-### Le problème des nullable states en JS
+### The nullable-states problem in JS
 
-Un state JS est souvent `T | null | undefined` :
+A JS state is often `T | null | undefined`:
 
 ```js
 const [value, setValue] = useState(null);      // int | null
 const [open, setOpen] = useState(undefined);   // boolean | undefined
 ```
 
-React utilise `Object.is` pour comparer. `Object.is(null, null) === true` donc
-`setState(null)` quand le state est déjà null → **pas de re-render**. Mais
-`setState(42)` quand le state est null → re-render.
+React uses `Object.is` to compare. `Object.is(null, null) === true` so
+`setState(null)` when the state is already null → **no re-render**. But
+`setState(42)` when the state is null → re-render.
 
 ---
 
-## Option A (implémentée) — Enum `StateValue` unifiée
+## Option A (implemented) — Unified `StateValue` enum
 
-`StateValue` est une enum plate représentant toutes les valeurs JS abstraites.
-`Copy` retiré (trop large) — Clone seulement.
+`StateValue` is a flat enum representing all abstract JS values.
+`Copy` removed (too large) — `Clone` only.
 
 ```rust
 #[derive(Debug, Clone, PartialEq)]
 pub enum StateValue {
-    /// ⊥ — chemin non atteignable (distinct de Null).
+    /// ⊥ — unreachable path (distinct from Null).
     Bottom,
-    /// Valeur JS `null` explicite.
+    /// Explicit JS `null` value.
     Null,
-    /// Valeur JS `undefined` explicite.
+    /// Explicit JS `undefined` value.
     Undefined,
-    /// Nombre entier ou flottant dans l'intervalle [lo, hi].
+    /// Integer or float number in the interval [lo, hi].
     Number(Interval),
-    /// Valeur booléenne.
+    /// Boolean value.
     Boolean(BoolVal),
-    /// Chaîne de caractères — ensemble exact de valeurs possibles.
+    /// String — exact set of possible values.
     StrConst(Arc<BTreeSet<String>>),
-    /// Chaîne de caractères — précision perdue (⊤ pour les strings).
+    /// String — precision lost (⊤ for strings).
     Str,
-    /// Référence objet/tableau/fonction — stability de référence.
+    /// Object/array/function reference — reference stability.
     Reference(Stability),
-    /// ⊤ — any JS value, précision perdue.
+    /// ⊤ — any JS value, precision lost.
     Top,
 }
 ```
 
-Note : `StateValue::StrConst` contient directement un `Arc<BTreeSet<String>>`,
-pas le type wrapper `StrConst`. Le widening string est géré par `StrConst`
-(voir Option B / `str_const.rs`), mais le résultat final stocké dans
-`StateValue` est l'arc brut ou `Str` une fois la précision perdue.
+Note: `StateValue::StrConst` contains directly an `Arc<BTreeSet<String>>`,
+not the `StrConst` wrapper type. String widening is handled by `StrConst`
+(see Option B / `str_const.rs`), but the final result stored in
+`StateValue` is the raw arc or `Str` once precision is lost.
 
-Fichiers extraits pour lisibilité :
-- `src/domains/impls/interval.rs` — type `Interval`
-- `src/domains/impls/bool_val.rs` — type `BoolVal`
+Files extracted for readability:
+- `src/domains/impls/interval.rs` — `Interval` type
+- `src/domains/impls/bool_val.rs` — `BoolVal` type
 
-### Lattice et `join`
+### Lattice and `join`
 
 ```
                     Top  (⊤)
@@ -82,7 +82,7 @@ Fichiers extraits pour lisibilité :
             Null  Undefined  Bottom (⊥)
 ```
 
-Règles de `join` :
+`join` rules:
 
 | a | b | join(a, b) |
 |---|---|---|
@@ -92,40 +92,40 @@ Règles de `join` :
 | Null | Undefined | Top |
 | Number(i) | Number(j) | Number(i.join(j)) |
 | Boolean(x) | Boolean(y) | Boolean(x.join(y)) |
-| StrConst(a) | StrConst(b) | StrConst(a ∪ b) ou Str si seuil dépassé |
+| StrConst(a) | StrConst(b) | StrConst(a ∪ b) or Str if threshold exceeded |
 | StrConst(_) | Str | Str |
 | Str | Str | Str |
 | Reference(s) | Reference(t) | Reference(s.join(t)) |
 | **Null \| Undefined** | **Number(i)** | **Top** (¹) |
 | **Number(i)** | **Boolean(x)** | **Top** |
-| tout autre mélange | | Top |
+| any other mix | | Top |
 
-**(¹) Précision perdue pour `int \| null`.** Voir section "Nullable" ci-dessous.
+**(¹) Precision lost for `int \| null`.** See "Nullable" section below.
 
 ### `widen`
 
-- `Number` → interval widening standard : si `lo` décroît → `lo = -∞`, si `hi` croît → `hi = +∞`
-- `Boolean` → `join` (treillis fini, height 2)
-- `StrConst` → `join` puis widen à `Str` si `|set| > 4` (seuil = 4, voir `str_const.rs`)
-- `Str`, `Null`, `Undefined`, `Reference` → `join` (finis)
+- `Number` → standard interval widening: if `lo` decreases → `lo = -∞`, if `hi` grows → `hi = +∞`
+- `Boolean` → `join` (finite lattice, height 2)
+- `StrConst` → `join` then widen to `Str` if `|set| > 4` (threshold = 4, see `str_const.rs`)
+- `Str`, `Null`, `Undefined`, `Reference` → `join` (finite)
 - `Top` → stable
 
-### Narrowing sur les branches
+### Narrowing on branches
 
-Après widening, les conditions de branche raffinent l'état :
+After widening, branch conditions refine the state:
 
 ```
 // useEffect(() => { if (count < 10) setCount(count + 1) })
-// Après widening : count ∈ [0, +∞)
-// Branche taken : count < 10 → narrow → count ∈ [0, 9]
-// Convergence à [0, 9] → pas de boucle infinie
+// After widening: count ∈ [0, +∞)
+// Taken branch: count < 10 → narrow → count ∈ [0, 9]
+// Convergence at [0, 9] → no infinite loop
 ```
 
-Le narrowing est appliqué dans le `exec_stmt` du CFG analyzer quand le
-terminator est un `Branch { cond }`. Le domaine `StateValue::Number(i)` doit
-implémenter `narrow_lt`, `narrow_leq`, `narrow_eq`, etc. sur son `Interval`.
+Narrowing is applied in the CFG analyzer's `exec_stmt` when the
+terminator is a `Branch { cond }`. The `StateValue::Number(i)` domain must
+implement `narrow_lt`, `narrow_leq`, `narrow_eq`, etc. on its `Interval`.
 
-### Inférence de type depuis `init`
+### Type inference from `init`
 
 ```rust
 impl StateValue {
@@ -142,7 +142,7 @@ impl StateValue {
         }
     }
 
-    /// Valeur initiale abstraite du state.
+    /// Abstract initial value of the state.
     pub fn init_value(init: &Expr) -> Self {
         match init {
             Expr::Lit(Prim::Int(n))    => StateValue::Number(Interval::point(*n as f64)),
@@ -160,44 +160,44 @@ impl StateValue {
 }
 ```
 
-### Handling `int | null` et `bool | null`
+### Handling `int | null` and `bool | null`
 
-**Problème** : `join(Null, Number([5,5])) = Top` → précision perdue immédiatement.
+**Problem**: `join(Null, Number([5,5])) = Top` → precision lost immediately.
 
-Dans un SCC comme :
+In an SCC such as:
 ```js
 const [n, setN] = useState(null);
 useEffect(() => { if (n === null) setN(0) }, [n]);
 ```
-- Iter 1 : n = Null → condition true → setN(0) → join(Null, Number([0,0])) = **Top**
-- Iter 2 : n = Top → condition ? → conservative → **Top** (converge)
-- Pas de widening → pas de signal boucle infinie ✓
+- Iter 1: n = Null → condition true → setN(0) → join(Null, Number([0,0])) = **Top**
+- Iter 2: n = Top → condition ? → conservative → **Top** (converges)
+- No widening → no infinite-loop signal ✓
 
-→ Pattern `null → value` non-cyclique : converge à Top, pas de faux positif.
+→ Non-cyclic `null → value` pattern: converges to Top, no false positive.
 
-**Pattern problématique :**
+**Problematic pattern:**
 ```js
 useEffect(() => { if (n !== null) setN(n + 1) }, [n]);
 ```
-- n démarre Null, après premier setter devient Number
-- join(Null, Number([1,1])) = Top → on perd la progression [1,2,3,...]
-- Pas de signal widening → **faux négatif possible** (boucle non détectée)
+- n starts as Null, after the first setter becomes Number
+- join(Null, Number([1,1])) = Top → we lose the [1,2,3,...] progression
+- No widening signal → **possible false negative** (loop not detected)
 
-**Résolution (2026-06-04)** : l'annotation TypeScript `useState<number>(null)` est maintenant capturée.
+**Resolution (2026-06-04)**: the TypeScript annotation `useState<number>(null)` is now captured.
 
-- Le lowering extrait `type_arguments[0]` sur `CallExpression` → `TSAnnotated(Call, TSType::Number)`.
-- `hook_extractor` lit le hint et le stocke dans `HookEntry::State { type_hint: Some(TSType::Number), .. }`.
-- `infer_state_type(Null, Some(TSType::Number))` retourne `StateType::Number` → label routé vers `number_store`.
-- Le fixpoint surcharge l'init : `(StateValue::Null, Some(TSType::Number))` → `Number([0,0])`. L'intervalle peut ensuite progresser et widener normalement.
+- The lowering extracts `type_arguments[0]` on `CallExpression` → `TSAnnotated(Call, TSType::Number)`.
+- `hook_extractor` reads the hint and stores it in `HookEntry::State { type_hint: Some(TSType::Number), .. }`.
+- `infer_state_type(Null, Some(TSType::Number))` returns `StateType::Number` → the label is routed to `number_store`.
+- The fixpoint overrides the init: `(StateValue::Null, Some(TSType::Number))` → `Number([0,0])`. The interval can then progress and widen normally.
 
-**Limite résiduelle** : `useState(null)` *sans* annotation TypeScript → init reste `Null` → `StateType::Unknown` → FN possible. Documenté dans TODO.md.
+**Residual limit**: `useState(null)` *without* a TypeScript annotation → init stays `Null` → `StateType::Unknown` → possible FN. Documented in TODO.md.
 
 ---
 
-## Option B (implémentée) — `TypedStateStore` avec sous-stores spécialisés
+## Option B (implemented) — `TypedStateStore` with specialized sub-stores
 
-Chaque `HookLabel` est associé à un `StateType` inféré statiquement.
-`TypedStateStore` dispatche vers un sous-store spécialisé selon ce type.
+Each `HookLabel` is associated with a statically-inferred `StateType`.
+`TypedStateStore` dispatches to a specialized sub-store based on this type.
 
 ### Structure (`src/domains/stores/typed_state_store.rs`)
 
@@ -208,15 +208,15 @@ pub struct TypedStateStore {
     bool_store:    StateStore<BoolVal>,
     str_store:     StateStore<StrConst>,
     ref_store:     StateStore<Stability>,
-    unknown_store: StateStore<StateValue>,  // fallback / mélange de types
+    unknown_store: StateStore<StateValue>,  // fallback / type mix
 }
 ```
 
-### `get()` — join avec `unknown_store`
+### `get()` — join with `unknown_store`
 
-Pour gérer les labels dont le type change en cours d'itération (type-mismatch),
-`get(label)` joint la valeur du sous-store spécialisé avec celle de
-`unknown_store` :
+To handle labels whose type changes mid-iteration (type mismatch),
+`get(label)` joins the value of the specialized sub-store with the value of
+`unknown_store`:
 
 ```rust
 // pseudo-code
@@ -232,10 +232,10 @@ fn get(&self, label: &HookLabel) -> StateValue {
 }
 ```
 
-Si un setter appelle le label avec un type inattendu, la valeur va dans
-`unknown_store` et remonte via le join → pas de perte silencieuse.
+If a setter calls the label with an unexpected type, the value goes to
+`unknown_store` and bubbles up via the join → no silent precision loss.
 
-### `update()` — dispatch par `(state_type, &val)`
+### `update()` — dispatch by `(state_type, &val)`
 
 ```rust
 fn update(&mut self, label: &HookLabel, val: StateValue) {
@@ -249,11 +249,11 @@ fn update(&mut self, label: &HookLabel, val: StateValue) {
 }
 ```
 
-### Interface Transfer / règles — inchangée
+### Transfer / rules interface — unchanged
 
-`TypedStateStore` est interne au fixpoint dans `analyze_component`.
-Le trait `Transfer` et toutes les règles voient toujours `StateStore<StateValue>`.
-Les méthodes `to_untyped()` / `from_untyped()` assurent la conversion :
+`TypedStateStore` is internal to the fixpoint in `analyze_component`.
+The `Transfer` trait and all rules still see `StateStore<StateValue>`.
+The methods `to_untyped()` / `from_untyped()` handle conversion:
 
 ```rust
 impl TypedStateStore {
@@ -262,7 +262,7 @@ impl TypedStateStore {
 }
 ```
 
-`AnalysisResult::state_store` retourne toujours `StateStore<StateValue>` — API publique inchangée.
+`AnalysisResult::state_store` always returns `StateStore<StateValue>` — public API unchanged.
 
 ### `StrConst` (`src/domains/impls/str_const.rs`)
 
@@ -274,41 +274,41 @@ pub enum StrConst {
 }
 ```
 
-- Seuil de widening : 4 (`|set| > 4` → widen vers `Top`)
-- `str_store` dans `TypedStateStore` utilise `StateStore<StrConst>`
-- Lors de `to_untyped()`, `StrConst::Set(s)` → `StateValue::StrConst(s)`, `StrConst::Top` → `StateValue::Str`
+- Widening threshold: 4 (`|set| > 4` → widen to `Top`)
+- `str_store` in `TypedStateStore` uses `StateStore<StrConst>`
+- During `to_untyped()`, `StrConst::Set(s)` → `StateValue::StrConst(s)`, `StrConst::Top` → `StateValue::Str`
 
 ---
 
-## Signal boucle infinie depuis ce domaine
+## Infinite-loop signal from this domain
 
-Dans le fixpoint SCC :
-- Si `StateStore<StateValue>` **widen** sur un label → état de ce label non convergent → **boucle infinie potentielle**
-- Si convergence sans widening → **pas de boucle infinie**
+In the SCC fixpoint:
+- If `StateStore<StateValue>` **widens** on a label → that label's state is non-convergent → **potential infinite loop**
+- If convergence without widening → **no infinite loop**
 
-Précision par type :
+Precision by type:
 
-| Type state | Détecte `setState(s + 1)` ? | Détecte `setState({...})` ? | `if (s < 10)` converge ? |
+| State type | Detects `setState(s + 1)`? | Detects `setState({...})`? | `if (s < 10)` converges? |
 |---|---|---|---|
-| Number (Interval) | ✓ widening [0,+∞) | n/a | ✓ avec narrowing |
-| Boolean | ✓ oscillation true↔false | n/a | ✓ fini |
-| StrConst | ✓ track ensemble exact, widen → Str au seuil=4 | n/a | n/a |
+| Number (Interval) | ✓ widening [0,+∞) | n/a | ✓ with narrowing |
+| Boolean | ✓ oscillation true↔false | n/a | ✓ finite |
+| StrConst | ✓ tracks exact set, widens → Str at threshold=4 | n/a | n/a |
 | Reference (Stability) | n/a | ✓ Unstable | n/a |
-| Null init → Number | ✗ faux négatif possible | n/a | n/a |
-| Top | ✗ converge immédiatement | ✗ | ✗ |
+| Null init → Number | ✗ possible false negative | n/a | n/a |
+| Top | ✗ converges immediately | ✗ | ✗ |
 
 ---
 
-## Conséquences
+## Consequences
 
-- `src/domains/impls/state_value.rs` — `StateValue` enum (Clone, pas Copy)
-- `src/domains/impls/interval.rs` — type `Interval` extrait
-- `src/domains/impls/bool_val.rs` — type `BoolVal` extrait
-- `src/domains/impls/str_const.rs` — enum `StrConst { Bottom, Set(Arc<BTreeSet<String>>), Top }`, seuil widening = 4
-- `src/domains/stores/typed_state_store.rs` — `TypedStateStore`, interne à `analyze_component`
-- `HookEntry::State { init, type_hint }` — `type_hint` capturé depuis `useState<T>()` par le lowering ; utilisé par `infer_state_type` et le fixpoint pour surcharger l'init nulle
-- `ir/expr.rs` — `TSType` enum (`Number|Boolean|Str|Reference|Unknown`) remplace l'alias `String`
-- `lowering/expr_lower.rs` — `CallExpression` avec `type_arguments` → `TSAnnotated(Call, TSType)`
-- Le fixpoint SCC est **distinct** du fixpoint Stability principal (cf. [ADR-007](ADR-007-cross-domain-queries.md), Option A post-pass)
-- `StateStore<StateValue>` utilisé dans l'API publique ; `TypedStateStore` transparent pour Transfer et les règles
-- Limite résiduelle : `useState(null)` sans annotation TypeScript → `StateType::Unknown` → FN possible (voir TODO.md)
+- `src/domains/impls/state_value.rs` — `StateValue` enum (Clone, not Copy)
+- `src/domains/impls/interval.rs` — `Interval` type extracted
+- `src/domains/impls/bool_val.rs` — `BoolVal` type extracted
+- `src/domains/impls/str_const.rs` — enum `StrConst { Bottom, Set(Arc<BTreeSet<String>>), Top }`, widening threshold = 4
+- `src/domains/stores/typed_state_store.rs` — `TypedStateStore`, internal to `analyze_component`
+- `HookEntry::State { init, type_hint }` — `type_hint` captured from `useState<T>()` by the lowering; used by `infer_state_type` and the fixpoint to override a null init
+- `ir/expr.rs` — `TSType` enum (`Number|Boolean|Str|Reference|Unknown`) replaces the `String` alias
+- `lowering/expr_lower.rs` — `CallExpression` with `type_arguments` → `TSAnnotated(Call, TSType)`
+- The SCC fixpoint is **distinct** from the main Stability fixpoint (cf. [ADR-007](ADR-007-cross-domain-queries.md), Option A post-pass)
+- `StateStore<StateValue>` used in the public API; `TypedStateStore` transparent to Transfer and the rules
+- Residual limit: `useState(null)` without TypeScript annotation → `StateType::Unknown` → possible FN (see TODO.md)

@@ -1,31 +1,31 @@
-# ADR-005 : Scope intra-procédural + hook registry modulaire
+# ADR-005: Intra-procedural scope + modular hook registry
 
-- **Statut** : Accepté
-- **Date** : 2026-05-29
+- **Status**: Accepted
+- **Date**: 2026-05-29
 
-## Contexte
+## Context
 
-Les custom hooks (`use*` fonctions utilisateur) et les hooks de librairies (TanStack Query, React Router, etc.) appellent des hooks natifs mais ne sont pas des composants. L'analyse inter-procédurale (inlining des custom hooks dans les composants appelants) est coûteuse à implémenter et non nécessaire pour détecter les premiers bugs cibles.
+Custom hooks (user-defined `use*` functions) and library hooks (TanStack Query, React Router, etc.) call native hooks but are not components. Inter-procedural analysis (inlining custom hooks into the calling components) is costly to implement and not necessary to detect the first target bugs.
 
-## Décision
+## Decision
 
-### Phase 1 (actuelle) : intra-procédural
+### Phase 1 (current): intra-procedural
 
-Chaque composant et chaque custom hook est analysé indépendamment.  
-Un appel à un hook non reconnu → retour `Unknown` pour toutes les valeurs.  
-Les bugs DANS les custom hooks sont détectés quand on analyse le hook directement.
+Each component and each custom hook is analyzed independently.
+A call to an unrecognized hook → return `Unknown` for all values.
+Bugs INSIDE custom hooks are detected when the hook is analyzed directly.
 
-### Phase inter-composant (implémentée — ADR-012)
+### Inter-component phase (implemented — ADR-012)
 
-Analyse top-down avec inlining de composants enfants, `ComponentSetter` comme valeur abstraite, `SharedStateStore` pour la propagation bidirectionnelle. Voir ADR-012 pour l'architecture complète.
+Top-down analysis with inlining of child components, `ComponentSetter` as abstract value, `SharedStateStore` for bidirectional propagation. See ADR-012 for the full architecture.
 
-### Phase 2 (future) : inlining call-string-1
+### Phase 2 (future): call-string-1 inlining
 
-À chaque appel `useX(args)`, substituer le corps du hook dans le CFG du composant appelant avec les arguments substitués. Depth = 1 (pas d'inlining récursif).
+At each `useX(args)` call, substitute the hook body in the caller component's CFG with the substituted arguments. Depth = 1 (no recursive inlining).
 
 ### Hook Registry
 
-Mécanisme central de modélisation des hooks sans inlining :
+Central mechanism for modeling hooks without inlining:
 
 ```rust
 trait HookModel: Send + Sync {
@@ -44,26 +44,26 @@ struct HookResult {
 }
 ```
 
-**Couches du registre (priorité décroissante) :**
+**Registry layers (decreasing priority):**
 
-1. **Built-in hooks** (toujours actifs) : `useState`, `useEffect`, `useMemo`, `useCallback`, `useRef`, `useContext`, `useReducer`.
-2. **Modules librairie** (activés si dépendance détectée dans `package.json`) : `@tanstack/react-query`, `react-router`, etc.
-3. **Config utilisateur** (fichier `reactant.toml` à la racine) : specs custom pour hooks maison.
-4. **Fallback** : hook non reconnu → `HookResult { return_aval: Unknown, ... }` + warning optionnel.
+1. **Built-in hooks** (always active): `useState`, `useEffect`, `useMemo`, `useCallback`, `useRef`, `useContext`, `useReducer`.
+2. **Library modules** (activated if dependency detected in `package.json`): `@tanstack/react-query`, `react-router`, etc.
+3. **User config** (`reactant.toml` file at root): custom specs for in-house hooks.
+4. **Fallback**: unrecognized hook → `HookResult { return_aval: Unknown, ... }` + optional warning.
 
-**Exemple spec TanStack :**
+**TanStack spec example:**
 ```
 useQuery(queryKey, queryFn, opts) →
-  data:      Stable si queryKey Stable, sinon Unknown
+  data:      Stable if queryKey Stable, else Unknown
   isLoading: Stable (boolean)
   error:     Stable
-  refetch:   Stable (TanStack garantit l'identité)
+  refetch:   Stable (TanStack guarantees identity)
 ```
 
-## Conséquences
+## Consequences
 
-- `src/registry/` contient le trait `HookModel` et les implémentations built-in.
-- `src/registry/tanstack.rs`, `src/registry/react_router.rs` etc. sont des modules optionnels.
-- `src/registry/user_config.rs` parse `reactant.toml`.
-- Le lowering produit `HookCall { name, label, args, deps }` pour tous les hooks — le registre est consulté à l'analyse uniquement.
-- L'inlining (phase 2) s'ajoute dans `src/engine/` sans modifier le registre ni les domaines.
+- `src/registry/` contains the `HookModel` trait and the built-in implementations.
+- `src/registry/tanstack.rs`, `src/registry/react_router.rs` etc. are optional modules.
+- `src/registry/user_config.rs` parses `reactant.toml`.
+- The lowering produces `HookCall { name, label, args, deps }` for all hooks — the registry is consulted at analysis time only.
+- Inlining (phase 2) is added in `src/engine/` without modifying the registry or the domains.

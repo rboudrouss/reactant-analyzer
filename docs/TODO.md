@@ -1,59 +1,59 @@
-# TODO — limites d'analyse restantes
+# TODO — remaining analysis limits
 
-## Faux négatifs connus (FN)
+## Known false negatives (FN)
 
-- **Callees inconnus sans `Loc`** — `myHelper(() => setX())` → FN si `myHelper` est importé depuis un package npm (pas dans les fichiers analysés) ou si l'inlining a été coupé par profondeur. Les utilities **locales** sont désormais inlinées (ADR-013 Phase 3) mais uniquement en position **statement** ; en position expression elles restent opaques. *(ADR-010, ADR-013)*
+- **Unknown callees without `Loc`** — `myHelper(() => setX())` → FN if `myHelper` is imported from an npm package (not in the analyzed files) or if inlining was cut off by depth. **Local** utilities are now inlined (ADR-013 Phase 3) but only in **statement** position; in expression position they stay opaque. *(ADR-010, ADR-013)*
 
-- **`cross-component-infinite-loop` FN si parent analysé intra seulement** — si le composant parent n'est pas atteint par l'analyse top-down (Phase 2 fallback, props = ⊤), le `SharedStateStore` n'est pas peuplé → règle ne fire pas. *(ADR-012)*
+- **`cross-component-infinite-loop` FN if the parent is only analyzed intra** — if the parent component isn't reached by top-down analysis (Phase 2 fallback, props = ⊤), the `SharedStateStore` isn't populated → the rule doesn't fire. *(ADR-012)*
 
-- **`useState(null)` sans annotation TypeScript** — init `Null` sans type hint → `join(Null, Number) = Top` → convergence immédiate → FN possible sur boucles. Atténué : `useState<number>(null)` détecté via le hint TS. *(ADR-008)*
+- **`useState(null)` without a TypeScript annotation** — `Null` init without a type hint → `join(Null, Number) = Top` → immediate convergence → possible FN on loops. Mitigated: `useState<number>(null)` is detected via the TS hint. *(ADR-008)*
 
-- **Valeurs loop-carried dans callback** — `exec_body` ne widen pas sur back-edges → `setX(arr[i])` enregistre valeur partielle. FN mineur sur la *valeur*, jamais de FP. *(ADR-009)*
+- **Loop-carried values inside callbacks** — `exec_body` doesn't widen on back-edges → `setX(arr[i])` records a partial value. Minor FN on the *value*, never an FP. *(ADR-009)*
 
-## Faux positifs connus (FP)
+## Known false positives (FP)
 
-- **`missing-deps` FP sur variables fonction stables** — `const cb = () => setData({loaded: true})` → `Reference(Unstable)` → `missing-deps` fire même si `cb` ne capture aucune valeur mutable. Conservatif acceptable (cf. ESLint rules-of-hooks).
+- **`missing-deps` FP on stable function variables** — `const cb = () => setData({loaded: true})` → `Reference(Unstable)` → `missing-deps` fires even if `cb` captures no mutable value. Conservative, acceptable (cf. ESLint rules-of-hooks).
 
-- **`useState({...})` retourne `Reference(Unstable)`** — l'analyseur ne distingue pas la première création de l'objet (mount) de sa réutilisation cross-render. Conséquence : `[obj]` dans un deps array peut déclencher `always-unstable-deps`. Conservatif acceptable.
+- **`useState({...})` returns `Reference(Unstable)`** — the analyzer doesn't distinguish the first creation of the object (mount) from its reuse cross-render. Consequence: `[obj]` in a deps array can trigger `always-unstable-deps`. Conservative, acceptable.
 
-## ADR-013 — limites de l'analyse cross-fichier
+## ADR-013 — cross-file analysis limits
 
-**Statut** : ADR-013 Phases 1-4 implémentées (cf. [ADR-013](adr/ADR-013-cross-file-analysis.md), [plugins.md](plugins.md)). Les sous-cas restants :
+**Status**: ADR-013 Phases 1-4 implemented (cf. [ADR-013](adr/ADR-013-cross-file-analysis.md), [plugins.md](plugins.md)). The remaining sub-cases:
 
-### Résolution d'imports
+### Import resolution
 
-- **tsconfig `paths` aliases non résolus par défaut** — `@/components/Button` retourne `None` via `DefaultImportResolver` → symbole traité comme externe → opaque. Contournement : implémenter `ImportResolver` custom (voir [docs/plugins.md](plugins.md) §"Wrapping `DefaultImportResolver` for tsconfig paths") puis appeler `analyze_with_resolvers`.
-- **Monorepo `@workspace/*` non résolu** — même cause, même contournement.
-- **Re-exports en chaîne profonde** — `export { X } from './a'` → `'./a'` qui ré-exporte depuis `'./b'` → ré-exports profonds peuvent manquer si la chaîne dépasse un niveau (le lowering ne suit pas les chaînes transitives).
-- **Re-export de hook tiers non tracé** — `export let useMyQuery = useQuery` (depuis `@tanstack/react-query`) : pas de corps de fonction → absent du `HookRegistry` ; import source = fichier local → ne matche pas la `SummaryRegistry` du package d'origine → `analysis-limit/unknown-hook` Info émis, binding = `⊤`. Fix nécessite suivi des alias de re-export.
-- **`node_modules` utilities/hooks/components** — jamais lowerés (non dans les fichiers découverts par `DefaultFileDiscoverer`) → opaque → fallback `SummaryRegistry` (hooks) ou `⊤`.
+- **tsconfig `paths` aliases not resolved by default** — `@/components/Button` returns `None` via `DefaultImportResolver` → the symbol is treated as external → opaque. Workaround: implement a custom `ImportResolver` (see [docs/plugins.md](plugins.md) §"Wrapping `DefaultImportResolver` for tsconfig paths") then call `analyze_with_resolvers`.
+- **Monorepo `@workspace/*` not resolved** — same cause, same workaround.
+- **Deep re-export chains** — `export { X } from './a'` → `'./a'` re-exports from `'./b'` → deep re-exports can be missed if the chain goes beyond one level (the lowering doesn't follow transitive chains).
+- **Re-export of a third-party hook not traced** — `export let useMyQuery = useQuery` (from `@tanstack/react-query`): no function body → absent from `HookRegistry`; import source = local file → doesn't match the `SummaryRegistry` of the origin package → `analysis-limit/unknown-hook` Info emitted, binding = `⊤`. Fixing this requires tracking re-export aliases.
+- **`node_modules` utilities/hooks/components** — never lowered (not in the files discovered by `DefaultFileDiscoverer`) → opaque → fallback to `SummaryRegistry` (hooks) or `⊤`.
 
-### Inlining d'utilities (Phase 3)
+### Utility inlining (Phase 3)
 
-- **Statement-level uniquement** — `doOrNot(setX(...))` comme statement isolé ou `let r = util(...)` est inliné. **Appels en position expression** restent opaques (`Top`) :
-  - `if (util(x)) { ... }` → branche évaluée à `Top` → branches non distinguées
-  - `setX(util(y))` → setter reçoit `Top`
+- **Statement-level only** — `doOrNot(setX(...))` as an isolated statement or `let r = util(...)` is inlined. **Calls in expression position** stay opaque (`Top`):
+  - `if (util(x)) { ... }` → branch evaluated to `Top` → branches not distinguished
+  - `setX(util(y))` → setter receives `Top`
   - `arr.map(util)` → callback opaque
-- **Récursion** — chaque utility est inlinée au plus **une fois** par CFG (guard par `HashSet<Symbol>`). Self-recursive (`A → A`) ou indirect (`A → B → A`) → premier inline OK, les suivants restent en `Call` opaque.
-- **`max_inline_depth = 8`** — budget global de splices par CFG. Au-delà, les utilities restantes restent opaques.
-- **Default-export utilities** — `export default function foo() {...}` non détecté comme utility (le détecteur skip volontairement les default exports — usage rare et nommage ambigu).
-- **Closures imbriquées non extraites** — seules les fonctions top-level (FunctionDeclaration, VariableDeclarator avec arrow/FunctionExpression) sont lowerées. Une utility définie à l'intérieur d'un autre composant/hook reste opaque.
-- **Retour de FnLit dans le corps inliné** — si l'utility retourne une fonction (`function makeHandler() { return () => setX() }`), le `Return` est splicé en `Assign var = FnLit`, mais le call site qui invoque cette FnLit reste un `Call` opaque (la valeur de retour est connue, l'appel ne l'est pas).
+- **Recursion** — each utility is inlined at most **once** per CFG (guarded by `HashSet<Symbol>`). Self-recursive (`A → A`) or indirect (`A → B → A`) → first inline OK, the rest stay as opaque `Call`.
+- **`max_inline_depth = 8`** — global splice budget per CFG. Beyond it, remaining utilities stay opaque.
+- **Default-export utilities** — `export default function foo() {...}` not detected as a utility (the detector intentionally skips default exports — rare usage and ambiguous naming).
+- **Nested closures not extracted** — only top-level functions (FunctionDeclaration, VariableDeclarator with arrow/FunctionExpression) are lowered. A utility defined inside another component/hook stays opaque.
+- **Returning an FnLit inside an inlined body** — if the utility returns a function (`function makeHandler() { return () => setX() }`), the `Return` is spliced as `Assign var = FnLit`, but the call site that invokes this FnLit stays as an opaque `Call` (the return value is known, the call isn't).
 
-### Collision de noms
+### Name collision
 
-- **Premier match arbitraire pour `RootStrategy::Explicit(["Page"])`** — `--entry Page` quand deux fichiers définissent `Page` analyse **les deux**. Pour cibler un seul, passer la forme disambiguée `Page@/abs/path/page.tsx` (visible dans la sortie quand collision détectée).
-- **`get_by_name` legacy** — utilisé en fallback dans `eval_comp_app` et `expand_custom_hooks` quand `resolved_file` n'est pas peuplé (composant cible appelé sans import, ou import non résolu). Retourne le **premier match** par ordre de path → résultat non déterministe au sens utilisateur si plusieurs fichiers partagent le nom et n'ont pas été reliés par import. Atténuation : import explicite + `ImportResolver` qui résout → `resolved_file` rempli → lookup précis.
+- **First arbitrary match for `RootStrategy::Explicit(["Page"])`** — `--entry Page` when two files define `Page` analyzes **both**. To target a single one, pass the disambiguated form `Page@/abs/path/page.tsx` (visible in the output when a collision is detected).
+- **`get_by_name` legacy** — used as a fallback in `eval_comp_app` and `expand_custom_hooks` when `resolved_file` isn't populated (target component called without an import, or unresolved import). Returns the **first match** by path order → non-deterministic from a user perspective if several files share the name and aren't connected by an import. Mitigation: explicit import + `ImportResolver` that resolves → `resolved_file` populated → precise lookup.
 
 ### Plugin interface (Phase 4)
 
-- **Traits sync uniquement** — `FileDiscoverer::discover` et `ImportResolver::resolve` doivent être synchrones. Discovery async (workspace distant) nécessite un wrapper qui bloque sur les futures.
-- **Un seul `ImportResolver` par run** — pas d'override par fichier ; composer manuellement dans une impl custom si besoin.
-- **Eager parsing** — tous les fichiers découverts sont parsés au début, même ceux non atteignables depuis un root. Pas de mode lazy.
+- **Sync traits only** — `FileDiscoverer::discover` and `ImportResolver::resolve` must be synchronous. Async discovery (remote workspace) requires a wrapper that blocks on futures.
+- **One `ImportResolver` per run** — no per-file override; compose manually in a custom impl if needed.
+- **Eager parsing** — all discovered files are parsed up front, even those not reachable from a root. No lazy mode.
 
-## Périmètre hors scope (futur)
+## Out-of-scope perimeter (future)
 
-- **Composants dynamiques** — `const C = cond ? A : B; <C />` → `CompApp` non généré, non analysé.
-- **`React.memo` / `forwardRef` wrappers** — `const Memo = React.memo(function Foo() {...})` → le détecteur de composant ne suit pas l'expression wrappée.
-- **Default-export anonymes** — `export default () => <div/>` mappé sur `"DefaultExport"` ; collisions multi-fichier possibles si plusieurs default-exports anonymes (atténuées par le keying `(file, name)` mais le nom utilisateur reste générique).
-- **Frameworks (Next.js, TanStack Router)** — pas de plugin built-in. Voir [docs/plugins.md](plugins.md) pour écrire un plugin de discovery framework-spécifique.
+- **Dynamic components** — `const C = cond ? A : B; <C />` → `CompApp` not generated, not analyzed.
+- **`React.memo` / `forwardRef` wrappers** — `const Memo = React.memo(function Foo() {...})` → the component detector doesn't follow the wrapped expression.
+- **Anonymous default exports** — `export default () => <div/>` mapped to `"DefaultExport"`; multi-file collisions possible if several anonymous default exports exist (mitigated by `(file, name)` keying but the user-visible name stays generic).
+- **Frameworks (Next.js, TanStack Router)** — no built-in plugin. See [docs/plugins.md](plugins.md) to write a framework-specific discovery plugin.

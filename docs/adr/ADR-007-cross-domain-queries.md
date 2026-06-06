@@ -1,22 +1,22 @@
-# ADR-007 : Cross-domain queries — QueryContext trait (B3 implémenté)
+# ADR-007: Cross-domain queries — QueryContext trait (B3 implemented)
 
-- **Statut** : Implémenté (B3 actif, B1 groundwork en place)
-- **Date** : 2026-06-02
-- **Mise à jour** : 2026-06-03 — `AnalysisCtx<D>` bundle `(state, memo, heap, query)` ; `Transfer` réduit à 3 params.
+- **Status**: Implemented (B3 active, B1 groundwork in place)
+- **Date**: 2026-06-02
+- **Update**: 2026-06-03 — `AnalysisCtx<D>` bundles `(state, memo, heap, query)`; `Transfer` reduced to 3 params.
 
-## Contexte
+## Context
 
-Quand plusieurs domaines abstraits tournent en produit (ex. `Stability × SetterEffect`), le domaine `SetterEffect` a besoin de lire les résultats de `Stability` pour classifier l'argument d'un `setState` :
+When several abstract domains run in product (e.g. `Stability × SetterEffect`), the `SetterEffect` domain needs to read the results of `Stability` to classify the argument of a `setState`:
 
-- `setState({...})` → Stability dit `Unstable` → nouvelle référence garantie → boucle infinie
-- `setState(count + 1)` → Stability dit `Stable`, mais l'AST contient `StateVal(label)` → boucle infinie
-- `setState(42)` → Stability dit `Stable`, pas de `StateVal` → pas forcément une boucle
+- `setState({...})` → Stability says `Unstable` → new reference guaranteed → infinite loop
+- `setState(count + 1)` → Stability says `Stable`, but the AST contains `StateVal(label)` → infinite loop
+- `setState(42)` → Stability says `Stable`, no `StateVal` → not necessarily a loop
 
-Sans accès cross-domaine, `SetterEffect` ne peut pas distinguer ces cas.
+Without cross-domain access, `SetterEffect` cannot distinguish these cases.
 
-### Référence : MOPSA
+### Reference: MOPSA
 
-MOPSA (OCaml) résout ce problème avec un **Manager object** passé à chaque fonction de transfert. Le produit réduit split ce manager en `fst_pair_man` / `snd_pair_man`. La communication cross-domaine passe par `man.ask(Q_some_query)` — un GADT extensible où chaque query a son propre type de retour `'r` :
+MOPSA (OCaml) solves this problem with a **Manager object** passed to each transfer function. The reduced product splits this manager into `fst_pair_man` / `snd_pair_man`. Cross-domain communication goes through `man.ask(Q_some_query)` — an extensible GADT where each query has its own return type `'r`:
 
 ```ocaml
 val ask : ('a,'r) query -> ('a, t) man -> 'a flow -> ('a, 'r) cases option
@@ -26,15 +26,15 @@ type ('a, _) query +=
   | Q_variables_linked_to : expr -> ('a, VarSet.t) query
 ```
 
-Le type de retour est polymorphe (`'r`) et statiquement sûr grâce aux GADTs OCaml. Chaque domaine implémente `ask` pour les queries qu'il sait répondre ; les autres retournent `None`.
+The return type is polymorphic (`'r`) and statically safe thanks to OCaml GADTs. Each domain implements `ask` for the queries it can answer; the others return `None`.
 
 ---
 
-## Decision A : Solution implémentée — `QueryContext` trait (B3)
+## Decision A: Implemented solution — `QueryContext` trait (B3)
 
-Le trait `Transfer` prend `ctx: &dyn QueryContext` — `dyn` (pas `impl`) pour garder `Transfer` object-safe (pas de paramètre générique dans les méthodes).
+The `Transfer` trait takes `ctx: &dyn QueryContext` — `dyn` (not `impl`) to keep `Transfer` object-safe (no generic parameter in methods).
 
-`(state, memo, heap, query)` sont maintenant bundlés dans `AnalysisCtx<D>`, réduisant chaque méthode de 6 → 3 params. `env` reste séparé (mutabilité incompatible entre `eval_expr` `&` et `exec_stmt` `&mut`). `recompute_memo` garde `ctx: &dyn QueryContext` — il n'a pas besoin de state/memo/heap.
+`(state, memo, heap, query)` are now bundled in `AnalysisCtx<D>`, reducing each method from 6 → 3 params. `env` stays separate (mutability incompatible between `eval_expr` `&` and `exec_stmt` `&mut`). `recompute_memo` keeps `ctx: &dyn QueryContext` — it doesn't need state/memo/heap.
 
 ```rust
 pub struct AnalysisCtx<'a, D: AbstractDomain> {
@@ -74,25 +74,25 @@ pub trait Transfer {
 }
 ```
 
-### Trois implémentations de `QueryContext`
+### Three implementations of `QueryContext`
 
-**`NullCtx`** — retourne `Top` pour toute query. Utilisé dans les tests et comme base de récursion dans `recompute_memo`.
+**`NullCtx`** — returns `Top` for any query. Used in tests and as recursion base in `recompute_memo`.
 
-**`FixpointCtx<'a>`** — utilisé pendant le calcul du point fixe. Enveloppe `&StateStore<StateValue>` et `&MemoStore<StateValue>`. Passé à `analyze_cfg`, scopé à chaque appel pour éviter les conflits d'emprunt avec `memo_store.set`.
+**`FixpointCtx<'a>`** — used during fixpoint computation. Wraps `&StateStore<StateValue>` and `&MemoStore<StateValue>`. Passed to `analyze_cfg`, scoped at each call to avoid borrow conflicts with `memo_store.set`.
 
-**`AnalysisQueryCtx<'a>`** — utilisé post-point-fixe. Enveloppe `&AnalysisResult<StateValue>`.
+**`AnalysisQueryCtx<'a>`** — used post-fixpoint. Wraps `&AnalysisResult<StateValue>`.
 
 ---
 
-## Decision B : Migration future — Manager générique (B1)
+## Decision B: Future migration — generic Manager (B1)
 
-### Le problème : les GADTs n'existent pas en Rust
+### The problem: GADTs don't exist in Rust
 
-OCaml permet `type ('a, 'r) query = ..` où `'r` varie par constructeur. Rust n'a pas ce mécanisme.  
-Le naïf ne compile pas :
+OCaml allows `type ('a, 'r) query = ..` where `'r` varies per constructor. Rust has no such mechanism.
+The naive version doesn't compile:
 
 ```rust
-// NE COMPILE PAS
+// DOES NOT COMPILE
 trait DomainQuery {
     type Result;
 }
@@ -105,20 +105,20 @@ struct ProductManager<M1, M2>(M1, M2);
 
 impl<M1: Manager, M2: Manager> Manager for ProductManager<M1, M2> {
     fn ask<Q: DomainQuery>(&self, q: Q) -> Option<Q::Result> {
-        // requires specialization (#31844), unstable depuis 2015
+        // requires specialization (#31844), unstable since 2015
         self.0.ask(q).or_else(|| self.1.ask(q))
-        //                              ^^ q déjà moved
+        //                              ^^ q already moved
     }
 }
 ```
 
-**Deux blocages Rust** :
+**Two Rust blockers**:
 
-1. **`specialization` est unstable** ([tracking issue #31844](https://github.com/rust-lang/rust/issues/31844)). Sans elle, on ne peut pas implémenter `Manager::ask` différemment selon si `M1` connaît le type `Q` ou non.
+1. **`specialization` is unstable** ([tracking issue #31844](https://github.com/rust-lang/rust/issues/31844)). Without it, we cannot implement `Manager::ask` differently depending on whether `M1` knows the type `Q` or not.
 
-2. **Move sémantique** : `q` est moved dans `self.0.ask(q)` avant `self.1.ask(q)`. Contournable avec `Clone` ou en passant `&Q`, mais `Q::Result` peut ne pas être `Clone`.
+2. **Move semantics**: `q` is moved in `self.0.ask(q)` before `self.1.ask(q)`. Workable with `Clone` or by passing `&Q`, but `Q::Result` may not be `Clone`.
 
-### Solution B1 viable en Rust stable : marker types + `where` bounds
+### B1 solution viable in stable Rust: marker types + `where` bounds
 
 ```rust
 struct StabilityOf<'a>(pub &'a Expr);
@@ -145,23 +145,23 @@ where
 }
 ```
 
-**Avantage** : 100% stable Rust, type-safe, zéro overhead runtime.  
-**Limite** : si T1 ne gère pas Q mais T2 le fait, il faut un impl séparé `where T2: Queryable<Q>`. Un macro `impl_queryable_product!` peut générer ça automatiquement.
+**Advantage**: 100% stable Rust, type-safe, zero runtime overhead.
+**Limit**: if T1 doesn't handle Q but T2 does, a separate impl `where T2: Queryable<Q>` is needed. A macro `impl_queryable_product!` can generate that automatically.
 
-Le groundwork existe déjà : `DomainQuery` et `Queryable<Q>` sont définis dans `query.rs` ; `ProductTransfer` délègue via ce trait dans `product.rs`. Aucun type de query concret n'est encore défini — c'est le travail restant.
+The groundwork exists already: `DomainQuery` and `Queryable<Q>` are defined in `query.rs`; `ProductTransfer` delegates via this trait in `product.rs`. No concrete query type is defined yet — that's the remaining work.
 
 ---
 
-## Conséquences
+## Consequences
 
-**Actuel** :
-- `Transfer::eval_expr` / `exec_stmt` prennent `ctx: &mut AnalysisCtx<D>` (3 params au lieu de 6).
-- `AnalysisCtx<D>` contient `state`, `memo`, `heap`, et `query: &dyn QueryContext`.
-- `recompute_memo` prend encore `ctx: &dyn QueryContext` directement (pas besoin de state/memo/heap).
-- `NullCtx` / `FixpointCtx` / `AnalysisQueryCtx` couvrent les trois phases ; accessible via `ctx.query`.
-- `AnalysisCtx::null(state, memo, heap)` est un constructeur pratique pour tests et impls simples.
-- `dyn QueryContext` assure l'object-safety de `Transfer` (pas de monomorphisation par contexte).
+**Current**:
+- `Transfer::eval_expr` / `exec_stmt` take `ctx: &mut AnalysisCtx<D>` (3 params instead of 6).
+- `AnalysisCtx<D>` contains `state`, `memo`, `heap`, and `query: &dyn QueryContext`.
+- `recompute_memo` still takes `ctx: &dyn QueryContext` directly (doesn't need state/memo/heap).
+- `NullCtx` / `FixpointCtx` / `AnalysisQueryCtx` cover the three phases; accessible via `ctx.query`.
+- `AnalysisCtx::null(state, memo, heap)` is a convenient constructor for tests and simple impls.
+- `dyn QueryContext` ensures `Transfer`'s object-safety (no monomorphization per context).
 
-**Reste à faire** :
-- Définir des types de query concrets (`StabilityOf`, etc.) pour les requêtes cross-domaine au-delà de `state_value_of`.
-- Implémenter `Queryable<Q>` sur les transfers concernés et étendre `QueryContext` ou migrer vers le pattern B1 si le nombre de domaines dépasse ~5.
+**Remaining work**:
+- Define concrete query types (`StabilityOf`, etc.) for cross-domain requests beyond `state_value_of`.
+- Implement `Queryable<Q>` on the affected transfers and extend `QueryContext` or migrate to the B1 pattern if the number of domains exceeds ~5.

@@ -1,15 +1,15 @@
-# ADR-002 : Domaines abstraits — stability lattice + 3 stores
+# ADR-002: Abstract domains — stability lattice + 3 stores
 
-- **Statut** : Accepté
-- **Date** : 2026-05-29
+- **Status**: Accepted
+- **Date**: 2026-05-29
 
-## Contexte
+## Context
 
-Le domaine abstrait central doit capturer la propriété React la plus importante pour détecter les re-renders inutiles : **la stabilité de référence**. React utilise `Object.is` pour comparer les valeurs d'état et les props — une nouvelle référence vers un objet structurellement identique déclenche un re-render.
+The central abstract domain must capture the React property most important for detecting unnecessary re-renders: **reference stability**. React uses `Object.is` to compare state and prop values — a new reference to a structurally identical object triggers a re-render.
 
-## Décision
+## Decision
 
-### Treillis principal : Stability
+### Main lattice: Stability
 
 ```
        ⊤ (Unknown)
@@ -19,52 +19,52 @@ Le domaine abstrait central doit capturer la propriété React la plus important
        ⊥ (Bottom)
 ```
 
-- `Stable` : même référence garantie entre deux renders.
-- `Unstable` : nouvelle référence à chaque render (objet/array/fonction non mémoïsée).
-- `Unknown (⊤)` : indéterminé. join(Stable, Unstable) = ⊤.
-- `Bottom (⊥)` : chemin non atteignable.
+- `Stable`: guaranteed same reference between two renders.
+- `Unstable`: new reference on each render (object/array/non-memoized function).
+- `Unknown (⊤)`: undetermined. join(Stable, Unstable) = ⊤.
+- `Bottom (⊥)`: unreachable path.
 
-### Fonctions de transfert statiques
+### Static transfer functions
 
-| Construction | Stabilité |
+| Construction | Stability |
 |---|---|
 | Primitive (`42`, `"x"`, `true`, `null`) | Stable |
 | Object literal `{}` / Array `[]` / `() => {}` | Unstable |
-| `useState` → setter | Stable (garanti par React) |
-| `useState` → valeur | join de tous les args de `setState` |
-| `useRef()` | Stable (objet ref identique) |
+| `useState` → setter | Stable (guaranteed by React) |
+| `useState` → value | join of all `setState` args |
+| `useRef()` | Stable (identical ref object) |
 | `useRef().current` | Unknown |
 | `useMemo(f, deps)` | join(stability(deps)) |
 | `useCallback(f, deps)` | join(stability(deps)) |
-| `f(args)` (non-hook) | Unstable (conservatif) |
+| `f(args)` (non-hook) | Unstable (conservative) |
 | `a ? b : c` | join(stability(b), stability(c)) |
-| `obj.prop` | Unknown (conservatif, pas de points-to) |
-| Annotation TypeScript primitive | hint Stable |
+| `obj.prop` | Unknown (conservative, no points-to) |
+| Primitive TypeScript annotation | Stable hint |
 
-### 3 stores séparés
+### 3 separate stores
 
-Un store unifié forcerait tous les hooks dans le même fixpoint. Les trois types de hooks ont des sémantiques différentes vis-à-vis du cycle de render :
+A unified store would force all hooks into the same fixpoint. The three types of hooks have different semantics relative to the render cycle:
 
-**StateStore** `{ HookLabel → AVal }` — sujet au fixpoint render-loop.  
-Seul store dont la mise à jour déclenche un Check decision (re-render potentiel).
+**StateStore** `{ HookLabel → AVal }` — subject to the render-loop fixpoint.
+Only store whose update triggers a Check decision (potential re-render).
 
-**MemoStore** `{ HookLabel → (deps: Vec<AVal>, val: AVal) }` — calculé depuis les deps.  
-Valeur dérivée fonctionnellement, pas de fixpoint propre. Calculé en une passe après StateStore stabilisé.
+**MemoStore** `{ HookLabel → (deps: Vec<AVal>, val: AVal) }` — computed from deps.
+Value functionally derived, no fixpoint of its own. Computed in one pass after StateStore stabilized.
 
-**RefStore** `{ HookLabel → () }` — trivial.  
-L'objet ref est toujours Stable. `ref.current` n'est pas tracké par React.
+**RefStore** `{ HookLabel → () }` — trivial.
+The ref object is always Stable. `ref.current` is not tracked by React.
 
 ### Widening
 
-Threshold configurable (défaut : 2 itérations avant widening).  
-`widen(Stable, Unstable) = Unknown`. `widen(Const(n), Const(m)) = ⊤` si n ≠ m.  
-Override via config Mopsa-style.
+Configurable threshold (default: 2 iterations before widening).
+`widen(Stable, Unstable) = Unknown`. `widen(Const(n), Const(m)) = ⊤` if n ≠ m.
+Override via Mopsa-style config.
 
-## Conséquences
+## Consequences
 
-- `src/domains/stability.rs` implémente le treillis Stability.
-- `src/domains/state_store.rs`, `memo_store.rs`, `ref_store.rs` implémentent les 3 stores.
-- Chaque domaine implémente le trait `AbstractDomain` (join, meet, widen, subset).
-- Domaines composables en produit réduit via `src/domains/product.rs`.
-- Communication cross-domaine (ex. `SetterEffect` lisant `Stability`) via `AnalysisCtx` struct — voir [ADR-007](ADR-007-cross-domain-queries.md) pour la décision et la migration future vers un Manager générique.
-- Extension future : `SetterEffect` ou `ConstantDomain` ajoutés en produit sans modifier les autres domaines.
+- `src/domains/stability.rs` implements the Stability lattice.
+- `src/domains/state_store.rs`, `memo_store.rs`, `ref_store.rs` implement the 3 stores.
+- Each domain implements the `AbstractDomain` trait (join, meet, widen, subset).
+- Domains composable in reduced product via `src/domains/product.rs`.
+- Cross-domain communication (e.g. `SetterEffect` reading `Stability`) via `AnalysisCtx` struct — see [ADR-007](ADR-007-cross-domain-queries.md) for the decision and the future migration to a generic Manager.
+- Future extension: `SetterEffect` or `ConstantDomain` added in product without modifying the other domains.

@@ -1,20 +1,20 @@
-# ADR-004 : Structure d'un composant — render_cfg + effect_cfg séparés
+# ADR-004: Component structure — separate render_cfg + effect_cfg
 
-- **Statut** : Accepté
-- **Date** : 2026-05-29
+- **Status**: Accepted
+- **Date**: 2026-05-29
 
-## Contexte
+## Context
 
-Chaque composant React a deux phases d'exécution distinctes dans React-tRace : le render (évaluation du corps du composant) et les effets (exécution des useEffect après le render). Ces deux phases correspondent à des CFGs distincts avec des sémantiques différentes vis-à-vis du StateStore.
+Each React component has two distinct execution phases in React-tRace: the render (evaluation of the component body) and the effects (execution of useEffect after the render). These two phases correspond to distinct CFGs with different semantics relative to the StateStore.
 
-Un méta-CFG unifié (render + effets dans un seul graphe avec back-edges render→effect→check) serait plus expressif mais :
-- Crée un graphe de grande taille difficile à maintenir.
-- Rend la séparation sémantique render-time / effect-time implicite.
-- Risque de modélisation incorrecte de l'ordre d'exécution React.
+A unified meta-CFG (render + effects in a single graph with render→effect→check back-edges) would be more expressive but:
+- Creates a large graph that is hard to maintain.
+- Makes the render-time / effect-time semantic separation implicit.
+- Risks incorrect modeling of React's execution order.
 
-## Décision
+## Decision
 
-Chaque composant est représenté par :
+Each component is represented by:
 
 ```rust
 struct ComponentIR {
@@ -34,29 +34,29 @@ enum HookEntry {
 }
 ```
 
-### Cycle d'analyse (correspondance React-tRace)
+### Analysis cycle (React-tRace correspondence)
 
 ```
-Itération fixpoint :
-  1. Analyser render_cfg avec (StateStore_n, AbstractEnv)
-     → produit AbstractEnv_render, nouveaux hook_calls
-  2. Pour chaque Effect dont la décision = Effect :
-     Analyser effect_cfg avec AbstractEnv_render
-     → peut mettre à jour StateStore via appels setter
-  3. StateStore_{n+1} = join(StateStore_n, mises_à_jour_effets)
-  4. Si StateStore_{n+1} ⊑ StateStore_n → fixpoint atteint
-     Sinon : widening si seuil atteint, recommencer
+Fixpoint iteration:
+  1. Analyze render_cfg with (StateStore_n, AbstractEnv)
+     → produces AbstractEnv_render, new hook_calls
+  2. For each Effect whose decision = Effect:
+     Analyze effect_cfg with AbstractEnv_render
+     → may update StateStore via setter calls
+  3. StateStore_{n+1} = join(StateStore_n, effect_updates)
+  4. If StateStore_{n+1} ⊑ StateStore_n → fixpoint reached
+     Else: widening if threshold reached, restart
 ```
 
-Cette structure correspond directement aux transitions StepInit → StepEffect → StepCheck de React-tRace.
+This structure directly corresponds to the StepInit → StepEffect → StepCheck transitions of React-tRace.
 
-### Pourquoi pas de méta-CFG
+### Why no meta-CFG
 
-Les bugs sémantiques ciblés (re-renders inutiles, deps manquantes) sont des propriétés de l'**état** au fixpoint, pas des propriétés de chemins dans un graphe unifié. La séparation render/effect est une invariante sémantique de React (l'effet ne s'exécute jamais pendant le render). La rendre explicite dans la structure de données la préserve sans effort.
+The targeted semantic bugs (unnecessary re-renders, missing deps) are properties of the **state** at the fixpoint, not properties of paths in a unified graph. The render/effect separation is a semantic invariant of React (the effect never executes during the render). Making it explicit in the data structure preserves it without effort.
 
-## Conséquences
+## Consequences
 
-- `src/ir/component.rs` définit `ComponentIR` et `HookEntry`.
-- `src/engine/` implémente le cycle d'analyse (render → effects → check → loop).
-- Les tests peuvent analyser `render_cfg` et `effect_cfg` indépendamment.
-- Extension inter-composant (phase 8) : ajouter des arêtes entre `ComponentIR` dans un call graph, sans modifier la structure interne.
+- `src/ir/component.rs` defines `ComponentIR` and `HookEntry`.
+- `src/engine/` implements the analysis cycle (render → effects → check → loop).
+- Tests can analyze `render_cfg` and `effect_cfg` independently.
+- Inter-component extension (phase 8): add edges between `ComponentIR` in a call graph, without modifying the internal structure.

@@ -1,59 +1,59 @@
-# Utilisation de reactant (ADR-013 — analyse cross-fichier)
+# Using reactant (ADR-013 — cross-file analysis)
 
 ## CLI
 
 ```sh
-# 1) Un ou plusieurs fichiers (mode legacy, toujours supporté)
+# 1) One or several files (legacy mode, still supported)
 cargo run -- src/app/page.tsx src/components/Button.tsx
 
-# 2) Un répertoire (depuis Phase 1, ADR-013)
-#    DefaultFileDiscoverer marche récursivement, exclut node_modules/,
+# 2) A directory (since Phase 1, ADR-013)
+#    DefaultFileDiscoverer walks recursively, excludes node_modules/,
 #    dist/, build/, .next/, *.test.*, *.spec.*, *.d.ts
 cargo run -- src/
 
-# 3) Mélanger fichiers et répertoires
+# 3) Mixing files and directories
 cargo run -- src/app/ src/lib/utils.ts
 ```
 
 ### Flags
 
-| Flag | Effet |
-|------|-------|
-| `--info` | Affiche aussi les diagnostics `Info` (limites connues d'analyse). |
-| `--verbose` | Sur stderr : ordre topologique du symbol graph, nombre d'utilities lowerées, stats de fixpoint. Pratique pour debugger l'inlining. |
-| `--all-roots` | Analyse chaque composant comme un entry point indépendant (`props = ⊤`). |
-| `--entry Foo,Bar` | Force la liste explicite des roots. Quand un nom est ambigu (deux `Page` dans des fichiers différents), les deux sont analysés ; pour cibler un seul, passer la forme `Page@/abs/path/page.tsx` (visible dans la sortie sur collision). |
+| Flag | Effect |
+|------|--------|
+| `--info` | Also display `Info` diagnostics (known analysis limits). |
+| `--verbose` | On stderr: symbol graph topological order, number of lowered utilities, fixpoint stats. Handy when debugging inlining. |
+| `--all-roots` | Analyze every component as an independent entry point (`props = ⊤`). |
+| `--entry Foo,Bar` | Force the explicit list of roots. When a name is ambiguous (two `Page` in different files), both are analyzed; to target a single one, pass the form `Page@/abs/path/page.tsx` (visible in the output on collision). |
 
-### Lecture de la sortie
+### Reading the output
 
 ```
-  Counter  (3 hooks)  ✓             ← composant analysé, pas de diagnostic
-  Counter  (3 hooks)                ← composant avec diagnostics
+  Counter  (3 hooks)  ✓             ← component analyzed, no diagnostic
+  Counter  (3 hooks)                ← component with diagnostics
     warn   infinite-loop  ...
 ```
 
-Quand deux fichiers définissent un composant du même nom, la sortie disambigue automatiquement :
+When two files define a component with the same name, the output disambiguates automatically:
 
 ```
   Page@tests/fixtures/page_collision/users/page.tsx  (2 hooks)
     warn   infinite-loop  ...
 ```
 
-Le **suffixe `@<file>`** n'apparaît que sur collision. Un projet sans collision continue d'afficher juste `Page`, `Counter`, etc.
+The **`@<file>` suffix** only appears on collision. A project without collisions still displays just `Page`, `Counter`, etc.
 
-## Cas d'usage couverts par les fixtures (`tests/fixtures/`)
+## Use cases covered by the fixtures (`tests/fixtures/`)
 
-| Fixture | Démontre |
-|---------|----------|
-| `counter.tsx`, `bugs.tsx`, ... (fichiers historiques) | Détection intra-composant — règles `infinite-loop`, `missing-deps`, `setter-in-render`, etc. |
-| `inter_component.tsx` | Analyse inter-composant top-down (ADR-012). |
-| `page_collision/{users,posts}/page.tsx` | **ADR-013 §1** — deux `Page` Next.js coexistent ; la version buggy est flaggée sans écraser la clean. |
-| `cross_file_hook/page.tsx` + `hooks/useData.ts` | **ADR-013 §2** — `useData` importé via `./hooks/useData` est lookuppé par `(file, name)` et inliné ; le bug dans son body remonte sur `Page`. |
-| `utility_inlining/same_file.tsx` | **ADR-013 Phase 3** — utility `bump(setC, 1)` inlinée au statement-level dans le même fichier. |
-| `utility_inlining/guarded_setter.tsx` | **ADR-013 Phase 3 limite** — le guard `if (!LAUNCH) return` est splicé, mais `() => setC(c+1)` en arg reste opaque (call en position expression). |
-| `utility_inlining_cross_file/page.tsx` + `lib/helpers.ts` | **ADR-013 Phase 3** — utility importée depuis un fichier sibling, résolue par `ImportResolver` puis inlinée. |
+| Fixture | Demonstrates |
+|---------|--------------|
+| `counter.tsx`, `bugs.tsx`, ... (historical files) | Intra-component detection — `infinite-loop`, `missing-deps`, `setter-in-render`, etc. |
+| `inter_component.tsx` | Top-down inter-component analysis (ADR-012). |
+| `page_collision/{users,posts}/page.tsx` | **ADR-013 §1** — two `Page` Next.js components coexist; the buggy version is flagged without overwriting the clean one. |
+| `cross_file_hook/page.tsx` + `hooks/useData.ts` | **ADR-013 §2** — `useData` imported via `./hooks/useData` is looked up by `(file, name)` and inlined; the bug in its body surfaces on `Page`. |
+| `utility_inlining/same_file.tsx` | **ADR-013 Phase 3** — utility `bump(setC, 1)` inlined at statement-level in the same file. |
+| `utility_inlining/guarded_setter.tsx` | **ADR-013 Phase 3 limit** — the guard `if (!LAUNCH) return` is spliced, but `() => setC(c+1)` as an argument remains opaque (call in expression position). |
+| `utility_inlining_cross_file/page.tsx` + `lib/helpers.ts` | **ADR-013 Phase 3** — utility imported from a sibling file, resolved via `ImportResolver` then inlined. |
 
-Lancer chaque fixture pour voir le comportement :
+Run each fixture to see the behavior:
 
 ```sh
 cargo run -- tests/fixtures/page_collision/
@@ -62,9 +62,9 @@ cargo run -- tests/fixtures/utility_inlining/
 cargo run -- tests/fixtures/utility_inlining_cross_file/
 ```
 
-## API plugin (Phase 4)
+## Plugin API (Phase 4)
 
-Quand le CLI ne suffit pas (Next.js `app/` discovery, tsconfig `paths` aliases, monorepo) :
+When the CLI isn't enough (Next.js `app/` discovery, tsconfig `paths` aliases, monorepos):
 
 ```rust
 use std::path::Path;
@@ -78,31 +78,31 @@ impl FileDiscoverer for OnlyPages { /* ... */ }
 
 let (result, file_count) = analyze_with_resolvers(
     Path::new("./my-nextjs-app"),
-    &OnlyPages,                    // ou &DefaultFileDiscoverer
-    &DefaultImportResolver,        // ou un resolver tsconfig-paths-aware
+    &OnlyPages,                    // or &DefaultFileDiscoverer
+    &DefaultImportResolver,        // or a tsconfig-paths-aware resolver
     RootStrategy::AllComponents,
     Config::default(),
 );
 ```
 
-Exemples complets dans [docs/plugins.md](plugins.md) (Next.js, tsconfig aliases).
+Full examples in [docs/plugins.md](plugins.md) (Next.js, tsconfig aliases).
 
-## Limites à connaître avant utilisation
+## Limits to know before use
 
-Référence détaillée : [docs/TODO.md §ADR-013](TODO.md#adr-013--limites-de-lanalyse-cross-fichier). Récap des plus impactantes :
+Detailed reference: [docs/TODO.md §ADR-013](TODO.md#adr-013--cross-file-analysis-limits). Recap of the most impactful:
 
-- **Imports non résolus restent opaques** — un specifier `@/components/Button` (tsconfig alias) ou `@workspace/lib` (monorepo) n'est pas trouvé par défaut → composant/hook traité comme externe. Solution : `ImportResolver` custom via `analyze_with_resolvers`.
-- **Inlining statement-level uniquement** — `let r = util(x);` et `util(x);` (statement isolé) sont inlinés. `if (util(x))`, `setX(util(y))`, `arr.map(util)` restent opaques.
-- **Récursion d'utility** — inlining au plus 1 fois par CFG.
-- **`--entry Foo` ambigu** sur deux fichiers définissant `Foo` → les deux sont analysés. Disambiguer avec la forme `Foo@/path`.
-- **Pas de plugin built-in** pour Next.js / TanStack — écrire un `FileDiscoverer` custom (≈ 30 lignes, voir plugins.md).
+- **Unresolved imports stay opaque** — a specifier like `@/components/Button` (tsconfig alias) or `@workspace/lib` (monorepo) isn't found by default → the component/hook is treated as external. Solution: a custom `ImportResolver` via `analyze_with_resolvers`.
+- **Statement-level inlining only** — `let r = util(x);` and `util(x);` (isolated statement) are inlined. `if (util(x))`, `setX(util(y))`, `arr.map(util)` stay opaque.
+- **Utility recursion** — inlining at most once per CFG.
+- **`--entry Foo` ambiguous** across two files defining `Foo` → both are analyzed. Disambiguate with the form `Foo@/path`.
+- **No built-in plugin** for Next.js / TanStack — write a custom `FileDiscoverer` (~30 lines, see plugins.md).
 
 ## Tests
 
-Le suite de tests est exhaustive sur ADR-013 :
+The test suite is exhaustive on ADR-013:
 
 ```sh
-cargo test                                    # tout (496 tests)
+cargo test                                    # everything (496 tests)
 cargo test resolver                           # discovery + import resolution
 cargo test --test page_collision              # Page collision e2e
 cargo test --test relative_import_resolution  # resolved_file precision

@@ -1,33 +1,33 @@
-# ADR-010 : Heap model — allocation-site abstraction pour la résolution des callbacks par variable
+# ADR-010: Heap model — allocation-site abstraction for resolving callbacks by variable
 
-- **Statut** : Accepté — implémenté (complet)
-- **Date** : 2026-06-03
-- **Mis à jour** : 2026-06-04 — B5 cross-pass structural bug fixé : `collect_setter_calls` dans `InfiniteLoop` ne trouvait pas `setN` quand le FnLit était défini dans le render body (pas dans l'effect). Fix : `collect_setter_calls_with_extra` + `render_fn_bindings` mergé dans le check effect. `RenderCbInEffectLoop` désormais détecté.
-- **Contexte** : [ADR-009](ADR-009-callback-traversal.md) (traversée callbacks), [ADR-003](ADR-003-ir-design.md) (IR / FnLit), [ADR-005](ADR-005-analysis-scope.md) (scope intra-procédural)
+- **Status**: Accepted — implemented (complete)
+- **Date**: 2026-06-03
+- **Updated**: 2026-06-04 — B5 cross-pass structural bug fixed: `collect_setter_calls` in `InfiniteLoop` wasn't finding `setN` when the FnLit was defined in the render body (not in the effect). Fix: `collect_setter_calls_with_extra` + `render_fn_bindings` merged into the effect check. `RenderCbInEffectLoop` now detected.
+- **Context**: [ADR-009](ADR-009-callback-traversal.md) (callback traversal), [ADR-003](ADR-003-ir-design.md) (IR / FnLit), [ADR-005](ADR-005-analysis-scope.md) (intra-procedural scope)
 
-## Contexte
+## Context
 
-ADR-009 implémente la descente dans les callbacks inline (`FnLit` passé directement à `.then(cb)`). Deux patterns courants restaient aveugles :
+ADR-009 implements descent into inline callbacks (`FnLit` passed directly to `.then(cb)`). Two common patterns remained blind:
 
-**B5 — callback par variable :**
+**B5 — callback by variable:**
 ```js
 const cb = () => setN(n + 1);
-setTimeout(cb, 1000);  // arg = Identifier, pas FnLit → skippé
+setTimeout(cb, 1000);  // arg = Identifier, not FnLit → skipped
 ```
 
-**B6 — appel direct à une fonction locale :**
+**B6 — direct call to a local function:**
 ```js
 async function load() { setUser(data); }
-load();  // Call{ fn_: Var("load") } → callee Unknown → skippé
+load();  // Call{ fn_: Var("load") } → Unknown callee → skipped
 ```
 
-Dans les deux cas, le corps de la fonction est inaccessible parce que l'IR ne lie pas les noms de variables aux corps de leurs `FnLit` au moment de l'analyse.
+In both cases, the function body is unreachable because the IR doesn't link variable names to their `FnLit` bodies at analysis time.
 
-## Décision
+## Decision
 
-### 1. ExprId — identifiant d'allocation
+### 1. ExprId — allocation identifier
 
-Chaque nœud « allouant » (`FnLit`, `ObjectLit`, `ArrayLit`) reçoit un `id: ExprId` (newtype `struct ExprId(pub usize)`) assigné par un compteur dans `BlockBuilder` au moment du lowering. C'est le *allocation-site* : même nœud syntaxique → même ExprId à travers toutes les itérations du fixpoint.
+Each "allocating" node (`FnLit`, `ObjectLit`, `ArrayLit`) receives an `id: ExprId` (newtype `struct ExprId(pub usize)`) assigned by a counter in `BlockBuilder` at lowering time. This is the *allocation site*: same syntactic node → same ExprId across all fixpoint iterations.
 
 ```rust
 // ir/types.rs
@@ -39,53 +39,53 @@ ObjectLit { id: ExprId, fields: Vec<(Symbol, Expr)> },
 ArrayLit { id: ExprId, elems: Vec<Expr> },
 ```
 
-`Arc<CFG>` remplace `Box<CFG>` dans `FnLit` pour que le heap stocke un clone bon marché.
+`Arc<CFG>` replaces `Box<CFG>` in `FnLit` so the heap stores a cheap clone.
 
-### 2. Heap — store par site d'allocation
+### 2. Heap — store by allocation site
 
 ```rust
 // domains/stores/heap.rs
 pub enum HeapValue {
     Fn { params: Vec<Var>, body_cfg: Arc<CFG> },
-    Obj(HashMap<Symbol, StateValue>),  // réservé — domaine objet futur
-    Arr(Vec<StateValue>),              // réservé — domaine tableau futur
+    Obj(HashMap<Symbol, StateValue>),  // reserved — future object domain
+    Arr(Vec<StateValue>),              // reserved — future array domain
 }
 
 pub struct Heap(HashMap<ExprId, HeapValue>);
 ```
 
-Le heap est monotone (insert-only). `join` = union (même site → même corps, valeurs scalaires joinées pour les futurs domaines objet/tableau).
+The heap is monotone (insert-only). `join` = union (same site → same body, scalar values joined for the future object/array domains).
 
-### 3. AbstractEnv — deux maps séparées
+### 3. AbstractEnv — two separate maps
 
-`AbstractEnv<D>` maintient désormais :
+`AbstractEnv<D>` now maintains:
 
-- `stabs: HashMap<Var, D>` — valeurs abstraites (inchangé sémantiquement)
-- `locs: HashMap<Var, HashSet<ExprId>>` — sites d'allocation pour les variables liées à un `FnLit`/`ObjectLit`/`ArrayLit`
+- `stabs: HashMap<Var, D>` — abstract values (semantically unchanged)
+- `locs: HashMap<Var, HashSet<ExprId>>` — allocation sites for variables bound to an `FnLit`/`ObjectLit`/`ArrayLit`
 
-Les deux coexistent pour la même variable. `extend(var, val)` touche `stabs`, `extend_loc(var, id)` touche `locs`. `lookup_env_val(var)` renvoie `Some(EnvVal::Loc(ids))` si `locs` contient var, sinon `Some(EnvVal::Val(...))` depuis `stabs`.
+Both coexist for the same variable. `extend(var, val)` touches `stabs`, `extend_loc(var, id)` touches `locs`. `lookup_env_val(var)` returns `Some(EnvVal::Loc(ids))` if `locs` contains var, else `Some(EnvVal::Val(...))` from `stabs`.
 
-**Pourquoi deux maps séparées** : une seule map `EnvVal = Val | Loc` était tentante mais `env.extend(var, val)` écrasait le `Loc` précédemment posé par `env.extend_loc(var, id)`. Les deux maps évitent ce conflict.
+**Why two separate maps**: a single map `EnvVal = Val | Loc` was tempting but `env.extend(var, val)` overwrote the `Loc` previously placed by `env.extend_loc(var, id)`. The two maps avoid this conflict.
 
-### 4. Population du heap
+### 4. Heap population
 
-Dans `exec_state_value`, au traitement d'un `Stmt::Let { var, rhs: FnLit{id, params, body_cfg} }` :
+In `exec_state_value`, when processing a `Stmt::Let { var, rhs: FnLit{id, params, body_cfg} }`:
 
 ```rust
 env.extend_loc(var, *id);
 heap.insert(*id, HeapValue::Fn { params: params.clone(), body_cfg: Arc::clone(body_cfg) });
-// + eval normal → env.extend(var, Reference(Unstable))
+// + normal eval → env.extend(var, Reference(Unstable))
 ```
 
-Le heap est ainsi peuplé dès la première rencontre du `let cb = () => ...` dans l'analyse.
+The heap is thus populated as soon as `let cb = () => ...` is first encountered in the analysis.
 
-### 5. Transfer trait — heap en paramètre
+### 5. Transfer trait — heap as parameter
 
-`heap: &mut Heap` ajouté à `exec_stmt` et `eval_expr` dans le trait `Transfer`. `analyze_cfg` accepte `heap: &mut Heap` et mute le heap in-place. La fonction retourne `(exit_envs, state_out)` — le heap n'est plus retourné mais accumulé directement. Dans `fixpoint.rs`, un seul `heap` est créé avant la outer loop et passé à toutes les passes render et effect : le heap survit d'une itération à l'autre et entre passes render→effect (B5 cross-pass corrigé).
+`heap: &mut Heap` added to `exec_stmt` and `eval_expr` in the `Transfer` trait. `analyze_cfg` accepts `heap: &mut Heap` and mutates the heap in place. The function returns `(exit_envs, state_out)` — the heap is no longer returned but accumulated directly. In `fixpoint.rs`, a single `heap` is created before the outer loop and passed to all render and effect passes: the heap survives from one iteration to the next and between render→effect passes (B5 cross-pass fixed).
 
-### 6. B5 — résolution callback par variable
+### 6. B5 — callback by variable resolution
 
-Dans `exec_callbacks_depth`, pour un arg `Expr::Var(name)` quand `class == InCycle` :
+In `exec_callbacks_depth`, for an `Expr::Var(name)` arg when `class == InCycle`:
 
 ```rust
 Expr::Var(name) if class == TriggerClass::InCycle => {
@@ -93,13 +93,13 @@ Expr::Var(name) if class == TriggerClass::InCycle => {
 }
 ```
 
-`exec_var_callback` : `lookup_env_val(name)` → `EnvVal::Loc(ids)` → pour chaque `id` → `heap.get(id)` → `HeapValue::Fn{params, body_cfg}` → `exec_body_depth(body_cfg, sub_env, ..., depth+1)`.
+`exec_var_callback`: `lookup_env_val(name)` → `EnvVal::Loc(ids)` → for each `id` → `heap.get(id)` → `HeapValue::Fn{params, body_cfg}` → `exec_body_depth(body_cfg, sub_env, ..., depth+1)`.
 
-Si `name` n'a pas de `Loc` (variable externe/importée) → skip silencieux → **pas de FP**.
+If `name` has no `Loc` (external/imported variable) → silent skip → **no FP**.
 
-### 7. B6 — inlining des appels locaux directs
+### 7. B6 — inlining of direct local calls
 
-Même `exec_var_callback`, déclenchée depuis le traitement d'un `Call` dont le callee est `Unknown` :
+Same `exec_var_callback`, triggered from the handling of a `Call` whose callee is `Unknown`:
 
 ```rust
 if class == TriggerClass::Unknown {
@@ -109,33 +109,33 @@ if class == TriggerClass::Unknown {
 }
 ```
 
-`Unknown + Loc` → inliné. `Unknown + pas de Loc` → skip → conservatif. Distingue naturellement les fonctions locales (Loc dans env) des callees externes (pas de Loc).
+`Unknown + Loc` → inlined. `Unknown + no Loc` → skip → conservative. Naturally distinguishes local functions (Loc in env) from external callees (no Loc).
 
-### 8. Garde de profondeur
+### 8. Depth guard
 
-`MAX_INLINE_DEPTH = 3`. La profondeur est propagée à travers `exec_callbacks_depth → exec_var_callback → exec_body_depth → exec_state_value_depth → exec_callbacks_depth`. Si `depth >= MAX_INLINE_DEPTH` → bail immédiat.
+`MAX_INLINE_DEPTH = 3`. The depth is propagated through `exec_callbacks_depth → exec_var_callback → exec_body_depth → exec_state_value_depth → exec_callbacks_depth`. If `depth >= MAX_INLINE_DEPTH` → immediate bail.
 
-**FN connu** : fonctions mutuellement récursives ou callstack plus profonde de 3 niveaux → non descendues.
+**Known FN**: mutually recursive functions or callstack deeper than 3 levels → not descended.
 
-## Limites connues
+## Known limits
 
-- **Back-edge dans un corps de callback** → FN (documenté ADR-009, inchangé).
-- **Domaines objet/tableau** (`HeapValue::Obj`/`Arr`) réservés — non utilisés jusqu'à l'implémentation d'un domaine de champs.
-- **Multi-site join** : `locs` peut contenir plusieurs ExprIds pour une même variable (branches ternaires). Tous les corps sont exécutés et leurs effets joints — correct par over-approximation.
-- **Callee inconnu sans `Loc`** (helper externe) → bail immédiat → FN. Quand `depth >= MAX_INLINE_DEPTH`, la règle `analysis-limit` émet un `Info` (visible avec `--info`) signalant que des chaînes de callbacks n'ont pas été descendues.
+- **Back-edge in a callback body** → FN (documented ADR-009, unchanged).
+- **Object/array domains** (`HeapValue::Obj`/`Arr`) reserved — unused until a field domain is implemented.
+- **Multi-site join**: `locs` can contain several ExprIds for a same variable (ternary branches). All bodies are executed and their effects joined — correct by over-approximation.
+- **Unknown callee without `Loc`** (external helper) → immediate bail → FN. When `depth >= MAX_INLINE_DEPTH`, the `analysis-limit` rule emits an `Info` (visible with `--info`) signaling that callback chains weren't descended.
 
-## Conséquences
+## Consequences
 
 - `src/ir/types.rs` — `ExprId` newtype.
-- `src/ir/expr.rs` — `FnLit`/`ObjectLit`/`ArrayLit` struct variants avec `id`.
+- `src/ir/expr.rs` — `FnLit`/`ObjectLit`/`ArrayLit` struct variants with `id`.
 - `src/lowering/cfg_builder.rs` — `expr_counter` + `next_expr_id()`.
-- `src/lowering/expr_lower.rs` — assignation des ids aux 3 sites d'allocation.
-- `src/domains/stores/abstract_env.rs` — `locs: HashMap<Var, HashSet<ExprId>>`, `extend_loc`, `lookup_env_val`, join/widen/leq des locs.
-- `src/domains/stores/heap.rs` — **nouveau** fichier.
-- `src/domains/mod.rs` — `Transfer` étendu avec `heap: &mut Heap`.
-- `src/engine/cfg_analyzer.rs` — accepte `heap: &mut Heap` (plus de création interne), retourne `(exit_envs, state_out)`.
-- `src/engine/fixpoint.rs` — `heap` créé une fois avant la outer loop, passé à toutes les passes render et effect ; `effect_block_states: HashMap<HookLabel, HashMap<BlockId, AbstractEnv<D>>>` ajouté à `AnalysisResult`.
-- `src/engine/analysis_result.rs` — champ `effect_block_states` ajouté.
+- `src/lowering/expr_lower.rs` — id assignment to the 3 allocation sites.
+- `src/domains/stores/abstract_env.rs` — `locs: HashMap<Var, HashSet<ExprId>>`, `extend_loc`, `lookup_env_val`, join/widen/leq of locs.
+- `src/domains/stores/heap.rs` — **new** file.
+- `src/domains/mod.rs` — `Transfer` extended with `heap: &mut Heap`.
+- `src/engine/cfg_analyzer.rs` — accepts `heap: &mut Heap` (no more internal creation), returns `(exit_envs, state_out)`.
+- `src/engine/fixpoint.rs` — `heap` created once before the outer loop, passed to all render and effect passes; `effect_block_states: HashMap<HookLabel, HashMap<BlockId, AbstractEnv<D>>>` added to `AnalysisResult`.
+- `src/engine/analysis_result.rs` — `effect_block_states` field added.
 - `src/domains/impls/state_value.rs` — `exec_var_callback`, `exec_callbacks_depth`, `exec_body_depth`, `exec_state_value_depth`.
-- `src/rules/mod.rs` — `collect_setter_calls` étendu : pré-scan du CFG pour `let X = FnLit{...}` → résolution des args `Var("X")` (B5) et des callees directs `Call{ fn_: Var("X") }` (B6) dans la vérification structurelle. Nécessaire pour que `InfiniteLoop` tire sur les patterns variable-callback même quand l'analyse sémantique widen.
-- Blast radius IR : tous les match sur `ObjectLit`/`ArrayLit`/`FnLit` mis à jour (wildcard `{ .. }` ou nommage des champs).
+- `src/rules/mod.rs` — `collect_setter_calls` extended: pre-scan of the CFG for `let X = FnLit{...}` → resolution of `Var("X")` args (B5) and direct callees `Call{ fn_: Var("X") }` (B6) in the structural check. Necessary for `InfiniteLoop` to fire on variable-callback patterns even when the semantic analysis widens.
+- IR blast radius: all match on `ObjectLit`/`ArrayLit`/`FnLit` updated (wildcard `{ .. }` or named fields).

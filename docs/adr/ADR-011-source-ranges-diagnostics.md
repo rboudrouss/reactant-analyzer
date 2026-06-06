@@ -1,39 +1,39 @@
-# ADR-011 : Source ranges + diagnostic notes
+# ADR-011: Source ranges + diagnostic notes
 
-- **Statut** : Accepté — implémenté
-- **Date** : 2026-06-03
+- **Status**: Accepted — implemented
+- **Date**: 2026-06-03
 
-## Contexte
+## Context
 
-Les diagnostics affichaient un hook label (`[hook:0]`) sans indiquer la ligne source ni expliquer la chaîne causale. En particulier, le pattern InfiniteLoop détecté via handler (ADR-009 §5) produisait :
+Diagnostics displayed a hook label (`[hook:0]`) without indicating the source line or explaining the causal chain. In particular, the InfiniteLoop pattern detected via a handler (ADR-009 §5) produced:
 
 ```
 ⚠  infinite-loop  [hook:0]  — effect 1 unconditionally sets state 0 ...
 ```
 
-sans mentionner le handler `onClick` qui avait broadened le range d'état pour rendre la branche de l'effect réatteignable.
+without mentioning the `onClick` handler that had broadened the state range to make the effect's branch reachable.
 
-Deux problèmes distincts :
-1. **Absence de source location** — les spans Oxc étaient disponibles pendant le parsing mais jetés au point `lower_program(&ret.program)`.
-2. **Diagnostic monoplat** — `Diagnostic` n'avait qu'un seul `hook_label` ; impossible d'exprimer "plusieurs participants" à un diagnostic.
+Two distinct problems:
+1. **Missing source location** — Oxc spans were available during parsing but discarded at the `lower_program(&ret.program)` point.
+2. **Flat diagnostic** — `Diagnostic` only had a single `hook_label`; impossible to express "multiple participants" in a diagnostic.
 
-## Décision
+## Decision
 
-### 1. `SourceRange` — type et utilitaires
+### 1. `SourceRange` — type and utilities
 
-Nouveau module `src/ir/source_range.rs` : `SourceRange { line: u32, col: u32 }` (1-indexed line), `compute_line_starts(source: &str) -> Vec<u32>`, `offset_to_range(starts: &[u32], offset: u32) -> SourceRange`.
+New module `src/ir/source_range.rs`: `SourceRange { line: u32, col: u32 }` (1-indexed line), `compute_line_starts(source: &str) -> Vec<u32>`, `offset_to_range(starts: &[u32], offset: u32) -> SourceRange`.
 
-La table `line_starts` est précalculée une fois en `O(n)` dans `analyze_file` et passée dans le lowering. La conversion offset → (line, col) est un `binary_search` en `O(log n)`.
+The `line_starts` table is precomputed once in `O(n)` in `analyze_file` and passed into the lowering. The offset → (line, col) conversion is a `binary_search` in `O(log n)`.
 
-### 2. Spans dans l'IR
+### 2. Spans in the IR
 
-`Stmt` et `HookEntry` ont tous un champ `span: Option<SourceRange>`.  `Option` préserve la compatibilité des tests IR manuels (tests unitaires moteur/règles construisent l'IR avec `span: None`).
+`Stmt` and `HookEntry` all have a `span: Option<SourceRange>` field. `Option` preserves compatibility with manual IR tests (engine/rules unit tests build the IR with `span: None`).
 
-- **Stmts** : le `BlockBuilder` porte la table `line_starts` et expose `span_at(offset: u32)`. Chaque `Statement::ExpressionStatement` et `VariableDeclarator` principal reçoit son span à la construction.
-- **HookEntry** : `process_stmt` dans `hook_extractor.rs` lit le span du `Stmt` entrant et le propage via `make_hook_entry(..., span)`. Effect et State ainsi que les autres hooks héritent du span de leur statement de déclaration.
-- **Handler** : `lower_jsx_props` collecte `prop_spans: HashMap<String, Option<SourceRange>>` pour chaque prop `onX` pendant le lowering. `collect_handlers_in_expr` consomme ce map via `prop_spans.get(name)` — span est `Some` en production, `None` uniquement dans les tests qui passent `&[]` comme `line_starts`.
+- **Stmts**: the `BlockBuilder` carries the `line_starts` table and exposes `span_at(offset: u32)`. Each `Statement::ExpressionStatement` and main `VariableDeclarator` gets its span at construction.
+- **HookEntry**: `process_stmt` in `hook_extractor.rs` reads the span of the incoming `Stmt` and propagates it via `make_hook_entry(..., span)`. Effect and State as well as the other hooks inherit the span of their declaration statement.
+- **Handler**: `lower_jsx_props` collects `prop_spans: HashMap<String, Option<SourceRange>>` for each `onX` prop during the lowering. `collect_handlers_in_expr` consumes this map via `prop_spans.get(name)` — span is `Some` in production, `None` only in tests that pass `&[]` as `line_starts`.
 
-### 3. `Note` + `notes` sur `Diagnostic`
+### 3. `Note` + `notes` on `Diagnostic`
 
 ```rust
 pub struct Note {
@@ -43,28 +43,28 @@ pub struct Note {
 }
 
 pub struct Diagnostic {
-    // champs existants...
-    pub range: Option<SourceRange>,  // localisation du finding principal
-    pub notes: Vec<Note>,            // chaîne causale
+    // existing fields...
+    pub range: Option<SourceRange>,  // location of the main finding
+    pub notes: Vec<Note>,            // causal chain
 }
 ```
 
-Builder : `.with_range(r)`, `.with_note(msg, hook, range)`.
+Builder: `.with_range(r)`, `.with_note(msg, hook, range)`.
 
-### 4. InfiniteLoop — scanner les handlers + construire notes
+### 4. InfiniteLoop — scan handlers + build notes
 
-La règle scanne maintenant `result.hooks` pour les `HookEntry::Handler` qui appellent le même setter que l'effet incriminé. Chaque handler trouvé génère une `Note` avec son label et son nom d'event (capitalisé).
+The rule now scans `result.hooks` for `HookEntry::Handler` that call the same setter as the offending effect. Each handler found generates a `Note` with its label and capitalized event name.
 
-### 5. CLI — affichage notes
+### 5. CLI — note display
 
 ```
 ⚠  infinite-loop  [hook:0]  (line 54:2)  — effect 1 sets state 0 ...
    → handler `onClick` also calls setter — grows state 0 range  [hook:2]
 ```
 
-## Conséquences
+## Consequences
 
-- **Thread line_starts** : `lower_program`, `build_cfg`, `BlockBuilder` ont un paramètre `line_starts: &[u32]`. Les tests qui construisent l'IR à la main (fixpoint, rules) passent `&[]` ou `None`.
-- **Sites mécaniques** : `Stmt::ExprStmt(e)` → `ExprStmt(e, _)` dans tous les patterns ; `ExprStmt(e)` → `ExprStmt(e, None)` dans les constructions test. Idem pour `HookEntry` variants.
-- **Handler span** : résolu — `lower_jsx_props` capture `prop_spans: HashMap<String, Option<SourceRange>>` pour chaque prop `onX` avant que l'AST Oxc soit libéré. `collect_handlers_in_expr` lit `prop_spans.get(name)` lors de la construction du `HookEntry::Handler`. Span est `Some` en production et `None` uniquement dans les tests unitaires qui passent `&[]` comme `line_starts`.
-- **Règles non mises à jour** : seule `InfiniteLoop` génère des notes pour l'instant. Les autres règles (`missing-deps`, `stale-closure`, etc.) bénéficieront du `range` sur Diagnostic quand elles propageront leur Effect.span.
+- **Thread line_starts**: `lower_program`, `build_cfg`, `BlockBuilder` have a `line_starts: &[u32]` parameter. Tests that build the IR by hand (fixpoint, rules) pass `&[]` or `None`.
+- **Mechanical sites**: `Stmt::ExprStmt(e)` → `ExprStmt(e, _)` in all patterns; `ExprStmt(e)` → `ExprStmt(e, None)` in test constructions. Same for `HookEntry` variants.
+- **Handler span**: resolved — `lower_jsx_props` captures `prop_spans: HashMap<String, Option<SourceRange>>` for each `onX` prop before the Oxc AST is freed. `collect_handlers_in_expr` reads `prop_spans.get(name)` when building the `HookEntry::Handler`. Span is `Some` in production and `None` only in unit tests that pass `&[]` as `line_starts`.
+- **Rules not updated**: only `InfiniteLoop` generates notes for now. The other rules (`missing-deps`, `stale-closure`, etc.) will benefit from the `range` on Diagnostic when they propagate their Effect.span.
