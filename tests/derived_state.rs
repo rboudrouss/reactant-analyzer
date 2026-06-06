@@ -211,6 +211,27 @@ fn empty_deps_does_not_fire() {
 }
 
 #[test]
+fn self_referential_does_not_fire() {
+    // setValue(value + 1) with deps [value] writes the SAME slot it reads.
+    // That is a counter / infinite-loop pattern, not a derivation: useMemo
+    // cannot express it, so derived-state must NOT fire (infinite-loop does).
+    let hits = derived_state_hits(
+        r#"
+        import { useState, useEffect } from "react";
+        function C() {
+            const [value, setValue] = useState(0);
+            useEffect(() => { setValue(value + 1); }, [value]);
+            return <div>{value}</div>;
+        }
+        "#,
+    );
+    assert_eq!(
+        hits, 0,
+        "self-referential setX(x+1) on its own dep must not fire derived-state"
+    );
+}
+
+#[test]
 fn clean_component_no_false_positive() {
     // No effect at all → no derived-state
     let hits = derived_state_hits(

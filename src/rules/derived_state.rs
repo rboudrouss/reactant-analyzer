@@ -7,7 +7,7 @@ use crate::{
         expr::Expr,
         hooks::HookEntry,
         stmt::Stmt,
-        types::{BlockId, Symbol, Var},
+        types::{BlockId, HookLabel, Symbol, Var},
     },
 };
 
@@ -31,9 +31,13 @@ impl Rule for DerivedState {
 
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
         let result = &result.components[component];
-        // Build set of all state setter vars.
+        // Build set of all state setter vars, plus a map from each setter/state-val
+        // var to the state slot (label) it touches — used below to reject
+        // self-referential updates.
         let mut setter_vars: HashSet<Var> = HashSet::new();
         let mut state_var_names: HashSet<Var> = HashSet::new();
+        let mut setter_label: HashMap<Var, HookLabel> = HashMap::new();
+        let mut state_val_label: HashMap<Var, HookLabel> = HashMap::new();
         for hook in &result.hooks {
             if let HookEntry::State { label, .. } = hook {
                 for block in result.render_cfg.blocks.values() {
@@ -46,6 +50,7 @@ impl Rule for DerivedState {
                             && lbl == label
                         {
                             setter_vars.insert(var.clone());
+                            setter_label.insert(var.clone(), *label);
                         }
                         if let Stmt::Let {
                             var,
@@ -55,6 +60,7 @@ impl Rule for DerivedState {
                             && lbl == label
                         {
                             state_var_names.insert(var.clone());
+                            state_val_label.insert(var.clone(), *label);
                         }
                     }
                 }
@@ -95,6 +101,18 @@ impl Rule for DerivedState {
             let Some(setter_name) = find_uncond_setter_call(body_cfg, &setter_vars) else {
                 continue;
             };
+
+            // Reject self-referential updates: when the setter writes the SAME
+            // state slot the dep reads (e.g. `setX(x + 1)` with deps `[x]`), this
+            // is accumulation/a counter — caught by `infinite-loop` — not a
+            // derivation. `useMemo` cannot express it, so flagging derived-state
+            // here is a false positive.
+            if let (Some(set_lbl), Some(dep_lbl)) =
+                (setter_label.get(&setter_name), state_val_label.get(&dep_var))
+                && set_lbl == dep_lbl
+            {
+                continue;
+            }
 
             // The same setter must not be called in the render body.
             if render_setters.contains(&setter_name) {
