@@ -37,7 +37,7 @@ fn run(src: &str) -> Vec<reactant::engine::AnalysisResult<reactant::domains::Sta
         .parse();
     assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
     let line_starts = compute_line_starts(src);
-    let components = lower_program(&ret.program, &line_starts);
+    let components = lower_program(&ret.program, &line_starts, std::path::Path::new("test.tsx"));
     assert!(!components.is_empty(), "no component detected");
     components
         .into_iter()
@@ -51,7 +51,11 @@ fn derived_state_hits(src: &str) -> usize {
         .with_options(oxc_parser::ParseOptions::default())
         .parse();
     let line_starts = reactant::lowering::compute_line_starts(src);
-    let components = reactant::lowering::lower_program(&ret.program, &line_starts);
+    let components = reactant::lowering::lower_program(
+        &ret.program,
+        &line_starts,
+        std::path::Path::new("test.tsx"),
+    );
     components
         .into_iter()
         .map(|comp| {

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crate::ir::{
     cfg::CFG,
     hooks::HookEntry,
@@ -6,6 +8,10 @@ use crate::ir::{
 
 #[derive(Debug, Clone)]
 pub struct ComponentIR {
+    /// Source file this component was lowered from. Used as part of the
+    /// `(file, name)` registry key so two components named `Page` in
+    /// different files don't collide (ADR-013 §1).
+    pub file: PathBuf,
     pub name: Symbol,
     pub param: Var,
     pub render_cfg: CFG,

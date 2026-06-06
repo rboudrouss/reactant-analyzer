@@ -1,6 +1,6 @@
 # ADR-013 : Analyse cross-fichier — résolution d'imports + symbol graph
 
-- **Statut** : Proposé
+- **Statut** : Accepté — Phases 1-4 implémentées (2026-06-06)
 - **Date** : 2026-06-05
 
 ## Contexte
@@ -148,9 +148,15 @@ Pas d'erreur fatale : un projet réel peut avoir des imports non résolus (tscon
 
 ## Limites acceptées
 
-- **tsconfig `paths` aliases** — non résolus par `DefaultImportResolver` (`@/components/Button` → `None`). Contournement : plugin custom ou attendre ADR-014.
+Liste consolidée dans [docs/TODO.md](../TODO.md#adr-013--limites-de-lanalyse-cross-fichier). Résumé :
+
+- **tsconfig `paths` aliases** — non résolus par `DefaultImportResolver` (`@/components/Button` → `None`). Contournement : `ImportResolver` custom passé à `analyze_with_resolvers` (voir [docs/plugins.md](../plugins.md)).
 - **Re-exports en chaîne** — `export { useMyQuery } from './hooks'` → tracé un niveau si `./hooks` est dans les fichiers découverts ; chaînes profondes peuvent manquer.
-- **`node_modules` utilities** — jamais inlinées (non dans les fichiers découverts) → opaque → comportement actuel.
+- **`node_modules` utilities/hooks/components** — jamais lowerés (non dans les fichiers découverts) → fallback `SummaryRegistry` pour les hooks, `⊤` pour le reste.
+- **Inlining statement-level uniquement** — calls en position expression restent opaques. Cas typiques : `if (util(x))`, `setX(util(y))`, `arr.map(util)`.
+- **Récursion d'utility** — inlining au plus une fois par CFG (recursion guard).
+- **Closures imbriquées** — seules les fonctions top-level sont lowerées.
+- **`get_by_name` fallback** — quand `resolved_file` est `None`, premier match par ordre de path retenu → résultat non déterministe en cas de collision sans import.
 
 ## Conséquences
 

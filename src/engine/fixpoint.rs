@@ -23,13 +23,17 @@ use super::{
     cfg_analyzer::analyze_cfg,
     component_cache::ComponentCache,
     component_registry::ComponentRegistry,
+    function_registry::FunctionRegistry,
     hook_registry::HookRegistry,
     program_result::{AnalysisStats, ComponentCallGraph, ProgramAnalysisResult},
     root_detector::RootStrategy,
 };
 use crate::{
     domains::{stores::SharedStateStore, transfer::StateValueTransfer},
-    ir::remap::{remap_cfg, remap_hooks},
+    ir::{
+        cfg::{BasicBlock, Terminator},
+        remap::{remap_cfg, remap_hooks},
+    },
     registry::SummaryRegistry,
 };
 
@@ -38,6 +42,13 @@ pub struct Config {
     /// Known library hooks (TanStack, React Router, etc.) without source.
     /// Used in `expand_custom_hooks` as a fallback when a hook is not in the `HookRegistry`.
     pub summary_registry: SummaryRegistry,
+    /// Utility-function inlining registry (ADR-013 Phase 3). When non-empty,
+    /// statement-level calls to known utilities are spliced into the caller's
+    /// CFG instead of being evaluated as opaque `Top`.
+    pub function_registry: FunctionRegistry,
+    /// Cap on transitive utility-inlining depth, to bound CFG growth when
+    /// utilities chain or recurse.
+    pub max_inline_depth: usize,
 }
 
 impl Default for Config {
@@ -45,6 +56,8 @@ impl Default for Config {
         Config {
             widen_threshold: 3,
             summary_registry: SummaryRegistry::new(),
+            function_registry: FunctionRegistry::new(),
+            max_inline_depth: 8,
         }
     }
 }
@@ -103,15 +116,28 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     inter: Option<&InterCtx<'_>>,
 ) -> AnalysisResult<StateValue> {
     let ComponentIR {
+        file: comp_file,
         name: comp_name,
         render_cfg: mut render_cfg,
         hooks,
         ..
     } = comp;
 
+    let mut hooks = hooks;
+
+    // Utility-function inlining (ADR-013 Phase 3). Runs before
+    // `expand_custom_hooks` so utility bodies that contain hook calls (rare
+    // but possible) become visible to the hook expansion pass.
+    expand_utility_calls(
+        &mut render_cfg,
+        &mut hooks,
+        &config.function_registry,
+        &comp_file,
+        config.max_inline_depth,
+    );
+
     // Expand HookEntry::Custom entries by inlining sub-hooks with remapped labels.
     // Must happen before TypedStateStore::from_component so inlined State entries are seeded.
-    let mut hooks = hooks;
     expand_custom_hooks(&mut hooks, &mut render_cfg, inter);
 
     let mut typed_state = TypedStateStore::from_component(&hooks);
@@ -374,10 +400,13 @@ pub fn analyze_program(
         RefCell::new(HashMap::new());
 
     let roots = strategy.detect(&registry);
+    let mut analysed_keys: std::collections::HashSet<crate::engine::ComponentKey> =
+        std::collections::HashSet::new();
 
     // Phase 1: analyze roots top-down (children inlined via eval_comp_app).
-    for root_name in &roots {
-        if let Some(root_ir) = registry.get(root_name).cloned() {
+    for root_key in &roots {
+        if let Some(root_ir) = registry.get(root_key).cloned() {
+            let display = registry.display_name(root_key);
             let inter = InterCtx::new(
                 &registry,
                 &cache,
@@ -385,7 +414,7 @@ pub fn analyze_program(
                 &call_graph,
                 &stats,
                 &results,
-                root_name.clone(),
+                display.clone(),
                 config,
                 analyze_component_inter as AnalyzeChildFn,
                 Some(&hook_registry),
@@ -399,21 +428,33 @@ pub fn analyze_program(
                 Some(&inter),
             );
             stats.borrow_mut().components_analyzed += 1;
-            results.borrow_mut().insert(root_name.clone(), result);
+            results.borrow_mut().insert(display, result);
+            analysed_keys.insert(root_key.clone());
         }
     }
 
     // Phase 2: analyze any component not yet reached (props = ⊤, intra only).
-    let remaining: Vec<String> = registry
-        .all_names()
-        .filter(|n| !results.borrow().contains_key(*n))
-        .cloned()
+    // Iterate by composite key so distinct files defining the same name are
+    // each analysed (ADR-013 §1, fixes Page() collisions). Skip components
+    // whose display name is already in `results` — the inter-component pass
+    // (via `eval_comp_app`) inserts child results under their plain name, and
+    // re-running them here would overwrite the precise inter result with a
+    // less informative props=⊤ intra-only analysis.
+    let mut remaining_keys: Vec<crate::engine::ComponentKey> = registry
+        .all_keys()
+        .into_iter()
+        .filter(|k| !analysed_keys.contains(k))
         .collect();
-    for name in remaining {
-        if let Some(ir) = registry.get(&name).cloned() {
+    remaining_keys.sort();
+    for key in remaining_keys {
+        if let Some(ir) = registry.get(&key).cloned() {
+            let display = registry.display_name(&key);
+            if results.borrow().contains_key(&display) {
+                continue;
+            }
             let result = analyze_component(ir, &StateValueTransfer, config);
             stats.borrow_mut().components_analyzed += 1;
-            results.borrow_mut().insert(name, result);
+            results.borrow_mut().insert(display, result);
         }
     }
 
@@ -459,13 +500,19 @@ fn expand_custom_hooks(
 
     let mut i = 0;
     while i < hooks.len() {
-        let (name, call_args, import_source) = match &hooks[i] {
+        let (name, call_args, import_source, resolved_file) = match &hooks[i] {
             HookEntry::Custom {
                 name,
                 args,
                 import_source,
+                resolved_file,
                 ..
-            } => (name.clone(), args.clone(), import_source.clone()),
+            } => (
+                name.clone(),
+                args.clone(),
+                import_source.clone(),
+                resolved_file.clone(),
+            ),
             _ => {
                 i += 1;
                 continue;
@@ -478,7 +525,14 @@ fn expand_custom_hooks(
             continue;
         }
 
-        let Some(hook_ir) = reg.get(&name) else {
+        // Prefer the resolved-file key (ADR-013 §1) when available; fall back to
+        // a name-only lookup for hooks whose import wasn't resolved (legacy,
+        // test inputs without a file).
+        let hook_ir_opt = match &resolved_file {
+            Some(file) => reg.get(&(file.clone(), name.clone())),
+            None => reg.get_by_name(&name),
+        };
+        let Some(hook_ir) = hook_ir_opt else {
             // Not in HookRegistry — check SummaryRegistry as fallback.
             // Known library hooks (TanStack, React Router, etc.) are removed from the
             // hooks vec so they don't generate opaque Custom diagnostics.
@@ -860,6 +914,290 @@ fn collect_handler_info(hooks: &[HookEntry]) -> HashMap<HookLabel, HandlerInfo> 
         .collect()
 }
 
+// ── Utility-function inlining (ADR-013 Phase 3) ────────────────────────────────
+
+/// Splice every statement-level call to a known utility into the caller's
+/// CFG (and the body CFGs of its hook entries). Operates in place on
+/// `render_cfg` and `hooks`.
+///
+/// "Statement-level" means the call is the rhs of a `Let` or the entirety
+/// of an `ExprStmt` — calls in arbitrary expression positions (`if (util(x))`,
+/// `setState(util(x))`) stay opaque (`Top`). This matches the plan's Phase 3
+/// scope; expression-position inlining is intentionally deferred.
+fn expand_utility_calls(
+    render_cfg: &mut CFG,
+    hooks: &mut [HookEntry],
+    registry: &FunctionRegistry,
+    caller_file: &std::path::Path,
+    max_depth: usize,
+) {
+    if registry.is_empty() {
+        return;
+    }
+    inline_in_cfg(
+        render_cfg,
+        registry,
+        caller_file,
+        max_depth,
+        &mut HashSet::new(),
+    );
+    for hook in hooks.iter_mut() {
+        match hook {
+            HookEntry::Effect { body_cfg, .. }
+            | HookEntry::Memo { body_cfg, .. }
+            | HookEntry::Callback { body_cfg, .. }
+            | HookEntry::Handler { body_cfg, .. } => {
+                inline_in_cfg(
+                    body_cfg,
+                    registry,
+                    caller_file,
+                    max_depth,
+                    &mut HashSet::new(),
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Splice utility calls in `cfg`. Each utility name is inlined at most once
+/// per CFG: this is the recursion guard (self-recursive utilities, and
+/// `A → B → A` chains, terminate after a single round-trip; subsequent calls
+/// remain `Call` → opaque `Top`).
+///
+/// `max_depth` caps the total number of splices into this CFG so a single
+/// inlining never explodes the IR even with deep utility chains.
+fn inline_in_cfg(
+    cfg: &mut CFG,
+    registry: &FunctionRegistry,
+    caller_file: &std::path::Path,
+    max_depth: usize,
+    expanding: &mut HashSet<String>,
+) {
+    let mut budget = max_depth;
+    loop {
+        if budget == 0 {
+            break;
+        }
+        let Some((block_id, stmt_idx, name)) =
+            find_inlining_target(cfg, registry, caller_file, expanding)
+        else {
+            break;
+        };
+        // Mark before splicing so a self-recursive call inside the spliced
+        // body is skipped on the next scan.
+        expanding.insert(name);
+        splice_one_call(cfg, block_id, stmt_idx, registry, caller_file);
+        budget -= 1;
+    }
+}
+
+fn find_inlining_target(
+    cfg: &CFG,
+    registry: &FunctionRegistry,
+    caller_file: &std::path::Path,
+    expanding: &HashSet<String>,
+) -> Option<(BlockId, usize, String)> {
+    let mut block_ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
+    block_ids.sort_unstable();
+    for bid in block_ids {
+        let block = &cfg.blocks[&bid];
+        for (idx, stmt) in block.stmts.iter().enumerate() {
+            if let Some(name) = utility_call_target(stmt) {
+                if expanding.contains(&name) {
+                    continue;
+                }
+                if registry
+                    .get(&(caller_file.to_path_buf(), name.clone()))
+                    .is_some()
+                    || registry.get_by_name(&name).is_some()
+                {
+                    return Some((bid, idx, name));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// If `stmt` is `let _ = util(...)` or `util(...)` where `util` is a `Var`,
+/// return the callee name.
+fn utility_call_target(stmt: &Stmt) -> Option<String> {
+    let call_expr = match stmt {
+        Stmt::Let { rhs, .. } => rhs,
+        Stmt::ExprStmt(expr, _) => expr,
+        Stmt::Assign { .. } => return None,
+    };
+    let (fn_, _) = match call_expr {
+        Expr::Call { fn_, args } => (fn_, args),
+        Expr::TSAnnotated(inner, _) => match inner.as_ref() {
+            Expr::Call { fn_, args } => (fn_, args),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    match fn_.as_ref() {
+        Expr::Var(name) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// Resolve `name` to a [`FunctionIR`], preferring `(caller_file, name)`.
+fn resolve_utility<'a>(
+    registry: &'a FunctionRegistry,
+    caller_file: &std::path::Path,
+    name: &str,
+) -> Option<&'a crate::ir::FunctionIR> {
+    registry
+        .get(&(caller_file.to_path_buf(), name.to_string()))
+        .or_else(|| registry.get_by_name(&name.to_string()))
+}
+
+/// Splice a single utility call at `(block_id, stmt_idx)` into `cfg`.
+///
+/// Algorithm:
+///   1. Snapshot the caller's `BasicBlock` and split its `stmts` at `stmt_idx`
+///      into `pre` (kept) and `post` (moved to a new "join" block).
+///   2. Allocate fresh block ids for the callee's blocks (offset to avoid
+///      collisions with the caller).
+///   3. For each callee block:
+///        - remap any embedded `BlockId` in terminators / edges
+///        - rewrite `Terminator::Return(expr)` so it jumps to the join block,
+///          and (for `Let { var, .. }` call sites) assigns `var = expr` at the
+///          end of the returning block.
+///   4. Prepend the param-binding `Let`s to the callee's entry block.
+///   5. Splice into the caller CFG: original block keeps `pre` + `Jump(entry)`;
+///      the join block holds `post` + the caller's original terminator.
+fn splice_one_call(
+    cfg: &mut CFG,
+    block_id: BlockId,
+    stmt_idx: usize,
+    registry: &FunctionRegistry,
+    caller_file: &std::path::Path,
+) {
+    // 1. Inspect the call statement.
+    let call_stmt = cfg.blocks[&block_id].stmts[stmt_idx].clone();
+    let (bound_var, call_args) = match &call_stmt {
+        Stmt::Let { var, rhs, .. } => match strip_ts_annot(rhs) {
+            Expr::Call { args, .. } => (Some(var.clone()), args.clone()),
+            _ => return,
+        },
+        Stmt::ExprStmt(expr, _) => match strip_ts_annot(expr) {
+            Expr::Call { args, .. } => (None, args.clone()),
+            _ => return,
+        },
+        _ => return,
+    };
+    let name = match utility_call_target(&call_stmt) {
+        Some(n) => n,
+        None => return,
+    };
+    let utility = match resolve_utility(registry, caller_file, &name) {
+        Some(u) => u.clone(),
+        None => return,
+    };
+
+    // 2. Split the caller block.
+    let pre_post = cfg.blocks.get_mut(&block_id).unwrap();
+    let mut post: Vec<Stmt> = pre_post.stmts.split_off(stmt_idx);
+    // Drop the call stmt itself (it's the first stmt of `post`).
+    if !post.is_empty() {
+        post.remove(0);
+    }
+    let old_term = std::mem::replace(&mut pre_post.term, Terminator::Unreachable);
+
+    // 3. Compute fresh BlockId allocations.
+    let block_offset: BlockId = cfg.blocks.keys().copied().max().map(|m| m + 1).unwrap_or(0);
+    let join_block_id: BlockId = block_offset + utility.body_cfg.blocks.len();
+
+    // 4. Build the param-binding prefix.
+    let mut param_lets: Vec<Stmt> = utility
+        .params
+        .iter()
+        .zip(call_args.iter())
+        .map(|(p, a)| Stmt::Let {
+            var: p.clone(),
+            rhs: a.clone(),
+            span: None,
+        })
+        .collect();
+
+    // 5. Insert each callee block with remapped ids, rewriting Returns to jump
+    //    to the join block (and possibly assign `bound_var = ret_expr`).
+    let mut callee_blocks: Vec<(BlockId, BasicBlock)> = utility
+        .body_cfg
+        .blocks
+        .iter()
+        .map(|(bid, block)| (*bid + block_offset, block.clone()))
+        .collect();
+    for (new_id, block) in callee_blocks.iter_mut() {
+        block.id = *new_id;
+        // Remap embedded BlockIds in terminators.
+        block.term = match std::mem::replace(&mut block.term, Terminator::Unreachable) {
+            Terminator::Jump(t) => Terminator::Jump(t + block_offset),
+            Terminator::Branch { cond, then_, else_ } => Terminator::Branch {
+                cond,
+                then_: then_ + block_offset,
+                else_: else_ + block_offset,
+            },
+            Terminator::Return(ret_expr) => {
+                if let Some(var) = &bound_var {
+                    block.stmts.push(Stmt::Assign {
+                        var: var.clone(),
+                        rhs: ret_expr,
+                        span: None,
+                    });
+                }
+                // Else: discard the return value.
+                Terminator::Jump(join_block_id)
+            }
+            Terminator::Unreachable => Terminator::Unreachable,
+        };
+    }
+
+    // Prepend param-binding Lets to the callee's entry block.
+    let callee_entry = utility.body_cfg.entry + block_offset;
+    if let Some((_, entry_block)) = callee_blocks.iter_mut().find(|(id, _)| *id == callee_entry) {
+        let mut new_stmts = std::mem::take(&mut param_lets);
+        new_stmts.extend(std::mem::take(&mut entry_block.stmts));
+        entry_block.stmts = new_stmts;
+    } else {
+        // Defensive: entry block missing.
+        return;
+    }
+
+    // 6. Insert callee blocks into the caller CFG.
+    for (id, block) in callee_blocks {
+        cfg.blocks.insert(id, block);
+    }
+
+    // 7. Caller block now jumps to callee entry.
+    cfg.blocks.get_mut(&block_id).unwrap().term = Terminator::Jump(callee_entry);
+
+    // 8. Create the join block — holds the original post-call stmts and the
+    //    caller's original terminator.
+    cfg.blocks.insert(
+        join_block_id,
+        BasicBlock {
+            id: join_block_id,
+            stmts: post,
+            term: old_term,
+        },
+    );
+
+    // Edge maintenance: the cfg's `edges` vec is used by some passes (e.g.
+    // narrowing) for IfTrue/IfFalse classification — leaves on Unconditional
+    // jumps are not always recorded. We keep edges minimal; the abstract
+    // interpreter recomputes successors from terminators when needed.
+}
+
+fn strip_ts_annot(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::TSAnnotated(inner, _) => inner.as_ref(),
+        other => other,
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -906,6 +1244,7 @@ mod tests {
             },
         );
         ComponentIR {
+            file: std::path::PathBuf::new(),
             name: "TestComp".to_string(),
             param: "props".to_string(),
             render_cfg: CFG {
@@ -1224,6 +1563,7 @@ mod tests {
             },
         );
         let comp = ComponentIR {
+            file: std::path::PathBuf::new(),
             name: "C".to_string(),
             param: "props".to_string(),
             render_cfg: CFG {

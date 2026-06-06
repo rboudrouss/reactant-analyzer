@@ -162,7 +162,7 @@ fn eval_comp_app(
     }
 
     // Registry lookup
-    let Some(child_ir) = inter.registry.get(name).cloned() else {
+    let Some(child_ir) = inter.registry.get_by_name(name).cloned() else {
         inter
             .stats
             .borrow_mut()

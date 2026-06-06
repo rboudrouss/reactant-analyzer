@@ -43,7 +43,7 @@ fn infinite_loop_hits(src: &str) -> usize {
         .parse();
     assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
     let line_starts = compute_line_starts(src);
-    let components = lower_program(&ret.program, &line_starts);
+    let components = lower_program(&ret.program, &line_starts, std::path::Path::new("test.tsx"));
     assert!(!components.is_empty(), "no component detected");
     components
         .into_iter()

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::ir::{
     cfg::{BasicBlock, CFG, Terminator},
@@ -209,6 +210,7 @@ fn prop_to_event(name: &str) -> String {
 pub fn extract_hooks(
     cfg: &mut CFG,
     import_map: &HashMap<String, String>,
+    resolved_import_map: &HashMap<String, PathBuf>,
 ) -> (Vec<HookEntry>, HookLabel) {
     let mut label: HookLabel = 0;
     let mut hooks: Vec<HookEntry> = Vec::new();
@@ -230,6 +232,7 @@ pub fn extract_hooks(
                 &mut label,
                 &mut state_temps,
                 import_map,
+                resolved_import_map,
             );
         }
 
@@ -246,6 +249,7 @@ fn process_stmt(
     label: &mut HookLabel,
     state_temps: &mut HashMap<String, HookLabel>,
     import_map: &HashMap<String, String>,
+    resolved_import_map: &HashMap<String, PathBuf>,
 ) {
     match stmt {
         Stmt::Let {
@@ -263,16 +267,19 @@ fn process_stmt(
                     hooks.push(entry);
                 }
 
-                // Record the binding variable and import source for Custom hooks.
+                // Record the binding variable, npm import source, and resolved
+                // file (ADR-013 §2) for Custom hooks.
                 if !is_arr_temp {
                     if let Some(HookEntry::Custom {
                         binding,
                         import_source,
+                        resolved_file,
                         ..
                     }) = hooks.last_mut()
                     {
                         *binding = Some(var.clone());
                         *import_source = import_map.get(&name).cloned();
+                        *resolved_file = resolved_import_map.get(&name).cloned();
                     }
                 }
 
@@ -302,6 +309,18 @@ fn process_stmt(
                 *label += 1;
                 if let Some(entry) = make_hook_entry(&name, lbl, args, None, stmt_span) {
                     hooks.push(entry);
+                }
+                // For Custom hooks without a binding, populate import_source +
+                // resolved_file so the engine can still resolve their definition
+                // (ADR-013 §2).
+                if let Some(HookEntry::Custom {
+                    import_source,
+                    resolved_file,
+                    ..
+                }) = hooks.last_mut()
+                {
+                    *import_source = import_map.get(&name).cloned();
+                    *resolved_file = resolved_import_map.get(&name).cloned();
                 }
                 // useEffect and similar void hooks: no stmt emitted.
             }
@@ -453,6 +472,7 @@ fn make_hook_entry(
                 deps: None,
                 binding: None,
                 import_source: None,
+                resolved_file: None,
                 span,
             })
         }
@@ -595,7 +615,7 @@ mod tests {
                 _ => None,
             })
             .expect("no function found");
-        let (hooks, _) = extract_hooks(&mut cfg, &HashMap::new());
+        let (hooks, _) = extract_hooks(&mut cfg, &HashMap::new(), &HashMap::new());
         (cfg, hooks)
     }
 
@@ -838,7 +858,7 @@ mod tests {
                 _ => None,
             })
             .expect("no function found");
-        let (mut hooks, mut next_label) = extract_hooks(&mut cfg, &HashMap::new());
+        let (mut hooks, mut next_label) = extract_hooks(&mut cfg, &HashMap::new(), &HashMap::new());
         extract_handlers(&cfg, &mut hooks, &mut next_label);
         (cfg, hooks)
     }
@@ -962,7 +982,7 @@ mod tests {
                 _ => None,
             })
             .expect("no function found");
-        let (mut hooks, mut next_label) = extract_hooks(&mut cfg, &HashMap::new());
+        let (mut hooks, mut next_label) = extract_hooks(&mut cfg, &HashMap::new(), &HashMap::new());
         extract_handlers(&cfg, &mut hooks, &mut next_label);
         let handler = hooks
             .iter()
@@ -991,7 +1011,7 @@ mod tests {
                 _ => None,
             })
             .expect("no function found");
-        let (mut hooks, mut next_label) = extract_hooks(&mut cfg, &HashMap::new());
+        let (mut hooks, mut next_label) = extract_hooks(&mut cfg, &HashMap::new(), &HashMap::new());
         extract_handlers(&cfg, &mut hooks, &mut next_label);
         extract_subscriptions(&mut hooks, &mut next_label);
         (cfg, hooks)

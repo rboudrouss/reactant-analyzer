@@ -413,6 +413,7 @@ mod tests {
             },
         );
         let comp = ComponentIR {
+            file: std::path::PathBuf::new(),
             name: "Counter".to_string(),
             param: "props".to_string(),
             render_cfg: CFG {

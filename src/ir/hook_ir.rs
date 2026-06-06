@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crate::ir::{
     cfg::CFG,
     hooks::HookEntry,
@@ -8,6 +10,8 @@ use crate::ir::{
 /// Analogous to `ComponentIR` but for `use*` functions.
 #[derive(Debug, Clone)]
 pub struct HookIR {
+    /// Source file this hook was lowered from (ADR-013 §1).
+    pub file: PathBuf,
     pub name: Symbol,
     pub params: Vec<Var>,
     pub body_cfg: CFG,

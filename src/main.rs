@@ -1,4 +1,7 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use clap::Parser;
 use oxc_allocator::Allocator;
@@ -6,15 +9,20 @@ use oxc_parser::{ParseOptions, Parser as OxcParser};
 use oxc_span::SourceType;
 
 use reactant::{
-    engine::{ComponentRegistry, Config, HookRegistry, RootStrategy, analyze_program},
-    lowering::{compute_line_starts, lower_custom_hooks, lower_program},
+    engine::{
+        ComponentRegistry, Config, FunctionRegistry, HookRegistry, RootStrategy, SymbolGraph,
+        analyze_program,
+    },
+    lowering::{compute_line_starts, lower_custom_hooks, lower_program, lower_utilities},
+    resolver::{DefaultFileDiscoverer, FileDiscoverer},
     rules::{Severity, all_rules},
 };
 
 #[derive(Parser)]
 #[command(name = "reactant", about = "Sound static analyzer for React hooks")]
 struct Args {
-    /// Files to analyze (.tsx / .ts / .jsx / .js)
+    /// Files or directories to analyze. Directories are walked recursively
+    /// for `.ts` / `.tsx` / `.js` / `.jsx` files.
     files: Vec<String>,
 
     /// Show Info diagnostics (known analysis limitations, e.g. widening)
@@ -39,26 +47,44 @@ fn main() {
 
     if args.files.is_empty() {
         eprintln!(
-            "Usage: reactant [--info] [--verbose] [--all-roots] [--entry Foo,Bar] <file.tsx> ..."
+            "Usage: reactant [--info] [--verbose] [--all-roots] [--entry Foo,Bar] <file.tsx|dir> ..."
         );
         std::process::exit(1);
     }
 
-    // Phase 1: parse all files and collect ComponentIRs + HookIRs.
+    // Expand directory inputs via FileDiscoverer; explicit files pass through.
+    let discoverer = DefaultFileDiscoverer;
+    let mut resolved_files: Vec<PathBuf> = Vec::new();
+    for input in &args.files {
+        let p = Path::new(input);
+        if p.is_dir() {
+            let found = discoverer.discover(p);
+            if found.is_empty() {
+                eprintln!("[error] no .ts/.tsx/.js/.jsx files found in {}", input);
+                std::process::exit(1);
+            }
+            resolved_files.extend(found);
+        } else {
+            resolved_files.push(p.to_path_buf());
+        }
+    }
+
+    // Phase 1: parse all files and collect ComponentIRs + HookIRs + FunctionIRs.
     let mut all_components = Vec::new();
     let mut all_hook_irs = Vec::new();
+    let mut all_utilities = Vec::new();
     let mut file_count = 0usize;
 
-    for path in &args.files {
-        let source = match fs::read_to_string(Path::new(path)) {
+    for path in &resolved_files {
+        let source = match fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[error] {}: {}", path, e);
+                eprintln!("[error] {}: {}", path.display(), e);
                 continue;
             }
         };
         let alloc = Allocator::default();
-        let source_type = match Path::new(path).extension().and_then(|e| e.to_str()) {
+        let source_type = match path.extension().and_then(|e| e.to_str()) {
             Some("tsx") => SourceType::tsx(),
             Some("ts") => SourceType::ts(),
             Some("jsx") => SourceType::jsx(),
@@ -68,12 +94,17 @@ fn main() {
             .with_options(ParseOptions::default())
             .parse();
         if !ret.errors.is_empty() {
-            eprintln!("[parse error] {}: {}", path, ret.errors[0].message);
+            eprintln!(
+                "[parse error] {}: {}",
+                path.display(),
+                ret.errors[0].message
+            );
             continue;
         }
         let line_starts = compute_line_starts(&source);
-        all_components.extend(lower_program(&ret.program, &line_starts));
-        all_hook_irs.extend(lower_custom_hooks(&ret.program, &line_starts));
+        all_components.extend(lower_program(&ret.program, &line_starts, path));
+        all_hook_irs.extend(lower_custom_hooks(&ret.program, &line_starts, path));
+        all_utilities.extend(lower_utilities(&ret.program, &line_starts, path));
         file_count += 1;
     }
 
@@ -83,10 +114,32 @@ fn main() {
     }
 
     // Phase 2: build registry and determine root strategy.
+    // hook_counts is keyed by registry display name so collisions disambiguate
+    // (ADR-013 §1) — e.g. two `Page` components in different files each get
+    // their own entry instead of overwriting on plain name.
+    let temp_registry = ComponentRegistry::from_components(all_components.clone());
     let hook_counts: std::collections::HashMap<String, usize> = all_components
         .iter()
-        .map(|c| (c.name.clone(), c.hooks.len()))
+        .map(|c| {
+            let key = (c.file.clone(), c.name.clone());
+            (temp_registry.display_name(&key), c.hooks.len())
+        })
         .collect();
+    drop(temp_registry);
+
+    // Symbol graph for deterministic ordering / cycle reporting (ADR-013 §4).
+    let symbol_graph = SymbolGraph::build(&all_components, &all_hook_irs);
+    let topo = symbol_graph.topo_sort();
+    if args.verbose {
+        eprintln!(
+            "[verbose] symbol graph: {} nodes, topo order = [{}]",
+            topo.len(),
+            topo.iter()
+                .map(|n| format!("{}@{}", n.name, n.file.display()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     let registry = ComponentRegistry::from_components(all_components);
     let hook_registry = HookRegistry::from_hooks(all_hook_irs);
@@ -98,7 +151,15 @@ fn main() {
         RootStrategy::Heuristic
     };
 
-    let config = Config::default();
+    let mut config = Config::default();
+    config.function_registry = FunctionRegistry::from_functions(all_utilities);
+
+    if args.verbose {
+        eprintln!(
+            "[verbose] {} utility function(s) available for inlining",
+            config.function_registry.len()
+        );
+    }
 
     // Phase 3: inter-component analysis.
     let program_result = analyze_program(registry, hook_registry, strategy, &config);

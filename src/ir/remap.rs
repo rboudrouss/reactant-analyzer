@@ -222,6 +222,7 @@ fn remap_hook_entry(entry: HookEntry, offset: HookLabel) -> HookEntry {
             deps,
             binding,
             import_source,
+            resolved_file,
             span,
         } => HookEntry::Custom {
             label: label + offset,
@@ -230,6 +231,7 @@ fn remap_hook_entry(entry: HookEntry, offset: HookLabel) -> HookEntry {
             deps: deps.map(|v| v.into_iter().map(|e| remap_expr(e, offset)).collect()),
             binding,
             import_source,
+            resolved_file,
             span,
         },
         HookEntry::Handler {

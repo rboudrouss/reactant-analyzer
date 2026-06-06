@@ -52,6 +52,7 @@ fn empty_cfg() -> CFG {
 /// ComponentIR with no hooks and no render body.
 fn leaf_component(name: &str) -> ComponentIR {
     ComponentIR {
+        file: std::path::PathBuf::new(),
         name: name.to_string(),
         param: "props".to_string(),
         render_cfg: empty_cfg(),
@@ -90,6 +91,7 @@ fn heuristic_detects_parent_not_child_as_root() {
             },
         );
         ComponentIR {
+            file: std::path::PathBuf::new(),
             name: "Parent".to_string(),
             param: "props".to_string(),
             render_cfg: CFG {
@@ -103,7 +105,8 @@ fn heuristic_detects_parent_not_child_as_root() {
     let child = leaf_component("Child");
     let reg = ComponentRegistry::from_components(vec![parent, child]);
     let roots = RootStrategy::Heuristic.detect(&reg);
-    assert_eq!(roots, vec!["Parent".to_string()]);
+    let names: Vec<String> = roots.into_iter().map(|(_, n)| n).collect();
+    assert_eq!(names, vec!["Parent".to_string()]);
 }
 
 // ── analyze_program basic ─────────────────────────────────────────────────────
@@ -139,6 +142,7 @@ fn analyze_program_populates_call_graph_for_parent_child() {
             },
         );
         ComponentIR {
+            file: std::path::PathBuf::new(),
             name: "Parent".to_string(),
             param: "props".to_string(),
             render_cfg: CFG {
@@ -225,6 +229,7 @@ fn setter_prop_propagates_to_shared_state() {
             }
         };
         ComponentIR {
+            file: std::path::PathBuf::new(),
             name: "Child".to_string(),
             param: "props".to_string(),
             render_cfg: render,
@@ -276,6 +281,7 @@ fn setter_prop_propagates_to_shared_state() {
             }
         };
         ComponentIR {
+            file: std::path::PathBuf::new(),
             name: "Parent".to_string(),
             param: "props".to_string(),
             render_cfg: render,
@@ -324,6 +330,7 @@ fn recursive_component_does_not_crash() {
             },
         );
         ComponentIR {
+            file: std::path::PathBuf::new(),
             name: "TreeNode".to_string(),
             param: "props".to_string(),
             render_cfg: CFG {
@@ -442,7 +449,7 @@ fn parse_and_analyze_with_strategy(src: &str, strategy: RootStrategy) -> Program
         .parse();
     assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
     let line_starts = compute_line_starts(src);
-    let components = lower_program(&ret.program, &line_starts);
+    let components = lower_program(&ret.program, &line_starts, std::path::Path::new("test.tsx"));
     let reg = ComponentRegistry::from_components(components);
     analyze_program(reg, HookRegistry::new(), strategy, &Config::default())
 }
@@ -562,6 +569,7 @@ fn prop_drilling_direct_ir() {
             }
         };
         ComponentIR {
+            file: std::path::PathBuf::new(),
             name: "Leaf".to_string(),
             param: "props".to_string(),
             render_cfg: empty_cfg(),
@@ -597,6 +605,7 @@ fn prop_drilling_direct_ir() {
             },
         );
         ComponentIR {
+            file: std::path::PathBuf::new(),
             name: "Middle".to_string(),
             param: "props".to_string(),
             render_cfg: CFG {
@@ -636,6 +645,7 @@ fn prop_drilling_direct_ir() {
             },
         );
         ComponentIR {
+            file: std::path::PathBuf::new(),
             name: "Root".to_string(),
             param: "props".to_string(),
             render_cfg: CFG {
@@ -1007,7 +1017,7 @@ fn missing_deps_inter_specific_fp_suppression() {
         .with_options(ParseOptions::default())
         .parse();
     let line_starts = compute_line_starts(&src);
-    let components = lower_program(&ret.program, &line_starts);
+    let components = lower_program(&ret.program, &line_starts, std::path::Path::new("test.tsx"));
     // Analyze ONLY Section6_Child in isolation (no parent, no inter context).
     let isolated: Vec<_> = components
         .into_iter()

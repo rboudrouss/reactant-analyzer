@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::{
-    engine::component_registry::ComponentRegistry,
+    engine::component_registry::{ComponentKey, ComponentRegistry},
     ir::{
         cfg::{CFG, Terminator},
         component::ComponentIR,
@@ -18,32 +18,45 @@ pub enum RootStrategy {
     Heuristic,
     /// `--all-roots`: every component analyzed as a root (props = ⊤ if not inlined).
     AllComponents,
-    /// `--entry Foo,Bar`: explicit list.
+    /// `--entry Foo,Bar`: explicit list (matched against component names; every
+    /// `(file, name)` registry entry whose name matches becomes a root).
     Explicit(Vec<Symbol>),
 }
 
 impl RootStrategy {
-    pub fn detect(&self, registry: &ComponentRegistry) -> Vec<Symbol> {
+    /// Returns the set of root components to analyse, keyed by `(file, name)`
+    /// so distinct files defining the same name are each analysed (ADR-013 §1).
+    pub fn detect(&self, registry: &ComponentRegistry) -> Vec<ComponentKey> {
         match self {
             RootStrategy::Heuristic => {
                 let mut referenced: HashSet<Symbol> = HashSet::new();
                 for comp in registry.all_components() {
                     collect_compapp_in_component(comp, &mut referenced);
                 }
-                let mut roots: Vec<Symbol> = registry
-                    .all_names()
-                    .filter(|name| !referenced.contains(*name))
-                    .cloned()
+                let mut roots: Vec<ComponentKey> = registry
+                    .all_keys()
+                    .into_iter()
+                    .filter(|(_, name)| !referenced.contains(name))
                     .collect();
-                roots.sort(); // deterministic order
+                roots.sort();
                 roots
             }
             RootStrategy::AllComponents => {
-                let mut names: Vec<Symbol> = registry.all_names().cloned().collect();
-                names.sort();
-                names
+                let mut keys = registry.all_keys();
+                keys.sort();
+                keys
             }
-            RootStrategy::Explicit(names) => names.clone(),
+            RootStrategy::Explicit(names) => {
+                let mut keys: Vec<ComponentKey> = Vec::new();
+                for name in names {
+                    for c in registry.find_all_by_name(name) {
+                        keys.push((c.file.clone(), c.name.clone()));
+                    }
+                }
+                keys.sort();
+                keys.dedup();
+                keys
+            }
         }
     }
 }
@@ -161,6 +174,7 @@ mod tests {
 
     fn component(name: &str) -> ComponentIR {
         ComponentIR {
+            file: std::path::PathBuf::new(),
             name: name.to_string(),
             param: "props".to_string(),
             render_cfg: trivial_cfg(),
@@ -182,6 +196,7 @@ mod tests {
             },
         );
         ComponentIR {
+            file: std::path::PathBuf::new(),
             name: name.to_string(),
             param: "props".to_string(),
             render_cfg: CFG {
@@ -197,12 +212,18 @@ mod tests {
         ComponentRegistry::from_components(comps)
     }
 
+    fn names(keys: &[crate::engine::ComponentKey]) -> Vec<String> {
+        let mut out: Vec<String> = keys.iter().map(|(_, n)| n.clone()).collect();
+        out.sort();
+        out
+    }
+
     #[test]
     fn heuristic_leaf_component_is_root() {
         // App has no parent → root
         let reg = registry(vec![component("App")]);
         let roots = RootStrategy::Heuristic.detect(&reg);
-        assert_eq!(roots, vec!["App".to_string()]);
+        assert_eq!(names(&roots), vec!["App".to_string()]);
     }
 
     #[test]
@@ -213,7 +234,7 @@ mod tests {
             component("Child"),
         ]);
         let roots = RootStrategy::Heuristic.detect(&reg);
-        assert_eq!(roots, vec!["Parent".to_string()]);
+        assert_eq!(names(&roots), vec!["Parent".to_string()]);
     }
 
     #[test]
@@ -224,18 +245,16 @@ mod tests {
             component("B"),
             component("C"),
         ]);
-        let mut roots = RootStrategy::Heuristic.detect(&reg);
-        roots.sort();
-        assert_eq!(roots, vec!["A".to_string(), "C".to_string()]);
+        let roots = RootStrategy::Heuristic.detect(&reg);
+        assert_eq!(names(&roots), vec!["A".to_string(), "C".to_string()]);
     }
 
     #[test]
     fn all_components_returns_everything() {
         let reg = registry(vec![component("X"), component("Y"), component("Z")]);
-        let mut roots = RootStrategy::AllComponents.detect(&reg);
-        roots.sort();
+        let roots = RootStrategy::AllComponents.detect(&reg);
         assert_eq!(
-            roots,
+            names(&roots),
             vec!["X".to_string(), "Y".to_string(), "Z".to_string()]
         );
     }
@@ -244,7 +263,7 @@ mod tests {
     fn explicit_returns_named() {
         let reg = registry(vec![component("A"), component("B"), component("C")]);
         let roots = RootStrategy::Explicit(vec!["B".to_string()]).detect(&reg);
-        assert_eq!(roots, vec!["B".to_string()]);
+        assert_eq!(names(&roots), vec!["B".to_string()]);
     }
 
     #[test]

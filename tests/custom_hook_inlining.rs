@@ -25,8 +25,8 @@ fn parse_and_analyze(src: &str) -> ProgramAnalysisResult {
         .parse();
     assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
     let line_starts = compute_line_starts(src);
-    let components = lower_program(&ret.program, &line_starts);
-    let hook_irs = lower_custom_hooks(&ret.program, &line_starts);
+    let components = lower_program(&ret.program, &line_starts, std::path::Path::new("test.tsx"));
+    let hook_irs = lower_custom_hooks(&ret.program, &line_starts, std::path::Path::new("test.tsx"));
     let reg = ComponentRegistry::from_components(components);
     let hook_reg = HookRegistry::from_hooks(hook_irs);
     analyze_program(

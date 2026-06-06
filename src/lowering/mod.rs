@@ -3,18 +3,28 @@ pub mod component_detector;
 pub mod expr_lower;
 pub mod hook_detector;
 pub mod hook_extractor;
+pub mod import_resolution;
+pub mod utility_detector;
+pub mod utility_lowerer;
 
 pub use crate::ir::{compute_line_starts, offset_to_range};
 pub use cfg_builder::{build_cfg, build_fn_body_cfg};
 pub use component_detector::{ComponentCandidate, detect_components};
 pub use hook_detector::{HookCandidate, detect_custom_hooks};
 pub use hook_extractor::{extract_handlers, extract_hooks, extract_subscriptions};
+pub use import_resolution::build_resolved_import_map;
+pub use utility_detector::{UtilityCandidate, detect_utilities};
+pub use utility_lowerer::{lower_utilities, lower_utilities_with_resolver};
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use oxc_ast::ast::{ImportDeclarationSpecifier, Program, Statement};
 
-use crate::ir::{component::ComponentIR, hook_ir::HookIR};
+use crate::{
+    ir::{component::ComponentIR, hook_ir::HookIR},
+    resolver::{DefaultImportResolver, ImportResolver},
+};
 
 /// Build a map from locally-bound hook name → NPM package source for every
 /// named import in `program`.
@@ -55,17 +65,40 @@ fn build_import_map(program: &Program) -> HashMap<String, String> {
 
 /// Lower all user-defined custom hooks in `program` to `HookIR`.
 /// Called alongside `lower_program` to build the `HookRegistry`.
-pub fn lower_custom_hooks(program: &Program, line_starts: &[u32]) -> Vec<HookIR> {
+///
+/// `file` is the absolute path of the source file. It is stored on each
+/// produced `HookIR` so the engine can key registries by `(file, name)` and
+/// resolve cross-file imports (ADR-013 §1).
+///
+/// Uses [`DefaultImportResolver`] for relative-import resolution. Callers that
+/// need a custom resolver (Phase 4 plugin path) should use
+/// [`lower_custom_hooks_with_resolver`].
+pub fn lower_custom_hooks(program: &Program, line_starts: &[u32], file: &Path) -> Vec<HookIR> {
+    lower_custom_hooks_with_resolver(program, line_starts, file, &DefaultImportResolver)
+}
+
+/// Plugin-friendly variant of [`lower_custom_hooks`] that accepts a custom
+/// `ImportResolver` (ADR-013 §2 + Phase 4).
+pub fn lower_custom_hooks_with_resolver(
+    program: &Program,
+    line_starts: &[u32],
+    file: &Path,
+    resolver: &dyn ImportResolver,
+) -> Vec<HookIR> {
     let import_map = build_import_map(program);
+    let resolved_import_map: HashMap<String, PathBuf> =
+        build_resolved_import_map(program, file, resolver);
     detect_custom_hooks(program)
         .into_iter()
         .map(|candidate| {
             let (params, mut body_cfg) =
                 build_fn_body_cfg(candidate.params, candidate.body, line_starts);
-            let (mut hooks, mut next_label) = extract_hooks(&mut body_cfg, &import_map);
+            let (mut hooks, mut next_label) =
+                extract_hooks(&mut body_cfg, &import_map, &resolved_import_map);
             extract_handlers(&body_cfg, &mut hooks, &mut next_label);
             extract_subscriptions(&mut hooks, &mut next_label);
             HookIR {
+                file: file.to_path_buf(),
                 name: candidate.name,
                 params,
                 body_cfg,
@@ -77,14 +110,31 @@ pub fn lower_custom_hooks(program: &Program, line_starts: &[u32]) -> Vec<HookIR>
 }
 
 /// Stage 3 entry point: lower all React components in `program` to `ComponentIR`.
-pub fn lower_program(program: &Program, line_starts: &[u32]) -> Vec<ComponentIR> {
+///
+/// `file` is the absolute path of the source file (ADR-013 §1). Uses
+/// [`DefaultImportResolver`]; see [`lower_program_with_resolver`] for the
+/// plugin variant.
+pub fn lower_program(program: &Program, line_starts: &[u32], file: &Path) -> Vec<ComponentIR> {
+    lower_program_with_resolver(program, line_starts, file, &DefaultImportResolver)
+}
+
+/// Plugin-friendly variant of [`lower_program`] (ADR-013 §2 + Phase 4).
+pub fn lower_program_with_resolver(
+    program: &Program,
+    line_starts: &[u32],
+    file: &Path,
+    resolver: &dyn ImportResolver,
+) -> Vec<ComponentIR> {
     let import_map = build_import_map(program);
+    let resolved_import_map: HashMap<String, PathBuf> =
+        build_resolved_import_map(program, file, resolver);
     detect_components(program)
         .into_iter()
         .map(|candidate| {
             let (param_names, mut render_cfg) =
                 build_fn_body_cfg(candidate.params, candidate.body, line_starts);
-            let (mut hooks, mut next_label) = extract_hooks(&mut render_cfg, &import_map);
+            let (mut hooks, mut next_label) =
+                extract_hooks(&mut render_cfg, &import_map, &resolved_import_map);
             extract_handlers(&render_cfg, &mut hooks, &mut next_label);
             extract_subscriptions(&mut hooks, &mut next_label);
             let param = param_names
@@ -92,6 +142,7 @@ pub fn lower_program(program: &Program, line_starts: &[u32]) -> Vec<ComponentIR>
                 .next()
                 .unwrap_or_else(|| "props".to_string());
             ComponentIR {
+                file: file.to_path_buf(),
                 name: candidate.name,
                 param,
                 render_cfg,

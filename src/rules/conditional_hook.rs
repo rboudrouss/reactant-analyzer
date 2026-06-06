@@ -327,6 +327,7 @@ mod tests {
             },
         );
         let comp = ComponentIR {
+            file: std::path::PathBuf::new(),
             name: "C".to_string(),
             param: "props".to_string(),
             render_cfg: CFG {
@@ -402,6 +403,7 @@ mod tests {
             },
         );
         let comp = ComponentIR {
+            file: std::path::PathBuf::new(),
             name: "C".to_string(),
             param: "props".to_string(),
             render_cfg: CFG {
