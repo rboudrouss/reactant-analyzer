@@ -1,7 +1,14 @@
 [package]
-name = "reactant"
-version = "0.1.0"
-edition = "2024"
+name          = "reactant"
+version       = "0.1.0"
+edition       = "2024"
+description   = "Static analyzer for React hook bugs (infinite loops, missing deps, derived state, ...) based on abstract interpretation over a dedicated CFG-based IR."
+license       = "MIT"
+repository    = "https://github.com/rboudrouss/reactant-analyzer"
+readme        = "README.md"
+authors       = ["rboudrouss <r.boudrouss@gmail.com>"]
+keywords      = ["react", "static-analysis", "linter", "hooks", "abstract-interpretation"]
+categories    = ["development-tools", "development-tools::debugging"]
 
 [[bin]]
 name = "reactant"
