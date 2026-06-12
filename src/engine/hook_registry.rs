@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crate::ir::{hook_ir::HookIR, types::Symbol};
 
 /// Key for [`HookRegistry`]: `(file, name)`. Two hooks named `useData`
-/// in different files coexist without overwriting (ADR-013 §1).
+/// in different files coexist without overwriting.
 pub type HookKey = (PathBuf, Symbol);
 
 /// Maps `(file, name)` pairs to lowered `HookIR`. Built once from all parsed
@@ -28,12 +28,12 @@ impl HookRegistry {
         reg
     }
 
-    /// Primary lookup: by `(file, name)` (ADR-013 §1).
+    /// Primary lookup: by `(file, name)`.
     pub fn get(&self, key: &HookKey) -> Option<&HookIR> {
         self.hooks.get(key)
     }
 
-    /// Legacy lookup by name only — returns the first match (sorted) when
+    /// Legacy lookup by name only returns the first match (sorted) when
     /// multiple files define a hook with the same name. Use [`Self::get`]
     /// when the caller knows which file the lookup belongs to.
     #[doc(hidden)]

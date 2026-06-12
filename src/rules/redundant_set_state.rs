@@ -16,15 +16,9 @@ use crate::{
 
 use super::{Diagnostic, Rule};
 
-/// Fires when `setState` is called with a stable value AND the current state
-/// for that label is already stable — the update won't change anything.
-///
-/// Rationale: if the new value is stable (won't change render-to-render) and
-/// the state is already stable, there is no reason to call setState at all.
-/// Checked in both the render body and useEffect bodies.
-///
-/// Conservative: only fires when BOTH argument and current state are stable.
-/// Unstable/Top arguments are never flagged (could still cause a change).
+/// Fires when `setState` is called with a stable value when the state is already stable.
+/// Checked in both render body and effect bodies.
+/// Only fires when BOTH argument and current state are stable.
 pub struct RedundantSetState;
 
 impl Rule for RedundantSetState {
@@ -62,8 +56,6 @@ impl Rule for RedundantSetState {
         }
 
         // ── Effect bodies ─────────────────────────────────────────────────────
-        // Use the render-exit env to resolve setter bindings (setters are bound
-        // in render scope and captured as free variables by effect closures).
         let env_exit = result.exit_env();
 
         for hook in &result.hooks {
@@ -82,7 +74,6 @@ impl Rule for RedundantSetState {
                     &transfer,
                     &mut diags,
                 );
-                // Attach effect source location to any diagnostics just emitted.
                 if let Some(r) = result.effect_info.get(eff_label).and_then(|i| i.span) {
                     for d in &mut diags[prev_len..] {
                         if d.range.is_none() {
@@ -98,10 +89,7 @@ impl Rule for RedundantSetState {
 }
 
 /// Scan all blocks of `cfg` for redundant setter calls.
-///
-/// Setters whose argument value differs across calls in the effect CFG
-/// (including inside `FnLit` bodies such as `.then()` callbacks) are skipped
-/// — they're part of a state-transition sequence, not a redundant set.
+/// Skips setters whose argument differs across calls (state-transition pattern).
 fn check_cfg_for_redundant_sets(
     cfg: &CFG,
     env: &AbstractEnv<StateValue>,
@@ -128,9 +116,7 @@ fn check_cfg_for_redundant_sets(
     }
 }
 
-/// Returns setter labels whose evaluated argument value differs across calls in
-/// `cfg` (including nested `FnLit` bodies). A diverged setter is part of a
-/// state-transition pattern and should not be flagged as redundant.
+/// Returns setter labels whose argument value differs across calls in `cfg` (including nested FnLits).
 fn collect_transition_setters(
     cfg: &CFG,
     env: &AbstractEnv<StateValue>,
@@ -270,7 +256,7 @@ fn check_setter_calls(
                         "redundant-set-state",
                         format!(
                             "setState for hook {} called with a stable value \
-                                     when state is already stable — update is redundant",
+                                     when state is already stable update is redundant",
                             label
                         ),
                     )
@@ -374,7 +360,7 @@ mod tests {
 
     #[test]
     fn stable_arg_stable_state_warns() {
-        // setN(42) — 42 is a point interval (stable), state is a point interval → redundant
+        // setN(42) 42 is a point interval (stable), state is a point interval → redundant
         let stmts = vec![
             Stmt::Let {
                 var: "setN".to_string(),
@@ -506,8 +492,6 @@ mod tests {
         );
     }
 
-    // ── Effect body tests ─────────────────────────────────────────────────────
-
     fn make_result_with_effect(
         render_stmts: Vec<Stmt>,
         effect_stmts: Vec<Stmt>,
@@ -516,7 +500,6 @@ mod tests {
     ) -> AnalysisResult<StateValue> {
         use crate::ir::hooks::HookEntry;
 
-        // Render CFG block
         let mut blocks = HashMap::new();
         blocks.insert(
             0,
@@ -532,7 +515,6 @@ mod tests {
             edges: vec![],
         };
 
-        // Render exit env (used by effect check)
         let mut env = AbstractEnv::<StateValue>::new();
         for (name, val, setter) in &env_bindings {
             env.extend((*name).to_string(), val.clone());
@@ -543,7 +525,6 @@ mod tests {
         let mut block_states = HashMap::new();
         block_states.insert(0usize, env);
 
-        // Effect CFG
         let mut eff_blocks = HashMap::new();
         eff_blocks.insert(
             0,
@@ -589,8 +570,7 @@ mod tests {
 
     #[test]
     fn effect_stable_setter_stable_state_warns() {
-        // useEffect(() => { setN(42) }, []) where state is already stable
-        // Setter is bound in render, used in effect body as free var.
+        // useEffect(() => { setN(42) }, []) state already stable
         let render_stmts = vec![Stmt::Let {
             var: "setN".to_string(),
             rhs: Expr::StateSetter(0),
@@ -616,7 +596,7 @@ mod tests {
 
     #[test]
     fn effect_unstable_arg_no_warning() {
-        // useEffect(() => { setN({}) }, []) — arg unstable → no warning
+        // useEffect(() => { setN({}) }, []) arg unstable → no warning
         let render_stmts = vec![Stmt::Let {
             var: "setN".to_string(),
             rhs: Expr::StateSetter(0),

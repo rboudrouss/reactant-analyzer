@@ -1,7 +1,7 @@
 //! End-to-end tests for the `always-unstable-deps` rule.
 //!
 //! Fires when every dep in `useEffect`/`useMemo`/`useCallback` evaluates to an
-//! unstable value — the deps array no longer scopes anything.
+//! unstable value the deps array no longer scopes anything.
 
 use oxc_allocator::Allocator;
 use oxc_parser::{ParseOptions, Parser};

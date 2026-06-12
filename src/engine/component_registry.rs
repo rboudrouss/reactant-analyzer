@@ -5,7 +5,7 @@ use crate::ir::{component::ComponentIR, types::Symbol};
 
 /// Maps `(file, name)` pairs to their lowered IR, built from all files before
 /// analysis. The composite key prevents two components with the same name in
-/// different files from colliding (ADR-013 §1, fixing Next.js `Page()` clashes).
+/// different files from colliding (fixing Next.js `Page()` clashes).
 pub type ComponentKey = (PathBuf, Symbol);
 
 #[derive(Debug, Default)]
@@ -27,17 +27,16 @@ impl ComponentRegistry {
         registry
     }
 
-    /// Primary lookup: by full `(file, name)` key (ADR-013 §1).
+    /// Primary lookup: by full `(file, name)` key.
     pub fn get(&self, key: &ComponentKey) -> Option<&ComponentIR> {
         self.components.get(key)
     }
 
-    /// Legacy lookup by name only — returns the first match (sorted by file path)
+    /// Legacy lookup by name only returns the first match (sorted by file path)
     /// when multiple files define a component with the same name.
     ///
     /// Use [`Self::get`] when the caller knows which file the lookup belongs to.
     /// This method exists for callers that operate on names alone (CLI input,
-    /// pre-ADR-013 tests). Phase 2.D will replace most of its uses with proper
     /// `(file, name)` resolution via `ImportResolver`.
     #[doc(hidden)]
     pub fn get_by_name(&self, name: &Symbol) -> Option<&ComponentIR> {
@@ -95,7 +94,7 @@ impl ComponentRegistry {
 
     /// Produce a stable display name for `(file, name)` that disambiguates
     /// collisions: returns `name` when `name` occurs in only one file, or
-    /// `name@<file>` when it occurs in multiple files (ADR-013 §1 output).
+    /// `name@<file>` when it occurs in multiple files.
     pub fn display_name(&self, key: &ComponentKey) -> String {
         let (file, name) = key;
         let count = self.components.keys().filter(|(_, n)| n == name).count();

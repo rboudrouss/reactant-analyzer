@@ -1,7 +1,7 @@
 //! End-to-end tests for the `lazy-init` rule.
 //!
 //! Fires when `useState(expensive())` uses a direct function call as init.
-//! Structural rule — no fixpoint needed; the lowering preserves `Expr::Call`
+//! Structural rule no fixpoint needed; the lowering preserves `Expr::Call`
 //! in the `HookEntry::State.init` slot (possibly wrapped in `TSAnnotated`).
 
 use oxc_allocator::Allocator;
@@ -121,7 +121,7 @@ fn literal_init_no_fire() {
 
 #[test]
 fn object_lit_init_no_fire() {
-    // useState({}) is a separate concern (instability) — lazy-init only flags Calls.
+    // useState({}) is a separate concern (instability) lazy-init only flags Calls.
     let h = hits(
         r#"
         function C() {
@@ -135,7 +135,7 @@ fn object_lit_init_no_fire() {
 
 #[test]
 fn nested_call_in_binop_fires() {
-    // Nested call (1 + compute()) — the call runs on every render.
+    // Nested call (1 + compute()) the call runs on every render.
     let h = hits(
         r#"
         function C() {
@@ -162,7 +162,7 @@ fn nested_call_in_object_lit_fires() {
 
 #[test]
 fn binop_no_call_no_fire() {
-    // `a + 1` is a BinOp with no Call node — must not fire.
+    // `a + 1` is a BinOp with no Call node must not fire.
     let h = hits(
         r#"
         function C({ offset }) {

@@ -82,7 +82,7 @@ pub struct AnalysisResult<D: AbstractDomain> {
     pub hook_calls: Vec<HookCallInfo>,
     pub effect_info: HashMap<HookLabel, EffectInfo>,
     /// Abstract environment at the *exit* of each block, per JSX handler body CFG.
-    /// Populated at each fixpoint iteration; last iteration's values survive (ADR-009 §5).
+    /// Populated at each fixpoint iteration; last iteration's values survive.
     pub handler_block_states: HashMap<HookLabel, HashMap<BlockId, AbstractEnv<D>>>,
     pub handler_info: HashMap<HookLabel, HandlerInfo>,
     /// Labels whose state was widened to force convergence.
@@ -95,7 +95,7 @@ pub struct AnalysisResult<D: AbstractDomain> {
     /// `Bottom` for a label = effect never called that setter in the semantic analysis.
     pub effect_setter_writes: StateStore<D>,
     pub render_cfg: CFG,
-    /// Original hook entries — needed by rules that inspect effect body CFGs.
+    /// Original hook entries needed by rules that inspect effect body CFGs.
     pub hooks: Vec<HookEntry>,
     /// Number of outer fixpoint iterations before convergence.  Useful for
     /// --verbose output and for Info diagnostics about analysis depth.

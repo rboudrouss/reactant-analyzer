@@ -40,15 +40,11 @@ use crate::{
     },
 };
 
-/// Confidence level of a diagnostic finding.
+/// Confidence level of a diagnostic.
 ///
-/// Determined at the emission site by what the abstract domain proves:
-/// - `Error`   — violation proven on ALL execution paths (e.g. setter call
-///               in a block that dominates every render exit).
-/// - `Warning` — violation possible but uncertain (conditional path, or
-///               over-approximation inherent to the rule).
-/// - `Info`    — known analysis limitation (widening triggered, depth cap,
-///               etc.).  Hidden by default; shown with --info.
+/// - `Error`   violation on ALL execution paths.
+/// - `Warning` possible but uncertain (conditional path or over-approx).
+/// - `Info`    known analysis limitation (widening, depth cap). Hidden by default; show with --info.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Severity {
     Error,
@@ -144,9 +140,8 @@ pub trait Rule {
 pub struct SetterCall {
     pub var: Var,
     pub span: Option<SourceRange>,
-    /// Block ID in the TOP-LEVEL cfg where the call was found.
-    /// `None` when the call is inside a nested `FnLit` body (separate CFG) —
-    /// conditionality cannot be determined without cross-CFG dominance.
+    /// Block in the top-level CFG where the call was found.
+    /// `None` when the call is inside a nested `FnLit` body dominance unknowable.
     pub block_id: Option<BlockId>,
 }
 
@@ -161,9 +156,8 @@ pub fn collect_setter_calls(
     collect_setter_calls_with_extra(cfg, setter_vars, max_depth, &HashMap::new())
 }
 
-/// Like `collect_setter_calls` but merges `extra_fn_bindings` (e.g. from the
-/// render CFG) so that B5 variable callbacks defined outside `cfg` are resolved.
-/// Entries in `cfg` take precedence over `extra_fn_bindings`.
+/// Like `collect_setter_calls` but merges `extra_fn_bindings` so that variable
+/// callbacks defined outside `cfg` are resolved. `cfg`-local entries take precedence.
 pub fn collect_setter_calls_with_extra(
     cfg: &CFG,
     setter_vars: &HashSet<Var>,
@@ -176,7 +170,6 @@ pub fn collect_setter_calls_with_extra(
             .entry(k.clone())
             .or_insert_with(|| Arc::clone(v));
     }
-    // (span, block_id) — block_id is None when found inside a nested FnLit.
     let mut found: HashMap<Var, (Option<SourceRange>, Option<BlockId>)> = HashMap::new();
     collect_setter_calls_inner(cfg, setter_vars, max_depth, &fn_bindings, &mut found, true);
     found
@@ -264,11 +257,8 @@ pub(super) fn collect_fn_bindings(cfg: &CFG) -> HashMap<Var, Arc<CFG>> {
     map
 }
 
-/// `top_level = true` → we're scanning the CFG passed by the public caller;
-/// block IDs recorded in `found` belong to that CFG and are meaningful for
-/// dominance checks.  `top_level = false` → we've descended into a nested
-/// FnLit body (a separate CFG); block IDs are meaningless to the caller, so
-/// we record `None`.
+/// `top_level = true` → block IDs recorded are from the caller's CFG, meaningful for dominance.
+/// `top_level = false` → inside a nested FnLit; block IDs are `None`.
 fn collect_setter_calls_inner(
     cfg: &CFG,
     setter_vars: &HashSet<Var>,
@@ -288,7 +278,6 @@ fn collect_setter_calls_inner(
             for stmt in &block.stmts {
                 check_stmt_for_setters(stmt, block_id, setter_vars, depth, fn_bindings, found);
             }
-            // Terminators also carry expressions: scan Return value and Branch condition.
             match &block.term {
                 Terminator::Return(expr) => {
                     check_expr_for_setters(
@@ -333,7 +322,7 @@ fn check_stmt_for_setters(
 ) {
     let (expr, span) = match stmt {
         Stmt::ExprStmt(e, span) => (e, *span),
-        // Also descend into Let rhs that are FnLit — direct setter call at top level of a closure.
+        // Also descend Let rhs FnLits.
         Stmt::Let { rhs, .. } => (rhs, None),
         Stmt::Assign { rhs, .. } => (rhs, None),
     };
@@ -354,9 +343,7 @@ fn check_expr_for_setters(
             if setter_vars.contains(name) {
                 found.entry(name.clone()).or_insert((stmt_span, block_id));
             }
-            // B6: direct call to a locally-bound function — descend its body.
-            // The call site IS in the top-level CFG, so propagate the outer block_id to
-            // any setters found inside the body (enables Error severity when unconditional).
+            // B6: direct call to a locally-bound function descend its body, propagate outer block_id.
             if depth > 0
                 && let Some(body) = fn_bindings.get(name)
             {
@@ -377,8 +364,7 @@ fn check_expr_for_setters(
         }
         for arg in args {
             match arg {
-                // Inline FnLit arg — descend body (costs one depth level).
-                // Nested CFG → top_level = false.
+                // Inline FnLit arg descend body, costs one depth level.
                 Expr::FnLit { body_cfg, .. } if depth > 0 => {
                     collect_setter_calls_inner(
                         body_cfg,
@@ -389,10 +375,7 @@ fn check_expr_for_setters(
                         false,
                     );
                 }
-                // B5: variable arg — pointer-following, no depth cost.
-                // Resolving Var("cb") to its FnLit is just name resolution,
-                // not an extra call frame → same depth passes through.
-                // Still a nested FnLit CFG → top_level = false.
+                // B5: variable arg name resolution, no depth cost.
                 Expr::Var(name) => {
                     if let Some(body) = fn_bindings.get(name) {
                         collect_setter_calls_inner(
@@ -411,11 +394,8 @@ fn check_expr_for_setters(
     }
 }
 
-/// Returns `true` when every expression in `deps` evaluates to an unstable abstract
-/// value in the render-exit env.  An entirely-unstable deps array does not scope the
-/// hook — it runs on every render, equivalent to having no deps argument at all.
-///
-/// An empty `deps` slice returns `false` (mount-only `[]` is not "all-unstable").
+/// `true` when every dep in `deps` is unstable in the render-exit env.
+/// Empty `deps` returns `false` (`[]` is mount-only, not all-unstable).
 pub(super) fn all_deps_unstable(deps: &[Expr], result: &AnalysisResult<StateValue>) -> bool {
     if deps.is_empty() {
         return false;

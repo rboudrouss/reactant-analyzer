@@ -1,6 +1,6 @@
 //! End-to-end tests for the `missing-deps` rule.
 //!
-//! Covers `useEffect`, `useCallback`, and `useMemo` — the rule extended to
+//! Covers `useEffect`, `useCallback`, and `useMemo` the rule extended to
 //! Memo/Callback bodies via `EffectInfo { kind: HookKind, .. }`.
 //! useEffect cases are also exercised by other fixtures; this file focuses on
 //! Memo/Callback to make the extension's behavior explicit.

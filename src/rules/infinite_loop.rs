@@ -26,21 +26,13 @@ fn capitalize_first(s: &str) -> String {
     }
 }
 
-/// Fires when an effect causes an infinite render loop — either intra-component
-/// (local state widens) or cross-component (parent state widens via a setter prop).
+/// Fires when an effect causes an infinite render loop.
 ///
-/// Rule names emitted:
-/// - `"infinite-loop"`               — local state loops.
-/// - `"cross-component-infinite-loop"` — parent's state loops via ComponentSetter prop.
+/// - `"infinite-loop"` local state widens in fixpoint.
+/// - `"cross-component-infinite-loop"` parent state widens via ComponentSetter prop.
 ///
-/// Trigger (applies to both):
-/// - Effect with no deps (`deps: None`) — runs every render.
-/// - Effect with all-unstable deps — equivalent to no-deps.
-/// - Effect with `deps: []` — mount-only, excluded.
-///
-/// Intra confirmation: `widened_labels` non-empty + write unbounded.
-/// Cross confirmation: parent's `widened_labels` contains the setter's label.
-/// If parent not in results (external), cross fires as a Warning heuristic.
+/// Effects with `deps: []` (mount-only) are excluded. Effects with all-unstable deps
+/// are treated as no-deps. If parent not in results, cross fires as Warning.
 pub struct InfiniteLoop;
 
 impl Rule for InfiniteLoop {
@@ -51,12 +43,9 @@ impl Rule for InfiniteLoop {
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
         let comp_result = &result.components[component];
 
-        // var → state label for local setters
         let local_setter_labels: HashMap<Var, HookLabel> = build_setter_var_to_label(comp_result);
 
-        // ComponentSetter-valued props (direct or FnLit-wrapped).
-        // Exclude self-references: StateSetter evaluates to ComponentSetter{component:self}
-        // in inter context, so local setters must stay in local_setter_labels only.
+        // ComponentSetter props, excluding self-references.
         let cs_vars: HashMap<Var, (Symbol, HookLabel)> = collect_component_setter_vars(
             &comp_result.render_cfg,
             &comp_result.block_states,
@@ -114,7 +103,7 @@ impl Rule for InfiniteLoop {
                     }
 
                     let deps_note = if deps.is_some() {
-                        " (all deps unstable — effect runs every render)"
+                        " (all deps unstable effect runs every render)"
                     } else {
                         ""
                     };
@@ -122,7 +111,7 @@ impl Rule for InfiniteLoop {
                         "infinite-loop",
                         format!(
                             "effect {} sets state {}{} which needed widening \
-                             — potential infinite render loop",
+                             potential infinite render loop",
                             eff_label, state_label, deps_note
                         ),
                     )
@@ -132,7 +121,6 @@ impl Rule for InfiniteLoop {
                         diag = diag.with_range(r);
                     }
 
-                    // Note: handlers also calling this setter.
                     let setter_vars_for_label: HashSet<Var> = local_setter_labels
                         .iter()
                         .filter(|&(_, l)| *l == state_label)
@@ -150,7 +138,7 @@ impl Rule for InfiniteLoop {
                             let h_span = comp_result.handler_info.get(h_label).and_then(|i| i.span);
                             diag = diag.with_note(
                                 format!(
-                                    "handler `on{}` also calls setter — \
+                                    "handler `on{}` also calls setter \
                                      grows state {} range across fixpoint iterations",
                                     capitalize_first(event),
                                     state_label
@@ -164,11 +152,6 @@ impl Rule for InfiniteLoop {
                     diags.push(diag);
                 } else if let Some((parent_comp, parent_label)) = cs_vars.get(&call.var) {
                     // ── Cross-component ────────────────────────────────────────
-                    // Use SharedStateStore as the proof signal: if the child's calls to
-                    // this setter produced an unbounded abstract value, the parent's state
-                    // diverges → proven infinite loop.
-                    // A bounded write (e.g. always `setN(1)`) terminates — React bails out
-                    // when new state equals old state.
                     let shared_write = result.shared_state.get(parent_comp, *parent_label);
                     if shared_write == crate::domains::StateValue::Bottom {
                         continue; // setter not reached in semantic analysis
@@ -178,12 +161,12 @@ impl Rule for InfiniteLoop {
                     }
 
                     let deps_note = if deps.is_some() {
-                        " (all deps unstable — effect runs every render)"
+                        " (all deps unstable effect runs every render)"
                     } else {
                         ""
                     };
                     let msg = format!(
-                        "effect {} calls `{}` — setter #{} of parent `{}`{} — \
+                        "effect {} calls `{}` setter #{} of parent `{}`{} \
                          parent re-renders → child re-renders → effect fires again: infinite loop",
                         eff_label, call.var, parent_label, parent_comp, deps_note
                     );
@@ -329,9 +312,6 @@ mod tests {
 
     #[test]
     fn widened_with_unconditional_setter_warns() {
-        // Effect body entry block: setN({})
-        // render_cfg: let setN = StateSetter(0)
-        // widened_labels: {0}
         let mut eff_blocks = HashMap::new();
         eff_blocks.insert(
             0,
@@ -356,7 +336,6 @@ mod tests {
             edges: vec![],
         };
 
-        // deps: None = no deps array = runs every render = can cycle
         let hooks = vec![HookEntry::Effect {
             label: 1,
             body_cfg: eff_cfg,
@@ -400,7 +379,7 @@ mod tests {
 
     #[test]
     fn empty_deps_array_never_warns() {
-        // deps: Some([]) = runs once on mount = no cycle possible, even if setter called
+        // deps: Some([]) = mount-only, no cycle even if setter called
         let mut eff_blocks = HashMap::new();
         eff_blocks.insert(
             0,
@@ -446,7 +425,6 @@ mod tests {
 
     #[test]
     fn widened_different_state_no_warning() {
-        // Effect sets state[1], but widened_labels = {0} → no match → no warning
         let mut eff_blocks = HashMap::new();
         eff_blocks.insert(
             0,
@@ -477,13 +455,11 @@ mod tests {
             deps: None,
             span: None,
         }];
-        // render only registers setN for state 0, not setOther
         let render_stmts = vec![Stmt::Let {
             var: "setN".to_string(),
             rhs: Expr::StateSetter(0),
             span: None,
         }];
-        // widened = {0} but effect calls setOther which isn't mapped to 0
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
         assert!(
             InfiniteLoop
@@ -494,8 +470,6 @@ mod tests {
 
     #[test]
     fn via_analyze_component_widening_threshold_1() {
-        // With widen_threshold=1, any state update triggers widening.
-        // Effect sets state with unstable value → widened_labels = {0}.
         let mut eff_blocks = HashMap::new();
         eff_blocks.insert(
             0,
@@ -534,7 +508,6 @@ mod tests {
                 type_hint: None,
                 span: None,
             },
-            // deps: None = no deps array = runs every render = can cycle
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
@@ -585,10 +558,7 @@ mod tests {
 
     #[test]
     fn count_plus_one_infinite_loop_detected() {
-        // useEffect(() => { setCount(count + 1) }, [count])
-        // Previously undetected with Stability domain; now caught via Interval widening.
-        // - Init: count = Number([0,0])
-        // - Each effect iter: count+1 grows the interval → widen → widened_labels={0}
+        // useEffect(() => { setCount(count + 1) }, [count]) count grows unboundedly
         let mut eff_blocks = HashMap::new();
         eff_blocks.insert(
             0,
@@ -682,8 +652,7 @@ mod tests {
 
     #[test]
     fn setter_in_non_entry_block_still_warns() {
-        // Effect: block 0 (entry, no setter) → jump → block 1 (has setter call).
-        // Previous entry-block-only check would miss this; BFS should catch it.
+        // block 0 (empty entry) → jump → block 1 (has setter)
         let mut eff_blocks = HashMap::new();
         eff_blocks.insert(
             0,
@@ -739,10 +708,9 @@ mod tests {
         );
     }
 
-    // ── callback traversal (ADR-009) ─────────────────────────────────────────
+    // ── callback traversal ───────────────────────────────────────────────────
 
-    /// Builds a component whose effect body is `Let setX = StateSetter(0)` followed
-    /// by `ExprStmt(call_expr)`, with `state[0]` init 0 and deps `deps`.
+    /// Component with effect body `setX = StateSetter(0); call_expr`, state[0] init 0.
     fn component_with_effect_call(
         setter_name: &str,
         call_expr: Expr,
@@ -817,7 +785,7 @@ mod tests {
         }
     }
 
-    /// `() => setN(n + 1)` as a single-block FnLit (no params).
+    /// `() => setN(n + 1)` as a single-block FnLit.
     fn incrementing_setter_cb(setter_name: &str) -> Expr {
         let mut b = HashMap::new();
         b.insert(
@@ -852,7 +820,6 @@ mod tests {
     #[test]
     fn then_callback_setter_triggers_infinite_loop() {
         // useEffect(() => { p.then(() => setN(n + 1)) }, [n])
-        // The .then callback is descended (ADR-009) → n grows → widens → InfiniteLoop.
         let call = Expr::Call {
             fn_: Box::new(Expr::FieldAccess {
                 obj: Box::new(Expr::Var("p".to_string())),
@@ -883,9 +850,7 @@ mod tests {
 
     #[test]
     fn add_event_listener_setter_does_not_loop() {
-        // useEffect(() => { el.addEventListener('click', () => setN(n + 1)) })  (deps: None)
-        // Subscription handler is NOT descended → n never grows → no widening, no diag.
-        // This is the key anti-false-positive test for event handlers.
+        // useEffect(() => { el.addEventListener('click', () => setN(n + 1)) })
         let call = Expr::Call {
             fn_: Box::new(Expr::FieldAccess {
                 obj: Box::new(Expr::Var("el".to_string())),
@@ -919,8 +884,7 @@ mod tests {
 
     #[test]
     fn unknown_callee_setter_does_not_loop() {
-        // useEffect(() => { myHelper(() => setN(n + 1)) })  (deps: None)
-        // Unknown callee is NOT descended (FP-averse) → no widening, no diag.
+        // useEffect(() => { myHelper(() => setN(n + 1)) }) unknown callee not descended
         let call = Expr::Call {
             fn_: Box::new(Expr::Var("myHelper".to_string())),
             args: vec![incrementing_setter_cb("setN")],
@@ -944,10 +908,7 @@ mod tests {
 
     #[test]
     fn back_edge_in_then_callback_now_detected() {
-        // useEffect(() => { p.then(() => { loop { setN(n+1) } }) })  (deps: None)
-        // The callback body has a back edge. exec_body no longer bails: it traverses
-        // the body for side effects, so setN(n+1) fires → n grows → widening →
-        // InfiniteLoop. (Previously a known FN — the bail dropped the setter.)
+        // useEffect(() => { p.then(() => { loop { setN(n+1) } }) }) back edge in callback
         let mut cb_blocks = HashMap::new();
         cb_blocks.insert(
             0,
@@ -1010,9 +971,7 @@ mod tests {
 
     #[test]
     fn setter_in_loop_in_then_does_not_loop_when_bounded() {
-        // useEffect(() => { p.then(() => { while (..) { setN(0) } }) }, [n])
-        // The loop body is now traversed, but the setter writes a constant → the
-        // value stabilises → no widening → NO false positive.
+        // useEffect(() => { p.then(() => { while (..) { setN(0) } }) }, [n]) constant setter stabilises
         let mut cb_blocks = HashMap::new();
         cb_blocks.insert(
             0,
@@ -1114,7 +1073,7 @@ mod tests {
         );
     }
 
-    /// Build a ComponentIR whose effect body has multiple statements.
+    /// Component with effect body built from `stmts`, state[0] init 0.
     fn component_with_effect_stmts(
         setter_name: &str,
         stmts: Vec<Stmt>,
@@ -1190,8 +1149,7 @@ mod tests {
 
     #[test]
     fn var_callback_setter_triggers_infinite_loop() {
-        // const cb = () => setN(n + 1); setTimeout(cb, 1000)  — deps: [n]
-        // B5: cb resolved via heap → setN executed → n grows → widening → InfiniteLoop.
+        // const cb = () => setN(n + 1); setTimeout(cb, 1000)  deps: [n]
         use crate::ir::types::ExprId;
         let cb_body_cfg = {
             let mut b = HashMap::new();
@@ -1260,8 +1218,7 @@ mod tests {
 
     #[test]
     fn var_callback_then_setter_triggers_infinite_loop() {
-        // const inc = () => setN(n + 1); fetch().then(inc)  — deps: [n]
-        // B5: inc resolved via heap from .then arg → n grows → widening → InfiniteLoop.
+        // const inc = () => setN(n + 1); fetch().then(inc)  deps: [n]
         use crate::ir::types::ExprId;
         let cb_body_cfg = {
             let mut b = HashMap::new();
@@ -1336,10 +1293,7 @@ mod tests {
 
     #[test]
     fn nested_var_callback_chain_triggers_infinite_loop() {
-        // const inner = () => setN(n + 1);
-        // const outer = () => setTimeout(inner, 100);
-        // outer()  — deps: [n]
-        // B6 inlines outer(), B5 resolves inner from .setTimeout arg → InfiniteLoop.
+        // outer() → setTimeout(inner) → setN(n+1) deps: [n]
         use crate::ir::types::ExprId;
         let inner_body_cfg = {
             let mut b = HashMap::new();
@@ -1462,8 +1416,6 @@ mod tests {
 
     #[test]
     fn handler_note_attached_when_handler_calls_setter() {
-        // widened_labels = {0}, effect(1) calls setN, handler(2) also calls setN.
-        // Diagnostic must carry a note pointing to handler label 2.
         let hooks = vec![
             HookEntry::Effect {
                 label: 1,
@@ -1504,7 +1456,6 @@ mod tests {
 
     #[test]
     fn no_note_when_no_handler_calls_setter() {
-        // Effect alone — no handler.  notes must be empty.
         let hooks = vec![HookEntry::Effect {
             label: 1,
             body_cfg: setter_cfg("setN"),
@@ -1527,9 +1478,6 @@ mod tests {
         let diags = InfiniteLoop.check(&prog("C", &result), &"C".to_string());
 
         assert!(!diags.is_empty(), "should detect infinite loop");
-        assert!(
-            diags[0].notes.is_empty(),
-            "no handler — notes must be empty"
-        );
+        assert!(diags[0].notes.is_empty(), "no handler notes must be empty");
     }
 }

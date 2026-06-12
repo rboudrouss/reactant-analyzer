@@ -50,7 +50,7 @@ fn cross_setter_in_render_fires_unconditional() {
     let result = parse_and_analyze(&fixture());
     let child = "Section9_Child".to_string();
     if !result.components.contains_key(&child) {
-        // Child not in registry (analyzed inline-only) — skip gracefully.
+        // Child not in registry (analyzed inline-only) skip gracefully.
         return;
     }
     let diags = SetterInRender.check(&result, &child);
@@ -96,7 +96,7 @@ fn cross_setter_in_render_no_fire_setter_in_callback() {
     let diags = SetterInRender.check(&result, &child);
     assert!(
         diags.is_empty(),
-        "setter only used inside onClick callback prop — must not fire"
+        "setter only used inside onClick callback prop must not fire"
     );
 }
 
@@ -122,7 +122,7 @@ fn cross_setter_in_render_conditional_is_warning() {
 
 // ── cross-component-infinite-loop ─────────────────────────────────────────────
 
-/// Section 10: `bump(1)` writes a CONSTANT — parent state converges [0,1], bounded.
+/// Section 10: `bump(1)` writes a CONSTANT parent state converges [0,1], bounded.
 /// React bails out when state doesn't change → NOT an infinite loop → must NOT fire.
 #[test]
 fn cross_component_infinite_loop_no_fire_constant_write() {
@@ -142,7 +142,7 @@ fn cross_component_infinite_loop_no_fire_constant_write() {
     );
 }
 
-/// Section 28: `bump(n+1)` — unbounded increment, no deps.
+/// Section 28: `bump(n+1)` unbounded increment, no deps.
 /// SharedStateStore grows without bound → proven loop → must fire.
 #[test]
 fn cross_component_infinite_loop_fires_unbounded_nodeps() {
@@ -178,13 +178,13 @@ fn cross_component_infinite_loop_no_fire_mount_only() {
     let diags = InfiniteLoop.check(&result, &child);
     assert!(
         diags.is_empty(),
-        "mount-only effect (deps: []) cannot cause a render loop — must not fire"
+        "mount-only effect (deps: []) cannot cause a render loop must not fire"
     );
 }
 
 /// Section 23: effect with `[value]` where `value = Number([0,+inf])` (widens) →
 /// all deps are unstable → equivalent to no-deps → cross-component-infinite-loop fires.
-/// The diagnostic message mentions "(all deps unstable — effect runs every render)".
+/// The diagnostic message mentions "(all deps unstable effect runs every render)".
 #[test]
 fn cross_component_infinite_loop_fires_all_unstable_deps() {
     let result = parse_and_analyze(&fixture());
@@ -206,7 +206,7 @@ fn cross_component_infinite_loop_fires_all_unstable_deps() {
 
 // ── indirect calls via local wrappers ────────────────────────────────────────
 
-/// Section 24: local wrapper `doReset()` calls own setter — setter-in-render fires Error.
+/// Section 24: local wrapper `doReset()` calls own setter setter-in-render fires Error.
 #[test]
 fn setter_in_render_via_local_wrapper_is_error() {
     use reactant::rules::{Rule, SetterInRender};
@@ -264,7 +264,7 @@ fn setter_in_render_two_level_wrapper_fires() {
     );
 }
 
-/// Section 27: wrapper only called from onClick, never in render — no fire.
+/// Section 27: wrapper only called from onClick, never in render no fire.
 #[test]
 fn setter_in_render_no_fire_wrapper_in_handler() {
     use reactant::rules::{Rule, SetterInRender};
@@ -276,7 +276,7 @@ fn setter_in_render_no_fire_wrapper_in_handler() {
     let diags = SetterInRender.check(&result, &comp);
     assert!(
         diags.is_empty(),
-        "wrapper only in onClick handler — must not fire in render"
+        "wrapper only in onClick handler must not fire in render"
     );
 }
 

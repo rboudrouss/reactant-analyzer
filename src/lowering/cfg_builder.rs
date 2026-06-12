@@ -133,20 +133,15 @@ pub fn build_cfg(body: &FunctionBody, line_starts: &[u32]) -> CFG {
 
 /// Build a CFG for an expression-bodied arrow (`x => expr`).
 ///
-/// Oxc stores the implicit-return expression as a single `ExpressionStatement`
-/// in `body.statements`. Lowering it through [`build_cfg`] would treat it as a
-/// value-discarding side-effect statement (terminator `Unreachable`, no
-/// `Return`), so the body would evaluate to `Bottom` — silently dropping the
-/// return value of every concise arrow (`map(x => x*2)`, functional updaters
-/// `setN(c => c + 1)`, …). Here the lone expression is lowered as the block's
-/// `Return` so the body yields its value.
+/// Oxc stores the implicit return as a single `ExpressionStatement`. Using
+/// [`build_cfg`] would discard it (no `Return`); here it's lowered as `Return`
+/// so the body yields its value (`map(x => x*2)`, `setN(c => c+1)`, …).
 pub fn build_expr_body_cfg(body: &FunctionBody, line_starts: &[u32]) -> CFG {
     let mut builder = BlockBuilder::new_with_line_starts(line_starts);
     builder.start_block(0);
     if let Some(Statement::ExpressionStatement(es)) = body.statements.first() {
         let expr = lower_expr(&es.expression, &mut builder);
-        // `lower_expr` may have opened blocks (ternary, `&&`, …); the current
-        // block is where the result is available — return from there.
+        // `lower_expr` may open blocks (ternary, `&&`…); seal current block.
         if !builder.is_terminated() {
             builder.seal_with(Terminator::Return(expr));
         }
@@ -482,8 +477,7 @@ fn lower_var_declarator(vd: &VariableDeclarator, builder: &mut BlockBuilder) {
     lower_binding_pattern(&vd.id, rhs, span, builder);
 }
 
-/// Recursively lower a binding pattern into Let stmts, emitting `rhs` under `span`
-/// for the root binding and `None` for all nested ones.
+/// Recursively lower a binding pattern into Let stmts.
 fn lower_binding_pattern(
     pat: &BindingPattern,
     rhs: Expr,
@@ -535,15 +529,14 @@ fn lower_binding_pattern(
             }
         }
         BindingPattern::AssignmentPattern(ap) => {
-            // Ignore the default expression — conservative (use rhs as-is)
+            // Ignore the default expression conservative (use rhs as-is)
             lower_binding_pattern(&ap.left, rhs, span, builder);
         }
     }
 }
 
-/// Emit preamble Let stmts for every formal parameter, returning the list of
-/// param names suitable for `FnLit.params`.  Destructured params get a fresh
-/// temp name (`__pN`) and their bindings are unpacked into the current block.
+/// Emit Let stmts for every formal parameter; destructured params get temp name `__pN`.
+/// Returns param names for `FnLit.params`.
 pub(super) fn inject_param_preamble(
     params: &FormalParameters,
     builder: &mut BlockBuilder,
@@ -564,8 +557,7 @@ pub(super) fn inject_param_preamble(
     names
 }
 
-/// Build a function body CFG, prepending Let stmts for destructured params.
-/// Returns `(param_names, body_cfg)`.
+/// Build a function body CFG with param destructuring preamble.
 pub fn build_fn_body_cfg(
     params: &FormalParameters,
     body: &FunctionBody,
@@ -578,7 +570,7 @@ pub fn build_fn_body_cfg(
     (param_names, builder.into_cfg(0))
 }
 
-/// Like [`build_fn_body_cfg`] but for concise arrow bodies (`x => expr`).
+/// Like [`build_fn_body_cfg`] for concise arrow bodies (`x => expr`).
 pub fn build_expr_fn_body_cfg(
     params: &FormalParameters,
     body: &FunctionBody,

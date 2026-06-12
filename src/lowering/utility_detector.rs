@@ -1,7 +1,7 @@
-//! Detect top-level utility functions (ADR-013 §5 + Phase 3).
+//! Detect top-level utility functions.
 //!
 //! A "utility" is a top-level function that is neither a React component
-//! (returns JSX) nor a custom hook (`use*` naming convention) — typically
+//! (returns JSX) nor a custom hook (`use*` naming convention) typically
 //! pure helpers like `doOrNot` whose bodies the analyzer currently treats as
 //! opaque calls. Mirrors [`crate::lowering::component_detector`] and
 //! [`crate::lowering::hook_detector`].
@@ -133,7 +133,7 @@ fn is_utility(name: &str) -> bool {
     {
         return false;
     }
-    // Components — uppercase first letter
+    // Components uppercase first letter
     if name.chars().next().is_some_and(|c| c.is_uppercase()) {
         return false;
     }
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn utility_that_returns_jsx_indirectly_is_component_not_utility() {
-        // Function returning JSX — treated as component, not utility.
+        // Function returning JSX treated as component, not utility.
         assert!(names("function widget() { return <div/>; }").is_empty());
     }
 }

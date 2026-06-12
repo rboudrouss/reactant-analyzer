@@ -23,7 +23,7 @@ impl Rule for WideningInfo {
                     "widening-info",
                     format!(
                         "state {label} required widening to force convergence \
-                         — abstract values are over-approximated"
+                         abstract values are over-approximated"
                     ),
                 )
                 .with_severity(Severity::Info)

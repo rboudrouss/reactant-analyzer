@@ -993,7 +993,7 @@ mod tests {
         assert_eq!(state.get(1), StateValue::Number(Interval::point(1.0)));
     }
 
-    // ── callback traversal (ADR-009) ─────────────────────────────────────────
+    // ── callback traversal ────────────────────────────────────────────────────
 
     #[test]
     fn then_callback_updates_state() {

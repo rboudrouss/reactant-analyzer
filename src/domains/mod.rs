@@ -22,10 +22,10 @@ use crate::ir::{Expr, Stmt};
 /// Core abstract domain trait.
 ///
 /// Supertrait bounds:
-/// - `Clone + Copy`  — values are small, freely copyable
-/// - `PartialEq`     — needed for convergence checks
-/// - `PartialOrd`    — lattice order (a ≤ b = a ⊑ b)
-/// - `Debug`         — required for diagnostics and derive macros on generic containers
+/// - `Clone + Copy`  values are small, freely copyable
+/// - `PartialEq`     needed for convergence checks
+/// - `PartialOrd`    lattice order (a ≤ b = a ⊑ b)
+/// - `Debug`         required for diagnostics and derive macros on generic containers
 pub trait AbstractDomain: Clone + PartialEq + PartialOrd + std::fmt::Debug {
     fn bottom() -> Self;
     fn top() -> Self;
@@ -80,7 +80,7 @@ pub trait AbstractDomain: Clone + PartialEq + PartialOrd + std::fmt::Debug {
 /// Adding a new domain = new struct + `impl Transfer`.
 ///
 /// The `ctx` parameter lets a Transfer query other domains during analysis
-/// (cross-domain ask pattern — ADR-007 B3). Pass `&NullCtx` when no
+/// (cross-domain ask pattern). Pass `&NullCtx` when no
 /// cross-domain queries are needed (tests, simple impls).
 pub trait Transfer {
     type Domain: AbstractDomain;

@@ -1,4 +1,4 @@
-//! Lower top-level utility functions to [`FunctionIR`] (ADR-013 Phase 3).
+//! Lower top-level utility functions to [`FunctionIR`].
 //!
 //! Utilities are non-hook, non-component functions whose bodies the analyzer
 //! would otherwise treat as opaque calls. By lowering them to a CFG, the
@@ -20,16 +20,13 @@ pub fn lower_utilities(program: &Program, line_starts: &[u32], file: &Path) -> V
     lower_utilities_with_resolver(program, line_starts, file, &DefaultImportResolver)
 }
 
-/// Plugin-friendly variant of [`lower_utilities`] (ADR-013 §2 + Phase 4).
+/// Plugin-friendly variant of [`lower_utilities`].
 pub fn lower_utilities_with_resolver(
     program: &Program,
     line_starts: &[u32],
     file: &Path,
     _resolver: &dyn ImportResolver,
 ) -> Vec<FunctionIR> {
-    // Currently utilities don't carry hook entries or resolved imports — the
-    // resolver argument is reserved for future use (e.g. inlining transitive
-    // utility imports). Kept for API symmetry with `lower_program`.
     detect_utilities(program)
         .into_iter()
         .map(|candidate| {

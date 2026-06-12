@@ -26,7 +26,6 @@ pub const MAX_INLINE_DEPTH: usize = 3;
 ///
 /// `Transfer::exec_stmt` implementations call this to get the full traversal
 /// machinery (`.then`, timers, sync HOFs, B5/B6 var-callback resolution) for free.
-/// See [ADR-009](../../../docs/adr/ADR-009-callback-traversal.md).
 pub(crate) fn exec_stmt_with_callbacks<T: Transfer>(
     transfer: &T,
     stmt: &Stmt,
@@ -276,14 +275,9 @@ fn exec_setter_call<T: Transfer>(
 }
 
 /// Processes blocks in topological order. Back edges are ignored for env
-/// propagation (forward-predecessor join only, since `topo_sort` emits a loop
-/// header before its back-edge source); statements still execute once, so
-/// loop-body side effects (setter `state.update`s) are captured even when the
-/// body contains a loop. At branches, both paths are executed and their
-/// environments are joined (over-approximate). Return values from all
-/// `Terminator::Return` blocks are joined; if the body contains any back edge
-/// the return value is conservatively joined to Top (loop-carried return values
-/// are not widened in-body — see ADR-009 "Limites").
+/// propagation (forward-predecessor join only); statements still execute once so
+/// loop-body setter side effects are captured. Return values from all exits are
+/// joined; back-edge loops conservatively join return to Top.
 fn exec_body_impl<T: Transfer>(
     transfer: &T,
     cfg: &CFG,
@@ -350,23 +344,19 @@ fn exec_body_impl<T: Transfer>(
         }
     }
 
-    // A loop body's return value cannot be precisely computed in a single
-    // forward pass (loop-carried values are not widened here); be conservative.
-    // Side effects above already fired regardless.
+    // Loop-carried return values can't be computed precisely in a single pass; be conservative.
     if has_back_edge {
         return_val = return_val.join(&T::Domain::top());
     }
     return_val
 }
 
-/// Per-expression side-effect pre-pass: walk the expression tree and, for any
-/// in-cycle call (`.then`, timers, sync HOFs), execute its closure arguments for
-/// their side effects. Setter closures and event subscriptions are NOT descended.
+/// Per-expression side-effect pre-pass: for in-cycle calls (`.then`, timers,
+/// sync HOFs), execute closure arguments for their side effects.
 ///
-/// Invariant: never recurse INTO a `FnLit` body here — bodies run only via
-/// `exec_body_depth` (when the `FnLit` is an in-cycle argument); otherwise
-/// `exec_body_impl → exec_full_stmt → exec_callbacks_depth` would double-execute.
-/// Nesting (`.then(() => other.map(cb2))`) is handled naturally by that recursion.
+/// Invariant: never recurse INTO a `FnLit` body here bodies run only via
+/// `exec_body_depth`; otherwise `exec_body_impl → exec_full_stmt → exec_callbacks_depth`
+/// would double-execute. Nesting is handled naturally by that recursion.
 fn exec_callbacks_depth<T: Transfer>(
     transfer: &T,
     expr: &Expr,
@@ -400,18 +390,18 @@ fn exec_callbacks_depth<T: Transfer>(
                         }
                         let _ = exec_body_depth(transfer, body_cfg, &sub_env, ctx, depth + 1);
                     }
-                    // B5: variable callback — resolve Identifier to heap Fn and execute.
+                    // B5: variable callback resolve Identifier to heap Fn and execute.
                     Expr::Var(name) if class == TriggerClass::InCycle => {
                         exec_var_callback(transfer, name, env, ctx, depth);
                     }
-                    // Setter/Subscription/Unknown inline closures not descended (ADR-009).
+                    // Setter/Subscription/Unknown inline closures not descended.
                     Expr::FnLit { .. } => {}
                     other => {
                         exec_callbacks_depth(transfer, other, env, ctx, depth);
                     }
                 }
             }
-            // B6: direct local call inlining — Unknown callee that resolves to a heap Fn.
+            // B6: direct local call inlining Unknown callee that resolves to a heap Fn.
             // External/imported functions have no Loc → skipped (no FP).
             if class == TriggerClass::Unknown
                 && let Expr::Var(name) = fn_.as_ref()
@@ -445,9 +435,7 @@ fn exec_callbacks_depth<T: Transfer>(
         }
         Expr::CompApp { props, .. } => {
             exec_callbacks_depth(transfer, props, env, ctx, depth);
-            // Evaluate the CompApp itself so inter-component inlining fires for
-            // CompApp nodes inside NativeElem children, ObjectLit fields, etc.
-            // (Return(CompApp) is already handled by exec_full_stmt; cache hit = no-op.)
+            // Fire inter-component inlining for CompApp inside children/fields.
             transfer.eval_expr(expr, env, ctx);
         }
         Expr::NativeElem {
@@ -487,7 +475,6 @@ fn exec_var_callback<T: Transfer>(
                 let body_cfg = Arc::clone(body_cfg);
                 let captured = captured.clone();
                 let mut sub_env = env.clone();
-                // Restore captured environment at closure creation time.
                 for (var, val) in captured {
                     sub_env.extend(var, T::Domain::from_state_value(val));
                 }

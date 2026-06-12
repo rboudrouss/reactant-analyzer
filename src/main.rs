@@ -109,14 +109,12 @@ fn main() {
     }
 
     if all_components.is_empty() {
-        println!("✓  {} file(s) — no components detected.", file_count);
+        println!("✓  {} file(s) no components detected.", file_count);
         return;
     }
 
     // Phase 2: build registry and determine root strategy.
-    // hook_counts is keyed by registry display name so collisions disambiguate
-    // (ADR-013 §1) — e.g. two `Page` components in different files each get
-    // their own entry instead of overwriting on plain name.
+    // Keyed by display name to disambiguate same-named components across files.
     let temp_registry = ComponentRegistry::from_components(all_components.clone());
     let hook_counts: std::collections::HashMap<String, usize> = all_components
         .iter()
@@ -127,7 +125,7 @@ fn main() {
         .collect();
     drop(temp_registry);
 
-    // Symbol graph for deterministic ordering / cycle reporting (ADR-013 §4).
+    // Symbol graph for deterministic topo ordering / cycle reporting.
     let symbol_graph = SymbolGraph::build(&all_components, &all_hook_irs);
     let topo = symbol_graph.topo_sort();
     if args.verbose {
@@ -246,7 +244,7 @@ fn main() {
                         .map(|r| format!("  (line {}:{})", r.line, r.col))
                         .unwrap_or_default();
                     println!(
-                        "    {sev_tag}  {}{}{}{}  — {}",
+                        "    {sev_tag}  {}{}{}{}  {}",
                         d.rule, label_info, var_info, range_info, d.message
                     );
                     for note in &d.notes {
@@ -267,7 +265,7 @@ fn main() {
 
     println!();
     if total_errors == 0 && total_warnings == 0 {
-        println!("✓  {} file(s) — no issues found.", file_count);
+        println!("✓  {} file(s) no issues found.", file_count);
     } else {
         let parts: Vec<String> = [
             (total_errors > 0).then(|| format!("{} error(s)", total_errors)),

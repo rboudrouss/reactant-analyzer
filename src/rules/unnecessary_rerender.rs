@@ -31,7 +31,6 @@ impl Rule for UnnecessaryRerender {
 
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
         let result = &result.components[component];
-        // Evaluate each useState init to its abstract value (same as fixpoint seed).
         let empty_env = AbstractEnv::bottom();
         let empty_state = StateStore::bottom();
         let empty_memo = MemoStore::new();
@@ -56,7 +55,6 @@ impl Rule for UnnecessaryRerender {
             })
             .collect();
 
-        // label → setter variable names (from render CFG let-bindings).
         let setters_for: HashMap<HookLabel, HashSet<Var>> = {
             let mut map: HashMap<HookLabel, HashSet<Var>> = HashMap::new();
             for block in result.render_cfg.blocks.values() {
@@ -91,7 +89,6 @@ impl Rule for UnnecessaryRerender {
             }
             let eff_span = result.effect_info.get(eff_label).and_then(|i| i.span);
 
-            // BFS through effect body for setter calls.
             let mut visited: HashSet<_> = HashSet::new();
             let mut queue: VecDeque<_> = VecDeque::new();
             queue.push_back(body_cfg.entry);
@@ -107,7 +104,6 @@ impl Rule for UnnecessaryRerender {
                             continue;
                         };
 
-                        // Resolve setter name → state label.
                         let Some(state_label) = setters_for
                             .iter()
                             .find(|(_, names)| names.contains(setter_name))
@@ -120,7 +116,7 @@ impl Rule for UnnecessaryRerender {
                             continue;
                         };
                         if !init_val.is_stable() {
-                            continue; // init not a known constant — can't compare
+                            continue;
                         }
 
                         let arg_val = args
@@ -138,17 +134,17 @@ impl Rule for UnnecessaryRerender {
                             .unwrap_or(StateValue::Top);
 
                         if !arg_val.is_stable() {
-                            continue; // arg not a known constant — can't compare
+                            continue;
                         }
                         if arg_val == *init_val {
-                            continue; // same value as init → redundant-set-state, not this rule
+                            continue; // same as init → redundant-set-state, not this rule
                         }
 
                         let mut d = Diagnostic::new(
                             "unnecessary-rerender",
                             format!(
                                 "mount-only effect sets state {state_label} to a constant \
-                                 different from its initial value — causes one extra rerender on mount; \
+                                 different from its initial value causes one extra rerender on mount; \
                                  consider initialising directly with the target value"
                             ),
                         )
@@ -320,7 +316,7 @@ mod tests {
 
     #[test]
     fn non_mount_effect_no_warning() {
-        // deps: None = runs every render — not a mount-only effect
+        // deps: None = runs every render not a mount-only effect
         let eff_stmts = vec![Stmt::ExprStmt(
             Expr::Call {
                 fn_: Box::new(Expr::Var("setX".to_string())),

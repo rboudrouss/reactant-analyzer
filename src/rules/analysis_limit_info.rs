@@ -9,14 +9,14 @@ use super::{Diagnostic, Rule, Severity};
 /// to preserve soundness.  Each site is a potential source of false negatives.
 ///
 /// Four cases:
-/// - `recursion-cutoff`    — component references itself (directly or transitively);
+/// - `recursion-cutoff`    component references itself (directly or transitively);
 ///                           the recursive call is resolved to ⊤.
-/// - `unknown-component`   — component instantiates a child not found in the
+/// - `unknown-component`   component instantiates a child not found in the
 ///                           analysis registry (imported from an unanalyzed file);
 ///                           props and effects of that child are treated as ⊤.
-/// - `callback-depth-cap`  — callback inlining reached MAX_INLINE_DEPTH; deeper
+/// - `callback-depth-cap`  callback inlining reached MAX_INLINE_DEPTH; deeper
 ///                           HOF chains (`.then(() => .then(…))`) not descended.
-/// - `unknown-hook`        — custom hook call whose source is not in the registry
+/// - `unknown-hook`        custom hook call whose source is not in the registry
 ///                           and has no `HookSummary`; its internals are opaque (FN possible).
 pub struct AnalysisLimitInfo;
 
@@ -35,7 +35,7 @@ impl Rule for AnalysisLimitInfo {
                     Diagnostic::new(
                         "analysis-limit",
                         format!(
-                            "recursive component reference `{callee}` cut to ⊤ — \
+                            "recursive component reference `{callee}` cut to ⊤ \
                              cross-component cycles not fully analysed (FN possible)"
                         ),
                     )
@@ -50,7 +50,7 @@ impl Rule for AnalysisLimitInfo {
                     Diagnostic::new(
                         "analysis-limit",
                         format!(
-                            "component `{callee}` not found in analysis registry — \
+                            "component `{callee}` not found in analysis registry \
                              pass its file on the command line to analyse it (FN possible)"
                         ),
                     )
@@ -64,7 +64,7 @@ impl Rule for AnalysisLimitInfo {
                 Diagnostic::new(
                     "analysis-limit",
                     format!(
-                        "callback inlining reached depth cap ({}) — \
+                        "callback inlining reached depth cap ({}) \
                          deeper HOF chains not descended (FN possible on nested callbacks)",
                         crate::domains::interp::MAX_INLINE_DEPTH
                     ),
@@ -73,7 +73,7 @@ impl Rule for AnalysisLimitInfo {
             );
         }
 
-        // Unknown custom hooks — survived expand_custom_hooks (not in HookRegistry or SummaryRegistry).
+        // Unknown custom hooks survived expand_custom_hooks (not in HookRegistry or SummaryRegistry).
         if let Some(comp_result) = result.components.get(component) {
             for call in &comp_result.hook_calls {
                 if call.kind != HookKind::Custom {
@@ -89,7 +89,7 @@ impl Rule for AnalysisLimitInfo {
                 let mut d = Diagnostic::new(
                     "analysis-limit",
                     format!(
-                        "hook `{name}` not found in registry — \
+                        "hook `{name}` not found in registry \
                          pass its source file or add a HookSummary to analyse it (FN possible)"
                     ),
                 )

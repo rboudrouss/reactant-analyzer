@@ -12,16 +12,16 @@ use crate::{
 
 use super::{Diagnostic, Rule, Severity, collect_component_setter_vars, collect_setter_calls};
 
-/// Fires when a state setter is called directly in the render body — either a
+/// Fires when a state setter is called directly in the render body either a
 /// local setter (`StateSetter`) or a parent-component setter passed as a prop.
 ///
 /// Rule names emitted in diagnostics:
-/// - `"setter-in-render"`        — local `useState` setter called in render.
-/// - `"cross-setter-in-render"`  — parent's setter (prop) called in render.
+/// - `"setter-in-render"`        local `useState` setter called in render.
+/// - `"cross-setter-in-render"`  parent's setter (prop) called in render.
 ///
 /// Severity:
-/// - `Error`   — call block dominates all render exits (unconditional).
-/// - `Warning` — conditional path or nested FnLit (dominance unknowable).
+/// - `Error`   call block dominates all render exits (unconditional).
+/// - `Warning` conditional path or nested FnLit (dominance unknowable).
 pub struct SetterInRender;
 
 impl Rule for SetterInRender {
@@ -32,7 +32,6 @@ impl Rule for SetterInRender {
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
         let comp_result = &result.components[component];
 
-        // Local setters: `let setX = StateSetter(label)` bindings.
         let local_setter_info: HashMap<Var, (HookLabel, Option<crate::ir::SourceRange>)> =
             comp_result
                 .render_cfg
@@ -58,10 +57,7 @@ impl Rule for SetterInRender {
                 })
                 .collect();
 
-        // Cross-component setters: props whose abstract value is ComponentSetter
-        // (direct or via a FnLit wrapping one).
-        // Filter out self-references: StateSetter evaluates to ComponentSetter{component:self}
-        // in inter context, so local setters (and FnLits capturing them) must be excluded.
+        // Cross-component setters: ComponentSetter-valued props, excluding self-references.
         let cs_vars: HashMap<Var, (crate::ir::types::Symbol, crate::ir::types::HookLabel)> =
             collect_component_setter_vars(
                 &comp_result.render_cfg,
@@ -116,7 +112,7 @@ impl Rule for SetterInRender {
                     Diagnostic::new(
                         "cross-setter-in-render",
                         format!(
-                            "prop `{}` (setter for `{}` state #{}) called during render of `{}` — \
+                            "prop `{}` (setter for `{}` state #{}) called during render of `{}` \
                              triggers parent re-render on every render",
                             call.var, parent_comp, parent_label, component
                         ),
@@ -220,7 +216,6 @@ mod tests {
 
     #[test]
     fn setter_not_called_no_warning() {
-        // `let setN = StateSetter(0)` exists but is never called.
         let render_stmts = vec![Stmt::Let {
             var: "setN".to_string(),
             rhs: Expr::StateSetter(0),
@@ -236,7 +231,6 @@ mod tests {
 
     #[test]
     fn setter_called_in_render_is_error() {
-        // Single block (entry = exit) → setter block dominates all exits → Error.
         let render_stmts = vec![
             Stmt::Let {
                 var: "setN".to_string(),
@@ -260,9 +254,7 @@ mod tests {
 
     #[test]
     fn setter_in_branch_block_is_warning() {
-        // block 0: let setN = StateSetter(0); branch → 1 / 2
-        // block 1: setN(42)   ← conditional path → Warning
-        // block 2: return
+        // block 0: branch → 1 / 2; block 1: setN(42) conditional → Warning
         let mut blocks = HashMap::new();
         blocks.insert(
             0,
@@ -431,8 +423,7 @@ mod tests {
 
     #[test]
     fn setter_inside_callback_arg_is_warning() {
-        // render body: someCall((u) => { setN(u) })
-        // setN is inside a FnLit arg → block_id = None → Warning.
+        // someCall((u) => { setN(u) }) setter in FnLit arg → Warning
         let mut cb_blocks = HashMap::new();
         cb_blocks.insert(
             0,
@@ -460,7 +451,6 @@ mod tests {
                 rhs: Expr::StateSetter(0),
                 span: None,
             },
-            // someCall(u => setN(u))
             Stmt::ExprStmt(
                 Expr::Call {
                     fn_: Box::new(Expr::Var("someCall".to_string())),

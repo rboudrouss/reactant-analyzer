@@ -2,11 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ir::{cfg::CFG, types::BlockId};
 
-/// Compute the full dominator sets for every block using the iterative
-/// Cooper-Harvey-Kennedy algorithm (2001).
-///
-/// Returns `dom` where `dom[b]` = set of blocks that dominate `b`.
-/// `entry` dominates only itself initially; all others start with all blocks.
+/// Compute dominator sets iteratively. Returns `dom[b]` = set of blocks dominating `b`.
 pub fn compute_dominators(cfg: &CFG) -> HashMap<BlockId, HashSet<BlockId>> {
     let all_blocks: HashSet<BlockId> = cfg.blocks.keys().copied().collect();
     let mut dom: HashMap<BlockId, HashSet<BlockId>> = HashMap::new();

@@ -5,7 +5,7 @@ use crate::domains::{AbstractEnv, MemoStore, QueryContext, StateStore, Transfer}
 /// Marker trait for a cross-domain query. The associated `Result` type is the
 /// answer returned by whichever domain handles the query.
 ///
-/// This is the B1 generic manager foundation (see ADR-007). Because Rust lacks
+/// Because Rust lacks
 /// OCaml GADTs, each query is a concrete struct; type-safety comes from the
 /// `Queryable<Q>` bound on the answering transfer.
 pub trait DomainQuery: 'static {

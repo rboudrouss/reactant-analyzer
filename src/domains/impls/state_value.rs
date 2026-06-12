@@ -29,7 +29,7 @@ pub(crate) fn str_const(set: BTreeSet<String>) -> StateValue {
 /// proper widening and infinite-loop detection.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StateValue {
-    /// ⊥ — unreachable / not yet set.
+    /// ⊥ unreachable / not yet set.
     Bottom,
     /// JS `null`.
     Null,
@@ -43,12 +43,12 @@ pub enum StateValue {
     StrConst(Arc<BTreeSet<String>>),
     /// String with unknown content (string-type ⊤).
     Str,
-    /// Object / array / function — track reference stability.
+    /// Object / array / function track reference stability.
     Reference(Stability),
     /// A specific `useState` setter from another component.
     /// React guarantees setter identity across renders → always `Stable`.
     ComponentSetter { component: Symbol, label: HookLabel },
-    /// ⊤ — any JS value, precision lost.
+    /// ⊤ any JS value, precision lost.
     Top,
 }
 

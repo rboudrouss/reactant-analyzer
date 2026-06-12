@@ -1,9 +1,9 @@
-//! End-to-end tests for ADR-009 §4 — addEventListener lifting.
+//! End-to-end tests for ADR-009 §4 addEventListener lifting.
 //!
 //! `extract_subscriptions` scans `HookEntry::Effect` body CFGs for
 //! `obj.addEventListener(str, FnLit)` and lifts each callback to a
 //! `HookEntry::Handler`. The fixpoint engine then analyses those handlers as
-//! separate entry points, excluded from `widened_labels` — so a setter called
+//! separate entry points, excluded from `widened_labels` so a setter called
 //! inside an event handler never causes a false-positive `infinite-loop`.
 
 use oxc_allocator::Allocator;
@@ -99,7 +99,7 @@ fn addeventlistener_setter_no_infinite_loop_no_deps() {
 
 #[test]
 fn addeventlistener_setter_no_infinite_loop_with_deps() {
-    // Effect avec [width] en deps — même verdict : hors cycle.
+    // Effect avec [width] en deps même verdict : hors cycle.
     let hits = infinite_loop_hits(
         r#"
         import { useState, useEffect } from "react";
@@ -120,7 +120,7 @@ fn addeventlistener_setter_no_infinite_loop_with_deps() {
 
 #[test]
 fn addeventlistener_setter_no_infinite_loop_empty_deps() {
-    // Effect mount-only — sain aussi.
+    // Effect mount-only sain aussi.
     let hits = infinite_loop_hits(
         r#"
         import { useState, useEffect } from "react";
@@ -227,7 +227,7 @@ fn jsx_handler_and_addeventlistener_coexist() {
     );
 }
 
-// ── addEventListener hors d'un effet — ignoré (pas dans body_cfg d'un Effect) ─
+// ── addEventListener hors d'un effet ignoré (pas dans body_cfg d'un Effect) ─
 
 #[test]
 fn addeventlistener_in_render_body_not_lifted() {

@@ -4,34 +4,13 @@ use crate::domains::StateValue;
 
 // ── HookSummary trait ─────────────────────────────────────────────────────────
 
-/// Abstract summary for a library hook that has no source available.
-///
-/// Implementors describe what a hook returns (conservatively) so the fixpoint
-/// can provide a more precise binding than opaque `Unit`.  The default
-/// implementation returns `Top` — sound but imprecise.
-///
-/// # Adding a new library hook
-///
-/// ```rust
-/// use reactant::registry::summary::{HookSummary, SummaryRegistry};
-/// use reactant::domains::{StateValue, Stability};
-///
-/// struct UseMyHook;
-/// impl HookSummary for UseMyHook {
-///     fn name(&self) -> &str { "useMyHook" }
-///     fn summarize(&self, _args: &[StateValue]) -> StateValue {
-///         StateValue::Reference(Stability::Stable)
-///     }
-/// }
-///
-/// let mut reg = SummaryRegistry::new();
-/// reg.register(Box::new(UseMyHook));
-/// ```
+/// Abstract summary for a library hook without source.
+/// Default `summarize` returns `Top`; override to be more precise.
 pub trait HookSummary: Send + Sync {
     fn name(&self) -> &str;
 
     /// Compute the abstract return value of this hook given abstract arg values.
-    /// Default: `Top` (most conservative — completely unknown).
+    /// Default: `Top` (most conservative completely unknown).
     fn summarize(&self, _args: &[StateValue]) -> StateValue {
         StateValue::Top
     }
@@ -44,15 +23,7 @@ pub trait HookSummary: Send + Sync {
 type SummaryKey = (Option<String>, String);
 
 /// Registry mapping library hooks to their abstract summaries.
-///
-/// Lookup is import-source-aware: a hook imported from `@tanstack/react-query`
-/// only matches summaries registered for that exact package, preventing
-/// accidental shadowing when a user defines their own `useQuery`.
-///
-/// # Lookup order
-///
-/// 1. `(Some(import_source), name)` — exact package match.
-/// 2. `(None, name)` — unscoped fallback (matches any import source or none).
+/// Lookup: `(package, name)` exact match first, then `(None, name)` fallback.
 pub struct SummaryRegistry {
     summaries: HashMap<SummaryKey, Box<dyn HookSummary>>,
 }

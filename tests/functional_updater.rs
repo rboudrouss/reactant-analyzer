@@ -2,7 +2,7 @@
 //!
 //! Concise-arrow bodies (`c => c + 1`) used to drop their implicit-return value
 //! during lowering, so `setCount(c => c + 1)` never widened state and
-//! `infinite-loop` missed it — while the plain form `setCount(count + 1)` was
+//! `infinite-loop` missed it while the plain form `setCount(count + 1)` was
 //! flagged. The fix lowers concise bodies to a `Return` terminator
 //! (`build_expr_body_cfg`), fires side effects from that terminator, and lets
 //! `collect_setter_calls` scan it. These tests pin the whole chain

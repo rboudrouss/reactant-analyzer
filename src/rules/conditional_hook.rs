@@ -31,7 +31,7 @@ impl Rule for ConditionalHook {
             .hook_calls
             .iter()
             .filter(|call| {
-                // Conditional = doesn't dominate at least one exit.
+                // Conditional = doesn't dominate every exit.
                 exits
                     .iter()
                     .any(|&exit| !dominates(&result.render_cfg, call.block_id, exit))
@@ -291,13 +291,13 @@ mod tests {
                 kind: HookKind::State,
                 block_id: 0,
                 span: None,
-            }, // unconditional
+            },
             HookCallInfo {
                 label: 1,
                 kind: HookKind::State,
                 block_id: 1,
                 span: None,
-            }, // conditional
+            },
         ];
         let result = make_result(cfg, hook_calls);
         let diags = ConditionalHook.check(&prog(&result), &"C".to_string());
@@ -347,7 +347,6 @@ mod tests {
 
     #[test]
     fn via_analyze_component_conditional_hook_warns() {
-        // useState in a branch block
         let hooks = vec![HookEntry::State {
             label: 0,
             init: Expr::Lit(Prim::Int(0)),

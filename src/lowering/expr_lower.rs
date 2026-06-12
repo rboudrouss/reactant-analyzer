@@ -17,9 +17,8 @@ use super::cfg_builder::{BlockBuilder, build_expr_fn_body_cfg, build_fn_body_cfg
 
 /// Lower an Oxc expression to IR.
 ///
-/// Branching expressions (ternary, `&&`, `||`, `??`) create new basic blocks
-/// in `builder` and return a `Var` referencing a temp that holds the result.
-/// All other expressions are lowered structurally without touching `builder`.
+/// Branching expressions (ternary, `&&`, `||`, `??`) split `builder` into new
+/// blocks and return a `Var` temp. All other expressions lower structurally.
 pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr {
     match expr {
         // ── Literals ──────────────────────────────────────────────────────────
@@ -260,7 +259,7 @@ fn lower_ts_type(ts: &oxc_ast::ast::TSType) -> crate::ir::expr::TSType {
 
 // ── Block-splitting lowering ──────────────────────────────────────────────────
 
-/// `a ? b : c` — splits into three blocks:
+/// `a ? b : c` splits into three blocks:
 ///
 ///   current:  Branch(a, then, else)
 ///   then:     Let __tN = b; Jump(join)
@@ -401,11 +400,8 @@ fn lower_jsx_element(jsx: &JSXElement, builder: &mut BlockBuilder) -> Expr {
     }
 }
 
-/// Lower JSX attributes to an `ObjectLit` and collect spans for `onX` event props.
-///
-/// Returns `(props_expr, prop_spans)` where `prop_spans` maps each event-handler
-/// prop name to its source location (used by `hook_extractor` to set
-/// `HookEntry::Handler.span`).
+/// Lower JSX attributes to an `ObjectLit`, collecting spans for `onX` props.
+/// Returns `(props_expr, prop_spans)` keyed by prop name.
 fn lower_jsx_props(
     attrs: &[JSXAttributeItem],
     builder: &mut BlockBuilder,
@@ -590,7 +586,7 @@ mod tests {
 
     #[test]
     fn logical_and_splits_blocks() {
-        // enabled && doSomething() — the call must be inside a conditional block
+        // enabled && doSomething() the call must be inside a conditional block
         let cfg = build("function f(enabled) { enabled && doSomething(); }");
         // entry: Let __t0=enabled, Branch(Var(__t0), rhs, join)
         // rhs: Assign __t0 = doSomething(), Jump(join)

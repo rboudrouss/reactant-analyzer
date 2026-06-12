@@ -40,7 +40,7 @@ impl<D: AbstractDomain> StateStore<D> {
         StateStore(out)
     }
 
-    /// Widening — pointwise `D::widen`. Critical for interval domains where
+    /// Widening pointwise `D::widen`. Critical for interval domains where
     /// widen ≠ join (bounds jump to ±∞ instead of hull).
     pub fn widen(&self, other: &Self) -> Self {
         let mut out = self.0.clone();
@@ -51,7 +51,7 @@ impl<D: AbstractDomain> StateStore<D> {
         StateStore(out)
     }
 
-    /// Lattice bottom — all labels have `D::bottom()`.
+    /// Lattice bottom all labels have `D::bottom()`.
     pub fn bottom() -> Self {
         Self::default()
     }

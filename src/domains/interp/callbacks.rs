@@ -4,10 +4,9 @@ use crate::{
 };
 
 /// How a call's closure arguments should be treated by the side-effect pre-pass.
-/// See [ADR-009](../../../docs/adr/ADR-009-callback-traversal.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriggerClass {
-    /// Callee is a bound state setter — handled by the core exec path (functional
+    /// Callee is a bound state setter handled by the core exec path (functional
     /// updaters), so the pre-pass must NOT descend its closure.
     Setter,
     /// Runs as a consequence of the current render/effect: synchronous HOFs
@@ -15,7 +14,7 @@ pub enum TriggerClass {
     /// `setTimeout`/`setInterval`, `queueMicrotask`, `requestAnimationFrame`).
     /// Its closure arguments ARE descended into.
     InCycle,
-    /// Event subscription (`addEventListener`/`removeEventListener`) — triggered
+    /// Event subscription (`addEventListener`/`removeEventListener`) triggered
     /// externally, NOT part of the render→effect→render cycle. Not descended.
     Subscription,
     /// Unrecognized callee (custom helper/hook). Conservatively NOT descended
@@ -25,7 +24,7 @@ pub enum TriggerClass {
 
 /// Classify a call's callee to decide whether its closure arguments run as a
 /// consequence of the current render/effect (and so must be descended into for
-/// their side effects). See [ADR-009] for the policy rationale.
+/// their side effects).
 pub fn classify_callee<D: AbstractDomain>(fn_: &Expr, env: &AbstractEnv<D>) -> TriggerClass {
     match fn_ {
         Expr::Var(name) => {

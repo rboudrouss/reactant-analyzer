@@ -21,7 +21,7 @@ impl Interval {
         }
     }
 
-    /// Empty interval — represents ⊥ for the numeric sub-lattice.
+    /// Empty interval represents ⊥ for the numeric sub-lattice.
     pub fn bottom() -> Self {
         Interval {
             lo: f64::INFINITY,

@@ -130,7 +130,7 @@ fn directory_input_discovers_and_analyzes_multiple_files() {
         all_hook_irs.iter().map(|h| &h.name).collect::<Vec<_>>()
     );
 
-    // Phase 2: registries + analysis (smoke check — analysis must not panic
+    // Phase 2: registries + analysis (smoke check analysis must not panic
     // when the component's custom hook lives in a different source file).
     let reg = ComponentRegistry::from_components(all_components);
     let hook_reg = HookRegistry::from_hooks(all_hook_irs);

@@ -42,9 +42,8 @@ pub struct Config {
     /// Known library hooks (TanStack, React Router, etc.) without source.
     /// Used in `expand_custom_hooks` as a fallback when a hook is not in the `HookRegistry`.
     pub summary_registry: SummaryRegistry,
-    /// Utility-function inlining registry (ADR-013 Phase 3). When non-empty,
-    /// statement-level calls to known utilities are spliced into the caller's
-    /// CFG instead of being evaluated as opaque `Top`.
+    /// Utility-function inlining registry. When non-empty, statement-level calls
+    /// to known utilities are spliced into the caller's CFG instead of opaque `Top`.
     pub function_registry: FunctionRegistry,
     /// Cap on transitive utility-inlining depth, to bound CFG growth when
     /// utilities chain or recurse.
@@ -62,7 +61,7 @@ impl Default for Config {
     }
 }
 
-/// `AnalyzeChildFn` callback — called from `eval_comp_app` to inline a child component.
+/// `AnalyzeChildFn` callback called from `eval_comp_app` to inline a child component.
 /// Provided to `InterCtx` at creation time to break the circular dep between
 /// `domains::transfer` and `engine::fixpoint`.
 pub fn analyze_component_inter(
@@ -81,7 +80,7 @@ pub fn analyze_component_inter(
     )
 }
 
-/// Public entry point — intra-component analysis only (no inter-component context).
+/// Public entry point intra-component analysis only (no inter-component context).
 pub fn analyze_component<T: Transfer<Domain = StateValue>>(
     comp: ComponentIR,
     transfer: &T,
@@ -104,7 +103,7 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
 ///   2. Render pass: analyze `render_cfg`.
 ///   3. Recompute memo store from exit env.
 ///   4. Effect passes.
-///   5. Handler passes (in-cycle — ADR-009 §5).
+///   5. Handler passes (in-cycle).
 ///   6. Convergence check.
 ///   7. Widen after `config.widen_threshold` iterations.
 fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
@@ -125,9 +124,8 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 
     let mut hooks = hooks;
 
-    // Utility-function inlining (ADR-013 Phase 3). Runs before
-    // `expand_custom_hooks` so utility bodies that contain hook calls (rare
-    // but possible) become visible to the hook expansion pass.
+    // Utility-function inlining. Runs before `expand_custom_hooks` so utility
+    // bodies containing hook calls become visible to the hook expansion pass.
     expand_utility_calls(
         &mut render_cfg,
         &mut hooks,
@@ -136,8 +134,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         config.max_inline_depth,
     );
 
-    // Expand HookEntry::Custom entries by inlining sub-hooks with remapped labels.
-    // Must happen before TypedStateStore::from_component so inlined State entries are seeded.
+    // Expand Custom entries before TypedStateStore::from_component so inlined State entries are seeded.
     expand_custom_hooks(&mut hooks, &mut render_cfg, inter);
 
     let mut typed_state = TypedStateStore::from_component(&hooks);
@@ -254,10 +251,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             }
         }
 
-        // ── Handler passes (in-cycle — ADR-009 §5) ───────────────────────────
+        // ── Handler passes (in-cycle) ─────────────────────────────────────────
         // Handlers run 0..N times → include in fixpoint for sound range approx.
-        // State joined into new_untyped_full for convergence, but NOT tracked in
-        // widened_labels (handler-caused widening is not an InfiniteLoop bug).
+        // NOT tracked in widened_labels (handler-caused widening ≠ InfiniteLoop).
         let mut state_from_handlers = StateStore::bottom();
         for hook in &hooks {
             if let HookEntry::Handler {
@@ -312,7 +308,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         }
 
         if iteration >= config.widen_threshold {
-            // widened_labels: render+effects only — handler widening is not a bug.
+            // widened_labels: render+effects only handler widening is not a bug.
             let incycle_typed = typed_state.from_untyped(&new_untyped_incycle);
             for label in incycle_typed.changed_labels(&typed_state) {
                 widened_labels.insert(label);
@@ -324,14 +320,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     }
 
     // ── Post-convergence: pure setter writes ──────────────────────────────────
-    // Re-run each effect with StateStore::bottom() as the accumulator base so
-    // that `state_out` contains only what the setters actually wrote, not the
-    // pre-existing fixpoint state.  The query context still uses the final
-    // state so that expression evaluation (StateVal reads, narrowing) is correct.
-    //
-    // This lets InfiniteLoop distinguish bounded growth (narrowing held it, e.g.
-    // `if (count < 10) setCount(count + 1)` writes [1,10]) from true divergence
-    // (`setCount(count + 1)` writes [1,+∞)).
+    // Re-run effects from ⊥ so `effect_setter_writes` contains only what setters
+    // actually wrote. InfiniteLoop uses this to distinguish bounded growth (narrowing
+    // held: `[1,10]`) from true divergence (`[1,+∞)`).
     let final_state = typed_state.to_untyped();
     let final_ctx = FixpointCtx {
         state: &final_state,
@@ -382,7 +373,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 // ── Program-level analysis ────────────────────────────────────────────────────
 
 /// Analyze all components in `registry` together, propagating props and
-/// callbacks across component boundaries (top-down inlining, ADR-012).
+/// callbacks across component boundaries (top-down inlining).
 pub fn analyze_program(
     registry: ComponentRegistry,
     hook_registry: HookRegistry,
@@ -433,13 +424,8 @@ pub fn analyze_program(
         }
     }
 
-    // Phase 2: analyze any component not yet reached (props = ⊤, intra only).
-    // Iterate by composite key so distinct files defining the same name are
-    // each analysed (ADR-013 §1, fixes Page() collisions). Skip components
-    // whose display name is already in `results` — the inter-component pass
-    // (via `eval_comp_app`) inserts child results under their plain name, and
-    // re-running them here would overwrite the precise inter result with a
-    // less informative props=⊤ intra-only analysis.
+    // Phase 2: analyze unreached components (props=⊤, intra only). Skip
+    // those already in `results` inter-component pass inserted precise results.
     let mut remaining_keys: Vec<crate::engine::ComponentKey> = registry
         .all_keys()
         .into_iter()
@@ -485,7 +471,7 @@ pub fn analyze_program(
 /// have been inserted into `hooks` in this call.  Once a name is in the set, any
 /// further `Custom` entry with that name is skipped (cut to ⊤).  This is correct
 /// for self-recursive hooks and sound for the rare case of a hook called twice in
-/// the same component (second call stays opaque — FN, not FP).
+/// the same component (second call stays opaque FN, not FP).
 fn expand_custom_hooks(
     hooks: &mut Vec<HookEntry>,
     render_cfg: &mut CFG,
@@ -525,15 +511,14 @@ fn expand_custom_hooks(
             continue;
         }
 
-        // Prefer the resolved-file key (ADR-013 §1) when available; fall back to
-        // a name-only lookup for hooks whose import wasn't resolved (legacy,
-        // test inputs without a file).
+        // Prefer resolved-file key when available; fall back to name-only for
+        // hooks whose import wasn't resolved (legacy / test inputs without a file).
         let hook_ir_opt = match &resolved_file {
             Some(file) => reg.get(&(file.clone(), name.clone())),
             None => reg.get_by_name(&name),
         };
         let Some(hook_ir) = hook_ir_opt else {
-            // Not in HookRegistry — check SummaryRegistry as fallback.
+            // Not in HookRegistry check SummaryRegistry as fallback.
             // Known library hooks (TanStack, React Router, etc.) are removed from the
             // hooks vec so they don't generate opaque Custom diagnostics.
             // Call summarize() to get the abstract return value and patch the
@@ -563,7 +548,7 @@ fn expand_custom_hooks(
                     }
                 }
                 hooks.remove(i);
-                // Don't increment i — it now points to the next entry.
+                // Don't increment i it now points to the next entry.
                 continue;
             }
             i += 1;
@@ -638,7 +623,7 @@ fn expand_custom_hooks(
         for (j, h) in remapped.into_iter().enumerate() {
             hooks.insert(i + j, h);
         }
-        // Don't increment i — re-examine position i (first inlined entry, may itself be Custom).
+        // Don't increment i re-examine position i (first inlined entry, may itself be Custom).
     }
 }
 
@@ -914,16 +899,15 @@ fn collect_handler_info(hooks: &[HookEntry]) -> HashMap<HookLabel, HandlerInfo> 
         .collect()
 }
 
-// ── Utility-function inlining (ADR-013 Phase 3) ────────────────────────────────
+// ── Utility-function inlining ─────────────────────────────────────────────────
 
 /// Splice every statement-level call to a known utility into the caller's
 /// CFG (and the body CFGs of its hook entries). Operates in place on
 /// `render_cfg` and `hooks`.
 ///
-/// "Statement-level" means the call is the rhs of a `Let` or the entirety
-/// of an `ExprStmt` — calls in arbitrary expression positions (`if (util(x))`,
-/// `setState(util(x))`) stay opaque (`Top`). This matches the plan's Phase 3
-/// scope; expression-position inlining is intentionally deferred.
+/// "Statement-level" means the call is the rhs of a `Let` or the entirety of
+/// an `ExprStmt` calls in expression positions (`if (util(x))`,
+/// `setState(util(x))`) stay opaque (`Top`); expression-position inlining deferred.
 fn expand_utility_calls(
     render_cfg: &mut CFG,
     hooks: &mut [HookEntry],
@@ -1174,7 +1158,7 @@ fn splice_one_call(
     // 7. Caller block now jumps to callee entry.
     cfg.blocks.get_mut(&block_id).unwrap().term = Terminator::Jump(callee_entry);
 
-    // 8. Create the join block — holds the original post-call stmts and the
+    // 8. Create the join block holds the original post-call stmts and the
     //    caller's original terminator.
     cfg.blocks.insert(
         join_block_id,
@@ -1186,7 +1170,7 @@ fn splice_one_call(
     );
 
     // Edge maintenance: the cfg's `edges` vec is used by some passes (e.g.
-    // narrowing) for IfTrue/IfFalse classification — leaves on Unconditional
+    // narrowing) for IfTrue/IfFalse classification leaves on Unconditional
     // jumps are not always recorded. We keep edges minimal; the abstract
     // interpreter recomputes successors from terminators when needed.
 }
@@ -1502,7 +1486,7 @@ mod tests {
 
     #[test]
     fn effect_info_captures_free_vars() {
-        // Effect body uses "n" and "setN" — both are free vars
+        // Effect body uses "n" and "setN" both are free vars
         let mut eff_blocks = HashMap::new();
         eff_blocks.insert(
             0,
@@ -1765,7 +1749,6 @@ mod tests {
 
     #[test]
     fn handler_does_not_drive_widening() {
-        // Handler with setN(n+1) is now in the fixpoint loop (ADR-009 §5).
         // incycle_typed (render+effects only) never grows → widened_labels stays empty.
         let body = handler_cfg(vec![
             Stmt::Let {
@@ -2024,7 +2007,7 @@ mod tests {
         assert_eq!(
             result.state_store.get(0),
             StateValue::Number(Interval { lo: 0.0, hi: 99.0 }),
-            "handler's setN(99) must be joined into state_store (ADR-009 §5: handler in fixpoint)"
+            "handler's setN(99) must be joined into state_store"
         );
     }
 
@@ -2162,7 +2145,7 @@ mod tests {
 
     #[test]
     fn handler_info_event_and_free_vars() {
-        // Handler reads "n" and calls setN — both are free vars.
+        // Handler reads "n" and calls setN both are free vars.
         let body = handler_cfg(vec![Stmt::ExprStmt(
             Expr::Call {
                 fn_: Box::new(Expr::Var("setN".to_string())),
@@ -2198,7 +2181,7 @@ mod tests {
 
     #[test]
     fn free_vars_captured_from_branch_condition() {
-        // Effect body: `if (x > 0) { setN(1); }` — x appears only in the Branch cond.
+        // Effect body: `if (x > 0) { setN(1); }` x appears only in the Branch cond.
         // Before the fix, compute_free_vars skipped terminators → x was not a free var.
         let mut blocks = HashMap::new();
         // block 0: Branch { cond: x > 0 } → then=1, else=2
@@ -2275,7 +2258,7 @@ mod tests {
         let info = &result.effect_info[&0];
         assert!(
             info.free_vars.contains("x"),
-            "x appears only in Branch cond — must be a free var"
+            "x appears only in Branch cond must be a free var"
         );
         assert!(info.free_vars.contains("setN"));
     }

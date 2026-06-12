@@ -14,7 +14,7 @@ use crate::{
 use super::{Diagnostic, Rule, collect_setter_calls};
 
 /// Fires when a `useEffect` unconditionally sets a state variable whose value
-/// is a call-free function of a single other state variable — a pattern that
+/// is a call-free function of a single other state variable a pattern that
 /// should instead be a `useMemo` or a derived variable computed during render.
 ///
 /// Pattern matched:
@@ -31,9 +31,6 @@ impl Rule for DerivedState {
 
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
         let result = &result.components[component];
-        // Build set of all state setter vars, plus a map from each setter/state-val
-        // var to the state slot (label) it touches — used below to reject
-        // self-referential updates.
         let mut setter_vars: HashSet<Var> = HashSet::new();
         let mut state_var_names: HashSet<Var> = HashSet::new();
         let mut setter_label: HashMap<Var, HookLabel> = HashMap::new();
@@ -67,7 +64,7 @@ impl Rule for DerivedState {
             }
         }
 
-        // Setters called in the render body (not derived-state candidates if called here too).
+        // Setters called in render body are not derived-state candidates.
         let render_setters: HashSet<Var> =
             collect_setter_calls(&result.render_cfg, &setter_vars, 1)
                 .into_iter()
@@ -97,19 +94,15 @@ impl Rule for DerivedState {
                 _ => continue,
             };
 
-            // Effect body must unconditionally call exactly one setter with a call-free arg.
             let Some(setter_name) = find_uncond_setter_call(body_cfg, &setter_vars) else {
                 continue;
             };
 
-            // Reject self-referential updates: when the setter writes the SAME
-            // state slot the dep reads (e.g. `setX(x + 1)` with deps `[x]`), this
-            // is accumulation/a counter — caught by `infinite-loop` — not a
-            // derivation. `useMemo` cannot express it, so flagging derived-state
-            // here is a false positive.
-            if let (Some(set_lbl), Some(dep_lbl)) =
-                (setter_label.get(&setter_name), state_val_label.get(&dep_var))
-                && set_lbl == dep_lbl
+            // Reject self-referential updates (e.g. `setX(x+1)`) accumulation, not derivation.
+            if let (Some(set_lbl), Some(dep_lbl)) = (
+                setter_label.get(&setter_name),
+                state_val_label.get(&dep_var),
+            ) && set_lbl == dep_lbl
             {
                 continue;
             }
@@ -145,7 +138,7 @@ impl Rule for DerivedState {
                 "derived-state",
                 format!(
                     "setter `{setter_name}` is always called with a call-free expression of \
-                     `{dep_var}` in effect {eff_label} — replace with `useMemo` or compute \
+                     `{dep_var}` in effect {eff_label} replace with `useMemo` or compute \
                      during render"
                 ),
             )
@@ -160,11 +153,9 @@ impl Rule for DerivedState {
     }
 }
 
-/// Return `Some(setter_var)` if `cfg` unconditionally calls exactly one setter
-/// (the same var on all paths) with call-free arguments.
+/// Returns `Some(var)` if `cfg` unconditionally calls exactly one setter with call-free args on all paths.
 ///
-/// Uses a must-forward dataflow: `must_out[B] = (∩ must_out[preds]) || called_in[B]`.
-/// The setter is unconditional iff every return block has `must_out = true`.
+/// Must-forward dataflow: `must_out[B] = (∩ must_out[preds]) || called_in[B]`.
 fn find_uncond_setter_call(cfg: &CFG, setter_vars: &HashSet<Var>) -> Option<Var> {
     // Collect all call sites: (block_id, setter_var, arg).
     let mut call_sites: Vec<(BlockId, Var, Expr)> = vec![];
@@ -198,10 +189,7 @@ fn find_uncond_setter_call(cfg: &CFG, setter_vars: &HashSet<Var>) -> Option<Var>
         return None;
     }
 
-    // Must-forward dataflow: does the target setter fire on EVERY path to every return?
-    //   must_in[B]  = AND of must_out[pred] for each pred
-    //   must_out[B] = must_in[B] || called_in[B]
-    //   Initial: must_out[entry] = called_in[entry]; must_out[others] = true (top)
+    // must_in[B] = AND must_out[preds]; must_out[B] = must_in[B] || called_in[B]
     let called_in: HashMap<BlockId, bool> = cfg
         .blocks
         .keys()
@@ -234,10 +222,7 @@ fn find_uncond_setter_call(cfg: &CFG, setter_vars: &HashSet<Var>) -> Option<Var>
         }
     }
 
-    // Every exit block (Return or Unreachable — effect bodies end with Unreachable
-    // because they are void: `into_cfg` uses Unreachable for unterminated blocks)
-    // must have must_out = true.  The iterator must be non-empty to avoid the
-    // vacuously-true case where a CFG has no exit blocks at all.
+    // Every exit block must have must_out = true; non-empty to avoid vacuous truth.
     let exit_blocks: Vec<_> = cfg
         .blocks
         .values()

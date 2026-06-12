@@ -14,33 +14,21 @@ use crate::{
 
 // ── AnalyzeChildFn ─────────────────────────────────────────────────────────────
 
-/// Function pointer type for inlining a child component's analysis.
-/// Provided by `engine::fixpoint` at `InterCtx` creation time to break the
-/// circular dependency between `domains::transfer` and `engine::fixpoint`.
-/// `initial_heap` carries pre-populated heap entries (props abstract object) for the child.
+/// Function pointer for inlining a child component's analysis. Breaks the
+/// circular dep between `domains::transfer` and `engine::fixpoint`.
 pub type AnalyzeChildFn =
     fn(&ComponentIR, AbstractEnv<StateValue>, Heap, &InterCtx<'_>) -> AnalysisResult<StateValue>;
 
 // ── QueryContext trait ────────────────────────────────────────────────────────
 
-/// Cross-domain context passed to every Transfer method.
-///
-/// Allows a Transfer to query the abstract state of other domains during
-/// `eval_expr` / `exec_stmt`. Implemented by:
-/// - `NullCtx`          — no-op (returns Top); used in tests and as the recursion base.
-/// - `FixpointCtx`      — mid-fixpoint queries using the current iteration's state.
-/// - `AnalysisQueryCtx` — post-fixpoint queries using the converged `AnalysisResult`.
+/// Cross-domain context passed to every Transfer method for abstract-state queries.
 pub trait QueryContext {
     fn state_value_of(&self, expr: &Expr) -> StateValue;
 }
 
 // ── NullCtx ───────────────────────────────────────────────────────────────────
 
-/// No-op context: conservatively returns `Top` for every query.
-///
-/// Used in tests and as the recursive base case inside `FixpointCtx` and
-/// `AnalysisQueryCtx` (preventing infinite dispatch when `StateValueTransfer`
-/// is called with a ctx that itself calls `StateValueTransfer`).
+/// No-op context: returns `Top` for every query. Used in tests and as recursion base.
 pub struct NullCtx;
 
 impl QueryContext for NullCtx {
@@ -55,7 +43,7 @@ impl QueryContext for NullCtx {
 /// top-down inlining across component boundaries.
 ///
 /// Uses `RefCell` for all mutable shared state so that `InterCtx` can be passed
-/// as a shared `&InterCtx` reference — avoiding nested `&mut` lifetime issues while
+/// as a shared `&InterCtx` reference avoiding nested `&mut` lifetime issues while
 /// still allowing mutation through `borrow_mut()`.
 pub struct InterCtx<'a> {
     pub registry: &'a ComponentRegistry,
@@ -186,7 +174,7 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
 ///
 /// Used by `analyze_cfg` to give Transfer methods read access to the fixpoint
 /// state accumulated so far. Local variables return `Bottom` (no per-block env
-/// threaded here — conservative but sound).
+/// threaded here conservative but sound).
 pub struct FixpointCtx<'a> {
     pub state: &'a StateStore<StateValue>,
     pub memo: &'a MemoStore<StateValue>,

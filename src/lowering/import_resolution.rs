@@ -6,7 +6,7 @@
 //! file path that a relative specifier resolves to via [`ImportResolver`].
 //!
 //! Populated values flow into [`crate::ir::hooks::HookEntry::Custom::resolved_file`]
-//! at extraction time (ADR-013 §1 + §2).
+//! at extraction time.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -41,7 +41,7 @@ pub fn build_resolved_import_map(
             continue;
         };
         let source = decl.source.value.as_str();
-        // Only relative imports — npm packages are tracked by build_import_map.
+        // Only relative imports npm packages are tracked by build_import_map.
         if !source.starts_with('.') {
             continue;
         }

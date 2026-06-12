@@ -12,13 +12,8 @@ use crate::ir::{
 
 // ── Subscription extraction (addEventListener in effect bodies) ───────────────
 
-/// Scan every `HookEntry::Effect` body_cfg for `addEventListener(str, FnLit)`
-/// calls and append a `HookEntry::Handler` for each one found.
-/// Labels continue from `*next_label`.
-///
-/// Only inline `FnLit` callbacks with a string-literal event name are lifted;
-/// variable callbacks or dynamic event names are skipped (acceptable FN).
-/// FnLit bodies are not recursed into — nested addEventListener is pathological.
+/// Scan every effect body for `addEventListener(str, FnLit)` and append a
+/// `HookEntry::Handler` for each. Variable callbacks / dynamic names skipped.
 pub fn extract_subscriptions(hooks: &mut Vec<HookEntry>, next_label: &mut HookLabel) {
     let n = hooks.len();
     let mut new_handlers: Vec<HookEntry> = Vec::new();
@@ -43,7 +38,7 @@ fn collect_subscriptions_in_cfg(cfg: &CFG, out: &mut Vec<HookEntry>, next_label:
             };
             collect_subscriptions_in_expr(expr, span, out, next_label);
         }
-        // Terminator::Return not scanned — addEventListener is never a return expr.
+        // Terminator::Return not scanned addEventListener is never a return expr.
     }
 }
 
@@ -77,7 +72,7 @@ fn collect_subscriptions_in_expr(
                 }
                 return;
             }
-            // Not an addEventListener match — recurse into all sub-expressions.
+            // Not an addEventListener match recurse into all sub-expressions.
             collect_subscriptions_in_expr(fn_, stmt_span, out, next_label);
             for arg in args {
                 collect_subscriptions_in_expr(arg, stmt_span, out, next_label);
@@ -119,11 +114,8 @@ fn collect_subscriptions_in_expr(
 // ── Handler extraction ────────────────────────────────────────────────────────
 
 /// Scan `cfg` for JSX `onX={fn}` event handler props and append each as
-/// `HookEntry::Handler` to `hooks`.  Labels continue from `*next_label`.
-///
-/// Scans both block statements and `Terminator::Return` expressions (JSX is
-/// typically in the return of the render function).  Only `NativeElem` props
-/// are inspected — `CompApp` props carry React component props, not DOM events.
+/// `HookEntry::Handler`. Inspects statements and `Terminator::Return`; only
+/// `NativeElem` props (not `CompApp`).
 pub fn extract_handlers(cfg: &CFG, hooks: &mut Vec<HookEntry>, next_label: &mut HookLabel) {
     for block in cfg.blocks.values() {
         for stmt in &block.stmts {
@@ -170,7 +162,7 @@ fn collect_handlers_in_expr(expr: &Expr, hooks: &mut Vec<HookEntry>, next_label:
                 collect_handlers_in_expr(child, hooks, next_label);
             }
         }
-        // Don't scan CompApp props — those are React component props, not DOM events.
+        // Don't scan CompApp props those are React component props, not DOM events.
         Expr::TSAnnotated(e, _) => collect_handlers_in_expr(e, hooks, next_label),
         _ => {}
     }
@@ -193,20 +185,9 @@ fn prop_to_event(name: &str) -> String {
     s
 }
 
-/// Walk `cfg` in block-id order, extract all top-level hook calls into a
-/// `Vec<HookEntry>`, and rewrite the affected statements in-place.
-///
-/// Labels are assigned in ascending block-id + statement order, which matches
-/// textual source order for ~95% of React code.
-///
-/// Destructuring of useState/useReducer is resolved:
-///   `__arr_N[0]` → `StateVal(L)`, `__arr_N[1]` → `StateSetter(L)`
-/// Returns `(hooks, next_label)` where `next_label` is the first available
-/// label after all extracted hooks.  Pass `next_label` to `extract_handlers`
-/// so that handler labels don't collide with hook labels.
-/// `import_map` maps each locally-bound hook name to its NPM package source, e.g.
-/// `{"useQuery" → "@tanstack/react-query"}`.  Built from `import` declarations before
-/// lowering so `HookEntry::Custom::import_source` can be set at extraction time.
+/// Walk `cfg` in block-id order, extract top-level hook calls, and rewrite
+/// affected statements in-place. Returns `(hooks, next_label)`.
+/// Destructuring is resolved: `__arr_N[0]` → `StateVal(L)`, `__arr_N[1]` → `StateSetter(L)`.
 pub fn extract_hooks(
     cfg: &mut CFG,
     import_map: &HashMap<String, String>,
@@ -267,8 +248,7 @@ fn process_stmt(
                     hooks.push(entry);
                 }
 
-                // Record the binding variable, npm import source, and resolved
-                // file (ADR-013 §2) for Custom hooks.
+                // Record the binding variable, npm import source, and resolved file for Custom hooks.
                 if !is_arr_temp {
                     if let Some(HookEntry::Custom {
                         binding,
@@ -310,9 +290,7 @@ fn process_stmt(
                 if let Some(entry) = make_hook_entry(&name, lbl, args, None, stmt_span) {
                     hooks.push(entry);
                 }
-                // For Custom hooks without a binding, populate import_source +
-                // resolved_file so the engine can still resolve their definition
-                // (ADR-013 §2).
+                // For Custom hooks without a binding, populate import_source + resolved_file.
                 if let Some(HookEntry::Custom {
                     import_source,
                     resolved_file,
@@ -881,7 +859,7 @@ mod tests {
 
     #[test]
     fn non_fn_event_prop_not_extracted() {
-        // onClick={someVar} — value is a Var, not FnLit → no Handler entry
+        // onClick={someVar} value is a Var, not FnLit → no Handler entry
         let (_, hooks) = parse_and_extract_with_handlers(
             "function Btn({ onClick }) { return <button onClick={onClick}/>; }",
         );
@@ -962,8 +940,7 @@ mod tests {
     #[test]
     fn handler_span_populated_with_real_line_starts() {
         // Verify that handler spans are non-None when real line_starts are provided.
-        // Previously documented as a limitation (ADR-011 §2); resolved by
-        // lower_jsx_props capturing prop_spans before the AST is dropped.
+        // Spans are non-None when real line_starts are provided.
         let src = "function Btn() {\n  return <button onClick={() => {}} />;\n}";
         let alloc = Allocator::default();
         let ret = Parser::new(&alloc, src, SourceType::tsx())

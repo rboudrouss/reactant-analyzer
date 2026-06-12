@@ -1,4 +1,4 @@
-//! ADR-013 Phase 3 — statement-level utility inlining.
+//! ADR-013 Phase 3 statement-level utility inlining.
 //!
 //! Verifies that calls like `doOrNot(setX(...))` are spliced in place of the
 //! opaque `Call → Top` so the analyzer sees branch guards inside the utility.
@@ -121,7 +121,7 @@ fn detector_classifies_utility_function() {
 fn statement_call_to_utility_does_not_panic() {
     // Most basic end-to-end: a component that calls a known utility at
     // statement-level. The exact diagnostic semantics depend on the engine,
-    // but the analysis must complete without crashing — exercises the splicer.
+    // but the analysis must complete without crashing exercises the splicer.
     let tmp = Tmp::new("stmt-call");
     let path = tmp.write(
         "main.tsx",
@@ -239,7 +239,7 @@ fn doornot_guard_suppresses_infinite_loop_false_positive() {
 
 #[test]
 fn recursion_guard_does_not_loop_forever() {
-    // self-recursive utility — must not stack-overflow during splicing.
+    // self-recursive utility must not stack-overflow during splicing.
     let tmp = Tmp::new("recursion");
     let path = tmp.write(
         "main.tsx",

@@ -13,11 +13,11 @@ const STR_WIDEN_THRESHOLD: usize = 4;
 /// join(Set(a), Set(b)) widens to Top when |a ∪ b| > STR_WIDEN_THRESHOLD.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StrConst {
-    /// ⊥ — no possible string value (unreachable path).
+    /// ⊥ no possible string value (unreachable path).
     Bottom,
     /// Finite known set of string constants.
     Set(Arc<BTreeSet<String>>),
-    /// ⊤ — any string (widened beyond threshold).
+    /// ⊤ any string (widened beyond threshold).
     Top,
 }
 
@@ -97,7 +97,7 @@ impl AbstractDomain for StrConst {
     }
 
     fn widen(&self, other: &Self) -> Self {
-        // join already applies the threshold — widening = join for this domain
+        // join already applies the threshold widening = join for this domain
         self.join(other)
     }
 }

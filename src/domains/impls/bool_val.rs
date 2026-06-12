@@ -4,11 +4,11 @@ use crate::domains::AbstractDomain;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoolVal {
-    /// ⊥ — unreachable.
+    /// ⊥ unreachable.
     Bottom,
     True,
     False,
-    /// ⊤ — may be either.
+    /// ⊤ may be either.
     Top,
 }
 

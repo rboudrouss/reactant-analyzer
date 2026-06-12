@@ -4,7 +4,7 @@ use crate::{domains::AbstractDomain, ir::types::HookLabel};
 
 /// Maps each `useMemo` / `useCallback` hook label to its current abstract value.
 ///
-/// Unlike `StateStore`, this store is NOT a fixpoint subject — it is fully
+/// Unlike `StateStore`, this store is NOT a fixpoint subject it is fully
 /// recomputed via `Transfer::recompute_memo` after each render-pass analysis.
 /// The `set` method is the only mutation; the recomputation logic lives in the
 /// `Transfer` implementation so each domain can define its own semantics.

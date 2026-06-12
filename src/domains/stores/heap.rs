@@ -27,10 +27,7 @@ pub enum HeapValue {
 }
 
 /// Abstract heap: maps allocation-site `ExprId`s to `HeapValue`s.
-///
-/// Populated during analysis whenever `eval_expr` encounters a `FnLit`,
-/// `ObjectLit`, or `ArrayLit` node. The heap is part of `AnalysisCtx` and
-/// participates in the fixpoint (join at block boundaries).
+/// Populated by `eval_expr` for `FnLit`/`ObjectLit`/`ArrayLit` nodes.
 #[derive(Debug, Clone, Default)]
 pub struct Heap(HashMap<ExprId, HeapValue>);
 

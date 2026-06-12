@@ -1,5 +1,5 @@
 //! Integration test for ADR-013 §1: two components sharing a name in
-//! different files must coexist in the analyzer's output — the Next.js
+//! different files must coexist in the analyzer's output the Next.js
 //! `app/<route>/page.tsx` pattern is no longer silently dropped.
 
 use std::fs;

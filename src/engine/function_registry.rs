@@ -1,12 +1,12 @@
 //! Registry of utility [`FunctionIR`]s, mirroring [`ComponentRegistry`] /
-//! [`HookRegistry`]. ADR-013 §5 + Phase 3.
+//! [`HookRegistry`].
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::ir::{FunctionIR, types::Symbol};
 
-/// `(file, name)` key — same shape as the other registries (ADR-013 §1).
+/// `(file, name)` key same shape as the other registries.
 pub type FunctionKey = (PathBuf, Symbol);
 
 #[derive(Debug, Default)]
@@ -33,8 +33,8 @@ impl FunctionRegistry {
     }
 
     /// Legacy lookup by name only, returning the first match (sorted) when
-    /// the same name appears in multiple files. Phase 3.B reaches for this
-    /// only when no resolved import-file is available at the call site.
+    /// the same name appears in multiple files. Used when no resolved import-file
+    /// is available at the call site.
     #[doc(hidden)]
     pub fn get_by_name(&self, name: &Symbol) -> Option<&FunctionIR> {
         let mut keys: Vec<&FunctionKey> =

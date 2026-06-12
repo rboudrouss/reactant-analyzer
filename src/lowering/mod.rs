@@ -33,7 +33,7 @@ use crate::{
 ///          → `{"useQuery": "@tanstack/react-query"}`
 ///
 /// Only named and default imports are tracked; namespace imports (`* as foo`)
-/// are skipped.  Relative imports (starting with `.`) are excluded — they
+/// are skipped.  Relative imports (starting with `.`) are excluded they
 /// are local files, not packages, and would not match SummaryRegistry entries.
 fn build_import_map(program: &Program) -> HashMap<String, String> {
     let mut map = HashMap::new();
@@ -42,7 +42,7 @@ fn build_import_map(program: &Program) -> HashMap<String, String> {
             continue;
         };
         let source = decl.source.value.as_str();
-        // Skip relative imports — local files, not packages.
+        // Skip relative imports local files, not packages.
         if source.starts_with('.') {
             continue;
         }
@@ -68,17 +68,17 @@ fn build_import_map(program: &Program) -> HashMap<String, String> {
 ///
 /// `file` is the absolute path of the source file. It is stored on each
 /// produced `HookIR` so the engine can key registries by `(file, name)` and
-/// resolve cross-file imports (ADR-013 §1).
+/// resolve cross-file imports.
 ///
 /// Uses [`DefaultImportResolver`] for relative-import resolution. Callers that
-/// need a custom resolver (Phase 4 plugin path) should use
+/// need a custom resolver should use
 /// [`lower_custom_hooks_with_resolver`].
 pub fn lower_custom_hooks(program: &Program, line_starts: &[u32], file: &Path) -> Vec<HookIR> {
     lower_custom_hooks_with_resolver(program, line_starts, file, &DefaultImportResolver)
 }
 
 /// Plugin-friendly variant of [`lower_custom_hooks`] that accepts a custom
-/// `ImportResolver` (ADR-013 §2 + Phase 4).
+/// `ImportResolver`.
 pub fn lower_custom_hooks_with_resolver(
     program: &Program,
     line_starts: &[u32],
@@ -111,14 +111,14 @@ pub fn lower_custom_hooks_with_resolver(
 
 /// Stage 3 entry point: lower all React components in `program` to `ComponentIR`.
 ///
-/// `file` is the absolute path of the source file (ADR-013 §1). Uses
+/// `file` is the absolute path of the source file. Uses
 /// [`DefaultImportResolver`]; see [`lower_program_with_resolver`] for the
 /// plugin variant.
 pub fn lower_program(program: &Program, line_starts: &[u32], file: &Path) -> Vec<ComponentIR> {
     lower_program_with_resolver(program, line_starts, file, &DefaultImportResolver)
 }
 
-/// Plugin-friendly variant of [`lower_program`] (ADR-013 §2 + Phase 4).
+/// Plugin-friendly variant of [`lower_program`].
 pub fn lower_program_with_resolver(
     program: &Program,
     line_starts: &[u32],

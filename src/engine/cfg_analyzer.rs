@@ -16,8 +16,8 @@ use crate::{
 /// Worklist-based abstract interpretation of a single CFG.
 ///
 /// Returns `(exit_envs, state_out)`:
-/// - `exit_envs[b]` — abstract environment at the *exit* of block `b`.
-/// - `state_out` — outer state + all `setState` discoveries from this pass.
+/// - `exit_envs[b]` abstract environment at the *exit* of block `b`.
+/// - `state_out` outer state + all `setState` discoveries from this pass.
 ///
 /// `heap` is mutated in-place (insert-only) as `FnLit`/`ObjectLit`/`ArrayLit`
 /// nodes are encountered. Callers pass and accumulate the same heap across
@@ -60,7 +60,7 @@ pub fn analyze_cfg<'inter, T: Transfer>(
 
         let env_in = entry_envs[&b].clone();
         let mut env_out = env_in;
-        // Memo is fixed for this pass; local mutations from exec_stmt are discarded.
+        // Memo is fixed for this pass; local mutations are discarded.
         let mut memo_local = memo.clone();
 
         if let Some(block) = cfg.blocks.get(&b) {
@@ -74,11 +74,8 @@ pub fn analyze_cfg<'inter, T: Transfer>(
             for stmt in &block.stmts {
                 transfer.exec_stmt(stmt, &mut env_out, &mut ac);
             }
-            // Concise-arrow bodies (`() => expr`) lower `expr` to Terminator::Return
-            // rather than an ExprStmt. Process it for setter side effects so that
-            // e.g. `onClick={() => setN(1)}` or `addEventListener("e", () => setN(1))`
-            // correctly updates the state store. Block bodies return `Lit(Unit)`,
-            // for which exec_stmt is a no-op, so this is safe for all CFGs.
+            // Concise-arrow bodies lower `expr` to Terminator::Return rather than
+            // an ExprStmt process for setter side effects (`() => setN(1)`).
             if let Terminator::Return(return_expr) = &block.term {
                 transfer.exec_stmt(
                     &Stmt::ExprStmt(return_expr.clone(), None),
@@ -90,7 +87,6 @@ pub fn analyze_cfg<'inter, T: Transfer>(
 
         exit_envs.insert(b, env_out.clone());
 
-        // Compute outgoing env per successor, narrowed at branch conditions.
         let outgoing: Vec<(BlockId, AbstractEnv<T::Domain>)> =
             if let Some(block) = cfg.blocks.get(&b) {
                 match &block.term {
@@ -469,7 +465,7 @@ mod tests {
                 id: 0,
                 stmts: vec![Stmt::Let {
                     var: "x".to_string(),
-                    rhs: Expr::Lit(Prim::Int(0)), // will be in env, but we set it up via entry_env
+                    rhs: Expr::Lit(Prim::Int(0)),
                     span: None,
                 }],
                 term: Terminator::Branch {
@@ -516,7 +512,6 @@ mod tests {
             ],
         };
 
-        // Seed entry env with x = Number([0, +∞))
         let mut entry_env = AbstractEnv::bottom();
         entry_env.extend(
             "x".to_string(),
@@ -539,38 +534,19 @@ mod tests {
             None,
         );
 
-        // then-branch: x < 10 → x ∈ [0, 9]  (after block 0's let x=0 re-binds to Number([0,0]),
-        // but we seeded via entry_env above; block 0's let x=0 will re-bind x to [0,0] in
-        // env_out. So the narrowing happens on [0,0] which is already < 10 → stays [0,0]).
-        // The key test is that entry_env of block 1 has x narrowed from block 0's exit.
-        // Block 0 exec: let x = Int(0) → x = Number([0,0]) in env_out.
-        // Then narrow_lt(10) on Number([0,0]) → [0, min(0, 9)] = [0, 0].
-        // So block 1 gets x=[0,0], block 2 gets x=geq(10) = [max(0,10), 0] = bottom (empty).
-        // The important property: block 2 (else-branch) has x narrowed to geq(10).
         let then_x = exit_envs[&1].lookup("x");
         let else_x = exit_envs[&2].lookup("x");
-        // then-branch: x < 10, so x ∈ [0, 9] (or point [0,0] narrowed to [0,0])
         assert!(matches!(then_x, StateValue::Number(i) if !i.is_bottom()));
-        // else-branch: x >= 10 on top of [0,0] → bottom (can't be ≥ 10 when x was 0)
+        // else-branch: x >= 10 on [0,0] → bottom
         assert!(
             matches!(else_x, StateValue::Number(i) if i.is_bottom())
                 || else_x == StateValue::Bottom
         );
     }
 
-    // ── Regression: concise-arrow Return side effects ─────────────────────────
-    //
-    // Before the fix, `Terminator::Return(expr)` was never passed to
-    // `transfer.exec_stmt`, so setter calls in concise-arrow bodies
-    // (`() => setN(99)` lowered to `Return(Call{setN, [99]})`) were silently
-    // dropped and the state was never updated.
-
-    /// Setter call in Terminator::Return fires and updates state_out.
-    /// Mirrors a concise-arrow handler body `() => setN(99)`:
-    ///   block 0: stmts=[], Terminator::Return(Call{Var("setN"), [Lit(99)]})
+    /// Setter call in Return terminator updates state (`() => setN(99)` concise-arrow).
     #[test]
     fn setter_in_return_terminator_updates_state() {
-        // Build a one-block CFG where the only setter call is in Return.
         let mut blocks = std::collections::HashMap::new();
         blocks.insert(
             0,
@@ -589,7 +565,6 @@ mod tests {
             edges: vec![],
         };
 
-        // Entry env has setN bound as StateSetter for label 0.
         let mut entry_env = AbstractEnv::bottom();
         entry_env.bind_setter("setN".to_string(), 0);
 
@@ -606,8 +581,6 @@ mod tests {
             None,
         );
 
-        // Before fix: state_out.get(0) = Bottom (setter call never executed).
-        // After fix:  state_out.get(0) = Number([99,99]).
         assert_eq!(
             state_out.get(0),
             StateValue::Number(Interval::point(99.0)),
@@ -615,7 +588,7 @@ mod tests {
         );
     }
 
-    /// Block-body Return (Lit::Unit) is a no-op — no spurious state changes.
+    /// Block-body Return (Lit::Unit) is a no-op no spurious state changes.
     #[test]
     fn unit_return_terminator_is_noop() {
         let mut blocks = std::collections::HashMap::new();
@@ -650,8 +623,6 @@ mod tests {
             None,
         );
 
-        // StateSetter in a Let stmt does NOT call the setter (only a Call does).
-        // Return(Lit(Unit)) must not cause any spurious state update.
         assert_eq!(
             state_out.get(0),
             StateValue::Bottom,
@@ -659,14 +630,12 @@ mod tests {
         );
     }
 
-    /// Setter call in Return with functional updater fires correctly.
-    /// Mirrors `() => setN(c => c + 1)` concise-arrow body.
+    /// Functional updater in Return terminator fires (`() => setN(c => c + 1)`).
     #[test]
     fn functional_updater_in_return_terminator_fires() {
         use crate::ir::types::ExprId;
         use std::sync::Arc;
 
-        // FnLit body: Return(BinOp{StateVal(0), Add, Lit(1)})
         let mut updater_blocks = std::collections::HashMap::new();
         updater_blocks.insert(
             0,
@@ -686,7 +655,6 @@ mod tests {
             edges: vec![],
         });
 
-        // Handler body: Return(Call{Var("setN"), [FnLit{c => c+1}]})
         let mut blocks = std::collections::HashMap::new();
         blocks.insert(
             0,

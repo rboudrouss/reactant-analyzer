@@ -29,7 +29,7 @@ impl Rule for MissingDeps {
             let declared: HashSet<Var> = dep_var_names(&info.declared_deps);
 
             if !info.has_deps_array {
-                // deps: None → runs every render → closure always fresh → no stale capture possible.
+                // no deps array → runs every render → no stale capture
                 continue;
             }
 
@@ -37,8 +37,7 @@ impl Rule for MissingDeps {
                 if declared.contains(var) {
                     continue;
                 }
-                // Only report vars that the analysis explicitly tracked.
-                // Globals (String, fetch, console, …) are not in env_exit → skip.
+                // Globals (fetch, console, …) are not in env_exit → skip.
                 if !env_exit.contains(var) {
                     continue;
                 }
@@ -256,7 +255,6 @@ mod tests {
 
     #[test]
     fn no_deps_array_skipped() {
-        // deps: None → no deps argument passed → runs every render → skip.
         let mut effect_info = HashMap::new();
         effect_info.insert(
             0,
@@ -341,7 +339,7 @@ mod tests {
 
     #[test]
     fn callback_with_missing_unstable_dep_warns() {
-        // useCallback(() => doX(n), []) — n is captured, unstable, not declared.
+        // useCallback(() => doX(n), []) n is captured, unstable, not declared.
         let mut effect_info = HashMap::new();
         effect_info.insert(
             0,
@@ -372,7 +370,7 @@ mod tests {
 
     #[test]
     fn memo_with_missing_unstable_dep_warns() {
-        // useMemo(() => compute(n), []) — n captured, unstable, not declared.
+        // useMemo(() => compute(n), []) n captured, unstable, not declared.
         let mut effect_info = HashMap::new();
         effect_info.insert(
             0,

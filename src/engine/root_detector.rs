@@ -25,7 +25,7 @@ pub enum RootStrategy {
 
 impl RootStrategy {
     /// Returns the set of root components to analyse, keyed by `(file, name)`
-    /// so distinct files defining the same name are each analysed (ADR-013 §1).
+    /// so distinct files defining the same name are each analysed.
     pub fn detect(&self, registry: &ComponentRegistry) -> Vec<ComponentKey> {
         match self {
             RootStrategy::Heuristic => {

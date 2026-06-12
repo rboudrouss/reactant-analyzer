@@ -9,22 +9,11 @@ use crate::{
 
 use super::{Diagnostic, Rule};
 
-/// Fires when every dep in a `useEffect`, `useMemo`, or `useCallback` deps
-/// array evaluates to an unstable value — the hook fires on every render,
-/// defeating the purpose of the deps array.
+/// Fires when every dep in a `useEffect`/`useMemo`/`useCallback` deps array
+/// evaluates to an unstable value the hook fires on every render.
 ///
-/// Patterns matched:
-/// ```js
-/// useEffect(() => { doX() }, [{}])         // inline object literal = unstable
-/// useEffect(() => { doX() }, [someObj])    // someObj = Reference(Unstable)
-/// useMemo(() => x * 2, [{ a: 1 }])         // same logic
-/// useCallback(() => cb(), [() => 0])       // arrow literal = unstable
-/// ```
-///
-/// Non-matched:
-/// - Empty deps array `[]` — never fires; that's `mount-only`, not unstable.
-/// - At least one stable dep — array genuinely scopes the effect.
-/// - No deps array at all (`useEffect(fn)`) — runs every render by design.
+/// Skipped when: deps array is empty (mount-only), at least one dep is stable,
+/// or there is no deps array at all.
 pub struct AlwaysUnstableDeps;
 
 impl Rule for AlwaysUnstableDeps {
@@ -59,8 +48,6 @@ impl Rule for AlwaysUnstableDeps {
                 continue;
             }
 
-            // Evaluate every dep expression in the render-exit env.
-            // Fire only if every one is definitively unstable.
             let all_unstable = deps_ref.iter().all(|dep| {
                 eval_dep_is_unstable(
                     dep,
@@ -78,7 +65,7 @@ impl Rule for AlwaysUnstableDeps {
             let mut d = Diagnostic::new(
                 "always-unstable-deps",
                 format!(
-                    "{} {} has an entirely unstable deps array — \
+                    "{} {} has an entirely unstable deps array \
                      every dep is a new value on each render, so the deps array \
                      no longer scopes the {}",
                     hook_kind_word(kind),
@@ -274,7 +261,7 @@ mod tests {
 
     #[test]
     fn effect_no_deps_no_warning() {
-        // useEffect(() => {}) — no deps array at all
+        // useEffect(() => {}) no deps array at all
         let hooks = vec![HookEntry::Effect {
             label: 0,
             body_cfg: empty_cfg(),
@@ -292,7 +279,7 @@ mod tests {
 
     #[test]
     fn effect_mixed_deps_no_warning() {
-        // useEffect(() => {}, [{}, 42]) — at least one stable, skip
+        // useEffect(() => {}, [{}, 42]) at least one stable, skip
         let hooks = vec![HookEntry::Effect {
             label: 0,
             body_cfg: empty_cfg(),

@@ -1,4 +1,4 @@
-//! ADR-013 Phase 4 — plugin interface smoke tests for `analyze_with_resolvers`.
+//! ADR-013 Phase 4 plugin interface smoke tests for `analyze_with_resolvers`.
 
 use std::fs;
 use std::path::{Path, PathBuf};

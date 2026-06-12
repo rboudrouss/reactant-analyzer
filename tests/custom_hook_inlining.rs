@@ -1,7 +1,7 @@
 /// Integration tests for custom hook inlining (étape 8).
 ///
 /// Tests verify that hooks declared inside user-defined `use*` functions are
-/// visible to the fixpoint of the calling component — enabling rules to fire
+/// visible to the fixpoint of the calling component enabling rules to fire
 /// for bugs that originate inside custom hooks.
 use reactant::{
     engine::{
@@ -50,7 +50,7 @@ fn diags_for(result: &ProgramAnalysisResult, component: &str) -> Vec<Diagnostic>
 #[test]
 fn infinite_loop_via_custom_hook_detected() {
     // useCounter has useEffect(() => setCount(c+1), [count]) → infinite loop.
-    // Counter calls useCounter — the loop must be detected on Counter.
+    // Counter calls useCounter the loop must be detected on Counter.
     let src = r#"
         function useCounter(initial) {
             const [count, setCount] = useState(initial);
@@ -207,7 +207,7 @@ fn setter_in_render_via_custom_hook_detected() {
 
 #[test]
 fn recursive_custom_hook_terminates() {
-    // useRecursive calls itself — analysis must terminate (recursion guard).
+    // useRecursive calls itself analysis must terminate (recursion guard).
     let src = r#"
         function useRecursive(n) {
             const [x, setX] = useState(n);

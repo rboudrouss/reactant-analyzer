@@ -53,7 +53,7 @@ pub enum Expr {
     // Primitive literals
     Lit(Prim),
 
-    // Composites — each allocating node carries an ExprId (allocation-site key for the heap).
+    // Composites each allocating node carries an ExprId (allocation-site key for the heap).
     ObjectLit {
         id: ExprId,
         fields: Vec<(Symbol, Expr)>,
@@ -129,7 +129,7 @@ pub enum Expr {
 /// Lives in `ir` to avoid a circular dependency between `ir` and `domains`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SummaryValue {
-    /// ⊤ — completely unknown; default for hooks without a precise summary.
+    /// ⊤ completely unknown; default for hooks without a precise summary.
     Top,
     /// Hook returns a reference-stable value (safe as a `useEffect` dep).
     StableRef,
@@ -139,9 +139,6 @@ pub enum SummaryValue {
 
 impl Expr {
     /// Returns `true` iff the expression tree contains no `Call` or `CompApp` node.
-    /// Used to guard the `derived-state` rule: if the setter arg is call-free, the
-    /// derivation is a pure data transformation and replacing the effect with `useMemo`
-    /// is always safe.
     pub fn is_call_free(&self) -> bool {
         match self {
             Expr::Call { .. } | Expr::CompApp { .. } | Expr::NativeElem { .. } => false,

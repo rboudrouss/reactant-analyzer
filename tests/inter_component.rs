@@ -315,7 +315,7 @@ fn setter_prop_propagates_to_shared_state() {
 
 #[test]
 fn recursive_component_does_not_crash() {
-    // TreeNode renders <TreeNode /> — recursion detected, returns ⊤.
+    // TreeNode renders <TreeNode /> recursion detected, returns ⊤.
     let tree_node = {
         let mut blocks = HashMap::new();
         blocks.insert(
@@ -509,7 +509,7 @@ fn missing_deps_fires_for_unstable_callback_prop() {
             "MissingDeps should fire on Section5_Child: onUpdate is unstable but not in deps"
         );
     }
-    // If not in components (analyzed inline only), skip — acceptable behavior.
+    // If not in components (analyzed inline only), skip acceptable behavior.
 }
 
 #[test]
@@ -755,7 +755,7 @@ fn no_deps_effect_calling_parent_setter_terminates() {
     // SharedStateStore updated: parent state was written to.
     let parent_state = result.shared_state.get(&"Section10_Parent".to_string(), 0);
     // Value may be Bottom (no deps effect doesn't fire in child's fixpoint body analysis) or
-    // Number(1) if the no-deps effect ran. Either is acceptable — key assertion is no panic.
+    // Number(1) if the no-deps effect ran. Either is acceptable key assertion is no panic.
     let _ = parent_state;
 }
 
@@ -763,13 +763,13 @@ fn no_deps_effect_calling_parent_setter_terminates() {
 //
 // NOTE on which are GENUINELY inter-specific (result differs intra vs inter):
 //
-//  Section 11 ConditionalHook  — fires both intra and inter (hooks checked structurally)
-//  Section 12 SetterInRender   — fires both (setter_bindings detected in child's own CFG)
-//  Section 13 RedundantSetState — fires both (no setter calls in child's CFG)
-//  Section 14 InfiniteLoop     — INTER-SPECIFIC:
+//  Section 11 ConditionalHook  fires both intra and inter (hooks checked structurally)
+//  Section 12 SetterInRender   fires both (setter_bindings detected in child's own CFG)
+//  Section 13 RedundantSetState fires both (no setter calls in child's CFG)
+//  Section 14 InfiniteLoop     INTER-SPECIFIC:
 //    intra: step=Top → count+Top=Top → converges in 2 iter, widened_labels={}  → NO fire
 //    inter: step=Number(1.0) → count grows [0,1]→[0,2]→widen → widened_labels={0} → fires
-//  Section 15 DerivedState     — more precise with inter (total is a Number, not Top)
+//  Section 15 DerivedState     more precise with inter (total is a Number, not Top)
 //
 // Tests below verify correct rule behavior when child is analyzed in inter context.
 
@@ -830,7 +830,7 @@ fn redundant_set_state_inter_specific_stable_string_prop() {
         let diags = RedundantSetState.check(&result_inter, &child_name);
         assert!(
             !diags.is_empty(),
-            "Inter analysis: RedundantSetState should fire — stableLabel=StrConst(\"hello\") is \
+            "Inter analysis: RedundantSetState should fire stableLabel=StrConst(\"hello\") is \
              stable and setVal(stableLabel) is called when state is already stable. \
              With intra (stableLabel=Top), Top.is_stable()=false → no fire."
         );
@@ -858,7 +858,7 @@ fn infinite_loop_fires_inter_specific_numeric_step() {
         assert!(
             !diags.is_empty(),
             "InfiniteLoop should fire on Section14_Child when step=Number(1) from parent. \
-             With intra (step=Top), count+Top=Top immediately — no widening, rule does NOT fire."
+             With intra (step=Top), count+Top=Top immediately no widening, rule does NOT fire."
         );
     }
 }
@@ -871,7 +871,7 @@ fn derived_state_fires_on_child_mirroring_parent_state() {
         .expect("inter_component.tsx not found");
     let result = parse_and_analyze(&src);
 
-    // Section15_Child: setDoubled(total * 2) in effect — derived state pattern.
+    // Section15_Child: setDoubled(total * 2) in effect derived state pattern.
     // With inter, total=Number(5.0) so the derivation is concrete and detectable.
     let child_name = "Section15_Child".to_string();
     if result.components.contains_key(&child_name) {
@@ -929,7 +929,7 @@ fn missing_deps_no_fire_on_memo_with_stable_string_prop_inter() {
             .collect();
         assert!(
             fp_inter.is_empty(),
-            "Inter analysis: `label` resolved to StrConst(\"hello\") (stable) — \
+            "Inter analysis: `label` resolved to StrConst(\"hello\") (stable) \
              MissingDeps must not fire on useMemo body."
         );
     }

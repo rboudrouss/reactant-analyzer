@@ -95,7 +95,7 @@ fn guarded_increment_lt_not_flagged() {
     );
     assert_eq!(
         hits, 0,
-        "guarded increment (count < 10) must converge — not an infinite-loop"
+        "guarded increment (count < 10) must converge not an infinite-loop"
     );
 }
 
@@ -117,13 +117,13 @@ fn guarded_decrement_gt_not_flagged() {
     );
     assert_eq!(
         hits, 0,
-        "guarded decrement (count > 0) must converge — not an infinite-loop"
+        "guarded decrement (count > 0) must converge not an infinite-loop"
     );
 }
 
 #[test]
 fn guarded_increment_leq_not_flagged() {
-    // if (count <= 5) setCount(count + 1) — leq variant of the guard.
+    // if (count <= 5) setCount(count + 1) leq variant of the guard.
     let hits = infinite_loop_hits(
         r#"
         import { useState, useEffect } from "react";
@@ -138,7 +138,7 @@ fn guarded_increment_leq_not_flagged() {
     );
     assert_eq!(
         hits, 0,
-        "guarded increment (count <= 5) must converge — not an infinite-loop"
+        "guarded increment (count <= 5) must converge not an infinite-loop"
     );
 }
 
@@ -168,7 +168,7 @@ fn guarded_increment_no_deps_not_flagged() {
 
 #[test]
 fn always_true_guard_is_flagged() {
-    // if (count >= 0) setCount(count + 1) — condition always true for count >= 0
+    // if (count >= 0) setCount(count + 1) condition always true for count >= 0
     // init, so narrowing keeps the full interval → unbounded → flagged.
     let hits = infinite_loop_hits(
         r#"
@@ -184,11 +184,11 @@ fn always_true_guard_is_flagged() {
     );
     assert_eq!(
         hits, 1,
-        "always-true guard does not restrict the interval — must still be flagged"
+        "always-true guard does not restrict the interval must still be flagged"
     );
 }
 
-// ── TypeScript type hint: useState<number>(null) — ADR-008 int|null FN fix ────
+// ── TypeScript type hint: useState<number>(null) ADR-008 int|null FN fix ────
 
 #[test]
 fn null_init_with_number_hint_unbounded_is_flagged() {

@@ -33,17 +33,14 @@ pub struct HookResult {
 // ── HookModel trait ──────────────────────────────────────────────────────────
 
 /// Describes the abstract behavior of a React hook.
-///
-/// Each implementation represents one hook (builtin or custom) and defines
-/// how to compute `HookResult` from the already-evaluated argument stabilities.
-/// Adding a new hook = new struct + `impl HookModel` + call `registry.register()`.
+/// Adding a new hook: new struct + `impl HookModel` + `registry.register()`.
 pub trait HookModel: Send + Sync {
     fn name(&self) -> &str;
 
     /// Compute the abstract result of calling this hook.
     ///
-    /// - `args`  — stability of each positional argument (e.g. initial state).
-    /// - `deps`  — stability of each dep in the deps array, or `None` if absent.
+    /// - `args`  stability of each positional argument (e.g. initial state).
+    /// - `deps`  stability of each dep in the deps array, or `None` if absent.
     fn analyze(&self, args: &[Stability], deps: Option<&[Stability]>) -> HookResult;
 }
 

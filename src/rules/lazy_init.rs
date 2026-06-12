@@ -8,7 +8,7 @@ use super::{Diagnostic, Rule};
 /// Fires when `useState(...)` is initialised with an expression that contains
 /// any function call (e.g. `useState(expensiveCompute())`, `useState(1 + f())`).
 /// React evaluates the init argument on every render but only uses the result
-/// on mount — so the call is wasted work on every render after mount.
+/// on mount so the call is wasted work on every render after mount.
 /// The fix is the lazy-initialiser form: `useState(() => expensiveCompute())`.
 ///
 /// Patterns matched (any call anywhere in the init expression):
@@ -20,10 +20,10 @@ use super::{Diagnostic, Rule};
 /// ```
 ///
 /// Non-matched:
-/// - `useState(0)` — literal, call-free.
-/// - `useState(a + 1)` — BinOp with no call node.
-/// - `useState(() => expensiveCompute())` — already lazy (FnLit, not Call).
-/// - `useState(props.value)` — FieldAccess, call-free.
+/// - `useState(0)` literal, call-free.
+/// - `useState(a + 1)` BinOp with no call node.
+/// - `useState(() => expensiveCompute())` already lazy (FnLit, not Call).
+/// - `useState(props.value)` FieldAccess, call-free.
 pub struct LazyInit;
 
 impl Rule for LazyInit {
@@ -48,7 +48,7 @@ impl Rule for LazyInit {
             let mut d = Diagnostic::new(
                 "lazy-init",
                 format!(
-                    "useState {label} is initialised by a direct function call — \
+                    "useState {label} is initialised by a direct function call \
                      the call runs on every render but the result is only used on mount; \
                      wrap as `useState(() => …)` to defer it"
                 ),
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn ts_annotated_call_init_warns() {
-        // useState<number>(Date.now()) — TSAnnotated(Call, Number)
+        // useState<number>(Date.now()) TSAnnotated(Call, Number)
         let call = Expr::Call {
             fn_: Box::new(Expr::FieldAccess {
                 obj: Box::new(Expr::Var("Date".to_string())),
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn fn_lit_init_no_warning() {
-        // useState(() => compute()) — already lazy, FnLit not Call.
+        // useState(() => compute()) already lazy, FnLit not Call.
         let lazy = Expr::FnLit {
             id: ExprId(0),
             params: vec![],
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn var_init_no_warning() {
-        // useState(props.value) — no call.
+        // useState(props.value) no call.
         let hooks = vec![HookEntry::State {
             label: 0,
             init: Expr::FieldAccess {
@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn object_lit_init_no_warning() {
-        // useState({}) — ObjectLit, not a call. Other rules handle the unstable-init concern.
+        // useState({}) ObjectLit, not a call.
         let hooks = vec![HookEntry::State {
             label: 0,
             init: Expr::ObjectLit {
@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn nested_call_in_binop_fires() {
-        // useState(1 + compute()) — call nested inside BinOp → must fire.
+        // useState(1 + compute()) call nested inside BinOp → must fire.
         let hooks = vec![HookEntry::State {
             label: 0,
             init: Expr::BinOp {

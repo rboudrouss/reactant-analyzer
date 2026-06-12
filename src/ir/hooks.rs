@@ -49,7 +49,7 @@ pub enum HookEntry {
         /// E.g. `"@tanstack/react-query"` for `import { useQuery } from '@tanstack/react-query'`.
         /// `None` when the hook is defined locally or the import source is unknown.
         import_source: Option<String>,
-        /// Relative-import source file resolved via `ImportResolver` (ADR-013 §2).
+        /// Relative-import source file resolved via `ImportResolver`.
         /// E.g. `Some("/abs/path/to/hooks/useData.ts")` for `import { useData } from './hooks/useData'`.
         /// `None` for npm imports (see `import_source`) or unresolvable specifiers.
         resolved_file: Option<PathBuf>,

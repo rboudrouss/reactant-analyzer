@@ -1,7 +1,7 @@
 //! End-to-end tests for nested destructuring lowering.
 //!
 //! Before the fix, patterns like `const [[a, b]] = rhs`, `const [{ x }] = rhs`,
-//! and `const { a: { b } } = rhs` silently dropped the inner vars — FN by
+//! and `const { a: { b } } = rhs` silently dropped the inner vars FN by
 //! construction.  These tests verify that:
 //!
 //!  1. The full pipeline (parse → lower → analyze → rules) does not panic.
@@ -141,7 +141,7 @@ fn destructured_component_props_detected() {
 
 #[test]
 fn nested_array_destr_no_false_positive() {
-    // Clean use of nested array destr — no rule should fire
+    // Clean use of nested array destr no rule should fire
     let diags = any_diags(
         r#"
         import { useState } from "react";
@@ -194,9 +194,9 @@ fn destructured_state_setter_detected() {
             SetterInRender.check(&prog, &name).len()
         })
         .sum();
-    // The setter is inside a nested array destr — it must still be recognized.
+    // The setter is inside a nested array destr it must still be recognized.
     // (This is an intentional FP-check: we're verifying the rule fires, not that it doesn't.)
-    // Acceptable either way — the key test is "no panic".
+    // Acceptable either way the key test is "no panic".
     let _ = diags;
 }
 

@@ -99,7 +99,7 @@ fn library_hook_no_analysis_limit_diagnostic() {
 
 #[test]
 fn stable_ref_hook_not_flagged_as_missing_dep() {
-    // useStableData returns a stable reference — using it in a useEffect dep
+    // useStableData returns a stable reference using it in a useEffect dep
     // array is correct and should NOT trigger missing-deps.
     let src = r#"
         function Widget() {

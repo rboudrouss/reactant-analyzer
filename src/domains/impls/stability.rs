@@ -5,7 +5,7 @@ use crate::{
     ir::expr::{Expr, SummaryValue},
 };
 
-/// Stability lattice — tracks whether a value's reference is stable across renders.
+/// Stability lattice tracks whether a value's reference is stable across renders.
 ///
 /// ```text
 ///        Unknown  (⊤)
@@ -19,13 +19,13 @@ use crate::{
 /// `join(Stable, Unstable) = Unknown`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stability {
-    /// ⊥ — no information (unreachable path / uninitialized).
+    /// ⊥ no information (unreachable path / uninitialized).
     Bottom,
     /// Reference is the same object on every render (safe as a dep).
     Stable,
     /// Reference changes on every render (unsafe as a dep if not memoized).
     Unstable,
-    /// ⊤ — may be either stable or unstable (join of both paths).
+    /// ⊤ may be either stable or unstable (join of both paths).
     Unknown,
 }
 
@@ -65,7 +65,7 @@ impl Stability {
         }
     }
 
-    /// Widening — equals join for this finite-height lattice (height 2).
+    /// Widening equals join for this finite-height lattice (height 2).
     pub fn widen(&self, other: &Self) -> Self {
         self.join(other)
     }

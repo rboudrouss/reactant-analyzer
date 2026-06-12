@@ -1,11 +1,9 @@
 //! File discovery and import resolution.
 //!
-//! Phase 1 of ADR-013: provides the two extension points the cross-file
-//! pipeline relies on. Default implementations cover the common case
-//! (recursive `*.ts*` discovery + relative imports with `.ts`/`.tsx`/index
-//! fallbacks). Custom implementations can replace either via trait objects.
-//!
-//! See `docs/plugins.md` for an end-to-end plugin example (ADR-013 Phase 4).
+//! File discovery and import resolution extension points.
+//! Default implementations cover the common case (recursive `*.ts*` discovery
+//! + relative imports with `.ts`/`.tsx`/index fallbacks).
+//! See `docs/plugins.md` for an end-to-end plugin example.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,12 +33,12 @@ pub trait ImportResolver: Send + Sync {
 pub struct DefaultFileDiscoverer;
 pub struct DefaultImportResolver;
 
-// ── Plugin-facing high-level entry point (ADR-013 Phase 4) ────────────────────
+// ── Plugin-facing high-level entry point ─────────────────────────────────────
 
 /// Run the full reactant pipeline (discover → parse → lower → analyse) with
 /// caller-provided `FileDiscoverer` and `ImportResolver` implementations.
 ///
-/// Use this when integrating reactant programmatically — e.g. a Next.js or
+/// Use this when integrating reactant programmatically e.g. a Next.js or
 /// monorepo plugin that needs custom discovery (`app/**/page.tsx` only) or
 /// custom import resolution (`tsconfig` path aliases).
 ///

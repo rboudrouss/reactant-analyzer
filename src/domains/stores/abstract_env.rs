@@ -26,17 +26,11 @@ impl<D: AbstractDomain> EnvVal<D> {
     }
 }
 
-/// Per-variable abstract environment: maps each variable to a domain value.
+/// Per-variable abstract environment.
 ///
-/// `lookup` returns `D::top()` for unbound variables (conservative).
-/// The bottom element is the empty map.
-///
-/// `setter_bindings` is a React-specific side-channel for setState detection.
-///
-/// `locs` is a parallel map for heap locations: variables bound to locally-
-/// defined FnLit/ObjectLit/ArrayLit carry their `ExprId`(s) here so the
-/// analysis can look up function bodies in the heap. `locs` and `stabs` are
-/// independent — a variable can have both an abstract value AND a location.
+/// `lookup` returns `D::top()` for unbound vars. `setter_bindings` is a
+/// React-specific side-channel for setState. `locs` tracks heap allocation-site
+/// `ExprId`s for FnLit/ObjectLit/ArrayLit vars; independent from `stabs`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AbstractEnv<D: AbstractDomain> {
     stabs: HashMap<Var, D>,
@@ -162,7 +156,7 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         }
     }
 
-    /// Empty env — lattice bottom.
+    /// Empty env lattice bottom.
     pub fn bottom() -> Self {
         Self::default()
     }

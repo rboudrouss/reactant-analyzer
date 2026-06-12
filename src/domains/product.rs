@@ -60,14 +60,14 @@ impl<D1: AbstractDomain, D2: AbstractDomain> AbstractDomain for ProductDomain<D1
 ///
 /// **Current status**: groundwork for future fused fixpoints (e.g.
 /// `Stability × StateValue` in the same pass). The `Transfer` implementation
-/// is not yet wired into `analyze_component` — that still uses
+/// is not yet wired into `analyze_component` that still uses
 /// `StateValueTransfer` alone.
 ///
 /// The primary purpose of this struct right now is enabling typed
 /// `Queryable<Q>` delegation so that a composed transfer can answer
 /// cross-domain queries from either sub-transfer.
 ///
-/// See ADR-007 for the full migration plan to B1.
+/// Enables typed `Queryable<Q>` delegation from either sub-transfer.
 pub struct ProductTransfer<T1, T2>(pub T1, pub T2);
 
 // ── Queryable delegation ──────────────────────────────────────────────────────
@@ -89,7 +89,7 @@ where
         ctx: &dyn QueryContext,
     ) -> Q::Result {
         // Project to T1's domain via bottom env (conservative but type-correct).
-        // Full projection requires map_values on stores — TODO when fused fixpoint
+        // Full projection requires map_values on stores TODO when fused fixpoint
         // is wired in. For now, T1 can use its own query logic with empty context.
         let empty_env = AbstractEnv::bottom();
         let empty_state = StateStore::bottom();

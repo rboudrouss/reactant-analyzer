@@ -56,7 +56,7 @@ pub fn infer_state_type(init: &Expr, type_hint: Option<&TSType>) -> StateType {
 
 // ── TypedStateStore ───────────────────────────────────────────────────────────
 
-/// Per-label typed state store — ADR-008 Option B.
+/// Per-label typed state store with per-domain widening.
 ///
 /// Each useState label is associated with a `StateType` inferred from its init.
 /// Values for typed labels are stored in specialised sub-stores, enabling

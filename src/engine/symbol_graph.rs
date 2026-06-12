@@ -1,4 +1,4 @@
-//! Symbol-level dependency graph for cross-file analysis (ADR-013 §4).
+//! Symbol-level dependency graph for cross-file analysis.
 //!
 //! Nodes are `(file, name, kind)` triples covering every component and custom
 //! hook lowered from the parsed batch. Edges are call-time dependencies:
@@ -6,7 +6,7 @@
 //! lowered IR (`ComponentIR` / `HookIR`), so dependency extraction does not
 //! re-parse the AST.
 //!
-//! Cycles are tolerated — the existing fixpoint already handles recursion at
+//! Cycles are tolerated the existing fixpoint already handles recursion at
 //! the analysis level. Topological sort is best-effort: cycles get a stable
 //! arbitrary order so callers can still iterate deterministically.
 
@@ -66,9 +66,8 @@ impl SymbolGraph {
     pub fn build(components: &[ComponentIR], hooks: &[HookIR]) -> Self {
         let mut graph = Self::new();
 
-        // Index symbols by name → list of nodes with that name. Phase 2 uses
-        // this for legacy name-based dependency extraction; Phase 2.D
-        // resolves imports for HookEntry::Custom precisely via resolved_file.
+        // Index symbols by name for legacy name-based extraction; precise lookups
+        // use resolved_file from HookEntry::Custom.
         let mut by_name: HashMap<Symbol, Vec<SymbolNode>> = HashMap::new();
 
         for c in components {
@@ -125,8 +124,7 @@ impl SymbolGraph {
             ..
         } = entry
         {
-            // Resolved import path → precise edge (ADR-013 §2). Otherwise fall
-            // back to name-based ambiguity (Phase 2 best-effort).
+            // Resolved import path → precise edge; otherwise name-based best-effort.
             if let Some(file) = resolved_file {
                 let target = SymbolNode::new(file.clone(), name.clone(), SymbolKind::Hook);
                 if self.nodes.contains(&target) {
@@ -316,7 +314,7 @@ fn collect_callees_in_expr(expr: &Expr, out: &mut Vec<Symbol>) {
         // their inline traversal here avoids double-counting and preserves the
         // existing free-vars contract.
         Expr::FnLit { .. } => {}
-        // Literals, vars, hook value handles, summaries — no callees.
+        // Literals, vars, hook value handles, summaries no callees.
         Expr::Lit(_)
         | Expr::Var(_)
         | Expr::StateVal(_)
