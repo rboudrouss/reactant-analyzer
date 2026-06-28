@@ -1,0 +1,122 @@
+//! End-to-end tests for threshold widening ("widening up-to", ADR-014).
+//!
+//! Full pipeline: source fixture → lowering → fixpoint → rule / converged state.
+//!
+//! Threshold widening recovers precision in the ascending phase by jumping a
+//! growing bound to the tightest enclosing program constant instead of ±∞.
+//!
+//! NOTE (limitation surfaced while writing these): the lowering currently drops
+//! assignment / update statements to existing variables (`x = e`, `x++`,
+//! `s += 1`) — see `expr_lower.rs::AssignmentExpression`, which lowers only the
+//! RHS. A local loop counter therefore never grows in the IR, so the *inner*
+//! threshold widening (on the `analyze_cfg` back-edge) cannot be exercised
+//! through real source yet — only via the unit test
+//! `cfg_analyzer::tests::loop_counter_bounded_by_threshold` (hand-built CFG).
+//! `bounded_local_loop_is_precise` below is `#[ignore]`d until lowering models
+//! assignments; it asserts the *desired* precise result.
+
+use std::collections::HashMap;
+
+use oxc_allocator::Allocator;
+use oxc_parser::{ParseOptions, Parser};
+use oxc_span::SourceType;
+
+use reactant::{
+    domains::{Interval, StateValue, StateValueTransfer},
+    engine::{AnalysisResult, Config, analyze_component},
+    lowering::{compute_line_starts, lower_program},
+    rules::{InfiniteLoop, Rule},
+};
+
+/// Lower the fixture and analyse every component intra-procedurally.
+fn analyze_fixture() -> HashMap<String, AnalysisResult<StateValue>> {
+    let src = std::fs::read_to_string("tests/fixtures/widening.tsx").expect("read fixture");
+    let alloc = Allocator::default();
+    let ret = Parser::new(&alloc, &src, SourceType::tsx())
+        .with_options(ParseOptions::default())
+        .parse();
+    assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
+    let line_starts = compute_line_starts(&src);
+    let components = lower_program(
+        &ret.program,
+        &line_starts,
+        std::path::Path::new("widening.tsx"),
+    );
+    assert!(!components.is_empty(), "no component detected");
+    components
+        .into_iter()
+        .map(|comp| {
+            let name = comp.name.clone();
+            (
+                name,
+                analyze_component(comp, &StateValueTransfer, &Config::default()),
+            )
+        })
+        .collect()
+}
+
+fn infinite_loop_hits(results: &HashMap<String, AnalysisResult<StateValue>>, name: &str) -> usize {
+    use reactant::engine::{ComponentCallGraph, ProgramAnalysisResult};
+    let mut components = HashMap::new();
+    components.insert(name.to_string(), results[name].clone());
+    let prog = ProgramAnalysisResult {
+        components,
+        shared_state: reactant::domains::stores::SharedStateStore::new(),
+        call_graph: ComponentCallGraph::new(),
+        recursive_components: std::collections::HashSet::new(),
+        stats: reactant::engine::AnalysisStats::default(),
+    };
+    InfiniteLoop.check(&prog, &name.to_string()).len()
+}
+
+/// Abstract value of the first `useState` label (label 0) for `component`.
+fn state0(results: &HashMap<String, AnalysisResult<StateValue>>, name: &str) -> StateValue {
+    results[name].state_store.get(0)
+}
+
+#[test]
+fn unbounded_counter_is_flagged_and_grows_to_infinity() {
+    let r = analyze_fixture();
+    assert_eq!(
+        infinite_loop_hits(&r, "UnboundedCounter"),
+        1,
+        "unguarded self-increment must be flagged"
+    );
+    match state0(&r, "UnboundedCounter") {
+        StateValue::Number(i) => assert!(i.hi.is_infinite(), "count must reach +∞ (got {i:?})"),
+        other => panic!("expected Number interval, got {other:?}"),
+    }
+}
+
+#[test]
+fn guarded_counter_converges_bounded() {
+    // Branch narrowing bounds the setter argument; threshold widening converges
+    // without overshoot. (Convergence here is primarily branch narrowing —
+    // pre-existing — but the test pins the combined behaviour.)
+    let r = analyze_fixture();
+    assert_eq!(
+        infinite_loop_hits(&r, "GuardedCounter"),
+        0,
+        "guarded increment must converge, no infinite-loop"
+    );
+    assert_eq!(
+        state0(&r, "GuardedCounter"),
+        StateValue::Number(Interval { lo: 0.0, hi: 10.0 }),
+        "guarded counter must converge to [0, 10]"
+    );
+}
+
+#[test]
+#[ignore = "blocked by lowering gap: `i = i + 1` / `i++` drop the write target \
+            (expr_lower.rs AssignmentExpression), so the loop counter never grows \
+            in the IR. Un-ignore once lowering models assignments — then the inner \
+            threshold widening yields the precise [0,5]."]
+fn bounded_local_loop_is_precise() {
+    let r = analyze_fixture();
+    assert_eq!(infinite_loop_hits(&r, "BoundedLocalLoop"), 0);
+    assert_eq!(
+        state0(&r, "BoundedLocalLoop"),
+        StateValue::Number(Interval { lo: 0.0, hi: 5.0 }),
+        "loop counter bounded by guard constant 5 → setter writes total ∈ [0, 5]"
+    );
+}
