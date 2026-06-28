@@ -24,12 +24,14 @@ function CallbackInlineFnDep() {
   return <button onClick={cb}>x</button>;
 }
 
-// ── Mixed deps (one stable) — no warning ──────────────────────────────────────
-function MixedDepsOk() {
+// ── Mixed deps (one unstable ref) — warns ─────────────────────────────────────
+// A stable neighbour does NOT rescue a fresh-reference dep: `Object.is` differs
+// every render on `{ key: "v" }`, so the effect re-runs regardless of `count`.
+function MixedDepsOneUnstable() {
   const [count, setCount] = useState(0);
   useEffect(() => {
     console.log(count);
-  }, [{ key: "v" }, count]); // ✓ count stabilises the array
+  }, [{ key: "v" }, count]); // ❌ always-unstable-deps (dep 0 is a fresh object)
   return <p>{count}</p>;
 }
 

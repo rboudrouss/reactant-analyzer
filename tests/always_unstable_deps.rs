@@ -1,7 +1,8 @@
 //! End-to-end tests for the `always-unstable-deps` rule.
 //!
-//! Fires when every dep in `useEffect`/`useMemo`/`useCallback` evaluates to an
-//! unstable value the deps array no longer scopes anything.
+//! Fires when at least one dep in `useEffect`/`useMemo`/`useCallback` is a fresh
+//! reference each render (object/array/function literal) `Object.is` differs
+//! every render, so the hook re-runs regardless of the other deps.
 
 use oxc_allocator::Allocator;
 use oxc_parser::{ParseOptions, Parser};
@@ -167,18 +168,39 @@ fn no_deps_arg_no_fire() {
 }
 
 #[test]
-fn mixed_deps_no_fire() {
+fn mixed_deps_one_unstable_fires() {
+    // The stable `n` does NOT rescue the fresh-object dep: `Object.is` still
+    // differs every render, so the effect re-runs regardless.
     let h = hits(
         r#"
         import { useState, useEffect } from "react";
         function C() {
             const [n, setN] = useState(0);
-            useEffect(() => {}, [{}, n]); // n stable point → array not all-unstable
+            useEffect(() => {}, [{}, n]);
             return <div>{n}</div>;
         }
         "#,
     );
-    assert_eq!(h, 0, "mixed deps with at least one stable must not fire");
+    assert_eq!(
+        h, 1,
+        "one unstable ref dep must fire even alongside a stable dep"
+    );
+}
+
+#[test]
+fn all_primitive_deps_no_fire() {
+    // All deps value-compared → no fresh reference → no fire.
+    let h = hits(
+        r#"
+        import { useState, useEffect } from "react";
+        function C() {
+            const [n, setN] = useState(0);
+            useEffect(() => {}, [n, 42]);
+            return <div>{n}</div>;
+        }
+        "#,
+    );
+    assert_eq!(h, 0, "all-primitive deps must not fire");
 }
 
 // ── Fixture regression ────────────────────────────────────────────────────────
@@ -187,7 +209,9 @@ fn mixed_deps_no_fire() {
 fn always_unstable_deps_fixture() {
     let src = std::fs::read_to_string("tests/fixtures/always_unstable_deps.tsx")
         .expect("always_unstable_deps.tsx not found");
-    // EffectInlineObjectDep + MemoInlineArrayDep + CallbackInlineFnDep = 3.
+    // EffectInlineObjectDep + MemoInlineArrayDep + CallbackInlineFnDep
+    // + MixedDepsOneUnstable (the fresh object dep fires despite a stable
+    // neighbour) = 4.
     let h = hits(&src);
-    assert_eq!(h, 3, "always_unstable_deps.tsx: expected 3 hits");
+    assert_eq!(h, 4, "always_unstable_deps.tsx: expected 4 hits");
 }

@@ -1,7 +1,7 @@
 use crate::{
     domains::{
         AbstractEnv, AnalysisCtx, MemoStore, StateStore, StateValueTransfer, Transfer,
-        impls::StateValue,
+        impls::{Stability, StateValue},
     },
     engine::{HookKind, ProgramAnalysisResult},
     ir::{expr::Expr, hooks::HookEntry, types::Symbol},
@@ -9,11 +9,25 @@ use crate::{
 
 use super::{Diagnostic, Rule};
 
-/// Fires when every dep in a `useEffect`/`useMemo`/`useCallback` deps array
-/// evaluates to an unstable value the hook fires on every render.
+/// Fires when **at least one** dep in a `useEffect`/`useMemo`/`useCallback` deps
+/// array is a freshly-allocated **reference** (object/array/function literal).
+/// React compares deps with `Object.is`, so a single new-identity-every-render
+/// dep defeats the whole array — the hook re-runs on every render no matter how
+/// stable the other deps are. A neighbouring stable dep does *not* rescue it.
 ///
-/// Skipped when: deps array is empty (mount-only), at least one dep is stable,
-/// or there is no deps array at all.
+/// Only reference-typed deps qualify: a primitive dep (number/bool/string) is
+/// value-compared and never causes a spurious re-render — even when its abstract
+/// value spans a wide interval (e.g. a `useState` counter converged to
+/// `[0, 10]`). Treating a wide numeric interval as "unstable" would conflate
+/// fixpoint value-variance with referential newness and false-positive on the
+/// canonical `[count]` dep. `Top` (precision lost) stays silent to avoid FPs.
+///
+/// Distinct from `InfiniteLoop`: that rule covers only `useEffect` setting state
+/// (an actual render loop); this one also catches broken memoization in
+/// `useMemo`/`useCallback`, where an unstable dep wastes work rather than looping.
+///
+/// Skipped when: deps array is empty (mount-only), no dep is an unstable
+/// reference, or there is no deps array at all.
 pub struct AlwaysUnstableDeps;
 
 impl Rule for AlwaysUnstableDeps {
@@ -48,29 +62,34 @@ impl Rule for AlwaysUnstableDeps {
                 continue;
             }
 
-            let all_unstable = deps_ref.iter().all(|dep| {
-                eval_dep_is_unstable(
-                    dep,
-                    &env_exit,
-                    &result.state_store,
-                    &result.memo_store,
-                    &transfer,
-                )
-            });
+            let unstable_idx: Vec<usize> = deps_ref
+                .iter()
+                .enumerate()
+                .filter(|(_, dep)| {
+                    eval_dep_is_unstable(
+                        dep,
+                        &env_exit,
+                        &result.state_store,
+                        &result.memo_store,
+                        &transfer,
+                    )
+                })
+                .map(|(i, _)| i)
+                .collect();
 
-            if !all_unstable {
+            if unstable_idx.is_empty() {
                 continue;
             }
 
+            let word = hook_kind_word(kind);
             let mut d = Diagnostic::new(
                 "always-unstable-deps",
                 format!(
-                    "{} {} has an entirely unstable deps array \
-                     every dep is a new value on each render, so the deps array \
-                     no longer scopes the {}",
-                    hook_kind_word(kind),
-                    label,
-                    hook_kind_word(kind)
+                    "{word} {label} has unstable dep(s) at index {idx} \
+                     a new reference every render — `Object.is` always differs, \
+                     so the {word} re-runs on every render regardless of the \
+                     other deps",
+                    idx = fmt_indices(&unstable_idx),
                 ),
             )
             .with_label(label);
@@ -95,7 +114,18 @@ fn eval_dep_is_unstable(
     let mut m = memo.clone();
     let mut h = crate::domains::Heap::new();
     let val = transfer.eval_expr(dep, env, &mut AnalysisCtx::null(&mut s, &mut m, &mut h));
-    val.is_unstable()
+    // Only a freshly-allocated reference breaks `Object.is` every render.
+    // Primitives (Number/Bool/Str) are value-compared — never flagged here, even
+    // for wide intervals. `Top` (precision lost) stays silent to avoid FPs.
+    matches!(val, StateValue::Reference(Stability::Unstable))
+}
+
+/// Render dep indices as `0`, `0, 2`, etc.
+fn fmt_indices(idx: &[usize]) -> String {
+    idx.iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn hook_kind_word(kind: HookKind) -> &'static str {
@@ -278,8 +308,9 @@ mod tests {
     }
 
     #[test]
-    fn effect_mixed_deps_no_warning() {
-        // useEffect(() => {}, [{}, 42]) at least one stable, skip
+    fn effect_mixed_deps_one_unstable_warns() {
+        // useEffect(() => {}, [{}, 42]) the stable `42` does NOT rescue the
+        // fresh-object dep `Object.is` still differs every render.
         let hooks = vec![HookEntry::Effect {
             label: 0,
             body_cfg: empty_cfg(),
@@ -290,6 +321,26 @@ mod tests {
                 },
                 Expr::Lit(Prim::Int(42)),
             ]),
+            span: None,
+        }];
+        let comp = component(hooks, vec![]);
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+        let diags = AlwaysUnstableDeps.check(&prog(&result), &"C".to_string());
+        assert_eq!(diags.len(), 1, "one unstable ref dep must fire");
+        assert!(
+            diags[0].message.contains("index 0"),
+            "message should point at dep 0: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn effect_all_stable_deps_no_warning() {
+        // useEffect(() => {}, [42, true]) all primitives, value-compared → skip.
+        let hooks = vec![HookEntry::Effect {
+            label: 0,
+            body_cfg: empty_cfg(),
+            deps: Some(vec![Expr::Lit(Prim::Int(42)), Expr::Lit(Prim::Bool(true))]),
             span: None,
         }];
         let comp = component(hooks, vec![]);
@@ -321,6 +372,42 @@ mod tests {
             "message should mention memo: {}",
             diags[0].message
         );
+    }
+
+    #[test]
+    fn wide_numeric_state_dep_not_flagged() {
+        // Regression: a `useState` value converged to a wide interval (`[0, 10]`)
+        // is value-compared by `Object.is`, not a fresh reference each render, so
+        // `[count]` must NOT be flagged — even though its abstract value is a
+        // non-point (formerly "unstable") interval.
+        use crate::domains::{Interval, StateStore, StateValue, stores::MemoStore};
+        let env = AbstractEnv::<StateValue>::default();
+        let mut state = StateStore::<StateValue>::bottom();
+        state.update(0, StateValue::Number(Interval { lo: 0.0, hi: 10.0 }));
+        let memo = MemoStore::<StateValue>::new();
+        assert!(
+            !eval_dep_is_unstable(&Expr::StateVal(0), &env, &state, &memo, &StateValueTransfer),
+            "wide numeric state dep must not count as unstable"
+        );
+    }
+
+    #[test]
+    fn unstable_reference_dep_still_flagged() {
+        // Sanity: a fresh object literal still qualifies.
+        use crate::domains::{StateStore, StateValue, stores::MemoStore};
+        let env = AbstractEnv::<StateValue>::default();
+        let state = StateStore::<StateValue>::bottom();
+        let memo = MemoStore::<StateValue>::new();
+        assert!(eval_dep_is_unstable(
+            &Expr::ObjectLit {
+                id: ExprId(0),
+                fields: vec![]
+            },
+            &env,
+            &state,
+            &memo,
+            &StateValueTransfer
+        ));
     }
 
     #[test]

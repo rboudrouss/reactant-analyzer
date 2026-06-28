@@ -12,7 +12,7 @@ A static analyzer for React hook bugs, built on **abstract interpretation** over
 | `infinite-loop` | `useEffect(() => setN(n + 1), [n])` |
 | `derived-state` | `useEffect(() => setFull(`${first} ${last}`), [first, last])` |
 | `missing-deps` | `useEffect(() => fetch(url), [])` — `url` captured, not declared |
-| `always-unstable-deps` | `useEffect(() => ..., [{ x }])` — fresh object every render |
+| `always-unstable-deps` | `useEffect(() => ..., [{ x }, id])` — a fresh-reference dep re-runs the hook every render, even beside stable deps |
 | `setter-in-render` | `setX(...)` called during the render body |
 | `conditional-hook` | `if (cond) useState(...)` |
 | `redundant-set-state` | `setN(0)` when `n` is already `0` |
@@ -69,7 +69,7 @@ function useData(initial) {
 
 ```
   Page  (1 hooks)
-    warn   always-unstable-deps  [hook:2]  (line 7:2)  — effect 2 has an entirely unstable deps array — every dep is a new value on each render, so the deps array no longer scopes the effect
+    warn   always-unstable-deps  [hook:2]  (line 7:2)  — effect 2 has unstable dep(s) at index 0 — a new reference every render — `Object.is` always differs, so the effect re-runs on every render regardless of the other deps
     warn   infinite-loop  [hook:1]  (line 7:2)  — effect 2 sets state 1 (all deps unstable — effect runs every render) which needed widening — potential infinite render loop
 
 ⚠  2 warning(s) across 2 file(s).
