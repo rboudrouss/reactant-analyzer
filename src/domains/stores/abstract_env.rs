@@ -134,10 +134,21 @@ impl<D: AbstractDomain> AbstractEnv<D> {
 
     /// Pointwise widening. Used for back-edge merging in `analyze_cfg`.
     pub fn widen(&self, other: &Self) -> Self {
+        self.widen_with(other, &[])
+    }
+
+    /// Threshold ("up-to") pointwise widening (ADR-014). Back-edge merging in
+    /// `analyze_cfg` passes the component's threshold set so loop-counter bounds
+    /// jump to the guard constant instead of ±∞.
+    pub fn widen_to(&self, other: &Self, thresholds: &[f64]) -> Self {
+        self.widen_with(other, thresholds)
+    }
+
+    fn widen_with(&self, other: &Self, thresholds: &[f64]) -> Self {
         let mut stabs = HashMap::new();
         for (k, v) in &self.stabs {
             let w = other.stabs.get(k).cloned().unwrap_or_else(D::top);
-            stabs.insert(k.clone(), v.widen(&w));
+            stabs.insert(k.clone(), v.widen_to(&w, thresholds));
         }
         for k in other.stabs.keys() {
             if !self.stabs.contains_key(k) {

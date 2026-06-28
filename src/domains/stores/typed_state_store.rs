@@ -245,6 +245,22 @@ impl TypedStateStore {
         }
     }
 
+    /// Threshold widening. Only the numeric stores (`number_store`, and the
+    /// `Number` arm inside `unknown_store`) consume thresholds; the others use
+    /// the threshold-unaware default (= plain widen).
+    pub fn widen_to(&self, other: &Self, thresholds: &[f64]) -> Self {
+        TypedStateStore {
+            type_map: self.type_map.clone(),
+            number_store: self.number_store.widen_to(&other.number_store, thresholds),
+            bool_store: self.bool_store.widen(&other.bool_store),
+            str_store: self.str_store.widen(&other.str_store),
+            ref_store: self.ref_store.widen(&other.ref_store),
+            unknown_store: self
+                .unknown_store
+                .widen_to(&other.unknown_store, thresholds),
+        }
+    }
+
     /// Labels whose abstract value differs between `self` and `other`.
     pub fn changed_labels(&self, other: &Self) -> Vec<HookLabel> {
         let mut changed: Vec<HookLabel> = self

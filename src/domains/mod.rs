@@ -34,6 +34,15 @@ pub trait AbstractDomain: Clone + PartialEq + PartialOrd + std::fmt::Debug {
     fn meet(&self, other: &Self) -> Self;
     fn widen(&self, other: &Self) -> Self;
 
+    /// Widening "up to" a finite set of thresholds (ASTRÉE-style).
+    ///
+    /// A growing bound jumps to the tightest enclosing threshold rather than
+    /// straight to ⊤/±∞, recovering precision on guarded growth. Default falls
+    /// back to plain `widen` (sound, threshold-unaware). Numeric domains override.
+    fn widen_to(&self, other: &Self, _thresholds: &[f64]) -> Self {
+        self.widen(other)
+    }
+
     /// Try to recover the underlying `StateValue`, if this domain IS `StateValue`.
     /// Default returns `None` (other domains). Used when the heap needs to store
     /// a captured environment with `StateValue` type (e.g. closure capture at FnLit creation).

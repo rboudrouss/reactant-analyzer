@@ -51,6 +51,17 @@ impl<D: AbstractDomain> StateStore<D> {
         StateStore(out)
     }
 
+    /// Threshold widening pointwise `D::widen_to`. Domains without thresholds
+    /// (default impl) fall back to plain `widen`.
+    pub fn widen_to(&self, other: &Self, thresholds: &[f64]) -> Self {
+        let mut out = self.0.clone();
+        for (&k, v) in &other.0 {
+            let cur = out.get(&k).cloned().unwrap_or_else(D::bottom);
+            out.insert(k, cur.widen_to(v, thresholds));
+        }
+        StateStore(out)
+    }
+
     /// Lattice bottom all labels have `D::bottom()`.
     pub fn bottom() -> Self {
         Self::default()

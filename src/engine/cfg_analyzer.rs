@@ -35,6 +35,7 @@ pub fn analyze_cfg<'inter, T: Transfer>(
     memo: &MemoStore<T::Domain>,
     transfer: &T,
     widen_threshold: usize,
+    thresholds: &[f64],
     heap: &mut Heap,
     ctx: &dyn QueryContext,
     inter: Option<&'inter InterCtx<'inter>>,
@@ -118,7 +119,7 @@ pub fn analyze_cfg<'inter, T: Transfer>(
                         let cnt = back_edge_counts.entry(succ).or_insert(0);
                         *cnt += 1;
                         if *cnt >= widen_threshold {
-                            existing.widen(&outgoing_env)
+                            existing.widen_to(&outgoing_env, thresholds)
                         } else {
                             existing.join(&outgoing_env)
                         }
@@ -228,6 +229,7 @@ mod tests {
             &MemoStore::new(),
             &StateValueTransfer,
             3,
+            &[],
             &mut heap,
             &NullCtx,
             None,
@@ -251,6 +253,7 @@ mod tests {
             &MemoStore::new(),
             &StateValueTransfer,
             3,
+            &[],
             &mut heap,
             &NullCtx,
             None,
@@ -259,6 +262,141 @@ mod tests {
             exit_envs[&0].lookup("x"),
             StateValue::Number(Interval::point(42.0))
         );
+    }
+
+    /// `let i = 0; while (i < 5) { i = i + 1; }` — back-edge loop on `i`.
+    fn counting_loop_cfg() -> CFG {
+        use crate::ir::cfg::{Edge, EdgeKind};
+        let mut blocks = HashMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![Stmt::Let {
+                    var: "i".to_string(),
+                    rhs: Expr::Lit(Prim::Int(0)),
+                    span: None,
+                }],
+                term: Terminator::Jump(1),
+            },
+        );
+        blocks.insert(
+            1,
+            BasicBlock {
+                id: 1,
+                stmts: vec![],
+                term: Terminator::Branch {
+                    cond: Expr::BinOp {
+                        op: crate::ir::expr::BinOp::Lt,
+                        lhs: Box::new(Expr::Var("i".to_string())),
+                        rhs: Box::new(Expr::Lit(Prim::Int(5))),
+                    },
+                    then_: 2,
+                    else_: 3,
+                },
+            },
+        );
+        blocks.insert(
+            2,
+            BasicBlock {
+                id: 2,
+                stmts: vec![Stmt::Assign {
+                    var: "i".to_string(),
+                    rhs: Expr::BinOp {
+                        op: crate::ir::expr::BinOp::Add,
+                        lhs: Box::new(Expr::Var("i".to_string())),
+                        rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                    },
+                    span: None,
+                }],
+                term: Terminator::Jump(1),
+            },
+        );
+        blocks.insert(
+            3,
+            BasicBlock {
+                id: 3,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        CFG {
+            entry: 0,
+            blocks,
+            edges: vec![
+                Edge {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::Unconditional,
+                },
+                Edge {
+                    from: 1,
+                    to: 2,
+                    kind: EdgeKind::IfTrue,
+                },
+                Edge {
+                    from: 1,
+                    to: 3,
+                    kind: EdgeKind::IfFalse,
+                },
+                Edge {
+                    from: 2,
+                    to: 1,
+                    kind: EdgeKind::Back,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn loop_counter_unbounded_without_thresholds() {
+        let cfg = counting_loop_cfg();
+        let mut heap = Heap::new();
+        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
+            &cfg,
+            AbstractEnv::bottom(),
+            &StateStore::bottom(),
+            &MemoStore::new(),
+            &StateValueTransfer,
+            3,
+            &[],
+            &mut heap,
+            &NullCtx,
+            None,
+        );
+        // No threshold → plain widen jumps `i` to +∞ at the loop header.
+        let i = exit_envs[&1].lookup("i");
+        assert_eq!(
+            i,
+            StateValue::Number(Interval {
+                lo: 0.0,
+                hi: f64::INFINITY
+            })
+        );
+    }
+
+    #[test]
+    fn loop_counter_bounded_by_threshold() {
+        let cfg = counting_loop_cfg();
+        let mut heap = Heap::new();
+        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
+            &cfg,
+            AbstractEnv::bottom(),
+            &StateStore::bottom(),
+            &MemoStore::new(),
+            &StateValueTransfer,
+            3,
+            &[5.0], // guard constant harvested as a threshold
+            &mut heap,
+            &NullCtx,
+            None,
+        );
+        // Threshold 5 caps the widen → loop-header `i` bounded to [0,5] (vs +∞),
+        // and the loop-exit (else) block sees `i = [5,5]`.
+        let header_i = exit_envs[&1].lookup("i");
+        assert_eq!(header_i, StateValue::Number(Interval { lo: 0.0, hi: 5.0 }));
+        let exit_i = exit_envs[&3].lookup("i");
+        assert_eq!(exit_i, StateValue::Number(Interval::point(5.0)));
     }
 
     #[test]
@@ -290,6 +428,7 @@ mod tests {
             &MemoStore::new(),
             &StateValueTransfer,
             3,
+            &[],
             &mut heap,
             &NullCtx,
             None,
@@ -344,6 +483,7 @@ mod tests {
             &MemoStore::new(),
             &StateValueTransfer,
             3,
+            &[],
             &mut heap,
             &NullCtx,
             None,
@@ -443,6 +583,7 @@ mod tests {
             &MemoStore::new(),
             &StateValueTransfer,
             3,
+            &[],
             &mut heap,
             &NullCtx,
             None,
@@ -529,6 +670,7 @@ mod tests {
             &MemoStore::new(),
             &StateValueTransfer,
             3,
+            &[],
             &mut heap,
             &NullCtx,
             None,
@@ -576,6 +718,7 @@ mod tests {
             &MemoStore::new(),
             &StateValueTransfer,
             3,
+            &[],
             &mut heap,
             &NullCtx,
             None,
@@ -618,6 +761,7 @@ mod tests {
             &MemoStore::new(),
             &StateValueTransfer,
             3,
+            &[],
             &mut heap,
             &NullCtx,
             None,
@@ -692,6 +836,7 @@ mod tests {
             &MemoStore::new(),
             &StateValueTransfer,
             3,
+            &[],
             &mut heap,
             &NullCtx,
             None,

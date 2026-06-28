@@ -137,6 +137,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // Expand Custom entries before TypedStateStore::from_component so inlined State entries are seeded.
     expand_custom_hooks(&mut hooks, &mut render_cfg, inter);
 
+    // Threshold set for widening up-to (ADR-014); harvested once, post-expansion.
+    let thresholds = collect_thresholds(&render_cfg, &hooks);
+
     let mut typed_state = TypedStateStore::from_component(&hooks);
     let mut memo_store: MemoStore<StateValue> = MemoStore::new();
     let mut heap = initial_heap;
@@ -201,6 +204,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 &memo_store,
                 transfer,
                 config.widen_threshold,
+                &thresholds,
                 &mut heap,
                 &ctx,
                 inter,
@@ -241,6 +245,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                         &memo_store,
                         transfer,
                         config.widen_threshold,
+                        &thresholds,
                         &mut heap,
                         &ctx,
                         inter,
@@ -272,6 +277,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                         &memo_store,
                         transfer,
                         config.widen_threshold,
+                        &thresholds,
                         &mut heap,
                         &ctx,
                         inter,
@@ -313,7 +319,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             for label in incycle_typed.changed_labels(&typed_state) {
                 widened_labels.insert(label);
             }
-            typed_state = typed_state.widen(&new_typed);
+            typed_state = typed_state.widen_to(&new_typed, &thresholds);
         } else {
             typed_state = new_typed;
         }
@@ -339,6 +345,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 &memo_store,
                 transfer,
                 config.widen_threshold,
+                &thresholds,
                 &mut heap,
                 &final_ctx,
                 None,
@@ -662,6 +669,91 @@ fn subst_vars(expr: Expr, subst: &HashMap<String, Expr>) -> Expr {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Harvest the finite threshold set for "widening up-to" (see ADR-014).
+///
+/// Collects numeric literals from the render CFG, all hook bodies, and useState
+/// init expressions — the constants against which guarded state growth is
+/// bounded. Over-collecting is harmless: the set stays finite (termination) and
+/// extra thresholds only add candidate bounds (precision, never unsoundness).
+fn collect_thresholds(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<f64> {
+    let mut out: Vec<f64> = Vec::new();
+    collect_lits_cfg(render_cfg, &mut out);
+    for hook in hooks {
+        match hook {
+            HookEntry::State { init, .. } => collect_lits_expr(init, &mut out),
+            HookEntry::Effect { body_cfg, .. } | HookEntry::Handler { body_cfg, .. } => {
+                collect_lits_cfg(body_cfg, &mut out)
+            }
+            _ => {}
+        }
+    }
+    out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    out.dedup();
+    out
+}
+
+fn collect_lits_cfg(cfg: &CFG, out: &mut Vec<f64>) {
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => collect_lits_expr(rhs, out),
+                Stmt::ExprStmt(e, _) => collect_lits_expr(e, out),
+            }
+        }
+        match &block.term {
+            Terminator::Branch { cond, .. } => collect_lits_expr(cond, out),
+            Terminator::Return(e) => collect_lits_expr(e, out),
+            _ => {}
+        }
+    }
+}
+
+fn collect_lits_expr(expr: &Expr, out: &mut Vec<f64>) {
+    use crate::ir::expr::Prim;
+    match expr {
+        Expr::Lit(Prim::Int(n)) => out.push(*n as f64),
+        Expr::Lit(Prim::Float(f)) => out.push(*f),
+        Expr::BinOp { lhs, rhs, .. } => {
+            collect_lits_expr(lhs, out);
+            collect_lits_expr(rhs, out);
+        }
+        Expr::UnaryOp { arg, .. } => collect_lits_expr(arg, out),
+        Expr::FieldAccess { obj, .. } => collect_lits_expr(obj, out),
+        Expr::IndexAccess { arr, idx } => {
+            collect_lits_expr(arr, out);
+            collect_lits_expr(idx, out);
+        }
+        Expr::Call { fn_, args } => {
+            collect_lits_expr(fn_, out);
+            for a in args {
+                collect_lits_expr(a, out);
+            }
+        }
+        Expr::ObjectLit { fields, .. } => {
+            for (_, v) in fields {
+                collect_lits_expr(v, out);
+            }
+        }
+        Expr::ArrayLit { elems, .. } => {
+            for e in elems {
+                collect_lits_expr(e, out);
+            }
+        }
+        Expr::CompApp { props, .. } => collect_lits_expr(props, out),
+        Expr::NativeElem {
+            props, children, ..
+        } => {
+            collect_lits_expr(props, out);
+            for c in children {
+                collect_lits_expr(c, out);
+            }
+        }
+        Expr::TSAnnotated(inner, _) => collect_lits_expr(inner, out),
+        Expr::FnLit { body_cfg, .. } => collect_lits_cfg(body_cfg, out),
+        _ => {}
+    }
+}
 
 fn exit_env<D: AbstractDomain>(
     cfg: &CFG,
@@ -1238,6 +1330,44 @@ mod tests {
             },
             hooks,
         }
+    }
+
+    #[test]
+    fn collect_thresholds_gathers_branch_and_init_literals() {
+        // render: branch on `x < 10`; state init 0; effect writes `+1`.
+        let mut blocks = HashMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![],
+                term: Terminator::Branch {
+                    cond: Expr::BinOp {
+                        op: crate::ir::expr::BinOp::Lt,
+                        lhs: Box::new(Expr::Var("x".to_string())),
+                        rhs: Box::new(Expr::Lit(Prim::Int(10))),
+                    },
+                    then_: 0,
+                    else_: 0,
+                },
+            },
+        );
+        let render = CFG {
+            entry: 0,
+            blocks,
+            edges: vec![],
+        };
+        let hooks = vec![HookEntry::State {
+            label: 0,
+            init: Expr::Lit(Prim::Int(0)),
+            type_hint: None,
+            span: None,
+        }];
+        let t = collect_thresholds(&render, &hooks);
+        assert!(t.contains(&10.0), "branch literal 10 harvested");
+        assert!(t.contains(&0.0), "state init 0 harvested");
+        // sorted + deduped
+        assert!(t.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]

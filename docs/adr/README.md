@@ -15,3 +15,4 @@
 | [ADR-011](ADR-011-source-ranges-diagnostics.md) | Source ranges for diagnostics — `SourceRange` propagated from parse to output | Accepted |
 | [ADR-012](ADR-012-inter-component-analysis.md) | Inter-component analysis — top-down inlining + `SharedStateStore` | Accepted |
 | [ADR-013](ADR-013-cross-file-analysis.md) | Cross-file analysis — import resolution + symbol graph | Accepted |
+| [ADR-014](ADR-014-widening-narrowing.md) | Widening up-to (thresholds); narrowing superseded by inner threshold widening | Accepted |

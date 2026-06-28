@@ -301,6 +301,16 @@ impl AbstractDomain for StateValue {
             _ => self.join(other),
         }
     }
+
+    fn widen_to(&self, other: &Self, thresholds: &[f64]) -> Self {
+        match (self, other) {
+            (StateValue::Number(a), StateValue::Number(b)) => {
+                StateValue::Number(a.widen_to(b, thresholds))
+            }
+            // Non-numeric arms have no notion of a threshold → plain widen.
+            _ => self.widen(other),
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

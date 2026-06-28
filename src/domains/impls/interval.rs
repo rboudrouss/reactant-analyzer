@@ -77,6 +77,42 @@ impl Interval {
         }
     }
 
+    /// Threshold widening ("widening up to"). A bound that grows jumps to the
+    /// tightest enclosing threshold instead of ±∞; ±∞ is used only when no finite
+    /// threshold encloses the grown bound. `thresholds` need not be sorted.
+    ///
+    /// Sound: result ⊒ self.hull(other) (bounds only ever loosen), and the set is
+    /// finite so the ascending chain still stabilises.
+    pub fn widen_to(&self, other: &Self, thresholds: &[f64]) -> Self {
+        if self.is_bottom() {
+            return *other;
+        }
+        if other.is_bottom() {
+            return *self;
+        }
+        let lo = if other.lo < self.lo {
+            // Largest threshold ≤ other.lo, else -∞.
+            thresholds
+                .iter()
+                .copied()
+                .filter(|&t| t <= other.lo)
+                .fold(f64::NEG_INFINITY, f64::max)
+        } else {
+            self.lo
+        };
+        let hi = if other.hi > self.hi {
+            // Smallest threshold ≥ other.hi, else +∞.
+            thresholds
+                .iter()
+                .copied()
+                .filter(|&t| t >= other.hi)
+                .fold(f64::INFINITY, f64::min)
+        } else {
+            self.hi
+        };
+        Interval { lo, hi }
+    }
+
     pub fn add(&self, other: &Self) -> Self {
         if self.is_bottom() || other.is_bottom() {
             return Interval::bottom();
@@ -200,6 +236,9 @@ impl AbstractDomain for Interval {
     fn widen(&self, other: &Self) -> Self {
         Interval::widen(self, other)
     }
+    fn widen_to(&self, other: &Self, thresholds: &[f64]) -> Self {
+        Interval::widen_to(self, other, thresholds)
+    }
 
     // Use fully-qualified inherent methods to avoid recursive trait dispatch.
     fn narrow_lt(self, v: f64) -> Self {
@@ -269,6 +308,69 @@ mod tests {
         let r = a.add(&b);
         assert_eq!(r.lo, 1.0);
         assert_eq!(r.hi, 4.0);
+    }
+
+    #[test]
+    fn widen_to_jumps_to_threshold_not_infinity() {
+        // [0,5] grows to [0,6]; threshold 10 encloses 6 → hi = 10, not +∞.
+        let a = Interval { lo: 0.0, hi: 5.0 };
+        let b = Interval { lo: 0.0, hi: 6.0 };
+        let w = a.widen_to(&b, &[10.0]);
+        assert_eq!(w.lo, 0.0);
+        assert_eq!(w.hi, 10.0);
+    }
+
+    #[test]
+    fn widen_to_goes_infinity_when_no_threshold_encloses() {
+        // grows past every threshold → +∞ (still sound).
+        let a = Interval { lo: 0.0, hi: 5.0 };
+        let b = Interval { lo: 0.0, hi: 11.0 };
+        let w = a.widen_to(&b, &[10.0]);
+        assert!(w.hi.is_infinite() && w.hi > 0.0);
+    }
+
+    #[test]
+    fn widen_to_picks_tightest_enclosing_threshold() {
+        let a = Interval { lo: 0.0, hi: 5.0 };
+        let b = Interval { lo: 0.0, hi: 12.0 };
+        let w = a.widen_to(&b, &[10.0, 20.0, 100.0]);
+        assert_eq!(w.hi, 20.0); // smallest threshold ≥ 12
+    }
+
+    #[test]
+    fn widen_to_lower_bound_threshold() {
+        // lower bound shrinks; threshold -5 is the largest ≤ -3.
+        let a = Interval { lo: 0.0, hi: 5.0 };
+        let b = Interval { lo: -3.0, hi: 5.0 };
+        let w = a.widen_to(&b, &[-5.0, 0.0]);
+        assert_eq!(w.lo, -5.0);
+        assert_eq!(w.hi, 5.0);
+    }
+
+    #[test]
+    fn widen_to_empty_thresholds_equals_plain_widen() {
+        let a = Interval { lo: 0.0, hi: 5.0 };
+        let b = Interval { lo: 0.0, hi: 6.0 };
+        assert_eq!(a.widen_to(&b, &[]), a.widen(&b));
+    }
+
+    #[test]
+    fn widen_to_stable_bound_untouched() {
+        // hi does not grow → keep it; only lo handling differs.
+        let a = Interval { lo: 0.0, hi: 5.0 };
+        let b = Interval { lo: 0.0, hi: 3.0 };
+        let w = a.widen_to(&b, &[10.0]);
+        assert_eq!(w, Interval { lo: 0.0, hi: 5.0 });
+    }
+
+    #[test]
+    fn widen_to_is_sound_superset_of_hull() {
+        // Result must contain the hull (over-approximation preserved).
+        let a = Interval { lo: 2.0, hi: 5.0 };
+        let b = Interval { lo: 0.0, hi: 8.0 };
+        let w = a.widen_to(&b, &[10.0]);
+        let h = a.hull(&b);
+        assert!(w.lo <= h.lo && w.hi >= h.hi, "widen_to must be ⊒ hull");
     }
 
     #[test]
