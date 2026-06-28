@@ -30,15 +30,12 @@ export function GuardedCounter() {
   return <div>{count}</div>;
 }
 
-// ── Local bounded loop feeding a setter → SHOULD be precise [0, 5] ────────────
-// Intended: `i` widened on the loop back-edge, guard constant 5 as a threshold →
-// `i` converges to [0,5] / exit 5, so the setter writes total ∈ [0,5].
-//
-// CURRENT LIMITATION: lowering drops the write target of `i = i + 1`
-// (expr_lower.rs AssignmentExpression lowers only the RHS), so `i` never grows
-// in the IR and `total` stays [0,0]. The corresponding e2e assertion is
-// `#[ignore]`d until lowering models assignments. The inner threshold widening
-// itself is proven at unit level (cfg_analyzer::loop_counter_bounded_by_threshold).
+// ── Local bounded loop feeding a setter → precise [0, 5] ──────────────────────
+// `i` is widened on the loop back-edge; guard constant 5 is a threshold, so `i`
+// converges to [0,5] / exit 5 and the setter writes total ∈ [0,5]. This is the
+// end-to-end witness for inner threshold widening: it exercises the real
+// pipeline (lowering now models `i = i + 1` as a write — expr_lower.rs
+// AssignmentExpression / UpdateExpression).
 export function BoundedLocalLoop() {
   const [total, setTotal] = useState(0);
   useEffect(() => {

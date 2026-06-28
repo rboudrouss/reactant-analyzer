@@ -73,9 +73,27 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 _ => arg,
             }
         }
+        // `i++` / `--i`: emit the write (`i = i ± 1`), then yield the variable.
+        // Prefix/postfix differ only in the *value* expression (new vs old); we
+        // return the post-write `Var` for both — a sound approximation for the
+        // numeric domain (the rare `a = i++` over-counts by one, never under).
         Expression::UpdateExpression(upd) => match &upd.argument {
             SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
-                Expr::Var(id.name.to_string())
+                let name = id.name.to_string();
+                let op = match upd.operator {
+                    UpdateOperator::Increment => IrBinOp::Add,
+                    UpdateOperator::Decrement => IrBinOp::Sub,
+                };
+                builder.push_stmt(Stmt::Assign {
+                    var: name.clone(),
+                    rhs: Expr::BinOp {
+                        op,
+                        lhs: Box::new(Expr::Var(name.clone())),
+                        rhs: Box::new(Expr::Lit(Prim::Int(1))),
+                    },
+                    span: builder.span_at(upd.span.start),
+                });
+                Expr::Var(name)
             }
             _ => Expr::Var("__opaque".to_string()),
         },
@@ -224,7 +242,40 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         Expression::TSTypeAssertion(ts) => lower_expr(&ts.expression, builder),
 
         // ── Misc ──────────────────────────────────────────────────────────────
-        Expression::AssignmentExpression(assign) => lower_expr(&assign.right, builder),
+        // Assignment is both a value (its RHS) and an effect (the write). Emit
+        // the write as `Stmt::Assign` when the target is a plain identifier so
+        // reassignments / compound updates flow into the abstract env (loop
+        // counters, accumulators). Non-identifier targets (`obj.f`, `arr[i]`)
+        // are untracked cells → no write (their abstract value stays Top).
+        Expression::AssignmentExpression(assign) => {
+            let rhs_val = lower_expr(&assign.right, builder);
+            match assign_target_ident(&assign.left) {
+                Some(name) => {
+                    // Reconstruct `x op= e` → `x = x op e`, but only for operators
+                    // `lower_binop` maps faithfully (Add/Sub/Mul/Div). Other
+                    // compounds (%=, **=, bitwise, logical) would alias onto the
+                    // wrong IR op → unsound; havoc the target to Top instead.
+                    let rhs = if assign.operator.is_assign() {
+                        rhs_val
+                    } else if let Some(op) = faithful_compound_binop(assign.operator) {
+                        Expr::BinOp {
+                            op,
+                            lhs: Box::new(Expr::Var(name.clone())),
+                            rhs: Box::new(rhs_val),
+                        }
+                    } else {
+                        Expr::Var("__opaque".to_string())
+                    };
+                    builder.push_stmt(Stmt::Assign {
+                        var: name.clone(),
+                        rhs,
+                        span: builder.span_at(assign.span.start),
+                    });
+                    Expr::Var(name)
+                }
+                None => rhs_val,
+            }
+        }
         Expression::SequenceExpression(seq) => seq
             .expressions
             .last()
@@ -500,6 +551,28 @@ fn lower_jsx_child(child: &JSXChild, builder: &mut BlockBuilder) -> Option<Expr>
 
 // ── Operator mapping ──────────────────────────────────────────────────────────
 
+/// Identifier name of a plain assignment target, or `None` for member/index/
+/// pattern targets (which the abstract env does not track as a single cell).
+fn assign_target_ident(target: &AssignmentTarget) -> Option<String> {
+    match target {
+        AssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.to_string()),
+        _ => None,
+    }
+}
+
+/// `IrBinOp` for a compound-assignment operator, restricted to those
+/// [`lower_binop`] maps faithfully. Returns `None` for `=` and for operators
+/// that would silently fall back to `Add` (%=, **=, bitwise, logical).
+fn faithful_compound_binop(op: AssignmentOperator) -> Option<IrBinOp> {
+    match op {
+        AssignmentOperator::Addition => Some(IrBinOp::Add),
+        AssignmentOperator::Subtraction => Some(IrBinOp::Sub),
+        AssignmentOperator::Multiplication => Some(IrBinOp::Mul),
+        AssignmentOperator::Division => Some(IrBinOp::Div),
+        _ => None,
+    }
+}
+
 fn lower_binop(op: BinaryOperator) -> IrBinOp {
     match op {
         BinaryOperator::Addition => IrBinOp::Add,
@@ -681,5 +754,116 @@ mod tests {
     fn coalesce_splits_blocks() {
         let cfg = build("function f(a, b) { return a ?? b; }");
         assert!(cfg.blocks.len() >= 3);
+    }
+
+    /// All `Stmt::Assign { var, rhs }` in `cfg`'s entry block, for assertions.
+    fn entry_assigns(cfg: &CFG) -> Vec<(String, Expr)> {
+        cfg.blocks
+            .get(&cfg.entry)
+            .unwrap()
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Assign { var, rhs, .. } => Some((var.clone(), rhs.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reassignment_emits_assign() {
+        // `i = i + 1` must write back to `i` (previously the target was dropped).
+        let cfg = build("function f() { let i = 0; i = i + 1; }");
+        let assigns = entry_assigns(&cfg);
+        assert!(
+            assigns.iter().any(|(v, rhs)| v == "i"
+                && matches!(
+                    rhs,
+                    Expr::BinOp {
+                        op: IrBinOp::Add,
+                        ..
+                    }
+                )),
+            "expected `Assign i = i + 1`, got {assigns:?}"
+        );
+    }
+
+    #[test]
+    fn compound_assignment_reconstructs_binop() {
+        // `s += 2` → `s = s + 2`.
+        let cfg = build("function f() { let s = 0; s += 2; }");
+        let assigns = entry_assigns(&cfg);
+        let (_, rhs) = assigns
+            .iter()
+            .find(|(v, _)| v == "s")
+            .expect("expected Assign for s");
+        match rhs {
+            Expr::BinOp { op, lhs, .. } => {
+                assert!(matches!(op, IrBinOp::Add));
+                assert!(matches!(lhs.as_ref(), Expr::Var(v) if v == "s"));
+            }
+            other => panic!("expected `s + 2`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_expression_emits_increment() {
+        // `i++` → `i = i + 1`.
+        let cfg = build("function f() { let i = 0; i++; }");
+        let assigns = entry_assigns(&cfg);
+        assert!(
+            assigns.iter().any(|(v, rhs)| v == "i"
+                && matches!(
+                    rhs,
+                    Expr::BinOp {
+                        op: IrBinOp::Add,
+                        ..
+                    }
+                )),
+            "expected `Assign i = i + 1` from i++, got {assigns:?}"
+        );
+    }
+
+    #[test]
+    fn decrement_emits_sub() {
+        let cfg = build("function f() { let i = 0; i--; }");
+        let assigns = entry_assigns(&cfg);
+        assert!(
+            assigns.iter().any(|(v, rhs)| v == "i"
+                && matches!(
+                    rhs,
+                    Expr::BinOp {
+                        op: IrBinOp::Sub,
+                        ..
+                    }
+                )),
+            "expected `Assign i = i - 1` from i--, got {assigns:?}"
+        );
+    }
+
+    #[test]
+    fn exotic_compound_havocs_target() {
+        // `x %= 3`: `%` has no faithful IrBinOp → havoc to `__opaque` (Top),
+        // never silently aliased onto `Add`.
+        let cfg = build("function f() { let x = 9; x %= 3; }");
+        let assigns = entry_assigns(&cfg);
+        let (_, rhs) = assigns
+            .iter()
+            .find(|(v, _)| v == "x")
+            .expect("expected Assign for x");
+        assert!(
+            matches!(rhs, Expr::Var(v) if v == "__opaque"),
+            "exotic compound must havoc, got {rhs:?}"
+        );
+    }
+
+    #[test]
+    fn member_assignment_emits_no_write() {
+        // `obj.f = 1`: untracked cell → no `Assign` (RHS still lowered).
+        let cfg = build("function f(obj) { obj.f = 1; }");
+        assert!(
+            entry_assigns(&cfg).is_empty(),
+            "member-target assignment must not emit a tracked Assign"
+        );
     }
 }

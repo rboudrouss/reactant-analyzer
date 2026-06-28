@@ -5,15 +5,11 @@
 //! Threshold widening recovers precision in the ascending phase by jumping a
 //! growing bound to the tightest enclosing program constant instead of ±∞.
 //!
-//! NOTE (limitation surfaced while writing these): the lowering currently drops
-//! assignment / update statements to existing variables (`x = e`, `x++`,
-//! `s += 1`) — see `expr_lower.rs::AssignmentExpression`, which lowers only the
-//! RHS. A local loop counter therefore never grows in the IR, so the *inner*
-//! threshold widening (on the `analyze_cfg` back-edge) cannot be exercised
-//! through real source yet — only via the unit test
-//! `cfg_analyzer::tests::loop_counter_bounded_by_threshold` (hand-built CFG).
-//! `bounded_local_loop_is_precise` below is `#[ignore]`d until lowering models
-//! assignments; it asserts the *desired* precise result.
+//! `bounded_local_loop_is_precise` is the end-to-end witness for the *inner*
+//! threshold widening (on the `analyze_cfg` back-edge): the lowering models
+//! assignments / updates to existing variables (`x = e`, `x++`, `s += 1`) as
+//! `Stmt::Assign` (see `expr_lower.rs`), so a local loop counter grows in the IR
+//! and converges to the threshold instead of freezing at its init value.
 
 use std::collections::HashMap;
 
@@ -25,7 +21,7 @@ use reactant::{
     domains::{Interval, StateValue, StateValueTransfer},
     engine::{AnalysisResult, Config, analyze_component},
     lowering::{compute_line_starts, lower_program},
-    rules::{InfiniteLoop, Rule},
+    rules::{AlwaysUnstableDeps, InfiniteLoop, Rule},
 };
 
 /// Lower the fixture and analyse every component intra-procedurally.
@@ -55,7 +51,11 @@ fn analyze_fixture() -> HashMap<String, AnalysisResult<StateValue>> {
         .collect()
 }
 
-fn infinite_loop_hits(results: &HashMap<String, AnalysisResult<StateValue>>, name: &str) -> usize {
+fn rule_hits<R: Rule>(
+    rule: &R,
+    results: &HashMap<String, AnalysisResult<StateValue>>,
+    name: &str,
+) -> usize {
     use reactant::engine::{ComponentCallGraph, ProgramAnalysisResult};
     let mut components = HashMap::new();
     components.insert(name.to_string(), results[name].clone());
@@ -66,7 +66,11 @@ fn infinite_loop_hits(results: &HashMap<String, AnalysisResult<StateValue>>, nam
         recursive_components: std::collections::HashSet::new(),
         stats: reactant::engine::AnalysisStats::default(),
     };
-    InfiniteLoop.check(&prog, &name.to_string()).len()
+    rule.check(&prog, &name.to_string()).len()
+}
+
+fn infinite_loop_hits(results: &HashMap<String, AnalysisResult<StateValue>>, name: &str) -> usize {
+    rule_hits(&InfiniteLoop, results, name)
 }
 
 /// Abstract value of the first `useState` label (label 0) for `component`.
@@ -104,13 +108,17 @@ fn guarded_counter_converges_bounded() {
         StateValue::Number(Interval { lo: 0.0, hi: 10.0 }),
         "guarded counter must converge to [0, 10]"
     );
+    // Regression: `[count]` is a primitive (value-compared) dep, not a fresh
+    // reference each render — must not trip always-unstable-deps even though
+    // `count` converged to a wide interval.
+    assert_eq!(
+        rule_hits(&AlwaysUnstableDeps, &r, "GuardedCounter"),
+        0,
+        "numeric state dep must not be flagged always-unstable"
+    );
 }
 
 #[test]
-#[ignore = "blocked by lowering gap: `i = i + 1` / `i++` drop the write target \
-            (expr_lower.rs AssignmentExpression), so the loop counter never grows \
-            in the IR. Un-ignore once lowering models assignments — then the inner \
-            threshold widening yields the precise [0,5]."]
 fn bounded_local_loop_is_precise() {
     let r = analyze_fixture();
     assert_eq!(infinite_loop_hits(&r, "BoundedLocalLoop"), 0);
