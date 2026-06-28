@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 
 use crate::{
     domains::{
@@ -9,11 +9,11 @@ use crate::{
         expr::Expr,
         hooks::HookEntry,
         stmt::Stmt,
-        types::{HookLabel, Symbol, Var},
+        types::{HookLabel, Symbol},
     },
 };
 
-use super::{Diagnostic, Rule};
+use super::{Diagnostic, Rule, resolve_setter_aliases, setter_var_labels};
 
 /// Fires when a mount-only effect (`deps: []`) sets a state to a stable constant
 /// that differs from the state's init value.
@@ -55,22 +55,8 @@ impl Rule for UnnecessaryRerender {
             })
             .collect();
 
-        let setters_for: HashMap<HookLabel, HashSet<Var>> = {
-            let mut map: HashMap<HookLabel, HashSet<Var>> = HashMap::new();
-            for block in result.render_cfg.blocks.values() {
-                for stmt in &block.stmts {
-                    if let Stmt::Let {
-                        var,
-                        rhs: Expr::StateSetter(label),
-                        ..
-                    } = stmt
-                    {
-                        map.entry(*label).or_default().insert(var.clone());
-                    }
-                }
-            }
-            map
-        };
+        // Setter var → state label, from the render body's `let setX = useState(...)[1]`.
+        let setter_to_label = setter_var_labels(&result.render_cfg);
 
         let mut diags = Vec::new();
 
@@ -89,77 +75,68 @@ impl Rule for UnnecessaryRerender {
             }
             let eff_span = result.effect_info.get(eff_label).and_then(|i| i.span);
 
-            let mut visited: HashSet<_> = HashSet::new();
-            let mut queue: VecDeque<_> = VecDeque::new();
-            queue.push_back(body_cfg.entry);
-            visited.insert(body_cfg.entry);
+            // Utility inlining binds a setter param via an alias `let setter = setX`
+            // inside the effect body. Follow such aliases so a spliced `setter(B)`
+            // is still recognised as a call to the underlying state setter.
+            let setters = resolve_setter_aliases(body_cfg, &setter_to_label);
 
-            while let Some(bid) = queue.pop_front() {
-                if let Some(block) = body_cfg.blocks.get(&bid) {
-                    for stmt in &block.stmts {
-                        let Stmt::ExprStmt(Expr::Call { fn_, args }, _) = stmt else {
-                            continue;
-                        };
-                        let Expr::Var(setter_name) = fn_.as_ref() else {
-                            continue;
-                        };
+            // Order-independent scan: any const setter call anywhere in a
+            // mount-only effect forces the extra render, so a flat pass over
+            // every block suffices (no need for control-flow ordering).
+            for block in body_cfg.blocks.values() {
+                for stmt in &block.stmts {
+                    let Stmt::ExprStmt(Expr::Call { fn_, args }, _) = stmt else {
+                        continue;
+                    };
+                    let Expr::Var(setter_name) = fn_.as_ref() else {
+                        continue;
+                    };
 
-                        let Some(state_label) = setters_for
-                            .iter()
-                            .find(|(_, names)| names.contains(setter_name))
-                            .map(|(&lbl, _)| lbl)
-                        else {
-                            continue;
-                        };
+                    let Some(&state_label) = setters.get(setter_name) else {
+                        continue;
+                    };
 
-                        let Some(init_val) = init_values.get(&state_label) else {
-                            continue;
-                        };
-                        if !init_val.is_stable() {
-                            continue;
-                        }
-
-                        let arg_val = args
-                            .first()
-                            .map(|a| {
-                                let mut s = result.state_store.clone();
-                                let mut m = result.memo_store.clone();
-                                let mut h = crate::domains::Heap::new();
-                                StateValueTransfer.eval_expr(
-                                    a,
-                                    &empty_env,
-                                    &mut AnalysisCtx::null(&mut s, &mut m, &mut h),
-                                )
-                            })
-                            .unwrap_or(StateValue::Top);
-
-                        if !arg_val.is_stable() {
-                            continue;
-                        }
-                        if arg_val == *init_val {
-                            continue; // same as init → redundant-set-state, not this rule
-                        }
-
-                        let mut d = Diagnostic::new(
-                            "unnecessary-rerender",
-                            format!(
-                                "mount-only effect sets state {state_label} to a constant \
-                                 different from its initial value causes one extra rerender on mount; \
-                                 consider initialising directly with the target value"
-                            ),
-                        )
-                        .with_label(state_label);
-                        if let Some(r) = eff_span {
-                            d = d.with_range(r);
-                        }
-                        diags.push(d);
+                    let Some(init_val) = init_values.get(&state_label) else {
+                        continue;
+                    };
+                    if !init_val.is_stable() {
+                        continue;
                     }
 
-                    for succ in body_cfg.successors(bid) {
-                        if visited.insert(succ) {
-                            queue.push_back(succ);
-                        }
+                    let arg_val = args
+                        .first()
+                        .map(|a| {
+                            let mut s = result.state_store.clone();
+                            let mut m = result.memo_store.clone();
+                            let mut h = crate::domains::Heap::new();
+                            StateValueTransfer.eval_expr(
+                                a,
+                                &empty_env,
+                                &mut AnalysisCtx::null(&mut s, &mut m, &mut h),
+                            )
+                        })
+                        .unwrap_or(StateValue::Top);
+
+                    if !arg_val.is_stable() {
+                        continue;
                     }
+                    if arg_val == *init_val {
+                        continue; // same as init → redundant-set-state, not this rule
+                    }
+
+                    let mut d = Diagnostic::new(
+                        "unnecessary-rerender",
+                        format!(
+                            "mount-only effect sets state {state_label} to a constant \
+                             different from its initial value causes one extra rerender on mount; \
+                             consider initialising directly with the target value"
+                        ),
+                    )
+                    .with_label(state_label);
+                    if let Some(r) = eff_span {
+                        d = d.with_range(r);
+                    }
+                    diags.push(d);
                 }
             }
         }
@@ -288,6 +265,35 @@ mod tests {
         let diags = UnnecessaryRerender.check(&prog(&result), &"C".to_string());
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].rule, "unnecessary-rerender");
+        assert_eq!(diags[0].hook_label, Some(0));
+    }
+
+    #[test]
+    fn aliased_setter_via_inlining_warns() {
+        // After utility inlining: useEffect(() => { let setter = setX; setter("dark") }, [])
+        // The setter is reached through an alias `let setter = setX` (param binding).
+        let eff_stmts = vec![
+            Stmt::Let {
+                var: "setter".to_string(),
+                rhs: Expr::Var("setX".to_string()),
+                span: None,
+            },
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setter".to_string())),
+                    args: vec![Expr::Lit(Prim::String("dark".into()))],
+                },
+                None,
+            ),
+        ];
+        let comp = component_with(
+            Expr::Lit(Prim::String("light".into())),
+            eff_stmts,
+            Some(vec![]),
+        );
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+        let diags = UnnecessaryRerender.check(&prog(&result), &"C".to_string());
+        assert_eq!(diags.len(), 1, "aliased setter should still warn");
         assert_eq!(diags[0].hook_label, Some(0));
     }
 

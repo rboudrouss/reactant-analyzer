@@ -121,6 +121,24 @@ fn unary_negation_derivation_fires() {
     assert_eq!(hits, 1, "!on derivation must fire");
 }
 
+#[test]
+fn aliased_setter_derivation_fires() {
+    // The setter is reached through an alias `const setter = setB` (the shape
+    // utility inlining produces). Must still be recognised as a setter call.
+    let hits = derived_state_hits(
+        r#"
+        import { useState, useEffect } from "react";
+        function C() {
+            const [a, setA] = useState(0);
+            const [b, setB] = useState(0);
+            useEffect(() => { const setter = setB; setter(a + 1); }, [a]);
+            return <div>{a} {b}</div>;
+        }
+        "#,
+    );
+    assert_eq!(hits, 1, "aliased setter derivation must fire");
+}
+
 // ── True negatives ────────────────────────────────────────────────────────────
 
 #[test]

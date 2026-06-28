@@ -31,7 +31,7 @@ use super::{
 use crate::{
     domains::{stores::SharedStateStore, transfer::StateValueTransfer},
     ir::{
-        cfg::{BasicBlock, Terminator},
+        cfg::{BasicBlock, Edge, EdgeKind, Terminator},
         remap::{remap_cfg, remap_hooks},
     },
     registry::SummaryRegistry,
@@ -1206,6 +1206,9 @@ fn splice_one_call(
         .iter()
         .map(|(bid, block)| (*bid + block_offset, block.clone()))
         .collect();
+    // Callee blocks whose Return was rewritten into `Jump(join)`; each needs a
+    // fresh edge to the join block.
+    let mut callee_return_blocks: Vec<BlockId> = Vec::new();
     for (new_id, block) in callee_blocks.iter_mut() {
         block.id = *new_id;
         // Remap embedded BlockIds in terminators.
@@ -1225,6 +1228,7 @@ fn splice_one_call(
                     });
                 }
                 // Else: discard the return value.
+                callee_return_blocks.push(*new_id);
                 Terminator::Jump(join_block_id)
             }
             Terminator::Unreachable => Terminator::Unreachable,
@@ -1261,10 +1265,42 @@ fn splice_one_call(
         },
     );
 
-    // Edge maintenance: the cfg's `edges` vec is used by some passes (e.g.
-    // narrowing) for IfTrue/IfFalse classification leaves on Unconditional
-    // jumps are not always recorded. We keep edges minimal; the abstract
-    // interpreter recomputes successors from terminators when needed.
+    // 9. Edge maintenance. `CFG::successors`/`predecessors` (hence `topo_sort`,
+    //    dominance, and the abstract interpreter) read `edges`, so spliced
+    //    blocks MUST be wired in or they become unreachable — the engine would
+    //    silently skip the inlined body. We patch surgically to preserve the
+    //    callee's own EdgeKind (Back edges drive widening; IfTrue/IfFalse drive
+    //    narrowing) rather than recomputing from terminators.
+    //
+    //  a) The caller's original out-edges now leave the join block (it carries
+    //     `old_term`), not the original block.
+    for edge in cfg.edges.iter_mut() {
+        if edge.from == block_id {
+            edge.from = join_block_id;
+        }
+    }
+    //  b) Original block → callee entry (the splice jump).
+    cfg.edges.push(Edge {
+        from: block_id,
+        to: callee_entry,
+        kind: EdgeKind::Unconditional,
+    });
+    //  c) Callee-internal edges, remapped by block_offset (kinds preserved).
+    for edge in &utility.body_cfg.edges {
+        cfg.edges.push(Edge {
+            from: edge.from + block_offset,
+            to: edge.to + block_offset,
+            kind: edge.kind.clone(),
+        });
+    }
+    //  d) Each rewritten callee Return → join.
+    for ret_block in callee_return_blocks {
+        cfg.edges.push(Edge {
+            from: ret_block,
+            to: join_block_id,
+            kind: EdgeKind::Unconditional,
+        });
+    }
 }
 
 fn strip_ts_annot(expr: &Expr) -> &Expr {

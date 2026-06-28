@@ -191,6 +191,62 @@ fn cross_file_utility_inlines_via_caller_name_lookup() {
 }
 
 #[test]
+fn inlined_effect_blocks_are_edge_wired_and_engine_visible() {
+    // Regression: `splice_one_call` must rebuild `edges`, not just terminators.
+    // `CFG::successors` (hence topo_sort / the abstract interpreter) reads
+    // `edges`; if the spliced blocks are not wired, the engine silently skips
+    // the inlined body and rules over it produce false negatives.
+    let tmp = Tmp::new("edge-wiring");
+    let path = tmp.write(
+        "main.tsx",
+        r#"
+        function bump(setter) {
+            setter(1);
+        }
+        function Page() {
+            const [c, setC] = useState(0);
+            useEffect(() => {
+                bump(setC);
+            }, []);
+            return <div>{c}</div>;
+        }
+        "#,
+    );
+    let (components, hooks, utilities) = lower_file(&path);
+    let result = analyze(components, hooks, utilities);
+    let page = &result.components["Page"];
+
+    // The spliced `setter = setC; setC(1)` block must be reachable from the
+    // effect entry through `edges` (not just terminators).
+    let effect = page
+        .hooks
+        .iter()
+        .find_map(|h| match h {
+            reactant::ir::hooks::HookEntry::Effect { body_cfg, .. } => Some(body_cfg),
+            _ => None,
+        })
+        .expect("Page has an effect");
+    let mut reachable = std::collections::HashSet::new();
+    let mut stack = vec![effect.entry];
+    while let Some(b) = stack.pop() {
+        if reachable.insert(b) {
+            stack.extend(effect.successors(b));
+        }
+    }
+    assert!(
+        reachable.len() > 1,
+        "spliced block unreachable via edges (got {reachable:?}) — edges not rebuilt"
+    );
+
+    // End-to-end: the now-visible `setC(1)` (init 0) must trigger the rule.
+    let warnings = warnings_for(&result, "Page");
+    assert!(
+        warnings.iter().any(|w| w == "unnecessary-rerender"),
+        "unnecessary-rerender must fire on inlined mount setter (got {warnings:?})"
+    );
+}
+
+#[test]
 fn doornot_guard_suppresses_infinite_loop_false_positive() {
     // Without inlining: `doOrNot(() => setC(c+1))` is opaque → the engine cannot
     // see that the setter is on a guarded path → `infinite-loop` may fire on

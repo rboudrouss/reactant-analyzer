@@ -312,6 +312,79 @@ fn collect_setter_calls_inner(
     }
 }
 
+/// Extend a `setter var → state label` map with alias `let a = b` bindings in
+/// `var → state label` for every `let var = useState(...)[1]` (the setter) in
+/// `cfg`. The render body's authoritative setter-name → label map; pass it as
+/// the `base` of [`resolve_setter_aliases`].
+pub(crate) fn setter_var_labels(cfg: &CFG) -> HashMap<Var, HookLabel> {
+    state_binding_labels(cfg, |rhs| match rhs {
+        Expr::StateSetter(label) => Some(*label),
+        _ => None,
+    })
+}
+
+/// `var → state label` for every `let var = useState(...)[0]` (the value) in `cfg`.
+pub(crate) fn state_val_labels(cfg: &CFG) -> HashMap<Var, HookLabel> {
+    state_binding_labels(cfg, |rhs| match rhs {
+        Expr::StateVal(label) => Some(*label),
+        _ => None,
+    })
+}
+
+/// Shared kernel: collect `var → label` for `let var = <rhs>` where `pick`
+/// extracts a label from the rhs.
+fn state_binding_labels(
+    cfg: &CFG,
+    pick: impl Fn(&Expr) -> Option<HookLabel>,
+) -> HashMap<Var, HookLabel> {
+    let mut map = HashMap::new();
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            if let Stmt::Let { var, rhs, .. } = stmt
+                && let Some(label) = pick(rhs)
+            {
+                map.insert(var.clone(), label);
+            }
+        }
+    }
+    map
+}
+
+/// `cfg` (b a known setter ⇒ a is too). Iterates to a fixpoint so chains
+/// `let s1 = setX; let s2 = s1` all resolve.
+///
+/// Utility inlining binds setter params via such aliases (`let setter = setX`)
+/// inside spliced bodies; rules matching setters by name must follow them or
+/// the spliced setter call goes unseen (false negative).
+pub(crate) fn resolve_setter_aliases(
+    cfg: &CFG,
+    base: &HashMap<Var, HookLabel>,
+) -> HashMap<Var, HookLabel> {
+    let mut map = base.clone();
+    loop {
+        let mut changed = false;
+        for block in cfg.blocks.values() {
+            for stmt in &block.stmts {
+                if let Stmt::Let {
+                    var,
+                    rhs: Expr::Var(src),
+                    ..
+                } = stmt
+                    && !map.contains_key(var)
+                    && let Some(&label) = map.get(src)
+                {
+                    map.insert(var.clone(), label);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    map
+}
+
 fn check_stmt_for_setters(
     stmt: &Stmt,
     block_id: Option<BlockId>,

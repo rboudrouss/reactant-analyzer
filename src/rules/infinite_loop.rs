@@ -2,20 +2,17 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::{
-    domains::StateValue,
-    engine::{AnalysisResult, ProgramAnalysisResult},
+    engine::ProgramAnalysisResult,
     ir::{
         cfg::CFG,
-        expr::Expr,
         hooks::HookEntry,
-        stmt::Stmt,
         types::{HookLabel, Symbol, Var},
     },
 };
 
 use super::{
     Diagnostic, Rule, all_deps_unstable, collect_component_setter_vars, collect_fn_bindings,
-    collect_setter_calls, collect_setter_calls_with_extra,
+    collect_setter_calls, collect_setter_calls_with_extra, setter_var_labels,
 };
 
 fn capitalize_first(s: &str) -> String {
@@ -43,7 +40,8 @@ impl Rule for InfiniteLoop {
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
         let comp_result = &result.components[component];
 
-        let local_setter_labels: HashMap<Var, HookLabel> = build_setter_var_to_label(comp_result);
+        let local_setter_labels: HashMap<Var, HookLabel> =
+            setter_var_labels(&comp_result.render_cfg);
 
         // ComponentSetter props, excluding self-references.
         let cs_vars: HashMap<Var, (Symbol, HookLabel)> = collect_component_setter_vars(
@@ -191,24 +189,6 @@ impl Rule for InfiniteLoop {
 
         diags
     }
-}
-
-/// Collect `var → state_label` for all `let var = StateSetter(label)` in render.
-fn build_setter_var_to_label(result: &AnalysisResult<StateValue>) -> HashMap<Var, HookLabel> {
-    let mut map = HashMap::new();
-    for block in result.render_cfg.blocks.values() {
-        for stmt in &block.stmts {
-            if let Stmt::Let {
-                var,
-                rhs: Expr::StateSetter(label),
-                ..
-            } = stmt
-            {
-                map.insert(var.clone(), *label);
-            }
-        }
-    }
-    map
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

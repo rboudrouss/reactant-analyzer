@@ -7,11 +7,14 @@ use crate::{
         expr::Expr,
         hooks::HookEntry,
         stmt::Stmt,
-        types::{BlockId, HookLabel, Symbol, Var},
+        types::{BlockId, Symbol, Var},
     },
 };
 
-use super::{Diagnostic, Rule, collect_setter_calls};
+use super::{
+    Diagnostic, Rule, collect_setter_calls, resolve_setter_aliases, setter_var_labels,
+    state_val_labels,
+};
 
 /// Fires when a `useEffect` unconditionally sets a state variable whose value
 /// is a call-free function of a single other state variable a pattern that
@@ -31,38 +34,25 @@ impl Rule for DerivedState {
 
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
         let result = &result.components[component];
-        let mut setter_vars: HashSet<Var> = HashSet::new();
-        let mut state_var_names: HashSet<Var> = HashSet::new();
-        let mut setter_label: HashMap<Var, HookLabel> = HashMap::new();
-        let mut state_val_label: HashMap<Var, HookLabel> = HashMap::new();
-        for hook in &result.hooks {
-            if let HookEntry::State { label, .. } = hook {
-                for block in result.render_cfg.blocks.values() {
-                    for stmt in &block.stmts {
-                        if let Stmt::Let {
-                            var,
-                            rhs: Expr::StateSetter(lbl),
-                            ..
-                        } = stmt
-                            && lbl == label
-                        {
-                            setter_vars.insert(var.clone());
-                            setter_label.insert(var.clone(), *label);
-                        }
-                        if let Stmt::Let {
-                            var,
-                            rhs: Expr::StateVal(lbl),
-                            ..
-                        } = stmt
-                            && lbl == label
-                        {
-                            state_var_names.insert(var.clone());
-                            state_val_label.insert(var.clone(), *label);
-                        }
-                    }
-                }
-            }
+        let mut setter_label = setter_var_labels(&result.render_cfg);
+        let state_val_label = state_val_labels(&result.render_cfg);
+        let state_var_names: HashSet<Var> = state_val_label.keys().cloned().collect();
+
+        // Utility inlining binds setter params via aliases (`let setter = setX`)
+        // in spliced bodies. Follow them across the render body and every hook
+        // body so an aliased setter call is still recognised (else: false neg).
+        for cfg in
+            std::iter::once(&result.render_cfg).chain(result.hooks.iter().filter_map(|h| match h {
+                HookEntry::Effect { body_cfg, .. }
+                | HookEntry::Memo { body_cfg, .. }
+                | HookEntry::Callback { body_cfg, .. }
+                | HookEntry::Handler { body_cfg, .. } => Some(body_cfg),
+                _ => None,
+            }))
+        {
+            setter_label = resolve_setter_aliases(cfg, &setter_label);
         }
+        let setter_vars: HashSet<Var> = setter_label.keys().cloned().collect();
 
         // Setters called in render body are not derived-state candidates.
         let render_setters: HashSet<Var> =
