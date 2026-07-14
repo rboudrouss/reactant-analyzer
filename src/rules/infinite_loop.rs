@@ -96,7 +96,7 @@ impl Rule for InfiniteLoop {
                         continue; // state didn't diverge → bounded
                     }
                     let writes = comp_result.effect_setter_writes.get(state_label);
-                    if writes != crate::domains::StateValue::Bottom && !writes.is_unbounded() {
+                    if !writes.is_bottom_value() && !writes.is_unbounded() {
                         continue; // write bounded → narrowing held the growth
                     }
 
@@ -151,7 +151,7 @@ impl Rule for InfiniteLoop {
                 } else if let Some((parent_comp, parent_label)) = cs_vars.get(&call.var) {
                     // ── Cross-component ────────────────────────────────────────
                     let shared_write = result.shared_state.get(parent_comp, *parent_label);
-                    if shared_write == crate::domains::StateValue::Bottom {
+                    if shared_write.is_bottom_value() {
                         continue; // setter not reached in semantic analysis
                     }
                     if !shared_write.is_unbounded() {
@@ -485,7 +485,6 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
-                type_hint: None,
                 span: None,
             },
             HookEntry::Effect {
@@ -575,7 +574,6 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
-                type_hint: None,
                 span: None,
             },
             HookEntry::Effect {
@@ -721,7 +719,6 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
-                type_hint: None,
                 span: None,
             },
             HookEntry::Effect {
@@ -1083,7 +1080,6 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
-                type_hint: None,
                 span: None,
             },
             HookEntry::Effect {

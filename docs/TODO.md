@@ -6,8 +6,6 @@
 
 - **`cross-component-infinite-loop` FN if the parent is only analyzed intra** — if the parent component isn't reached by top-down analysis (Phase 2 fallback, props = ⊤), the `SharedStateStore` isn't populated → the rule doesn't fire. *(ADR-012)*
 
-- **`useState(null)` without a TypeScript annotation** — `Null` init without a type hint → `join(Null, Number) = Top` → immediate convergence → possible FN on loops. Mitigated: `useState<number>(null)` is detected via the TS hint. *(ADR-008)*
-
 - **Loop-carried values inside callbacks** — `exec_body` doesn't widen on back-edges → `setX(arr[i])` records a partial value. Minor FN on the *value*, never an FP. *(ADR-009)*
 
 ## Known false positives (FP)

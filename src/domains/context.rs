@@ -33,7 +33,7 @@ pub struct NullCtx;
 
 impl QueryContext for NullCtx {
     fn state_value_of(&self, _expr: &Expr) -> StateValue {
-        StateValue::Top
+        StateValue::top()
     }
 }
 

@@ -60,6 +60,32 @@ pub trait AbstractDomain: Clone + PartialEq + PartialOrd + std::fmt::Debug {
 
     // Branch narrowing: default = identity (sound, imprecise).
     // Override for numeric domains to refine interval bounds on branch conditions.
+
+    // Nullability narrowing (ADR-015). The IR conflates `==`/`===` into `Eq`,
+    // so the refinements below are the sound envelope of both semantics.
+    /// Taken `x !== null` (or false `x === null`): null impossible.
+    fn narrow_drop_null(self) -> Self {
+        self
+    }
+    /// Taken `x !== undefined` (or false `x === undefined`): undefined impossible.
+    fn narrow_drop_undef(self) -> Self {
+        self
+    }
+    /// Taken `x == null` / `x == undefined`: only null/undefined survive.
+    fn narrow_keep_nullish_only(self) -> Self {
+        self
+    }
+    /// Taken truthiness guard `if (x)`: excludes every falsy JS value
+    /// (null, undefined, 0, "", false).
+    fn narrow_truthy(self) -> Self {
+        self
+    }
+    /// Falsy branch (`else` of `if (x)`, taken `if (!x)`): only falsy values
+    /// survive (null, undefined, 0, "", false).
+    fn narrow_falsy(self) -> Self {
+        self
+    }
+
     fn narrow_lt(self, _v: f64) -> Self {
         self
     }

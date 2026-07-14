@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::ir::{
     cfg::CFG,
-    expr::{Expr, TSType},
+    expr::Expr,
     source_range::SourceRange,
     types::{HookLabel, Symbol, Var},
 };
@@ -12,7 +12,6 @@ pub enum HookEntry {
     State {
         label: HookLabel,
         init: Expr,
-        type_hint: Option<TSType>,
         span: Option<SourceRange>,
     },
     Effect {

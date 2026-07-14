@@ -125,15 +125,13 @@ mod tests {
     use super::*;
     use crate::{
         domains::{
-            impls::{Stability, StateValue, interval::Interval},
-            stores::{AbstractEnv, MemoStore, StateStore},
+            impls::{Stability, StateValue},
+            stores::{MemoStore, StateStore},
         },
         engine::AnalysisResult,
         ir::{
             cfg::{BasicBlock, CFG, Terminator},
             expr::{Expr, Prim},
-            hooks::HookEntry,
-            types::ExprId,
         },
     };
     use std::collections::{HashMap, HashSet};
@@ -174,7 +172,7 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(
             "onClick".to_string(),
-            StateValue::Reference(Stability::Stable),
+            StateValue::reference(Stability::Stable),
         );
         m
     }
@@ -183,7 +181,7 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(
             "onClick".to_string(),
-            StateValue::Reference(Stability::Unstable),
+            StateValue::reference(Stability::Unstable),
         );
         m
     }
@@ -250,7 +248,7 @@ mod tests {
         cache.insert("C".to_string(), unstable_props(), trivial_result());
         // Third insert → overflow → evict to 1 degraded entry
         let mut other_props = HashMap::new();
-        other_props.insert("label".to_string(), StateValue::Top);
+        other_props.insert("label".to_string(), StateValue::top());
         cache.insert("C".to_string(), other_props, trivial_result());
         // After eviction: exactly 1 entry remains
         assert_eq!(cache.cache_size(&"C".to_string()), 1);
@@ -263,7 +261,7 @@ mod tests {
         let mut cache = ComponentCache::with_max(1);
         // First insert with Top props
         let mut top_props = HashMap::new();
-        top_props.insert("x".to_string(), StateValue::Top);
+        top_props.insert("x".to_string(), StateValue::top());
         cache.insert("C".to_string(), top_props.clone(), trivial_result());
         // Lookup with Top = exact match
         assert!(cache.lookup(&"C".to_string(), &top_props).is_some());
@@ -277,12 +275,12 @@ fn join_all_props(all: &[&HashMap<Symbol, StateValue>]) -> HashMap<Symbol, State
     let mut result: HashMap<Symbol, StateValue> = HashMap::new();
     for props in all {
         for k in props.keys() {
-            result.entry(k.clone()).or_insert(StateValue::Bottom);
+            result.entry(k.clone()).or_insert(StateValue::bottom());
         }
     }
     for (k, v) in &mut result {
         for props in all {
-            let val = props.get(k).cloned().unwrap_or(StateValue::Top);
+            let val = props.get(k).cloned().unwrap_or(StateValue::top());
             *v = v.clone().join(&val);
         }
     }

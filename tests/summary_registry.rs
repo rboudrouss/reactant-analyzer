@@ -50,7 +50,7 @@ impl HookSummary for StableRefHook {
         self.0
     }
     fn summarize(&self, _args: &[StateValue]) -> StateValue {
-        StateValue::Reference(Stability::Stable)
+        StateValue::reference(Stability::Stable)
     }
 }
 
@@ -60,7 +60,7 @@ impl HookSummary for UnstableRefHook {
         self.0
     }
     fn summarize(&self, _args: &[StateValue]) -> StateValue {
-        StateValue::Reference(Stability::Unstable)
+        StateValue::reference(Stability::Unstable)
     }
 }
 

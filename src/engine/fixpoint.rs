@@ -4,13 +4,13 @@ use crate::{
     domains::{
         AbstractDomain, AnalysisCtx, AnalyzeChildFn, FixpointCtx, Heap, InterCtx, NullCtx,
         Transfer,
-        impls::{StateValue, interval::Interval},
-        stores::{AbstractEnv, MemoStore, StateStore, TypedStateStore},
+        impls::StateValue,
+        stores::{AbstractEnv, MemoStore, StateStore},
     },
     ir::{
         cfg::CFG,
         component::ComponentIR,
-        expr::{Expr, SummaryValue, TSType},
+        expr::{Expr, SummaryValue},
         free_vars::compute_free_vars,
         hooks::HookEntry,
         stmt::Stmt,
@@ -117,7 +117,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     let ComponentIR {
         file: comp_file,
         name: comp_name,
-        render_cfg: mut render_cfg,
+        mut render_cfg,
         hooks,
         ..
     } = comp;
@@ -134,13 +134,15 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         config.max_inline_depth,
     );
 
-    // Expand Custom entries before TypedStateStore::from_component so inlined State entries are seeded.
+    // Expand Custom entries before seeding so inlined State entries are seeded.
     expand_custom_hooks(&mut hooks, &mut render_cfg, inter);
 
     // Threshold set for widening up-to (ADR-014); harvested once, post-expansion.
     let thresholds = collect_thresholds(&render_cfg, &hooks);
 
-    let mut typed_state = TypedStateStore::from_component(&hooks);
+    // Fixpoint carrier: the product StateValue tracks every JS kind per label
+    // (ADR-015), so no per-type sub-store dispatch is needed anymore.
+    let mut state: StateStore<StateValue> = StateStore::bottom();
     let mut memo_store: MemoStore<StateValue> = MemoStore::new();
     let mut heap = initial_heap;
     let mut widened_labels: HashSet<HookLabel> = HashSet::new();
@@ -158,37 +160,25 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         let init_memo = MemoStore::new();
         let init_untyped = StateStore::bottom();
         for hook in &hooks {
-            if let HookEntry::State {
-                label,
-                init,
-                type_hint,
-                ..
-            } = hook
-            {
+            if let HookEntry::State { label, init, .. } = hook {
                 let init_val = {
                     let mut init_untyped_mut = init_untyped.clone();
                     let mut init_memo_mut = init_memo.clone();
                     let mut heap = crate::domains::Heap::new();
                     let mut ac =
                         AnalysisCtx::null(&mut init_untyped_mut, &mut init_memo_mut, &mut heap);
-                    let v = transfer.eval_expr(init, &init_env, &mut ac);
-                    // useState<number>(null): override Null/Undefined with Number([0,0])
-                    // so the interval domain tracks progression from the first setter call.
-                    match (&v, type_hint) {
-                        (StateValue::Null | StateValue::Undefined, Some(TSType::Number)) => {
-                            StateValue::Number(Interval::point(0.0))
-                        }
-                        _ => v,
-                    }
+                    // A null/undefined init needs no TS-hint override anymore:
+                    // the product value joins the null slot with whatever the
+                    // setters write, and the num slot widens independently.
+                    transfer.eval_expr(init, &init_env, &mut ac)
                 };
-                typed_state.update(*label, init_val);
+                state.update(*label, init_val);
             }
         }
     }
 
     loop {
-        // Project to StateStore<StateValue> for Transfer compatibility.
-        let state_store = typed_state.to_untyped();
+        let state_store = state.clone();
 
         // ── Render pass ───────────────────────────────────────────────────────
         // Use initial_env as entry: child analyses start with props bound.
@@ -288,40 +278,38 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             }
         }
 
-        // ── Convergence check (per-sub-store precision) ───────────────────────
-        let new_untyped_incycle = state_from_render.join(&state_from_effects);
+        // ── Convergence check ─────────────────────────────────────────────────
+        let new_state_incycle = state_from_render.join(&state_from_effects);
         // Include cross-component state updates made by child effects/callbacks.
         let external_updates = inter
             .map(|i| i.shared_state.borrow().slice(&comp_name))
             .unwrap_or_else(StateStore::bottom);
-        let new_untyped_full = new_untyped_incycle
+        let new_state = new_state_incycle
             .join(&state_from_handlers)
             .join(&external_updates);
-        let new_typed = typed_state.from_untyped(&new_untyped_full);
 
-        if new_typed.leq(&typed_state) {
+        if new_state.leq(&state) {
             break;
         }
 
         iteration += 1;
         if iteration >= 100 {
             // Pathological input: force widening on all labels to guarantee convergence.
-            for label in typed_state.all_labels() {
+            for label in state.labels() {
                 widened_labels.insert(label);
             }
-            typed_state = typed_state.widen(&new_typed);
+            state = state.widen(&new_state);
             break;
         }
 
         if iteration >= config.widen_threshold {
             // widened_labels: render+effects only handler widening is not a bug.
-            let incycle_typed = typed_state.from_untyped(&new_untyped_incycle);
-            for label in incycle_typed.changed_labels(&typed_state) {
+            for label in new_state_incycle.changed_labels(&state) {
                 widened_labels.insert(label);
             }
-            typed_state = typed_state.widen_to(&new_typed, &thresholds);
+            state = state.widen_to(&new_state, &thresholds);
         } else {
-            typed_state = new_typed;
+            state = new_state;
         }
     }
 
@@ -329,7 +317,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // Re-run effects from ⊥ so `effect_setter_writes` contains only what setters
     // actually wrote. InfiniteLoop uses this to distinguish bounded growth (narrowing
     // held: `[1,10]`) from true divergence (`[1,+∞)`).
-    let final_state = typed_state.to_untyped();
+    let final_state = state;
     let final_ctx = FixpointCtx {
         state: &final_state,
         memo: &memo_store,
@@ -576,20 +564,14 @@ fn expand_custom_hooks(
 
         let remapped = remap_hooks(hook_ir.hooks.clone(), offset);
 
-        // Substitute call-site args for hook params in State init expressions so that
-        // `TypedStateStore::from_component` seeds the correct initial value rather than Bottom.
+        // Substitute call-site args for hook params in State init expressions so
+        // that seeding uses the correct initial value rather than Bottom.
         let remapped: Vec<HookEntry> = remapped
             .into_iter()
             .map(|h| match h {
-                HookEntry::State {
-                    label,
-                    init,
-                    type_hint,
-                    span,
-                } => HookEntry::State {
+                HookEntry::State { label, init, span } => HookEntry::State {
                     label,
                     init: subst_vars(init, &param_subst),
-                    type_hint,
                     span,
                 },
                 other => other,
@@ -639,10 +621,12 @@ fn expand_custom_hooks(
 /// stable reference, unstable reference, or unknown (⊤).
 fn state_value_to_summary_value(v: StateValue) -> SummaryValue {
     use crate::domains::impls::Stability;
-    match v {
-        StateValue::Reference(Stability::Stable) => SummaryValue::StableRef,
-        StateValue::Reference(Stability::Unstable) => SummaryValue::UnstableRef,
-        _ => SummaryValue::Top,
+    if v == StateValue::reference(Stability::Stable) {
+        SummaryValue::StableRef
+    } else if v.is_unstable_reference_only() {
+        SummaryValue::UnstableRef
+    } else {
+        SummaryValue::Top
     }
 }
 
@@ -1396,7 +1380,6 @@ mod tests {
         let hooks = vec![HookEntry::State {
             label: 0,
             init: Expr::Lit(Prim::Int(0)),
-            type_hint: None,
             span: None,
         }];
         let t = collect_thresholds(&render, &hooks);
@@ -1410,7 +1393,7 @@ mod tests {
     fn no_hooks_converges_immediately() {
         let comp = component(vec![], vec![]);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        assert_eq!(result.state_store.get(0), StateValue::Bottom);
+        assert_eq!(result.state_store.get(0), StateValue::bottom());
         assert!(result.widened_labels.is_empty());
         assert_eq!(result.hook_calls.len(), 0);
     }
@@ -1421,7 +1404,6 @@ mod tests {
         let hooks = vec![HookEntry::State {
             label: 0,
             init: Expr::Lit(Prim::Int(0)),
-            type_hint: None,
             span: None,
         }];
         let render_stmts = vec![Stmt::Let {
@@ -1433,7 +1415,7 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert_eq!(
             result.state_store.get(0),
-            StateValue::Number(Interval::point(0.0))
+            StateValue::number(Interval::point(0.0))
         );
         assert!(result.widened_labels.is_empty());
     }
@@ -1474,7 +1456,6 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
-                type_hint: None,
                 span: None,
             },
             HookEntry::Effect {
@@ -1502,7 +1483,7 @@ mod tests {
         // The interval [0,42] covers both the init value and the set value.
         assert_eq!(
             result.state_store.get(0),
-            StateValue::Number(Interval { lo: 0.0, hi: 42.0 })
+            StateValue::number(Interval { lo: 0.0, hi: 42.0 })
         );
         assert!(result.widened_labels.is_empty());
     }
@@ -1546,7 +1527,6 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
-                type_hint: None,
                 span: None,
             },
             HookEntry::Effect {
@@ -1558,8 +1538,12 @@ mod tests {
         ];
         let comp = component(hooks, vec![]);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        // Init = Number([0,0]); setN({}) joins cross-type → Top; settles at Top.
-        assert_eq!(result.state_store.get(0), StateValue::Top);
+        // Init = Number([0,0]); setN({}) joins cross-kind → the product keeps
+        // both slots (ADR-015): number[0,0] | ref(Unstable). No collapse to ⊤.
+        let v = result.state_store.get(0);
+        assert_eq!(v.num, Interval::point(0.0));
+        assert_eq!(v.reference, crate::domains::impls::Stability::Unstable);
+        assert!(!v.is_top_value());
         assert!(result.widened_labels.is_empty());
     }
 
@@ -1601,7 +1585,6 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
-                type_hint: None,
                 span: None,
             },
             HookEntry::Effect {
@@ -1646,7 +1629,7 @@ mod tests {
         // dep x = Number([1,1]).to_stability() = Stable → Reference(Stable)
         assert_eq!(
             result.memo_store.get(0),
-            StateValue::Reference(Stability::Stable)
+            StateValue::reference(Stability::Stable)
         );
     }
 
@@ -1730,7 +1713,7 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert_eq!(
             result.block_states[&1].lookup("x"),
-            StateValue::Number(Interval::point(42.0))
+            StateValue::number(Interval::point(42.0))
         );
     }
 
@@ -1794,7 +1777,6 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
-                type_hint: None,
                 span: None,
             },
             HookEntry::Effect {
@@ -1831,8 +1813,11 @@ mod tests {
         let comp = component(hooks, render_stmts);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
 
-        // setN({}) fires via cb → Reference(Unstable) joins Number([0,0]) → Top.
-        assert_eq!(result.state_store.get(0), StateValue::Top);
+        // setN({}) fires via cb → Reference(Unstable) joins Number([0,0]) →
+        // product keeps both slots (ADR-015).
+        let v = result.state_store.get(0);
+        assert_eq!(v.num, Interval::point(0.0));
+        assert_eq!(v.reference, crate::domains::impls::Stability::Unstable);
     }
 
     // ── Handler entry point tests ─────────────────────────────────────────────
@@ -1876,7 +1861,6 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
-                type_hint: None,
                 span: None,
             },
             HookEntry::Handler {
@@ -1938,7 +1922,6 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
-                type_hint: None,
                 span: None,
             },
             HookEntry::Handler {
@@ -2075,7 +2058,6 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
-                type_hint: None,
                 span: None,
             },
             HookEntry::Handler {
@@ -2143,7 +2125,6 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
-                type_hint: None,
                 span: None,
             },
             HookEntry::Handler {
@@ -2172,7 +2153,7 @@ mod tests {
 
         assert_eq!(
             result.state_store.get(0),
-            StateValue::Number(Interval { lo: 0.0, hi: 99.0 }),
+            StateValue::number(Interval { lo: 0.0, hi: 99.0 }),
             "handler's setN(99) must be joined into state_store"
         );
     }
@@ -2272,7 +2253,6 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
-                type_hint: None,
                 span: None,
             },
             HookEntry::Effect {
@@ -2323,7 +2303,6 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
-                type_hint: None,
                 span: None,
             },
             HookEntry::Handler {

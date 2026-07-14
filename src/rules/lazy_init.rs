@@ -149,7 +149,6 @@ mod tests {
                 fn_: Box::new(Expr::Var("compute".to_string())),
                 args: vec![],
             },
-            type_hint: None,
             span: None,
         }];
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
@@ -172,7 +171,6 @@ mod tests {
         let hooks = vec![HookEntry::State {
             label: 0,
             init: Expr::TSAnnotated(Box::new(call), TSType::Number),
-            type_hint: Some(TSType::Number),
             span: None,
         }];
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
@@ -185,7 +183,6 @@ mod tests {
         let hooks = vec![HookEntry::State {
             label: 0,
             init: Expr::Lit(Prim::Int(0)),
-            type_hint: None,
             span: None,
         }];
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
@@ -203,7 +200,6 @@ mod tests {
         let hooks = vec![HookEntry::State {
             label: 0,
             init: lazy,
-            type_hint: None,
             span: None,
         }];
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
@@ -219,7 +215,6 @@ mod tests {
                 obj: Box::new(Expr::Var("props".to_string())),
                 field: "value".to_string(),
             },
-            type_hint: None,
             span: None,
         }];
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
@@ -235,7 +230,6 @@ mod tests {
                 id: ExprId(0),
                 fields: vec![],
             },
-            type_hint: None,
             span: None,
         }];
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
@@ -255,7 +249,6 @@ mod tests {
                     args: vec![],
                 }),
             },
-            type_hint: None,
             span: None,
         }];
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());

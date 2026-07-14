@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     domains::{
-        AbstractEnv, AnalysisCtx, MemoStore, StateStore, StateValue, StateValueTransfer, Transfer,
+        AbstractDomain, AbstractEnv, AnalysisCtx, MemoStore, StateStore, StateValue,
+        StateValueTransfer, Transfer,
     },
     engine::ProgramAnalysisResult,
     ir::{
@@ -174,7 +175,7 @@ fn collect_setter_vals_in_expr(
                         let mut h = crate::domains::Heap::new();
                         transfer.eval_expr(a, env, &mut AnalysisCtx::null(&mut s, &mut m, &mut h))
                     })
-                    .unwrap_or(StateValue::Top);
+                    .unwrap_or(StateValue::top());
                 match tracker.entry(label) {
                     std::collections::hash_map::Entry::Vacant(e) => {
                         e.insert((arg_val, false));
@@ -246,7 +247,7 @@ fn check_setter_calls(
                     let mut h = crate::domains::Heap::new();
                     transfer.eval_expr(a, env, &mut AnalysisCtx::null(&mut s, &mut m, &mut h))
                 })
-                .unwrap_or(StateValue::Top);
+                .unwrap_or(StateValue::top());
 
             let current_val = state.get(label);
 
@@ -377,8 +378,8 @@ mod tests {
         ];
         let result = make_result(
             vec![(0, stmts)],
-            vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
-            vec![(0, StateValue::Reference(Stability::Stable))],
+            vec![("setN", StateValue::reference(Stability::Stable), Some(0))],
+            vec![(0, StateValue::reference(Stability::Stable))],
         );
         let diags = RedundantSetState.check(&prog(&result), &"C".to_string());
         assert_eq!(diags.len(), 1);
@@ -407,8 +408,8 @@ mod tests {
         ];
         let result = make_result(
             vec![(0, stmts)],
-            vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
-            vec![(0, StateValue::Reference(Stability::Stable))],
+            vec![("setN", StateValue::reference(Stability::Stable), Some(0))],
+            vec![(0, StateValue::reference(Stability::Stable))],
         );
         assert!(
             RedundantSetState
@@ -436,8 +437,8 @@ mod tests {
         ];
         let result = make_result(
             vec![(0, stmts)],
-            vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
-            vec![(0, StateValue::Reference(Stability::Unstable))],
+            vec![("setN", StateValue::reference(Stability::Stable), Some(0))],
+            vec![(0, StateValue::reference(Stability::Unstable))],
         );
         assert!(
             RedundantSetState
@@ -481,8 +482,8 @@ mod tests {
         ];
         let result = make_result(
             vec![(0, stmts)],
-            vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
-            vec![(0, StateValue::Reference(Stability::Stable))],
+            vec![("setN", StateValue::reference(Stability::Stable), Some(0))],
+            vec![(0, StateValue::reference(Stability::Stable))],
         );
         assert_eq!(
             RedundantSetState
@@ -586,8 +587,8 @@ mod tests {
         let result = make_result_with_effect(
             render_stmts,
             effect_stmts,
-            vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
-            vec![(0, StateValue::Reference(Stability::Stable))],
+            vec![("setN", StateValue::reference(Stability::Stable), Some(0))],
+            vec![(0, StateValue::reference(Stability::Stable))],
         );
         let diags = RedundantSetState.check(&prog(&result), &"C".to_string());
         assert_eq!(diags.len(), 1, "effect body setter should be checked");
@@ -615,8 +616,8 @@ mod tests {
         let result = make_result_with_effect(
             render_stmts,
             effect_stmts,
-            vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
-            vec![(0, StateValue::Reference(Stability::Stable))],
+            vec![("setN", StateValue::reference(Stability::Stable), Some(0))],
+            vec![(0, StateValue::reference(Stability::Stable))],
         );
         assert!(
             RedundantSetState
@@ -646,8 +647,8 @@ mod tests {
         let result = make_result_with_effect(
             render_stmts,
             effect_stmts,
-            vec![("setN", StateValue::Reference(Stability::Stable), Some(0))],
-            vec![(0, StateValue::Reference(Stability::Stable))],
+            vec![("setN", StateValue::reference(Stability::Stable), Some(0))],
+            vec![(0, StateValue::reference(Stability::Stable))],
         );
         assert!(
             RedundantSetState

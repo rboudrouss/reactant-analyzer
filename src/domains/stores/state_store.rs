@@ -78,6 +78,13 @@ impl<D: AbstractDomain> StateStore<D> {
         true
     }
 
+    /// All labels present in the store.
+    pub fn labels(&self) -> Vec<HookLabel> {
+        let mut labels: Vec<HookLabel> = self.0.keys().copied().collect();
+        labels.sort_unstable();
+        labels
+    }
+
     /// Labels whose value differs between `self` and `other`.
     pub fn changed_labels(&self, other: &Self) -> Vec<HookLabel> {
         let all: HashSet<HookLabel> = self.0.keys().chain(other.0.keys()).copied().collect();

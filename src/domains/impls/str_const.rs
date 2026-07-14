@@ -28,7 +28,7 @@ impl StrConst {
         StrConst::Set(Arc::new(set))
     }
 
-    fn from_set(set: BTreeSet<String>) -> Self {
+    pub(crate) fn from_set(set: BTreeSet<String>) -> Self {
         if set.is_empty() {
             StrConst::Bottom
         } else if set.len() > STR_WIDEN_THRESHOLD {

@@ -1,7 +1,7 @@
 use crate::{
     domains::{
         AbstractEnv, AnalysisCtx, MemoStore, StateStore, StateValueTransfer, Transfer,
-        impls::{Stability, StateValue},
+        impls::StateValue,
     },
     engine::{HookKind, ProgramAnalysisResult},
     ir::{expr::Expr, hooks::HookEntry, types::Symbol},
@@ -117,7 +117,7 @@ fn eval_dep_is_unstable(
     // Only a freshly-allocated reference breaks `Object.is` every render.
     // Primitives (Number/Bool/Str) are value-compared — never flagged here, even
     // for wide intervals. `Top` (precision lost) stays silent to avoid FPs.
-    matches!(val, StateValue::Reference(Stability::Unstable))
+    val.is_unstable_reference_only()
 }
 
 /// Render dep indices as `0`, `0, 2`, etc.
@@ -383,7 +383,7 @@ mod tests {
         use crate::domains::{Interval, StateStore, StateValue, stores::MemoStore};
         let env = AbstractEnv::<StateValue>::default();
         let mut state = StateStore::<StateValue>::bottom();
-        state.update(0, StateValue::Number(Interval { lo: 0.0, hi: 10.0 }));
+        state.update(0, StateValue::number(Interval { lo: 0.0, hi: 10.0 }));
         let memo = MemoStore::<StateValue>::new();
         assert!(
             !eval_dep_is_unstable(&Expr::StateVal(0), &env, &state, &memo, &StateValueTransfer),

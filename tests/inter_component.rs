@@ -8,20 +8,18 @@
 ///   - `RootStrategy::Heuristic` identifies correct roots
 ///   - `FieldAccess` heap lookup for destructured props
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use reactant::{
     domains::{
-        InterCtx,
         impls::{Stability, StateValue, interval::Interval},
         stores::{AbstractEnv, EnvVal, MemoStore, SharedStateStore, StateStore},
     },
     engine::{
         AnalysisResult, AnalysisStats, ComponentCallGraph, ComponentRegistry, Config, HookRegistry,
-        ProgramAnalysisResult, RootStrategy, analyze_component, analyze_program,
+        ProgramAnalysisResult, RootStrategy, analyze_program,
     },
     ir::{
-        cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator},
+        cfg::{BasicBlock, CFG, Terminator},
         component::ComponentIR,
         expr::{Expr, Prim},
         hooks::HookEntry,
@@ -288,7 +286,6 @@ fn setter_prop_propagates_to_shared_state() {
             hooks: vec![HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
-                type_hint: None,
                 span: None,
             }],
         }
@@ -306,7 +303,7 @@ fn setter_prop_propagates_to_shared_state() {
     let parent_count = result.shared_state.get(&"Parent".to_string(), 0);
     assert_eq!(
         parent_count,
-        StateValue::Number(Interval::point(42.0)),
+        StateValue::number(Interval::point(42.0)),
         "SharedStateStore[(Parent,0)] should be Number([42,42]) after child effect fires"
     );
 }
@@ -362,7 +359,7 @@ fn recursive_component_does_not_crash() {
 fn field_access_resolves_abstract_object_in_heap() {
     use reactant::domains::impls::StateValue;
     use reactant::domains::stores::Heap;
-    use reactant::domains::{AnalysisCtx, NullCtx, StateValueTransfer, Transfer};
+    use reactant::domains::{AnalysisCtx, StateValueTransfer, Transfer};
     use reactant::ir::types::ExprId;
 
     // Build a heap with an abstract object at ExprId(1)
@@ -370,10 +367,7 @@ fn field_access_resolves_abstract_object_in_heap() {
     let mut fields = HashMap::new();
     fields.insert(
         "onClick".to_string(),
-        EnvVal::Val(StateValue::ComponentSetter {
-            component: "Parent".to_string(),
-            label: 0,
-        }),
+        EnvVal::Val(StateValue::component_setter("Parent".to_string(), 0)),
     );
     heap.insert(ExprId(1), reactant::domains::stores::HeapValue::Obj(fields));
 
@@ -393,10 +387,7 @@ fn field_access_resolves_abstract_object_in_heap() {
     let val = StateValueTransfer.eval_expr(&expr, &env, &mut ctx);
     assert_eq!(
         val,
-        StateValue::ComponentSetter {
-            component: "Parent".to_string(),
-            label: 0
-        },
+        StateValue::component_setter("Parent".to_string(), 0),
         "FieldAccess on heap AbstractObject should return the stored value"
     );
 }
@@ -404,14 +395,14 @@ fn field_access_resolves_abstract_object_in_heap() {
 #[test]
 fn field_access_unknown_field_returns_top() {
     use reactant::domains::stores::Heap;
-    use reactant::domains::{AnalysisCtx, StateValueTransfer, Transfer};
+    use reactant::domains::{AbstractDomain, AnalysisCtx, StateValueTransfer, Transfer};
     use reactant::ir::types::ExprId;
 
     let mut heap = Heap::new();
     let mut fields = HashMap::new();
     fields.insert(
         "onClick".to_string(),
-        EnvVal::Val(StateValue::Reference(Stability::Stable)),
+        EnvVal::Val(StateValue::reference(Stability::Stable)),
     );
     heap.insert(ExprId(1), reactant::domains::stores::HeapValue::Obj(fields));
 
@@ -428,7 +419,7 @@ fn field_access_unknown_field_returns_top() {
         field: "nonexistent".to_string(),
     };
     let val = StateValueTransfer.eval_expr(&expr, &env, &mut ctx);
-    assert_eq!(val, StateValue::Top);
+    assert_eq!(val, StateValue::top());
 }
 
 // ── Fixture-based end-to-end ──────────────────────────────────────────────────
@@ -656,7 +647,6 @@ fn prop_drilling_direct_ir() {
             hooks: vec![HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
-                type_hint: None,
                 span: None,
             }],
         }
@@ -673,7 +663,7 @@ fn prop_drilling_direct_ir() {
     let root_state = result.shared_state.get(&"Root".to_string(), 0);
     assert_eq!(
         root_state,
-        StateValue::Number(Interval::point(99.0)),
+        StateValue::number(Interval::point(99.0)),
         "Prop drilling via Middle: Leaf's effect should update Root.v = 99. \
          Note: Leaf effect uses FieldAccess directly on props, not destructuring."
     );
@@ -697,7 +687,7 @@ fn prop_drilling_two_levels_updates_shared_state() {
     let parent_state = result.shared_state.get(&"Section7_Root".to_string(), 0);
     assert_eq!(
         parent_state,
-        StateValue::Number(Interval::point(99.0)),
+        StateValue::number(Interval::point(99.0)),
         "Prop drilling: Leaf's effect should update Root's state to 99 via SharedStateStore"
     );
 }
@@ -716,7 +706,7 @@ fn nativeelem_children_compapps_are_analyzed() {
     use reactant::domains::impls::interval::Interval;
     assert_eq!(
         app_state,
-        StateValue::Number(Interval { lo: 1.0, hi: 2.0 }),
+        StateValue::number(Interval { lo: 1.0, hi: 2.0 }),
         "Both CompApp children inside NativeElem should be analyzed; \
          SharedStateStore[(App,0)] = join(1,2) = [1,2]"
     );

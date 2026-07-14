@@ -1,6 +1,6 @@
 # ADR-008: Value domain for the SCC fixpoint — StateValue enum + TypedStateStore
 
-- **Status**: Implemented (Option A + Option B active)
+- **Status**: **Superseded by [ADR-015](ADR-015-product-value-domain.md)** (2026-07-14) — the flat `StateValue` enum became a pointwise product over disjoint JS kinds; `TypedStateStore`, `infer_state_type` and the `type_hint` override were deleted. The `Interval`/`BoolVal`/`StrConst` sub-domains, the widening/narrowing machinery and the infinite-loop signal described here survive as slots of the product.
 - **Date**: 2026-06-02
 - **Updated**: 2026-06-04 — `TSType` promoted to an enum (`Number|Boolean|Str|Reference|Unknown`); `HookEntry::State` carries `type_hint: Option<TSType>` captured from the TypeScript generic argument (`useState<T>()`). `infer_state_type` and the fixpoint use the hint to override `StateType::Unknown` when the init is `null`/`undefined`. Null init + `Number` hint → `Number([0,0])` → infinite-loop detection operational. See "Handling `int | null`" section below.
 - **Context**: [ADR-007](ADR-007-cross-domain-queries.md) (cross-domain), [ADR-002](ADR-002-abstract-domains.md) (Stability)

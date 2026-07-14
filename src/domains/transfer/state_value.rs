@@ -1,12 +1,11 @@
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use std::collections::HashMap;
 
 use crate::{
     domains::{
         AbstractDomain, AnalysisCtx, QueryContext, Transfer,
-        impls::{BoolVal, Interval, Stability, StateValue},
+        impls::{BoolVal, Interval, SetterVal, Stability, StateValue, StrConst},
         interp::exec_stmt_with_callbacks,
         stores::{AbstractEnv, EnvVal, HeapValue, MemoStore, StateStore},
     },
@@ -16,17 +15,6 @@ use crate::{
         types::{ExprId, Symbol},
     },
 };
-
-/// Max strings tracked in a `StrConst` set before widening to `Str`.
-const STR_WIDEN_THRESHOLD: usize = 4;
-
-fn str_const(set: BTreeSet<String>) -> StateValue {
-    if set.len() > STR_WIDEN_THRESHOLD {
-        StateValue::Str
-    } else {
-        StateValue::StrConst(Arc::new(set))
-    }
-}
 
 // ── StateValueTransfer ────────────────────────────────────────────────────────
 
@@ -60,7 +48,7 @@ impl Transfer for StateValueTransfer {
         _ctx: &dyn QueryContext,
     ) -> StateValue {
         if deps.is_empty() {
-            return StateValue::Reference(Stability::Stable);
+            return StateValue::reference(Stability::Stable);
         }
         let stability = deps.iter().fold(Stability::Bottom, |acc, dep| {
             let mut s = StateStore::bottom();
@@ -70,7 +58,7 @@ impl Transfer for StateValueTransfer {
             let val = eval_state_value(dep, env, &mut tmp_ctx);
             acc.join(&val.to_stability())
         });
-        StateValue::Reference(stability)
+        StateValue::reference(stability)
     }
 }
 
@@ -82,33 +70,30 @@ fn eval_state_value(
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> StateValue {
     match expr {
-        Expr::Lit(Prim::Int(n)) => StateValue::Number(Interval::point(*n as f64)),
-        Expr::Lit(Prim::Float(f)) => StateValue::Number(Interval::point(*f)),
+        Expr::Lit(Prim::Int(n)) => StateValue::number(Interval::point(*n as f64)),
+        Expr::Lit(Prim::Float(f)) => StateValue::number(Interval::point(*f)),
         Expr::Lit(Prim::Bool(b)) => {
-            StateValue::Boolean(if *b { BoolVal::True } else { BoolVal::False })
+            StateValue::boolean(if *b { BoolVal::True } else { BoolVal::False })
         }
-        Expr::Lit(Prim::String(s)) => str_const(std::iter::once(s.to_string()).collect()),
-        Expr::Lit(Prim::Null) => StateValue::Null,
-        Expr::Lit(Prim::Unit) => StateValue::Undefined,
+        Expr::Lit(Prim::String(s)) => StateValue::str_singleton(s.to_string()),
+        Expr::Lit(Prim::Null) => StateValue::null(),
+        Expr::Lit(Prim::Unit) => StateValue::undefined(),
 
         Expr::Var(v) => env.lookup(v),
         Expr::StateVal(label) => ctx.state.get(*label),
         Expr::StateSetter(label) => {
             if let Some(inter) = &ctx.inter {
-                StateValue::ComponentSetter {
-                    component: inter.component_name.clone(),
-                    label: *label,
-                }
+                StateValue::component_setter(inter.component_name.clone(), *label)
             } else {
-                StateValue::Reference(Stability::Stable)
+                StateValue::reference(Stability::Stable)
             }
         }
         Expr::MemoVal(label) | Expr::CallbackVal(label) => ctx.memo.get(*label),
 
-        Expr::ObjectLit { .. } => StateValue::Reference(Stability::Unstable),
-        Expr::ArrayLit { .. } => StateValue::Reference(Stability::Unstable),
-        Expr::FnLit { .. } => StateValue::Reference(Stability::Unstable),
-        Expr::NativeElem { .. } => StateValue::Reference(Stability::Stable),
+        Expr::ObjectLit { .. } => StateValue::reference(Stability::Unstable),
+        Expr::ArrayLit { .. } => StateValue::reference(Stability::Unstable),
+        Expr::FnLit { .. } => StateValue::reference(Stability::Unstable),
+        Expr::NativeElem { .. } => StateValue::reference(Stability::Stable),
 
         Expr::CompApp { name, props } => eval_comp_app(name, props, env, ctx),
 
@@ -123,18 +108,18 @@ fn eval_state_value(
             eval_unary(op, v)
         }
 
-        Expr::Call { .. } => StateValue::Top,
+        Expr::Call { .. } => StateValue::top(),
 
         Expr::FieldAccess { obj, field } => eval_field_access(obj, field, env, ctx),
-        Expr::IndexAccess { .. } => StateValue::Top,
+        Expr::IndexAccess { .. } => StateValue::top(),
 
         Expr::TSAnnotated(inner, _) => eval_state_value(inner, env, ctx),
 
         Expr::SummaryVal(sv) => match sv {
-            crate::ir::expr::SummaryValue::Top => StateValue::Top,
-            crate::ir::expr::SummaryValue::StableRef => StateValue::Reference(Stability::Stable),
+            crate::ir::expr::SummaryValue::Top => StateValue::top(),
+            crate::ir::expr::SummaryValue::StableRef => StateValue::reference(Stability::Stable),
             crate::ir::expr::SummaryValue::UnstableRef => {
-                StateValue::Reference(Stability::Unstable)
+                StateValue::reference(Stability::Unstable)
             }
         },
     }
@@ -148,7 +133,7 @@ fn eval_comp_app(
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> StateValue {
     let Some(inter) = ctx.inter else {
-        return StateValue::Reference(Stability::Stable);
+        return StateValue::reference(Stability::Stable);
     };
 
     // Recursion guard
@@ -158,7 +143,7 @@ fn eval_comp_app(
         stats
             .recursive_component_refs
             .insert((inter.component_name.clone(), name.clone()));
-        return StateValue::Reference(Stability::Stable);
+        return StateValue::reference(Stability::Stable);
     }
 
     // Registry lookup
@@ -168,7 +153,7 @@ fn eval_comp_app(
             .borrow_mut()
             .unknown_component_refs
             .insert((inter.component_name.clone(), name.clone()));
-        return StateValue::Reference(Stability::Stable);
+        return StateValue::reference(Stability::Stable);
     };
 
     // Evaluate props → abstract map (EnvVals, preserving heap Locs for FnLit props)
@@ -184,7 +169,7 @@ fn eval_comp_app(
     if inter.cache.borrow().lookup(name, &abstract_props).is_some() {
         inter.stats.borrow_mut().cache_hits += 1;
         record_call_site(inter, name.clone(), abstract_props, None);
-        return StateValue::Reference(Stability::Stable);
+        return StateValue::reference(Stability::Stable);
     }
     inter.stats.borrow_mut().cache_misses += 1;
 
@@ -222,7 +207,7 @@ fn eval_comp_app(
         .insert(name.clone(), abstract_props.clone(), child_result);
     record_call_site(inter, name.clone(), abstract_props, None);
 
-    StateValue::Reference(Stability::Stable)
+    StateValue::reference(Stability::Stable)
 }
 
 /// Evaluate field access: look up heap if obj is a variable with known locations.
@@ -250,7 +235,7 @@ fn eval_field_access(
             return vals.into_iter().reduce(|a, b| a.join(&b)).unwrap();
         }
     }
-    StateValue::Top
+    StateValue::top()
 }
 
 /// Convert an `EnvVal` stored in a heap `Obj` field to a `StateValue`.
@@ -332,50 +317,109 @@ fn record_call_site(
     );
 }
 
+/// Numeric view of an operand for arithmetic, per JS `ToNumber` coercion.
+///
+/// `Some` only when the value's active slots are within {number, null}:
+/// `ToNumber(null) = 0`, so a nullable number stays a precise interval —
+/// this is what lets `useState(null)` counters (`setN(n + 1)`) keep widening.
+/// `undefined` coerces to NaN and every other kind is unpredictable → `None`.
+fn as_arith(v: &StateValue) -> Option<Interval> {
+    if v.boolean == BoolVal::Bottom
+        && v.str == StrConst::Bottom
+        && v.reference == Stability::Bottom
+        && !v.undef
+        && v.setter == SetterVal::Bottom
+        && !v.other
+    {
+        // NB: a ⊥ interval stays Some(⊥) — a narrowed-dead path must produce
+        // ⊥ (joins as a no-op), not fall through to ⊤.
+        Some(if v.null {
+            v.num.hull(&Interval::point(0.0))
+        } else {
+            v.num
+        })
+    } else {
+        None
+    }
+}
+
+/// String view of an operand: `Some` only when the string slot is the only
+/// active one (mixed kinds concatenate unpredictably).
+fn as_str_only(v: &StateValue) -> Option<&StrConst> {
+    if v.num.is_bottom()
+        && v.boolean == BoolVal::Bottom
+        && v.reference == Stability::Bottom
+        && !v.null
+        && !v.undef
+        && v.setter == SetterVal::Bottom
+        && !v.other
+        && v.str != StrConst::Bottom
+    {
+        Some(&v.str)
+    } else {
+        None
+    }
+}
+
 fn eval_binop(op: &BinOp, lhs: StateValue, rhs: StateValue) -> StateValue {
     match op {
-        BinOp::Add => match (lhs, rhs) {
-            (StateValue::Number(a), StateValue::Number(b)) => StateValue::Number(a.add(&b)),
-            (StateValue::StrConst(a), StateValue::StrConst(b)) => {
-                let product: BTreeSet<String> = a
-                    .iter()
-                    .flat_map(|s1| b.iter().map(move |s2| format!("{s1}{s2}")))
-                    .collect();
-                str_const(product)
+        BinOp::Add => {
+            if let (Some(a), Some(b)) = (as_arith(&lhs), as_arith(&rhs)) {
+                return StateValue::number(a.add(&b));
             }
-            (StateValue::StrConst(_), StateValue::Str)
-            | (StateValue::Str, StateValue::StrConst(_))
-            | (StateValue::Str, StateValue::Str) => StateValue::Str,
-            _ => StateValue::Top,
+            match (as_str_only(&lhs), as_str_only(&rhs)) {
+                (Some(StrConst::Set(a)), Some(StrConst::Set(b))) => {
+                    let product: BTreeSet<String> = a
+                        .iter()
+                        .flat_map(|s1| b.iter().map(move |s2| format!("{s1}{s2}")))
+                        .collect();
+                    StateValue::str_set(product)
+                }
+                (Some(_), Some(_)) => StateValue::str_top(),
+                _ => StateValue::top(),
+            }
+        }
+        BinOp::Sub => match (as_arith(&lhs), as_arith(&rhs)) {
+            (Some(a), Some(b)) => StateValue::number(a.sub(&b)),
+            _ => StateValue::top(),
         },
-        BinOp::Sub => match (lhs, rhs) {
-            (StateValue::Number(a), StateValue::Number(b)) => StateValue::Number(a.sub(&b)),
-            _ => StateValue::Top,
+        BinOp::Mul => match (as_arith(&lhs), as_arith(&rhs)) {
+            (Some(a), Some(b)) => StateValue::number(a.mul(&b)),
+            _ => StateValue::top(),
         },
-        BinOp::Mul => match (lhs, rhs) {
-            (StateValue::Number(a), StateValue::Number(b)) => StateValue::Number(a.mul(&b)),
-            _ => StateValue::Top,
-        },
-        BinOp::Div => StateValue::Top,
-        BinOp::And | BinOp::Or => StateValue::Top,
+        BinOp::Div => StateValue::top(),
+        BinOp::And | BinOp::Or => StateValue::top(),
         BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Leq | BinOp::Geq => {
-            StateValue::Boolean(BoolVal::Top)
+            StateValue::boolean(BoolVal::Top)
         }
     }
 }
 
 fn eval_unary(op: &UnaryOp, val: StateValue) -> StateValue {
     match op {
-        UnaryOp::Neg => match val {
-            StateValue::Number(i) => StateValue::Number(i.neg()),
-            _ => StateValue::Top,
+        UnaryOp::Neg => match as_arith(&val) {
+            Some(i) => StateValue::number(i.neg()),
+            None => StateValue::top(),
         },
-        UnaryOp::Not => match val {
-            StateValue::Boolean(BoolVal::True) => StateValue::Boolean(BoolVal::False),
-            StateValue::Boolean(BoolVal::False) => StateValue::Boolean(BoolVal::True),
-            StateValue::Boolean(_) => StateValue::Boolean(BoolVal::Top),
-            _ => StateValue::Top,
-        },
+        UnaryOp::Not => {
+            // Boolean-only operand inverts precisely; anything else is Top.
+            if val.num.is_bottom()
+                && val.str == StrConst::Bottom
+                && val.reference == Stability::Bottom
+                && !val.null
+                && !val.undef
+                && val.setter == SetterVal::Bottom
+                && !val.other
+            {
+                match val.boolean {
+                    BoolVal::True => StateValue::boolean(BoolVal::False),
+                    BoolVal::False => StateValue::boolean(BoolVal::True),
+                    _ => StateValue::boolean(BoolVal::Top),
+                }
+            } else {
+                StateValue::top()
+            }
+        }
     }
 }
 
@@ -383,6 +427,8 @@ fn eval_unary(op: &UnaryOp, val: StateValue) -> StateValue {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::domains::{
         AnalysisCtx,
@@ -435,7 +481,7 @@ mod tests {
                 &env,
                 &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
             ),
-            StateValue::Number(Interval::point(5.0))
+            StateValue::number(Interval::point(5.0))
         );
     }
 
@@ -449,7 +495,7 @@ mod tests {
                 &env,
                 &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
             ),
-            StateValue::Boolean(BoolVal::True)
+            StateValue::boolean(BoolVal::True)
         );
     }
 
@@ -466,7 +512,7 @@ mod tests {
                 &env,
                 &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
             ),
-            StateValue::Reference(Stability::Unstable)
+            StateValue::reference(Stability::Unstable)
         );
     }
 
@@ -485,14 +531,14 @@ mod tests {
                 &env,
                 &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap)
             ),
-            StateValue::Number(Interval::point(7.0))
+            StateValue::number(Interval::point(7.0))
         );
     }
 
     #[test]
     fn eval_binop_add_state_plus_one_uses_state_interval() {
         let (env, mut state, mut memo) = empty();
-        state.update(0, StateValue::Number(Interval::point(2.0)));
+        state.update(0, StateValue::number(Interval::point(2.0)));
         let mut heap = Heap::new();
         let expr = Expr::BinOp {
             op: BinOp::Add,
@@ -505,7 +551,7 @@ mod tests {
                 &env,
                 &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap)
             ),
-            StateValue::Number(Interval::point(3.0))
+            StateValue::number(Interval::point(3.0))
         );
     }
 
@@ -523,7 +569,7 @@ mod tests {
                 &env,
                 &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap)
             ),
-            StateValue::Boolean(BoolVal::False)
+            StateValue::boolean(BoolVal::False)
         );
     }
 
@@ -536,9 +582,7 @@ mod tests {
             &env,
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
-        let expected =
-            StateValue::StrConst(Arc::new(std::iter::once("dark".to_string()).collect()));
-        assert_eq!(v, expected);
+        assert_eq!(v, StateValue::str_singleton("dark".to_string()));
     }
 
     // ── exec_stmt / setter ────────────────────────────────────────────────────
@@ -567,7 +611,7 @@ mod tests {
             &mut env,
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
-        assert_eq!(state.get(0), StateValue::Number(Interval::point(42.0)));
+        assert_eq!(state.get(0), StateValue::number(Interval::point(42.0)));
     }
 
     // ── exec_body / functional updaters ──────────────────────────────────────
@@ -575,9 +619,9 @@ mod tests {
     #[test]
     fn functional_updater_increments_state() {
         let (mut env, mut state, mut memo) = empty();
-        state.update(0, StateValue::Number(Interval::point(5.0)));
+        state.update(0, StateValue::number(Interval::point(5.0)));
         env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
         let body_cfg = single_block_cfg(
             vec![],
@@ -607,16 +651,16 @@ mod tests {
 
         assert_eq!(
             state.get(0),
-            StateValue::Number(Interval { lo: 5.0, hi: 6.0 })
+            StateValue::number(Interval { lo: 5.0, hi: 6.0 })
         );
     }
 
     #[test]
     fn functional_updater_branch_joins() {
         let (mut env, mut state, mut memo) = empty();
-        state.update(0, StateValue::Number(Interval::point(3.0)));
+        state.update(0, StateValue::number(Interval::point(3.0)));
         env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
         let mut blocks = std::collections::HashMap::new();
         blocks.insert(
@@ -683,7 +727,7 @@ mod tests {
 
         assert_eq!(
             state.get(0),
-            StateValue::Number(Interval { lo: 0.0, hi: 3.0 })
+            StateValue::number(Interval { lo: 0.0, hi: 3.0 })
         );
     }
 
@@ -712,7 +756,7 @@ mod tests {
         };
 
         let mut entry_env = AbstractEnv::new();
-        entry_env.extend("c".to_string(), StateValue::Number(Interval::point(0.0)));
+        entry_env.extend("c".to_string(), StateValue::number(Interval::point(0.0)));
         let mut state = StateStore::bottom();
         let mut memo = MemoStore::new();
 
@@ -723,7 +767,7 @@ mod tests {
             &entry_env,
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
-        assert_eq!(result, StateValue::Top);
+        assert_eq!(result, StateValue::top());
     }
 
     /// Build a `while`-shaped body CFG (`pre → header ⇄ body`; `header → exit`)
@@ -809,9 +853,9 @@ mod tests {
         // A setter inside a while-loop body must fire (side-effect traversal) even
         // though the body has a back edge; the body's return value is Top.
         let (mut env, mut state, mut memo) = empty();
-        state.update(0, StateValue::Number(Interval::point(0.0)));
+        state.update(0, StateValue::number(Interval::point(0.0)));
         env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
         let body_cfg = while_loop_body(vec![setter_call(
             "setN",
@@ -833,10 +877,10 @@ mod tests {
         // setN(state[0] + 1) fired once → state[0] grew off the initial point.
         assert_eq!(
             state.get(0),
-            StateValue::Number(Interval { lo: 0.0, hi: 1.0 })
+            StateValue::number(Interval { lo: 0.0, hi: 1.0 })
         );
         // Back edge present → return value conservatively Top.
-        assert_eq!(ret, StateValue::Top);
+        assert_eq!(ret, StateValue::top());
     }
 
     #[test]
@@ -844,9 +888,9 @@ mod tests {
         // `for`-shaped body (pre → header ⇄ body → update → header; header → exit).
         // The setter in the body block must fire despite the back edge.
         let (mut env, mut state, mut memo) = empty();
-        state.update(0, StateValue::Number(Interval::point(0.0)));
+        state.update(0, StateValue::number(Interval::point(0.0)));
         env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
         let mut blocks = std::collections::HashMap::new();
         blocks.insert(
@@ -942,9 +986,9 @@ mod tests {
 
         assert_eq!(
             state.get(0),
-            StateValue::Number(Interval { lo: 0.0, hi: 1.0 })
+            StateValue::number(Interval { lo: 0.0, hi: 1.0 })
         );
-        assert_eq!(ret, StateValue::Top);
+        assert_eq!(ret, StateValue::top());
     }
 
     #[test]
@@ -953,13 +997,13 @@ mod tests {
         // The body has a back edge → the functional-updater result is Top (state 0
         // → Top), but the inner setOther for state 1 still fires.
         let (mut env, mut state, mut memo) = empty();
-        state.update(0, StateValue::Number(Interval::point(5.0)));
+        state.update(0, StateValue::number(Interval::point(5.0)));
         env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
         env.bind_setter("setOther".to_string(), 1);
         env.extend(
             "setOther".to_string(),
-            StateValue::Reference(Stability::Stable),
+            StateValue::reference(Stability::Stable),
         );
 
         // Reuse the while shape but give block 3 (exit) a real `c + 1` return.
@@ -988,9 +1032,9 @@ mod tests {
         );
 
         // Functional updater body has a back edge → its return value is Top.
-        assert_eq!(state.get(0), StateValue::Top);
+        assert_eq!(state.get(0), StateValue::top());
         // The inner setOther(1) fired during the side-effect traversal.
-        assert_eq!(state.get(1), StateValue::Number(Interval::point(1.0)));
+        assert_eq!(state.get(1), StateValue::number(Interval::point(1.0)));
     }
 
     // ── callback traversal ────────────────────────────────────────────────────
@@ -998,11 +1042,11 @@ mod tests {
     #[test]
     fn then_callback_updates_state() {
         let (mut env, mut state, mut memo) = empty();
-        state.update(0, StateValue::Number(Interval::point(0.0)));
+        state.update(0, StateValue::number(Interval::point(0.0)));
         env.bind_setter("setUser".to_string(), 0);
         env.extend(
             "setUser".to_string(),
-            StateValue::Reference(Stability::Stable),
+            StateValue::reference(Stability::Stable),
         );
 
         let cb_body = single_block_cfg(
@@ -1039,14 +1083,14 @@ mod tests {
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
 
-        assert_eq!(state.get(0), StateValue::Top);
+        assert_eq!(state.get(0), StateValue::top());
     }
 
     #[test]
     fn set_timeout_callback_updates_state() {
         let (mut env, mut state, mut memo) = empty();
         env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -1079,16 +1123,16 @@ mod tests {
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
 
-        assert_eq!(state.get(0), StateValue::Number(Interval::point(42.0)));
+        assert_eq!(state.get(0), StateValue::number(Interval::point(42.0)));
     }
 
     #[test]
     fn then_chain_descends_both_callbacks() {
         let (mut env, mut state, mut memo) = empty();
         env.bind_setter("setA".to_string(), 0);
-        env.extend("setA".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("setA".to_string(), StateValue::reference(Stability::Stable));
         env.bind_setter("setB".to_string(), 1);
-        env.extend("setB".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("setB".to_string(), StateValue::reference(Stability::Stable));
 
         let cb_a = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -1139,15 +1183,15 @@ mod tests {
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
 
-        assert_eq!(state.get(0), StateValue::Number(Interval::point(1.0)));
-        assert_eq!(state.get(1), StateValue::Number(Interval::point(2.0)));
+        assert_eq!(state.get(0), StateValue::number(Interval::point(1.0)));
+        assert_eq!(state.get(1), StateValue::number(Interval::point(2.0)));
     }
 
     #[test]
     fn then_in_let_binding_descends() {
         let (mut env, mut state, mut memo) = empty();
         env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
         let cb = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -1184,14 +1228,14 @@ mod tests {
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
 
-        assert_eq!(state.get(0), StateValue::Number(Interval::point(7.0)));
+        assert_eq!(state.get(0), StateValue::number(Interval::point(7.0)));
     }
 
     #[test]
     fn subscription_callback_not_descended() {
         let (mut env, mut state, mut memo) = empty();
         env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
         let cb = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -1227,16 +1271,16 @@ mod tests {
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
 
-        assert_eq!(state.get(0), StateValue::Bottom);
+        assert_eq!(state.get(0), StateValue::bottom());
     }
 
     #[test]
     fn then_both_args_descended() {
         let (mut env, mut state, mut memo) = empty();
         env.bind_setter("setA".to_string(), 0);
-        env.extend("setA".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("setA".to_string(), StateValue::reference(Stability::Stable));
         env.bind_setter("setB".to_string(), 1);
-        env.extend("setB".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("setB".to_string(), StateValue::reference(Stability::Stable));
 
         let on_fulfilled = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -1286,15 +1330,15 @@ mod tests {
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
 
-        assert_eq!(state.get(0), StateValue::Number(Interval::point(1.0)));
-        assert_eq!(state.get(1), StateValue::Number(Interval::point(2.0)));
+        assert_eq!(state.get(0), StateValue::number(Interval::point(1.0)));
+        assert_eq!(state.get(1), StateValue::number(Interval::point(2.0)));
     }
 
     #[test]
     fn promise_all_settled_then_cb_descended() {
         let (mut env, mut state, mut memo) = empty();
         env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
         let cb = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -1336,7 +1380,7 @@ mod tests {
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
 
-        assert_eq!(state.get(0), StateValue::Number(Interval::point(42.0)));
+        assert_eq!(state.get(0), StateValue::number(Interval::point(42.0)));
     }
 
     // ── B5: variable callback resolution ─────────────────────────────────────
@@ -1345,7 +1389,7 @@ mod tests {
     fn var_callback_updates_state() {
         let (mut env, mut state, mut memo) = empty();
         env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -1386,14 +1430,14 @@ mod tests {
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
 
-        assert_eq!(state.get(0), StateValue::Number(Interval::point(42.0)));
+        assert_eq!(state.get(0), StateValue::number(Interval::point(42.0)));
     }
 
     #[test]
     fn var_callback_not_descended_without_loc() {
         let (mut env, mut state, mut memo) = empty();
         env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -1405,7 +1449,7 @@ mod tests {
             )],
             Expr::Lit(Prim::Unit),
         );
-        env.extend("cb".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("cb".to_string(), StateValue::reference(Stability::Stable));
 
         let call = Stmt::ExprStmt(
             Expr::Call {
@@ -1429,7 +1473,7 @@ mod tests {
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
 
-        assert_eq!(state.get(0), StateValue::Bottom);
+        assert_eq!(state.get(0), StateValue::bottom());
     }
 
     // ── B6: direct local call inlining ────────────────────────────────────────
@@ -1440,7 +1484,7 @@ mod tests {
         env.bind_setter("setUser".to_string(), 0);
         env.extend(
             "setUser".to_string(),
-            StateValue::Reference(Stability::Stable),
+            StateValue::reference(Stability::Stable),
         );
 
         let load_body = single_block_cfg(
@@ -1482,14 +1526,14 @@ mod tests {
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
 
-        assert_eq!(state.get(0), StateValue::Number(Interval::point(7.0)));
+        assert_eq!(state.get(0), StateValue::number(Interval::point(7.0)));
     }
 
     #[test]
     fn set_interval_var_callback_updates_state() {
         let (mut env, mut state, mut memo) = empty();
         env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -1528,14 +1572,14 @@ mod tests {
             &mut env,
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
-        assert_eq!(state.get(0), StateValue::Number(Interval::point(5.0)));
+        assert_eq!(state.get(0), StateValue::number(Interval::point(5.0)));
     }
 
     #[test]
     fn for_each_var_callback_updates_state() {
         let (mut env, mut state, mut memo) = empty();
         env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
         let cb_body = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -1577,14 +1621,14 @@ mod tests {
             &mut env,
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
-        assert_eq!(state.get(0), StateValue::Number(Interval::point(3.0)));
+        assert_eq!(state.get(0), StateValue::number(Interval::point(3.0)));
     }
 
     #[test]
     fn nested_var_callbacks_both_executed() {
         let (mut env, mut state, mut memo) = empty();
         env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
         let inner_body = single_block_cfg(
             vec![Stmt::ExprStmt(
@@ -1650,14 +1694,14 @@ mod tests {
             &mut env,
             &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
         );
-        assert_eq!(state.get(0), StateValue::Number(Interval::point(9.0)));
+        assert_eq!(state.get(0), StateValue::number(Interval::point(9.0)));
     }
 
     #[test]
     fn depth_limit_stops_deep_inlining() {
         let (mut env, mut state, mut memo) = empty();
         env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
         let make_body = |callee: &str| -> Arc<CFG> {
             Arc::new(single_block_cfg(
@@ -1737,7 +1781,7 @@ mod tests {
                 &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
             );
         }
-        assert_eq!(state.get(0), StateValue::Bottom);
+        assert_eq!(state.get(0), StateValue::bottom());
     }
 
     #[test]
@@ -1748,7 +1792,7 @@ mod tests {
         // the chain: setN at depth 4 is never reached → state stays Bottom.
         let (mut env, mut state, mut memo) = empty();
         env.bind_setter("setN".to_string(), 0);
-        env.extend("setN".to_string(), StateValue::Reference(Stability::Stable));
+        env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
         // A loop body whose single body-block statement calls `callee()`.
         let make_loop_wrapper = |callee: &str| -> Arc<CFG> {
@@ -1818,6 +1862,6 @@ mod tests {
                 &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
             );
         }
-        assert_eq!(state.get(0), StateValue::Bottom);
+        assert_eq!(state.get(0), StateValue::bottom());
     }
 }

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::domains::StateValue;
+use crate::domains::{AbstractDomain, StateValue};
 
 // ── HookSummary trait ─────────────────────────────────────────────────────────
 
@@ -12,7 +12,7 @@ pub trait HookSummary: Send + Sync {
     /// Compute the abstract return value of this hook given abstract arg values.
     /// Default: `Top` (most conservative completely unknown).
     fn summarize(&self, _args: &[StateValue]) -> StateValue {
-        StateValue::Top
+        StateValue::top()
     }
 }
 
@@ -171,7 +171,7 @@ mod tests {
                 "useFixed"
             }
             fn summarize(&self, _: &[StateValue]) -> StateValue {
-                StateValue::Null
+                StateValue::null()
             }
         }
         let mut r = SummaryRegistry::new();
@@ -180,7 +180,7 @@ mod tests {
         assert!(r.contains("useFixed", None));
         assert!(r.contains("useFixed", Some("some-package")));
         let s = r.get("useFixed", None).unwrap();
-        assert_eq!(s.summarize(&[]), StateValue::Null);
+        assert_eq!(s.summarize(&[]), StateValue::null());
     }
 
     #[test]
@@ -206,7 +206,7 @@ mod tests {
                 "useX"
             }
             fn summarize(&self, _: &[StateValue]) -> StateValue {
-                StateValue::Null
+                StateValue::null()
             }
         }
         struct Unscoped;
@@ -215,7 +215,7 @@ mod tests {
                 "useX"
             }
             fn summarize(&self, _: &[StateValue]) -> StateValue {
-                StateValue::Top
+                StateValue::top()
             }
         }
         let mut r = SummaryRegistry::new();
@@ -223,9 +223,9 @@ mod tests {
         r.register(Box::new(Unscoped));
         assert_eq!(
             r.get("useX", Some("pkg")).unwrap().summarize(&[]),
-            StateValue::Null
+            StateValue::null()
         );
-        assert_eq!(r.get("useX", None).unwrap().summarize(&[]), StateValue::Top);
+        assert_eq!(r.get("useX", None).unwrap().summarize(&[]), StateValue::top());
     }
 
     #[test]
@@ -233,7 +233,7 @@ mod tests {
         let mut r = SummaryRegistry::new();
         r.register_many_for_package("my-pkg", &["useTopHook"]);
         let s = r.get("useTopHook", Some("my-pkg")).unwrap();
-        assert_eq!(s.summarize(&[]), StateValue::Top);
+        assert_eq!(s.summarize(&[]), StateValue::top());
     }
 
     #[test]

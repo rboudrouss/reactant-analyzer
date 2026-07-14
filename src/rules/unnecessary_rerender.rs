@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use crate::{
     domains::{
-        AbstractEnv, AnalysisCtx, MemoStore, StateStore, StateValue, StateValueTransfer, Transfer,
+        AbstractDomain, AbstractEnv, AnalysisCtx, MemoStore, StateStore, StateValue,
+        StateValueTransfer, Transfer,
     },
     engine::ProgramAnalysisResult,
     ir::{
@@ -115,7 +116,7 @@ impl Rule for UnnecessaryRerender {
                                 &mut AnalysisCtx::null(&mut s, &mut m, &mut h),
                             )
                         })
-                        .unwrap_or(StateValue::Top);
+                        .unwrap_or(StateValue::top());
 
                     if !arg_val.is_stable() {
                         continue;
@@ -202,7 +203,6 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init,
-                type_hint: None,
                 span: None,
             },
             HookEntry::Effect {

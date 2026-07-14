@@ -117,5 +117,5 @@ Full list in [docs/TODO.md](docs/TODO.md).
 
 ```sh
 cargo build --release    # binary at target/release/reactant
-cargo test               # ~496 tests, runs in a few seconds
+cargo test               # ~533 tests, runs in a few seconds
 ```

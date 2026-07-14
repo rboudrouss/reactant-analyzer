@@ -145,7 +145,14 @@ pub fn analyze_cfg<'inter, T: Transfer>(
 
 /// Refine `env` by applying the constraint implied by `cond` on the chosen branch.
 ///
-/// Handles `BinOp { op, lhs: Var(x), rhs: Lit(Int|Float) }`.
+/// Handles:
+/// - `BinOp { op, lhs: Var(x), rhs: Lit(Int|Float) }` → numeric interval narrowing
+/// - `BinOp { Eq|Neq, lhs: Var(x), rhs: Lit(Null|Unit) }` → nullability narrowing
+///   (the IR conflates `==`/`===`, so refinements are the sound envelope of both:
+///   the positive `== null` branch keeps null AND undefined; the negative branch
+///   only drops the compared literal)
+/// - `Var(x)` / `!x` truthiness → drops null/undefined on the truthy branch
+///
 /// `taken = true` → then-branch constraint; `taken = false` → else-branch (negated).
 /// Falls through to cloning env unchanged for unrecognised patterns.
 fn narrow_env_for_branch<D: AbstractDomain>(
@@ -153,35 +160,94 @@ fn narrow_env_for_branch<D: AbstractDomain>(
     cond: &Expr,
     taken: bool,
 ) -> AbstractEnv<D> {
-    if let Expr::BinOp { op, lhs, rhs } = cond {
-        let v = match rhs.as_ref() {
-            Expr::Lit(Prim::Int(n)) => Some(*n as f64),
-            Expr::Lit(Prim::Float(f)) => Some(*f),
-            _ => None,
-        };
-        if let (Expr::Var(x), Some(v)) = (lhs.as_ref(), v) {
-            let cur = env.lookup(x);
-            let refined = match (op, taken) {
-                (BinOp::Lt, true) => cur.narrow_lt(v),
-                (BinOp::Lt, false) => cur.narrow_geq(v),
-                (BinOp::Leq, true) => cur.narrow_leq(v),
-                (BinOp::Leq, false) => cur.narrow_gt(v),
-                (BinOp::Gt, true) => cur.narrow_gt(v),
-                (BinOp::Gt, false) => cur.narrow_leq(v),
-                (BinOp::Geq, true) => cur.narrow_geq(v),
-                (BinOp::Geq, false) => cur.narrow_lt(v),
-                (BinOp::Eq, true) => cur.narrow_eq(v),
-                (BinOp::Eq, false) => cur.narrow_neq(v),
-                (BinOp::Neq, true) => cur.narrow_neq(v),
-                (BinOp::Neq, false) => cur.narrow_eq(v),
-                _ => cur,
+    let with_refined = |x: &str, refined: D| {
+        let mut narrowed = env.clone();
+        narrowed.extend(x.to_string(), refined);
+        narrowed
+    };
+
+    match cond {
+        Expr::BinOp { op, lhs, rhs } => {
+            let Expr::Var(x) = lhs.as_ref() else {
+                return env.clone();
             };
-            let mut narrowed = env.clone();
-            narrowed.extend(x.clone(), refined);
-            return narrowed;
+            match rhs.as_ref() {
+                Expr::Lit(Prim::Int(_) | Prim::Float(_)) => {
+                    let v = match rhs.as_ref() {
+                        Expr::Lit(Prim::Int(n)) => *n as f64,
+                        Expr::Lit(Prim::Float(f)) => *f,
+                        _ => unreachable!(),
+                    };
+                    let cur = env.lookup(x);
+                    let refined = match (op, taken) {
+                        (BinOp::Lt, true) => cur.narrow_lt(v),
+                        (BinOp::Lt, false) => cur.narrow_geq(v),
+                        (BinOp::Leq, true) => cur.narrow_leq(v),
+                        (BinOp::Leq, false) => cur.narrow_gt(v),
+                        (BinOp::Gt, true) => cur.narrow_gt(v),
+                        (BinOp::Gt, false) => cur.narrow_leq(v),
+                        (BinOp::Geq, true) => cur.narrow_geq(v),
+                        (BinOp::Geq, false) => cur.narrow_lt(v),
+                        (BinOp::Eq, true) => cur.narrow_eq(v),
+                        (BinOp::Eq, false) => cur.narrow_neq(v),
+                        (BinOp::Neq, true) => cur.narrow_neq(v),
+                        (BinOp::Neq, false) => cur.narrow_eq(v),
+                        _ => cur,
+                    };
+                    with_refined(x, refined)
+                }
+                Expr::Lit(Prim::Null) => {
+                    let cur = env.lookup(x);
+                    let refined = match (op, taken) {
+                        (BinOp::Eq, true) | (BinOp::Neq, false) => cur.narrow_keep_nullish_only(),
+                        (BinOp::Eq, false) | (BinOp::Neq, true) => cur.narrow_drop_null(),
+                        _ => cur,
+                    };
+                    with_refined(x, refined)
+                }
+                Expr::Lit(Prim::Unit) => {
+                    let cur = env.lookup(x);
+                    let refined = match (op, taken) {
+                        (BinOp::Eq, true) | (BinOp::Neq, false) => cur.narrow_keep_nullish_only(),
+                        (BinOp::Eq, false) | (BinOp::Neq, true) => cur.narrow_drop_undef(),
+                        _ => cur,
+                    };
+                    with_refined(x, refined)
+                }
+                _ => env.clone(),
+            }
         }
+        // Truthiness guard `if (x)`: the taken branch excludes every falsy
+        // value (null, undefined, 0, "", false); the else branch keeps only
+        // the falsy ones (references are always truthy → ⊥ there).
+        Expr::Var(x) => with_refined(
+            x,
+            if taken {
+                env.lookup(x).narrow_truthy()
+            } else {
+                env.lookup(x).narrow_falsy()
+            },
+        ),
+        // `if (!x)`: branches swap — the ELSE branch is the truthy one.
+        Expr::UnaryOp {
+            op: crate::ir::expr::UnaryOp::Not,
+            arg,
+        } => {
+            if let Expr::Var(x) = arg.as_ref() {
+                with_refined(
+                    x,
+                    if taken {
+                        env.lookup(x).narrow_falsy()
+                    } else {
+                        env.lookup(x).narrow_truthy()
+                    },
+                )
+            } else {
+                env.clone()
+            }
+        }
+        _ => env.clone(),
     }
-    env.clone()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -260,7 +326,7 @@ mod tests {
         );
         assert_eq!(
             exit_envs[&0].lookup("x"),
-            StateValue::Number(Interval::point(42.0))
+            StateValue::number(Interval::point(42.0))
         );
     }
 
@@ -368,7 +434,7 @@ mod tests {
         let i = exit_envs[&1].lookup("i");
         assert_eq!(
             i,
-            StateValue::Number(Interval {
+            StateValue::number(Interval {
                 lo: 0.0,
                 hi: f64::INFINITY
             })
@@ -394,9 +460,9 @@ mod tests {
         // Threshold 5 caps the widen → loop-header `i` bounded to [0,5] (vs +∞),
         // and the loop-exit (else) block sees `i = [5,5]`.
         let header_i = exit_envs[&1].lookup("i");
-        assert_eq!(header_i, StateValue::Number(Interval { lo: 0.0, hi: 5.0 }));
+        assert_eq!(header_i, StateValue::number(Interval { lo: 0.0, hi: 5.0 }));
         let exit_i = exit_envs[&3].lookup("i");
-        assert_eq!(exit_i, StateValue::Number(Interval::point(5.0)));
+        assert_eq!(exit_i, StateValue::number(Interval::point(5.0)));
     }
 
     #[test]
@@ -433,7 +499,7 @@ mod tests {
             &NullCtx,
             None,
         );
-        assert_eq!(state_out.get(0), StateValue::Reference(Stability::Unstable));
+        assert_eq!(state_out.get(0), StateValue::reference(Stability::Unstable));
     }
 
     #[test]
@@ -490,7 +556,7 @@ mod tests {
         );
         assert_eq!(
             exit_envs[&1].lookup("x"),
-            StateValue::Reference(Stability::Unstable)
+            StateValue::reference(Stability::Unstable)
         );
     }
 
@@ -588,8 +654,12 @@ mod tests {
             &NullCtx,
             None,
         );
-        // join(Number([1,1]), Reference(Unstable)) = Top at merge block 3
-        assert_eq!(exit_envs[&3].lookup("x"), StateValue::Top);
+        // join(Number([1,1]), Reference(Unstable)) keeps both slots at merge
+        // block 3 (ADR-015 product) — no collapse to ⊤.
+        let x = exit_envs[&3].lookup("x");
+        assert_eq!(x.num, Interval::point(1.0));
+        assert_eq!(x.reference, Stability::Unstable);
+        assert!(!x.is_top_value());
     }
 
     #[test]
@@ -656,7 +726,7 @@ mod tests {
         let mut entry_env = AbstractEnv::bottom();
         entry_env.extend(
             "x".to_string(),
-            StateValue::Number(Interval {
+            StateValue::number(Interval {
                 lo: 0.0,
                 hi: f64::INFINITY,
             }),
@@ -678,12 +748,9 @@ mod tests {
 
         let then_x = exit_envs[&1].lookup("x");
         let else_x = exit_envs[&2].lookup("x");
-        assert!(matches!(then_x, StateValue::Number(i) if !i.is_bottom()));
+        assert!(!then_x.num.is_bottom());
         // else-branch: x >= 10 on [0,0] → bottom
-        assert!(
-            matches!(else_x, StateValue::Number(i) if i.is_bottom())
-                || else_x == StateValue::Bottom
-        );
+        assert!(else_x.num.is_bottom());
     }
 
     /// Setter call in Return terminator updates state (`() => setN(99)` concise-arrow).
@@ -726,7 +793,7 @@ mod tests {
 
         assert_eq!(
             state_out.get(0),
-            StateValue::Number(Interval::point(99.0)),
+            StateValue::number(Interval::point(99.0)),
             "setter in Return terminator must update state (concise-arrow regression)"
         );
     }
@@ -769,7 +836,7 @@ mod tests {
 
         assert_eq!(
             state_out.get(0),
-            StateValue::Bottom,
+            StateValue::bottom(),
             "Return(Lit(Unit)) must be a no-op for state"
         );
     }
@@ -826,7 +893,7 @@ mod tests {
 
         // Seed state[0] = Number([5,5]) so c+1 = 6.
         let mut initial_state = StateStore::bottom();
-        initial_state.update(0, StateValue::Number(Interval::point(5.0)));
+        initial_state.update(0, StateValue::number(Interval::point(5.0)));
 
         let mut heap = Heap::new();
         let (_, state_out) = analyze_cfg::<StateValueTransfer>(
@@ -845,7 +912,7 @@ mod tests {
         // c=5, c+1=6 → state[0] = join(5, 6) = [5,6].
         assert_eq!(
             state_out.get(0),
-            StateValue::Number(Interval { lo: 5.0, hi: 6.0 }),
+            StateValue::number(Interval { lo: 5.0, hi: 6.0 }),
             "functional updater in Return terminator must fire"
         );
     }

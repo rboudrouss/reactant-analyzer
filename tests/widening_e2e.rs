@@ -86,10 +86,11 @@ fn unbounded_counter_is_flagged_and_grows_to_infinity() {
         1,
         "unguarded self-increment must be flagged"
     );
-    match state0(&r, "UnboundedCounter") {
-        StateValue::Number(i) => assert!(i.hi.is_infinite(), "count must reach +∞ (got {i:?})"),
-        other => panic!("expected Number interval, got {other:?}"),
-    }
+    let v = state0(&r, "UnboundedCounter");
+    assert!(
+        !v.num.is_bottom() && v.num.hi.is_infinite(),
+        "count must reach +∞ (got {v:?})"
+    );
 }
 
 #[test]
@@ -105,7 +106,7 @@ fn guarded_counter_converges_bounded() {
     );
     assert_eq!(
         state0(&r, "GuardedCounter"),
-        StateValue::Number(Interval { lo: 0.0, hi: 10.0 }),
+        StateValue::number(Interval { lo: 0.0, hi: 10.0 }),
         "guarded counter must converge to [0, 10]"
     );
     // Regression: `[count]` is a primitive (value-compared) dep, not a fresh
@@ -124,7 +125,7 @@ fn bounded_local_loop_is_precise() {
     assert_eq!(infinite_loop_hits(&r, "BoundedLocalLoop"), 0);
     assert_eq!(
         state0(&r, "BoundedLocalLoop"),
-        StateValue::Number(Interval { lo: 0.0, hi: 5.0 }),
+        StateValue::number(Interval { lo: 0.0, hi: 5.0 }),
         "loop counter bounded by guard constant 5 → setter writes total ∈ [0, 5]"
     );
 }

@@ -190,9 +190,14 @@ impl Interval {
             Interval::bottom()
         }
     }
-    /// Conservative: can't split an interval at a point; return self.
-    pub fn narrow_neq(&self, _v: f64) -> Self {
-        *self
+    /// Conservative: can't split an interval at an interior point; return self.
+    /// Exception: a point interval equal to `v` is exactly excluded → ⊥.
+    pub fn narrow_neq(&self, v: f64) -> Self {
+        if self.is_point() && self.lo == v {
+            Interval::bottom()
+        } else {
+            *self
+        }
     }
 }
 

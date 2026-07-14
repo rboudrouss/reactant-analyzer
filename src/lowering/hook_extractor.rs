@@ -238,13 +238,13 @@ fn process_stmt(
             rhs,
             span: stmt_span,
         } => match try_consume_hook_call(rhs) {
-            Ok((name, args, type_hint)) => {
+            Ok((name, args)) => {
                 let lbl = *label;
                 *label += 1;
                 let is_state_like = matches!(name.as_str(), "useState" | "useReducer");
                 let is_arr_temp = var.starts_with("__arr_");
 
-                if let Some(entry) = make_hook_entry(&name, lbl, args, type_hint, stmt_span) {
+                if let Some(entry) = make_hook_entry(&name, lbl, args, stmt_span) {
                     hooks.push(entry);
                 }
 
@@ -284,10 +284,10 @@ fn process_stmt(
             }
         },
         Stmt::ExprStmt(expr, stmt_span) => match try_consume_hook_call(expr) {
-            Ok((name, args, _type_hint)) => {
+            Ok((name, args)) => {
                 let lbl = *label;
                 *label += 1;
-                if let Some(entry) = make_hook_entry(&name, lbl, args, None, stmt_span) {
+                if let Some(entry) = make_hook_entry(&name, lbl, args, stmt_span) {
                     hooks.push(entry);
                 }
                 // For Custom hooks without a binding, populate import_source + resolved_file.
@@ -318,15 +318,15 @@ fn process_stmt(
 
 // ── Hook call detection ───────────────────────────────────────────────────────
 
-/// Returns `Ok((hook_name, args, type_hint))` if `expr` is a `use*` call; else `Err(expr)`.
-fn try_consume_hook_call(
-    expr: Expr,
-) -> Result<(String, Vec<Expr>, Option<crate::ir::expr::TSType>), Expr> {
+/// Returns `Ok((hook_name, args))` if `expr` is a `use*` call; else `Err(expr)`.
+/// A `TSAnnotated` wrapper (`useState<T>(..)`) is looked through — the product
+/// value domain (ADR-015) no longer needs the generic-argument type hint.
+fn try_consume_hook_call(expr: Expr) -> Result<(String, Vec<Expr>), Expr> {
     match expr {
         Expr::TSAnnotated(inner, ts_type) => {
             if let Expr::Call { fn_, args } = *inner {
                 match hook_name_from_callee(&fn_) {
-                    Some(name) => Ok((name, args, Some(ts_type))),
+                    Some(name) => Ok((name, args)),
                     None => Err(Expr::TSAnnotated(
                         Box::new(Expr::Call { fn_, args }),
                         ts_type,
@@ -337,7 +337,7 @@ fn try_consume_hook_call(
             }
         }
         Expr::Call { fn_, args } => match hook_name_from_callee(&fn_) {
-            Some(name) => Ok((name, args, None)),
+            Some(name) => Ok((name, args)),
             None => Err(Expr::Call { fn_, args }),
         },
         other => Err(other),
@@ -361,19 +361,13 @@ fn make_hook_entry(
     name: &str,
     label: HookLabel,
     args: Vec<Expr>,
-    type_hint: Option<crate::ir::expr::TSType>,
     span: Option<SourceRange>,
 ) -> Option<HookEntry> {
     let mut it = args.into_iter();
     match name {
         "useState" => {
             let init = it.next().unwrap_or(Expr::Lit(Prim::Unit));
-            Some(HookEntry::State {
-                label,
-                init,
-                type_hint,
-                span,
-            })
+            Some(HookEntry::State { label, init, span })
         }
         "useEffect" => {
             let body_cfg = it
@@ -421,12 +415,7 @@ fn make_hook_entry(
         "useReducer" => {
             let _reducer = it.next(); // skip reducer fn
             let init = it.next().unwrap_or(Expr::Lit(Prim::Unit));
-            Some(HookEntry::State {
-                label,
-                init,
-                type_hint,
-                span,
-            })
+            Some(HookEntry::State { label, init, span })
         }
         "useLayoutEffect" | "useInsertionEffect" => {
             let body_cfg = it

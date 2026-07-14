@@ -19,12 +19,12 @@ impl SharedStateStore {
         Self::default()
     }
 
-    /// Returns `StateValue::Bottom` for unknown entries.
+    /// Returns `StateValue::bottom()` for unknown entries.
     pub fn get(&self, comp: &Symbol, label: HookLabel) -> StateValue {
         self.entries
             .get(&(comp.clone(), label))
             .cloned()
-            .unwrap_or(StateValue::Bottom)
+            .unwrap_or(StateValue::bottom())
     }
 
     /// Monotone update: `self[(comp, label)] = self[(comp, label)] ⊔ val`.
@@ -34,7 +34,7 @@ impl SharedStateStore {
             .entries
             .get(&key)
             .cloned()
-            .unwrap_or(StateValue::Bottom);
+            .unwrap_or(StateValue::bottom());
         self.entries.insert(key, current.join(&val));
     }
 
@@ -42,7 +42,7 @@ impl SharedStateStore {
     pub fn join(&self, other: &Self) -> Self {
         let mut out = self.entries.clone();
         for (k, v) in &other.entries {
-            let cur = out.get(k).cloned().unwrap_or(StateValue::Bottom);
+            let cur = out.get(k).cloned().unwrap_or(StateValue::bottom());
             out.insert(k.clone(), cur.join(v));
         }
         SharedStateStore { entries: out }
@@ -84,7 +84,7 @@ mod tests {
     #[test]
     fn get_unknown_is_bottom() {
         let s = SharedStateStore::new();
-        assert_eq!(s.get(&"Foo".to_string(), 0), StateValue::Bottom);
+        assert_eq!(s.get(&"Foo".to_string(), 0), StateValue::bottom());
     }
 
     #[test]
@@ -93,21 +93,21 @@ mod tests {
         s.update(
             &"Foo".to_string(),
             0,
-            StateValue::Number(Interval::point(1.0)),
+            StateValue::number(Interval::point(1.0)),
         );
         assert_eq!(
             s.get(&"Foo".to_string(), 0),
-            StateValue::Number(Interval::point(1.0))
+            StateValue::number(Interval::point(1.0))
         );
         // update again with different value → join
         s.update(
             &"Foo".to_string(),
             0,
-            StateValue::Number(Interval::point(2.0)),
+            StateValue::number(Interval::point(2.0)),
         );
         assert_eq!(
             s.get(&"Foo".to_string(), 0),
-            StateValue::Number(Interval { lo: 1.0, hi: 2.0 })
+            StateValue::number(Interval { lo: 1.0, hi: 2.0 })
         );
     }
 
@@ -117,20 +117,20 @@ mod tests {
         s.update(
             &"A".to_string(),
             0,
-            StateValue::Number(Interval::point(1.0)),
+            StateValue::number(Interval::point(1.0)),
         );
         s.update(
             &"B".to_string(),
             0,
-            StateValue::Number(Interval::point(2.0)),
+            StateValue::number(Interval::point(2.0)),
         );
         assert_eq!(
             s.get(&"A".to_string(), 0),
-            StateValue::Number(Interval::point(1.0))
+            StateValue::number(Interval::point(1.0))
         );
         assert_eq!(
             s.get(&"B".to_string(), 0),
-            StateValue::Number(Interval::point(2.0))
+            StateValue::number(Interval::point(2.0))
         );
     }
 
@@ -140,24 +140,24 @@ mod tests {
         s.update(
             &"A".to_string(),
             0,
-            StateValue::Number(Interval::point(5.0)),
+            StateValue::number(Interval::point(5.0)),
         );
         s.update(
             &"A".to_string(),
             1,
-            StateValue::Number(Interval::point(7.0)),
+            StateValue::number(Interval::point(7.0)),
         );
         s.update(
             &"B".to_string(),
             0,
-            StateValue::Number(Interval::point(99.0)),
+            StateValue::number(Interval::point(99.0)),
         );
 
         let slice = s.slice(&"A".to_string());
-        assert_eq!(slice.get(0), StateValue::Number(Interval::point(5.0)));
-        assert_eq!(slice.get(1), StateValue::Number(Interval::point(7.0)));
+        assert_eq!(slice.get(0), StateValue::number(Interval::point(5.0)));
+        assert_eq!(slice.get(1), StateValue::number(Interval::point(7.0)));
         // B's slot 0 not in A's slice
-        assert_eq!(slice.get(99), StateValue::Bottom);
+        assert_eq!(slice.get(99), StateValue::bottom());
     }
 
     #[test]
@@ -166,28 +166,28 @@ mod tests {
         a.update(
             &"X".to_string(),
             0,
-            StateValue::Number(Interval::point(1.0)),
+            StateValue::number(Interval::point(1.0)),
         );
         let mut b = SharedStateStore::new();
         b.update(
             &"X".to_string(),
             0,
-            StateValue::Number(Interval::point(2.0)),
+            StateValue::number(Interval::point(2.0)),
         );
         b.update(
             &"Y".to_string(),
             0,
-            StateValue::Number(Interval::point(3.0)),
+            StateValue::number(Interval::point(3.0)),
         );
 
         let j = a.join(&b);
         assert_eq!(
             j.get(&"X".to_string(), 0),
-            StateValue::Number(Interval { lo: 1.0, hi: 2.0 })
+            StateValue::number(Interval { lo: 1.0, hi: 2.0 })
         );
         assert_eq!(
             j.get(&"Y".to_string(), 0),
-            StateValue::Number(Interval::point(3.0))
+            StateValue::number(Interval::point(3.0))
         );
     }
 
@@ -198,7 +198,7 @@ mod tests {
         other.update(
             &"X".to_string(),
             0,
-            StateValue::Number(Interval::point(1.0)),
+            StateValue::number(Interval::point(1.0)),
         );
         assert!(empty.leq(&other));
         assert!(!other.leq(&empty));

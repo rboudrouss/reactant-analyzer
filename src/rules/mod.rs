@@ -212,9 +212,9 @@ pub(super) fn collect_component_setter_vars(
             if result.contains_key(var) {
                 continue;
             }
-            // Direct ComponentSetter stab value.
-            if let StateValue::ComponentSetter { component, label } = env.lookup(var) {
-                result.insert(var.clone(), (component, label));
+            // Direct component-setter value (exact setter slot).
+            if let Some((component, label)) = env.lookup(var).as_setter() {
+                result.insert(var.clone(), (component.clone(), *label));
                 continue;
             }
             // Loc pointing to a FnLit that captures a ComponentSetter
@@ -223,7 +223,7 @@ pub(super) fn collect_component_setter_vars(
                 for id in ids {
                     if let Some(HeapValue::Fn { captured, .. }) = heap.get(id) {
                         for val in captured.values() {
-                            if let StateValue::ComponentSetter { component, label } = val {
+                            if let Some((component, label)) = val.as_setter() {
                                 result.insert(var.clone(), (component.clone(), *label));
                                 break;
                             }

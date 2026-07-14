@@ -250,12 +250,7 @@ fn exec_setter_call<T: Transfer>(
             transfer
                 .eval_expr(fn_, env, ctx)
                 .as_state_value()
-                .and_then(|sv| match sv {
-                    crate::domains::StateValue::ComponentSetter { component, label } => {
-                        Some((component, label))
-                    }
-                    _ => None,
-                });
+                .and_then(|sv| sv.as_setter().map(|(c, l)| (c.clone(), *l)));
         if let Some((component, label)) = comp_setter
             && ctx.inter.is_some()
         {
@@ -263,7 +258,7 @@ fn exec_setter_call<T: Transfer>(
                 .first()
                 .map(|a| transfer.eval_expr(a, env, ctx))
                 .and_then(|v| v.as_state_value())
-                .unwrap_or(crate::domains::StateValue::Top);
+                .unwrap_or(crate::domains::StateValue::top());
             if let Some(inter) = &ctx.inter {
                 inter
                     .shared_state

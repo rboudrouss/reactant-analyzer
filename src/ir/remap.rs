@@ -166,15 +166,9 @@ pub fn remap_hooks(hooks: Vec<HookEntry>, offset: HookLabel) -> Vec<HookEntry> {
 
 fn remap_hook_entry(entry: HookEntry, offset: HookLabel) -> HookEntry {
     match entry {
-        HookEntry::State {
-            label,
-            init,
-            type_hint,
-            span,
-        } => HookEntry::State {
+        HookEntry::State { label, init, span } => HookEntry::State {
             label: label + offset,
             init: remap_expr(init, offset),
-            type_hint,
             span,
         },
         HookEntry::Effect {
@@ -324,7 +318,6 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
-                type_hint: None,
                 span: None,
             },
             HookEntry::Effect {

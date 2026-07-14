@@ -96,7 +96,7 @@ mod tests {
     use super::*;
     use crate::{
         domains::{
-            Stability, StateValue,
+            AbstractDomain, Stability, StateValue,
             stores::{AbstractEnv, MemoStore, StateStore},
         },
         engine::{AnalysisResult, EffectInfo, HookKind, ProgramAnalysisResult},
@@ -188,7 +188,7 @@ mod tests {
         let mut block_states = HashMap::new();
         block_states.insert(
             0,
-            env_with(&[("n", StateValue::Reference(Stability::Unstable))]),
+            env_with(&[("n", StateValue::reference(Stability::Unstable))]),
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
@@ -214,7 +214,7 @@ mod tests {
         let mut block_states = HashMap::new();
         block_states.insert(
             0,
-            env_with(&[("setN", StateValue::Reference(Stability::Stable))]),
+            env_with(&[("setN", StateValue::reference(Stability::Stable))]),
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
@@ -242,7 +242,7 @@ mod tests {
         let mut block_states = HashMap::new();
         block_states.insert(
             0,
-            env_with(&[("n", StateValue::Reference(Stability::Unstable))]),
+            env_with(&[("n", StateValue::reference(Stability::Unstable))]),
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
@@ -270,7 +270,7 @@ mod tests {
         let mut block_states = HashMap::new();
         block_states.insert(
             0,
-            env_with(&[("n", StateValue::Reference(Stability::Unstable))]),
+            env_with(&[("n", StateValue::reference(Stability::Unstable))]),
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
@@ -301,7 +301,7 @@ mod tests {
         let mut block_states = HashMap::new();
         block_states.insert(
             0,
-            env_with(&[("n", StateValue::Reference(Stability::Unstable))]),
+            env_with(&[("n", StateValue::reference(Stability::Unstable))]),
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
@@ -329,7 +329,7 @@ mod tests {
             },
         );
         let mut block_states = HashMap::new();
-        block_states.insert(0, env_with(&[("x", StateValue::Top)]));
+        block_states.insert(0, env_with(&[("x", StateValue::top())]));
 
         let result = make_result(block_states, effect_info, trivial_cfg());
         let diags = MissingDeps.check(&prog(&result), &"C".to_string());
@@ -355,7 +355,7 @@ mod tests {
         let mut block_states = HashMap::new();
         block_states.insert(
             0,
-            env_with(&[("n", StateValue::Reference(Stability::Unstable))]),
+            env_with(&[("n", StateValue::reference(Stability::Unstable))]),
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
@@ -386,7 +386,7 @@ mod tests {
         let mut block_states = HashMap::new();
         block_states.insert(
             0,
-            env_with(&[("n", StateValue::Reference(Stability::Unstable))]),
+            env_with(&[("n", StateValue::reference(Stability::Unstable))]),
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
@@ -416,7 +416,7 @@ mod tests {
         let mut block_states = HashMap::new();
         block_states.insert(
             0,
-            env_with(&[("n", StateValue::Reference(Stability::Unstable))]),
+            env_with(&[("n", StateValue::reference(Stability::Unstable))]),
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());

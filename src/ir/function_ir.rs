@@ -3,7 +3,7 @@
 //! Distinct from [`crate::ir::HookIR`] because utilities cannot contain hook
 //! calls (React's Rules of Hooks). Used as the inlining target for
 //! statement-level calls like `doOrNot(setX(...))` whose body would otherwise
-//! be opaque (`StateValue::Top`).
+//! be opaque (`StateValue::top()`).
 
 use std::path::PathBuf;
 
