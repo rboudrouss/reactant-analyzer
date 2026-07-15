@@ -1,0 +1,95 @@
+//! Command-line interface (ADR-016).
+//!
+//! Subcommands: `check` (default — `reactant src/` still works), `rules`,
+//! `explain <rule>`. Exit codes: 0 clean (or `--fail-on never`), 1 findings
+//! at or above the `--fail-on` threshold, 2 usage/IO error.
+
+mod check;
+mod color;
+mod explain;
+mod output_human;
+mod output_json;
+mod rules_cmd;
+
+use clap::{Parser, Subcommand, ValueEnum};
+
+pub const EXIT_OK: i32 = 0;
+pub const EXIT_FINDINGS: i32 = 1;
+pub const EXIT_USAGE: i32 = 2;
+
+#[derive(Parser)]
+#[command(
+    name = "reactant",
+    version,
+    about = "Static analyzer for React hook bugs, based on abstract interpretation",
+    args_conflicts_with_subcommands = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Legacy form: `reactant src/` behaves like `reactant check src/`.
+    #[command(flatten)]
+    check: check::CheckArgs,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Analyze files or directories (the default subcommand)
+    Check(check::CheckArgs),
+    /// List every diagnostic the analyzer can emit
+    Rules,
+    /// Show the full documentation of one diagnostic
+    Explain {
+        /// Diagnostic name, e.g. `infinite-loop` (see `reactant rules`)
+        rule: String,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    /// Grouped, colored, human-readable report
+    Human,
+    /// One JSON document on stdout (schema v1, see docs/usage.md)
+    Json,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum FailOn {
+    /// Exit 1 only when errors are found
+    Error,
+    /// Exit 1 when errors or warnings are found (default)
+    Warning,
+    /// Always exit 0, regardless of findings
+    Never,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ProjectMode {
+    /// Detect the project kind from marker files (vite.config.* → vite)
+    Auto,
+    /// Force Vite conventions (src/ discovery, tsconfig paths aliases)
+    Vite,
+    /// Disable detection: walk paths as-is, relative imports only
+    Plain,
+}
+
+/// Parse arguments, dispatch, and return the process exit code.
+pub fn run() -> i32 {
+    let cli = Cli::parse();
+    match cli.command {
+        Some(Command::Check(args)) => check::run(args),
+        Some(Command::Rules) => rules_cmd::run(),
+        Some(Command::Explain { rule }) => explain::run(&rule),
+        None => {
+            if cli.check.paths.is_empty() {
+                // Bare `reactant`: print help, exit as a usage error.
+                use clap::CommandFactory;
+                let _ = Cli::command().print_help();
+                println!();
+                return EXIT_USAGE;
+            }
+            check::run(cli.check)
+        }
+    }
+}

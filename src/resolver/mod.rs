@@ -13,6 +13,7 @@ use crate::{
         ComponentRegistry, Config, FunctionRegistry, HookRegistry, ProgramAnalysisResult,
         RootStrategy, analyze_program,
     },
+    ir::{component::ComponentIR, function_ir::FunctionIR, hook_ir::HookIR},
     lowering::{
         compute_line_starts, lower_custom_hooks_with_resolver, lower_program_with_resolver,
         utility_lowerer::lower_utilities_with_resolver,
@@ -33,7 +34,126 @@ pub trait ImportResolver: Send + Sync {
 pub struct DefaultFileDiscoverer;
 pub struct DefaultImportResolver;
 
-// ── Plugin-facing high-level entry point ─────────────────────────────────────
+// ── Plugin-facing high-level entry points ────────────────────────────────────
+
+/// Output of the parse+lower phase over a set of files, before any analysis.
+///
+/// Produced by [`lower_files`]; consumed by [`analyze_lowered`]. Splitting the
+/// pipeline here lets callers inspect the lowered IR (component names, files,
+/// hook counts) before running the fixpoint — the CLI uses this to build its
+/// display-name → file map.
+pub struct LoweredProgram {
+    pub components: Vec<ComponentIR>,
+    pub hooks: Vec<HookIR>,
+    pub utilities: Vec<FunctionIR>,
+    /// Number of files successfully parsed and lowered.
+    pub file_count: usize,
+    /// Files skipped due to read or parse errors, with the error message.
+    /// Not printed here — the caller decides how to report them.
+    pub parse_errors: Vec<(PathBuf, String)>,
+}
+
+/// Parse and lower an explicit list of files with the given `ImportResolver`.
+///
+/// Read/parse failures don't abort the run: the file is skipped and recorded
+/// in [`LoweredProgram::parse_errors`].
+pub fn lower_files(files: &[PathBuf], resolver: &dyn ImportResolver) -> LoweredProgram {
+    use oxc_allocator::Allocator;
+    use oxc_parser::{ParseOptions, Parser as OxcParser};
+    use oxc_span::SourceType;
+
+    let mut lowered = LoweredProgram {
+        components: Vec::new(),
+        hooks: Vec::new(),
+        utilities: Vec::new(),
+        file_count: 0,
+        parse_errors: Vec::new(),
+    };
+
+    for path in files {
+        let source = match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                lowered.parse_errors.push((path.clone(), e.to_string()));
+                continue;
+            }
+        };
+        let alloc = Allocator::default();
+        let source_type = match path.extension().and_then(|e| e.to_str()) {
+            Some("tsx") => SourceType::tsx(),
+            Some("ts") => SourceType::ts(),
+            Some("jsx") => SourceType::jsx(),
+            _ => SourceType::cjs(),
+        };
+        let ret = OxcParser::new(&alloc, &source, source_type)
+            .with_options(ParseOptions::default())
+            .parse();
+        if !ret.errors.is_empty() {
+            lowered
+                .parse_errors
+                .push((path.clone(), ret.errors[0].message.to_string()));
+            continue;
+        }
+        let line_starts = compute_line_starts(&source);
+        lowered.components.extend(lower_program_with_resolver(
+            &ret.program,
+            &line_starts,
+            path,
+            resolver,
+        ));
+        lowered.hooks.extend(lower_custom_hooks_with_resolver(
+            &ret.program,
+            &line_starts,
+            path,
+            resolver,
+        ));
+        lowered.utilities.extend(lower_utilities_with_resolver(
+            &ret.program,
+            &line_starts,
+            path,
+            resolver,
+        ));
+        lowered.file_count += 1;
+    }
+
+    lowered
+}
+
+/// Run the inter-component analysis on an already-lowered program.
+///
+/// `config` is consumed: `function_registry` is filled from
+/// [`LoweredProgram::utilities`] (any previously set value is overwritten).
+/// The caller's `widen_threshold`, `summary_registry`, and `max_inline_depth`
+/// are preserved.
+pub fn analyze_lowered(
+    lowered: LoweredProgram,
+    strategy: RootStrategy,
+    mut config: Config,
+) -> ProgramAnalysisResult {
+    config.function_registry = FunctionRegistry::from_functions(lowered.utilities);
+    let registry = ComponentRegistry::from_components(lowered.components);
+    let hook_registry = HookRegistry::from_hooks(lowered.hooks);
+    analyze_program(registry, hook_registry, strategy, &config)
+}
+
+/// Parse, lower, and analyze an explicit list of files.
+///
+/// Parse errors are reported on stderr and the file is skipped (same contract
+/// as [`analyze_with_resolvers`]). Returns the analysis result and the number
+/// of files actually analysed.
+pub fn analyze_files(
+    files: &[PathBuf],
+    resolver: &dyn ImportResolver,
+    strategy: RootStrategy,
+    config: Config,
+) -> (ProgramAnalysisResult, usize) {
+    let lowered = lower_files(files, resolver);
+    for (path, msg) in &lowered.parse_errors {
+        eprintln!("[parse error] {}: {}", path.display(), msg);
+    }
+    let file_count = lowered.file_count;
+    (analyze_lowered(lowered, strategy, config), file_count)
+}
 
 /// Run the full reactant pipeline (discover → parse → lower → analyse) with
 /// caller-provided `FileDiscoverer` and `ImportResolver` implementations.
@@ -54,75 +174,13 @@ pub fn analyze_with_resolvers(
     discoverer: &dyn FileDiscoverer,
     resolver: &dyn ImportResolver,
     strategy: RootStrategy,
-    mut config: Config,
+    config: Config,
 ) -> (ProgramAnalysisResult, usize) {
-    use oxc_allocator::Allocator;
-    use oxc_parser::{ParseOptions, Parser as OxcParser};
-    use oxc_span::SourceType;
-
     let files = discoverer.discover(root);
-    let mut all_components = Vec::new();
-    let mut all_hooks = Vec::new();
-    let mut all_utilities = Vec::new();
-    let mut file_count = 0usize;
-
-    for path in &files {
-        let source = match fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[error] {}: {}", path.display(), e);
-                continue;
-            }
-        };
-        let alloc = Allocator::default();
-        let source_type = match path.extension().and_then(|e| e.to_str()) {
-            Some("tsx") => SourceType::tsx(),
-            Some("ts") => SourceType::ts(),
-            Some("jsx") => SourceType::jsx(),
-            _ => SourceType::cjs(),
-        };
-        let ret = OxcParser::new(&alloc, &source, source_type)
-            .with_options(ParseOptions::default())
-            .parse();
-        if !ret.errors.is_empty() {
-            eprintln!(
-                "[parse error] {}: {}",
-                path.display(),
-                ret.errors[0].message
-            );
-            continue;
-        }
-        let line_starts = compute_line_starts(&source);
-        all_components.extend(lower_program_with_resolver(
-            &ret.program,
-            &line_starts,
-            path,
-            resolver,
-        ));
-        all_hooks.extend(lower_custom_hooks_with_resolver(
-            &ret.program,
-            &line_starts,
-            path,
-            resolver,
-        ));
-        all_utilities.extend(lower_utilities_with_resolver(
-            &ret.program,
-            &line_starts,
-            path,
-            resolver,
-        ));
-        file_count += 1;
-    }
-
-    config.function_registry = FunctionRegistry::from_functions(all_utilities);
-    let registry = ComponentRegistry::from_components(all_components);
-    let hook_registry = HookRegistry::from_hooks(all_hooks);
-
-    let result = analyze_program(registry, hook_registry, strategy, &config);
-    (result, file_count)
+    analyze_files(&files, resolver, strategy, config)
 }
 
-const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx"];
+pub(crate) const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx"];
 const EXCLUDED_DIRS: &[&str] = &["node_modules", "dist", "build", ".next"];
 
 fn is_source_file(path: &Path) -> bool {
@@ -137,10 +195,10 @@ fn is_source_file(path: &Path) -> bool {
 
     // *.test.* / *.spec.*
     let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
-    if let Some((_, suffix)) = stem.rsplit_once('.') {
-        if suffix == "test" || suffix == "spec" {
-            return false;
-        }
+    if let Some((_, suffix)) = stem.rsplit_once('.')
+        && (suffix == "test" || suffix == "spec")
+    {
+        return false;
     }
 
     match path.extension().and_then(|e| e.to_str()) {
@@ -190,7 +248,7 @@ impl FileDiscoverer for DefaultFileDiscoverer {
 /// Collapse `.` and `..` lexically, without touching the filesystem.
 /// We don't use `fs::canonicalize` because it resolves symlinks (and on
 /// Windows produces UNC paths), which is more than we need for registry keys.
-fn normalize(path: &Path) -> PathBuf {
+pub(crate) fn normalize(path: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
     for comp in path.components() {

@@ -1,0 +1,10 @@
+{
+  // Vite scaffold layout: the root tsconfig only references sub-configs;
+  // `paths` live in tsconfig.app.json. JSONC on purpose (comments + trailing
+  // commas) — the analyzer must parse this.
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.node.json" },
+  ],
+}

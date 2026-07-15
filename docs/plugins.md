@@ -7,10 +7,25 @@ crate.
 | Trait | Default | What to override for |
 |-------|---------|----------------------|
 | `FileDiscoverer` | `DefaultFileDiscoverer` (recursive `*.ts?(x)` walk, excludes `node_modules`/build dirs/`*.test.*`) | Framework conventions (Next.js `app/`, monorepos, glob patterns) |
-| `ImportResolver` | `DefaultImportResolver` (relative imports → `.ts`/`.tsx`/`index.*`) | `tsconfig` `paths` aliases, monorepo `@workspace/*`, custom resolvers |
+| `ImportResolver` | `DefaultImportResolver` (relative imports → `.ts`/`.tsx`/`index.*`) | Monorepo `@workspace/*`, exotic resolution schemes |
 
 Both traits live in `reactant::resolver`. Plug them in through
-`analyze_with_resolvers` instead of going through the CLI.
+`analyze_with_resolvers`, or use the finer-grained pipeline —
+`resolver::{lower_files, analyze_lowered, analyze_files}` — when you need to
+inspect the lowered IR between phases (the CLI does this to map component
+display names to files).
+
+> **tsconfig `paths` aliases are built in since ADR-016** — you no longer
+> need a custom resolver for the common Vite/`@/*` case:
+>
+> ```rust
+> use reactant::project;
+> let ctx = project::build_context(root, None);   // detects Vite, loads tsconfig paths
+> // ctx.resolver: Box<dyn ImportResolver>, ctx.discovery_root: PathBuf
+> ```
+>
+> `project::TsconfigPathsResolver::new(paths)` is also directly constructible
+> from a `project::TsconfigPaths` if you load aliases yourself.
 
 ## Skeleton
 
@@ -62,10 +77,11 @@ fn main() {
 }
 ```
 
-## Wrapping `DefaultImportResolver` for tsconfig paths
+## Wrapping `DefaultImportResolver` for custom aliases
 
-`tsconfig` `paths` aliases (`"@/*": ["src/*"]`) aren't handled by the default
-resolver. Wrap it:
+For alias schemes *not* declared in tsconfig `paths` (which are built in, see
+above) — e.g. aliases hardcoded in a bundler config — wrap the default
+resolver:
 
 ```rust
 use std::path::{Path, PathBuf};

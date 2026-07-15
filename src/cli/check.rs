@@ -1,0 +1,318 @@
+//! The `check` subcommand: discover → lower → analyze → report.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use clap::Args;
+
+use reactant::{
+    engine::{ComponentRegistry, Config, RootStrategy, SymbolGraph},
+    project::{self, ProjectKind},
+    resolver::{DefaultFileDiscoverer, FileDiscoverer, analyze_lowered, lower_files},
+    rules::{Diagnostic, Severity, all_rules, rule_doc},
+};
+
+use super::{EXIT_FINDINGS, EXIT_OK, EXIT_USAGE, FailOn, OutputFormat, ProjectMode};
+
+#[derive(Args, Default)]
+pub struct CheckArgs {
+    /// Files or directories to analyze (default: current directory).
+    /// Directories are walked recursively for .ts/.tsx/.js/.jsx files.
+    pub paths: Vec<String>,
+
+    /// Show Info diagnostics (known analysis limitations, e.g. widening)
+    #[arg(long)]
+    pub info: bool,
+
+    /// Verbose debug output (symbol graph, fixpoint stats) on stderr
+    #[arg(long)]
+    pub verbose: bool,
+
+    /// Analyze all components as entry points (props = ⊤)
+    #[arg(long)]
+    pub all_roots: bool,
+
+    /// Entry point component names (repeatable or comma-separated)
+    #[arg(long, value_delimiter = ',')]
+    pub entry: Vec<String>,
+
+    /// Output format
+    #[arg(long, value_enum, default_value = "human")]
+    pub format: Option<OutputFormat>,
+
+    /// Findings severity that makes the exit code non-zero
+    #[arg(long, value_enum, default_value = "warning")]
+    pub fail_on: Option<FailOn>,
+
+    /// Project kind: auto-detect, force vite conventions, or plain walk
+    #[arg(long, value_enum, default_value = "auto")]
+    pub project: Option<ProjectMode>,
+
+    /// Only report these diagnostics (repeatable; see `reactant rules`)
+    #[arg(long)]
+    pub rule: Vec<String>,
+
+    /// Suppress these diagnostics (repeatable)
+    #[arg(long)]
+    pub ignore_rule: Vec<String>,
+
+    /// Disable ANSI colors (also honored: NO_COLOR env, non-tty stdout)
+    #[arg(long)]
+    pub no_color: bool,
+}
+
+/// One component's report: display name, defining file, hook count, visible
+/// diagnostics.
+pub struct ComponentReport {
+    pub name: String,
+    pub file: Option<PathBuf>,
+    pub hook_count: usize,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Everything the renderers need.
+pub struct CheckReport {
+    pub components: Vec<ComponentReport>,
+    pub files_analyzed: usize,
+    pub parse_errors: Vec<(PathBuf, String)>,
+    pub errors: usize,
+    pub warnings: usize,
+    pub infos: usize,
+    pub exit_code: i32,
+}
+
+pub fn run(mut args: CheckArgs) -> i32 {
+    if args.paths.is_empty() {
+        args.paths.push(".".to_string());
+    }
+    let format = args.format.unwrap_or(OutputFormat::Human);
+    let fail_on = args.fail_on.unwrap_or(FailOn::Warning);
+
+    // Validate rule filters before doing any work.
+    for name in args.rule.iter().chain(args.ignore_rule.iter()) {
+        if rule_doc(name).is_none() {
+            eprintln!(
+                "[error] unknown rule `{name}` — run `reactant rules` for the list of valid names"
+            );
+            return EXIT_USAGE;
+        }
+    }
+
+    // ── Project context ───────────────────────────────────────────────────────
+    // The first directory argument drives project detection; other paths are
+    // discovered as-is with the same resolver.
+    let project_root = args
+        .paths
+        .iter()
+        .map(Path::new)
+        .find(|p| p.is_dir())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let forced = match args.project.unwrap_or(ProjectMode::Auto) {
+        ProjectMode::Auto => None,
+        ProjectMode::Vite => Some(ProjectKind::Vite),
+        ProjectMode::Plain => Some(ProjectKind::Plain),
+    };
+    if forced == Some(ProjectKind::Vite) && project::detect(&project_root) != ProjectKind::Vite {
+        eprintln!(
+            "[warn] --project vite: no vite.config.* found in {} — still trying tsconfig paths",
+            project_root.display()
+        );
+    }
+    let ctx = project::build_context(&project_root, forced);
+    if let Some(warning) = &ctx.alias_warning {
+        eprintln!("[warn] {warning}");
+    }
+    if args.verbose && ctx.kind == ProjectKind::Vite {
+        eprintln!(
+            "[verbose] vite project: discovery root {}, tsconfig aliases {}",
+            ctx.discovery_root.display(),
+            if ctx.alias_warning.is_none() {
+                "loaded"
+            } else {
+                "unavailable"
+            }
+        );
+    }
+
+    // ── Discovery ─────────────────────────────────────────────────────────────
+    let discoverer = DefaultFileDiscoverer;
+    let mut files: Vec<PathBuf> = Vec::new();
+    for input in &args.paths {
+        let p = Path::new(input);
+        if p.is_dir() {
+            // The project-root dir may be narrowed (vite → <root>/src).
+            let walk_root = if *p == *project_root {
+                &ctx.discovery_root
+            } else {
+                p
+            };
+            let found = discoverer.discover(walk_root);
+            if found.is_empty() {
+                eprintln!("[error] no .ts/.tsx/.js/.jsx files found in {input}");
+                return EXIT_USAGE;
+            }
+            files.extend(found);
+        } else if p.is_file() {
+            files.push(p.to_path_buf());
+        } else {
+            eprintln!("[error] no such file or directory: {input}");
+            return EXIT_USAGE;
+        }
+    }
+
+    // ── Lower ─────────────────────────────────────────────────────────────────
+    let mut lowered = lower_files(&files, ctx.resolver.as_ref());
+    if format == OutputFormat::Human {
+        for (path, msg) in &lowered.parse_errors {
+            eprintln!("[parse error] {}: {}", path.display(), msg);
+        }
+    }
+
+    // Display-name → (file, hook count) map, built before analysis consumes
+    // the components. Keyed by display name to disambiguate same-named
+    // components across files.
+    let temp_registry = ComponentRegistry::from_components(lowered.components.clone());
+    let mut component_meta: HashMap<String, (PathBuf, usize)> = HashMap::new();
+    for c in &lowered.components {
+        let key = (c.file.clone(), c.name.clone());
+        component_meta.insert(
+            temp_registry.display_name(&key),
+            (c.file.clone(), c.hooks.len()),
+        );
+    }
+    drop(temp_registry);
+
+    if args.verbose {
+        let symbol_graph = SymbolGraph::build(&lowered.components, &lowered.hooks);
+        let topo = symbol_graph.topo_sort();
+        eprintln!(
+            "[verbose] symbol graph: {} nodes, topo order = [{}]",
+            topo.len(),
+            topo.iter()
+                .map(|n| format!("{}@{}", n.name, n.file.display()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    if lowered.components.is_empty() {
+        let report = CheckReport {
+            components: vec![],
+            files_analyzed: lowered.file_count,
+            parse_errors: lowered.parse_errors,
+            errors: 0,
+            warnings: 0,
+            infos: 0,
+            exit_code: EXIT_OK,
+        };
+        render(&report, &args, format);
+        return report.exit_code;
+    }
+
+    // ── Analyze ───────────────────────────────────────────────────────────────
+    let strategy = if !args.entry.is_empty() {
+        RootStrategy::Explicit(args.entry.iter().map(|s| s.trim().to_string()).collect())
+    } else if args.all_roots {
+        RootStrategy::AllComponents
+    } else {
+        RootStrategy::Heuristic
+    };
+
+    let file_count = lowered.file_count;
+    let parse_errors = std::mem::take(&mut lowered.parse_errors);
+    let program_result = analyze_lowered(lowered, strategy, Config::default());
+
+    if args.verbose {
+        eprintln!(
+            "[verbose] {} components analyzed",
+            program_result.stats.components_analyzed
+        );
+        eprintln!(
+            "[verbose] cache hits: {}, misses: {}",
+            program_result.stats.cache_hits, program_result.stats.cache_misses
+        );
+    }
+
+    // ── Rules + filtering ─────────────────────────────────────────────────────
+    let rules = all_rules();
+    let mut names: Vec<&String> = program_result.components.keys().collect();
+    names.sort();
+
+    let mut components = Vec::new();
+    let (mut errors, mut warnings, mut infos) = (0usize, 0usize, 0usize);
+
+    for name in names {
+        if args.verbose {
+            let result = &program_result.components[name];
+            let mut labels: Vec<_> = result.widened_labels.iter().copied().collect();
+            labels.sort_unstable();
+            eprintln!(
+                "  [verbose] {name}: {} iteration(s), widened: {labels:?}",
+                result.iterations
+            );
+        }
+
+        let mut diags: Vec<Diagnostic> = rules
+            .iter()
+            .flat_map(|r| r.check(&program_result, name))
+            .collect();
+        diags.sort_by_key(|d| (d.rule, d.severity as u8));
+        diags.retain(|d| {
+            (args.rule.is_empty() || args.rule.iter().any(|r| r == d.rule))
+                && !args.ignore_rule.iter().any(|r| r == d.rule)
+                && (d.severity != Severity::Info || args.info)
+        });
+
+        errors += diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count();
+        warnings += diags
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .count();
+        infos += diags
+            .iter()
+            .filter(|d| d.severity == Severity::Info)
+            .count();
+
+        let (file, hook_count) = component_meta
+            .get(name)
+            .map(|(f, h)| (Some(f.clone()), *h))
+            .unwrap_or((None, 0));
+
+        components.push(ComponentReport {
+            name: name.clone(),
+            file,
+            hook_count,
+            diagnostics: diags,
+        });
+    }
+
+    let exit_code = match fail_on {
+        FailOn::Error if errors > 0 => EXIT_FINDINGS,
+        FailOn::Warning if errors + warnings > 0 => EXIT_FINDINGS,
+        _ => EXIT_OK,
+    };
+
+    let report = CheckReport {
+        components,
+        files_analyzed: file_count,
+        parse_errors,
+        errors,
+        warnings,
+        infos,
+        exit_code,
+    };
+    render(&report, &args, format);
+    report.exit_code
+}
+
+fn render(report: &CheckReport, args: &CheckArgs, format: OutputFormat) {
+    match format {
+        OutputFormat::Human => super::output_human::render(report, args.no_color),
+        OutputFormat::Json => super::output_json::render(report),
+    }
+}

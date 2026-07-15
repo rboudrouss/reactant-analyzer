@@ -295,10 +295,7 @@ fn null_init_guarded_converges_without_hint() {
         }
         "#,
     );
-    assert_eq!(
-        hits, 0,
-        "guarded increment on useState(null) must converge"
-    );
+    assert_eq!(hits, 0, "guarded increment on useState(null) must converge");
 }
 
 #[test]
@@ -340,10 +337,7 @@ fn nullable_fetch_pattern_no_false_positive() {
         }
         "#,
     );
-    assert_eq!(
-        hits, 0,
-        "null → object once, then stable: no infinite loop"
-    );
+    assert_eq!(hits, 0, "null → object once, then stable: no infinite loop");
 }
 
 // ── Truthiness narrowing (`if (x)` / `if (!x)`) — ADR-015 ─────────────────────
@@ -364,7 +358,10 @@ fn truthy_guarded_increment_from_one_is_flagged() {
         }
         "#,
     );
-    assert_eq!(hits, 1, "truthy counter from 1 grows forever: must be flagged");
+    assert_eq!(
+        hits, 1,
+        "truthy counter from 1 grows forever: must be flagged"
+    );
 }
 
 #[test]

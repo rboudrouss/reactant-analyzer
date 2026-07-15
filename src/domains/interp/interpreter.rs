@@ -246,11 +246,10 @@ fn exec_setter_call<T: Transfer>(
     // Handles fn_ = Var(name), FieldAccess { obj: Var, field }, or any other expr
     // that evaluates to ComponentSetter { component, label }.
     if let Expr::Call { fn_, args } = expr {
-        let comp_setter =
-            transfer
-                .eval_expr(fn_, env, ctx)
-                .as_state_value()
-                .and_then(|sv| sv.as_setter().map(|(c, l)| (c.clone(), *l)));
+        let comp_setter = transfer
+            .eval_expr(fn_, env, ctx)
+            .as_state_value()
+            .and_then(|sv| sv.as_setter().map(|(c, l)| (c.clone(), *l)));
         if let Some((component, label)) = comp_setter
             && ctx.inter.is_some()
         {

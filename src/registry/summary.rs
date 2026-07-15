@@ -225,7 +225,10 @@ mod tests {
             r.get("useX", Some("pkg")).unwrap().summarize(&[]),
             StateValue::null()
         );
-        assert_eq!(r.get("useX", None).unwrap().summarize(&[]), StateValue::top());
+        assert_eq!(
+            r.get("useX", None).unwrap().summarize(&[]),
+            StateValue::top()
+        );
     }
 
     #[test]

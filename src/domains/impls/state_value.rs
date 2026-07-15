@@ -275,7 +275,6 @@ impl StateValue {
     pub fn is_unstable(&self) -> bool {
         matches!(self.to_stability(), Stability::Unstable)
     }
-
 }
 
 // ── Debug — concise kind-union rendering (used in diagnostics via {:?}) ───────

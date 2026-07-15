@@ -17,3 +17,4 @@
 | [ADR-013](ADR-013-cross-file-analysis.md) | Cross-file analysis — import resolution + symbol graph | Accepted |
 | [ADR-014](ADR-014-widening-narrowing.md) | Widening up-to (thresholds); narrowing superseded by inner threshold widening | Accepted |
 | [ADR-015](ADR-015-product-value-domain.md) | Product value domain over disjoint JS kinds — supersedes ADR-008's flat enum, TypedStateStore and the useState<T> hint | Accepted |
+| [ADR-016](ADR-016-cli-projects-json.md) | CLI subcommands + JSON output + project-kind detection (Vite, tsconfig paths) | Accepted |

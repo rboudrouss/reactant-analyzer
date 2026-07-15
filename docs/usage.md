@@ -1,112 +1,198 @@
-# Using reactant (ADR-013 — cross-file analysis)
+# Using reactant
 
-## CLI
+## Subcommands
 
 ```sh
-# 1) One or several files (legacy mode, still supported)
-cargo run -- src/app/page.tsx src/components/Button.tsx
+reactant check [PATHS...]      # analyze files/directories (the default subcommand)
+reactant rules                 # list every diagnostic the analyzer can emit
+reactant explain <rule>        # full doc for one diagnostic: what, example, fix
+```
 
-# 2) A directory (since Phase 1, ADR-013)
-#    DefaultFileDiscoverer walks recursively, excludes node_modules/,
-#    dist/, build/, .next/, *.test.*, *.spec.*, *.d.ts
-cargo run -- src/
+`check` is the default: `reactant src/` ≡ `reactant check src/` (the historical
+flat form keeps working). Two consequences of the clap setup:
 
-# 3) Mixing files and directories
-cargo run -- src/app/ src/lib/utils.ts
+- flags can't precede a subcommand (`reactant --info check src/` is rejected —
+  write `reactant check src/ --info`);
+- a directory literally named `rules` or `check` must be passed as `./rules`.
+
+## `reactant check`
+
+```sh
+reactant check                                   # current directory
+reactant check src/ lib/utils.ts                 # mix directories and files
+reactant check my-vite-app/                      # auto-detects Vite (see below)
+reactant check src/ --format json                # machine-readable output
+reactant check src/ --fail-on error              # warnings don't fail CI
+reactant check src/ --rule infinite-loop         # only this diagnostic
+reactant check src/ --ignore-rule lazy-init      # all but this one
 ```
 
 ### Flags
 
 | Flag | Effect |
 |------|--------|
-| `--info` | Also display `Info` diagnostics (known analysis limits). |
-| `--verbose` | On stderr: symbol graph topological order, number of lowered utilities, fixpoint stats. Handy when debugging inlining. |
-| `--all-roots` | Analyze every component as an independent entry point (`props = ⊤`). |
-| `--entry Foo,Bar` | Force the explicit list of roots. When a name is ambiguous (two `Page` in different files), both are analyzed; to target a single one, pass the form `Page@/abs/path/page.tsx` (visible in the output on collision). |
+| `--format human\|json` | Output format. `json` prints exactly one JSON document on stdout (schema below); all warnings/verbose go to stderr. Default `human`. |
+| `--fail-on error\|warning\|never` | Which findings make the exit code `1`. Default `warning` (errors *or* warnings fail). `Info` diagnostics never affect the exit code. |
+| `--project auto\|vite\|plain` | Project-kind handling. `auto` (default) detects from marker files; `vite` forces Vite conventions; `plain` disables detection. |
+| `--rule <name>` | Only report this diagnostic (repeatable). Unknown name → exit 2. |
+| `--ignore-rule <name>` | Suppress this diagnostic (repeatable). |
+| `--info` | Also display `Info` diagnostics (known analysis limits: widening, recursion cutoff, unknown hooks). |
+| `--entry <names>` | Explicit root components. Repeatable or comma-separated (`--entry Foo,Bar`). On a name collision across files, use `Foo@/abs/path.tsx` (shown in the output). |
+| `--all-roots` | Analyze every component as an entry point (`props = ⊤`). |
+| `--verbose` | Debug output on stderr: symbol graph topo order, fixpoint stats, per-component iterations/widened labels. |
+| `--no-color` | Disable ANSI colors. Also honored: a non-empty `NO_COLOR` env var, or stdout not being a terminal. |
 
-### Reading the output
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | No findings at/above the `--fail-on` threshold (always `0` with `--fail-on never`). |
+| `1` | Findings at/above the threshold. |
+| `2` | Usage/IO error: no input files found, nonexistent path, unknown rule name, bare `reactant` with no args. |
+
+A missing or unparseable `tsconfig.json` is **not** an error: the run degrades
+to relative-only import resolution with a warning on stderr.
+
+## Project kinds
+
+`check` inspects the **first directory argument** (default `.`) for marker
+files. Other path arguments are discovered as-is with the same resolver.
+
+### Vite (`vite.config.{ts,js,mjs,mts}` present)
+
+- **Discovery narrows to `<root>/src`** when it exists (skips config files,
+  e2e dirs).
+- **Aliases are loaded from tsconfig `paths`** — `tsconfig.json` is parsed as
+  JSONC (comments, trailing commas), following the `extends` chain and, when
+  the root chain declares no `paths`, hopping through `references[].path`
+  (Vite scaffolds keep `paths` in `tsconfig.app.json`). `@/hooks/useData`
+  then resolves to `src/hooks/useData.ts` and the hook's body is inlined
+  cross-file like any relative import.
+- Aliases declared **only** in `vite.config.*` (`resolve.alias`) are not read
+  (that would require executing JS). If no tsconfig `paths` are found the CLI
+  warns: unresolved aliased imports are analysis blind spots — the imported
+  hook/component is treated as opaque, so bugs inside it will NOT surface
+  (false negatives), which is why this warning is not gated behind `--info`.
+
+### Plain (everything else)
+
+Recursive walk of the given directories for `.ts/.tsx/.js/.jsx`, excluding
+`node_modules/`, `dist/`, `build/`, `.next/`, `*.test.*`, `*.spec.*`,
+`*.d.ts`. Relative imports only.
+
+## JSON schema (v1)
+
+```json
+{
+  "version": 1,
+  "files_analyzed": 12,
+  "parse_errors": [ { "file": "src/broken.tsx", "message": "..." } ],
+  "diagnostics": [
+    {
+      "rule": "infinite-loop",
+      "severity": "warning",
+      "component": "Page@src/users/page.tsx",
+      "file": "src/users/page.tsx",
+      "line": 10,
+      "col": 4,
+      "hook_label": 2,
+      "var": null,
+      "message": "...",
+      "notes": [ { "message": "...", "hook_label": null, "line": 3, "col": 2 } ]
+    }
+  ],
+  "summary": {
+    "errors": 0, "warnings": 1, "infos": 0,
+    "components_analyzed": 5, "exit_code": 1
+  }
+}
+```
+
+Semantics:
+
+- `component` — registry display name; the `@<file>` suffix appears only when
+  two files define the same component name.
+- `file` — the component's defining file, relative to the CWD when possible.
+  `SourceRange` carries no file (ADR-011), so `line`/`col` of notes emitted
+  from a cross-file **inlined hook** may reference positions in the hook's
+  source file while `file` names the component's.
+- `line` is 1-indexed, `col` is 0-indexed; both `null` when the diagnostic has
+  no source range.
+- `severity` ∈ `"error" | "warning" | "info"`. Info entries appear only with
+  `--info`.
+- `summary.exit_code` mirrors the process exit code under the active
+  `--fail-on`.
+- stdout is exactly one JSON document; parse errors are both listed in
+  `parse_errors` and kept off stdout.
+
+## Reading the human output
 
 ```
-  Counter  (3 hooks)  ✓             ← component analyzed, no diagnostic
-  Counter  (3 hooks)                ← component with diagnostics
-    warn   infinite-loop  ...
+  Counter  (3 hooks)  src/Counter.tsx  ✓      ← analyzed, no diagnostic
+  Page  (2 hooks)  src/users/page.tsx         ← with diagnostics
+    warn   infinite-loop  [hook:1]  (line 7:2)  — effect 2 sets state 1 ...
+       → handler `onClick` also calls setter ... [hook:3] (line 12:4)
 ```
 
-When two files define a component with the same name, the output disambiguates automatically:
+On a component-name collision the name is disambiguated automatically
+(`Page@tests/fixtures/page_collision/users/page.tsx`).
 
-```
-  Page@tests/fixtures/page_collision/users/page.tsx  (2 hooks)
-    warn   infinite-loop  ...
-```
-
-The **`@<file>` suffix** only appears on collision. A project without collisions still displays just `Page`, `Counter`, etc.
-
-## Use cases covered by the fixtures (`tests/fixtures/`)
+## Fixtures
 
 | Fixture | Demonstrates |
 |---------|--------------|
-| `counter.tsx`, `bugs.tsx`, ... (historical files) | Intra-component detection — `infinite-loop`, `missing-deps`, `setter-in-render`, etc. |
+| `counter.tsx`, `bugs.tsx`, … | Intra-component detection — `infinite-loop`, `missing-deps`, `setter-in-render`, etc. |
 | `inter_component.tsx` | Top-down inter-component analysis (ADR-012). |
-| `page_collision/{users,posts}/page.tsx` | **ADR-013 §1** — two `Page` Next.js components coexist; the buggy version is flagged without overwriting the clean one. |
-| `cross_file_hook/page.tsx` + `hooks/useData.ts` | **ADR-013 §2** — `useData` imported via `./hooks/useData` is looked up by `(file, name)` and inlined; the bug in its body surfaces on `Page`. |
-| `utility_inlining/same_file.tsx` | **ADR-013 Phase 3** — utility `bump(setC, 1)` inlined at statement-level in the same file. |
-| `utility_inlining/guarded_setter.tsx` | **ADR-013 Phase 3 limit** — the guard `if (!LAUNCH) return` is spliced, but `() => setC(c+1)` as an argument remains opaque (call in expression position). |
-| `utility_inlining_cross_file/page.tsx` + `lib/helpers.ts` | **ADR-013 Phase 3** — utility imported from a sibling file, resolved via `ImportResolver` then inlined. |
-
-Run each fixture to see the behavior:
+| `page_collision/{users,posts}/page.tsx` | Two same-named `Page` components coexist (ADR-013 §1). |
+| `cross_file_hook/` | Custom hook resolved via relative import and inlined (ADR-013 §2). |
+| `utility_inlining*/` | Statement-level utility inlining (ADR-013 Phase 3). |
+| `vite_project/` | **ADR-016** — Vite detection, tsconfig `references` hop, `@/*` alias feeding cross-file hook inlining. |
 
 ```sh
-cargo run -- tests/fixtures/page_collision/
-cargo run -- tests/fixtures/cross_file_hook/
-cargo run -- tests/fixtures/utility_inlining/
-cargo run -- tests/fixtures/utility_inlining_cross_file/
+cargo run -- check tests/fixtures/vite_project
+cargo run -- check tests/fixtures/cross_file_hook
 ```
 
-## Plugin API (Phase 4)
+## Plugin API
 
-When the CLI isn't enough (Next.js `app/` discovery, tsconfig `paths` aliases, monorepos):
+When the CLI conventions aren't enough (Next.js `app/` discovery, monorepos):
 
 ```rust
 use std::path::Path;
 use reactant::{
     engine::{Config, RootStrategy},
-    resolver::{DefaultImportResolver, FileDiscoverer, analyze_with_resolvers},
+    project,                        // built-in Vite/tsconfig-paths support
+    resolver::{analyze_files, analyze_with_resolvers, DefaultFileDiscoverer},
 };
 
-struct OnlyPages;
-impl FileDiscoverer for OnlyPages { /* ... */ }
-
-let (result, file_count) = analyze_with_resolvers(
-    Path::new("./my-nextjs-app"),
-    &OnlyPages,                    // or &DefaultFileDiscoverer
-    &DefaultImportResolver,        // or a tsconfig-paths-aware resolver
-    RootStrategy::AllComponents,
-    Config::default(),
-);
+// Reuse the built-in project detection + alias resolver:
+let ctx = project::build_context(Path::new("./my-vite-app"), None);
+let files = DefaultFileDiscoverer.discover(&ctx.discovery_root);
+let (result, n) = analyze_files(&files, ctx.resolver.as_ref(),
+                                RootStrategy::Heuristic, Config::default());
 ```
 
-Full examples in [docs/plugins.md](plugins.md) (Next.js, tsconfig aliases).
+Full trait-level examples (custom `FileDiscoverer` / `ImportResolver`) in
+[docs/plugins.md](plugins.md).
 
 ## Limits to know before use
 
-Detailed reference: [docs/TODO.md §ADR-013](TODO.md#adr-013--cross-file-analysis-limits). Recap of the most impactful:
+Detailed list: [docs/TODO.md](TODO.md). Most impactful:
 
-- **Unresolved imports stay opaque** — a specifier like `@/components/Button` (tsconfig alias) or `@workspace/lib` (monorepo) isn't found by default → the component/hook is treated as external. Solution: a custom `ImportResolver` via `analyze_with_resolvers`.
-- **Statement-level inlining only** — `let r = util(x);` and `util(x);` (isolated statement) are inlined. `if (util(x))`, `setX(util(y))`, `arr.map(util)` stay opaque.
-- **Utility recursion** — inlining at most once per CFG.
-- **`--entry Foo` ambiguous** across two files defining `Foo` → both are analyzed. Disambiguate with the form `Foo@/path`.
-- **No built-in plugin** for Next.js / TanStack — write a custom `FileDiscoverer` (~30 lines, see plugins.md).
+- **Aliases outside tsconfig `paths` stay opaque** (monorepo `@workspace/*`
+  without tsconfig entries, vite-config-only aliases) → the imported symbol
+  is treated as external: its body is not analyzed (possible FN). Write a
+  custom `ImportResolver` for those.
+- **Statement-level utility inlining only** — `if (util(x))`, `setX(util(y))`
+  stay opaque.
+- **`--entry Foo` ambiguous** across files → both analyzed; disambiguate with
+  `Foo@/path`.
 
 ## Tests
 
-The test suite is exhaustive on ADR-013:
-
 ```sh
-cargo test                                    # everything (496 tests)
-cargo test resolver                           # discovery + import resolution
-cargo test --test page_collision              # Page collision e2e
-cargo test --test relative_import_resolution  # resolved_file precision
-cargo test --test utility_inlining            # Phase 3 splicing
-cargo test --test plugin_interface            # analyze_with_resolvers
-cargo test --test multi_file_discovery        # directory CLI e2e
+cargo test                       # full suite
+cargo test --test vite_project   # Vite e2e (detection → alias → inlining)
+cargo test --test cli            # CLI e2e (binary, exit codes, JSON schema)
+cargo test project::             # tsconfig/JSONC/alias unit tests
 ```

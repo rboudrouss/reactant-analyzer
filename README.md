@@ -26,19 +26,28 @@ Rules live in `src/rules/`, one file per rule, all post-pass on a single `Analys
 ```sh
 git clone https://github.com/rboudrouss/reactant-analyzer
 cd reactant-analyzer
-cargo run -- path/to/your-project/src
+cargo run -- check path/to/your-project
 ```
 
-The CLI accepts a directory (recursive walk, skips `node_modules`, build dirs, `*.test.*`, `*.spec.*`, `*.d.ts`) or an explicit list of files.
+The CLI has three subcommands (`check` is the default — plain `reactant src/` works too):
 
 ```sh
-cargo run -- src/                                 # whole tree
-cargo run -- src/app/page.tsx src/lib/utils.ts    # explicit files
-cargo run -- --info src/                          # also surface analysis-limit notices
-cargo run -- --all-roots src/                     # analyze every component with props = ⊤
+reactant check src/                            # analyze a tree (skips node_modules, build dirs, tests)
+reactant check my-vite-app/                    # auto-detects Vite: src/ discovery + @/* aliases
+reactant check src/ --format json              # machine-readable output for CI
+reactant check src/ --fail-on error            # warnings don't fail the build
+reactant check src/ --ignore-rule lazy-init    # filter diagnostics
+reactant rules                                 # list every diagnostic
+reactant explain infinite-loop                 # what it is, example, how to fix
 ```
 
-See [docs/usage.md](docs/usage.md) for all flags.
+Exit codes: `0` clean, `1` findings, `2` usage error. See [docs/usage.md](docs/usage.md) for all flags, the JSON schema, and project-kind detection.
+
+### Vite projects
+
+A directory containing `vite.config.*` is analyzed with Vite conventions: sources are discovered under `src/`, and `@/*`-style aliases are loaded from tsconfig `paths` (JSONC parsed, `extends` and project `references` followed — the standard Vite scaffold with `tsconfig.app.json` works out of the box). An aliased custom hook is then resolved and inlined cross-file exactly like a relative import.
+
+Aliases declared *only* in `vite.config.*` are not read (that would require executing JS); the CLI warns when it finds no tsconfig `paths`, because unresolved imports are analysis blind spots (possible false negatives).
 
 ## Example
 
@@ -65,14 +74,13 @@ function useData(initial) {
 }
 ```
 
-`cargo run -- src/` produces:
+`cargo run -- check src/` produces:
 
 ```
-  Page  (1 hooks)
-    warn   always-unstable-deps  [hook:2]  (line 7:2)  — effect 2 has unstable dep(s) at index 0 — a new reference every render — `Object.is` always differs, so the effect re-runs on every render regardless of the other deps
+  Page  (1 hooks)  src/page.tsx
     warn   infinite-loop  [hook:1]  (line 7:2)  — effect 2 sets state 1 (all deps unstable — effect runs every render) which needed widening — potential infinite render loop
 
-⚠  2 warning(s) across 2 file(s).
+⚠  1 warning(s) across 2 file(s).
 ```
 
 The bug is detected on `Page` after the analyzer resolves `./hooks/useData`, lowers `useData`'s body, and inlines it into `Page`'s fixpoint.
@@ -92,7 +100,7 @@ Concretely:
 
 ## Plugin API
 
-When the CLI isn't enough (Next.js `app/` conventions, tsconfig `paths` aliases, monorepos), drop down to the Rust API:
+When the CLI isn't enough (Next.js `app/` conventions, monorepos), drop down to the Rust API:
 
 ```rust
 use reactant::engine::{Config, RootStrategy};
@@ -107,7 +115,7 @@ let (result, file_count) = analyze_with_resolvers(
 );
 ```
 
-See [docs/plugins.md](docs/plugins.md) for full examples (Next.js App Router discoverer, tsconfig alias resolver).
+Vite detection and tsconfig-paths alias resolution are built in (`reactant::project::build_context`); `resolver::{lower_files, analyze_lowered, analyze_files}` expose the pipeline at finer grain. See [docs/plugins.md](docs/plugins.md) for full examples (Next.js App Router discoverer, custom resolvers).
 
 ## Known limitations
 
