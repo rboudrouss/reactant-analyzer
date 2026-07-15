@@ -333,6 +333,17 @@ pub(crate) fn state_val_labels(cfg: &CFG) -> HashMap<Var, HookLabel> {
     })
 }
 
+/// `var → memo label` for every `let var = useMemo/useCallback(...)` in `cfg`.
+/// The render env binds these BEFORE the memo store is recomputed, so their
+/// env value can be stale ⊤ — rules needing memo values must go through the
+/// memo store, keyed by this map.
+pub(crate) fn memo_val_labels(cfg: &CFG) -> HashMap<Var, HookLabel> {
+    state_binding_labels(cfg, |rhs| match rhs {
+        Expr::MemoVal(label) | Expr::CallbackVal(label) => Some(*label),
+        _ => None,
+    })
+}
+
 /// Shared kernel: collect `var → label` for `let var = <rhs>` where `pick`
 /// extracts a label from the rhs.
 fn state_binding_labels(

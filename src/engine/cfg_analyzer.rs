@@ -155,7 +155,7 @@ pub fn analyze_cfg<'inter, T: Transfer>(
 ///
 /// `taken = true` → then-branch constraint; `taken = false` → else-branch (negated).
 /// Falls through to cloning env unchanged for unrecognised patterns.
-fn narrow_env_for_branch<D: AbstractDomain>(
+pub(crate) fn narrow_env_for_branch<D: AbstractDomain>(
     env: &AbstractEnv<D>,
     cond: &Expr,
     taken: bool,
@@ -499,7 +499,10 @@ mod tests {
             &NullCtx,
             None,
         );
-        assert_eq!(state_out.get(0), StateValue::reference(Stability::Unstable));
+        assert_eq!(
+            state_out.get(0),
+            StateValue::reference(Stability::PerRender)
+        );
     }
 
     #[test]
@@ -556,7 +559,7 @@ mod tests {
         );
         assert_eq!(
             exit_envs[&1].lookup("x"),
-            StateValue::reference(Stability::Unstable)
+            StateValue::reference(Stability::PerRender)
         );
     }
 
@@ -658,7 +661,7 @@ mod tests {
         // block 3 (ADR-015 product) — no collapse to ⊤.
         let x = exit_envs[&3].lookup("x");
         assert_eq!(x.num, Interval::point(1.0));
-        assert_eq!(x.reference, Stability::Unstable);
+        assert_eq!(x.reference, Stability::PerRender);
         assert!(!x.is_top_value());
     }
 

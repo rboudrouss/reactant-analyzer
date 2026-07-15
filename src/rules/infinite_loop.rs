@@ -2,17 +2,26 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::{
+    domains::{
+        AbstractDomain, AnalysisCtx, StateValueTransfer, Transfer,
+        impls::Stability,
+        stores::{Heap, MemoStore, StateStore},
+    },
     engine::ProgramAnalysisResult,
     ir::{
+        SourceRange,
         cfg::CFG,
+        expr::Expr,
         hooks::HookEntry,
-        types::{HookLabel, Symbol, Var},
+        stmt::Stmt,
+        types::{BlockId, HookLabel, Symbol, Var},
     },
 };
 
 use super::{
-    Diagnostic, Rule, all_deps_unstable, collect_component_setter_vars, collect_fn_bindings,
-    collect_setter_calls, collect_setter_calls_with_extra, setter_var_labels,
+    Diagnostic, Rule, Severity, all_deps_unstable, collect_component_setter_vars,
+    collect_fn_bindings, collect_setter_calls, collect_setter_calls_with_extra, memo_val_labels,
+    resolve_setter_aliases, setter_var_labels, state_val_labels,
 };
 
 fn capitalize_first(s: &str) -> String {
@@ -62,7 +71,7 @@ impl Rule for InfiniteLoop {
 
         let render_fn_bindings: HashMap<Var, Arc<CFG>> =
             collect_fn_bindings(&comp_result.render_cfg);
-        let mut diags = Vec::new();
+        let mut diags = check_object_churn(result, component);
 
         for hook in &comp_result.hooks {
             let HookEntry::Effect {
@@ -189,6 +198,595 @@ impl Rule for InfiniteLoop {
 
         diags
     }
+}
+
+// ── Object-churn arm (ADR-017) ────────────────────────────────────────────────
+//
+// `useEffect(() => setObj({...obj}), [obj])` never widens: the reference slot
+// converges (`join(PerRender, PerRender)`), so the fixpoint arm above is blind
+// to it. Certainty comes from *dep structure* instead: a dep that is the state
+// slot itself must-changes when its setter stores a must-fresh reference.
+//
+// Stratification (Error = all-must, per the diagnostic doctrine):
+// - Error:   dep is slot X exactly ∧ setX(fresh) on ALL paths of the body
+// - Warning: dep versioned by X (alias/memo/field) ∧ body may-call setX(fresh?)
+// - Info:    effect deps on object state but freshly sets a DIFFERENT object
+//            state — cross-effect cycles are not analyzed (FN-flavor limit)
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Freshness {
+    Not,
+    /// May store a fresh reference (opaque value, imprecise updater).
+    Maybe,
+    /// Must store a fresh reference every call (`PerRender` argument).
+    Fresh,
+}
+
+/// A `setX(arg)` call site found in an effect body.
+struct ChurnSetterCall {
+    label: HookLabel,
+    freshness: Freshness,
+    /// Top-level block of the effect body; `None` when nested in a callback
+    /// (then never "must-reached").
+    block_id: Option<BlockId>,
+    span: Option<SourceRange>,
+    /// Abstract value being stored (fresh-reference approximation for
+    /// functional updaters). Used for the convergence proof.
+    written: crate::domains::StateValue,
+}
+
+fn peel(mut e: &Expr) -> &Expr {
+    while let Expr::TSAnnotated(inner, _) = e {
+        e = inner;
+    }
+    e
+}
+
+fn check_object_churn(result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+    let comp_result = &result.components[component];
+    let cfg = &comp_result.render_cfg;
+    let state_vals = resolve_setter_aliases(cfg, &state_val_labels(cfg));
+    let setter_labels = resolve_setter_aliases(cfg, &setter_var_labels(cfg));
+    let memo_vals = resolve_setter_aliases(cfg, &memo_val_labels(cfg));
+    if setter_labels.is_empty() {
+        return vec![];
+    }
+    let render_fn_bindings = collect_fn_bindings(cfg);
+    let mut diags = Vec::new();
+
+    for hook in &comp_result.hooks {
+        let HookEntry::Effect {
+            label: eff_label,
+            body_cfg,
+            deps: Some(dep_exprs),
+            ..
+        } = hook
+        else {
+            continue;
+        };
+        if dep_exprs.is_empty() {
+            continue; // mount-only
+        }
+
+        // Classify deps: exact state slots (must-change under a fresh set)
+        // vs slots that merely version the dep (may-change).
+        let mut exact: HashSet<HookLabel> = HashSet::new();
+        let mut versioned: HashSet<HookLabel> = HashSet::new();
+        for dep in dep_exprs {
+            match peel(dep) {
+                Expr::StateVal(l) => {
+                    exact.insert(*l);
+                }
+                Expr::Var(v) if state_vals.contains_key(v) => {
+                    exact.insert(state_vals[v]);
+                }
+                other => {
+                    // Memo/callback bindings: their env value is stale ⊤
+                    // (bound before memo recompute) — read the memo store.
+                    let val = match other {
+                        Expr::MemoVal(l) | Expr::CallbackVal(l) => comp_result.memo_store.get(*l),
+                        Expr::Var(v) if memo_vals.contains_key(v) => {
+                            comp_result.memo_store.get(memo_vals[v])
+                        }
+                        _ => eval_in_exit_env(other, comp_result),
+                    };
+                    if let Stability::Versioned(labels) = &val.reference {
+                        for (c, l) in labels {
+                            if c == component || c.is_empty() {
+                                versioned.insert(*l);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if exact.is_empty() && versioned.is_empty() {
+            continue;
+        }
+
+        let mut calls: Vec<ChurnSetterCall> = Vec::new();
+        collect_churn_calls(
+            body_cfg,
+            &setter_labels,
+            &render_fn_bindings,
+            comp_result,
+            1,
+            true,
+            &mut calls,
+        );
+
+        // Strongest verdict per state label.
+        let mut best: HashMap<HookLabel, (Severity, Option<SourceRange>)> = HashMap::new();
+        for call in &calls {
+            if call.freshness == Freshness::Not {
+                continue;
+            }
+            // Convergence proof (fetch-once pattern): once the written value
+            // sits in the slot, do the dominating guards kill this call?
+            // `if (user === null) setUser({...})` → narrowing the written
+            // (non-null, truthy) value through the guard yields ⊥ → the set
+            // fires at most once, no loop.
+            if let Some(b) = call.block_id
+                && converges_once_written(
+                    body_cfg,
+                    b,
+                    &state_vals,
+                    call.label,
+                    &call.written,
+                    comp_result,
+                )
+            {
+                continue;
+            }
+            let sev = if exact.contains(&call.label) || versioned.contains(&call.label) {
+                let fresh_blocks: HashSet<BlockId> = calls
+                    .iter()
+                    .filter(|c| c.label == call.label && c.freshness == Freshness::Fresh)
+                    .filter_map(|c| c.block_id)
+                    .collect();
+                if exact.contains(&call.label)
+                    && call.freshness == Freshness::Fresh
+                    && !fresh_blocks.is_empty()
+                    && on_all_paths(body_cfg, &fresh_blocks)
+                {
+                    Severity::Error
+                } else {
+                    Severity::Warning
+                }
+            } else {
+                // Sets a different object state freshly while depending on
+                // object state: possible multi-effect cycle, not analyzed.
+                Severity::Info
+            };
+            // Severity has no Ord: rank Error > Warning > Info manually.
+            let rank = |s: Severity| match s {
+                Severity::Error => 2,
+                Severity::Warning => 1,
+                Severity::Info => 0,
+            };
+            let entry = best.entry(call.label).or_insert((sev, call.span));
+            if rank(sev) > rank(entry.0) {
+                *entry = (sev, call.span);
+            }
+        }
+
+        for (state_label, (sev, call_span)) in best {
+            let eff_span = comp_result.effect_info.get(eff_label).and_then(|i| i.span);
+            let mut diag = match sev {
+                Severity::Error => Diagnostic::new(
+                    "infinite-loop",
+                    format!(
+                        "effect {eff_label} recreates object state {state_label} it depends on \
+                         every run stores a fresh reference (`Object.is` always fails) \
+                         and re-triggers itself: infinite render loop"
+                    ),
+                ),
+                Severity::Warning => Diagnostic::new(
+                    "infinite-loop",
+                    format!(
+                        "effect {eff_label} may store a fresh reference into state \
+                         {state_label} which versions its deps possible infinite render loop"
+                    ),
+                ),
+                Severity::Info => Diagnostic::new(
+                    "infinite-loop",
+                    format!(
+                        "effect {eff_label} depends on object state but freshly recreates \
+                         state {state_label} outside its deps cross-effect cycles are not \
+                         analyzed (depth > 1)"
+                    ),
+                ),
+            }
+            .with_severity(sev)
+            .with_label(state_label);
+            if let Some(r) = eff_span {
+                diag = diag.with_range(r);
+            }
+            if let Some(r) = call_span {
+                diag = diag.with_note(
+                    format!("setter of state {state_label} called here with a fresh value"),
+                    Some(*eff_label),
+                    Some(r),
+                );
+            }
+            diags.push(diag);
+        }
+    }
+    diags
+}
+
+/// Evaluate `expr` in the render exit environment (same pattern as
+/// `all_deps_unstable`).
+fn eval_in_exit_env(
+    expr: &Expr,
+    comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+) -> crate::domains::StateValue {
+    let exit_env = comp_result.exit_env();
+    let mut s: StateStore<crate::domains::StateValue> = comp_result.state_store.clone();
+    let mut m: MemoStore<crate::domains::StateValue> = comp_result.memo_store.clone();
+    let mut h = Heap::new();
+    StateValueTransfer.eval_expr(
+        expr,
+        &exit_env,
+        &mut AnalysisCtx::null(&mut s, &mut m, &mut h),
+    )
+}
+
+/// Must the argument of a setter call store a fresh reference?
+fn arg_freshness(
+    arg: &Expr,
+    comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+) -> Freshness {
+    match peel(arg) {
+        // Functional updater: React stores the *return* value.
+        Expr::FnLit {
+            params, body_cfg, ..
+        } => {
+            let mut returns = Vec::new();
+            for block in body_cfg.blocks.values() {
+                if let crate::ir::cfg::Terminator::Return(e) = &block.term {
+                    returns.push(peel(e));
+                }
+            }
+            if returns.is_empty() {
+                return Freshness::Maybe;
+            }
+            let fresh = returns
+                .iter()
+                .map(|e| classify_updater_return(e, params))
+                .collect::<Vec<_>>();
+            if fresh.iter().all(|f| *f == Freshness::Fresh) {
+                Freshness::Fresh
+            } else if fresh.iter().all(|f| *f == Freshness::Not) {
+                Freshness::Not
+            } else {
+                Freshness::Maybe
+            }
+        }
+        other => {
+            // Churn is about the REFERENCE kind only: a widened numeric value
+            // (`count + 1`) changes but never fails `Object.is` freshly.
+            let val = eval_in_exit_env(other, comp_result);
+            match &val.reference {
+                Stability::PerRender => {
+                    if val.is_unstable_reference_only() {
+                        Freshness::Fresh
+                    } else {
+                        Freshness::Maybe // joined with other kinds
+                    }
+                }
+                Stability::Unknown => Freshness::Maybe,
+                // Stable / Versioned / ⊥ reference; residual ⊤ stays Maybe.
+                _ if val.other => Freshness::Maybe,
+                _ => Freshness::Not,
+            }
+        }
+    }
+}
+
+/// Freshness of one return expression of a functional updater, without an
+/// environment (the updater runs in its own scope).
+fn classify_updater_return(e: &Expr, params: &[Var]) -> Freshness {
+    match peel(e) {
+        Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::FnLit { .. } => Freshness::Fresh,
+        // Identity updater `o => o` and literal resets converge.
+        Expr::Var(v) if params.first().is_some_and(|p| p == v) => Freshness::Not,
+        Expr::Lit(_) => Freshness::Not,
+        // JS operators return primitives — except logical ops, which return
+        // an operand: never *must*-fresh, at most maybe.
+        Expr::BinOp { lhs, rhs, .. } => {
+            let l = classify_updater_return(lhs, params);
+            let r = classify_updater_return(rhs, params);
+            l.max(r).min(Freshness::Maybe)
+        }
+        Expr::UnaryOp { .. } => Freshness::Not,
+        _ => Freshness::Maybe,
+    }
+}
+
+/// Recursively collect `setX(arg)` calls with their argument freshness.
+/// `top_level` — block IDs belong to the effect body CFG (must-reach usable).
+#[allow(clippy::too_many_arguments)]
+fn collect_churn_calls(
+    cfg: &CFG,
+    setter_labels: &HashMap<Var, HookLabel>,
+    fn_bindings: &HashMap<Var, Arc<CFG>>,
+    comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+    depth: usize,
+    top_level: bool,
+    out: &mut Vec<ChurnSetterCall>,
+) {
+    let mut local_bindings = collect_fn_bindings(cfg);
+    for (k, v) in fn_bindings {
+        local_bindings
+            .entry(k.clone())
+            .or_insert_with(|| Arc::clone(v));
+    }
+    for block in cfg.blocks.values() {
+        let block_id = if top_level { Some(block.id) } else { None };
+        for stmt in &block.stmts {
+            let (expr, span) = match stmt {
+                Stmt::ExprStmt(e, span) => (e, *span),
+                Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => (rhs, None),
+            };
+            churn_calls_in_expr(
+                expr,
+                span,
+                block_id,
+                setter_labels,
+                &local_bindings,
+                comp_result,
+                depth,
+                out,
+            );
+        }
+        match &block.term {
+            crate::ir::cfg::Terminator::Return(e)
+            | crate::ir::cfg::Terminator::Branch { cond: e, .. } => {
+                churn_calls_in_expr(
+                    e,
+                    None,
+                    block_id,
+                    setter_labels,
+                    &local_bindings,
+                    comp_result,
+                    depth,
+                    out,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn churn_calls_in_expr(
+    expr: &Expr,
+    span: Option<SourceRange>,
+    block_id: Option<BlockId>,
+    setter_labels: &HashMap<Var, HookLabel>,
+    fn_bindings: &HashMap<Var, Arc<CFG>>,
+    comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+    depth: usize,
+    out: &mut Vec<ChurnSetterCall>,
+) {
+    match expr {
+        Expr::Call { fn_, args } => {
+            if let Expr::Var(name) = peel(fn_) {
+                if let Some(&label) = setter_labels.get(name) {
+                    let freshness = args
+                        .first()
+                        .map(|a| arg_freshness(a, comp_result))
+                        .unwrap_or(Freshness::Not);
+                    let written = match args.first().map(peel) {
+                        // A fresh-returning updater stores a fresh (truthy,
+                        // non-null) reference — enough for guard proofs.
+                        Some(Expr::FnLit { .. }) => {
+                            crate::domains::StateValue::reference(Stability::PerRender)
+                        }
+                        Some(a) => eval_in_exit_env(a, comp_result),
+                        None => crate::domains::StateValue::top(),
+                    };
+                    out.push(ChurnSetterCall {
+                        label,
+                        freshness,
+                        block_id,
+                        span,
+                        written,
+                    });
+                } else if depth > 0
+                    && let Some(body) = fn_bindings.get(name)
+                {
+                    // Direct call of a bound helper: executes inline, keep
+                    // the caller's block for must-reach (mirrors B6).
+                    let mut inner = Vec::new();
+                    collect_churn_calls(
+                        body,
+                        setter_labels,
+                        fn_bindings,
+                        comp_result,
+                        depth - 1,
+                        false,
+                        &mut inner,
+                    );
+                    for mut c in inner {
+                        c.block_id = block_id;
+                        c.span = c.span.or(span);
+                        out.push(c);
+                    }
+                }
+            }
+            for arg in args {
+                match arg {
+                    // Callback passed elsewhere: runs at an unknown time,
+                    // never must-reached.
+                    Expr::FnLit { body_cfg, .. } if depth > 0 => {
+                        collect_churn_calls(
+                            body_cfg,
+                            setter_labels,
+                            fn_bindings,
+                            comp_result,
+                            depth - 1,
+                            false,
+                            out,
+                        );
+                    }
+                    _ => churn_calls_in_expr(
+                        arg,
+                        span,
+                        block_id,
+                        setter_labels,
+                        fn_bindings,
+                        comp_result,
+                        depth,
+                        out,
+                    ),
+                }
+            }
+        }
+        Expr::BinOp { lhs, rhs, .. } => {
+            for e in [lhs.as_ref(), rhs.as_ref()] {
+                churn_calls_in_expr(
+                    e,
+                    span,
+                    block_id,
+                    setter_labels,
+                    fn_bindings,
+                    comp_result,
+                    depth,
+                    out,
+                );
+            }
+        }
+        Expr::UnaryOp { arg, .. } => {
+            churn_calls_in_expr(
+                arg,
+                span,
+                block_id,
+                setter_labels,
+                fn_bindings,
+                comp_result,
+                depth,
+                out,
+            );
+        }
+        Expr::TSAnnotated(inner, _) => {
+            churn_calls_in_expr(
+                inner,
+                span,
+                block_id,
+                setter_labels,
+                fn_bindings,
+                comp_result,
+                depth,
+                out,
+            );
+        }
+        _ => {}
+    }
+}
+
+/// True when the dominating guards of `call_block` provably kill the call
+/// once `written` sits in state slot `label` — the set fires at most once.
+///
+/// Walks the single-predecessor chain up from the call block collecting
+/// `(cond, taken)` branch constraints, rebinds every var aliasing the slot to
+/// `written`, and applies the engine's branch narrowing: if the guarded
+/// variable narrows to ⊥, the branch is dead in every later run.
+fn converges_once_written(
+    cfg: &CFG,
+    call_block: BlockId,
+    state_vals: &HashMap<Var, HookLabel>,
+    label: HookLabel,
+    written: &crate::domains::StateValue,
+    comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+) -> bool {
+    use crate::ir::cfg::{EdgeKind, Terminator};
+
+    let mut guards: Vec<(&Expr, bool)> = Vec::new();
+    let mut cur = call_block;
+    loop {
+        let preds: Vec<&crate::ir::cfg::Edge> = cfg.edges.iter().filter(|e| e.to == cur).collect();
+        if preds.len() != 1 {
+            break; // join point or entry: stop collecting dominators
+        }
+        let edge = preds[0];
+        if let Some(pb) = cfg.blocks.get(&edge.from)
+            && let Terminator::Branch { cond, .. } = &pb.term
+        {
+            match edge.kind {
+                EdgeKind::IfTrue => guards.push((cond, true)),
+                EdgeKind::IfFalse => guards.push((cond, false)),
+                _ => {}
+            }
+        }
+        cur = edge.from;
+        if cur == cfg.entry {
+            break;
+        }
+    }
+    if guards.is_empty() {
+        return false;
+    }
+
+    let mut env = comp_result.exit_env();
+    for (v, l) in state_vals {
+        if *l == label {
+            env.extend(v.clone(), written.clone());
+        }
+    }
+    for (cond, taken) in guards {
+        let narrowed = crate::engine::cfg_analyzer::narrow_env_for_branch(&env, cond, taken);
+        if let Some(x) = guard_var(cond)
+            && narrowed.lookup(x).is_bottom_value()
+        {
+            return true;
+        }
+        env = narrowed;
+    }
+    false
+}
+
+/// The variable a guard condition constrains, if the narrowing recognises it.
+fn guard_var(cond: &Expr) -> Option<&str> {
+    match cond {
+        Expr::Var(x) => Some(x),
+        Expr::BinOp { lhs, .. } => match lhs.as_ref() {
+            Expr::Var(x) => Some(x),
+            _ => None,
+        },
+        Expr::UnaryOp {
+            op: crate::ir::expr::UnaryOp::Not,
+            arg,
+        } => match arg.as_ref() {
+            Expr::Var(x) => Some(x),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// True when every entry→exit path of `cfg` passes through one of `blocks`.
+fn on_all_paths(cfg: &CFG, blocks: &HashSet<BlockId>) -> bool {
+    if blocks.contains(&cfg.entry) {
+        return true;
+    }
+    // BFS avoiding `blocks`; reaching an exit block means a path escapes.
+    let mut visited: HashSet<BlockId> = HashSet::new();
+    let mut queue = vec![cfg.entry];
+    visited.insert(cfg.entry);
+    while let Some(bid) = queue.pop() {
+        let succs = cfg.successors(bid);
+        if succs.is_empty() {
+            return false; // exit reached without hitting a call block
+        }
+        for succ in succs {
+            if !blocks.contains(&succ) && visited.insert(succ) {
+                queue.push(succ);
+            }
+        }
+    }
+    true
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

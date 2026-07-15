@@ -170,7 +170,19 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     // A null/undefined init needs no TS-hint override anymore:
                     // the product value joins the null slot with whatever the
                     // setters write, and the num slot widens independently.
-                    transfer.eval_expr(init, &init_env, &mut ac)
+                    match init {
+                        // Lazy initializer `useState(() => expr)`: React runs
+                        // the thunk once at mount and stores its RETURN value
+                        // — the state is never the closure itself. Abstracting
+                        // the FnLit (reference(Unstable)) made every lazy-init
+                        // state slot an "unstable dep" (corpus FP, TODO.md F2).
+                        Expr::FnLit {
+                            params, body_cfg, ..
+                        } if params.is_empty() => crate::domains::interp::exec_body(
+                            transfer, body_cfg, &init_env, &mut ac,
+                        ),
+                        _ => transfer.eval_expr(init, &init_env, &mut ac),
+                    }
                 };
                 state.update(*label, init_val);
             }
@@ -1542,7 +1554,7 @@ mod tests {
         // both slots (ADR-015): number[0,0] | ref(Unstable). No collapse to ⊤.
         let v = result.state_store.get(0);
         assert_eq!(v.num, Interval::point(0.0));
-        assert_eq!(v.reference, crate::domains::impls::Stability::Unstable);
+        assert_eq!(v.reference, crate::domains::impls::Stability::PerRender);
         assert!(!v.is_top_value());
         assert!(result.widened_labels.is_empty());
     }
@@ -1817,7 +1829,7 @@ mod tests {
         // product keeps both slots (ADR-015).
         let v = result.state_store.get(0);
         assert_eq!(v.num, Interval::point(0.0));
-        assert_eq!(v.reference, crate::domains::impls::Stability::Unstable);
+        assert_eq!(v.reference, crate::domains::impls::Stability::PerRender);
     }
 
     // ── Handler entry point tests ─────────────────────────────────────────────

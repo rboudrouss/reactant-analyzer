@@ -113,25 +113,93 @@ fn collect_subscriptions_in_expr(
 
 // ── Handler extraction ────────────────────────────────────────────────────────
 
-/// Scan `cfg` for JSX `onX={fn}` event handler props and append each as
-/// `HookEntry::Handler`. Inspects statements and `Terminator::Return`; only
-/// `NativeElem` props (not `CompApp`).
+/// Scan `cfg` for `onX={…}` event-handler props and append each as
+/// `HookEntry::Handler`, so their setter writes join the fixpoint (handlers
+/// run 0..N times — under-approximating them is an FN class, TODO.md F4).
+///
+/// Covered forms:
+/// - `<div onClick={() => …}>` — inline `FnLit` on a native element;
+/// - `<Child onToggle={() => …}>` — inline `FnLit` on a **component** prop
+///   (the child may invoke it at any time: same trigger class per ADR-009);
+/// - `onX={someVar}` where the render CFG binds `someVar` to an `FnLit`
+///   or to a `useCallback` (`CallbackVal` — body taken from its hook entry).
+///
+/// Bare setters as props (`onOpenChange={setOpen}`) are handled by the
+/// engine instead (unknown-child havoc in `eval_comp_app`): only the engine
+/// knows whether the receiver is analyzable. Not covered: callbacks passed
+/// under non-`onX` prop names (`<Child action={cb}>`).
 pub fn extract_handlers(cfg: &CFG, hooks: &mut Vec<HookEntry>, next_label: &mut HookLabel) {
+    // Pre-pass: resolvable handler bodies by variable name.
+    // `let cb = () => …` and `let cb = useCallback(…)` (rewritten to
+    // `CallbackVal(l)` by extract_hooks, which runs before us).
+    let callback_bodies: HashMap<HookLabel, &CFG> = hooks
+        .iter()
+        .filter_map(|h| match h {
+            HookEntry::Callback {
+                label, body_cfg, ..
+            } => Some((*label, body_cfg)),
+            _ => None,
+        })
+        .collect();
+    let mut var_bodies: HashMap<&str, CFG> = HashMap::new();
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            if let Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } = stmt {
+                match rhs {
+                    Expr::FnLit { body_cfg, .. } => {
+                        var_bodies.insert(var.as_str(), (**body_cfg).clone());
+                    }
+                    Expr::CallbackVal(l) => {
+                        if let Some(body) = callback_bodies.get(l) {
+                            var_bodies.insert(var.as_str(), (*body).clone());
+                        }
+                    }
+                    // Bare setters (`onOpenChange={setOpen}`) are NOT handled
+                    // here: whether the receiver may call them with arbitrary
+                    // args depends on whether the child is analyzable, which
+                    // only the engine knows (see eval_comp_app's unknown-child
+                    // havoc). Synthesizing a ⊤-write at lowering time would
+                    // clobber the precise inter-component analysis of known
+                    // children (e.g. `onChange={setN}` between two analyzed
+                    // components).
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut found: Vec<HookEntry> = Vec::new();
     for block in cfg.blocks.values() {
         for stmt in &block.stmts {
             let expr = match stmt {
                 Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => rhs,
                 Stmt::ExprStmt(e, _) => e,
             };
-            collect_handlers_in_expr(expr, hooks, next_label);
+            collect_handlers_in_expr(expr, &var_bodies, &mut found, next_label);
         }
         if let Terminator::Return(e) = &block.term {
-            collect_handlers_in_expr(e, hooks, next_label);
+            collect_handlers_in_expr(e, &var_bodies, &mut found, next_label);
         }
+    }
+    hooks.extend(found);
+}
+
+/// Resolve one event-prop value to a handler body, if analyzable.
+fn handler_body(val: &Expr, var_bodies: &HashMap<&str, CFG>) -> Option<CFG> {
+    match val {
+        Expr::FnLit { body_cfg, .. } => Some((**body_cfg).clone()),
+        Expr::Var(v) => var_bodies.get(v.as_str()).cloned(),
+        Expr::TSAnnotated(e, _) => handler_body(e, var_bodies),
+        _ => None,
     }
 }
 
-fn collect_handlers_in_expr(expr: &Expr, hooks: &mut Vec<HookEntry>, next_label: &mut HookLabel) {
+fn collect_handlers_in_expr(
+    expr: &Expr,
+    var_bodies: &HashMap<&str, CFG>,
+    found: &mut Vec<HookEntry>,
+    next_label: &mut HookLabel,
+) {
     match expr {
         Expr::NativeElem {
             props,
@@ -142,28 +210,49 @@ fn collect_handlers_in_expr(expr: &Expr, hooks: &mut Vec<HookEntry>, next_label:
             if let Expr::ObjectLit { fields, .. } = props.as_ref() {
                 for (name, val) in fields {
                     if is_event_prop(name) {
-                        if let Expr::FnLit { body_cfg, .. } = val {
+                        if let Some(body_cfg) = handler_body(val, var_bodies) {
                             let label = *next_label;
                             *next_label += 1;
-                            hooks.push(HookEntry::Handler {
+                            found.push(HookEntry::Handler {
                                 label,
                                 event: prop_to_event(name),
-                                body_cfg: (**body_cfg).clone(),
+                                body_cfg,
                                 span: prop_spans.get(name).copied().flatten(),
                             });
                         }
-                        // Non-FnLit onX props (e.g. onX={someVar}) are not analysed.
                     } else {
-                        collect_handlers_in_expr(val, hooks, next_label);
+                        collect_handlers_in_expr(val, var_bodies, found, next_label);
                     }
                 }
             }
             for child in children {
-                collect_handlers_in_expr(child, hooks, next_label);
+                collect_handlers_in_expr(child, var_bodies, found, next_label);
             }
         }
-        // Don't scan CompApp props those are React component props, not DOM events.
-        Expr::TSAnnotated(e, _) => collect_handlers_in_expr(e, hooks, next_label),
+        // Component props: an `onX` callback prop is invoked by the child at
+        // arbitrary times — same handler trigger class as a DOM event.
+        // (Nested JSX rides in via non-event prop values, incl. `children`.)
+        Expr::CompApp { props, .. } => {
+            if let Expr::ObjectLit { fields, .. } = props.as_ref() {
+                for (name, val) in fields {
+                    if is_event_prop(name) {
+                        if let Some(body_cfg) = handler_body(val, var_bodies) {
+                            let label = *next_label;
+                            *next_label += 1;
+                            found.push(HookEntry::Handler {
+                                label,
+                                event: prop_to_event(name),
+                                body_cfg,
+                                span: None,
+                            });
+                        }
+                    } else {
+                        collect_handlers_in_expr(val, var_bodies, found, next_label);
+                    }
+                }
+            }
+        }
+        Expr::TSAnnotated(e, _) => collect_handlers_in_expr(e, var_bodies, found, next_label),
         _ => {}
     }
 }
@@ -249,18 +338,17 @@ fn process_stmt(
                 }
 
                 // Record the binding variable, npm import source, and resolved file for Custom hooks.
-                if !is_arr_temp {
-                    if let Some(HookEntry::Custom {
+                if !is_arr_temp
+                    && let Some(HookEntry::Custom {
                         binding,
                         import_source,
                         resolved_file,
                         ..
                     }) = hooks.last_mut()
-                    {
-                        *binding = Some(var.clone());
-                        *import_source = import_map.get(&name).cloned();
-                        *resolved_file = resolved_import_map.get(&name).cloned();
-                    }
+                {
+                    *binding = Some(var.clone());
+                    *import_source = import_map.get(&name).cloned();
+                    *resolved_file = resolved_import_map.get(&name).cloned();
                 }
 
                 if is_state_like && is_arr_temp {

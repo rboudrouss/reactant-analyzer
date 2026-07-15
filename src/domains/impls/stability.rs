@@ -1,43 +1,104 @@
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
 use crate::{
     domains::AbstractDomain,
-    ir::expr::{Expr, SummaryValue},
+    ir::{
+        expr::{Expr, SummaryValue},
+        types::{HookLabel, Symbol},
+    },
 };
 
-/// Stability lattice tracks whether a value's reference is stable across renders.
+/// Threshold on `Versioned` label sets before widening to `VersionedTop`
+/// (same pattern as `StrConst`).
+pub const VERSIONED_LABELS_THRESHOLD: usize = 4;
+
+/// Stability lattice: bounds on the *change trace* of a value — the set of
+/// renders where `Object.is(vᵢ, vᵢ₋₁)` fails (the only thing React observes).
+///
+/// Two kinds of bounds coexist (ADR-017):
+/// - **may** bound (over-approx): used by rules to *stay silent* soundly.
+/// - **must** bound (under-approx): used by rules to *fire* without FPs.
 ///
 /// ```text
-///        Unknown  (⊤)
-///        /     \
-///   Stable   Unstable
-///        \     /
-///         Bottom  (⊥)
+///               Unknown  (⊤)
+///              /         \
+///      VersionedTop    PerRender
+///           |              |
+///    Versioned(S) ⊆-chains |
+///           |              |
+///        Stable            |
+///              \          /
+///               Bottom  (⊥)
 /// ```
 ///
-/// `Stable` and `Unstable` are incomparable (neither implies the other).
-/// `join(Stable, Unstable) = Unknown`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `Versioned`/`VersionedTop` and `PerRender` are incomparable — not
+/// opposites, different bounds: `join = Unknown` (guarantees nothing in
+/// either direction).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stability {
     /// ⊥ no information (unreachable path / uninitialized).
     Bottom,
-    /// Reference is the same object on every render (safe as a dep).
+    /// Never changes: the same reference on every render (safe as a dep).
     Stable,
-    /// Reference changes on every render (unsafe as a dep if not memoized).
-    Unstable,
-    /// ⊤ may be either stable or unstable (join of both paths).
+    /// Changes *only* at setter events of these state slots (may bound).
+    /// Invariant: non-empty (canonicalised — `Versioned(∅) ≡ Stable`) and
+    /// `len() ≤ VERSIONED_LABELS_THRESHOLD` (widened to `VersionedTop` above).
+    Versioned(BTreeSet<(Symbol, HookLabel)>),
+    /// Versioned by unknown state slots (threshold-widened `Versioned`).
+    VersionedTop,
+    /// A fresh reference every render, guaranteed (must bound).
+    /// For non-reference kinds via `to_stability`: "may change every render".
+    PerRender,
+    /// ⊤ no bound in either direction.
     Unknown,
+}
+
+impl Stability {
+    /// Canonicalising constructor: ∅ → `Stable`, over-threshold → `VersionedTop`.
+    pub fn versioned(labels: BTreeSet<(Symbol, HookLabel)>) -> Self {
+        if labels.is_empty() {
+            Stability::Stable
+        } else if labels.len() > VERSIONED_LABELS_THRESHOLD {
+            Stability::VersionedTop
+        } else {
+            Stability::Versioned(labels)
+        }
+    }
+
+    /// Single-slot `Versioned`.
+    pub fn versioned_by(component: Symbol, label: HookLabel) -> Self {
+        Stability::Versioned(BTreeSet::from([(component, label)]))
+    }
 }
 
 impl PartialOrd for Stability {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        use Stability::*;
         match (self, other) {
             (a, b) if a == b => Some(Ordering::Equal),
-            (Stability::Bottom, _) => Some(Ordering::Less),
-            (_, Stability::Unknown) => Some(Ordering::Less),
-            (_, Stability::Bottom) => Some(Ordering::Greater),
-            (Stability::Unknown, _) => Some(Ordering::Greater),
-            _ => None, // Stable vs Unstable: incomparable
+            (Bottom, _) => Some(Ordering::Less),
+            (_, Bottom) => Some(Ordering::Greater),
+            (_, Unknown) => Some(Ordering::Less),
+            (Unknown, _) => Some(Ordering::Greater),
+            // Stable ⊑ Versioned ⊑ VersionedTop (behaviour-set inclusion:
+            // "never changes" ⊂ "changes only at sets").
+            (Stable, Versioned(_) | VersionedTop) => Some(Ordering::Less),
+            (Versioned(_) | VersionedTop, Stable) => Some(Ordering::Greater),
+            (Versioned(s), Versioned(t)) => {
+                if s.is_subset(t) {
+                    Some(Ordering::Less) // s ≠ t here (equal case above)
+                } else if t.is_subset(s) {
+                    Some(Ordering::Greater)
+                } else {
+                    None
+                }
+            }
+            (Versioned(_), VersionedTop) => Some(Ordering::Less),
+            (VersionedTop, Versioned(_)) => Some(Ordering::Greater),
+            // PerRender vs Stable/Versioned/VersionedTop: incomparable
+            // (different bounds — may vs must).
+            _ => None,
         }
     }
 }
@@ -49,23 +110,40 @@ impl Stability {
 
     /// Least upper bound (⊔).
     pub fn join(&self, other: &Self) -> Self {
+        use Stability::*;
         match (self, other) {
-            (a, b) if a == b => *a,
-            (Stability::Bottom, x) | (x, Stability::Bottom) => *x,
-            _ => Stability::Unknown,
+            (a, b) if a == b => a.clone(),
+            (Bottom, x) | (x, Bottom) => x.clone(),
+            (Unknown, _) | (_, Unknown) => Unknown,
+            (Stable, v @ (Versioned(_) | VersionedTop))
+            | (v @ (Versioned(_) | VersionedTop), Stable) => v.clone(),
+            (Versioned(s), Versioned(t)) => Stability::versioned(s.union(t).cloned().collect()),
+            (VersionedTop, Versioned(_)) | (Versioned(_), VersionedTop) => VersionedTop,
+            // {Stable, Versioned, VersionedTop} ⊔ PerRender = Unknown
+            _ => Unknown,
         }
     }
 
     /// Greatest lower bound (⊓).
     pub fn meet(&self, other: &Self) -> Self {
+        use Stability::*;
         match (self, other) {
-            (a, b) if a == b => *a,
-            (Stability::Unknown, x) | (x, Stability::Unknown) => *x,
-            _ => Stability::Bottom,
+            (a, b) if a == b => a.clone(),
+            (Unknown, x) | (x, Unknown) => x.clone(),
+            (Bottom, _) | (_, Bottom) => Bottom,
+            (Stable, Versioned(_) | VersionedTop) | (Versioned(_) | VersionedTop, Stable) => Stable,
+            (Versioned(s), Versioned(t)) => {
+                let inter: BTreeSet<_> = s.intersection(t).cloned().collect();
+                Stability::versioned(inter) // ∅ canonicalises to Stable
+            }
+            (VersionedTop, v @ Versioned(_)) | (v @ Versioned(_), VersionedTop) => v.clone(),
+            // {Stable, Versioned, VersionedTop} ⊓ PerRender = Bottom
+            _ => Bottom,
         }
     }
 
-    /// Widening equals join for this finite-height lattice (height 2).
+    /// Widening: join, whose `Versioned` union is already threshold-bounded —
+    /// chains have height ≤ threshold + 4.
     pub fn widen(&self, other: &Self) -> Self {
         self.join(other)
     }
@@ -98,12 +176,12 @@ impl Stability {
     pub fn from_expr_static(expr: &Expr) -> Stability {
         match expr {
             Expr::Lit(_) => Stability::Stable,
-            Expr::ObjectLit { .. } => Stability::Unstable,
-            Expr::ArrayLit { .. } => Stability::Unstable,
-            Expr::FnLit { .. } => Stability::Unstable,
+            Expr::ObjectLit { .. } => Stability::PerRender,
+            Expr::ArrayLit { .. } => Stability::PerRender,
+            Expr::FnLit { .. } => Stability::PerRender,
             Expr::StateSetter(_) => Stability::Stable,
             Expr::SummaryVal(SummaryValue::StableRef) => Stability::Stable,
-            Expr::SummaryVal(SummaryValue::UnstableRef) => Stability::Unstable,
+            Expr::SummaryVal(SummaryValue::UnstableRef) => Stability::PerRender,
             Expr::SummaryVal(SummaryValue::Top) => Stability::Unknown,
             _ => Stability::Unknown,
         }
@@ -117,121 +195,190 @@ mod tests {
     use super::*;
     use crate::ir::expr::{Expr, Prim};
 
+    fn v(labels: &[(&str, HookLabel)]) -> Stability {
+        Stability::Versioned(labels.iter().map(|(c, l)| (c.to_string(), *l)).collect())
+    }
+
+    fn all_points() -> Vec<Stability> {
+        vec![
+            Stability::Bottom,
+            Stability::Stable,
+            v(&[("A", 0)]),
+            v(&[("A", 0), ("B", 1)]),
+            Stability::VersionedTop,
+            Stability::PerRender,
+            Stability::Unknown,
+        ]
+    }
+
     // ── join ──────────────────────────────────────────────────────────────────
 
     #[test]
-    fn join_stable_unstable_is_unknown() {
+    fn join_stable_perrender_is_unknown() {
         assert_eq!(
-            Stability::Stable.join(&Stability::Unstable),
+            Stability::Stable.join(&Stability::PerRender),
             Stability::Unknown
         );
         assert_eq!(
-            Stability::Unstable.join(&Stability::Stable),
+            Stability::PerRender.join(&Stability::Stable),
             Stability::Unknown
         );
+    }
+
+    #[test]
+    fn join_versioned_perrender_is_unknown() {
+        assert_eq!(
+            v(&[("A", 0)]).join(&Stability::PerRender),
+            Stability::Unknown
+        );
+        assert_eq!(
+            Stability::VersionedTop.join(&Stability::PerRender),
+            Stability::Unknown
+        );
+    }
+
+    #[test]
+    fn join_stable_versioned_keeps_versioned() {
+        assert_eq!(Stability::Stable.join(&v(&[("A", 0)])), v(&[("A", 0)]));
+        assert_eq!(v(&[("A", 0)]).join(&Stability::Stable), v(&[("A", 0)]));
+    }
+
+    #[test]
+    fn join_versioned_is_label_union() {
+        assert_eq!(
+            v(&[("A", 0)]).join(&v(&[("B", 1)])),
+            v(&[("A", 0), ("B", 1)])
+        );
+    }
+
+    #[test]
+    fn join_versioned_over_threshold_widens_to_top() {
+        let big = v(&[("A", 0), ("A", 1), ("A", 2), ("A", 3)]);
+        assert_eq!(big.join(&v(&[("B", 9)])), Stability::VersionedTop);
     }
 
     #[test]
     fn join_with_bottom_is_identity() {
-        assert_eq!(
-            Stability::Stable.join(&Stability::Bottom),
-            Stability::Stable
-        );
-        assert_eq!(
-            Stability::Unstable.join(&Stability::Bottom),
-            Stability::Unstable
-        );
-        assert_eq!(
-            Stability::Bottom.join(&Stability::Stable),
-            Stability::Stable
-        );
+        for x in all_points() {
+            assert_eq!(Stability::Bottom.join(&x), x);
+            assert_eq!(x.join(&Stability::Bottom), x);
+        }
     }
 
     #[test]
     fn join_with_unknown_is_unknown() {
-        assert_eq!(
-            Stability::Stable.join(&Stability::Unknown),
-            Stability::Unknown
-        );
-        assert_eq!(
-            Stability::Unstable.join(&Stability::Unknown),
-            Stability::Unknown
-        );
-        assert_eq!(
-            Stability::Bottom.join(&Stability::Unknown),
-            Stability::Unknown
-        );
+        for x in all_points() {
+            assert_eq!(x.join(&Stability::Unknown), Stability::Unknown);
+        }
     }
 
     #[test]
-    fn join_idempotent() {
-        for v in [
-            Stability::Bottom,
-            Stability::Stable,
-            Stability::Unstable,
-            Stability::Unknown,
-        ] {
-            assert_eq!(v.join(&v), v);
+    fn join_idempotent_commutative() {
+        for a in all_points() {
+            assert_eq!(a.join(&a), a);
+            for b in all_points() {
+                assert_eq!(a.join(&b), b.join(&a), "join({a:?},{b:?}) not commutative");
+            }
         }
+    }
+
+    #[test]
+    fn join_is_upper_bound() {
+        for a in all_points() {
+            for b in all_points() {
+                let j = a.join(&b);
+                assert!(a <= j, "{a:?} ⋢ join({a:?},{b:?})={j:?}");
+                assert!(b <= j, "{b:?} ⋢ join({a:?},{b:?})={j:?}");
+            }
+        }
+    }
+
+    // ── canonicalisation ─────────────────────────────────────────────────────
+
+    #[test]
+    fn versioned_empty_is_stable() {
+        assert_eq!(Stability::versioned(BTreeSet::new()), Stability::Stable);
+    }
+
+    #[test]
+    fn meet_disjoint_versioned_is_stable() {
+        // intersection ∅ → canonicalises to Stable ("versioned by nothing").
+        assert_eq!(v(&[("A", 0)]).meet(&v(&[("B", 1)])), Stability::Stable);
     }
 
     // ── meet ─────────────────────────────────────────────────────────────────
 
     #[test]
-    fn meet_stable_unstable_is_bottom() {
+    fn meet_stable_perrender_is_bottom() {
         assert_eq!(
-            Stability::Stable.meet(&Stability::Unstable),
+            Stability::Stable.meet(&Stability::PerRender),
             Stability::Bottom
         );
     }
 
     #[test]
+    fn meet_versioned_is_label_intersection() {
+        assert_eq!(
+            v(&[("A", 0), ("B", 1)]).meet(&v(&[("B", 1), ("C", 2)])),
+            v(&[("B", 1)])
+        );
+    }
+
+    #[test]
     fn meet_with_unknown_is_identity() {
-        assert_eq!(
-            Stability::Stable.meet(&Stability::Unknown),
-            Stability::Stable
-        );
-        assert_eq!(
-            Stability::Unstable.meet(&Stability::Unknown),
-            Stability::Unstable
-        );
+        for x in all_points() {
+            assert_eq!(x.meet(&Stability::Unknown), x);
+        }
+    }
+
+    #[test]
+    fn meet_is_lower_bound() {
+        for a in all_points() {
+            for b in all_points() {
+                let m = a.meet(&b);
+                assert!(m <= a, "meet({a:?},{b:?})={m:?} ⋢ {a:?}");
+                assert!(m <= b, "meet({a:?},{b:?})={m:?} ⋢ {b:?}");
+            }
+        }
     }
 
     // ── partial order ─────────────────────────────────────────────────────────
 
     #[test]
-    fn bottom_is_least() {
-        assert!(Stability::Bottom <= Stability::Bottom);
-        assert!(Stability::Bottom <= Stability::Stable);
-        assert!(Stability::Bottom <= Stability::Unstable);
-        assert!(Stability::Bottom <= Stability::Unknown);
+    fn bottom_least_unknown_greatest() {
+        for x in all_points() {
+            assert!(Stability::Bottom <= x);
+            assert!(x <= Stability::Unknown);
+        }
     }
 
     #[test]
-    fn unknown_is_greatest() {
-        assert!(Stability::Stable <= Stability::Unknown);
-        assert!(Stability::Unstable <= Stability::Unknown);
-        assert!(Stability::Unknown <= Stability::Unknown);
+    fn stable_below_versioned_below_versioned_top() {
+        assert!(Stability::Stable <= v(&[("A", 0)]));
+        assert!(v(&[("A", 0)]) <= v(&[("A", 0), ("B", 1)]));
+        assert!(v(&[("A", 0)]) <= Stability::VersionedTop);
     }
 
     #[test]
-    fn stable_and_unstable_are_incomparable() {
-        assert!(!(Stability::Stable <= Stability::Unstable));
-        assert!(!(Stability::Unstable <= Stability::Stable));
+    fn perrender_incomparable_with_stable_and_versioned() {
+        for x in [Stability::Stable, v(&[("A", 0)]), Stability::VersionedTop] {
+            assert!(x.partial_cmp(&Stability::PerRender).is_none());
+        }
     }
 
-    // ── widen = join ──────────────────────────────────────────────────────────
+    #[test]
+    fn incomparable_versioned_sets() {
+        assert!(v(&[("A", 0)]).partial_cmp(&v(&[("B", 1)])).is_none());
+    }
+
+    // ── widen = join (threshold already inside join) ──────────────────────────
 
     #[test]
     fn widen_equals_join() {
-        let pairs = [
-            (Stability::Bottom, Stability::Stable),
-            (Stability::Stable, Stability::Unstable),
-            (Stability::Unstable, Stability::Unknown),
-            (Stability::Unknown, Stability::Bottom),
-        ];
-        for (a, b) in pairs {
-            assert_eq!(a.widen(&b), a.join(&b), "widen({a:?}, {b:?}) ≠ join");
+        for a in all_points() {
+            for b in all_points() {
+                assert_eq!(a.widen(&b), a.join(&b), "widen({a:?}, {b:?}) ≠ join");
+            }
         }
     }
 
@@ -254,29 +401,29 @@ mod tests {
     }
 
     #[test]
-    fn object_lit_is_unstable() {
+    fn object_lit_is_per_render() {
         assert_eq!(
             Stability::from_expr_static(&Expr::ObjectLit {
                 id: crate::ir::types::ExprId(0),
                 fields: vec![]
             }),
-            Stability::Unstable
+            Stability::PerRender
         );
     }
 
     #[test]
-    fn array_lit_is_unstable() {
+    fn array_lit_is_per_render() {
         assert_eq!(
             Stability::from_expr_static(&Expr::ArrayLit {
                 id: crate::ir::types::ExprId(0),
                 elems: vec![]
             }),
-            Stability::Unstable
+            Stability::PerRender
         );
     }
 
     #[test]
-    fn fn_lit_is_unstable() {
+    fn fn_lit_is_per_render() {
         use crate::ir::cfg::{BasicBlock, CFG, Terminator};
         let mut blocks = std::collections::HashMap::new();
         blocks.insert(
@@ -298,7 +445,7 @@ mod tests {
                 params: vec![],
                 body_cfg: std::sync::Arc::new(cfg)
             }),
-            Stability::Unstable
+            Stability::PerRender
         );
     }
 

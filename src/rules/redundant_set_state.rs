@@ -438,7 +438,7 @@ mod tests {
         let result = make_result(
             vec![(0, stmts)],
             vec![("setN", StateValue::reference(Stability::Stable), Some(0))],
-            vec![(0, StateValue::reference(Stability::Unstable))],
+            vec![(0, StateValue::reference(Stability::PerRender))],
         );
         assert!(
             RedundantSetState

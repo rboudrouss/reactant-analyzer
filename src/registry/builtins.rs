@@ -195,7 +195,7 @@ mod tests {
     #[test]
     fn use_effect_has_effect_semantics() {
         let r = registry();
-        let res = r.analyze("useEffect", &[Stability::Unstable], Some(&[]));
+        let res = r.analyze("useEffect", &[Stability::PerRender], Some(&[]));
         assert!(!res.creates_state);
         assert_eq!(res.effect_semantics, Some(EffectSemantics::Standard));
         assert_eq!(res.return_stability, Stability::Stable);
@@ -234,7 +234,7 @@ mod tests {
         let res = r.analyze(
             "useMemo",
             &[],
-            Some(&[Stability::Stable, Stability::Unstable]),
+            Some(&[Stability::Stable, Stability::PerRender]),
         );
         assert_eq!(res.return_stability, Stability::Unknown); // join(Stable, Unstable) = Unknown
     }
@@ -242,8 +242,8 @@ mod tests {
     #[test]
     fn use_memo_all_unstable_deps_unstable() {
         let r = registry();
-        let res = r.analyze("useMemo", &[], Some(&[Stability::Unstable]));
-        assert_eq!(res.return_stability, Stability::Unstable);
+        let res = r.analyze("useMemo", &[], Some(&[Stability::PerRender]));
+        assert_eq!(res.return_stability, Stability::PerRender);
     }
 
     // ── useCallback ───────────────────────────────────────────────────────────
@@ -251,7 +251,7 @@ mod tests {
     #[test]
     fn use_callback_empty_deps_stable() {
         let r = registry();
-        let res = r.analyze("useCallback", &[Stability::Unstable], Some(&[]));
+        let res = r.analyze("useCallback", &[Stability::PerRender], Some(&[]));
         assert_eq!(res.return_stability, Stability::Stable);
         assert!(!res.creates_state);
     }
@@ -259,8 +259,8 @@ mod tests {
     #[test]
     fn use_callback_unstable_dep_propagates() {
         let r = registry();
-        let res = r.analyze("useCallback", &[], Some(&[Stability::Unstable]));
-        assert_eq!(res.return_stability, Stability::Unstable);
+        let res = r.analyze("useCallback", &[], Some(&[Stability::PerRender]));
+        assert_eq!(res.return_stability, Stability::PerRender);
     }
 
     // ── useRef ────────────────────────────────────────────────────────────────
@@ -268,7 +268,7 @@ mod tests {
     #[test]
     fn use_ref_always_stable() {
         let r = registry();
-        for args in [vec![], vec![Stability::Unknown], vec![Stability::Unstable]] {
+        for args in [vec![], vec![Stability::Unknown], vec![Stability::PerRender]] {
             let res = r.analyze("useRef", &args, None);
             assert_eq!(
                 res.return_stability,
@@ -320,7 +320,7 @@ mod tests {
         let mut r = Registry::new_with_builtins();
         r.register(Box::new(AlwaysStable));
         // Last registered wins (HashMap overwrite).
-        let res = r.analyze("useMemo", &[], Some(&[Stability::Unstable]));
+        let res = r.analyze("useMemo", &[], Some(&[Stability::PerRender]));
         assert_eq!(res.return_stability, Stability::Stable);
     }
 }

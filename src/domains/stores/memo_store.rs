@@ -56,17 +56,17 @@ mod tests {
         let mut m = Memo::new();
         m.set(0, Stability::Stable);
         assert_eq!(m.get(0), Stability::Stable);
-        m.set(0, Stability::Unstable);
-        assert_eq!(m.get(0), Stability::Unstable);
+        m.set(0, Stability::PerRender);
+        assert_eq!(m.get(0), Stability::PerRender);
     }
 
     #[test]
     fn multiple_labels_independent() {
         let mut m = Memo::new();
         m.set(0, Stability::Stable);
-        m.set(1, Stability::Unstable);
+        m.set(1, Stability::PerRender);
         assert_eq!(m.get(0), Stability::Stable);
-        assert_eq!(m.get(1), Stability::Unstable);
+        assert_eq!(m.get(1), Stability::PerRender);
         assert_eq!(m.get(2), Stability::Unknown); // unset → top
     }
 }

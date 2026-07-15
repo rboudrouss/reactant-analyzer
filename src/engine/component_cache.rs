@@ -181,7 +181,7 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(
             "onClick".to_string(),
-            StateValue::reference(Stability::Unstable),
+            StateValue::reference(Stability::PerRender),
         );
         m
     }

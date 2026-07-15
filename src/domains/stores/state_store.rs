@@ -122,7 +122,7 @@ mod tests {
     fn update_is_monotone_join() {
         let mut s = Store::new();
         s.update(0, Stability::Stable);
-        s.update(0, Stability::Unstable);
+        s.update(0, Stability::PerRender);
         assert_eq!(s.get(0), Stability::Unknown);
     }
 
@@ -131,7 +131,7 @@ mod tests {
         let mut a = Store::new();
         a.update(0, Stability::Stable);
         let mut b = Store::new();
-        b.update(0, Stability::Unstable);
+        b.update(0, Stability::PerRender);
         b.update(1, Stability::Stable);
         let j = a.join(&b);
         assert_eq!(j.get(0), Stability::Unknown);
@@ -160,7 +160,7 @@ mod tests {
         a.update(1, Stability::Stable);
         let mut b = Store::new();
         b.update(0, Stability::Stable);
-        b.update(1, Stability::Unstable);
+        b.update(1, Stability::PerRender);
         assert_eq!(a.changed_labels(&b), vec![1]);
     }
 
@@ -169,7 +169,7 @@ mod tests {
         let mut a = Store::new();
         a.update(0, Stability::Stable);
         let mut b = Store::new();
-        b.update(0, Stability::Unstable);
+        b.update(0, Stability::PerRender);
         assert_eq!(a.widen(&b), a.join(&b));
     }
 }

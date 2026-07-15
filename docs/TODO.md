@@ -8,11 +8,27 @@
 
 - **Loop-carried values inside callbacks** — `exec_body` doesn't widen on back-edges → `setX(arr[i])` records a partial value. Minor FN on the *value*, never an FP. *(ADR-009)*
 
+- **Multi-effect churn cycles (F5b)** — effect A deps `[a]` sets `b` fresh; effect B deps `[b]` sets `a` fresh: a real render loop the `infinite-loop` churn arm doesn't prove (self-churn only). Surfaced as an `--info` diagnostic today; proper fix = fixpoint over the effect→state→effect graph. *(ADR-017 §Limitations)*
+
 ## Known false positives (FP)
 
-- **`missing-deps` FP on stable function variables** — `const cb = () => setData({loaded: true})` → `Reference(Unstable)` → `missing-deps` fires even if `cb` captures no mutable value. Conservative, acceptable (cf. ESLint rules-of-hooks).
+- **`missing-deps` FP on stable function variables** — `const cb = () => setData({loaded: true})` → per-render reference → `missing-deps` fires even if `cb` captures no mutable value. Conservative, acceptable (cf. ESLint rules-of-hooks).
 
-- **`useState({...})` returns `Reference(Unstable)`** — the analyzer doesn't distinguish the first creation of the object (mount) from its reuse cross-render. Consequence: `[obj]` in a deps array can trigger `always-unstable-deps`. Conservative, acceptable.
+- **Module-scope constants evaluate to ⊤ (F7 candidate)** — `setSelectedTemplate(DEFAULT_TEMPLATE)` where `DEFAULT_TEMPLATE` is a module-level `const`: env miss → ⊤ → `Maybe` freshness → spurious `infinite-loop` Warning (churn arm), and ⊤ noise anywhere else the value flows. Fix: bind module-level `const` literals during lowering. Seen once in memos (`CreateIdentityProviderDialog`).
+
+- **Prop-rooted deps have no stability model (F6 candidate)** — a dep rooted in a prop (memos `MentionResolutionProvider`, `[contents]`) fires `always-unstable-deps` even though the parent may pass a stable value. Props are a third change axis — `OnProps` ("changes when the parent changes it") in the ADR-017 may/must frame — not yet modelled; inter-component analysis could propagate the parent's actual stability.
+
+## Remaining from corpus bench 2026-07-15
+
+Fixes F1–F5 are implemented (regression suite: `tests/corpus_fp_fixes.rs`; domain redesign: [ADR-017](adr/ADR-017-versioned-stability.md)). Still open:
+
+- **4 `redundant-set-state` sites in memos** — need individual investigation; suspected async-arrow handlers and callbacks passed under non-`onX` prop names (`ref={captureFrame}`, render props) — the name-based `onX` handler heuristic doesn't see them.
+- **F1b — path-granular free variables** — crediting a member dep (`[x.b]`) to its root var silences the genuine mismatch case `use(x.a)` with deps `[x.b]` (warned *by accident* before F1). Recovering it needs paths as first-class in `compute_free_vars` + path-vs-path dep matching.
+- **Never-written state refinement** — `useState(CONST)` with no reachable setter call could read `Stable` (dep omittable) instead of `Versioned`. Needs a post-fixpoint "slot ever written" bit; marginal gain. *(ADR-017 §Limitations)*
+
+### Diagnostics UX (side-finding)
+
+- Messages leak internal jargon: `(value: ⊤)`, `number|boolean|string|ref(Unknown)|setter|other`. Map abstract values to user-language ("value may change between renders", "reference is recreated every render") at the rule/message boundary.
 
 ## ADR-013 — cross-file analysis limits
 
@@ -20,8 +36,8 @@
 
 ### Import resolution
 
-- **tsconfig `paths` aliases not resolved by default** — `@/components/Button` returns `None` via `DefaultImportResolver` → the symbol is treated as external → opaque. Workaround: implement a custom `ImportResolver` (see [docs/plugins.md](plugins.md) §"Wrapping `DefaultImportResolver` for tsconfig paths") then call `analyze_with_resolvers`.
-- **Monorepo `@workspace/*` not resolved** — same cause, same workaround.
+- **Aliases outside tsconfig `paths`** — tsconfig `paths` are built-in (ADR-016); still unresolved: aliases declared *only* in `vite.config.*` (`resolve.alias`, requires evaluating JS) and `jsconfig.json` — the CLI warns when a Vite project has no tsconfig `paths`.
+- **Monorepo `@workspace/*` not resolved** — workspace-package specifiers are not aliases; need package.json/workspace resolution. Workaround: custom `ImportResolver`.
 - **Deep re-export chains** — `export { X } from './a'` → `'./a'` re-exports from `'./b'` → deep re-exports can be missed if the chain goes beyond one level (the lowering doesn't follow transitive chains).
 - **Re-export of a third-party hook not traced** — `export let useMyQuery = useQuery` (from `@tanstack/react-query`): no function body → absent from `HookRegistry`; import source = local file → doesn't match the `SummaryRegistry` of the origin package → `analysis-limit/unknown-hook` Info emitted, binding = `⊤`. Fixing this requires tracking re-export aliases.
 - **`node_modules` utilities/hooks/components** — never lowered (not in the files discovered by `DefaultFileDiscoverer`) → opaque → fallback to `SummaryRegistry` (hooks) or `⊤`.
@@ -54,4 +70,4 @@
 - **Dynamic components** — `const C = cond ? A : B; <C />` → `CompApp` not generated, not analyzed.
 - **`React.memo` / `forwardRef` wrappers** — `const Memo = React.memo(function Foo() {...})` → the component detector doesn't follow the wrapped expression.
 - **Anonymous default exports** — `export default () => <div/>` mapped to `"DefaultExport"`; multi-file collisions possible if several anonymous default exports exist (mitigated by `(file, name)` keying but the user-visible name stays generic).
-- **Frameworks (Next.js, TanStack Router)** — no built-in plugin. See [docs/plugins.md](plugins.md) to write a framework-specific discovery plugin.
+- **Frameworks** — Vite is built in (ADR-016). Next.js / TanStack Router: no built-in plugin — Next.js App Router needs RSC semantics (server components have no hooks; `'use client'` boundary), not just a resolver — see [docs/plugins.md](plugins.md) for custom discovery meanwhile.

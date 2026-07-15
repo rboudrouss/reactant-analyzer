@@ -18,3 +18,4 @@
 | [ADR-014](ADR-014-widening-narrowing.md) | Widening up-to (thresholds); narrowing superseded by inner threshold widening | Accepted |
 | [ADR-015](ADR-015-product-value-domain.md) | Product value domain over disjoint JS kinds — supersedes ADR-008's flat enum, TypedStateStore and the useState<T> hint | Accepted |
 | [ADR-016](ADR-016-cli-projects-json.md) | CLI subcommands + JSON output + project-kind detection (Vite, tsconfig paths) | Accepted |
+| [ADR-017](ADR-017-versioned-stability.md) | Versioned reference stability — may/must change bounds, read-side state conversion, churn arm of infinite-loop | Accepted |

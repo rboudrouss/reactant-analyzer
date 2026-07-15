@@ -60,7 +60,7 @@ impl HookSummary for UnstableRefHook {
         self.0
     }
     fn summarize(&self, _args: &[StateValue]) -> StateValue {
-        StateValue::reference(Stability::Unstable)
+        StateValue::reference(Stability::PerRender)
     }
 }
 

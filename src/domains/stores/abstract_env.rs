@@ -228,7 +228,7 @@ mod tests {
         let mut a = Env::new();
         a.extend("x".to_string(), Stability::Stable);
         let mut b = Env::new();
-        b.extend("x".to_string(), Stability::Unstable);
+        b.extend("x".to_string(), Stability::PerRender);
         assert_eq!(a.join(&b).lookup("x"), Stability::Unknown);
     }
 

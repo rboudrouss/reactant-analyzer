@@ -171,10 +171,12 @@ impl StateValue {
         }
     }
 
-    /// True when the value is exactly an unstable reference (nothing else).
-    /// Mirrors the old exact `Reference(Stability::Unstable)` match.
+    /// True when the value is exactly a per-render-fresh reference (nothing
+    /// else) — a *must* fact: a new reference every render, guaranteed.
+    /// `Versioned` (changes only at setter events) deliberately returns false
+    /// (ADR-017).
     pub fn is_unstable_reference_only(&self) -> bool {
-        self.reference == Stability::Unstable
+        self.reference == Stability::PerRender
             && self.num.is_bottom()
             && self.boolean == BoolVal::Bottom
             && self.str == StrConst::Bottom
@@ -196,7 +198,7 @@ impl StateValue {
             Expr::Lit(Prim::Null) => StateValue::null(),
             Expr::Lit(Prim::Unit) => StateValue::undefined(),
             Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::FnLit { .. } => {
-                StateValue::reference(Stability::Unstable)
+                StateValue::reference(Stability::PerRender)
             }
             _ => StateValue::top(),
         }
@@ -206,9 +208,11 @@ impl StateValue {
     ///
     /// Per-kind mapping (same as the pre-ADR-015 flat lattice), combined with
     /// *motion-wins* priority: a slot known to be in motion across renders
-    /// (non-point number interval, unstable reference) makes the whole value
-    /// `Unstable` even if another slot is individually stable — a state that
-    /// widened through `null ∪ number[0,+∞)` genuinely changes every render.
+    /// (non-point number interval, per-render-fresh reference) makes the whole
+    /// value `PerRender` even if another slot is individually stable — a state
+    /// that widened through `null ∪ number[0,+∞)` genuinely changes every
+    /// render. (`PerRender` here is kind-agnostic: "may change every render",
+    /// not necessarily a reference — ADR-017.)
     /// The residual `other` slot forces `Unknown` (an opaque value must never
     /// claim definite (in)stability — Top stayed Unknown before ADR-015 too).
     ///
@@ -236,9 +240,9 @@ impl StateValue {
             StrConst::Set(set) if set.len() == 1 => acc = acc.join(&Stability::Stable),
             _ => acc = acc.join(&Stability::Unknown),
         }
-        match self.reference {
-            Stability::Unstable => in_motion = true,
-            s => acc = acc.join(&s),
+        match &self.reference {
+            Stability::PerRender => in_motion = true,
+            s => acc = acc.join(s),
         }
         if self.null || self.undef {
             acc = acc.join(&Stability::Stable);
@@ -248,7 +252,7 @@ impl StateValue {
             acc = acc.join(&Stability::Stable);
         }
         if in_motion {
-            return Stability::Unstable;
+            return Stability::PerRender;
         }
         acc
     }
@@ -258,11 +262,11 @@ impl StateValue {
     /// Used by `InfiniteLoop` to distinguish a setter that writes a bounded value
     /// (branch narrowing held the growth) from one that truly diverges:
     /// - Infinite interval bounds → numeric counter without a binding guard
-    /// - Unstable reference slot → new object/function literal every render
+    /// - Per-render reference slot → new object/function literal every render
     /// - Residual ⊤ → precision lost, conservatively unbounded
     pub fn is_unbounded(&self) -> bool {
         (!self.num.is_bottom() && (self.num.lo.is_infinite() || self.num.hi.is_infinite()))
-            || self.reference == Stability::Unstable
+            || self.reference == Stability::PerRender
             || self.other
     }
 
@@ -271,9 +275,10 @@ impl StateValue {
         matches!(self.to_stability(), Stability::Stable)
     }
 
-    /// True if this value is definitively unstable (always causes re-render).
+    /// True if this value changes every render (always causes re-render).
+    /// `Versioned` values return false — they change only at setter events.
     pub fn is_unstable(&self) -> bool {
-        matches!(self.to_stability(), Stability::Unstable)
+        matches!(self.to_stability(), Stability::PerRender)
     }
 }
 
@@ -312,7 +317,7 @@ impl fmt::Debug for StateValue {
             )),
             StrConst::Top => parts.push("string".into()),
         }
-        match self.reference {
+        match &self.reference {
             Stability::Bottom => {}
             s => parts.push(format!("ref({s:?})")),
         }
@@ -563,7 +568,7 @@ mod tests {
     #[test]
     fn top_is_greatest() {
         assert!(num_point(0.0) <= StateValue::top());
-        assert!(StateValue::reference(Stability::Unstable) <= StateValue::top());
+        assert!(StateValue::reference(Stability::PerRender) <= StateValue::top());
         assert!(StateValue::null() <= StateValue::top());
     }
 
@@ -630,7 +635,7 @@ mod tests {
     #[test]
     fn to_stability_wide_interval_is_unstable() {
         assert!(StateValue::number(Interval { lo: 0.0, hi: 5.0 }).is_unstable());
-        assert!(StateValue::reference(Stability::Unstable).is_unstable());
+        assert!(StateValue::reference(Stability::PerRender).is_unstable());
     }
 
     #[test]
@@ -683,7 +688,7 @@ mod tests {
                 id: crate::ir::types::ExprId(0),
                 fields: vec![],
             }),
-            StateValue::reference(Stability::Unstable)
+            StateValue::reference(Stability::PerRender)
         );
     }
 
@@ -816,7 +821,7 @@ mod tests {
                 ["a".to_string(), String::new()].into_iter().collect(),
             ))
             .join(&StateValue::boolean(BoolVal::Top))
-            .join(&StateValue::reference(Stability::Unstable));
+            .join(&StateValue::reference(Stability::PerRender));
         let f = v.narrow_falsy();
         assert!(f.null);
         assert_eq!(f.num, Interval::point(0.0), "only 0 is a falsy number");
@@ -829,7 +834,7 @@ mod tests {
         assert_eq!(f.reference, Stability::Bottom, "references are never falsy");
         // A truthy-only value narrows to ⊥ on the falsy branch.
         assert!(
-            StateValue::reference(Stability::Unstable)
+            StateValue::reference(Stability::PerRender)
                 .join(&num_point(3.0))
                 .narrow_falsy()
                 .is_bottom()
@@ -962,8 +967,8 @@ mod tests {
     #[test]
     fn component_setter_join_with_unstable_ref_is_unstable() {
         // Motion-wins: the unstable reference slot dominates the stable setter.
-        let j = cs("Foo", 0).join(&StateValue::reference(Stability::Unstable));
-        assert_eq!(j.to_stability(), Stability::Unstable);
+        let j = cs("Foo", 0).join(&StateValue::reference(Stability::PerRender));
+        assert_eq!(j.to_stability(), Stability::PerRender);
     }
 
     #[test]
@@ -975,7 +980,7 @@ mod tests {
             lo: 0.0,
             hi: f64::INFINITY,
         }));
-        assert_eq!(v.to_stability(), Stability::Unstable);
+        assert_eq!(v.to_stability(), Stability::PerRender);
         // Top stays Unknown: opaque values never claim definite instability.
         assert_eq!(StateValue::top().to_stability(), Stability::Unknown);
     }
@@ -1031,11 +1036,11 @@ mod tests {
 
     #[test]
     fn unstable_reference_only_detection() {
-        assert!(StateValue::reference(Stability::Unstable).is_unstable_reference_only());
+        assert!(StateValue::reference(Stability::PerRender).is_unstable_reference_only());
         assert!(!StateValue::reference(Stability::Stable).is_unstable_reference_only());
         assert!(!StateValue::top().is_unstable_reference_only());
         assert!(
-            !StateValue::reference(Stability::Unstable)
+            !StateValue::reference(Stability::PerRender)
                 .join(&StateValue::null())
                 .is_unstable_reference_only()
         );

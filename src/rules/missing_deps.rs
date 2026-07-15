@@ -77,15 +77,11 @@ fn hook_kind_word(kind: HookKind) -> &'static str {
     }
 }
 
+/// Variables covered by the deps array: each dep credits its root variable
+/// (`[memo.content]` covers `memo` — see `ir::free_vars::dep_root`).
 fn dep_var_names(deps: &[Expr]) -> HashSet<Var> {
     deps.iter()
-        .filter_map(|e| {
-            if let Expr::Var(v) = e {
-                Some(v.clone())
-            } else {
-                None
-            }
-        })
+        .filter_map(|e| crate::ir::free_vars::dep_root(e).cloned())
         .collect()
 }
 
@@ -188,7 +184,7 @@ mod tests {
         let mut block_states = HashMap::new();
         block_states.insert(
             0,
-            env_with(&[("n", StateValue::reference(Stability::Unstable))]),
+            env_with(&[("n", StateValue::reference(Stability::PerRender))]),
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
@@ -242,7 +238,7 @@ mod tests {
         let mut block_states = HashMap::new();
         block_states.insert(
             0,
-            env_with(&[("n", StateValue::reference(Stability::Unstable))]),
+            env_with(&[("n", StateValue::reference(Stability::PerRender))]),
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
@@ -251,6 +247,68 @@ mod tests {
                 .check(&prog(&result), &"C".to_string())
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn member_expression_dep_covers_root_var() {
+        // useEffect(() => use(memo.content), [memo.content]) — F1: the
+        // FieldAccess dep must credit `memo`, silencing the FP.
+        let mut effect_info = HashMap::new();
+        effect_info.insert(
+            0,
+            EffectInfo {
+                label: 0,
+                kind: HookKind::Effect,
+                free_vars: HashSet::from(["memo".to_string()]),
+                declared_deps: vec![Expr::FieldAccess {
+                    obj: Box::new(Expr::Var("memo".to_string())),
+                    field: "content".to_string(),
+                }],
+                has_deps_array: true,
+                span: None,
+            },
+        );
+        let mut block_states = HashMap::new();
+        block_states.insert(
+            0,
+            env_with(&[("memo", StateValue::reference(Stability::PerRender))]),
+        );
+
+        let result = make_result(block_states, effect_info, trivial_cfg());
+        assert!(
+            MissingDeps
+                .check(&prog(&result), &"C".to_string())
+                .is_empty(),
+            "[memo.content] must cover uses of `memo`"
+        );
+    }
+
+    #[test]
+    fn unrelated_member_dep_still_warns() {
+        // useEffect(() => use(other), [memo.content]) — `other` uncovered.
+        let mut effect_info = HashMap::new();
+        effect_info.insert(
+            0,
+            EffectInfo {
+                label: 0,
+                kind: HookKind::Effect,
+                free_vars: HashSet::from(["other".to_string()]),
+                declared_deps: vec![Expr::FieldAccess {
+                    obj: Box::new(Expr::Var("memo".to_string())),
+                    field: "content".to_string(),
+                }],
+                has_deps_array: true,
+                span: None,
+            },
+        );
+        let mut block_states = HashMap::new();
+        block_states.insert(
+            0,
+            env_with(&[("other", StateValue::reference(Stability::PerRender))]),
+        );
+
+        let result = make_result(block_states, effect_info, trivial_cfg());
+        assert_eq!(MissingDeps.check(&prog(&result), &"C".to_string()).len(), 1);
     }
 
     #[test]
@@ -270,7 +328,7 @@ mod tests {
         let mut block_states = HashMap::new();
         block_states.insert(
             0,
-            env_with(&[("n", StateValue::reference(Stability::Unstable))]),
+            env_with(&[("n", StateValue::reference(Stability::PerRender))]),
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
@@ -301,7 +359,7 @@ mod tests {
         let mut block_states = HashMap::new();
         block_states.insert(
             0,
-            env_with(&[("n", StateValue::reference(Stability::Unstable))]),
+            env_with(&[("n", StateValue::reference(Stability::PerRender))]),
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
@@ -355,7 +413,7 @@ mod tests {
         let mut block_states = HashMap::new();
         block_states.insert(
             0,
-            env_with(&[("n", StateValue::reference(Stability::Unstable))]),
+            env_with(&[("n", StateValue::reference(Stability::PerRender))]),
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
@@ -386,7 +444,7 @@ mod tests {
         let mut block_states = HashMap::new();
         block_states.insert(
             0,
-            env_with(&[("n", StateValue::reference(Stability::Unstable))]),
+            env_with(&[("n", StateValue::reference(Stability::PerRender))]),
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
@@ -416,7 +474,7 @@ mod tests {
         let mut block_states = HashMap::new();
         block_states.insert(
             0,
-            env_with(&[("n", StateValue::reference(Stability::Unstable))]),
+            env_with(&[("n", StateValue::reference(Stability::PerRender))]),
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());

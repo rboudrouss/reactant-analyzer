@@ -51,12 +51,28 @@ impl Transfer for StateValueTransfer {
             return StateValue::reference(Stability::Stable);
         }
         let stability = deps.iter().fold(Stability::Bottom, |acc, dep| {
+            // Structural shortcut (ADR-017): a dep that IS a state slot
+            // changes only at that slot's setter events — `Versioned({l})`
+            // by React semantics, no store read needed (the null ctx below
+            // has an empty store, which would erase the labels via ⊤).
+            let mut peeled = dep;
+            while let Expr::TSAnnotated(inner, _) = peeled {
+                peeled = inner;
+            }
+            if let Expr::StateVal(l) = peeled {
+                return acc.join(&Stability::versioned_by(Symbol::new(), *l));
+            }
             let mut s = StateStore::bottom();
             let mut m = MemoStore::new();
             let mut h = crate::domains::stores::Heap::new();
             let mut tmp_ctx = AnalysisCtx::null(&mut s, &mut m, &mut h);
             let val = eval_state_value(dep, env, &mut tmp_ctx);
-            acc.join(&val.to_stability())
+            // A dep whose reference kind is already versioned keeps its
+            // labels (`to_stability` would erase them if another slot is ⊤).
+            match &val.reference {
+                v @ (Stability::Versioned(_) | Stability::VersionedTop) => acc.join(v),
+                _ => acc.join(&val.to_stability()),
+            }
         });
         StateValue::reference(stability)
     }
@@ -80,7 +96,23 @@ fn eval_state_value(
         Expr::Lit(Prim::Unit) => StateValue::undefined(),
 
         Expr::Var(v) => env.lookup(v),
-        Expr::StateVal(label) => ctx.state.get(*label),
+        Expr::StateVal(label) => {
+            let mut val = ctx.state.get(*label);
+            // ADR-017 read-side conversion: the store holds the join of
+            // *written* values (event view); what a render *reads* can only
+            // change at setter events of this slot (cross-render view). The
+            // written value's allocation freshness (`PerRender`) must not
+            // leak into reads. Assumes sets happen outside render — the
+            // violation has its own diagnostic (`setter-in-render`).
+            if val.reference != Stability::Bottom {
+                let comp = ctx
+                    .inter
+                    .map(|i| i.component_name.clone())
+                    .unwrap_or_default();
+                val.reference = Stability::versioned_by(comp, *label);
+            }
+            val
+        }
         Expr::StateSetter(label) => {
             if let Some(inter) = &ctx.inter {
                 StateValue::component_setter(inter.component_name.clone(), *label)
@@ -90,9 +122,9 @@ fn eval_state_value(
         }
         Expr::MemoVal(label) | Expr::CallbackVal(label) => ctx.memo.get(*label),
 
-        Expr::ObjectLit { .. } => StateValue::reference(Stability::Unstable),
-        Expr::ArrayLit { .. } => StateValue::reference(Stability::Unstable),
-        Expr::FnLit { .. } => StateValue::reference(Stability::Unstable),
+        Expr::ObjectLit { .. } => StateValue::reference(Stability::PerRender),
+        Expr::ArrayLit { .. } => StateValue::reference(Stability::PerRender),
+        Expr::FnLit { .. } => StateValue::reference(Stability::PerRender),
         Expr::NativeElem { .. } => StateValue::reference(Stability::Stable),
 
         Expr::CompApp { name, props } => eval_comp_app(name, props, env, ctx),
@@ -119,9 +151,57 @@ fn eval_state_value(
             crate::ir::expr::SummaryValue::Top => StateValue::top(),
             crate::ir::expr::SummaryValue::StableRef => StateValue::reference(Stability::Stable),
             crate::ir::expr::SummaryValue::UnstableRef => {
-                StateValue::reference(Stability::Unstable)
+                StateValue::reference(Stability::PerRender)
             }
         },
+    }
+}
+
+/// Join ⊤ into every state slot whose setter is passed as a prop to an
+/// unanalyzable child. Own-component setters go through `ctx.state`; a
+/// forwarded ancestor setter goes through the `SharedStateStore` so the
+/// ancestor's fixpoint sees the write.
+fn havoc_setter_props(
+    props_expr: &Expr,
+    env: &AbstractEnv<StateValue>,
+    ctx: &mut AnalysisCtx<StateValue>,
+) {
+    let Expr::ObjectLit { fields, .. } = props_expr else {
+        return;
+    };
+    let mut setters: Vec<(Symbol, crate::ir::types::HookLabel)> = Vec::new();
+    for (_, v) in fields {
+        let val = eval_state_value(v, env, ctx);
+        if let Some((c, l)) = val.as_setter() {
+            setters.push((c.clone(), *l));
+        }
+        // Spread props (`<X {...props}/>`, kept under a synthetic `...N`
+        // key) forward a whole object: chase its heap fields for setters
+        // (`props.onOpenChange` may be an ancestor's setState).
+        if let Expr::Var(name) = v
+            && let Some(EnvVal::Loc(ids)) = env.lookup_env_val(name)
+        {
+            for id in ids.iter().copied().collect::<Vec<_>>() {
+                if let Some(HeapValue::Obj(obj_fields)) = ctx.heap.get(id) {
+                    for ev in obj_fields.values() {
+                        if let Some((c, l)) = ev.as_val().as_setter() {
+                            setters.push((c.clone(), *l));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let own = ctx.inter.map(|i| i.component_name.clone());
+    for (comp, label) in setters {
+        if Some(&comp) == own.as_ref() {
+            ctx.state.update(label, StateValue::top());
+        } else if let Some(inter) = &ctx.inter {
+            inter
+                .shared_state
+                .borrow_mut()
+                .update(&comp, label, StateValue::top());
+        }
     }
 }
 
@@ -153,6 +233,13 @@ fn eval_comp_app(
             .borrow_mut()
             .unknown_component_refs
             .insert((inter.component_name.clone(), name.clone()));
+        // An unknown child may invoke any setter it receives, with any
+        // argument, at any time (`<Sheet onOpenChange={setOpen}>`). Havoc
+        // those state slots — leaving them untouched under-approximates
+        // state and fabricates "state is stable" conclusions (TODO.md F4).
+        // Known children don't need this: their setter calls are modeled
+        // precisely by the inter-component analysis.
+        havoc_setter_props(props_expr, env, ctx);
         return StateValue::reference(Stability::Stable);
     };
 
@@ -512,7 +599,7 @@ mod tests {
                 &env,
                 &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
             ),
-            StateValue::reference(Stability::Unstable)
+            StateValue::reference(Stability::PerRender)
         );
     }
 

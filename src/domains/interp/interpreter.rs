@@ -37,8 +37,8 @@ pub(crate) fn exec_stmt_with_callbacks<T: Transfer>(
 
 /// Execute a FnLit body CFG and return its abstract return value.
 ///
-/// Only used in tests; production callers go through [`exec_body_depth`].
-#[cfg_attr(not(test), allow(dead_code))]
+/// Production callers: `useState` lazy-initializer seeding (fixpoint) —
+/// callback traversal goes through [`exec_body_depth`] to carry depth.
 pub(crate) fn exec_body<T: Transfer>(
     transfer: &T,
     cfg: &CFG,

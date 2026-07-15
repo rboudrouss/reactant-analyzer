@@ -489,7 +489,17 @@ fn lower_jsx_props(
                 };
                 Some((key, val))
             }
-            JSXAttributeItem::SpreadAttribute(_) => None,
+            // Keep spreads under a synthetic `...N` key: `<X {...props}/>`
+            // forwards every prop — dropping it makes forwarded setters
+            // vanish (unknown-child havoc must see them, TODO.md F4).
+            // The key can't collide with a real JSX attribute name.
+            JSXAttributeItem::SpreadAttribute(s) => {
+                let spread_id = builder.next_expr_id();
+                Some((
+                    format!("...{}", spread_id.0),
+                    lower_expr(&s.argument, builder),
+                ))
+            }
         })
         .collect();
     (Expr::ObjectLit { id, fields }, prop_spans)

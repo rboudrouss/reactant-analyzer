@@ -527,6 +527,14 @@ fn lower_binding_pattern(
                 };
                 lower_binding_pattern(&prop.value, field_rhs, None, builder);
             }
+            // Rest element `{ a, ...rest }`: bind `rest` to the source object
+            // itself — a sound over-approximation (rest has a subset of the
+            // fields, each with the same value). Dropping it unbinds `props`
+            // in wrapper components (`({...props}) => <X {...props}/>`) and
+            // loses forwarded setters (TODO.md F4).
+            if let Some(rest) = &obj.rest {
+                lower_binding_pattern(&rest.argument, Expr::Var(temp.clone()), None, builder);
+            }
         }
         BindingPattern::AssignmentPattern(ap) => {
             // Ignore the default expression conservative (use rhs as-is)
