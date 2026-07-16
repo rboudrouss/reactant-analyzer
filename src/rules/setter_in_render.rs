@@ -10,7 +10,11 @@ use crate::{
     },
 };
 
-use super::{Diagnostic, Rule, Severity, collect_component_setter_vars, collect_setter_calls};
+use super::infinite_loop::{converges_once_written, eval_in_exit_env};
+use super::{
+    Diagnostic, Rule, Severity, collect_component_setter_vars, collect_setter_calls,
+    resolve_setter_aliases, state_val_labels,
+};
 
 /// Fires when a state setter is called directly in the render body either a
 /// local setter (`StateSetter`) or a parent-component setter passed as a prop.
@@ -22,6 +26,14 @@ use super::{Diagnostic, Rule, Severity, collect_component_setter_vars, collect_s
 /// Severity:
 /// - `Error`   call block dominates all render exits (unconditional).
 /// - `Warning` conditional path or nested FnLit (dominance unknowable).
+///
+/// Silence: the sanctioned "adjust state during render" idiom — a
+/// **conditional local** call whose dominating guards read the slot it
+/// writes, such that once the written value sits in the slot the guard is
+/// dead (`if (changed && open) setOpen(false)`). React explicitly allows
+/// this shape (one convergent extra render, no loop); warning on it is
+/// noise. Cross-component calls are never silenced — setting another
+/// component's state during render is a runtime error regardless of guards.
 pub struct SetterInRender;
 
 impl Rule for SetterInRender {
@@ -83,9 +95,14 @@ impl Rule for SetterInRender {
             .map(|b| b.id)
             .collect();
 
+        let state_vals = resolve_setter_aliases(
+            &comp_result.render_cfg,
+            &state_val_labels(&comp_result.render_cfg),
+        );
+
         collect_setter_calls(&comp_result.render_cfg, &all_setter_vars, 2)
             .into_iter()
-            .map(|call| {
+            .filter_map(|call| {
                 let severity = match call.block_id {
                     Some(bid)
                         if exits
@@ -96,6 +113,25 @@ impl Rule for SetterInRender {
                     }
                     _ => Severity::Warning,
                 };
+
+                // Sanctioned adjust-during-render idiom: conditional local
+                // call whose guards die once the written value is in the
+                // slot — converges after one extra render, no diagnostic.
+                if severity == Severity::Warning
+                    && let Some(bid) = call.block_id
+                    && let Some(&(label, _)) = local_setter_info.get(&call.var)
+                    && let Some(arg) = setter_call_arg(&comp_result.render_cfg, bid, &call.var)
+                    && converges_once_written(
+                        &comp_result.render_cfg,
+                        bid,
+                        &state_vals,
+                        label,
+                        &eval_in_exit_env(arg, comp_result),
+                        comp_result,
+                    )
+                {
+                    return None;
+                }
 
                 let mut d = if let Some(&(label, _)) = local_setter_info.get(&call.var) {
                     Diagnostic::new(
@@ -130,10 +166,27 @@ impl Rule for SetterInRender {
                 if let Some(r) = call.span {
                     d = d.with_range(r);
                 }
-                d
+                Some(d)
             })
             .collect()
     }
+}
+
+/// First argument of the top-level `setter(arg)` call in block `bid`, if any.
+fn setter_call_arg<'a>(
+    cfg: &'a crate::ir::cfg::CFG,
+    bid: BlockId,
+    setter: &Var,
+) -> Option<&'a Expr> {
+    let block = cfg.blocks.get(&bid)?;
+    for stmt in &block.stmts {
+        if let Stmt::ExprStmt(Expr::Call { fn_, args }, _) = stmt
+            && matches!(fn_.as_ref(), Expr::Var(v) if v == setter)
+        {
+            return args.first();
+        }
+    }
+    None
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -48,6 +48,7 @@ use crate::{
 
 use super::infinite_loop::{
     Freshness, classify_effect_deps, collect_churn_calls, converges_once_written, on_all_paths,
+    reference_part,
 };
 use super::{
     collect_component_setter_vars, collect_fn_bindings, memo_val_labels, resolve_setter_aliases,
@@ -185,7 +186,9 @@ pub(super) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec<ChurnEdge
                 continue;
             }
             // Convergence kill — sound only for a single-effect-writer local
-            // slot (see module doc).
+            // slot (see module doc). Edges claim reference churn, so the
+            // guard proof runs against the reference part of the written
+            // value only (references are truthy and non-nullish).
             if call.node.0 == *f.comp
                 && writer_sites.get(&call.node) == Some(&1)
                 && let Some(b) = call.block_id
@@ -194,7 +197,7 @@ pub(super) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec<ChurnEdge
                     b,
                     &f.state_vals,
                     call.node.1,
-                    &call.written,
+                    &reference_part(&call.written),
                     f.comp_result,
                 )
             {

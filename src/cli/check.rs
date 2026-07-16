@@ -258,7 +258,29 @@ pub fn run(mut args: CheckArgs) -> i32 {
             .iter()
             .flat_map(|r| r.check(&program_result, name))
             .collect();
-        diags.sort_by_key(|d| (d.rule, d.severity as u8));
+        // Total order: rules iterate HashMaps internally, so same-key ties
+        // (many `analysis-limit` Infos, several notes on one slot) come back
+        // in a run-dependent order — tie-break on position, then content, so
+        // consecutive runs are byte-identical (CI/bench diffing).
+        diags.sort_by(|a, b| {
+            let pos = |d: &Diagnostic| d.range.map_or((u32::MAX, u32::MAX), |r| (r.line, r.col));
+            (
+                a.rule,
+                a.severity as u8,
+                pos(a),
+                &a.message,
+                &a.var,
+                a.hook_label,
+            )
+                .cmp(&(
+                    b.rule,
+                    b.severity as u8,
+                    pos(b),
+                    &b.message,
+                    &b.var,
+                    b.hook_label,
+                ))
+        });
         diags.retain(|d| {
             (args.rule.is_empty() || args.rule.iter().any(|r| r == d.rule))
                 && !args.ignore_rule.iter().any(|r| r == d.rule)

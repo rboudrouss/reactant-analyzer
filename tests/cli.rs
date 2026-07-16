@@ -153,3 +153,28 @@ fn json_stdout_is_pure_even_with_verbose() {
     assert!(doc.is_ok(), "stdout polluted by verbose output");
     assert!(!String::from_utf8_lossy(&out.stderr).is_empty());
 }
+
+// ── output determinism ────────────────────────────────────────────────────────
+
+#[test]
+fn consecutive_runs_are_byte_identical() {
+    // Rules iterate HashMaps internally; the output layer's total ordering
+    // must absorb that — consecutive runs over a fixture set with many
+    // same-severity diagnostics (analysis-limit Infos) must not reorder.
+    let args = &[
+        "check",
+        "tests/fixtures",
+        "--all-roots",
+        "--info",
+        "--fail-on",
+        "never",
+    ];
+    let first = stdout(&reactant(args));
+    for _ in 0..3 {
+        assert_eq!(
+            stdout(&reactant(args)),
+            first,
+            "diagnostic output must be byte-identical across runs"
+        );
+    }
+}

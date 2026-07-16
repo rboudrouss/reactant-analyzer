@@ -461,13 +461,19 @@ fn check_object_churn(
             // `if (user === null) setUser({...})` → narrowing the written
             // (non-null, truthy) value through the guard yields ⊥ → the set
             // fires at most once, no loop.
+            //
+            // This arm claims REFERENCE churn, and only a stored reference —
+            // always truthy, never nullish — can sustain the loop. Project
+            // the written value onto its reference slot so an opaque `f()`
+            // result (⊤ elsewhere) stays provable: if the guard dies under
+            // every reference, the reference-churn loop cannot re-fire.
             if let Some(b) = call.block_id
                 && converges_once_written(
                     body_cfg,
                     b,
                     &state_vals,
                     state_label,
-                    &call.written,
+                    &reference_part(&call.written),
                     comp_result,
                 )
             {
@@ -610,9 +616,18 @@ pub(super) fn classify_effect_deps(
     (exact, versioned)
 }
 
+/// Projection of a written value onto its reference slot — what a
+/// reference-churn loop can actually carry across renders. Every primitive
+/// part (which cannot fail `Object.is` freshly) is dropped, so guard proofs
+/// don't lose to residual ⊤ noise. A ⊥ reference slot yields ⊥: no
+/// reference can ever be stored → the claimed reference churn is vacuous.
+pub(super) fn reference_part(written: &crate::domains::StateValue) -> crate::domains::StateValue {
+    crate::domains::StateValue::reference(written.reference.clone())
+}
+
 /// Evaluate `expr` in the render exit environment (same pattern as
 /// `all_deps_unstable`).
-fn eval_in_exit_env(
+pub(super) fn eval_in_exit_env(
     expr: &Expr,
     comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
 ) -> crate::domains::StateValue {
@@ -901,13 +916,22 @@ pub(super) fn converges_once_written(
         return false;
     }
 
+    // Compound booleans (`a || b`, `a && b`) lower to a short-circuit temp
+    // (`__tN`) branched on directly — narrowing `__tN` alone proves nothing
+    // about the slot read inside an operand. Expand each guard into the
+    // conjunctive facts it implies over the operands.
+    let mut conjuncts: Vec<(&Expr, bool)> = Vec::new();
+    for (cond, taken) in guards {
+        expand_guard(cfg, cond, taken, 4, &mut conjuncts);
+    }
+
     let mut env = comp_result.exit_env();
     for (v, l) in state_vals {
         if *l == label {
             env.extend(v.clone(), written.clone());
         }
     }
-    for (cond, taken) in guards {
+    for (cond, taken) in conjuncts {
         let narrowed = crate::engine::cfg_analyzer::narrow_env_for_branch(&env, cond, taken);
         if let Some(x) = guard_var(cond)
             && narrowed.lookup(x).is_bottom_value()
@@ -917,6 +941,96 @@ pub(super) fn converges_once_written(
         env = narrowed;
     }
     false
+}
+
+/// Expand a guard `(cond, taken)` into the conjunction of operand facts it
+/// implies, resolving lowered short-circuit temps.
+///
+/// `lower_logical` turns `a OP b` into `let t = a; Branch(t){ rhs: t = b }`,
+/// so a branch on `Var(t)` hides the operands. Two polarities are exact
+/// conjunctions over the lowered CFG semantics:
+/// - `t = a || b` taken FALSE  ⇒ `a` falsy ∧ `b` falsy
+/// - `t = a && b` taken TRUE   ⇒ `a` truthy ∧ `b` truthy
+///
+/// (`??` lowers identically to `||` — the truthiness approximation is the
+/// lowering's, inherited here, not introduced.) The disjunctive polarities
+/// and anything unrecognised pass through unexpanded.
+fn expand_guard<'a>(
+    cfg: &'a CFG,
+    cond: &'a Expr,
+    taken: bool,
+    depth: usize,
+    out: &mut Vec<(&'a Expr, bool)>,
+) {
+    use crate::ir::cfg::{EdgeKind, Terminator};
+
+    if depth == 0 {
+        out.push((cond, taken));
+        return;
+    }
+    match cond {
+        // `!e` flips the polarity of `e`.
+        Expr::UnaryOp {
+            op: crate::ir::expr::UnaryOp::Not,
+            arg,
+        } => expand_guard(cfg, arg, !taken, depth - 1, out),
+        Expr::Var(t) => {
+            // Match the short-circuit diamond: one Let in a block that
+            // branches on `t`, one Assign in a direct successor (the rhs).
+            let mut let_site: Option<(BlockId, &Expr)> = None;
+            let mut assign_site: Option<(BlockId, &Expr)> = None;
+            let mut extra_bindings = false;
+            for block in cfg.blocks.values() {
+                for stmt in &block.stmts {
+                    match stmt {
+                        Stmt::Let { var, rhs, .. } if var == t => {
+                            extra_bindings |= let_site.is_some();
+                            let_site = Some((block.id, rhs));
+                        }
+                        Stmt::Assign { var, rhs, .. } if var == t => {
+                            extra_bindings |= assign_site.is_some();
+                            assign_site = Some((block.id, rhs));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let (Some((let_block, a)), Some((rhs_block, b))) = (let_site, assign_site) else {
+                out.push((cond, taken));
+                return;
+            };
+            let diamond = !extra_bindings
+                && matches!(
+                    &cfg.blocks.get(&let_block).map(|blk| &blk.term),
+                    Some(Terminator::Branch { cond: c, then_, else_ })
+                        if matches!(c, Expr::Var(v) if v == t)
+                            && (*then_ == rhs_block || *else_ == rhs_block)
+                );
+            if !diamond {
+                out.push((cond, taken));
+                return;
+            }
+            // Edge polarity into the rhs block: falsy evaluates the rhs for
+            // `||`/`??`, truthy for `&&`.
+            let to_rhs_kind = cfg
+                .edges
+                .iter()
+                .find(|e| e.from == let_block && e.to == rhs_block)
+                .map(|e| &e.kind);
+            let conjunctive = match to_rhs_kind {
+                Some(EdgeKind::IfFalse) => !taken, // `a || b`: guard-false ⇒ a falsy ∧ b falsy
+                Some(EdgeKind::IfTrue) => taken,   // `a && b`: guard-true  ⇒ a truthy ∧ b truthy
+                _ => false,
+            };
+            if conjunctive {
+                expand_guard(cfg, a, taken, depth - 1, out);
+                expand_guard(cfg, b, taken, depth - 1, out);
+            } else {
+                out.push((cond, taken));
+            }
+        }
+        _ => out.push((cond, taken)),
+    }
 }
 
 /// The variable a guard condition constrains, if the narrowing recognises it.

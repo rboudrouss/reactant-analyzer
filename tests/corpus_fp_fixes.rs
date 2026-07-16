@@ -1295,3 +1295,129 @@ function A({ dep }) {
         "no numeric label: {msg}"
     );
 }
+
+// ── Compound guard convergence (chakra Provider / excalidraw ToolPopover) ─────
+
+#[test]
+fn compound_or_guard_reading_slot_converges() {
+    // `if (!shadow || cache) return`: `||` lowers to a short-circuit temp;
+    // guard-false is a conjunction over the operands, so `cache` falsy is
+    // required to reach the write — once written (truthy), the effect no-ops.
+    let src = r#"
+function A() {
+  const [shadow, setShadow] = useState(null);
+  const [cache, setCache] = useState(null);
+  useEffect(() => {
+    if (!shadow || cache) return;
+    setCache({ built: true });
+  }, [shadow, cache]);
+  return <div onClick={() => setShadow({})} />;
+}
+"#;
+    let diags = diagnostics_sev(src);
+    assert!(
+        !diags.iter().any(|(r, _, _)| r == "infinite-loop"),
+        "compound-|| guard reading the written slot converges: {diags:?}"
+    );
+}
+
+#[test]
+fn compound_and_guard_reading_slot_converges() {
+    // `if (shadow && !cache) setCache(...)`: guard-true ⇒ both operands
+    // truthy ⇒ cache falsy — dead once written.
+    let src = r#"
+function A() {
+  const [shadow, setShadow] = useState(null);
+  const [cache, setCache] = useState(null);
+  useEffect(() => {
+    if (shadow && !cache) setCache({ built: true });
+  }, [shadow, cache]);
+  return <div onClick={() => setShadow({})} />;
+}
+"#;
+    let diags = diagnostics_sev(src);
+    assert!(
+        !diags.iter().any(|(r, _, _)| r == "infinite-loop"),
+        "compound-&& guard reading the written slot converges: {diags:?}"
+    );
+}
+
+#[test]
+fn compound_guard_not_reading_slot_still_warns() {
+    // Guard reads only `shadow`; nothing kills the fresh write once `shadow`
+    // is live — real churn, the warning must survive.
+    let src = r#"
+function A() {
+  const [shadow, setShadow] = useState(null);
+  const [cache, setCache] = useState({ n: 0 });
+  useEffect(() => {
+    if (shadow) setCache({ n: 1 });
+  }, [shadow, cache]);
+  return <div onClick={() => setShadow({ live: true })} />;
+}
+"#;
+    let diags = diagnostics_sev(src);
+    assert!(
+        diags
+            .iter()
+            .any(|(r, s, _)| r == "infinite-loop" && *s == Severity::Warning),
+        "guard not reading the written slot must keep the warning: {diags:?}"
+    );
+}
+
+// ── setter-in-render: sanctioned adjust-during-render idiom ───────────────────
+
+#[test]
+fn adjust_state_during_render_is_silent() {
+    // React-sanctioned: conditional render setter whose guard reads the slot
+    // it writes, and the written value kills the guard — converges after one
+    // extra render.
+    let src = r#"
+function ToolPopover({ options }) {
+  const [isPopupOpen, setIsPopupOpen] = useState(true);
+  if (!options.includes('x') && isPopupOpen) setIsPopupOpen(false);
+  return <div/>;
+}
+"#;
+    let diags = diagnostics_sev(src);
+    assert!(
+        !diags.iter().any(|(r, _, _)| r == "setter-in-render"),
+        "adjust-during-render idiom must be silent: {diags:?}"
+    );
+}
+
+#[test]
+fn adjust_during_render_not_killing_guard_warns() {
+    // Written value keeps the guard alive (`setOpen(true)` under `open`
+    // truthy): does not converge, warning stays.
+    let src = r#"
+function A({ options }) {
+  const [isPopupOpen, setIsPopupOpen] = useState(false);
+  if (!options.includes('x') && isPopupOpen) setIsPopupOpen(true);
+  return <div/>;
+}
+"#;
+    let diags = diagnostics_sev(src);
+    assert!(
+        diags.iter().any(|(r, _, _)| r == "setter-in-render"),
+        "non-convergent render setter must warn: {diags:?}"
+    );
+}
+
+#[test]
+fn unconditional_render_setter_still_error() {
+    let src = r#"
+function A() {
+  const [n, setN] = useState(0);
+  setN(1);
+  return <div/>;
+}
+"#;
+    let diags = diagnostics_sev(src);
+    assert!(
+        diags
+            .iter()
+            .any(|(r, s, _)| r == "setter-in-render" && *s == Severity::Error),
+        "unconditional render setter stays Error: {diags:?}"
+    );
+}
