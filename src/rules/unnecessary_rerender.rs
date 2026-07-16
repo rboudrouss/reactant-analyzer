@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::{
     domains::{
-        AbstractDomain, AbstractEnv, AnalysisCtx, MemoStore, StateStore, StateValue,
+        AbstractDomain, AbstractEnv, AnalysisCtx, BoolVal, MemoStore, StateStore, StateValue,
         StateValueTransfer, Transfer,
     },
     engine::ProgramAnalysisResult,
@@ -133,16 +133,33 @@ impl Rule for UnnecessaryRerender {
                         continue; // same as init → redundant-set-state, not this rule
                     }
 
-                    let mut d = Diagnostic::new(
-                        "unnecessary-rerender",
+                    // SSR mount-flag idiom: `useState(false)` flipped to
+                    // `true` on mount (hasMounted/isClient/isHydrated). The
+                    // extra render is the point — the server/hydration pass
+                    // must see `false` — so "initialise with the target
+                    // value" would break hydration. Keep the warning (the
+                    // idiom has a modern replacement) but give advice that
+                    // doesn't break the component.
+                    let is_mount_flag = *init_val == StateValue::boolean(BoolVal::False)
+                        && arg_val == StateValue::boolean(BoolVal::True);
+
+                    let message = if is_mount_flag {
+                        format!(
+                            "mount-only effect flips state {} from `false` to `true` \
+                             the SSR mount-flag idiom costs one extra rerender on every \
+                             mount; prefer `useSyncExternalStore` for client detection",
+                            state_slot_name(state_label, &state_names)
+                        )
+                    } else {
                         format!(
                             "mount-only effect sets state {} to a constant \
                              different from its initial value causes one extra rerender on mount; \
                              consider initialising directly with the target value",
                             state_slot_name(state_label, &state_names)
-                        ),
-                    )
-                    .with_label(state_label);
+                        )
+                    };
+                    let mut d =
+                        Diagnostic::new("unnecessary-rerender", message).with_label(state_label);
                     if let Some(r) = eff_span {
                         d = d.with_range(r);
                     }
@@ -346,6 +363,56 @@ mod tests {
             UnnecessaryRerender
                 .check(&prog(&result), &"C".to_string())
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn mount_flag_idiom_gets_ssr_advice() {
+        // useState(false) → setX(true) on mount: the SSR mount-flag idiom.
+        // Warns, but with useSyncExternalStore advice — NOT "initialise with
+        // the target value", which would break hydration.
+        let eff_stmts = vec![Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setX".to_string())),
+                args: vec![Expr::Lit(Prim::Bool(true))],
+            },
+            None,
+        )];
+        let comp = component_with(Expr::Lit(Prim::Bool(false)), eff_stmts, Some(vec![]));
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+        let diags = UnnecessaryRerender.check(&prog(&result), &"C".to_string());
+        assert_eq!(diags.len(), 1);
+        assert!(
+            diags[0].message.contains("useSyncExternalStore"),
+            "mount-flag idiom must get the SSR advice: {}",
+            diags[0].message
+        );
+        assert!(
+            !diags[0].message.contains("initialising directly"),
+            "must not suggest the hydration-breaking fix: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn reverse_bool_flip_keeps_generic_advice() {
+        // useState(true) → setX(false): not the mount-flag idiom (hydration
+        // gating needs false-first) — generic message stays.
+        let eff_stmts = vec![Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setX".to_string())),
+                args: vec![Expr::Lit(Prim::Bool(false))],
+            },
+            None,
+        )];
+        let comp = component_with(Expr::Lit(Prim::Bool(true)), eff_stmts, Some(vec![]));
+        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+        let diags = UnnecessaryRerender.check(&prog(&result), &"C".to_string());
+        assert_eq!(diags.len(), 1);
+        assert!(
+            diags[0].message.contains("initialising directly"),
+            "true→false flip keeps the generic advice: {}",
+            diags[0].message
         );
     }
 
