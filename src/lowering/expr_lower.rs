@@ -103,24 +103,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         Expression::ConditionalExpression(cond) => lower_ternary(cond, builder),
 
         // ── Calls ─────────────────────────────────────────────────────────────
-        Expression::CallExpression(call) => {
-            let fn_ = lower_expr(&call.callee, builder);
-            let args = call
-                .arguments
-                .iter()
-                .filter_map(|a| a.as_expression().map(|e| lower_expr(e, builder)))
-                .collect();
-            let call_expr = Expr::Call {
-                fn_: Box::new(fn_),
-                args,
-            };
-            match &call.type_arguments {
-                Some(params) if !params.params.is_empty() => {
-                    Expr::TSAnnotated(Box::new(call_expr), lower_ts_type(&params.params[0]))
-                }
-                _ => call_expr,
-            }
-        }
+        Expression::CallExpression(call) => lower_call(call, builder),
         Expression::NewExpression(new_) => {
             let fn_ = lower_expr(&new_.callee, builder);
             let args = new_
@@ -139,6 +122,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         },
 
         // ── Member access ─────────────────────────────────────────────────────
+        Expression::ChainExpression(chain) => lower_chain_element(&chain.expression, builder),
         Expression::StaticMemberExpression(m) => Expr::FieldAccess {
             obj: Box::new(lower_expr(&m.object, builder)),
             field: m.property.name.to_string(),
@@ -289,6 +273,49 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
             .unwrap_or(Expr::Lit(Prim::Unit)),
 
         _ => Expr::Var("__opaque".to_string()),
+    }
+}
+
+fn lower_call(call: &CallExpression, builder: &mut BlockBuilder) -> Expr {
+    let fn_ = lower_expr(&call.callee, builder);
+    let args = call
+        .arguments
+        .iter()
+        .filter_map(|a| a.as_expression().map(|e| lower_expr(e, builder)))
+        .collect();
+    let call_expr = Expr::Call {
+        fn_: Box::new(fn_),
+        args,
+    };
+    match &call.type_arguments {
+        Some(params) if !params.params.is_empty() => {
+            Expr::TSAnnotated(Box::new(call_expr), lower_ts_type(&params.params[0]))
+        }
+        _ => call_expr,
+    }
+}
+
+/// `a?.b` / `a?.[i]` / `f?.(x)` — optional chaining lowers like its
+/// non-optional counterpart. The nullish short-circuit needs no separate
+/// branch: a `Loc`-bound receiver is an object literal on every path (never
+/// nullish), and any other receiver already evaluates the access to ⊤,
+/// which covers the `undefined` outcome.
+fn lower_chain_element(elem: &ChainElement, builder: &mut BlockBuilder) -> Expr {
+    match elem {
+        ChainElement::CallExpression(call) => lower_call(call, builder),
+        ChainElement::TSNonNullExpression(ts) => lower_expr(&ts.expression, builder),
+        ChainElement::StaticMemberExpression(m) => Expr::FieldAccess {
+            obj: Box::new(lower_expr(&m.object, builder)),
+            field: m.property.name.to_string(),
+        },
+        ChainElement::ComputedMemberExpression(m) => Expr::IndexAccess {
+            arr: Box::new(lower_expr(&m.object, builder)),
+            idx: Box::new(lower_expr(&m.expression, builder)),
+        },
+        ChainElement::PrivateFieldExpression(p) => Expr::FieldAccess {
+            obj: Box::new(lower_expr(&p.object, builder)),
+            field: format!("#{}", p.field.name),
+        },
     }
 }
 

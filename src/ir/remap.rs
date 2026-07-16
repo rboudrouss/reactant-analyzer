@@ -196,11 +196,13 @@ fn remap_hook_entry(entry: HookEntry, offset: HookLabel) -> HookEntry {
         HookEntry::Callback {
             label,
             body_cfg,
+            params,
             deps,
             span,
         } => HookEntry::Callback {
             label: label + offset,
             body_cfg: remap_cfg(body_cfg, offset),
+            params,
             deps: deps.into_iter().map(|e| remap_expr(e, offset)).collect(),
             span,
         },

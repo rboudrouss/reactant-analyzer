@@ -57,12 +57,12 @@ impl Rule for MissingDeps {
                     let mut d = Diagnostic::new(
                         "missing-deps",
                         format!(
-                            "variable `{}` is used in {} {} but not in its deps array \
-                             (value: {:?})",
+                            "variable `{}` is used in {} {} but not in its deps array, \
+                             and {}",
                             var,
                             hook_kind_word(info.kind),
                             label,
-                            val
+                            super::describe_value(&val)
                         ),
                     )
                     .with_label(*label)
@@ -108,10 +108,14 @@ fn closure_is_behaviorally_stable(
         // adds no new evidence of instability.
         return true;
     }
-    let Some(body) = fn_lit_binding(var, cfg) else {
+    let Some((params, body)) = fn_lit_binding(var, cfg) else {
         return false;
     };
-    for cap in compute_free_vars(body) {
+    let mut caps = compute_free_vars(body);
+    for p in params {
+        caps.remove(p);
+    }
+    for cap in caps {
         // Globals (fetch, console, …) are not in env_exit — same convention
         // as the main loop above.
         if !env_exit.contains(&cap) {
@@ -127,11 +131,11 @@ fn closure_is_behaviorally_stable(
     true
 }
 
-/// The body of the unique `FnLit` bound to `var` in `cfg`, if any.
+/// The params and body of the unique `FnLit` bound to `var` in `cfg`, if any.
 /// Conditional or repeated re-binding bails out (`None`): the captured
 /// environment is no longer syntactically certain.
-fn fn_lit_binding<'c>(var: &str, cfg: &'c CFG) -> Option<&'c CFG> {
-    let mut found: Option<&CFG> = None;
+fn fn_lit_binding<'c>(var: &str, cfg: &'c CFG) -> Option<(&'c [Var], &'c CFG)> {
+    let mut found: Option<(&[Var], &CFG)> = None;
     for block in cfg.blocks.values() {
         for stmt in &block.stmts {
             let (Stmt::Let { var: v, rhs, .. } | Stmt::Assign { var: v, rhs, .. }) = stmt else {
@@ -145,7 +149,9 @@ fn fn_lit_binding<'c>(var: &str, cfg: &'c CFG) -> Option<&'c CFG> {
                 e = inner;
             }
             match e {
-                Expr::FnLit { body_cfg, .. } if found.is_none() => found = Some(body_cfg),
+                Expr::FnLit {
+                    params, body_cfg, ..
+                } if found.is_none() => found = Some((params, body_cfg)),
                 _ => return None,
             }
         }

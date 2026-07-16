@@ -431,6 +431,7 @@ mod tests {
         let hooks = vec![HookEntry::Callback {
             label: 0,
             body_cfg: empty_cfg(),
+            params: vec![],
             deps: vec![Expr::ArrayLit {
                 id: ExprId(0),
                 elems: vec![],

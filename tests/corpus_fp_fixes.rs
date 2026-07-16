@@ -1007,3 +1007,114 @@ function A() {
         "cross-kind union is not stable: {fired:?}"
     );
 }
+
+// ── Final missing-deps pass: optional chaining + useCallback params ───────────
+
+#[test]
+fn optchain_member_dep_covers_root_var() {
+    // memos AuthCallback repro: `[currentUser?.name]` must credit
+    // `currentUser` like a plain member dep — pre-fix, `ChainExpression`
+    // lowered to an opaque var and the dep vanished.
+    let src = r#"
+function A({ user }) {
+  useEffect(() => {
+    if (!user?.name) {
+      return;
+    }
+    console.log(user.name);
+  }, [user?.name]);
+  return <div />;
+}
+"#;
+    let fired = rules_fired(src);
+    assert!(
+        !fired.iter().any(|r| r == "missing-deps"),
+        "optional-chained dep must cover its root: {fired:?}"
+    );
+}
+
+#[test]
+fn optchain_dep_does_not_cover_other_vars() {
+    // FN guard: crediting `user?.name` to `user` must not silence a
+    // genuinely uncovered unstable capture.
+    let src = r#"
+function A({ user, other }) {
+  useEffect(() => {
+    console.log(user.name, other);
+  }, [user?.name]);
+  return <div />;
+}
+"#;
+    let fired = rules_fired(src);
+    assert!(
+        fired.iter().any(|r| r == "missing-deps"),
+        "uncovered capture must still warn: {fired:?}"
+    );
+}
+
+#[test]
+fn callback_own_param_shadowing_outer_binding_is_not_a_capture() {
+    // memos MotionPhotoPlayer repro: `startPlayback = useCallback(async
+    // (loop) => …)` where `loop` is ALSO a component prop. The callback's own
+    // params were dropped with the FnLit wrapper, so `loop` read as a capture
+    // of the ⊤ prop.
+    let src = r#"
+function A({ loop = false }) {
+  const cb = useCallback(async (loop) => {
+    console.log(loop);
+  }, []);
+  useEffect(() => {
+    void cb(loop);
+  }, [cb, loop]);
+  return <div />;
+}
+"#;
+    let fired = rules_fired(src);
+    assert!(
+        !fired.iter().any(|r| r == "missing-deps"),
+        "callback's own param leaked as free var: {fired:?}"
+    );
+}
+
+#[test]
+fn callback_unshadowed_capture_still_warns() {
+    // FN guard: subtracting params must not eat real captures.
+    let src = r#"
+function A({ user }) {
+  const cb = useCallback((x) => {
+    console.log(x, user);
+  }, []);
+  return <button onClick={() => cb(1)} />;
+}
+"#;
+    let fired = rules_fired(src);
+    assert!(
+        fired.iter().any(|r| r == "missing-deps"),
+        "real capture must still warn: {fired:?}"
+    );
+}
+
+#[test]
+fn optional_call_result_is_not_call_free() {
+    // excalidraw useHandleAppTheme repro (simplified): the state derives from
+    // `getQ()?.matches` — a CALL. Pre-fix the chain lowered to an opaque
+    // (call-free) var, so derived-state claimed the setter was "always called
+    // with a call-free expression of `a`". (The ternary variant of the repro
+    // still fires through a separate, pre-existing hole: `is_call_free`
+    // does not chase temp bindings — see TODO.md.)
+    let src = r#"
+function A() {
+  const [a, setA] = useState("system");
+  const [b, setB] = useState(false);
+  useEffect(() => {
+    setB(getQ()?.matches);
+  }, [a]);
+  return <div data-theme={b} onClick={() => setA("dark")} />;
+}
+"#;
+    let fired = rules_fired(src);
+    assert!(
+        !fired.iter().any(|r| r == "derived-state"),
+        "optional call is a call, not a render-derivable expression: {fired:?}"
+    );
+}

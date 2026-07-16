@@ -1011,6 +1011,7 @@ fn collect_effect_info(hooks: &[HookEntry]) -> HashMap<HookLabel, EffectInfo> {
             HookEntry::Callback {
                 label,
                 body_cfg,
+                params,
                 deps,
                 span,
             } => Some((
@@ -1018,7 +1019,15 @@ fn collect_effect_info(hooks: &[HookEntry]) -> HashMap<HookLabel, EffectInfo> {
                 EffectInfo {
                     label: *label,
                     kind: HookKind::Callback,
-                    free_vars: compute_free_vars(body_cfg),
+                    free_vars: {
+                        // The callback's own params are bound, not captured
+                        // (they shadow any same-named outer binding).
+                        let mut fv = compute_free_vars(body_cfg);
+                        for p in params {
+                            fv.remove(p);
+                        }
+                        fv
+                    },
                     has_deps_array: true,
                     declared_deps: deps.clone(),
                     span: *span,

@@ -508,14 +508,15 @@ fn make_hook_entry(
             })
         }
         "useCallback" => {
-            let body_cfg = it
+            let (params, body_cfg) = it
                 .next()
-                .and_then(expr_into_cfg)
-                .unwrap_or_else(fallback_cfg);
+                .and_then(expr_into_fn)
+                .unwrap_or_else(|| (vec![], fallback_cfg()));
             let deps = it.next().and_then(expr_into_deps).unwrap_or_default();
             Some(HookEntry::Callback {
                 label,
                 body_cfg,
+                params,
                 deps,
                 span,
             })
@@ -578,6 +579,20 @@ fn expr_into_cfg(expr: Expr) -> Option<CFG> {
             // the Expr was just produced by lowering). Fall back to clone for safety.
             Some(std::sync::Arc::try_unwrap(body_cfg).unwrap_or_else(|arc| (*arc).clone()))
         }
+        _ => None,
+    }
+}
+
+/// Like `expr_into_cfg` but keeps the `FnLit` params (useCallback fns take
+/// arguments; see `HookEntry::Callback::params`).
+fn expr_into_fn(expr: Expr) -> Option<(Vec<crate::ir::types::Var>, CFG)> {
+    match expr {
+        Expr::FnLit {
+            params, body_cfg, ..
+        } => Some((
+            params,
+            std::sync::Arc::try_unwrap(body_cfg).unwrap_or_else(|arc| (*arc).clone()),
+        )),
         _ => None,
     }
 }

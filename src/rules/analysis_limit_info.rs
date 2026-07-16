@@ -35,8 +35,9 @@ impl Rule for AnalysisLimitInfo {
                     Diagnostic::new(
                         "analysis-limit",
                         format!(
-                            "recursive component reference `{callee}` cut to ⊤ \
-                             cross-component cycles not fully analysed (FN possible)"
+                            "recursive component reference `{callee}` not followed — \
+                             its props are treated as unknown; cross-component cycles \
+                             are not fully analysed (FN possible)"
                         ),
                     )
                     .with_severity(Severity::Info),

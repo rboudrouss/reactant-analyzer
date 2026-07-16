@@ -42,6 +42,24 @@ use crate::{
     },
 };
 
+/// User-facing wording for an abstract value in a diagnostic message.
+///
+/// Rules must never print a domain value with `{:?}`: the lattice encoding
+/// (`⊤`, kind unions like `number|string|ref(Unknown)`) is an implementation
+/// detail. This is the rule/message boundary where abstract values map to
+/// user language.
+pub(crate) fn describe_value(val: &StateValue) -> &'static str {
+    use crate::domains::Stability;
+    match val.to_stability() {
+        Stability::Bottom | Stability::Stable => "its value never changes between renders",
+        Stability::PerRender => "it is recreated on every render",
+        Stability::Versioned(_) | Stability::VersionedTop => {
+            "its value changes when state is updated"
+        }
+        Stability::Unknown => "its value may change between renders",
+    }
+}
+
 /// Confidence level of a diagnostic.
 ///
 /// - `Error`   violation on ALL execution paths.

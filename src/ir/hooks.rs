@@ -29,6 +29,12 @@ pub enum HookEntry {
     Callback {
         label: HookLabel,
         body_cfg: CFG,
+        /// Parameters of the memoized function. Unlike effect/memo bodies
+        /// (zero-arg), a `useCallback` fn takes arguments; its params must be
+        /// subtracted from the body's free variables or they read as captures
+        /// of any same-named outer binding (`(options) => …` shadowing a
+        /// component-scope `options`).
+        params: Vec<Var>,
         deps: Vec<Expr>,
         span: Option<SourceRange>,
     },

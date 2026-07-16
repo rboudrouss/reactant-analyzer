@@ -22,8 +22,9 @@ impl Rule for WideningInfo {
                 Diagnostic::new(
                     "widening-info",
                     format!(
-                        "state {label} required widening to force convergence \
-                         abstract values are over-approximated"
+                        "state {label} kept changing during analysis and was \
+                         approximated to converge — findings that depend on it \
+                         may be imprecise"
                     ),
                 )
                 .with_severity(Severity::Info)

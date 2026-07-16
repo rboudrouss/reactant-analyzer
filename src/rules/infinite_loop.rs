@@ -117,8 +117,8 @@ impl Rule for InfiniteLoop {
                     let mut diag = Diagnostic::new(
                         "infinite-loop",
                         format!(
-                            "effect {} sets state {}{} which needed widening \
-                             potential infinite render loop",
+                            "effect {} keeps pushing state {}{} to new values \
+                             on every run potential infinite render loop",
                             eff_label, state_label, deps_note
                         ),
                     )
@@ -145,8 +145,8 @@ impl Rule for InfiniteLoop {
                             let h_span = comp_result.handler_info.get(h_label).and_then(|i| i.span);
                             diag = diag.with_note(
                                 format!(
-                                    "handler `on{}` also calls setter \
-                                     grows state {} range across fixpoint iterations",
+                                    "handler `on{}` also calls this setter \
+                                     and keeps growing state {}",
                                     capitalize_first(event),
                                     state_label
                                 ),
@@ -385,7 +385,7 @@ fn check_object_churn(result: &ProgramAnalysisResult, component: &Symbol) -> Vec
                     "infinite-loop",
                     format!(
                         "effect {eff_label} may store a fresh reference into state \
-                         {state_label} which versions its deps possible infinite render loop"
+                         {state_label} which its deps react to possible infinite render loop"
                     ),
                 ),
                 Severity::Info => Diagnostic::new(
