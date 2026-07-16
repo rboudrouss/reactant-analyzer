@@ -1099,9 +1099,7 @@ fn optional_call_result_is_not_call_free() {
     // excalidraw useHandleAppTheme repro (simplified): the state derives from
     // `getQ()?.matches` — a CALL. Pre-fix the chain lowered to an opaque
     // (call-free) var, so derived-state claimed the setter was "always called
-    // with a call-free expression of `a`". (The ternary variant of the repro
-    // still fires through a separate, pre-existing hole: `is_call_free`
-    // does not chase temp bindings — see TODO.md.)
+    // with a call-free expression of `a`".
     let src = r#"
 function A() {
   const [a, setA] = useState("system");
@@ -1116,6 +1114,48 @@ function A() {
     assert!(
         !fired.iter().any(|r| r == "derived-state"),
         "optional call is a call, not a render-derivable expression: {fired:?}"
+    );
+}
+
+#[test]
+fn call_hidden_behind_ternary_temp_is_not_derived_state() {
+    // Ternary/logical lowering hides the call behind a branch temp
+    // (`setB(a === 1 ? f() : 2)` → `setB(__t)`). The call-free check must
+    // resolve the temp binding, else derived-state fires on a call.
+    let src = r#"
+function A() {
+  const [a, setA] = useState(1);
+  const [b, setB] = useState(0);
+  useEffect(() => {
+    setB(a === 1 ? f() : 2);
+  }, [a]);
+  return <div onClick={() => setA(2)}>{b}</div>;
+}
+"#;
+    let fired = rules_fired(src);
+    assert!(
+        !fired.iter().any(|r| r == "derived-state"),
+        "a call behind a ternary temp is not render-derivable: {fired:?}"
+    );
+}
+
+#[test]
+fn call_free_ternary_temp_still_fires_derived_state() {
+    // FN guard: a genuinely call-free ternary temp is still derivable.
+    let src = r#"
+function A() {
+  const [a, setA] = useState(1);
+  const [b, setB] = useState(0);
+  useEffect(() => {
+    setB(a === 1 ? 10 : 2);
+  }, [a]);
+  return <div onClick={() => setA(2)}>{b}</div>;
+}
+"#;
+    let fired = rules_fired(src);
+    assert!(
+        fired.iter().any(|r| r == "derived-state"),
+        "call-free derivation should still be flagged: {fired:?}"
     );
 }
 
@@ -1193,5 +1233,58 @@ function A({ x }) {
     assert!(
         fired.iter().any(|r| r == "missing-deps"),
         "whole-object read is not covered by field deps: {fired:?}"
+    );
+}
+
+// ── Diagnostic UX: source names, no internal hook labels ──────────────────────
+
+#[test]
+fn messages_name_state_by_source_var_not_label() {
+    // infinite-loop churn: the message must say `obj` (the source var), never
+    // an internal post-inlining label like "state 0".
+    let src = r#"
+function A() {
+  const [obj, setObj] = useState({});
+  useEffect(() => { setObj({ ...obj, a: 1 }); }, [obj]);
+  return <div>{obj.a}</div>;
+}
+"#;
+    let msgs: Vec<String> = diagnostics(src)
+        .into_iter()
+        .filter(|(r, _)| r == "infinite-loop")
+        .map(|(_, m)| m)
+        .collect();
+    assert!(!msgs.is_empty(), "expected an infinite-loop diagnostic");
+    assert!(
+        msgs.iter().any(|m| m.contains("`obj`")),
+        "message should name the state var: {msgs:?}"
+    );
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| m.contains("state 0") || m.contains("effect 0")),
+        "message must not leak internal hook labels: {msgs:?}"
+    );
+}
+
+#[test]
+fn missing_deps_message_uses_this_effect_not_label() {
+    let src = r#"
+function A({ dep }) {
+  useEffect(() => {
+    console.log(dep);
+  }, []);
+  return <div />;
+}
+"#;
+    let msg = diagnostics(src)
+        .into_iter()
+        .find(|(r, _)| r == "missing-deps")
+        .map(|(_, m)| m)
+        .expect("missing-deps expected");
+    assert!(msg.contains("this effect"), "{msg}");
+    assert!(
+        !msg.contains("effect 0") && !msg.contains("effect 1"),
+        "no numeric label: {msg}"
     );
 }

@@ -39,10 +39,7 @@ impl Rule for ConditionalHook {
             .map(|call| {
                 let mut d = Diagnostic::new(
                     "conditional-hook",
-                    format!(
-                        "hook {} is called conditionally (not on every render path)",
-                        call.label
-                    ),
+                    "this hook is called conditionally (not on every render path)".to_string(),
                 )
                 .with_severity(Severity::Error)
                 .with_label(call.label);

@@ -108,13 +108,13 @@ impl Rule for SetterInRender {
                     )
                     .with_severity(severity)
                     .with_label(label)
-                } else if let Some((parent_comp, parent_label)) = cs_vars.get(&call.var) {
+                } else if let Some((parent_comp, _parent_label)) = cs_vars.get(&call.var) {
                     Diagnostic::new(
                         "cross-setter-in-render",
                         format!(
-                            "prop `{}` (setter for `{}` state #{}) called during render of `{}` \
+                            "prop `{}` (a state setter of parent `{}`) called during render of `{}` \
                              triggers parent re-render on every render",
-                            call.var, parent_comp, parent_label, component
+                            call.var, parent_comp, component
                         ),
                     )
                     .with_severity(severity)

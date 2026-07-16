@@ -127,9 +127,8 @@ impl Rule for DerivedState {
             let mut d = Diagnostic::new(
                 "derived-state",
                 format!(
-                    "setter `{setter_name}` is always called with a call-free expression of \
-                     `{dep_var}` in effect {eff_label} replace with `useMemo` or compute \
-                     during render"
+                    "this effect always sets `{setter_name}` to a call-free expression of \
+                     `{dep_var}` replace with `useMemo` or compute during render"
                 ),
             )
             .with_label(*eff_label);
@@ -174,8 +173,15 @@ fn find_uncond_setter_call(cfg: &CFG, setter_vars: &HashSet<Var>) -> Option<Var>
         return None;
     }
 
-    // All args must be call-free.
-    if !call_sites.iter().all(|(_, _, arg)| arg.is_call_free()) {
+    // All args must be call-free — resolving local temp bindings, since
+    // ternary/logical lowering hides the branch value behind a `Var(__tN)`
+    // that is structurally call-free even when its binding holds a call
+    // (`setB(a ? f() : 2)` → `setB(__tN)`, `__tN = f()` on one path).
+    let bindings = local_bindings(cfg);
+    if !call_sites
+        .iter()
+        .all(|(_, _, arg)| arg_is_call_free(arg, &bindings, &mut HashSet::new()))
+    {
         return None;
     }
 
@@ -228,6 +234,62 @@ fn find_uncond_setter_call(cfg: &CFG, setter_vars: &HashSet<Var>) -> Option<Var>
         .all(|b| *must_out.get(&b.id).unwrap_or(&false));
 
     if all_covered { Some(target) } else { None }
+}
+
+/// Every RHS assigned to each variable in `cfg` (a var may be written on
+/// multiple paths — a lowered ternary/logical temp is).
+fn local_bindings(cfg: &CFG) -> HashMap<&str, Vec<&Expr>> {
+    let mut map: HashMap<&str, Vec<&Expr>> = HashMap::new();
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            if let Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } = stmt {
+                map.entry(var.as_str()).or_default().push(rhs);
+            }
+        }
+    }
+    map
+}
+
+/// Like `Expr::is_call_free`, but a `Var` bound to local temp(s) is call-free
+/// only when *every* binding is — so a call hidden behind a branch temp is
+/// seen. Vars with no local binding (params, props, state) are plain values.
+fn arg_is_call_free(
+    e: &Expr,
+    bindings: &HashMap<&str, Vec<&Expr>>,
+    seen: &mut HashSet<Var>,
+) -> bool {
+    match e {
+        Expr::Call { .. } | Expr::CompApp { .. } | Expr::NativeElem { .. } => false,
+        Expr::Var(v) => match bindings.get(v.as_str()) {
+            Some(rhss) => {
+                if !seen.insert(v.clone()) {
+                    return true; // cycle: no new call evidence
+                }
+                rhss.iter().all(|r| arg_is_call_free(r, bindings, seen))
+            }
+            None => true,
+        },
+        Expr::Lit(_)
+        | Expr::StateVal(_)
+        | Expr::StateSetter(_)
+        | Expr::MemoVal(_)
+        | Expr::CallbackVal(_)
+        | Expr::SummaryVal(_)
+        | Expr::FnLit { .. } => true,
+        Expr::ObjectLit { fields, .. } => fields
+            .iter()
+            .all(|(_, v)| arg_is_call_free(v, bindings, seen)),
+        Expr::ArrayLit { elems, .. } => elems.iter().all(|x| arg_is_call_free(x, bindings, seen)),
+        Expr::FieldAccess { obj, .. } => arg_is_call_free(obj, bindings, seen),
+        Expr::IndexAccess { arr, idx } => {
+            arg_is_call_free(arr, bindings, seen) && arg_is_call_free(idx, bindings, seen)
+        }
+        Expr::BinOp { lhs, rhs, .. } => {
+            arg_is_call_free(lhs, bindings, seen) && arg_is_call_free(rhs, bindings, seen)
+        }
+        Expr::UnaryOp { arg, .. } => arg_is_call_free(arg, bindings, seen),
+        Expr::TSAnnotated(inner, _) => arg_is_call_free(inner, bindings, seen),
+    }
 }
 
 fn try_extract_setter_call<'a>(

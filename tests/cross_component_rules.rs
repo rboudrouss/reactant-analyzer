@@ -162,8 +162,9 @@ fn cross_component_infinite_loop_fires_unbounded_nodeps() {
     );
     assert!(cross[0].message.contains("bump"));
     assert!(
-        !cross[0].notes.is_empty(),
-        "note should point to parent component"
+        cross[0].message.contains("parent"),
+        "message should point to the parent component: {}",
+        cross[0].message
     );
 }
 

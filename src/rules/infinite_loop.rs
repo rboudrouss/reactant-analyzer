@@ -21,7 +21,7 @@ use crate::{
 use super::{
     Diagnostic, Rule, Severity, all_deps_unstable, collect_component_setter_vars,
     collect_fn_bindings, collect_setter_calls, collect_setter_calls_with_extra, memo_val_labels,
-    resolve_setter_aliases, setter_var_labels, state_val_labels,
+    resolve_setter_aliases, setter_var_labels, state_slot_name, state_val_labels,
 };
 
 fn capitalize_first(s: &str) -> String {
@@ -51,6 +51,7 @@ impl Rule for InfiniteLoop {
 
         let local_setter_labels: HashMap<Var, HookLabel> =
             setter_var_labels(&comp_result.render_cfg);
+        let state_names = state_val_labels(&comp_result.render_cfg);
 
         // ComponentSetter props, excluding self-references.
         let cs_vars: HashMap<Var, (Symbol, HookLabel)> = collect_component_setter_vars(
@@ -117,9 +118,10 @@ impl Rule for InfiniteLoop {
                     let mut diag = Diagnostic::new(
                         "infinite-loop",
                         format!(
-                            "effect {} keeps pushing state {}{} to new values \
+                            "this effect keeps pushing state {}{} to new values \
                              on every run potential infinite render loop",
-                            eff_label, state_label, deps_note
+                            state_slot_name(state_label, &state_names),
+                            deps_note
                         ),
                     )
                     .with_label(state_label);
@@ -148,7 +150,7 @@ impl Rule for InfiniteLoop {
                                     "handler `on{}` also calls this setter \
                                      and keeps growing state {}",
                                     capitalize_first(event),
-                                    state_label
+                                    state_slot_name(state_label, &state_names)
                                 ),
                                 Some(*h_label),
                                 h_span,
@@ -173,9 +175,9 @@ impl Rule for InfiniteLoop {
                         ""
                     };
                     let msg = format!(
-                        "effect {} calls `{}` setter #{} of parent `{}`{} \
+                        "this effect calls `{}`, a state setter of parent `{}`{} \
                          parent re-renders → child re-renders → effect fires again: infinite loop",
-                        eff_label, call.var, parent_label, parent_comp, deps_note
+                        call.var, parent_comp, deps_note
                     );
                     let mut diag = Diagnostic::new("cross-component-infinite-loop", msg)
                         .with_label(*eff_label);
@@ -183,14 +185,6 @@ impl Rule for InfiniteLoop {
                     if let Some(r) = comp_result.effect_info.get(eff_label).and_then(|i| i.span) {
                         diag = diag.with_range(r);
                     }
-                    diag = diag.with_note(
-                        format!(
-                            "state #{} belongs to parent `{}`",
-                            parent_label, parent_comp
-                        ),
-                        None,
-                        None,
-                    );
                     diags.push(diag);
                 }
             }
@@ -376,24 +370,27 @@ fn check_object_churn(result: &ProgramAnalysisResult, component: &Symbol) -> Vec
                 Severity::Error => Diagnostic::new(
                     "infinite-loop",
                     format!(
-                        "effect {eff_label} recreates object state {state_label} it depends on \
+                        "this effect recreates object state {state} it depends on \
                          every run stores a fresh reference (`Object.is` always fails) \
-                         and re-triggers itself: infinite render loop"
+                         and re-triggers itself: infinite render loop",
+                        state = state_slot_name(state_label, &state_vals)
                     ),
                 ),
                 Severity::Warning => Diagnostic::new(
                     "infinite-loop",
                     format!(
-                        "effect {eff_label} may store a fresh reference into state \
-                         {state_label} which its deps react to possible infinite render loop"
+                        "this effect may store a fresh reference into state \
+                         {state} which its deps react to possible infinite render loop",
+                        state = state_slot_name(state_label, &state_vals)
                     ),
                 ),
                 Severity::Info => Diagnostic::new(
                     "infinite-loop",
                     format!(
-                        "effect {eff_label} depends on object state but freshly recreates \
-                         state {state_label} outside its deps cross-effect cycles are not \
-                         analyzed (depth > 1)"
+                        "this effect depends on object state but freshly recreates \
+                         state {state} outside its deps cross-effect cycles are not \
+                         analyzed (depth > 1)",
+                        state = state_slot_name(state_label, &state_vals)
                     ),
                 ),
             }
@@ -404,7 +401,10 @@ fn check_object_churn(result: &ProgramAnalysisResult, component: &Symbol) -> Vec
             }
             if let Some(r) = call_span {
                 diag = diag.with_note(
-                    format!("setter of state {state_label} called here with a fresh value"),
+                    format!(
+                        "setter of state {} called here with a fresh value",
+                        state_slot_name(state_label, &state_vals)
+                    ),
                     Some(*eff_label),
                     Some(r),
                 );

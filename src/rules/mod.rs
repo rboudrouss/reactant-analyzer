@@ -60,6 +60,23 @@ pub(crate) fn describe_value(val: &StateValue) -> &'static str {
     }
 }
 
+/// User-facing name for a state slot identified by its hook label. Prefers the
+/// source variable it binds to (`` `count` ``); falls back to `state #N` when the
+/// slot has no syntactic name (destructured indirectly, cross-component, …).
+///
+/// Messages must never print a bare internal `HookLabel` ("state 46"): the
+/// number is a post-inlining counter meaningless next to source.
+pub(crate) fn state_slot_name(
+    label: HookLabel,
+    state_val_labels: &HashMap<Var, HookLabel>,
+) -> String {
+    state_val_labels
+        .iter()
+        .find(|(_, l)| **l == label)
+        .map(|(v, _)| format!("`{v}`"))
+        .unwrap_or_else(|| format!("state #{label}"))
+}
+
 /// Confidence level of a diagnostic.
 ///
 /// - `Error`   violation on ALL execution paths.

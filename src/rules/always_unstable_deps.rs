@@ -86,7 +86,7 @@ impl Rule for AlwaysUnstableDeps {
             let mut d = Diagnostic::new(
                 "always-unstable-deps",
                 format!(
-                    "{word} {label} has unstable dep(s) at index {idx} \
+                    "this {word} has unstable dep(s) at index {idx} \
                      a new reference every render — `Object.is` always differs, \
                      so the {word} re-runs on every render regardless of the \
                      other deps",

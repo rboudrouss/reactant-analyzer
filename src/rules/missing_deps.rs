@@ -59,10 +59,9 @@ impl Rule for MissingDeps {
                     let mut d = Diagnostic::new(
                         "missing-deps",
                         format!(
-                            "`{}` is used in {} {} but not in its deps array, and {}",
+                            "`{}` is used in this {} but not in its deps array, and {}",
                             path,
                             hook_kind_word(info.kind),
-                            label,
                             super::describe_value(&val)
                         ),
                     )

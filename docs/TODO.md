@@ -20,8 +20,6 @@
 
 - **Module consts don't cross files into inlined hooks** — a custom hook inlined from another file reads the *component's* module consts, not its own file's → its module-const references stay ⊤ (same FP class as above, one level removed).
 
-- **`is_call_free` doesn't chase temp bindings** — ternary/logical lowering hides calls behind a temp (`setB(a ? f() : 2)` → arg = `Var(__tN)`, call-free), so `derived-state` can claim "call-free expression" through a temp whose binding contains a call. Fix: resolve `Var` args to their unique binding before deciding call-freedom (same pattern as `fn_lit_binding`).
-
 - **Per-slot hook summaries** — `SummaryRegistry` returns ONE `StateValue` per hook; tuple-returning third-party hooks (jotai `useAtom` → `[value, setValue]`) can't expose a Stable setter slot → `missing-deps` flags `setValue` (⊤) even though it is stable (excalidraw `useAtomWithInitialValue`, author eslint-disabled the same warning). Needs summaries that describe destructured slots.
 
 ## Remaining from corpus bench 2026-07-15
@@ -34,7 +32,6 @@ Corpus state after F1b (path-granular free vars): bulletproof-react 0, shadcn-ad
 ### Diagnostics UX (side-finding)
 
 - **Cross-component blame** — `always-unstable-deps` on a prop-rooted dep blames the *child* (memos `MentionResolutionProvider`) when the instability comes from a specific parent call site (`MemoDetail.tsx` passes an unmemoized array). The propagation is semantically correct (verified: the provider analyzed alone is silent); the message should carry the provenance ("unstable because `<Parent>` passes a fresh array at file:line"). An `OnProps` label family in the ADR-017 frame would make this provenance first-class — worth doing for the *message*, no FP to fix.
-- **Hook labels in messages** — "effect 46" is a post-inlining internal label, meaningless next to a source file that shows ~5 effects. The span already points to the right line; the label mostly serves note-linking. Either drop it from the text or map back to a per-file hook index.
 
 ### Escaping-setter chase bounds
 

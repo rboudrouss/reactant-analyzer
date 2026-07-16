@@ -14,7 +14,9 @@ use crate::{
     },
 };
 
-use super::{Diagnostic, Rule, resolve_setter_aliases, setter_var_labels};
+use super::{
+    Diagnostic, Rule, resolve_setter_aliases, setter_var_labels, state_slot_name, state_val_labels,
+};
 
 /// Fires when a mount-only effect (`deps: []`) sets a state to a stable constant
 /// that differs from the state's init value.
@@ -58,6 +60,7 @@ impl Rule for UnnecessaryRerender {
 
         // Setter var → state label, from the render body's `let setX = useState(...)[1]`.
         let setter_to_label = setter_var_labels(&result.render_cfg);
+        let state_names = state_val_labels(&result.render_cfg);
 
         let mut diags = Vec::new();
 
@@ -133,9 +136,10 @@ impl Rule for UnnecessaryRerender {
                     let mut d = Diagnostic::new(
                         "unnecessary-rerender",
                         format!(
-                            "mount-only effect sets state {state_label} to a constant \
+                            "mount-only effect sets state {} to a constant \
                              different from its initial value causes one extra rerender on mount; \
-                             consider initialising directly with the target value"
+                             consider initialising directly with the target value",
+                            state_slot_name(state_label, &state_names)
                         ),
                     )
                     .with_label(state_label);

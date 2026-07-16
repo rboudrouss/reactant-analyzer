@@ -47,11 +47,10 @@ impl Rule for LazyInit {
             }
             let mut d = Diagnostic::new(
                 "lazy-init",
-                format!(
-                    "useState {label} is initialised by a direct function call \
-                     the call runs on every render but the result is only used on mount; \
-                     wrap as `useState(() => …)` to defer it"
-                ),
+                "this useState is initialised by a direct function call \
+                 the call runs on every render but the result is only used on mount; \
+                 wrap as `useState(() => …)` to defer it"
+                    .to_string(),
             )
             .with_label(*label);
             if let Some(r) = span {
