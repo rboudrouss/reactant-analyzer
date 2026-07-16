@@ -75,6 +75,29 @@ Corpus state: bulletproof-react 0, shadcn-admin 0, excalidraw 1 W, memos 1 E + 1
 - **One `ImportResolver` per run** — no per-file override; compose manually in a custom impl if needed.
 - **Eager parsing** — all discovered files are parsed up front, even those not reachable from a root. No lazy mode.
 
+## Proposed rules (semantic — not covered by eslint-plugin-react-hooks)
+
+Ranked by "only abstract interpretation catches this" and by existing engine support.
+Soundness rule stands: FN forbidden → gate each on a *proven* domain fact, else downgrade
+Error→Warning. Rules that would just re-do eslint AST pattern-matching (raw exhaustive-deps,
+rules-of-hooks, index-as-key, naming) are explicitly out of scope.
+
+### Tier 1 — differentiators (engine already has the domains)
+
+- **`state-mutation`** — in-place mutation of a state/prop object with no fresh reference. `arr.push(x); setArr(arr)` → same heap identity → React bail-out → no re-render (a *silent* user FN). Engine: `heap.rs` identity — detect a write to an object whose identity roots in a state slot, then a setter called with that same identity (also flags direct prop mutation). FP near-zero (identity is exact). **Highest priority: biggest real dark pattern, machinery already present.**
+
+- **`stale-closure`** — a callback that outlives the render (`setInterval`/`setTimeout`/`addEventListener`/`.then`/subscribe) captures a state value under empty/stable deps → the captured version is frozen at mount. `useEffect(() => { setInterval(() => setN(n+1), 1000) }, [])` → `n` stays 0 forever. Engine: version domain (ADR-017) — compare the version captured in the closure vs the current slot version. **FN gate: fire only when a `Versioned` slot is read/written inside an auto-run callback whose deps are stable.** Opposite angle to `always-unstable-deps` (deps too empty vs too unstable).
+
+- **`frozen-initial-state`** — a versioned prop seeded into `useState` initial with no sync path → the local state freezes at the first prop value. `const [v, setV] = useState(props.value)` where `value` later changes. Engine: `useState` initial is a `Versioned` expr rooted on a prop, no syncing effect, prop proven versioned cross-component (ADR-012). **FN gate: require the prop proven versioned; else Warning.** Distinct from `derived-state` (an effect that *does* sync) — here there is no sync at all.
+
+- **`stale-update`** — new state depends on old without the functional updater. `setCount(count + 1)` twice in one tick = +1 not +2 (batching); or a setter in an async/long-lived closure reading a captured slot, where `set(prev => …)` would be safe. Engine: ≥2 sync writes to one slot reading the captured value, or a setter in an async callback reading a captured slot. Overlaps `stale-closure` but the fix differs (updater vs deps). **Warning — batching semantics are React-version-dependent.**
+
+### Tier 2 — semantic but higher FP (aim Warning/Info)
+
+- **`missing-cleanup`** — a resource created in an effect (`setInterval`/`addEventListener`/`subscribe`/`new WebSocket`) with no cleanup `return` → leak + double-subscribe under StrictMode/effect re-run. Engine: sees the call and the absence of a `Return` FnLit in the effect block. FP: cleanup done via a helper. **Warning.**
+
+- **`async-setState-race`** — setter after `await`/in `.then` with no guard (no `AbortController`, no `cancelled` flag) → out-of-order responses overwrite. `useEffect(() => { fetch(url).then(r => setData(r)) }, [url])`. **Warning/Info — often benign.**
+
 ## Out-of-scope perimeter (future)
 
 - **Dynamic components** — `const C = cond ? A : B; <C />` → `CompApp` not generated, not analyzed.
