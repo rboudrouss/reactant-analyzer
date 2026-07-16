@@ -547,8 +547,9 @@ function A() {
 }
 
 #[test]
-fn f5_effect_cycle_emits_info() {
-    // Real 2-effect cycle: each Info arm fires (limitation made visible).
+fn f5b_effect_cycle_is_error() {
+    // Real 2-effect cycle: the churn graph (F5b) proves it — Error on each
+    // participating effect, and the old per-edge Infos are superseded.
     let src = r#"
 function A() {
   const [a, setA] = useState({ x: 1 });
@@ -563,11 +564,17 @@ function A() {
 }
 "#;
     let diags = diagnostics_sev(src);
-    let infos = diags
+    let errors = diags
         .iter()
-        .filter(|(r, s, _)| r == "infinite-loop" && *s == Severity::Info)
+        .filter(|(r, s, _)| r == "infinite-loop" && *s == Severity::Error)
         .count();
-    assert!(infos >= 2, "both cycle edges must emit Info: {diags:?}");
+    assert_eq!(errors, 2, "both cycle effects must be Error: {diags:?}");
+    assert!(
+        !diags
+            .iter()
+            .any(|(r, s, _)| r == "infinite-loop" && *s == Severity::Info),
+        "cycle-covered writes must not also emit the Info: {diags:?}"
+    );
 }
 
 #[test]

@@ -228,11 +228,11 @@ if evaluation is too imprecise the case degrades to Warning, never silence.
 ## Limitations
 
 - **Multi-effect cycles** (effect 1: deps `[a]`, sets `b` fresh; effect 2:
-  deps `[b]`, sets `a` fresh) are a real loop not covered by the self-churn
-  arm. FN-flavor limitation → must not be silent: an `--info` diagnostic
-  fires when an effect sets a *different* object state with a fresh value
-  while itself having object-state deps. Proper fix (fixpoint over the
-  effect→state→effect graph) is follow-up F5b.
+  deps `[b]`, sets `a` fresh) — **resolved by F5b**
+  ([ADR-018](ADR-018-effect-cycle-graph.md)): a graph over qualified state
+  slots finds churn cycles across effects and components. The `--info`
+  diagnostic remains only for fresh writes that close no cycle (residual
+  dep imprecision marker).
 - **Never-written refinement dropped**: `useState(CONST)` with no reachable
   setter call could read `Stable` (more precise; dep omittable). Needs a
   post-fixpoint "slot ever written" bit; marginal gain (eslint requires the

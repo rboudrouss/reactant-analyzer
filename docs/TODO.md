@@ -2,15 +2,15 @@
 
 ## Known false negatives (FN)
 
-- **Aliased React hook imports stay Custom** — `import { useMemo as useM } from "react"`: classification keys on the LOCAL name (`useM` matches no React arm) → Custom with `import_source: "react"` → not analyzed as a memo. Rare pattern; fixing it needs the *imported* name in the import map, not just the local binding. (The reverse collision — a custom hook literally named `useMemo` — is handled: classification is import-aware, see `ImportCtx::callee_is_react`.)
+- **Aliased React hook imports stay Custom** — `import { useMemo as useM } from "react"`: classification keys on the LOCAL name (`useM` matches no React arm) → Custom with `import_source: "react"` → not analyzed as a memo. Rare pattern; fixing it needs the *imported* name in the import map, not just the local binding.
 
-- **Unknown callees without `Loc`** — `myHelper(() => setX())` → FN if `myHelper` is imported from an npm package (not in the analyzed files) or if inlining was cut off by depth. **Local** utilities are now inlined (ADR-013 Phase 3) but only in **statement** position; in expression position they stay opaque. *(ADR-010, ADR-013)*
+- **Unknown callees without `Loc`** — `myHelper(() => setX())` → FN if `myHelper` is imported from an npm package (not in the analyzed files) or if inlining was cut off by depth. Local utilities are inlined (ADR-013 Phase 3) but only in **statement** position; in expression position they stay opaque. *(ADR-010, ADR-013)*
 
 - **`cross-component-infinite-loop` FN if the parent is only analyzed intra** — if the parent component isn't reached by top-down analysis (Phase 2 fallback, props = ⊤), the `SharedStateStore` isn't populated → the rule doesn't fire. *(ADR-012)*
 
 - **Loop-carried values inside callbacks** — `exec_body` doesn't widen on back-edges → `setX(arr[i])` records a partial value. Minor FN on the *value*, never an FP. *(ADR-009)*
 
-- **Multi-effect churn cycles (F5b)** — effect A deps `[a]` sets `b` fresh; effect B deps `[b]` sets `a` fresh: a real render loop the `infinite-loop` churn arm doesn't prove (self-churn only). Surfaced as an `--info` diagnostic today; proper fix = fixpoint over the effect→state→effect graph. *(ADR-017 §Limitations)*
+- **Churn-graph residuals (ADR-018)** — auto-run nested callbacks (`.then(() => set(fresh))`) in **no-deps** effects create no self-edge (event-vs-async callback classification lives in the engine, not the syntactic collector); cross-component edges are lost when a prop dep degrades to `Unknown` (FieldAccess on versioned, ADR-017 §Limitations).
 
 ## Known false positives (FP)
 
@@ -22,14 +22,18 @@
 
 - **Per-slot hook summaries** — `SummaryRegistry` returns ONE `StateValue` per hook; tuple-returning third-party hooks (jotai `useAtom` → `[value, setValue]`) can't expose a Stable setter slot → `missing-deps` flags `setValue` (⊤) even though it is stable (excalidraw `useAtomWithInitialValue`, author eslint-disabled the same warning). Needs summaries that describe destructured slots.
 
+- **Churn-cycle Warning on convergent multi-writer pairs** — the F5b convergence kill requires a single effect write-site per slot (ADR-018); a guarded fetch-once write coexisting with another writer of the same slot keeps its edge even when the pair in fact converges. Precise alternative: narrow guards against the join of all writers' values.
+
 ## Remaining from corpus bench 2026-07-15
 
-Corpus state after F1b (path-granular free vars): bulletproof-react 0, shadcn-admin 0, excalidraw 1 W, memos 1 E + 12 W. F1b recovered 3 previously-silenced findings (memos `App` ×2, `LocationPicker`), all the same class: an object read *whole* (in a `if (!x)` guard or `x ?? default`) while only its fields are declared (`[x?.locale]`, `[latlng?.lat, latlng?.lng]`) — `eslint-plugin-react-hooks` reports these too. Benign in these cases (the whole-ref read is a truthiness/nullish test) but a real path mismatch. Regression suite: `tests/corpus_fp_fixes.rs`.
+Corpus state: bulletproof-react 0, shadcn-admin 0, excalidraw 1 W, memos 1 E + 12 W — everything triaged TP/advice. Regression suite: `tests/corpus_fp_fixes.rs`.
 
-- **Whole-object read via guard/nullish is flagged** — the 3 findings above. A truthiness test (`if (!x)`) or nullish default (`x ?? d`) reads the whole reference, so declaring only fields doesn't cover it. Distinguishing "value use" from "existence check" would need tracking *how* the whole ref is consumed — deferred; keeping the (sound, eslint-aligned) warning.
+- **Whole-object read via guard/nullish is flagged** — 3 advice-class findings (memos `App` ×2, `LocationPicker`): a truthiness test (`if (!x)`) or nullish default (`x ?? d`) reads the whole reference, so declaring only fields (`[x?.locale]`) doesn't cover it. Distinguishing "value use" from "existence check" would need tracking *how* the whole ref is consumed — deferred; keeping the (sound, eslint-aligned) warning.
 - **Never-written state refinement** — `useState(CONST)` with no reachable setter call could read `Stable` (dep omittable) instead of `Versioned`. Needs a post-fixpoint "slot ever written" bit; marginal gain. *(ADR-017 §Limitations)*
 
 ### Diagnostics UX (side-finding)
+
+- **Diagnostic output order is not fully deterministic** — components and some diagnostic groups follow HashMap iteration order, so consecutive runs can reorder lines (seen on `analysis-limit` Infos while byte-diffing corpus runs). Fix = sort diagnostics (component, rule, range) at the output layer — matters for CI/bench diffing of the JSON output.
 
 - **Cross-component blame** — `always-unstable-deps` on a prop-rooted dep blames the *child* (memos `MentionResolutionProvider`) when the instability comes from a specific parent call site (`MemoDetail.tsx` passes an unmemoized array). The propagation is semantically correct (verified: the provider analyzed alone is silent); the message should carry the provenance ("unstable because `<Parent>` passes a fresh array at file:line"). An `OnProps` label family in the ADR-017 frame would make this provenance first-class — worth doing for the *message*, no FP to fix.
 

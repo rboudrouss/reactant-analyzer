@@ -72,7 +72,10 @@ impl Rule for InfiniteLoop {
 
         let render_fn_bindings: HashMap<Var, Arc<CFG>> =
             collect_fn_bindings(&comp_result.render_cfg);
-        let mut diags = check_object_churn(result, component);
+        let mut diags = Vec::new();
+        // Effects already reported by the fixpoint/cross arms — the churn
+        // cycle arm skips them (same outage class, one report per effect).
+        let mut reported_effects: HashSet<HookLabel> = HashSet::new();
 
         for hook in &comp_result.hooks {
             let HookEntry::Effect {
@@ -158,6 +161,7 @@ impl Rule for InfiniteLoop {
                         }
                     }
 
+                    reported_effects.insert(*eff_label);
                     diags.push(diag);
                 } else if let Some((parent_comp, parent_label)) = cs_vars.get(&call.var) {
                     // ── Cross-component ────────────────────────────────────────
@@ -185,12 +189,161 @@ impl Rule for InfiniteLoop {
                     if let Some(r) = comp_result.effect_info.get(eff_label).and_then(|i| i.span) {
                         diag = diag.with_range(r);
                     }
+                    reported_effects.insert(*eff_label);
                     diags.push(diag);
                 }
             }
         }
 
+        // ── F5b: multi-effect churn cycles (see churn_graph.rs) ───────────────
+        let (cycle_diags, covered) =
+            check_multi_effect_cycles(result, component, &reported_effects);
+        diags.extend(cycle_diags);
+        // Self-churn arm last: its Info branch skips writes a cycle covers.
+        diags.extend(check_object_churn(result, component, &covered));
+
         diags
+    }
+}
+
+/// F5b — report multi-effect churn cycles touching `component`'s effects.
+///
+/// One diagnostic per effect of `component` carrying a cycle edge (an effect
+/// in another component reports in that component's own check). Also returns
+/// the `(effect label, local state label)` writes covered by a reported
+/// cycle so the self-churn Info arm doesn't duplicate them.
+fn check_multi_effect_cycles(
+    result: &ProgramAnalysisResult,
+    component: &Symbol,
+    reported_effects: &HashSet<HookLabel>,
+) -> (Vec<Diagnostic>, HashSet<(HookLabel, HookLabel)>) {
+    use super::churn_graph::{ChurnEdge, build_churn_graph, find_churn_cycles};
+
+    let edges = build_churn_graph(result);
+    if edges.is_empty() {
+        return (Vec::new(), HashSet::new());
+    }
+    let cycles = find_churn_cycles(&edges);
+    let comp_result = &result.components[component];
+
+    let mut diags = Vec::new();
+    let mut covered: HashSet<(HookLabel, HookLabel)> = HashSet::new();
+    // Slot display names, resolved lazily per involved component.
+    let mut names: HashMap<Symbol, HashMap<Var, HookLabel>> = HashMap::new();
+
+    for cycle in &cycles {
+        let cyc: Vec<&ChurnEdge> = cycle.edge_idx.iter().map(|&i| &edges[i]).collect();
+        let path = {
+            let mut parts: Vec<String> = cyc
+                .iter()
+                .map(|e| node_display(&e.from, component, result, &mut names))
+                .collect();
+            parts.push(node_display(&cyc[0].from, component, result, &mut names));
+            parts.join(" → ")
+        };
+        for e in &cyc {
+            if e.component != *component {
+                continue;
+            }
+            if e.to.0 == *component {
+                covered.insert((e.effect_label, e.to.1));
+            }
+            if reported_effects.contains(&e.effect_label) {
+                continue; // fixpoint/cross arm already flagged this effect
+            }
+
+            // Cross-component must-rerun is unprovable (prop deps are
+            // `Versioned`, never the exact slot) → Warning ceiling.
+            let (rule, sev) = if cycle.cross_component {
+                ("cross-component-infinite-loop", Severity::Warning)
+            } else if cycle.all_must {
+                ("infinite-loop", Severity::Error)
+            } else {
+                ("infinite-loop", Severity::Warning)
+            };
+
+            let to_name = node_display(&e.to, component, result, &mut names);
+            let msg = if cyc.len() == 1 && e.no_deps {
+                format!(
+                    "this effect has no dependency array and stores a fresh \
+                     reference into state {to_name} it re-runs after every \
+                     render and re-triggers itself: infinite render loop"
+                )
+            } else if cyc.len() == 1 {
+                format!(
+                    "this effect stores a fresh reference into state {to_name} \
+                     which its own deps react to the re-render runs it again: \
+                     infinite render loop"
+                )
+            } else if cycle.all_must {
+                format!(
+                    "these effects form a state-update cycle ({path}) each \
+                     step stores a fresh reference that re-runs the next \
+                     effect: infinite render loop"
+                )
+            } else {
+                format!(
+                    "these effects may form a state-update cycle ({path}) \
+                     each step may store a fresh reference that re-runs the \
+                     next effect: possible infinite render loop"
+                )
+            };
+
+            let mut diag = Diagnostic::new(rule, msg)
+                .with_severity(sev)
+                .with_label(e.effect_label);
+            if let Some(r) = comp_result
+                .effect_info
+                .get(&e.effect_label)
+                .and_then(|i| i.span)
+            {
+                diag = diag.with_range(r);
+            }
+            if let Some(r) = e.write_span {
+                diag = diag.with_note(
+                    format!("fresh value stored into state {to_name} here"),
+                    Some(e.effect_label),
+                    Some(r),
+                );
+            }
+            // Point at the cycle's other steps living in this component.
+            for other in &cyc {
+                if other.effect_label == e.effect_label || other.component != *component {
+                    continue;
+                }
+                let other_to = node_display(&other.to, component, result, &mut names);
+                diag = diag.with_note(
+                    format!("cycle continues: this effect freshly stores state {other_to}"),
+                    Some(other.effect_label),
+                    other.write_span,
+                );
+            }
+            diags.push(diag);
+        }
+    }
+    (diags, covered)
+}
+
+/// Display name of a qualified slot: `` `count` `` locally,
+/// `` `count` of `Parent` `` for another component's slot.
+fn node_display(
+    node: &super::churn_graph::SlotNode,
+    component: &Symbol,
+    result: &ProgramAnalysisResult,
+    names: &mut HashMap<Symbol, HashMap<Var, HookLabel>>,
+) -> String {
+    let map = names.entry(node.0.clone()).or_insert_with(|| {
+        result
+            .components
+            .get(&node.0)
+            .map(|r| resolve_setter_aliases(&r.render_cfg, &state_val_labels(&r.render_cfg)))
+            .unwrap_or_default()
+    });
+    let base = state_slot_name(node.1, map);
+    if node.0 == *component {
+        base
+    } else {
+        format!("{base} of `{}`", node.0)
     }
 }
 
@@ -208,7 +361,7 @@ impl Rule for InfiniteLoop {
 //            state — cross-effect cycles are not analyzed (FN-flavor limit)
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Freshness {
+pub(super) enum Freshness {
     Not,
     /// May store a fresh reference (opaque value, imprecise updater).
     Maybe,
@@ -216,17 +369,19 @@ enum Freshness {
     Fresh,
 }
 
-/// A `setX(arg)` call site found in an effect body.
-struct ChurnSetterCall {
-    label: HookLabel,
-    freshness: Freshness,
+/// A `setX(arg)` call site found in an effect body. The target slot is
+/// qualified `(component, label)` so `ComponentSetter` props (writes into a
+/// parent slot) are first-class alongside local setters.
+pub(super) struct ChurnSetterCall {
+    pub(super) node: super::churn_graph::SlotNode,
+    pub(super) freshness: Freshness,
     /// Top-level block of the effect body; `None` when nested in a callback
     /// (then never "must-reached").
-    block_id: Option<BlockId>,
-    span: Option<SourceRange>,
+    pub(super) block_id: Option<BlockId>,
+    pub(super) span: Option<SourceRange>,
     /// Abstract value being stored (fresh-reference approximation for
     /// functional updaters). Used for the convergence proof.
-    written: crate::domains::StateValue,
+    pub(super) written: crate::domains::StateValue,
 }
 
 fn peel(mut e: &Expr) -> &Expr {
@@ -236,7 +391,11 @@ fn peel(mut e: &Expr) -> &Expr {
     e
 }
 
-fn check_object_churn(result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+fn check_object_churn(
+    result: &ProgramAnalysisResult,
+    component: &Symbol,
+    covered: &HashSet<(HookLabel, HookLabel)>,
+) -> Vec<Diagnostic> {
     let comp_result = &result.components[component];
     let cfg = &comp_result.render_cfg;
     let state_vals = resolve_setter_aliases(cfg, &state_val_labels(cfg));
@@ -245,6 +404,11 @@ fn check_object_churn(result: &ProgramAnalysisResult, component: &Symbol) -> Vec
     if setter_labels.is_empty() {
         return vec![];
     }
+    // This arm is single-effect/single-component: local setters only.
+    let setter_nodes: HashMap<Var, super::churn_graph::SlotNode> = setter_labels
+        .iter()
+        .map(|(v, l)| (v.clone(), (component.clone(), *l)))
+        .collect();
     let render_fn_bindings = collect_fn_bindings(cfg);
     let mut diags = Vec::new();
 
@@ -262,38 +426,14 @@ fn check_object_churn(result: &ProgramAnalysisResult, component: &Symbol) -> Vec
             continue; // mount-only
         }
 
-        // Classify deps: exact state slots (must-change under a fresh set)
-        // vs slots that merely version the dep (may-change).
-        let mut exact: HashSet<HookLabel> = HashSet::new();
-        let mut versioned: HashSet<HookLabel> = HashSet::new();
-        for dep in dep_exprs {
-            match peel(dep) {
-                Expr::StateVal(l) => {
-                    exact.insert(*l);
-                }
-                Expr::Var(v) if state_vals.contains_key(v) => {
-                    exact.insert(state_vals[v]);
-                }
-                other => {
-                    // Memo/callback bindings: their env value is stale ⊤
-                    // (bound before memo recompute) — read the memo store.
-                    let val = match other {
-                        Expr::MemoVal(l) | Expr::CallbackVal(l) => comp_result.memo_store.get(*l),
-                        Expr::Var(v) if memo_vals.contains_key(v) => {
-                            comp_result.memo_store.get(memo_vals[v])
-                        }
-                        _ => eval_in_exit_env(other, comp_result),
-                    };
-                    if let Stability::Versioned(labels) = &val.reference {
-                        for (c, l) in labels {
-                            if c == component {
-                                versioned.insert(*l);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let (exact, versioned_qualified) =
+            classify_effect_deps(dep_exprs, comp_result, &state_vals, &memo_vals);
+        // Self-churn is intra-component: keep only own slots.
+        let versioned: HashSet<HookLabel> = versioned_qualified
+            .into_iter()
+            .filter(|(c, _)| c == component)
+            .map(|(_, l)| l)
+            .collect();
         if exact.is_empty() && versioned.is_empty() {
             continue;
         }
@@ -301,7 +441,7 @@ fn check_object_churn(result: &ProgramAnalysisResult, component: &Symbol) -> Vec
         let mut calls: Vec<ChurnSetterCall> = Vec::new();
         collect_churn_calls(
             body_cfg,
-            &setter_labels,
+            &setter_nodes,
             &render_fn_bindings,
             comp_result,
             1,
@@ -312,6 +452,7 @@ fn check_object_churn(result: &ProgramAnalysisResult, component: &Symbol) -> Vec
         // Strongest verdict per state label.
         let mut best: HashMap<HookLabel, (Severity, Option<SourceRange>)> = HashMap::new();
         for call in &calls {
+            let state_label = call.node.1;
             if call.freshness == Freshness::Not {
                 continue;
             }
@@ -325,20 +466,20 @@ fn check_object_churn(result: &ProgramAnalysisResult, component: &Symbol) -> Vec
                     body_cfg,
                     b,
                     &state_vals,
-                    call.label,
+                    state_label,
                     &call.written,
                     comp_result,
                 )
             {
                 continue;
             }
-            let sev = if exact.contains(&call.label) || versioned.contains(&call.label) {
+            let sev = if exact.contains(&state_label) || versioned.contains(&state_label) {
                 let fresh_blocks: HashSet<BlockId> = calls
                     .iter()
-                    .filter(|c| c.label == call.label && c.freshness == Freshness::Fresh)
+                    .filter(|c| c.node == call.node && c.freshness == Freshness::Fresh)
                     .filter_map(|c| c.block_id)
                     .collect();
-                if exact.contains(&call.label)
+                if exact.contains(&state_label)
                     && call.freshness == Freshness::Fresh
                     && !fresh_blocks.is_empty()
                     && on_all_paths(body_cfg, &fresh_blocks)
@@ -349,7 +490,13 @@ fn check_object_churn(result: &ProgramAnalysisResult, component: &Symbol) -> Vec
                 }
             } else {
                 // Sets a different object state freshly while depending on
-                // object state: possible multi-effect cycle, not analyzed.
+                // object state: a multi-effect cycle candidate. The churn
+                // graph (F5b) analyzes those; when it reported a cycle for
+                // this write the Info would be a duplicate — skip. Otherwise
+                // keep it: deps may be too imprecise to close a real cycle.
+                if covered.contains(&(*eff_label, state_label)) {
+                    continue;
+                }
                 Severity::Info
             };
             // Severity has no Ord: rank Error > Warning > Info manually.
@@ -358,8 +505,14 @@ fn check_object_churn(result: &ProgramAnalysisResult, component: &Symbol) -> Vec
                 Severity::Warning => 1,
                 Severity::Info => 0,
             };
-            let entry = best.entry(call.label).or_insert((sev, call.span));
-            if rank(sev) > rank(entry.0) {
+            // Rank ties break on earliest source position: call collection
+            // follows HashMap block order, so "first collected" is not
+            // deterministic across runs.
+            let pos = |s: Option<SourceRange>| s.map_or((u32::MAX, u32::MAX), |r| (r.line, r.col));
+            let entry = best.entry(state_label).or_insert((sev, call.span));
+            if rank(sev) > rank(entry.0)
+                || (rank(sev) == rank(entry.0) && pos(call.span) < pos(entry.1))
+            {
                 *entry = (sev, call.span);
             }
         }
@@ -388,8 +541,8 @@ fn check_object_churn(result: &ProgramAnalysisResult, component: &Symbol) -> Vec
                     "infinite-loop",
                     format!(
                         "this effect depends on object state but freshly recreates \
-                         state {state} outside its deps cross-effect cycles are not \
-                         analyzed (depth > 1)",
+                         state {state} outside its deps no update cycle was found, \
+                         but deps may be too imprecise to rule one out",
                         state = state_slot_name(state_label, &state_vals)
                     ),
                 ),
@@ -413,6 +566,48 @@ fn check_object_churn(result: &ProgramAnalysisResult, component: &Symbol) -> Vec
         }
     }
     diags
+}
+
+/// Classify effect deps against the component's own state slots:
+/// - `exact` — deps that ARE a local state slot (`StateVal(l)` or a var
+///   resolving to one): must-change whenever a fresh value is stored.
+/// - `versioned` — qualified slots `(component, label)` that merely version
+///   a dep (field reads, memo chains, props): may-change under a fresh set.
+pub(super) fn classify_effect_deps(
+    dep_exprs: &[Expr],
+    comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+    state_vals: &HashMap<Var, HookLabel>,
+    memo_vals: &HashMap<Var, HookLabel>,
+) -> (HashSet<HookLabel>, HashSet<super::churn_graph::SlotNode>) {
+    let mut exact: HashSet<HookLabel> = HashSet::new();
+    let mut versioned: HashSet<super::churn_graph::SlotNode> = HashSet::new();
+    for dep in dep_exprs {
+        match peel(dep) {
+            Expr::StateVal(l) => {
+                exact.insert(*l);
+            }
+            Expr::Var(v) if state_vals.contains_key(v) => {
+                exact.insert(state_vals[v]);
+            }
+            other => {
+                // Memo/callback bindings: their env value is stale ⊤
+                // (bound before memo recompute) — read the memo store.
+                let val = match other {
+                    Expr::MemoVal(l) | Expr::CallbackVal(l) => comp_result.memo_store.get(*l),
+                    Expr::Var(v) if memo_vals.contains_key(v) => {
+                        comp_result.memo_store.get(memo_vals[v])
+                    }
+                    _ => eval_in_exit_env(other, comp_result),
+                };
+                if let Stability::Versioned(labels) = &val.reference {
+                    for (c, l) in labels {
+                        versioned.insert((c.clone(), *l));
+                    }
+                }
+            }
+        }
+    }
+    (exact, versioned)
 }
 
 /// Evaluate `expr` in the render exit environment (same pattern as
@@ -507,9 +702,9 @@ fn classify_updater_return(e: &Expr, params: &[Var]) -> Freshness {
 /// Recursively collect `setX(arg)` calls with their argument freshness.
 /// `top_level` — block IDs belong to the effect body CFG (must-reach usable).
 #[allow(clippy::too_many_arguments)]
-fn collect_churn_calls(
+pub(super) fn collect_churn_calls(
     cfg: &CFG,
-    setter_labels: &HashMap<Var, HookLabel>,
+    setter_nodes: &HashMap<Var, super::churn_graph::SlotNode>,
     fn_bindings: &HashMap<Var, Arc<CFG>>,
     comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
     depth: usize,
@@ -533,7 +728,7 @@ fn collect_churn_calls(
                 expr,
                 span,
                 block_id,
-                setter_labels,
+                setter_nodes,
                 &local_bindings,
                 comp_result,
                 depth,
@@ -547,7 +742,7 @@ fn collect_churn_calls(
                     e,
                     None,
                     block_id,
-                    setter_labels,
+                    setter_nodes,
                     &local_bindings,
                     comp_result,
                     depth,
@@ -564,7 +759,7 @@ fn churn_calls_in_expr(
     expr: &Expr,
     span: Option<SourceRange>,
     block_id: Option<BlockId>,
-    setter_labels: &HashMap<Var, HookLabel>,
+    setter_nodes: &HashMap<Var, super::churn_graph::SlotNode>,
     fn_bindings: &HashMap<Var, Arc<CFG>>,
     comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
     depth: usize,
@@ -573,7 +768,7 @@ fn churn_calls_in_expr(
     match expr {
         Expr::Call { fn_, args } => {
             if let Expr::Var(name) = peel(fn_) {
-                if let Some(&label) = setter_labels.get(name) {
+                if let Some(node) = setter_nodes.get(name) {
                     let freshness = args
                         .first()
                         .map(|a| arg_freshness(a, comp_result))
@@ -588,7 +783,7 @@ fn churn_calls_in_expr(
                         None => crate::domains::StateValue::top(),
                     };
                     out.push(ChurnSetterCall {
-                        label,
+                        node: node.clone(),
                         freshness,
                         block_id,
                         span,
@@ -602,7 +797,7 @@ fn churn_calls_in_expr(
                     let mut inner = Vec::new();
                     collect_churn_calls(
                         body,
-                        setter_labels,
+                        setter_nodes,
                         fn_bindings,
                         comp_result,
                         depth - 1,
@@ -623,7 +818,7 @@ fn churn_calls_in_expr(
                     Expr::FnLit { body_cfg, .. } if depth > 0 => {
                         collect_churn_calls(
                             body_cfg,
-                            setter_labels,
+                            setter_nodes,
                             fn_bindings,
                             comp_result,
                             depth - 1,
@@ -635,7 +830,7 @@ fn churn_calls_in_expr(
                         arg,
                         span,
                         block_id,
-                        setter_labels,
+                        setter_nodes,
                         fn_bindings,
                         comp_result,
                         depth,
@@ -652,7 +847,7 @@ fn churn_calls_in_expr(
                     c,
                     span,
                     block_id,
-                    setter_labels,
+                    setter_nodes,
                     fn_bindings,
                     comp_result,
                     depth,
@@ -670,7 +865,7 @@ fn churn_calls_in_expr(
 /// `(cond, taken)` branch constraints, rebinds every var aliasing the slot to
 /// `written`, and applies the engine's branch narrowing: if the guarded
 /// variable narrows to ⊥, the branch is dead in every later run.
-fn converges_once_written(
+pub(super) fn converges_once_written(
     cfg: &CFG,
     call_block: BlockId,
     state_vals: &HashMap<Var, HookLabel>,
@@ -744,7 +939,7 @@ fn guard_var(cond: &Expr) -> Option<&str> {
 }
 
 /// True when every entry→exit path of `cfg` passes through one of `blocks`.
-fn on_all_paths(cfg: &CFG, blocks: &HashSet<BlockId>) -> bool {
+pub(super) fn on_all_paths(cfg: &CFG, blocks: &HashSet<BlockId>) -> bool {
     if blocks.contains(&cfg.entry) {
         return true;
     }
