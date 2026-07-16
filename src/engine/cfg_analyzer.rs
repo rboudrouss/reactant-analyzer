@@ -9,7 +9,7 @@ use crate::{
         cfg::{CFG, EdgeKind, Terminator},
         expr::{BinOp, Expr, Prim},
         stmt::Stmt,
-        types::BlockId,
+        types::{BlockId, Symbol},
     },
 };
 
@@ -29,6 +29,7 @@ use crate::{
 /// `setState` calls are accumulated on top of it.
 #[allow(clippy::too_many_arguments)]
 pub fn analyze_cfg<'inter, T: Transfer>(
+    component: &Symbol,
     cfg: &CFG,
     entry_env: AbstractEnv<T::Domain>,
     state: &StateStore<T::Domain>,
@@ -66,6 +67,7 @@ pub fn analyze_cfg<'inter, T: Transfer>(
 
         if let Some(block) = cfg.blocks.get(&b) {
             let mut ac = AnalysisCtx {
+                component: component.clone(),
                 state: &mut state_out,
                 memo: &mut memo_local,
                 heap,
@@ -289,6 +291,7 @@ mod tests {
         let cfg = single_block_cfg(vec![]);
         let mut heap = Heap::new();
         let (exit_envs, state_out) = analyze_cfg::<StateValueTransfer>(
+            &"C".to_string(),
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
@@ -313,6 +316,7 @@ mod tests {
         }]);
         let mut heap = Heap::new();
         let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
+            &"C".to_string(),
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
@@ -419,6 +423,7 @@ mod tests {
         let cfg = counting_loop_cfg();
         let mut heap = Heap::new();
         let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
+            &"C".to_string(),
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
@@ -446,6 +451,7 @@ mod tests {
         let cfg = counting_loop_cfg();
         let mut heap = Heap::new();
         let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
+            &"C".to_string(),
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
@@ -488,6 +494,7 @@ mod tests {
         let cfg = single_block_cfg(stmts);
         let mut heap = Heap::new();
         let (_, state_out) = analyze_cfg::<StateValueTransfer>(
+            &"C".to_string(),
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
@@ -546,6 +553,7 @@ mod tests {
 
         let mut heap = Heap::new();
         let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
+            &"C".to_string(),
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
@@ -646,6 +654,7 @@ mod tests {
 
         let mut heap = Heap::new();
         let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
+            &"C".to_string(),
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
@@ -737,6 +746,7 @@ mod tests {
 
         let mut heap = Heap::new();
         let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
+            &"C".to_string(),
             &cfg,
             entry_env,
             &StateStore::bottom(),
@@ -782,6 +792,7 @@ mod tests {
 
         let mut heap = Heap::new();
         let (_, state_out) = analyze_cfg::<StateValueTransfer>(
+            &"C".to_string(),
             &cfg,
             entry_env,
             &StateStore::bottom(),
@@ -825,6 +836,7 @@ mod tests {
 
         let mut heap = Heap::new();
         let (_, state_out) = analyze_cfg::<StateValueTransfer>(
+            &"C".to_string(),
             &cfg,
             AbstractEnv::bottom(),
             &StateStore::bottom(),
@@ -900,6 +912,7 @@ mod tests {
 
         let mut heap = Heap::new();
         let (_, state_out) = analyze_cfg::<StateValueTransfer>(
+            &"C".to_string(),
             &cfg,
             entry_env,
             &initial_state,

@@ -18,11 +18,20 @@ pub use utility_lowerer::{lower_utilities, lower_utilities_with_resolver};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use oxc_ast::ast::{ImportDeclarationSpecifier, Program, Statement};
+use oxc_ast::ast::{
+    BindingPattern, Declaration, Expression, ImportDeclarationSpecifier, Program, Statement,
+    VariableDeclarationKind,
+};
 
 use crate::{
-    ir::{component::ComponentIR, hook_ir::HookIR},
+    ir::{
+        component::{ComponentIR, ModuleConstInit},
+        expr::Prim,
+        hook_ir::HookIR,
+        types::Var,
+    },
     resolver::{DefaultImportResolver, ImportResolver},
 };
 
@@ -57,6 +66,84 @@ fn build_import_map(program: &Program) -> HashMap<String, String> {
             };
             if local_name.starts_with("use") {
                 map.insert(local_name.to_string(), source.to_string());
+            }
+        }
+    }
+    map
+}
+
+/// Collect module-level `const` bindings whose initializer kind is
+/// syntactically certain (see [`ModuleConstInit`]).
+///
+/// JS semantics: a module-level `const` is evaluated once when the module
+/// loads, so its identity never changes across renders. Function-valued
+/// initializers (arrow / function expressions) are skipped entirely: those
+/// are components, custom hooks, or utilities, each with dedicated handling
+/// (detection, inlining), and seeding them here would shadow that machinery.
+/// Opaque initializers (calls, imported values, conditionals) are skipped
+/// too: their kind is unknown and the value domain has no sound encoding
+/// for "unknown kind, constant across renders" — they stay ⊤.
+fn collect_module_consts(program: &Program) -> HashMap<Var, ModuleConstInit> {
+    fn peel_ts<'e, 'a>(mut expr: &'e Expression<'a>) -> &'e Expression<'a> {
+        loop {
+            expr = match expr {
+                Expression::TSAsExpression(e) => &e.expression,
+                Expression::TSSatisfiesExpression(e) => &e.expression,
+                Expression::TSNonNullExpression(e) => &e.expression,
+                Expression::TSTypeAssertion(e) => &e.expression,
+                Expression::ParenthesizedExpression(e) => &e.expression,
+                _ => return expr,
+            };
+        }
+    }
+
+    fn lit_prim(expr: &Expression) -> Option<Prim> {
+        match expr {
+            Expression::BooleanLiteral(b) => Some(Prim::Bool(b.value)),
+            Expression::NullLiteral(_) => Some(Prim::Null),
+            Expression::NumericLiteral(n) => {
+                if n.value.fract() == 0.0 && n.value.abs() < i32::MAX as f64 {
+                    Some(Prim::Int(n.value as i32))
+                } else {
+                    Some(Prim::Float(n.value))
+                }
+            }
+            Expression::StringLiteral(s) => Some(Prim::String(s.value.to_string())),
+            _ => None,
+        }
+    }
+
+    let mut map = HashMap::new();
+    for stmt in &program.body {
+        let decl = match stmt {
+            Statement::VariableDeclaration(d) => d,
+            Statement::ExportNamedDeclaration(exp) => match &exp.declaration {
+                Some(Declaration::VariableDeclaration(d)) => d,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if decl.kind != VariableDeclarationKind::Const {
+            continue;
+        }
+        for vd in &decl.declarations {
+            let BindingPattern::BindingIdentifier(id) = &vd.id else {
+                continue;
+            };
+            let Some(init) = &vd.init else { continue };
+            let init = peel_ts(init);
+            if let Some(p) = lit_prim(init) {
+                map.insert(id.name.to_string(), ModuleConstInit::Prim(p));
+            } else if matches!(
+                init,
+                Expression::ObjectExpression(_)
+                    | Expression::ArrayExpression(_)
+                    | Expression::NewExpression(_)
+                    | Expression::RegExpLiteral(_)
+                    | Expression::JSXElement(_)
+                    | Expression::JSXFragment(_)
+            ) {
+                map.insert(id.name.to_string(), ModuleConstInit::Ref);
             }
         }
     }
@@ -128,6 +215,7 @@ pub fn lower_program_with_resolver(
     let import_map = build_import_map(program);
     let resolved_import_map: HashMap<String, PathBuf> =
         build_resolved_import_map(program, file, resolver);
+    let module_consts = Arc::new(collect_module_consts(program));
     detect_components(program)
         .into_iter()
         .map(|candidate| {
@@ -147,6 +235,7 @@ pub fn lower_program_with_resolver(
                 param,
                 render_cfg,
                 hooks,
+                module_consts: module_consts.clone(),
             }
         })
         .collect()

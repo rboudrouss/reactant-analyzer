@@ -11,7 +11,7 @@ pub mod stmt;
 pub mod types;
 
 pub use cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator};
-pub use component::ComponentIR;
+pub use component::{ComponentIR, ModuleConstInit};
 pub use expr::{BinOp, Expr, Prim, UnaryOp};
 pub use function_ir::FunctionIR;
 pub use hook_ir::HookIR;

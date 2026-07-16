@@ -1,10 +1,29 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::ir::{
     cfg::CFG,
+    expr::Prim,
     hooks::HookEntry,
     types::{Symbol, Var},
 };
+
+/// What is known about a module-level `const` initializer.
+///
+/// Only initializers whose JS *kind* is syntactically certain are collected:
+/// the product value domain expresses "constant across renders" as either an
+/// exact primitive or a `Stable` reference slot — an opaque value of unknown
+/// kind (`const X = f()`) has no sound encoding (a wide primitive slot reads
+/// as "changes per render") and is left out, falling back to ⊤.
+#[derive(Debug, Clone)]
+pub enum ModuleConstInit {
+    /// Primitive literal: the exact value.
+    Prim(Prim),
+    /// Object/array/new/JSX literal: a reference, allocated once per module
+    /// lifetime → identity Stable across renders.
+    Ref,
+}
 
 #[derive(Debug, Clone)]
 pub struct ComponentIR {
@@ -16,4 +35,9 @@ pub struct ComponentIR {
     pub param: Var,
     pub render_cfg: CFG,
     pub hooks: Vec<HookEntry>,
+    /// Module-level `const` bindings of the source file with syntactically
+    /// known kinds, keyed by name. Function-valued consts (arrow/function
+    /// expressions) are excluded: those are components/utilities/handlers
+    /// with their own machinery.
+    pub module_consts: Arc<HashMap<Var, ModuleConstInit>>,
 }

@@ -126,6 +126,7 @@ where
 
     fn recompute_memo(
         &self,
+        _component: &crate::ir::types::Symbol,
         _deps: &[crate::ir::expr::Expr],
         _env: &AbstractEnv<Self::Domain>,
         _ctx: &dyn QueryContext,

@@ -47,7 +47,7 @@ impl Rule for UnnecessaryRerender {
                     let val = StateValueTransfer.eval_expr(
                         init,
                         &empty_env,
-                        &mut AnalysisCtx::null(&mut s, &mut m, &mut h),
+                        &mut AnalysisCtx::null(result.component.clone(), &mut s, &mut m, &mut h),
                     );
                     Some((*label, val))
                 } else {
@@ -113,7 +113,12 @@ impl Rule for UnnecessaryRerender {
                             StateValueTransfer.eval_expr(
                                 a,
                                 &empty_env,
-                                &mut AnalysisCtx::null(&mut s, &mut m, &mut h),
+                                &mut AnalysisCtx::null(
+                                    result.component.clone(),
+                                    &mut s,
+                                    &mut m,
+                                    &mut h,
+                                ),
                             )
                         })
                         .unwrap_or(StateValue::top());
@@ -243,6 +248,7 @@ mod tests {
                 edges: vec![],
             },
             hooks,
+            module_consts: Default::default(),
         }
     }
 

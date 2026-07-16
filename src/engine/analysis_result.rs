@@ -10,7 +10,7 @@ use crate::{
         cfg::{CFG, Terminator},
         expr::Expr,
         hooks::HookEntry,
-        types::{BlockId, HookLabel, Var},
+        types::{BlockId, HookLabel, Symbol, Var},
     },
 };
 
@@ -72,6 +72,10 @@ pub struct EffectInfo {
 
 #[derive(Debug, Clone)]
 pub struct AnalysisResult<D: AbstractDomain> {
+    /// Name of the component this result belongs to. Rules re-evaluating
+    /// expressions against the result use it as the `AnalysisCtx` component
+    /// (state-slot provenance).
+    pub component: Symbol,
     pub state_store: StateStore<D>,
     pub memo_store: MemoStore<D>,
     /// Abstract environment at the *exit* of each render-CFG block.

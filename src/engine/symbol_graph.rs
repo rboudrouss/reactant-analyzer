@@ -372,6 +372,7 @@ mod tests {
             param: "props".to_string(),
             render_cfg: cfg_calling(callees),
             hooks: vec![],
+            module_consts: Default::default(),
         }
     }
 

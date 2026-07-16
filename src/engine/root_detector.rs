@@ -179,6 +179,7 @@ mod tests {
             param: "props".to_string(),
             render_cfg: trivial_cfg(),
             hooks: vec![],
+            module_consts: Default::default(),
         }
     }
 
@@ -205,6 +206,7 @@ mod tests {
                 edges: vec![],
             },
             hooks: vec![],
+            module_consts: Default::default(),
         }
     }
 

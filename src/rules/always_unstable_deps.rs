@@ -67,6 +67,7 @@ impl Rule for AlwaysUnstableDeps {
                 .enumerate()
                 .filter(|(_, dep)| {
                     eval_dep_is_unstable(
+                        &result.component,
                         dep,
                         &env_exit,
                         &result.state_store,
@@ -104,6 +105,7 @@ impl Rule for AlwaysUnstableDeps {
 }
 
 fn eval_dep_is_unstable(
+    component: &Symbol,
     dep: &Expr,
     env: &AbstractEnv<StateValue>,
     state: &StateStore<StateValue>,
@@ -113,7 +115,11 @@ fn eval_dep_is_unstable(
     let mut s = state.clone();
     let mut m = memo.clone();
     let mut h = crate::domains::Heap::new();
-    let val = transfer.eval_expr(dep, env, &mut AnalysisCtx::null(&mut s, &mut m, &mut h));
+    let val = transfer.eval_expr(
+        dep,
+        env,
+        &mut AnalysisCtx::null(component.clone(), &mut s, &mut m, &mut h),
+    );
     // Only a freshly-allocated reference breaks `Object.is` every render.
     // Primitives (Number/Bool/Str) are value-compared — never flagged here, even
     // for wide intervals. `Top` (precision lost) stays silent to avoid FPs.
@@ -211,6 +217,7 @@ mod tests {
                 edges: vec![],
             },
             hooks,
+            module_consts: Default::default(),
         }
     }
 
@@ -386,7 +393,14 @@ mod tests {
         state.update(0, StateValue::number(Interval { lo: 0.0, hi: 10.0 }));
         let memo = MemoStore::<StateValue>::new();
         assert!(
-            !eval_dep_is_unstable(&Expr::StateVal(0), &env, &state, &memo, &StateValueTransfer),
+            !eval_dep_is_unstable(
+                &"C".to_string(),
+                &Expr::StateVal(0),
+                &env,
+                &state,
+                &memo,
+                &StateValueTransfer
+            ),
             "wide numeric state dep must not count as unstable"
         );
     }
@@ -399,6 +413,7 @@ mod tests {
         let state = StateStore::<StateValue>::bottom();
         let memo = MemoStore::<StateValue>::new();
         assert!(eval_dep_is_unstable(
+            &"C".to_string(),
             &Expr::ObjectLit {
                 id: ExprId(0),
                 fields: vec![]

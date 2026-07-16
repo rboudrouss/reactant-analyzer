@@ -147,6 +147,7 @@ mod tests {
             },
         );
         AnalysisResult {
+            component: "C".to_string(),
             state_store: StateStore::bottom(),
             memo_store: MemoStore::new(),
             block_states: HashMap::new(),

@@ -7,7 +7,7 @@ use crate::{
         AbstractDomain, AnalysisCtx, QueryContext, Transfer,
         impls::{BoolVal, Interval, SetterVal, Stability, StateValue, StrConst},
         interp::exec_stmt_with_callbacks,
-        stores::{AbstractEnv, EnvVal, HeapValue, MemoStore, StateStore},
+        stores::{AbstractEnv, EnvVal, Heap, HeapValue, MemoStore, StateStore},
     },
     ir::{
         expr::{BinOp, Expr, Prim, UnaryOp},
@@ -43,6 +43,7 @@ impl Transfer for StateValueTransfer {
 
     fn recompute_memo(
         &self,
+        component: &Symbol,
         deps: &[Expr],
         env: &AbstractEnv<StateValue>,
         _ctx: &dyn QueryContext,
@@ -60,12 +61,12 @@ impl Transfer for StateValueTransfer {
                 peeled = inner;
             }
             if let Expr::StateVal(l) = peeled {
-                return acc.join(&Stability::versioned_by(Symbol::new(), *l));
+                return acc.join(&Stability::versioned_by(component.clone(), *l));
             }
             let mut s = StateStore::bottom();
             let mut m = MemoStore::new();
             let mut h = crate::domains::stores::Heap::new();
-            let mut tmp_ctx = AnalysisCtx::null(&mut s, &mut m, &mut h);
+            let mut tmp_ctx = AnalysisCtx::null(component.clone(), &mut s, &mut m, &mut h);
             let val = eval_state_value(dep, env, &mut tmp_ctx);
             // A dep whose reference kind is already versioned keeps its
             // labels (`to_stability` would erase them if another slot is ⊤).
@@ -105,21 +106,11 @@ fn eval_state_value(
             // leak into reads. Assumes sets happen outside render — the
             // violation has its own diagnostic (`setter-in-render`).
             if val.reference != Stability::Bottom {
-                let comp = ctx
-                    .inter
-                    .map(|i| i.component_name.clone())
-                    .unwrap_or_default();
-                val.reference = Stability::versioned_by(comp, *label);
+                val.reference = Stability::versioned_by(ctx.component.clone(), *label);
             }
             val
         }
-        Expr::StateSetter(label) => {
-            if let Some(inter) = &ctx.inter {
-                StateValue::component_setter(inter.component_name.clone(), *label)
-            } else {
-                StateValue::reference(Stability::Stable)
-            }
-        }
+        Expr::StateSetter(label) => StateValue::component_setter(ctx.component.clone(), *label),
         Expr::MemoVal(label) | Expr::CallbackVal(label) => ctx.memo.get(*label),
 
         Expr::ObjectLit { .. } => StateValue::reference(Stability::PerRender),
@@ -169,32 +160,22 @@ fn havoc_setter_props(
     let Expr::ObjectLit { fields, .. } = props_expr else {
         return;
     };
+    let own = ctx.component.clone();
     let mut setters: Vec<(Symbol, crate::ir::types::HookLabel)> = Vec::new();
     for (_, v) in fields {
+        // Bare setter prop (`<X onOpenChange={setOpen}/>`): the value
+        // carries its owner (`StateSetter` always evals to a
+        // `component_setter`, intra included).
         let val = eval_state_value(v, env, ctx);
         if let Some((c, l)) = val.as_setter() {
             setters.push((c.clone(), *l));
         }
-        // Spread props (`<X {...props}/>`, kept under a synthetic `...N`
-        // key) forward a whole object: chase its heap fields for setters
-        // (`props.onOpenChange` may be an ancestor's setState).
-        if let Expr::Var(name) = v
-            && let Some(EnvVal::Loc(ids)) = env.lookup_env_val(name)
-        {
-            for id in ids.iter().copied().collect::<Vec<_>>() {
-                if let Some(HeapValue::Obj(obj_fields)) = ctx.heap.get(id) {
-                    for ev in obj_fields.values() {
-                        if let Some((c, l)) = ev.as_val().as_setter() {
-                            setters.push((c.clone(), *l));
-                        }
-                    }
-                }
-            }
-        }
+        // Everything a function value can smuggle a setter through: spread
+        // objects, closures wrapping a setter call, heap-allocated FnLits.
+        collect_escaping_setters(v, env, ctx.heap, &own, &mut setters, 0);
     }
-    let own = ctx.inter.map(|i| i.component_name.clone());
     for (comp, label) in setters {
-        if Some(&comp) == own.as_ref() {
+        if comp == own {
             ctx.state.update(label, StateValue::top());
         } else if let Some(inter) = &ctx.inter {
             inter
@@ -202,6 +183,172 @@ fn havoc_setter_props(
                 .borrow_mut()
                 .update(&comp, label, StateValue::top());
         }
+    }
+}
+
+/// Setter labels reachable from a prop value handed to an unanalyzable child.
+///
+/// Chases, transitively: syntactic FnLits, heap closures (`cb && ((v) =>
+/// cb(v))` lowers the ternary to a temp var holding a heap `Fn`), spread
+/// objects (`<X {...props}/>` — `props.onOpenChange` may be an ancestor's
+/// setState), and calls inside those function bodies whose callee resolves
+/// to a setter. The child may invoke any function it receives, with any
+/// argument, at any time — reachability is decided by escape, not by prop
+/// names (TODO.md B).
+fn collect_escaping_setters(
+    v: &Expr,
+    env: &AbstractEnv<StateValue>,
+    heap: &Heap,
+    own: &Symbol,
+    out: &mut Vec<(Symbol, crate::ir::types::HookLabel)>,
+    depth: usize,
+) {
+    if depth > 4 {
+        return;
+    }
+    match v {
+        Expr::FnLit { body_cfg, .. } => {
+            setter_calls_in_cfg(body_cfg, env, None, heap, own, out, depth + 1);
+        }
+        Expr::Var(name) => {
+            let Some(EnvVal::Loc(ids)) = env.lookup_env_val(name) else {
+                return;
+            };
+            for id in ids.iter().copied().collect::<Vec<_>>() {
+                match heap.get(id) {
+                    Some(HeapValue::Fn {
+                        body_cfg, captured, ..
+                    }) => {
+                        setter_calls_in_cfg(
+                            body_cfg,
+                            env,
+                            Some(captured),
+                            heap,
+                            own,
+                            out,
+                            depth + 1,
+                        );
+                    }
+                    Some(HeapValue::Obj(obj_fields)) => {
+                        for ev in obj_fields.values() {
+                            if let Some((c, l)) = ev.as_val().as_setter() {
+                                out.push((c.clone(), *l));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Expr::TSAnnotated(inner, _) => {
+            collect_escaping_setters(inner, env, heap, own, out, depth);
+        }
+        Expr::ObjectLit { fields, .. } => {
+            for (_, f) in fields {
+                collect_escaping_setters(f, env, heap, own, out, depth + 1);
+            }
+        }
+        Expr::ArrayLit { elems, .. } => {
+            for e in elems {
+                collect_escaping_setters(e, env, heap, own, out, depth + 1);
+            }
+        }
+        // Deliberately NOT the generic `for_each_child` recursion: only
+        // container/function VALUES escape into the child's hands — a call's
+        // arguments or an index expression are not part of the prop value.
+        _ => {}
+    }
+}
+
+/// Walk a function body for calls whose callee resolves to a setter.
+/// `captured` is the closure's creation-time environment (heap `Fn`);
+/// syntactic FnLits resolve through the live `env` instead.
+fn setter_calls_in_cfg(
+    cfg: &crate::ir::cfg::CFG,
+    env: &AbstractEnv<StateValue>,
+    captured: Option<&HashMap<Symbol, StateValue>>,
+    heap: &Heap,
+    own: &Symbol,
+    out: &mut Vec<(Symbol, crate::ir::types::HookLabel)>,
+    depth: usize,
+) {
+    if depth > 4 {
+        return;
+    }
+    cfg.for_each_expr(&mut |e| setter_calls_in_expr(e, env, captured, heap, own, out, depth));
+}
+
+fn setter_calls_in_expr(
+    e: &Expr,
+    env: &AbstractEnv<StateValue>,
+    captured: Option<&HashMap<Symbol, StateValue>>,
+    heap: &Heap,
+    own: &Symbol,
+    out: &mut Vec<(Symbol, crate::ir::types::HookLabel)>,
+    depth: usize,
+) {
+    match e {
+        Expr::Call { fn_, .. } => {
+            if let Some((c, l)) = callee_setter(fn_, env, captured, heap, own) {
+                out.push((c, l));
+            }
+            e.for_each_child(&mut |c| {
+                setter_calls_in_expr(c, env, captured, heap, own, out, depth)
+            });
+        }
+        Expr::FnLit { body_cfg, .. } => {
+            setter_calls_in_cfg(body_cfg, env, captured, heap, own, out, depth + 1);
+        }
+        other => {
+            other.for_each_child(&mut |c| {
+                setter_calls_in_expr(c, env, captured, heap, own, out, depth)
+            });
+        }
+    }
+}
+
+/// Resolve a call target to a setter, if it is one. Resolution order for
+/// variables: the closure's captured environment (creation-time values),
+/// then the live env.
+fn callee_setter(
+    fn_: &Expr,
+    env: &AbstractEnv<StateValue>,
+    captured: Option<&HashMap<Symbol, StateValue>>,
+    heap: &Heap,
+    own: &Symbol,
+) -> Option<(Symbol, crate::ir::types::HookLabel)> {
+    match fn_ {
+        // Direct state-binding reference: always the current component's.
+        Expr::StateSetter(l) => Some((own.clone(), *l)),
+        Expr::Var(name) => {
+            if let Some(cap) = captured
+                && let Some(v) = cap.get(name.as_str())
+                && let Some((c, l)) = v.as_setter()
+            {
+                return Some((c.clone(), *l));
+            }
+            env.lookup(name).as_setter().map(|(c, l)| (c.clone(), *l))
+        }
+        // `props.onDone(...)`: chase the object's heap fields.
+        Expr::FieldAccess { obj, field } => {
+            let Expr::Var(o) = obj.as_ref() else {
+                return None;
+            };
+            let Some(EnvVal::Loc(ids)) = env.lookup_env_val(o) else {
+                return None;
+            };
+            for id in ids.iter().copied() {
+                if let Some(HeapValue::Obj(obj_fields)) = heap.get(id)
+                    && let Some(ev) = obj_fields.get(field)
+                    && let Some((c, l)) = ev.as_val().as_setter()
+                {
+                    return Some((c.clone(), *l));
+                }
+            }
+            None
+        }
+        Expr::TSAnnotated(inner, _) => callee_setter(inner, env, captured, heap, own),
+        _ => None,
     }
 }
 
@@ -213,6 +360,10 @@ fn eval_comp_app(
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> StateValue {
     let Some(inter) = ctx.inter else {
+        // Intra-component analysis: every child is unanalyzable, so any
+        // setter escaping into props may be invoked with any argument —
+        // same argument as the unknown-child branch below (TODO.md B).
+        havoc_setter_props(props_expr, env, ctx);
         return StateValue::reference(Stability::Stable);
     };
 
@@ -566,7 +717,7 @@ mod tests {
             StateValueTransfer.eval_expr(
                 &Expr::Lit(Prim::Int(5)),
                 &env,
-                &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+                &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
             ),
             StateValue::number(Interval::point(5.0))
         );
@@ -580,7 +731,7 @@ mod tests {
             StateValueTransfer.eval_expr(
                 &Expr::Lit(Prim::Bool(true)),
                 &env,
-                &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+                &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
             ),
             StateValue::boolean(BoolVal::True)
         );
@@ -597,7 +748,7 @@ mod tests {
                     fields: vec![]
                 },
                 &env,
-                &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+                &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
             ),
             StateValue::reference(Stability::PerRender)
         );
@@ -616,7 +767,7 @@ mod tests {
             StateValueTransfer.eval_expr(
                 &expr,
                 &env,
-                &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap)
+                &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap)
             ),
             StateValue::number(Interval::point(7.0))
         );
@@ -636,7 +787,7 @@ mod tests {
             StateValueTransfer.eval_expr(
                 &expr,
                 &env,
-                &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap)
+                &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap)
             ),
             StateValue::number(Interval::point(3.0))
         );
@@ -654,7 +805,7 @@ mod tests {
             StateValueTransfer.eval_expr(
                 &expr,
                 &env,
-                &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap)
+                &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap)
             ),
             StateValue::boolean(BoolVal::False)
         );
@@ -667,7 +818,7 @@ mod tests {
         let v = StateValueTransfer.eval_expr(
             &Expr::Lit(Prim::String("dark".into())),
             &env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
         assert_eq!(v, StateValue::str_singleton("dark".to_string()));
     }
@@ -685,7 +836,7 @@ mod tests {
                 span: None,
             },
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
         StateValueTransfer.exec_stmt(
             &Stmt::ExprStmt(
@@ -696,7 +847,7 @@ mod tests {
                 None,
             ),
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
         assert_eq!(state.get(0), StateValue::number(Interval::point(42.0)));
     }
@@ -733,7 +884,7 @@ mod tests {
                 None,
             ),
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(
@@ -809,7 +960,7 @@ mod tests {
                 None,
             ),
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(
@@ -852,7 +1003,7 @@ mod tests {
             &StateValueTransfer,
             &body_cfg,
             &entry_env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
         assert_eq!(result, StateValue::top());
     }
@@ -958,7 +1109,7 @@ mod tests {
             &StateValueTransfer,
             &body_cfg,
             &env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
 
         // setN(state[0] + 1) fired once → state[0] grew off the initial point.
@@ -1068,7 +1219,7 @@ mod tests {
             &StateValueTransfer,
             &body_cfg,
             &env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(
@@ -1115,7 +1266,7 @@ mod tests {
                 None,
             ),
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
 
         // Functional updater body has a back edge → its return value is Top.
@@ -1167,7 +1318,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &stmt,
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::top());
@@ -1207,7 +1358,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &stmt,
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::number(Interval::point(42.0)));
@@ -1267,7 +1418,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &Stmt::ExprStmt(outer, None),
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::number(Interval::point(1.0)));
@@ -1312,7 +1463,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &stmt,
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::number(Interval::point(7.0)));
@@ -1355,7 +1506,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &stmt,
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::bottom());
@@ -1414,7 +1565,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &stmt,
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::number(Interval::point(1.0)));
@@ -1464,7 +1615,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &stmt,
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::number(Interval::point(42.0)));
@@ -1509,12 +1660,12 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &let_cb,
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
         StateValueTransfer.exec_stmt(
             &call,
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::number(Interval::point(42.0)));
@@ -1557,7 +1708,7 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &call,
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::bottom());
@@ -1605,12 +1756,12 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &let_load,
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
         StateValueTransfer.exec_stmt(
             &call_load,
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
 
         assert_eq!(state.get(0), StateValue::number(Interval::point(7.0)));
@@ -1652,12 +1803,12 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &let_cb,
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
         StateValueTransfer.exec_stmt(
             &call,
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
         assert_eq!(state.get(0), StateValue::number(Interval::point(5.0)));
     }
@@ -1701,12 +1852,12 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &let_update,
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
         StateValueTransfer.exec_stmt(
             &call,
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
         assert_eq!(state.get(0), StateValue::number(Interval::point(3.0)));
     }
@@ -1769,17 +1920,17 @@ mod tests {
         StateValueTransfer.exec_stmt(
             &let_inner,
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
         StateValueTransfer.exec_stmt(
             &let_outer,
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
         StateValueTransfer.exec_stmt(
             &call_outer,
             &mut env,
-            &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+            &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
         assert_eq!(state.get(0), StateValue::number(Interval::point(9.0)));
     }
@@ -1865,7 +2016,7 @@ mod tests {
             StateValueTransfer.exec_stmt(
                 stmt,
                 &mut env,
-                &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+                &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
             );
         }
         assert_eq!(state.get(0), StateValue::bottom());
@@ -1946,7 +2097,7 @@ mod tests {
             StateValueTransfer.exec_stmt(
                 stmt,
                 &mut env,
-                &mut AnalysisCtx::null(&mut state, &mut memo, &mut heap),
+                &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
             );
         }
         assert_eq!(state.get(0), StateValue::bottom());

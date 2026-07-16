@@ -55,6 +55,7 @@ fn leaf_component(name: &str) -> ComponentIR {
         param: "props".to_string(),
         render_cfg: empty_cfg(),
         hooks: vec![],
+        module_consts: Default::default(),
     }
 }
 
@@ -98,6 +99,7 @@ fn heuristic_detects_parent_not_child_as_root() {
                 edges: vec![],
             },
             hooks: vec![],
+            module_consts: Default::default(),
         }
     };
     let child = leaf_component("Child");
@@ -149,6 +151,7 @@ fn analyze_program_populates_call_graph_for_parent_child() {
                 edges: vec![],
             },
             hooks: vec![],
+            module_consts: Default::default(),
         }
     };
     let child = leaf_component("Child");
@@ -237,6 +240,7 @@ fn setter_prop_propagates_to_shared_state() {
                 deps: Some(vec![]),
                 span: None,
             }],
+            module_consts: Default::default(),
         }
     };
 
@@ -288,6 +292,7 @@ fn setter_prop_propagates_to_shared_state() {
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             }],
+            module_consts: Default::default(),
         }
     };
 
@@ -336,6 +341,7 @@ fn recursive_component_does_not_crash() {
                 edges: vec![],
             },
             hooks: vec![],
+            module_consts: Default::default(),
         }
     };
     let reg = ComponentRegistry::from_components(vec![tree_node]);
@@ -377,7 +383,7 @@ fn field_access_resolves_abstract_object_in_heap() {
 
     let mut state = StateStore::bottom();
     let mut memo = MemoStore::new();
-    let mut ctx = AnalysisCtx::null(&mut state, &mut memo, &mut heap);
+    let mut ctx = AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap);
 
     let expr = Expr::FieldAccess {
         obj: Box::new(Expr::Var("props".to_string())),
@@ -411,7 +417,7 @@ fn field_access_unknown_field_returns_top() {
 
     let mut state = StateStore::bottom();
     let mut memo = MemoStore::new();
-    let mut ctx = AnalysisCtx::null(&mut state, &mut memo, &mut heap);
+    let mut ctx = AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap);
 
     // Access a field not in the object → Top
     let expr = Expr::FieldAccess {
@@ -570,6 +576,7 @@ fn prop_drilling_direct_ir() {
                 deps: Some(vec![]),
                 span: None,
             }],
+            module_consts: Default::default(),
         }
     };
     // Middle: return <Leaf action={props.action} />  param = "props"
@@ -605,6 +612,7 @@ fn prop_drilling_direct_ir() {
                 edges: vec![],
             },
             hooks: vec![],
+            module_consts: Default::default(),
         }
     };
     // Root: const [v, setV] = useState(0); return <Middle action={setV} />
@@ -649,6 +657,7 @@ fn prop_drilling_direct_ir() {
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             }],
+            module_consts: Default::default(),
         }
     };
 

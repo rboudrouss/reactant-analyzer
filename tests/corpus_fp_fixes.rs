@@ -673,3 +673,337 @@ function A({ openProp }) {
         "real capture must still warn: {diags:?}"
     );
 }
+
+// ── F7: module-scope const bindings ───────────────────────────────────────────
+
+#[test]
+fn f7_module_const_object_set_is_not_churn() {
+    // memos CreateIdentityProviderDialog repro: resetting state to a
+    // module-level template. The const is allocated once per module
+    // lifetime — its identity is Stable, the set can never be "fresh".
+    let src = r#"
+const DEFAULT_TEMPLATE = { title: "t", content: "" };
+function Dialog() {
+  const [tpl, setTpl] = useState(DEFAULT_TEMPLATE);
+  useEffect(() => {
+    setTpl(DEFAULT_TEMPLATE);
+  }, [tpl]);
+  return <div>{tpl.title}</div>;
+}
+"#;
+    let fired = rules_fired(src);
+    assert!(
+        !fired.iter().any(|r| r == "infinite-loop"),
+        "module const arg is reference-stable, not churn: {fired:?}"
+    );
+}
+
+#[test]
+fn f7_module_const_primitive_is_not_a_missing_dep() {
+    // A module const read inside an effect never changes → omitting it from
+    // the deps array is semantically harmless.
+    let src = r#"
+const LIMIT = 10;
+function Counter() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    if (n < LIMIT) {
+      report(LIMIT);
+    }
+  }, [n]);
+  return <div>{n}</div>;
+}
+"#;
+    let diags = diagnostics(src);
+    assert!(
+        !diags
+            .iter()
+            .any(|(r, m)| r == "missing-deps" && m.contains("LIMIT")),
+        "module const must read Stable: {diags:?}"
+    );
+}
+
+#[test]
+fn f7_local_shadow_stays_per_render() {
+    // A component-local binding with the same name shadows the module const;
+    // the local ObjectLit is fresh each render and must keep firing.
+    let src = r#"
+const CONFIG = { a: 1 };
+function A() {
+  const CONFIG = { a: 2 };
+  const [s, setS] = useState(0);
+  useEffect(() => {
+    apply(CONFIG);
+  }, [CONFIG]);
+  return <div>{s}</div>;
+}
+"#;
+    let fired = rules_fired(src);
+    assert!(
+        fired.iter().any(|r| r == "always-unstable-deps"),
+        "local shadow is per-render, seed must not mask it: {fired:?}"
+    );
+}
+
+#[test]
+fn f7_module_let_is_not_assumed_stable() {
+    // Only `const` gets the once-per-module identity guarantee; a module
+    // `let` can be reassigned by any code path → stays ⊤ (status quo).
+    let src = r#"
+let template = { title: "t" };
+function Dialog() {
+  const [tpl, setTpl] = useState({ title: "x" });
+  useEffect(() => {
+    setTpl(template);
+  }, [tpl]);
+  return <div>{tpl.title}</div>;
+}
+"#;
+    let fired = rules_fired(src);
+    assert!(
+        fired.iter().any(|r| r == "infinite-loop"),
+        "mutable module binding must stay unknown (may-fresh): {fired:?}"
+    );
+}
+
+// ── E: missing-deps reads captures, not function identity ────────────────────
+
+#[test]
+fn e_closure_with_stable_captures_is_not_a_missing_dep() {
+    // `cb` is a fresh reference every render, but everything it captures
+    // (a setter) is Stable — omitting it from deps causes no staleness.
+    let src = r#"
+function A() {
+  const [data, setData] = useState(null);
+  const cb = () => setData({ loaded: true });
+  useEffect(() => {
+    register(cb);
+  }, []);
+  return <div>{data}</div>;
+}
+"#;
+    let diags = diagnostics(src);
+    assert!(
+        !diags
+            .iter()
+            .any(|(r, m)| r == "missing-deps" && m.contains("`cb`")),
+        "closure over stable captures only: {diags:?}"
+    );
+}
+
+#[test]
+fn e_closure_capturing_state_still_warns() {
+    // The closure reads a state slot: omitting it from deps means the effect
+    // keeps a copy that goes stale on every set — real bug, must keep firing.
+    let src = r#"
+function A() {
+  const [obj, setObj] = useState({ n: 0 });
+  const cb = () => send(obj);
+  useEffect(() => {
+    register(cb);
+  }, []);
+  return <div>{obj.n}</div>;
+}
+"#;
+    let diags = diagnostics(src);
+    assert!(
+        diags
+            .iter()
+            .any(|(r, m)| r == "missing-deps" && m.contains("`cb`")),
+        "closure over a versioned state value must warn: {diags:?}"
+    );
+}
+
+#[test]
+fn e_closure_chain_propagates_stability() {
+    // cb -> inner: both capture only stable values through the chain.
+    let src = r#"
+function A() {
+  const [x, setX] = useState(0);
+  const inner = () => setX(1);
+  const cb = () => inner();
+  useEffect(() => {
+    register(cb);
+  }, []);
+  return <div>{x}</div>;
+}
+"#;
+    let diags = diagnostics(src);
+    assert!(
+        !diags
+            .iter()
+            .any(|(r, m)| r == "missing-deps" && m.contains("`cb`")),
+        "stability must propagate through closure chains: {diags:?}"
+    );
+}
+
+// ── B: callback reachability by escape, not by prop name ─────────────────────
+
+#[test]
+fn b_native_ref_callback_write_is_visible() {
+    // memos repro (`ref={captureFrame}`): a ref callback is invoked by React
+    // at mount — its write makes the effect's reset non-redundant.
+    let src = r#"
+function A() {
+  const [el, setEl] = useState(null);
+  const captureFrame = (node) => setEl(node);
+  useEffect(() => {
+    setEl(null);
+  }, []);
+  return <div ref={captureFrame} />;
+}
+"#;
+    let fired = rules_fired(src);
+    assert!(
+        !fired.iter().any(|r| r == "redundant-set-state"),
+        "ref callback write must reach the state store: {fired:?}"
+    );
+}
+
+#[test]
+fn b_render_prop_write_is_visible() {
+    // Render prop under a non-`onX` name: the child may invoke it anytime.
+    let src = r#"
+function A() {
+  const [sel, setSel] = useState(null);
+  useEffect(() => {
+    setSel(null);
+  }, []);
+  return <List renderItem={(item) => setSel(item)} />;
+}
+"#;
+    let fired = rules_fired(src);
+    assert!(
+        !fired.iter().any(|r| r == "redundant-set-state"),
+        "render-prop write must reach the state store: {fired:?}"
+    );
+}
+
+#[test]
+fn b_wrapped_setter_forwarded_to_unknown_child_havocs_state() {
+    // memos CreateIdentityProviderDialog→Select repro: a KNOWN wrapper
+    // re-wraps the parent's setter in a closure (`cb && ((v) => cb(v))`,
+    // which lowers through a branch temp into a heap Fn) and forwards it to
+    // an UNKNOWN primitive. The escaping-setter chase must reach through the
+    // heap closure and havoc the ancestor slot.
+    let src = r#"
+const Select = ({ onValueChange, ...props }: any) => {
+  return (
+    <Primitive.Root
+      onValueChange={onValueChange && ((value) => value !== null && onValueChange(value))}
+      {...props}
+    />
+  );
+};
+
+function A() {
+  const [tpl, setTpl] = useState("GitHub");
+  useEffect(() => {
+    if (!cond()) setTpl("GitHub");
+  }, [tpl]);
+  return <Select value={tpl} onValueChange={setTpl} />;
+}
+"#;
+    let fired = program_rules_fired(src);
+    assert!(
+        !fired.contains(&"redundant-set-state".to_string()),
+        "setter wrapped in a closure and forwarded must be havocked: {fired:?}"
+    );
+}
+
+#[test]
+fn b_callback_var_called_inside_handler_write_is_visible() {
+    // memos VideoPoster repro: the handler doesn't reference the useCallback
+    // var as a prop — it CALLS it (`onLoadedData={(e) => captureFrame(e)}`).
+    // The body lives in the hook entry (CallbackVal), reached through the
+    // env callback binding + QueryContext::callback_body.
+    let src = r#"
+function A() {
+  const [url, setUrl] = useState<string>();
+  useEffect(() => {
+    setUrl(undefined);
+  }, []);
+  const captureFrame = useCallback((video) => {
+    if (!url) {
+      setUrl("data:img");
+    }
+  }, [url]);
+  return <video onLoadedData={(event) => captureFrame(event.currentTarget)} />;
+}
+"#;
+    let fired = rules_fired(src);
+    assert!(
+        !fired.iter().any(|r| r == "redundant-set-state"),
+        "callback body reached through a call must be executed: {fired:?}"
+    );
+}
+
+#[test]
+fn b_render_helper_handlers_are_extracted() {
+    // memos CreateWebhookDialog repro: the only writes live in JSX handlers
+    // returned by a render-helper closure — reachable during render.
+    let src = r#"
+function A() {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    setCopied(false);
+  }, []);
+  const renderField = (secret: string) => (
+    <button onClick={() => setCopied(true)} />
+  );
+  return <div>{renderField("s")}</div>;
+}
+"#;
+    let fired = rules_fired(src);
+    assert!(
+        !fired.iter().any(|r| r == "redundant-set-state"),
+        "render-helper handlers must be extracted: {fired:?}"
+    );
+}
+
+#[test]
+fn b_compapp_children_are_props() {
+    // `<Dialog><Select onValueChange={setTpl}/></Dialog>`: nested JSX IS
+    // props.children — dropping it at lowering erased the Select and its
+    // escaping setter from the analysis entirely.
+    let src = r#"
+function A({ open }) {
+  const [tpl, setTpl] = useState("GitHub");
+  useEffect(() => {
+    if (!open) { setTpl("GitHub"); }
+  }, [open]);
+  return (
+    <Dialog open={open}>
+      <DialogContent>
+        <Select value={tpl} onValueChange={setTpl} />
+      </DialogContent>
+    </Dialog>
+  );
+}
+"#;
+    let fired = rules_fired(src);
+    assert!(
+        !fired.iter().any(|r| r == "redundant-set-state"),
+        "CompApp children must not be dropped: {fired:?}"
+    );
+}
+
+#[test]
+fn b_handler_transition_state_is_not_stable() {
+    // Domain fix: {undefined} ∪ {"data"} is TWO possible concrete values —
+    // a cross-kind union must never read Stable (`Object.is` never equates
+    // across kinds), else handler-driven transitions look redundant.
+    let src = r#"
+function A() {
+  const [x, setX] = useState<string>();
+  useEffect(() => { setX(undefined); }, []);
+  const capture = (v) => { setX("data"); };
+  return <video onLoadedData={(event) => capture(event.currentTarget)} />;
+}
+"#;
+    let fired = rules_fired(src);
+    assert!(
+        !fired.iter().any(|r| r == "redundant-set-state"),
+        "cross-kind union is not stable: {fired:?}"
+    );
+}

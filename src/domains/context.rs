@@ -2,14 +2,14 @@ use std::cell::RefCell;
 
 use crate::{
     domains::{
-        AbstractDomain, StateValue, StateValueTransfer, Transfer,
+        AbstractDomain, StateValue,
         stores::{AbstractEnv, Heap, MemoStore, SharedStateStore, StateStore},
     },
     engine::{
         AnalysisResult, AnalysisStats, ComponentCache, ComponentCallGraph, ComponentRegistry,
         HookRegistry, fixpoint::Config,
     },
-    ir::{component::ComponentIR, expr::Expr, types::Symbol},
+    ir::{component::ComponentIR, types::Symbol},
 };
 
 // ── AnalyzeChildFn ─────────────────────────────────────────────────────────────
@@ -23,7 +23,17 @@ pub type AnalyzeChildFn =
 
 /// Cross-domain context passed to every Transfer method for abstract-state queries.
 pub trait QueryContext {
-    fn state_value_of(&self, expr: &Expr) -> StateValue;
+    /// Body CFG of a `useCallback` hook, if the context knows it. Lets the
+    /// interpreter execute calls through a callback-bound variable
+    /// (`const cb = useCallback(...); ...; cb()`): the rewrite to
+    /// `CallbackVal(label)` moved the body out of the expression tree, so it
+    /// is not reachable through the heap like a plain FnLit.
+    fn callback_body(
+        &self,
+        _label: crate::ir::types::HookLabel,
+    ) -> Option<std::sync::Arc<crate::ir::cfg::CFG>> {
+        None
+    }
 }
 
 // ── NullCtx ───────────────────────────────────────────────────────────────────
@@ -31,11 +41,7 @@ pub trait QueryContext {
 /// No-op context: returns `Top` for every query. Used in tests and as recursion base.
 pub struct NullCtx;
 
-impl QueryContext for NullCtx {
-    fn state_value_of(&self, _expr: &Expr) -> StateValue {
-        StateValue::top()
-    }
-}
+impl QueryContext for NullCtx {}
 
 // ── InterCtx ──────────────────────────────────────────────────────────────────
 
@@ -142,6 +148,11 @@ impl<'a> InterCtx<'a> {
 /// `env` is kept as a separate parameter since its mutability and lifetime
 /// differ between `eval_expr` (`&`) and `exec_stmt` (`&mut`).
 pub struct AnalysisCtx<'a, D: AbstractDomain> {
+    /// Name of the component under analysis. An analysis is always the
+    /// analysis of SOME component — intra or inter — so this is not an
+    /// `Option`: state-slot provenance (`Versioned` labels, `SetterVal`)
+    /// always carries the real owner.
+    pub component: Symbol,
     pub state: &'a mut StateStore<D>,
     pub memo: &'a mut MemoStore<D>,
     pub heap: &'a mut Heap,
@@ -153,12 +164,14 @@ pub struct AnalysisCtx<'a, D: AbstractDomain> {
 impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
     /// Construct with `NullCtx` as the query context (tests, simple impls).
     pub fn null(
+        component: Symbol,
         state: &'a mut StateStore<D>,
         memo: &'a mut MemoStore<D>,
         heap: &'a mut Heap,
     ) -> Self {
         static NULL: NullCtx = NullCtx;
         AnalysisCtx {
+            component,
             state,
             memo,
             heap,
@@ -178,31 +191,18 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
 pub struct FixpointCtx<'a> {
     pub state: &'a StateStore<StateValue>,
     pub memo: &'a MemoStore<StateValue>,
+    /// `useCallback` body CFGs by hook label (see `QueryContext::callback_body`).
+    pub callbacks: &'a std::collections::HashMap<
+        crate::ir::types::HookLabel,
+        std::sync::Arc<crate::ir::cfg::CFG>,
+    >,
 }
 
 impl QueryContext for FixpointCtx<'_> {
-    fn state_value_of(&self, expr: &Expr) -> StateValue {
-        let mut state = self.state.clone();
-        let mut memo = self.memo.clone();
-        let mut heap = Heap::new();
-        let mut ctx = AnalysisCtx::null(&mut state, &mut memo, &mut heap);
-        StateValueTransfer.eval_expr(expr, &AbstractEnv::bottom(), &mut ctx)
-    }
-}
-
-// ── AnalysisQueryCtx ──────────────────────────────────────────────────────────
-
-/// Post-fixpoint context: evaluates `expr` against the fully converged `AnalysisResult`.
-pub struct AnalysisQueryCtx<'a> {
-    pub result: &'a AnalysisResult<StateValue>,
-}
-
-impl QueryContext for AnalysisQueryCtx<'_> {
-    fn state_value_of(&self, expr: &Expr) -> StateValue {
-        let mut state = self.result.state_store.clone();
-        let mut memo = self.result.memo_store.clone();
-        let mut heap = Heap::new();
-        let mut ctx = AnalysisCtx::null(&mut state, &mut memo, &mut heap);
-        StateValueTransfer.eval_expr(expr, &self.result.exit_env(), &mut ctx)
+    fn callback_body(
+        &self,
+        label: crate::ir::types::HookLabel,
+    ) -> Option<std::sync::Arc<crate::ir::cfg::CFG>> {
+        self.callbacks.get(&label).cloned()
     }
 }

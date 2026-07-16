@@ -12,23 +12,29 @@
 
 ## Known false positives (FP)
 
-- **`missing-deps` FP on stable function variables** — `const cb = () => setData({loaded: true})` → per-render reference → `missing-deps` fires even if `cb` captures no mutable value. Conservative, acceptable (cf. ESLint rules-of-hooks).
+- **Opaque module-const initializers stay ⊤** — `const X = f()` at module scope: identity is stable (evaluated once per module) but the *kind* is unknown, and the product domain has no encoding for "unknown kind, constant across renders" (a wide primitive slot reads as per-render motion). Only primitive literals (exact value) and reference literals (object/array/new/regexp/JSX → `Stable` reference) are seeded; everything else falls back to ⊤ noise.
 
-- **Module-scope constants evaluate to ⊤ (F7 candidate)** — `setSelectedTemplate(DEFAULT_TEMPLATE)` where `DEFAULT_TEMPLATE` is a module-level `const`: env miss → ⊤ → `Maybe` freshness → spurious `infinite-loop` Warning (churn arm), and ⊤ noise anywhere else the value flows. Fix: bind module-level `const` literals during lowering. Seen once in memos (`CreateIdentityProviderDialog`).
+- **`missing-deps` on conditionally re-bound closures** — the behavioral-stability check (`closure_is_behaviorally_stable`) bails out when a function variable is bound more than once (`let cb = a ? f : g`): the captured environment is no longer syntactically certain → conservative warn even when both closures capture only stable values.
 
-- **Prop-rooted deps have no stability model (F6 candidate)** — a dep rooted in a prop (memos `MentionResolutionProvider`, `[contents]`) fires `always-unstable-deps` even though the parent may pass a stable value. Props are a third change axis — `OnProps` ("changes when the parent changes it") in the ADR-017 may/must frame — not yet modelled; inter-component analysis could propagate the parent's actual stability.
+- **Module consts don't cross files into inlined hooks** — a custom hook inlined from another file reads the *component's* module consts, not its own file's → its module-const references stay ⊤ (same FP class as above, one level removed).
 
 ## Remaining from corpus bench 2026-07-15
 
-Fixes F1–F5 are implemented (regression suite: `tests/corpus_fp_fixes.rs`; domain redesign: [ADR-017](adr/ADR-017-versioned-stability.md)). Still open:
+Corpus state after the FP-root-cause fixes (regression suite: `tests/corpus_fp_fixes.rs`): bulletproof-react 0, shadcn-admin 0, excalidraw 2 W, memos 1 E + 15 W — every remaining finding triaged as true positive or advice except the open items below.
 
-- **4 `redundant-set-state` sites in memos** — need individual investigation; suspected async-arrow handlers and callbacks passed under non-`onX` prop names (`ref={captureFrame}`, render props) — the name-based `onX` handler heuristic doesn't see them.
+- **7 `missing-deps` in memos, 1 in excalidraw** — spot-checked as mostly legitimate; a final individual pass hasn't been done.
 - **F1b — path-granular free variables** — crediting a member dep (`[x.b]`) to its root var silences the genuine mismatch case `use(x.a)` with deps `[x.b]` (warned *by accident* before F1). Recovering it needs paths as first-class in `compute_free_vars` + path-vs-path dep matching.
 - **Never-written state refinement** — `useState(CONST)` with no reachable setter call could read `Stable` (dep omittable) instead of `Versioned`. Needs a post-fixpoint "slot ever written" bit; marginal gain. *(ADR-017 §Limitations)*
 
 ### Diagnostics UX (side-finding)
 
 - Messages leak internal jargon: `(value: ⊤)`, `number|boolean|string|ref(Unknown)|setter|other`. Map abstract values to user-language ("value may change between renders", "reference is recreated every render") at the rule/message boundary.
+- **Cross-component blame** — `always-unstable-deps` on a prop-rooted dep blames the *child* (memos `MentionResolutionProvider`) when the instability comes from a specific parent call site (`MemoDetail.tsx` passes an unmemoized array). The propagation is semantically correct (verified: the provider analyzed alone is silent); the message should carry the provenance ("unstable because `<Parent>` passes a fresh array at file:line"). An `OnProps` label family in the ADR-017 frame would make this provenance first-class — worth doing for the *message*, no FP to fix.
+
+### Escaping-setter chase bounds
+
+- `collect_escaping_setters` / `setter_calls_in_cfg` cap recursion at depth 4; a setter smuggled deeper (closure in closure in object in closure…) is missed → possible stale "state is stable" conclusion in pathological nesting.
+- Call targets are resolved one level (`f(...)`, `obj.field(...)`); a setter called through an index (`fns[0](...)`) or a call-returned function (`get()(x)`) is not chased.
 
 ## ADR-013 — cross-file analysis limits
 

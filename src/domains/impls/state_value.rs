@@ -251,6 +251,22 @@ impl StateValue {
             // React guarantees setter identity across renders.
             acc = acc.join(&Stability::Stable);
         }
+        // Each populated kind slot is individually "stable" when it holds a
+        // single point, but two populated kinds are two DISTINCT concrete
+        // values (`Object.is` never equates across kinds): the value can
+        // transition between them (`useState<string>()` + `setX("data")` in
+        // a handler → {undefined, "data"}). A cross-kind union is never
+        // definitely stable.
+        let populated = usize::from(!self.num.is_bottom())
+            + usize::from(self.boolean != BoolVal::Bottom)
+            + usize::from(self.str != StrConst::Bottom)
+            + usize::from(self.reference != Stability::Bottom)
+            + usize::from(self.null)
+            + usize::from(self.undef)
+            + usize::from(self.setter != SetterVal::Bottom);
+        if populated >= 2 {
+            acc = acc.join(&Stability::Unknown);
+        }
         if in_motion {
             return Stability::PerRender;
         }
@@ -644,10 +660,13 @@ mod tests {
     }
 
     #[test]
-    fn to_stability_mixed_stable_kinds_is_stable() {
-        // null ∪ point-number: both kinds individually stable → Stable.
+    fn to_stability_mixed_stable_kinds_is_unknown() {
+        // null ∪ point-number: each kind is a single point, but the union
+        // holds two distinct concrete values — the state can transition
+        // between them (e.g. a handler sets 1 on a null-initialized slot),
+        // so it is NOT definitely stable.
         let v = StateValue::null().join(&num_point(1.0));
-        assert_eq!(v.to_stability(), Stability::Stable);
+        assert_eq!(v.to_stability(), Stability::Unknown);
     }
 
     #[test]
@@ -961,7 +980,9 @@ mod tests {
         assert_eq!(j.reference, Stability::Stable);
         // Mixed with a reference → no longer an exact setter.
         assert!(j.as_setter().is_none());
-        assert_eq!(j.to_stability(), Stability::Stable);
+        // Two populated kinds = two distinct possible values → not
+        // definitely stable (cross-kind union rule).
+        assert_eq!(j.to_stability(), Stability::Unknown);
     }
 
     #[test]

@@ -6,9 +6,7 @@ pub mod query;
 pub mod stores;
 pub mod transfer;
 
-pub use context::{
-    AnalysisCtx, AnalysisQueryCtx, AnalyzeChildFn, FixpointCtx, InterCtx, NullCtx, QueryContext,
-};
+pub use context::{AnalysisCtx, AnalyzeChildFn, FixpointCtx, InterCtx, NullCtx, QueryContext};
 pub use impls::{BoolVal, Interval, Stability, StateValue};
 pub use product::{ProductDomain, ProductTransfer};
 pub use query::{DomainQuery, Queryable};
@@ -140,6 +138,7 @@ pub trait Transfer {
     /// Called by the engine after each render-pass to refresh the memo store.
     fn recompute_memo(
         &self,
+        component: &crate::ir::types::Symbol,
         deps: &[Expr],
         env: &AbstractEnv<Self::Domain>,
         ctx: &dyn QueryContext,

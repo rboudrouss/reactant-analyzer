@@ -36,6 +36,10 @@ pub struct AbstractEnv<D: AbstractDomain> {
     stabs: HashMap<Var, D>,
     locs: HashMap<Var, HashSet<ExprId>>,
     setter_bindings: HashMap<Var, HookLabel>,
+    /// Side-channel for `useCallback` bindings: the body lives in the hook
+    /// entry (`QueryContext::callback_body`), not the heap, so calls through
+    /// the variable can still be executed for side effects.
+    callback_bindings: HashMap<Var, HookLabel>,
 }
 
 impl<D: AbstractDomain> Default for AbstractEnv<D> {
@@ -44,6 +48,7 @@ impl<D: AbstractDomain> Default for AbstractEnv<D> {
             stabs: HashMap::new(),
             locs: HashMap::new(),
             setter_bindings: HashMap::new(),
+            callback_bindings: HashMap::new(),
         }
     }
 }
@@ -92,6 +97,16 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         self.setter_bindings.get(var).copied()
     }
 
+    /// Record that `var` is bound to a `useCallback` hook `label`.
+    pub fn bind_callback(&mut self, var: Var, label: HookLabel) {
+        self.callback_bindings.insert(var, label);
+    }
+
+    /// Returns the hook label if `var` is a known `useCallback` binding.
+    pub fn callback_label(&self, var: &str) -> Option<HookLabel> {
+        self.callback_bindings.get(var).copied()
+    }
+
     fn join_stabs(a: &HashMap<Var, D>, b: &HashMap<Var, D>) -> HashMap<Var, D> {
         let mut out = HashMap::new();
         for (k, v) in a {
@@ -125,10 +140,15 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         for (k, &v) in &other.setter_bindings {
             setter_bindings.entry(k.clone()).or_insert(v);
         }
+        let mut callback_bindings = self.callback_bindings.clone();
+        for (k, &v) in &other.callback_bindings {
+            callback_bindings.entry(k.clone()).or_insert(v);
+        }
         AbstractEnv {
             stabs,
             locs,
             setter_bindings,
+            callback_bindings,
         }
     }
 
@@ -160,10 +180,15 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         for (k, &v) in &other.setter_bindings {
             setter_bindings.entry(k.clone()).or_insert(v);
         }
+        let mut callback_bindings = self.callback_bindings.clone();
+        for (k, &v) in &other.callback_bindings {
+            callback_bindings.entry(k.clone()).or_insert(v);
+        }
         AbstractEnv {
             stabs,
             locs,
             setter_bindings,
+            callback_bindings,
         }
     }
 

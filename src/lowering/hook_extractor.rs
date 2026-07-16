@@ -113,21 +113,22 @@ fn collect_subscriptions_in_expr(
 
 // ── Handler extraction ────────────────────────────────────────────────────────
 
-/// Scan `cfg` for `onX={…}` event-handler props and append each as
-/// `HookEntry::Handler`, so their setter writes join the fixpoint (handlers
-/// run 0..N times — under-approximating them is an FN class, TODO.md F4).
+/// Scan `cfg` for callback props and append each as `HookEntry::Handler`,
+/// so their setter writes join the fixpoint (handlers run 0..N times —
+/// under-approximating them is an FN class, TODO.md F4).
 ///
-/// Covered forms:
-/// - `<div onClick={() => …}>` — inline `FnLit` on a native element;
-/// - `<Child onToggle={() => …}>` — inline `FnLit` on a **component** prop
-///   (the child may invoke it at any time: same trigger class per ADR-009);
-/// - `onX={someVar}` where the render CFG binds `someVar` to an `FnLit`
-///   or to a `useCallback` (`CallbackVal` — body taken from its hook entry).
+/// Reachability is decided by ESCAPE, not by prop name:
+/// - native elements: `on*` events and `ref` (the only native props React
+///   invokes);
+/// - components: ANY function-valued prop (`onToggle`, `ref`, render props,
+///   `action={cb}` — the child may invoke whatever it receives);
+/// - values resolve through `handler_body`: inline `FnLit`, a var bound to
+///   an `FnLit`, or a `useCallback` (`CallbackVal` — body from its hook
+///   entry); JSX inside render-helper closures is scanned too.
 ///
 /// Bare setters as props (`onOpenChange={setOpen}`) are handled by the
 /// engine instead (unknown-child havoc in `eval_comp_app`): only the engine
-/// knows whether the receiver is analyzable. Not covered: callbacks passed
-/// under non-`onX` prop names (`<Child action={cb}>`).
+/// knows whether the receiver is analyzable.
 pub fn extract_handlers(cfg: &CFG, hooks: &mut Vec<HookEntry>, next_label: &mut HookLabel) {
     // Pre-pass: resolvable handler bodies by variable name.
     // `let cb = () => …` and `let cb = useCallback(…)` (rewritten to
@@ -209,7 +210,11 @@ fn collect_handlers_in_expr(
         } => {
             if let Expr::ObjectLit { fields, .. } = props.as_ref() {
                 for (name, val) in fields {
-                    if is_event_prop(name) {
+                    // `on*` events and `ref` callbacks share invoke semantics
+                    // on native elements: React calls them at arbitrary times
+                    // (events / mount-unmount). Other native props are DOM
+                    // data, never invoked.
+                    if is_event_prop(name) || name == "ref" {
                         if let Some(body_cfg) = handler_body(val, var_bodies) {
                             let label = *next_label;
                             *next_label += 1;
@@ -229,31 +234,46 @@ fn collect_handlers_in_expr(
                 collect_handlers_in_expr(child, var_bodies, found, next_label);
             }
         }
-        // Component props: an `onX` callback prop is invoked by the child at
-        // arbitrary times — same handler trigger class as a DOM event.
-        // (Nested JSX rides in via non-event prop values, incl. `children`.)
+        // Component props: ANY function-valued prop handed to a component may
+        // be invoked by it at arbitrary times — reachability is decided by
+        // escape, not by the prop's name (`ref={captureFrame}`, render props,
+        // `action={cb}` all fire; the old `onX` filter was a nominal
+        // heuristic, TODO.md B). Only FnLits — inline or locally bound —
+        // resolve through `handler_body`, so module-level components passed
+        // as props (`component={Page}`) never match. Non-function values
+        // recurse for nested JSX (incl. `children`).
         Expr::CompApp { props, .. } => {
             if let Expr::ObjectLit { fields, .. } = props.as_ref() {
                 for (name, val) in fields {
-                    if is_event_prop(name) {
-                        if let Some(body_cfg) = handler_body(val, var_bodies) {
-                            let label = *next_label;
-                            *next_label += 1;
-                            found.push(HookEntry::Handler {
-                                label,
-                                event: prop_to_event(name),
-                                body_cfg,
-                                span: None,
-                            });
-                        }
+                    if let Some(body_cfg) = handler_body(val, var_bodies) {
+                        let label = *next_label;
+                        *next_label += 1;
+                        found.push(HookEntry::Handler {
+                            label,
+                            event: prop_to_event(name),
+                            body_cfg,
+                            span: None,
+                        });
                     } else {
                         collect_handlers_in_expr(val, var_bodies, found, next_label);
                     }
                 }
             }
         }
-        Expr::TSAnnotated(e, _) => collect_handlers_in_expr(e, var_bodies, found, next_label),
-        _ => {}
+        // Render helpers (`const renderRow = (x) => <Button onClick={...}/>`)
+        // run during render: JSX inside any locally-defined closure is
+        // reachable, so its handlers must be extracted too.
+        Expr::FnLit { body_cfg, .. } => {
+            body_cfg
+                .for_each_expr(&mut |e| collect_handlers_in_expr(e, var_bodies, found, next_label));
+        }
+        // Everything else (TSAnnotated, `children` ArrayLits, object props,
+        // conditional temps): JSX can ride anywhere — generic descent.
+        other => {
+            other.for_each_child(&mut |e| {
+                collect_handlers_in_expr(e, var_bodies, found, next_label)
+            });
+        }
     }
 }
 
@@ -266,6 +286,10 @@ fn is_event_prop(name: &str) -> bool {
 
 fn prop_to_event(name: &str) -> String {
     // "onClick" → "click",  "onChange" → "change"
+    // Non-`onX` callback props (`ref`, render props) keep their name as-is.
+    if !is_event_prop(name) {
+        return name.to_string();
+    }
     let rest = &name[2..];
     let mut s = rest.to_string();
     if let Some(first) = s.get_mut(0..1) {

@@ -46,6 +46,7 @@ impl Rule for RedundantSetState {
                 None => continue,
             };
             check_setter_calls(
+                &result.component,
                 &block.stmts,
                 env,
                 &result.state_store,
@@ -68,6 +69,7 @@ impl Rule for RedundantSetState {
             {
                 let prev_len = diags.len();
                 check_cfg_for_redundant_sets(
+                    &result.component,
                     body_cfg,
                     &env_exit,
                     &result.state_store,
@@ -92,6 +94,7 @@ impl Rule for RedundantSetState {
 /// Scan all blocks of `cfg` for redundant setter calls.
 /// Skips setters whose argument differs across calls (state-transition pattern).
 fn check_cfg_for_redundant_sets(
+    component: &Symbol,
     cfg: &CFG,
     env: &AbstractEnv<StateValue>,
     state: &StateStore<StateValue>,
@@ -99,12 +102,13 @@ fn check_cfg_for_redundant_sets(
     transfer: &StateValueTransfer,
     diags: &mut Vec<Diagnostic>,
 ) {
-    let skip_labels = collect_transition_setters(cfg, env, state, memo, transfer);
+    let skip_labels = collect_transition_setters(component, cfg, env, state, memo, transfer);
     let mut sorted: Vec<_> = cfg.blocks.keys().copied().collect();
     sorted.sort_unstable();
     for block_id in sorted {
         if let Some(block) = cfg.blocks.get(&block_id) {
             check_setter_calls(
+                component,
                 &block.stmts,
                 env,
                 state,
@@ -119,6 +123,7 @@ fn check_cfg_for_redundant_sets(
 
 /// Returns setter labels whose argument value differs across calls in `cfg` (including nested FnLits).
 fn collect_transition_setters(
+    component: &Symbol,
     cfg: &CFG,
     env: &AbstractEnv<StateValue>,
     state: &StateStore<StateValue>,
@@ -127,11 +132,9 @@ fn collect_transition_setters(
 ) -> HashSet<HookLabel> {
     // per label: (first seen arg value, has seen a different value)
     let mut tracker: HashMap<HookLabel, (StateValue, bool)> = HashMap::new();
-    for block in cfg.blocks.values() {
-        for stmt in &block.stmts {
-            collect_setter_vals_in_stmt(stmt, env, state, memo, transfer, &mut tracker);
-        }
-    }
+    cfg.for_each_expr(&mut |e| {
+        collect_setter_vals_in_expr(component, e, env, state, memo, transfer, &mut tracker)
+    });
     tracker
         .into_iter()
         .filter(|(_, (_, diverged))| *diverged)
@@ -139,22 +142,8 @@ fn collect_transition_setters(
         .collect()
 }
 
-fn collect_setter_vals_in_stmt(
-    stmt: &Stmt,
-    env: &AbstractEnv<StateValue>,
-    state: &StateStore<StateValue>,
-    memo: &MemoStore<StateValue>,
-    transfer: &StateValueTransfer,
-    tracker: &mut HashMap<HookLabel, (StateValue, bool)>,
-) {
-    match stmt {
-        Stmt::ExprStmt(e, _) | Stmt::Let { rhs: e, .. } | Stmt::Assign { rhs: e, .. } => {
-            collect_setter_vals_in_expr(e, env, state, memo, transfer, tracker);
-        }
-    }
-}
-
 fn collect_setter_vals_in_expr(
+    component: &Symbol,
     expr: &Expr,
     env: &AbstractEnv<StateValue>,
     state: &StateStore<StateValue>,
@@ -173,7 +162,11 @@ fn collect_setter_vals_in_expr(
                         let mut s = state.clone();
                         let mut m = memo.clone();
                         let mut h = crate::domains::Heap::new();
-                        transfer.eval_expr(a, env, &mut AnalysisCtx::null(&mut s, &mut m, &mut h))
+                        transfer.eval_expr(
+                            a,
+                            env,
+                            &mut AnalysisCtx::null(component.clone(), &mut s, &mut m, &mut h),
+                        )
                     })
                     .unwrap_or(StateValue::top());
                 match tracker.entry(label) {
@@ -187,41 +180,27 @@ fn collect_setter_vals_in_expr(
                     }
                 }
             }
-            collect_setter_vals_in_expr(fn_, env, state, memo, transfer, tracker);
-            for arg in args {
-                collect_setter_vals_in_expr(arg, env, state, memo, transfer, tracker);
-            }
+            expr.for_each_child(&mut |c| {
+                collect_setter_vals_in_expr(component, c, env, state, memo, transfer, tracker)
+            });
         }
         Expr::FnLit { body_cfg, .. } => {
-            for block in body_cfg.blocks.values() {
-                for stmt in &block.stmts {
-                    collect_setter_vals_in_stmt(stmt, env, state, memo, transfer, tracker);
-                }
-            }
+            body_cfg.for_each_expr(&mut |e| {
+                collect_setter_vals_in_expr(component, e, env, state, memo, transfer, tracker)
+            });
         }
-        Expr::BinOp { lhs, rhs, .. } => {
-            collect_setter_vals_in_expr(lhs, env, state, memo, transfer, tracker);
-            collect_setter_vals_in_expr(rhs, env, state, memo, transfer, tracker);
+        other => {
+            other.for_each_child(&mut |c| {
+                collect_setter_vals_in_expr(component, c, env, state, memo, transfer, tracker)
+            });
         }
-        Expr::UnaryOp { arg, .. } => {
-            collect_setter_vals_in_expr(arg, env, state, memo, transfer, tracker);
-        }
-        Expr::ArrayLit { elems, .. } => {
-            for item in elems {
-                collect_setter_vals_in_expr(item, env, state, memo, transfer, tracker);
-            }
-        }
-        Expr::ObjectLit { fields, .. } => {
-            for (_, val) in fields {
-                collect_setter_vals_in_expr(val, env, state, memo, transfer, tracker);
-            }
-        }
-        _ => {}
     }
 }
 
 /// Check a list of statements for `setState(stable)` when state is already stable.
+#[allow(clippy::too_many_arguments)]
 fn check_setter_calls(
+    component: &Symbol,
     stmts: &[Stmt],
     env: &AbstractEnv<StateValue>,
     state: &StateStore<StateValue>,
@@ -245,7 +224,11 @@ fn check_setter_calls(
                     let mut s = state.clone();
                     let mut m = memo.clone();
                     let mut h = crate::domains::Heap::new();
-                    transfer.eval_expr(a, env, &mut AnalysisCtx::null(&mut s, &mut m, &mut h))
+                    transfer.eval_expr(
+                        a,
+                        env,
+                        &mut AnalysisCtx::null(component.clone(), &mut s, &mut m, &mut h),
+                    )
                 })
                 .unwrap_or(StateValue::top());
 
@@ -342,6 +325,7 @@ mod tests {
         }
 
         AnalysisResult {
+            component: "C".to_string(),
             state_store,
             memo_store: MemoStore::new(),
             block_states,
@@ -547,6 +531,7 @@ mod tests {
         }
 
         AnalysisResult {
+            component: "C".to_string(),
             state_store,
             memo_store: MemoStore::new(),
             block_states,

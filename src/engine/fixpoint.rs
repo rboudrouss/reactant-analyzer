@@ -4,12 +4,12 @@ use crate::{
     domains::{
         AbstractDomain, AnalysisCtx, AnalyzeChildFn, FixpointCtx, Heap, InterCtx, NullCtx,
         Transfer,
-        impls::StateValue,
+        impls::{Stability, StateValue},
         stores::{AbstractEnv, MemoStore, StateStore},
     },
     ir::{
         cfg::CFG,
-        component::ComponentIR,
+        component::{ComponentIR, ModuleConstInit},
         expr::{Expr, SummaryValue},
         free_vars::compute_free_vars,
         hooks::HookEntry,
@@ -119,10 +119,44 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         name: comp_name,
         mut render_cfg,
         hooks,
+        module_consts,
         ..
     } = comp;
 
     let mut hooks = hooks;
+
+    // Seed module-level `const` bindings (TODO.md F7). A module const is
+    // evaluated once per module lifetime, so its value never changes across
+    // renders: a primitive literal seeds its exact value, a reference
+    // literal (`const D = {...}`) seeds a Stable reference. Without this,
+    // reads fall through to the env-miss default (⊤) and downstream rules
+    // see "may be fresh each render". Bindings already present in
+    // `initial_env` (props from a parent analysis) win.
+    let mut initial_env = initial_env;
+    {
+        let mut seed_state = StateStore::bottom();
+        let mut seed_memo: MemoStore<StateValue> = MemoStore::new();
+        let mut seed_heap = crate::domains::Heap::new();
+        let mut ac = AnalysisCtx::null(
+            comp_name.clone(),
+            &mut seed_state,
+            &mut seed_memo,
+            &mut seed_heap,
+        );
+        let empty_env = AbstractEnv::bottom();
+        for (name, init) in module_consts.iter() {
+            if initial_env.contains(name) {
+                continue;
+            }
+            let val = match init {
+                ModuleConstInit::Prim(p) => {
+                    transfer.eval_expr(&Expr::Lit(p.clone()), &empty_env, &mut ac)
+                }
+                ModuleConstInit::Ref => StateValue::reference(Stability::Stable),
+            };
+            initial_env.extend(name.clone(), val);
+        }
+    }
 
     // Utility-function inlining. Runs before `expand_custom_hooks` so utility
     // bodies containing hook calls become visible to the hook expansion pass.
@@ -140,6 +174,21 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // Threshold set for widening up-to (ADR-014); harvested once, post-expansion.
     let thresholds = collect_thresholds(&render_cfg, &hooks);
 
+    // useCallback bodies by label, exposed to the interpreter through
+    // `QueryContext::callback_body`: calls through a callback-bound variable
+    // (`const cb = useCallback(...); onLoad={(e) => cb(e)}`) execute the
+    // body for side effects even though the rewrite to `CallbackVal` moved
+    // it out of the expression tree.
+    let callback_bodies: HashMap<HookLabel, std::sync::Arc<CFG>> = hooks
+        .iter()
+        .filter_map(|h| match h {
+            HookEntry::Callback {
+                label, body_cfg, ..
+            } => Some((*label, std::sync::Arc::new(body_cfg.clone()))),
+            _ => None,
+        })
+        .collect();
+
     // Fixpoint carrier: the product StateValue tracks every JS kind per label
     // (ADR-015), so no per-type sub-store dispatch is needed anymore.
     let mut state: StateStore<StateValue> = StateStore::bottom();
@@ -154,9 +203,11 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     let mut handler_block_states: HashMap<HookLabel, HashMap<BlockId, AbstractEnv<StateValue>>> =
         HashMap::new();
 
-    // Seed each useState label with its init expression.
+    // Seed each useState label with its init expression. The init runs in
+    // the component's entry scope: module consts (and parent-bound props,
+    // when analyzed inter) are visible to `useState(DEFAULT)`.
     {
-        let init_env = AbstractEnv::bottom();
+        let init_env = initial_env.clone();
         let init_memo = MemoStore::new();
         let init_untyped = StateStore::bottom();
         for hook in &hooks {
@@ -165,8 +216,12 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     let mut init_untyped_mut = init_untyped.clone();
                     let mut init_memo_mut = init_memo.clone();
                     let mut heap = crate::domains::Heap::new();
-                    let mut ac =
-                        AnalysisCtx::null(&mut init_untyped_mut, &mut init_memo_mut, &mut heap);
+                    let mut ac = AnalysisCtx::null(
+                        comp_name.clone(),
+                        &mut init_untyped_mut,
+                        &mut init_memo_mut,
+                        &mut heap,
+                    );
                     // A null/undefined init needs no TS-hint override anymore:
                     // the product value joins the null slot with whatever the
                     // setters write, and the num slot widens independently.
@@ -198,8 +253,10 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             let ctx = FixpointCtx {
                 state: &state_store,
                 memo: &memo_store,
+                callbacks: &callback_bodies,
             };
             analyze_cfg::<T>(
+                &comp_name,
                 &render_cfg,
                 initial_env.clone(),
                 &state_store,
@@ -219,10 +276,16 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         for hook in &hooks {
             match hook {
                 HookEntry::Memo { label, deps, .. } => {
-                    memo_store.set(*label, transfer.recompute_memo(deps, &env_exit, &NullCtx));
+                    memo_store.set(
+                        *label,
+                        transfer.recompute_memo(&comp_name, deps, &env_exit, &NullCtx),
+                    );
                 }
                 HookEntry::Callback { label, deps, .. } => {
-                    memo_store.set(*label, transfer.recompute_memo(deps, &env_exit, &NullCtx));
+                    memo_store.set(
+                        *label,
+                        transfer.recompute_memo(&comp_name, deps, &env_exit, &NullCtx),
+                    );
                 }
                 _ => {}
             }
@@ -239,8 +302,10 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     let ctx = FixpointCtx {
                         state: &state_store,
                         memo: &memo_store,
+                        callbacks: &callback_bodies,
                     };
                     analyze_cfg::<T>(
+                        &comp_name,
                         body_cfg,
                         env_exit.clone(),
                         &state_store,
@@ -271,8 +336,10 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     let ctx = FixpointCtx {
                         state: &state_store,
                         memo: &memo_store,
+                        callbacks: &callback_bodies,
                     };
                     analyze_cfg::<T>(
+                        &comp_name,
                         body_cfg,
                         env_exit.clone(),
                         &state_store,
@@ -333,12 +400,14 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     let final_ctx = FixpointCtx {
         state: &final_state,
         memo: &memo_store,
+        callbacks: &callback_bodies,
     };
     let bottom_state: StateStore<StateValue> = StateStore::bottom();
     let mut effect_setter_writes: StateStore<StateValue> = StateStore::bottom();
     for hook in &hooks {
         if let HookEntry::Effect { body_cfg, .. } = hook {
             let (_, pure_writes) = analyze_cfg::<T>(
+                &comp_name,
                 body_cfg,
                 env_exit.clone(),
                 &bottom_state,
@@ -360,6 +429,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     let hooks_clone = hooks.clone();
 
     AnalysisResult {
+        component: comp_name,
         state_store: final_state,
         memo_store,
         block_states,
@@ -1361,6 +1431,7 @@ mod tests {
                 edges: vec![],
             },
             hooks,
+            module_consts: Default::default(),
         }
     }
 
@@ -1721,6 +1792,7 @@ mod tests {
                 }],
             },
             hooks: vec![],
+            module_consts: Default::default(),
         };
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert_eq!(

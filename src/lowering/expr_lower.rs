@@ -437,6 +437,23 @@ fn lower_jsx_element(jsx: &JSXElement, builder: &mut BlockBuilder) -> Expr {
     let (props, prop_spans) = lower_jsx_props(&jsx.opening_element.attributes, builder);
 
     if name.chars().next().is_some_and(|c| c.is_uppercase()) || name.contains('.') {
+        // React semantics: nested JSX children ARE `props.children`.
+        // Dropping them here would erase the whole subtree from the CFG
+        // (`<Dialog><Select onValueChange={setX}/></Dialog>` — the Select
+        // would never be visited, its escaping setter never havocked).
+        let mut props = props;
+        if !children.is_empty()
+            && let Expr::ObjectLit { fields, .. } = &mut props
+        {
+            let id = builder.next_expr_id();
+            fields.push((
+                "children".to_string(),
+                Expr::ArrayLit {
+                    id,
+                    elems: children,
+                },
+            ));
+        }
         Expr::CompApp {
             name,
             props: Box::new(props),

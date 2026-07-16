@@ -138,6 +138,65 @@ pub enum SummaryValue {
 }
 
 impl Expr {
+    /// Apply `f` to every DIRECT child expression of `self`.
+    ///
+    /// This is the canonical child enumeration: walkers write only the arms
+    /// they treat specially and delegate the default case here, so a new
+    /// `Expr` variant breaks compilation in exactly one place and every
+    /// walker inherits the fix. The match is deliberately exhaustive — do
+    /// NOT add a `_` arm.
+    ///
+    /// `FnLit` bodies are CFGs, not child expressions: crossing the function
+    /// boundary is a per-walker decision (see [`crate::ir::cfg::CFG::for_each_expr`]).
+    pub fn for_each_child<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
+        match self {
+            Expr::Lit(_)
+            | Expr::Var(_)
+            | Expr::FnLit { .. }
+            | Expr::StateVal(_)
+            | Expr::StateSetter(_)
+            | Expr::MemoVal(_)
+            | Expr::CallbackVal(_)
+            | Expr::SummaryVal(_) => {}
+            Expr::ObjectLit { fields, .. } => {
+                for (_, v) in fields {
+                    f(v);
+                }
+            }
+            Expr::ArrayLit { elems, .. } => {
+                for e in elems {
+                    f(e);
+                }
+            }
+            Expr::FieldAccess { obj, .. } => f(obj),
+            Expr::IndexAccess { arr, idx } => {
+                f(arr);
+                f(idx);
+            }
+            Expr::BinOp { lhs, rhs, .. } => {
+                f(lhs);
+                f(rhs);
+            }
+            Expr::UnaryOp { arg, .. } => f(arg),
+            Expr::Call { fn_, args } => {
+                f(fn_);
+                for a in args {
+                    f(a);
+                }
+            }
+            Expr::CompApp { props, .. } => f(props),
+            Expr::NativeElem {
+                props, children, ..
+            } => {
+                f(props);
+                for c in children {
+                    f(c);
+                }
+            }
+            Expr::TSAnnotated(inner, _) => f(inner),
+        }
+    }
+
     /// Returns `true` iff the expression tree contains no `Call` or `CompApp` node.
     pub fn is_call_free(&self) -> bool {
         match self {

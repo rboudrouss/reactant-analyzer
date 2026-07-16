@@ -96,6 +96,7 @@ mod tests {
 
     fn make_result(render_cfg: CFG, hook_calls: Vec<HookCallInfo>) -> AnalysisResult<StateValue> {
         AnalysisResult {
+            component: "C".to_string(),
             state_store: StateStore::bottom(),
             memo_store: MemoStore::new(),
             block_states: HashMap::new(),
@@ -335,6 +336,7 @@ mod tests {
                 edges: vec![],
             },
             hooks,
+            module_consts: Default::default(),
         };
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(
@@ -430,6 +432,7 @@ mod tests {
                 ],
             },
             hooks,
+            module_consts: Default::default(),
         };
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(

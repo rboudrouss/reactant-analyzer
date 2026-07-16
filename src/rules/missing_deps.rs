@@ -1,9 +1,13 @@
 use std::collections::HashSet;
 
 use crate::{
+    domains::{impls::StateValue, stores::AbstractEnv},
     engine::{HookKind, ProgramAnalysisResult},
     ir::{
+        cfg::CFG,
         expr::Expr,
+        free_vars::compute_free_vars,
+        stmt::Stmt,
         types::{Symbol, Var},
     },
 };
@@ -42,7 +46,14 @@ impl Rule for MissingDeps {
                     continue;
                 }
                 let val = env_exit.lookup(var);
-                if !val.is_stable() {
+                if !val.is_stable()
+                    && !closure_is_behaviorally_stable(
+                        var,
+                        &result.render_cfg,
+                        &env_exit,
+                        &mut HashSet::new(),
+                    )
+                {
                     let mut d = Diagnostic::new(
                         "missing-deps",
                         format!(
@@ -75,6 +86,71 @@ fn hook_kind_word(kind: HookKind) -> &'static str {
         HookKind::Callback => "callback",
         _ => "hook",
     }
+}
+
+/// Identity vs behavior (ADR-017 framing): this rule guards against *stale
+/// closures*, so what matters is whether the values a captured function
+/// closes over can change between renders — not whether the function's
+/// identity does. `const cb = () => setX(1)` is a fresh reference every
+/// render (PerRender), yet omitting it from a deps array is harmless when
+/// every value it captures is Stable: the stale copy behaves identically.
+/// Identity-based rules (`always-unstable-deps`, the `infinite-loop` churn
+/// arm) must keep reading PerRender — deps arrays compare by `Object.is`.
+fn closure_is_behaviorally_stable(
+    var: &str,
+    cfg: &CFG,
+    env_exit: &AbstractEnv<StateValue>,
+    seen: &mut HashSet<Var>,
+) -> bool {
+    if !seen.insert(var.to_string()) {
+        // Cycle between closures: recursion only descends through captures
+        // whose env value is non-stable *because* they are closures — a cycle
+        // adds no new evidence of instability.
+        return true;
+    }
+    let Some(body) = fn_lit_binding(var, cfg) else {
+        return false;
+    };
+    for cap in compute_free_vars(body) {
+        // Globals (fetch, console, …) are not in env_exit — same convention
+        // as the main loop above.
+        if !env_exit.contains(&cap) {
+            continue;
+        }
+        if env_exit.lookup(&cap).is_stable() {
+            continue;
+        }
+        if !closure_is_behaviorally_stable(&cap, cfg, env_exit, seen) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The body of the unique `FnLit` bound to `var` in `cfg`, if any.
+/// Conditional or repeated re-binding bails out (`None`): the captured
+/// environment is no longer syntactically certain.
+fn fn_lit_binding<'c>(var: &str, cfg: &'c CFG) -> Option<&'c CFG> {
+    let mut found: Option<&CFG> = None;
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            let (Stmt::Let { var: v, rhs, .. } | Stmt::Assign { var: v, rhs, .. }) = stmt else {
+                continue;
+            };
+            if v != var {
+                continue;
+            }
+            let mut e = rhs;
+            while let Expr::TSAnnotated(inner, _) = e {
+                e = inner;
+            }
+            match e {
+                Expr::FnLit { body_cfg, .. } if found.is_none() => found = Some(body_cfg),
+                _ => return None,
+            }
+        }
+    }
+    found
 }
 
 /// Variables covered by the deps array: each dep credits its root variable
@@ -142,6 +218,7 @@ mod tests {
         render_cfg: CFG,
     ) -> AnalysisResult<StateValue> {
         AnalysisResult {
+            component: "C".to_string(),
             state_store: StateStore::bottom(),
             memo_store: MemoStore::new(),
             block_states,

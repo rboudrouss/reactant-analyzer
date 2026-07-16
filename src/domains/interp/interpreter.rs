@@ -106,6 +106,9 @@ fn exec_stmt_core<T: Transfer>(
             if let Expr::StateSetter(label) = rhs {
                 env.bind_setter(var.clone(), *label);
             }
+            if let Expr::CallbackVal(label) = rhs {
+                env.bind_callback(var.clone(), *label);
+            }
             if let Expr::FnLit {
                 id,
                 params,
@@ -138,6 +141,9 @@ fn exec_stmt_core<T: Transfer>(
                 if let Some(label) = env.setter_label(src) {
                     env.bind_setter(var.clone(), label);
                 }
+                if let Some(label) = env.callback_label(src) {
+                    env.bind_callback(var.clone(), label);
+                }
             }
             // Propagate heap locs from field access (e.g. `let f = props.onClick`
             // where onClick is a FnLit stored in the parent's heap under the Obj).
@@ -161,6 +167,9 @@ fn exec_stmt_core<T: Transfer>(
         Stmt::Assign { var, rhs, .. } => {
             if let Expr::StateSetter(label) = rhs {
                 env.bind_setter(var.clone(), *label);
+            }
+            if let Expr::CallbackVal(label) = rhs {
+                env.bind_callback(var.clone(), *label);
             }
             if let Expr::FnLit {
                 id,
@@ -403,47 +412,16 @@ fn exec_callbacks_depth<T: Transfer>(
                 exec_var_callback(transfer, name, env, ctx, depth);
             }
         }
-        Expr::BinOp { lhs, rhs, .. } => {
-            exec_callbacks_depth(transfer, lhs, env, ctx, depth);
-            exec_callbacks_depth(transfer, rhs, env, ctx, depth);
-        }
-        Expr::UnaryOp { arg, .. } => {
-            exec_callbacks_depth(transfer, arg, env, ctx, depth);
-        }
-        Expr::FieldAccess { obj, .. } => {
-            exec_callbacks_depth(transfer, obj, env, ctx, depth);
-        }
-        Expr::IndexAccess { arr, idx } => {
-            exec_callbacks_depth(transfer, arr, env, ctx, depth);
-            exec_callbacks_depth(transfer, idx, env, ctx, depth);
-        }
-        Expr::ObjectLit { fields, .. } => {
-            for (_, v) in fields {
-                exec_callbacks_depth(transfer, v, env, ctx, depth);
-            }
-        }
-        Expr::ArrayLit { elems, .. } => {
-            for item in elems {
-                exec_callbacks_depth(transfer, item, env, ctx, depth);
-            }
-        }
         Expr::CompApp { props, .. } => {
             exec_callbacks_depth(transfer, props, env, ctx, depth);
             // Fire inter-component inlining for CompApp inside children/fields.
             transfer.eval_expr(expr, env, ctx);
         }
-        Expr::NativeElem {
-            props, children, ..
-        } => {
-            exec_callbacks_depth(transfer, props, env, ctx, depth);
-            for c in children {
-                exec_callbacks_depth(transfer, c, env, ctx, depth);
-            }
+        // Bare FnLit outside a call: never runs by itself — not descended.
+        // Everything else: generic child descent.
+        other => {
+            other.for_each_child(&mut |c| exec_callbacks_depth(transfer, c, env, ctx, depth));
         }
-        Expr::TSAnnotated(inner, _) => {
-            exec_callbacks_depth(transfer, inner, env, ctx, depth);
-        }
-        _ => {}
     }
 }
 
@@ -478,5 +456,14 @@ fn exec_var_callback<T: Transfer>(
                 let _ = exec_body_depth(transfer, &body_cfg, &sub_env, ctx, depth + 1);
             }
         }
+        return;
+    }
+    // useCallback binding: the body lives in the hook entry, not the heap
+    // (the rewrite to `CallbackVal` moved it out of the expression tree).
+    // Params stay unbound → env-miss ⊤, captures resolve in the live env.
+    if let Some(label) = env.callback_label(name)
+        && let Some(body_cfg) = ctx.query.callback_body(label)
+    {
+        let _ = exec_body_depth(transfer, &body_cfg, env, ctx, depth + 1);
     }
 }

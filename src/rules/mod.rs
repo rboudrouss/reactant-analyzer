@@ -495,7 +495,7 @@ pub(super) fn all_deps_unstable(deps: &[Expr], result: &AnalysisResult<StateValu
         let val = transfer.eval_expr(
             dep,
             &exit_env,
-            &mut AnalysisCtx::null(&mut s, &mut m, &mut h),
+            &mut AnalysisCtx::null(result.component.clone(), &mut s, &mut m, &mut h),
         );
         val.is_unstable()
     })

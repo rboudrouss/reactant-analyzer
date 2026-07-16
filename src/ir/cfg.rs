@@ -44,6 +44,26 @@ pub struct CFG {
 }
 
 impl CFG {
+    /// Apply `f` to every TOP-LEVEL expression of the CFG: statement
+    /// right-hand sides / expression statements, plus `Return` and `Branch`
+    /// terminator expressions. Companion of [`crate::ir::expr::Expr::for_each_child`]
+    /// for walkers that scan whole bodies. Block order is unspecified.
+    pub fn for_each_expr<'a>(&'a self, f: &mut impl FnMut(&'a crate::ir::expr::Expr)) {
+        for block in self.blocks.values() {
+            for stmt in &block.stmts {
+                match stmt {
+                    crate::ir::stmt::Stmt::Let { rhs, .. }
+                    | crate::ir::stmt::Stmt::Assign { rhs, .. } => f(rhs),
+                    crate::ir::stmt::Stmt::ExprStmt(e, _) => f(e),
+                }
+            }
+            match &block.term {
+                Terminator::Return(e) | Terminator::Branch { cond: e, .. } => f(e),
+                Terminator::Jump(_) | Terminator::Unreachable => {}
+            }
+        }
+    }
+
     pub fn successors(&self, block_id: BlockId) -> Vec<BlockId> {
         self.edges
             .iter()

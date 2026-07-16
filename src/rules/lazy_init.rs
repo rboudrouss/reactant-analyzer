@@ -137,6 +137,7 @@ mod tests {
                 edges: vec![],
             },
             hooks,
+            module_consts: Default::default(),
         }
     }
 

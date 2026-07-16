@@ -292,7 +292,7 @@ fn check_object_churn(result: &ProgramAnalysisResult, component: &Symbol) -> Vec
                     };
                     if let Stability::Versioned(labels) = &val.reference {
                         for (c, l) in labels {
-                            if c == component || c.is_empty() {
+                            if c == component {
                                 versioned.insert(*l);
                             }
                         }
@@ -428,7 +428,7 @@ fn eval_in_exit_env(
     StateValueTransfer.eval_expr(
         expr,
         &exit_env,
-        &mut AnalysisCtx::null(&mut s, &mut m, &mut h),
+        &mut AnalysisCtx::null(comp_result.component.clone(), &mut s, &mut m, &mut h),
     )
 }
 
@@ -644,10 +644,12 @@ fn churn_calls_in_expr(
                 }
             }
         }
-        Expr::BinOp { lhs, rhs, .. } => {
-            for e in [lhs.as_ref(), rhs.as_ref()] {
+        // Bare FnLit: body is a CFG, not a child expr — only runs if invoked
+        // (covered by the Call arm above). Everything else: generic descent.
+        other => {
+            other.for_each_child(&mut |c| {
                 churn_calls_in_expr(
-                    e,
+                    c,
                     span,
                     block_id,
                     setter_labels,
@@ -655,34 +657,9 @@ fn churn_calls_in_expr(
                     comp_result,
                     depth,
                     out,
-                );
-            }
+                )
+            });
         }
-        Expr::UnaryOp { arg, .. } => {
-            churn_calls_in_expr(
-                arg,
-                span,
-                block_id,
-                setter_labels,
-                fn_bindings,
-                comp_result,
-                depth,
-                out,
-            );
-        }
-        Expr::TSAnnotated(inner, _) => {
-            churn_calls_in_expr(
-                inner,
-                span,
-                block_id,
-                setter_labels,
-                fn_bindings,
-                comp_result,
-                depth,
-                out,
-            );
-        }
-        _ => {}
     }
 }
 
@@ -857,6 +834,7 @@ mod tests {
             },
         );
         AnalysisResult {
+            component: "C".to_string(),
             state_store: StateStore::bottom(),
             memo_store: MemoStore::new(),
             block_states: HashMap::new(),
@@ -1123,6 +1101,7 @@ mod tests {
                 edges: vec![],
             },
             hooks,
+            module_consts: Default::default(),
         };
         let config = Config {
             widen_threshold: 1,
@@ -1212,6 +1191,7 @@ mod tests {
                 edges: vec![],
             },
             hooks,
+            module_consts: Default::default(),
         };
         let config = Config {
             widen_threshold: 3,
@@ -1357,6 +1337,7 @@ mod tests {
                 edges: vec![],
             },
             hooks,
+            module_consts: Default::default(),
         }
     }
 
@@ -1718,6 +1699,7 @@ mod tests {
                 edges: vec![],
             },
             hooks,
+            module_consts: Default::default(),
         }
     }
 
