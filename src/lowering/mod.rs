@@ -16,7 +16,7 @@ pub use import_resolution::build_resolved_import_map;
 pub use utility_detector::{UtilityCandidate, detect_utilities};
 pub use utility_lowerer::{lower_utilities, lower_utilities_with_resolver};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -70,6 +70,36 @@ fn build_import_map(program: &Program) -> HashMap<String, String> {
         }
     }
     map
+}
+
+/// Local names bound to the `react` module itself: `import React from
+/// "react"` and `import * as R from "react"`. `R.useMemo(...)` is React's
+/// hook only through one of these bindings (see `ImportCtx::callee_is_react`).
+fn build_react_ns(program: &Program) -> HashSet<String> {
+    let mut ns = HashSet::new();
+    for stmt in &program.body {
+        let Statement::ImportDeclaration(decl) = stmt else {
+            continue;
+        };
+        if decl.source.value.as_str() != "react" {
+            continue;
+        }
+        let Some(specifiers) = &decl.specifiers else {
+            continue;
+        };
+        for spec in specifiers {
+            match spec {
+                ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                    ns.insert(s.local.name.to_string());
+                }
+                ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
+                    ns.insert(s.local.name.to_string());
+                }
+                ImportDeclarationSpecifier::ImportSpecifier(_) => {}
+            }
+        }
+    }
+    ns
 }
 
 /// Collect module-level `const` bindings whose initializer kind is
@@ -175,13 +205,21 @@ pub fn lower_custom_hooks_with_resolver(
     let import_map = build_import_map(program);
     let resolved_import_map: HashMap<String, PathBuf> =
         build_resolved_import_map(program, file, resolver);
-    detect_custom_hooks(program)
+    let react_ns = build_react_ns(program);
+    let candidates = detect_custom_hooks(program);
+    let local_hooks: HashSet<String> = candidates.iter().map(|c| c.name.clone()).collect();
+    let imports = hook_extractor::ImportCtx {
+        import_map: &import_map,
+        resolved_import_map: &resolved_import_map,
+        react_ns: &react_ns,
+        local_hooks: &local_hooks,
+    };
+    candidates
         .into_iter()
         .map(|candidate| {
             let (params, mut body_cfg) =
                 build_fn_body_cfg(candidate.params, candidate.body, line_starts);
-            let (mut hooks, mut next_label) =
-                extract_hooks(&mut body_cfg, &import_map, &resolved_import_map);
+            let (mut hooks, mut next_label) = extract_hooks(&mut body_cfg, &imports);
             extract_handlers(&body_cfg, &mut hooks, &mut next_label);
             extract_subscriptions(&mut hooks, &mut next_label);
             HookIR {
@@ -216,13 +254,23 @@ pub fn lower_program_with_resolver(
     let resolved_import_map: HashMap<String, PathBuf> =
         build_resolved_import_map(program, file, resolver);
     let module_consts = Arc::new(collect_module_consts(program));
+    let react_ns = build_react_ns(program);
+    let local_hooks: HashSet<String> = detect_custom_hooks(program)
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    let imports = hook_extractor::ImportCtx {
+        import_map: &import_map,
+        resolved_import_map: &resolved_import_map,
+        react_ns: &react_ns,
+        local_hooks: &local_hooks,
+    };
     detect_components(program)
         .into_iter()
         .map(|candidate| {
             let (param_names, mut render_cfg) =
                 build_fn_body_cfg(candidate.params, candidate.body, line_starts);
-            let (mut hooks, mut next_label) =
-                extract_hooks(&mut render_cfg, &import_map, &resolved_import_map);
+            let (mut hooks, mut next_label) = extract_hooks(&mut render_cfg, &imports);
             extract_handlers(&render_cfg, &mut hooks, &mut next_label);
             extract_subscriptions(&mut hooks, &mut next_label);
             let param = param_names

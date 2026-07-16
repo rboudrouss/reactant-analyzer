@@ -2,7 +2,7 @@
 
 ## Known false negatives (FN)
 
-- **React-hook name collision** — hook classification is name-based with no import-source check: a local hook literally named `useMemo` (memos `useMemoQueries.ts`) is classified as React's `useMemo`. Its args are then force-fitted (`useMemo(name, {enabled})` → fallback body + deps `[]` via `unwrap_or_default`) → the binding silently gets a wrong value and the hook body is never inlined. Fix: classify React hooks only when imported from `react` (or unimported); the import map is already available at extraction (`HookEntry::Custom::import_source`).
+- **Aliased React hook imports stay Custom** — `import { useMemo as useM } from "react"`: classification keys on the LOCAL name (`useM` matches no React arm) → Custom with `import_source: "react"` → not analyzed as a memo. Rare pattern; fixing it needs the *imported* name in the import map, not just the local binding. (The reverse collision — a custom hook literally named `useMemo` — is handled: classification is import-aware, see `ImportCtx::callee_is_react`.)
 
 - **Unknown callees without `Loc`** — `myHelper(() => setX())` → FN if `myHelper` is imported from an npm package (not in the analyzed files) or if inlining was cut off by depth. **Local** utilities are now inlined (ADR-013 Phase 3) but only in **statement** position; in expression position they stay opaque. *(ADR-010, ADR-013)*
 

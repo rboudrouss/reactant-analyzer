@@ -132,13 +132,16 @@ fn extract_arrow_hook_name(arrow: &ArrowFunctionExpression) -> Option<String> {
 
 /// Returns `true` iff `name` is a user-defined custom hook.
 /// Rule: starts with `use`, length > 3, not a React built-in hook.
+/// Any locally-defined `use*` function is a custom hook — INCLUDING one named
+/// like a React built-in (`function useMemo(name, options)`, memos): JS
+/// scoping makes the local definition shadow the React import/global, and the
+/// call-site classification (`ImportCtx::callee_is_react`) relies on these
+/// names to resolve the collision.
 fn is_custom_hook(name: &str) -> bool {
-    if !name.starts_with("use") || name.len() <= 3 {
-        return false;
-    }
-    !is_builtin_hook(name)
+    name.starts_with("use") && name.len() > 3
 }
 
+#[cfg(test)]
 const BUILTIN_HOOKS: &[&str] = &[
     "useState",
     "useEffect",
@@ -156,10 +159,6 @@ const BUILTIN_HOOKS: &[&str] = &[
     "useDebugValue",
     "useSyncExternalStore",
 ];
-
-fn is_builtin_hook(name: &str) -> bool {
-    BUILTIN_HOOKS.contains(&name)
-}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -212,13 +211,16 @@ mod tests {
     }
 
     #[test]
-    fn builtin_hooks_excluded() {
+    fn shadowing_builtin_names_detected() {
+        // A local definition shadows the React import/global (JS scoping);
+        // it must be a candidate so call sites resolve to it, not to React.
         for builtin in BUILTIN_HOOKS {
             let src = format!("function {builtin}() {{}}");
             let names = hook_names(&src);
-            assert!(
-                names.is_empty(),
-                "{builtin} should be excluded but got {names:?}"
+            assert_eq!(
+                names,
+                vec![builtin.to_string()],
+                "local {builtin} must be detected as a custom hook"
             );
         }
     }
