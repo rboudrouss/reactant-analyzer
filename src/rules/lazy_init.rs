@@ -1,15 +1,36 @@
+use std::collections::HashSet;
+
 use crate::{
     engine::ProgramAnalysisResult,
-    ir::{hooks::HookEntry, types::Symbol},
+    ir::{expr::Expr, hooks::HookEntry, types::Symbol, types::Var},
 };
 
-use super::{Diagnostic, Rule};
+use super::{Diagnostic, Rule, Severity, setter_var_labels};
 
 /// Fires when `useState(...)` is initialised with an expression that contains
 /// any function call (e.g. `useState(expensiveCompute())`, `useState(1 + f())`).
 /// React evaluates the init argument on every render but only uses the result
 /// on mount so the call is wasted work on every render after mount.
 /// The fix is the lazy-initialiser form: `useState(() => expensiveCompute())`.
+///
+/// This goes beyond a syntactic linter on two axes the abstract-interpretation
+/// pipeline uniquely enables:
+///
+/// 1. **Data-flow to the call.** [`arg_is_call_free`] chases the call through
+///    local bindings, so a call hidden behind a `const`/temp is still seen:
+///    ```js
+///    const initial = buildTree(props.data);
+///    const [t] = useState(initial);   // ❌  linter sees `useState(initial)` — opaque
+///    ```
+/// 2. **Effect classification of the call** (see [`InitEffect`]), which grades
+///    severity instead of firing one flat warning:
+///    - a state-setter call in init runs a state write every render → `Error`;
+///    - a side-effecting/async call (`fetch`, `subscribe`, `setTimeout`, …)
+///      re-fires the *effect* every render (leaked subscriptions/requests, not
+///      just wasted CPU) → `Warning` with a distinct message;
+///    - a proven-cheap pure builtin (`Math.*`, `Date.now`, …) → `Info`
+///      (advisory; wrapping is optional), which keeps the corpus quiet;
+///    - anything else (unknown callee) → `Warning`, as before.
 ///
 /// Patterns matched (any call anywhere in the init expression):
 /// ```js
@@ -26,6 +47,22 @@ use super::{Diagnostic, Rule};
 /// - `useState(props.value)` FieldAccess, call-free.
 pub struct LazyInit;
 
+/// Nature of the call(s) inside a `useState` initialiser, ordered by how much
+/// the finding matters. `Effectful`/`PureCheap` carry the callee name for the
+/// message. Classification is a heuristic *refinement* of severity — the
+/// trigger stays "a call is present" (sound: no false negative), and only the
+/// severity/wording changes.
+enum InitEffect {
+    /// A state setter is invoked in init — a state write on every render.
+    Setter,
+    /// A known side-effecting or async call re-fires its effect every render.
+    Effectful(String),
+    /// Only proven-cheap pure builtins — wrapping is advisory.
+    PureCheap(String),
+    /// A call whose purity/cost we cannot judge.
+    Unknown,
+}
+
 impl Rule for LazyInit {
     fn name(&self) -> &'static str {
         "lazy-init"
@@ -33,6 +70,12 @@ impl Rule for LazyInit {
 
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
         let result = &result.components[component];
+        // #1 chases a call through a local binding, but only when that binding is
+        // used exactly once (at the init). A `const x = f()` statement runs on
+        // every render regardless, so if `x` is read elsewhere the call is not
+        // wasted work specific to the init — flagging it would be a false
+        // positive (the lazy form cannot defer a value still needed elsewhere).
+        let setters: HashSet<Var> = setter_var_labels(&result.render_cfg).into_keys().collect();
         let mut diags = Vec::new();
 
         for hook in &result.hooks {
@@ -42,17 +85,53 @@ impl Rule for LazyInit {
             else {
                 continue;
             };
+            // Fire only on a call that is syntactically part of the init. We do
+            // NOT chase calls through local bindings: after custom-hook inlining
+            // an already-lazy `useState(() => f())` is flattened to a temp bound
+            // to `f()`, which is indistinguishable from an eager
+            // `const x = f(); useState(x)` — chasing would flag correct lazy code
+            // (corpus FP: `useMediaQuery`). See git history / notes.
             if init.is_call_free() {
                 continue;
             }
-            let mut d = Diagnostic::new(
-                "lazy-init",
-                "this useState is initialised by a direct function call \
-                 the call runs on every render but the result is only used on mount; \
-                 wrap as `useState(() => …)` to defer it"
-                    .to_string(),
-            )
-            .with_label(*label);
+
+            // #2: grade by what the call actually does.
+            let (severity, message) = match classify_init_effect(init, &setters) {
+                InitEffect::Setter => (
+                    Severity::Error,
+                    "this useState init calls a state setter — it runs a state write on \
+                     every render (the result is discarded after mount); move the call \
+                     into an effect or event handler"
+                        .to_string(),
+                ),
+                InitEffect::Effectful(name) => (
+                    Severity::Warning,
+                    format!(
+                        "this useState init calls `{name}`, which has side effects, on every \
+                         render — the result is only used on mount, so every later render \
+                         repeats the effect (duplicate subscriptions/requests/timers, not \
+                         just wasted work); wrap as `useState(() => …)`"
+                    ),
+                ),
+                InitEffect::PureCheap(name) => (
+                    Severity::Info,
+                    format!(
+                        "this useState init calls `{name}` on every render; the call is cheap \
+                         and pure, so wrapping as `useState(() => …)` is optional"
+                    ),
+                ),
+                InitEffect::Unknown => (
+                    Severity::Warning,
+                    "this useState is initialised by a direct function call \
+                     the call runs on every render but the result is only used on mount; \
+                     wrap as `useState(() => …)` to defer it"
+                        .to_string(),
+                ),
+            };
+
+            let mut d = Diagnostic::new("lazy-init", message)
+                .with_severity(severity)
+                .with_label(*label);
             if let Some(r) = span {
                 d = d.with_range(*r);
             }
@@ -61,6 +140,130 @@ impl Rule for LazyInit {
 
         diags
     }
+}
+
+/// Classify the call(s) syntactically present in `init`. Precedence:
+/// `Setter` > `Effectful` > `Unknown` > `PureCheap` — a single unknown or
+/// effectful call is enough to lose the "all cheap and pure" verdict.
+fn classify_init_effect(init: &Expr, setters: &HashSet<Var>) -> InitEffect {
+    let mut callees: Vec<&Expr> = Vec::new();
+    collect_callees(init, &mut callees);
+
+    let mut effectful: Option<String> = None;
+    let mut pure_name: Option<String> = None;
+    let mut has_unknown = false;
+
+    for callee in callees {
+        match classify_callee(callee, setters) {
+            Callee::Setter => return InitEffect::Setter,
+            Callee::Effectful(n) => effectful.get_or_insert(n),
+            Callee::PureCheap(n) => pure_name.get_or_insert(n),
+            Callee::Other => {
+                has_unknown = true;
+                continue;
+            }
+        };
+    }
+
+    match (effectful, pure_name) {
+        (Some(n), _) => InitEffect::Effectful(n),
+        // A pure-cheap verdict needs an actual pure call AND no unknown call.
+        // `has_unknown` also covers the no-`Call`-callee case (e.g. a `CompApp`/
+        // `NativeElem` init that is not call-free but has no plain callee).
+        (None, Some(n)) if !has_unknown => InitEffect::PureCheap(n),
+        _ => InitEffect::Unknown,
+    }
+}
+
+/// Collect the callee (`fn_`) of every `Call` syntactically present in `e`,
+/// descending into arguments and composites.
+fn collect_callees<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match e {
+        Expr::Call { fn_, args } => {
+            out.push(fn_);
+            collect_callees(fn_, out);
+            for a in args {
+                collect_callees(a, out);
+            }
+        }
+        // Rendering a component/element in init is real work with an unknown
+        // cost — register it (classified `Other`) so it is never demoted to a
+        // cheap-and-pure Info, then keep descending for nested calls in props.
+        Expr::CompApp { .. } | Expr::NativeElem { .. } => {
+            out.push(e);
+            e.for_each_child(&mut |c| collect_callees(c, out));
+        }
+        _ => e.for_each_child(&mut |c| collect_callees(c, out)),
+    }
+}
+
+enum Callee {
+    Setter,
+    Effectful(String),
+    PureCheap(String),
+    Other,
+}
+
+/// Classify a single call target. Setters are proven (the engine tracks them);
+/// the effectful/pure sets are small, high-precision name heuristics.
+fn classify_callee(fn_: &Expr, setters: &HashSet<Var>) -> Callee {
+    let fn_ = match fn_ {
+        Expr::TSAnnotated(inner, _) => inner.as_ref(),
+        other => other,
+    };
+    match fn_ {
+        Expr::StateSetter(_) => Callee::Setter,
+        Expr::Var(v) if setters.contains(v) => Callee::Setter,
+        Expr::Var(name) => name_class(name.as_str(), None),
+        Expr::FieldAccess { obj, field } => {
+            let root = match obj.as_ref() {
+                Expr::Var(v) => Some(v.as_str()),
+                _ => None,
+            };
+            name_class(field.as_str(), root)
+        }
+        _ => Callee::Other,
+    }
+}
+
+/// Map a callee `method` (with an optional receiver root, e.g. `Math` in
+/// `Math.floor`) to its effect class. Side-effecting/async methods are matched
+/// by method name regardless of receiver; the pure set is restricted to O(1)
+/// builtins so demotion to `Info` never hides genuinely expensive work.
+fn name_class(method: &str, obj_root: Option<&str>) -> Callee {
+    const EFFECTFUL: &[&str] = &[
+        "fetch",
+        "subscribe",
+        "addEventListener",
+        "removeEventListener",
+        "setInterval",
+        "setTimeout",
+        "requestAnimationFrame",
+        "requestIdleCallback",
+        "postMessage",
+    ];
+    if EFFECTFUL.contains(&method) {
+        return Callee::Effectful(match obj_root {
+            Some(r) => format!("{r}.{method}"),
+            None => method.to_string(),
+        });
+    }
+    match obj_root {
+        Some("Math") => return Callee::PureCheap(format!("Math.{method}")),
+        Some("Date") if method == "now" => return Callee::PureCheap("Date.now".to_string()),
+        Some("performance") if method == "now" => {
+            return Callee::PureCheap("performance.now".to_string());
+        }
+        None if matches!(
+            method,
+            "parseInt" | "parseFloat" | "isNaN" | "isFinite" | "Number" | "Boolean"
+        ) =>
+        {
+            return Callee::PureCheap(method.to_string());
+        }
+        _ => {}
+    }
+    Callee::Other
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -234,6 +437,100 @@ mod tests {
         }];
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
         assert!(LazyInit.check(&prog(&result), &"C".to_string()).is_empty());
+    }
+
+    fn component_with_render(
+        hooks: Vec<HookEntry>,
+        stmts: Vec<crate::ir::stmt::Stmt>,
+    ) -> ComponentIR {
+        let mut blocks = HashMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts,
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        ComponentIR {
+            file: std::path::PathBuf::new(),
+            name: "C".to_string(),
+            param: "props".to_string(),
+            render_cfg: CFG {
+                entry: 0,
+                blocks,
+                edges: vec![],
+            },
+            hooks,
+            module_consts: Default::default(),
+        }
+    }
+
+    #[test]
+    fn call_behind_binding_is_not_chased() {
+        // const initial = buildTree(props); const [t] = useState(initial);
+        // The init is `Var("initial")` — call-free. We deliberately do NOT chase
+        // through the binding: after custom-hook inlining an already-lazy
+        // `useState(() => f())` flattens to the same shape, so chasing would flag
+        // correct lazy code (corpus FP: `useMediaQuery`).
+        use crate::ir::stmt::Stmt;
+        let stmts = vec![Stmt::Let {
+            var: "initial".to_string(),
+            rhs: Expr::Call {
+                fn_: Box::new(Expr::Var("buildTree".to_string())),
+                args: vec![Expr::Var("props".to_string())],
+            },
+            span: None,
+        }];
+        let hooks = vec![HookEntry::State {
+            label: 0,
+            init: Expr::Var("initial".to_string()),
+            span: None,
+        }];
+        let result = analyze_component(
+            component_with_render(hooks, stmts),
+            &StateValueTransfer,
+            &Config::default(),
+        );
+        assert!(LazyInit.check(&prog(&result), &"C".to_string()).is_empty());
+    }
+
+    #[test]
+    fn effectful_call_is_warning_with_effect_message() {
+        // useState(fetch(url)) — side effect re-fires every render.
+        let hooks = vec![HookEntry::State {
+            label: 0,
+            init: Expr::Call {
+                fn_: Box::new(Expr::Var("fetch".to_string())),
+                args: vec![Expr::Var("url".to_string())],
+            },
+            span: None,
+        }];
+        let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
+        let diags = LazyInit.check(&prog(&result), &"C".to_string());
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Severity::Warning);
+        assert!(diags[0].message.contains("side effects"));
+    }
+
+    #[test]
+    fn pure_cheap_builtin_is_info() {
+        // useState(Math.random()) — cheap pure, demoted to Info (advisory).
+        let hooks = vec![HookEntry::State {
+            label: 0,
+            init: Expr::Call {
+                fn_: Box::new(Expr::FieldAccess {
+                    obj: Box::new(Expr::Var("Math".to_string())),
+                    field: "random".to_string(),
+                }),
+                args: vec![],
+            },
+            span: None,
+        }];
+        let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
+        let diags = LazyInit.check(&prog(&result), &"C".to_string());
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Severity::Info);
     }
 
     #[test]

@@ -111,7 +111,11 @@ pub const RULE_DOCS: &[RuleDoc] = &[
         summary: "useState initializer calls a function on every render",
         explanation: "`useState(f())` evaluates `f()` on every render but uses the result \
                       only on mount — wasted work on each subsequent render. The lazy form \
-                      `useState(() => f())` runs it once.",
+                      `useState(() => f())` runs it once. Severity is graded by what the call \
+                      does: a state-setter call is an Error (state write every render); a \
+                      side-effecting/async call (`fetch`, `subscribe`, `setTimeout`) is a \
+                      Warning (the effect re-fires, not just wasted CPU); a proven-cheap pure \
+                      builtin (`Math.*`, `Date.now`) is Info (advisory).",
         example: "const [data, setData] = useState(expensiveParse(blob));",
         fix: "const [data, setData] = useState(() => expensiveParse(blob));",
     },

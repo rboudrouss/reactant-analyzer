@@ -165,6 +165,65 @@ impl Diagnostic {
     }
 }
 
+/// Every RHS assigned to each variable in `cfg` (a var may be written on
+/// multiple paths — a lowered ternary/logical temp is). Used to chase a
+/// call hidden behind a local binding (`const x = f(); useState(x)`), which a
+/// syntactic linter cannot follow.
+pub(crate) fn local_bindings(cfg: &CFG) -> HashMap<&str, Vec<&Expr>> {
+    let mut map: HashMap<&str, Vec<&Expr>> = HashMap::new();
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            if let Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } = stmt {
+                map.entry(var.as_str()).or_default().push(rhs);
+            }
+        }
+    }
+    map
+}
+
+/// Like [`Expr::is_call_free`], but a `Var` bound to local temp(s) is call-free
+/// only when *every* binding is — so a call hidden behind a branch temp or a
+/// local `const` is seen. Vars with no local binding (params, props, state) are
+/// plain values. Cycle-safe via `seen`.
+pub(crate) fn arg_is_call_free(
+    e: &Expr,
+    bindings: &HashMap<&str, Vec<&Expr>>,
+    seen: &mut HashSet<Var>,
+) -> bool {
+    match e {
+        Expr::Call { .. } | Expr::CompApp { .. } | Expr::NativeElem { .. } => false,
+        Expr::Var(v) => match bindings.get(v.as_str()) {
+            Some(rhss) => {
+                if !seen.insert(v.clone()) {
+                    return true; // cycle: no new call evidence
+                }
+                rhss.iter().all(|r| arg_is_call_free(r, bindings, seen))
+            }
+            None => true,
+        },
+        Expr::Lit(_)
+        | Expr::StateVal(_)
+        | Expr::StateSetter(_)
+        | Expr::MemoVal(_)
+        | Expr::CallbackVal(_)
+        | Expr::SummaryVal(_)
+        | Expr::FnLit { .. } => true,
+        Expr::ObjectLit { fields, .. } => fields
+            .iter()
+            .all(|(_, v)| arg_is_call_free(v, bindings, seen)),
+        Expr::ArrayLit { elems, .. } => elems.iter().all(|x| arg_is_call_free(x, bindings, seen)),
+        Expr::FieldAccess { obj, .. } => arg_is_call_free(obj, bindings, seen),
+        Expr::IndexAccess { arr, idx } => {
+            arg_is_call_free(arr, bindings, seen) && arg_is_call_free(idx, bindings, seen)
+        }
+        Expr::BinOp { lhs, rhs, .. } => {
+            arg_is_call_free(lhs, bindings, seen) && arg_is_call_free(rhs, bindings, seen)
+        }
+        Expr::UnaryOp { arg, .. } => arg_is_call_free(arg, bindings, seen),
+        Expr::TSAnnotated(inner, _) => arg_is_call_free(inner, bindings, seen),
+    }
+}
+
 /// Post-pass analysis rule operating on a fully-computed `AnalysisResult`.
 ///
 /// Rules are stateless; adding a new rule = new struct + `impl Rule`.
