@@ -46,6 +46,21 @@ impl Rule for InfiniteLoop {
         "infinite-loop"
     }
 
+    fn safe_check(
+        &self,
+        result: &ProgramAnalysisResult,
+        component: &Symbol,
+    ) -> Option<super::SafeCheck> {
+        use crate::engine::HookKind;
+        // A render→effect→setState cycle needs both a state slot and an effect.
+        (super::has_hook_kind(result, component, HookKind::State)
+            && super::has_hook_kind(result, component, HookKind::Effect))
+        .then_some(super::SafeCheck {
+            rule: self.name(),
+            message: "no effect diverges into an infinite render loop",
+        })
+    }
+
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
         let comp_result = &result.components[component];
 

@@ -27,6 +27,20 @@ impl Rule for RedundantSetState {
         "redundant-set-state"
     }
 
+    fn safe_check(
+        &self,
+        result: &ProgramAnalysisResult,
+        component: &Symbol,
+    ) -> Option<super::SafeCheck> {
+        use crate::engine::HookKind;
+        (super::has_hook_kind(result, component, HookKind::State)
+            && super::has_hook_kind(result, component, HookKind::Effect))
+        .then_some(super::SafeCheck {
+            rule: self.name(),
+            message: "no setState writes the value the state already holds",
+        })
+    }
+
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
         let result = &result.components[component];
         let transfer = StateValueTransfer;

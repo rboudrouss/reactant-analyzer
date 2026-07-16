@@ -24,6 +24,22 @@ impl Rule for MissingDeps {
         "missing-deps"
     }
 
+    fn safe_check(
+        &self,
+        result: &ProgramAnalysisResult,
+        component: &Symbol,
+    ) -> Option<super::SafeCheck> {
+        // Applicable when some effect/memo/callback declared a deps array.
+        result
+            .components
+            .get(component)
+            .is_some_and(|c| c.effect_info.values().any(|e| e.has_deps_array))
+            .then_some(super::SafeCheck {
+                rule: self.name(),
+                message: "every effect declares the variables it reads",
+            })
+    }
+
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
         let result = &result.components[component];
         let env_exit = result.exit_env();

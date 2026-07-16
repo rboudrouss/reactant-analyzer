@@ -32,6 +32,28 @@ impl Rule for UnnecessaryRerender {
         "unnecessary-rerender"
     }
 
+    fn safe_check(
+        &self,
+        result: &ProgramAnalysisResult,
+        component: &Symbol,
+    ) -> Option<super::SafeCheck> {
+        use crate::engine::HookKind;
+        // Needs a state slot and a mount-only (`deps: []`) effect to overwrite it.
+        result
+            .components
+            .get(component)
+            .is_some_and(|c| {
+                c.hook_calls.iter().any(|h| h.kind == HookKind::State)
+                    && c.effect_info.values().any(|e| {
+                        e.kind == HookKind::Effect && e.has_deps_array && e.declared_deps.is_empty()
+                    })
+            })
+            .then_some(super::SafeCheck {
+                rule: self.name(),
+                message: "no mount effect overwrites its initial state",
+            })
+    }
+
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
         let result = &result.components[component];
         let empty_env = AbstractEnv::bottom();

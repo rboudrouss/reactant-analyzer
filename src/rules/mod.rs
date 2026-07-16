@@ -33,7 +33,7 @@ use crate::{
         AbstractEnv, AnalysisCtx, StateValue, StateValueTransfer, Transfer,
         stores::{EnvVal, Heap, HeapValue, MemoStore, StateStore},
     },
-    engine::{AnalysisResult, ProgramAnalysisResult},
+    engine::{AnalysisResult, HookKind, ProgramAnalysisResult},
     ir::{
         SourceRange,
         cfg::{CFG, Terminator},
@@ -165,6 +165,33 @@ impl Diagnostic {
     }
 }
 
+/// A check that was *applicable* to a component and found nothing wrong —
+/// surfaced under `--info` as positive assurance ("verified: …").
+///
+/// Distinct from an absent diagnostic: emptiness alone cannot tell "the
+/// infinite-loop check ran and the component is safe" from "there was no
+/// useState/useEffect for it to check". A `SafeCheck` records the former only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeCheck {
+    /// Diagnostic name the assurance corresponds to (matches `RuleDoc::name`).
+    pub rule: &'static str,
+    /// Present-tense assurance, e.g. "no effect diverges into an infinite loop".
+    pub message: &'static str,
+}
+
+/// `true` when `component` called at least one hook of `kind`. The applicability
+/// primitive for `Rule::safe_check`.
+pub(crate) fn has_hook_kind(
+    result: &ProgramAnalysisResult,
+    component: &Symbol,
+    kind: HookKind,
+) -> bool {
+    result
+        .components
+        .get(component)
+        .is_some_and(|c| c.hook_calls.iter().any(|h| h.kind == kind))
+}
+
 /// Every RHS assigned to each variable in `cfg` (a var may be written on
 /// multiple paths — a lowered ternary/logical temp is). Used to chase a
 /// call hidden behind a local binding (`const x = f(); useState(x)`), which a
@@ -230,6 +257,21 @@ pub(crate) fn arg_is_call_free(
 pub trait Rule {
     fn name(&self) -> &'static str;
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic>;
+
+    /// When this rule is *applicable* to `component` but `check` found nothing,
+    /// the positive assurance to surface under `--info`.
+    ///
+    /// Only consulted after `check` returned no diagnostics for the component,
+    /// so implementations decide *applicability* only — they need not re-check.
+    /// Default `None`: the rule opts out (e.g. Info-limitation rules, which have
+    /// no "safe" state to report).
+    fn safe_check(
+        &self,
+        _result: &ProgramAnalysisResult,
+        _component: &Symbol,
+    ) -> Option<SafeCheck> {
+        None
+    }
 }
 
 /// A setter call found by `collect_setter_calls`.

@@ -33,6 +33,8 @@ Corpus state: bulletproof-react 0, shadcn-admin 0, excalidraw 1 W, memos 1 E + 1
 
 ### Diagnostics UX (side-finding)
 
+- **Real explanatory trace / witness chain** — today `--trace` only prints the `notes` a rule chose to attach (one-off, hand-built per rule). Want a *structured provenance chain* reconstructed from the analysis: for each finding, why it fired + the conditions along the way. E.g. `lazy-init` should show `useState(f())` → `f` resolves to import `./util` → that body calls `fetch(...)` (proven non-pure) → hence Warning. `infinite-loop` should show the widening path (which effect write, which slot version grew, which guard failed to converge). Needs: (1) rules to emit a typed witness (call/import/branch/widen steps) instead of free-text `Note`; (2) each step carrying `(file, line:col)` — blocked on the ADR-011 limitation that `SourceRange` carries no file, so cross-file steps currently can't point at the right file; (3) renderer walks the chain. Gate the depth so pathological chains stay bounded. Related: the `--trace` flag + `Note` model already in place, and *Cross-component blame* below (provenance in the message).
+
 - **Cross-component blame** — `always-unstable-deps` on a prop-rooted dep blames the *child* (memos `MentionResolutionProvider`) when the instability comes from a specific parent call site (`MemoDetail.tsx` passes an unmemoized array). The propagation is semantically correct (verified: the provider analyzed alone is silent); the message should carry the provenance ("unstable because `<Parent>` passes a fresh array at file:line"). An `OnProps` label family in the ADR-017 frame would make this provenance first-class — worth doing for the *message*, no FP to fix.
 
 ### Escaping-setter chase bounds

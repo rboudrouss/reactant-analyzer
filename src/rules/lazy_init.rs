@@ -68,6 +68,18 @@ impl Rule for LazyInit {
         "lazy-init"
     }
 
+    fn safe_check(
+        &self,
+        result: &ProgramAnalysisResult,
+        component: &Symbol,
+    ) -> Option<super::SafeCheck> {
+        use crate::engine::HookKind;
+        super::has_hook_kind(result, component, HookKind::State).then_some(super::SafeCheck {
+            rule: self.name(),
+            message: "no useState initializer re-runs work on every render",
+        })
+    }
+
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
         let result = &result.components[component];
         // #1 chases a call through a local binding, but only when that binding is

@@ -36,7 +36,9 @@ reactant check src/ --ignore-rule lazy-init      # all but this one
 | `--project auto\|vite\|plain` | Project-kind handling. `auto` (default) detects from marker files; `vite` forces Vite conventions; `plain` disables detection. |
 | `--rule <name>` | Only report this diagnostic (repeatable). Unknown name → exit 2. |
 | `--ignore-rule <name>` | Suppress this diagnostic (repeatable). |
-| `--info` | Also display `Info` diagnostics (known analysis limits: widening, recursion cutoff, unknown hooks). |
+| `--info` | Also display `Info` diagnostics (known analysis limits: widening, recursion cutoff, unknown hooks), plus — per shown component — the applicable checks that ran and found nothing (`verified: …`). A check is listed only when it was applicable (e.g. `infinite-loop` appears only when the component has both a state slot and an effect). |
+| `--show-clean` | Show components with no findings (hidden by default). Without it, a trailing note reports how many clean components were hidden. |
+| `--trace` | Show each finding's causal chain — the `→` trace notes (e.g. "handler `onClick` also calls this setter"). Hidden by default; a finding with notes shows a `(N trace step(s) — rerun with --trace)` hint instead. `json` output always includes notes. |
 | `--entry <names>` | Explicit root components. Repeatable or comma-separated (`--entry Foo,Bar`). On a name collision across files, use `Foo@/abs/path.tsx` (shown in the output). |
 | `--all-roots` | Analyze every component as an entry point (`props = ⊤`). |
 | `--verbose` | Debug output on stderr: symbol graph topo order, fixpoint stats, per-component iterations/widened labels. |

@@ -41,6 +41,19 @@ impl Rule for SetterInRender {
         "setter-in-render"
     }
 
+    fn safe_check(
+        &self,
+        result: &ProgramAnalysisResult,
+        component: &Symbol,
+    ) -> Option<super::SafeCheck> {
+        use crate::engine::HookKind;
+        // Local setters exist iff the component has a useState slot.
+        super::has_hook_kind(result, component, HookKind::State).then_some(super::SafeCheck {
+            rule: self.name(),
+            message: "no setter is called during render",
+        })
+    }
+
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
         let comp_result = &result.components[component];
 

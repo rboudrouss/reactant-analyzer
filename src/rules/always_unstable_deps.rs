@@ -35,6 +35,22 @@ impl Rule for AlwaysUnstableDeps {
         "always-unstable-deps"
     }
 
+    fn safe_check(
+        &self,
+        result: &ProgramAnalysisResult,
+        component: &Symbol,
+    ) -> Option<super::SafeCheck> {
+        // Applicable when some hook declared a non-empty deps array to defeat.
+        result
+            .components
+            .get(component)
+            .is_some_and(|c| c.effect_info.values().any(|e| !e.declared_deps.is_empty()))
+            .then_some(super::SafeCheck {
+                rule: self.name(),
+                message: "no deps array is defeated by an always-fresh reference",
+            })
+    }
+
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
         let result = &result.components[component];
         let env_exit = result.exit_env();

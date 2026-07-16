@@ -9,7 +9,7 @@ use reactant::{
     engine::{ComponentRegistry, Config, RootStrategy, SymbolGraph},
     project::{self, ProjectKind},
     resolver::{DefaultFileDiscoverer, FileDiscoverer, analyze_lowered, lower_files},
-    rules::{Diagnostic, Severity, all_rules, rule_doc},
+    rules::{Diagnostic, SafeCheck, Severity, all_rules, rule_doc},
 };
 
 use super::{EXIT_FINDINGS, EXIT_OK, EXIT_USAGE, FailOn, OutputFormat, ProjectMode};
@@ -20,9 +20,18 @@ pub struct CheckArgs {
     /// Directories are walked recursively for .ts/.tsx/.js/.jsx files.
     pub paths: Vec<String>,
 
-    /// Show Info diagnostics (known analysis limitations, e.g. widening)
+    /// Show Info diagnostics (analysis limitations) plus, per shown component,
+    /// the applicable checks that ran and passed ("verified: …")
     #[arg(long)]
     pub info: bool,
+
+    /// Show components with no findings (hidden by default)
+    #[arg(long)]
+    pub show_clean: bool,
+
+    /// Show each finding's causal chain (the `→` trace notes)
+    #[arg(long)]
+    pub trace: bool,
 
     /// Verbose debug output (symbol graph, fixpoint stats) on stderr
     #[arg(long)]
@@ -68,6 +77,9 @@ pub struct ComponentReport {
     pub file: Option<PathBuf>,
     pub hook_count: usize,
     pub diagnostics: Vec<Diagnostic>,
+    /// Applicable checks that ran on this component and found nothing.
+    /// Surfaced only under `--info`.
+    pub safe_checks: Vec<SafeCheck>,
 }
 
 /// Everything the renderers need.
@@ -254,10 +266,20 @@ pub fn run(mut args: CheckArgs) -> i32 {
             );
         }
 
-        let mut diags: Vec<Diagnostic> = rules
-            .iter()
-            .flat_map(|r| r.check(&program_result, name))
-            .collect();
+        // Per rule: collect its diagnostics; when it produced none, consult
+        // `safe_check` — a rule reports "verified safe" only when it was
+        // applicable to this component (see the `SafeCheck` doc).
+        let mut diags: Vec<Diagnostic> = Vec::new();
+        let mut safe_checks: Vec<SafeCheck> = Vec::new();
+        for r in &rules {
+            let produced = r.check(&program_result, name);
+            if produced.is_empty()
+                && let Some(sc) = r.safe_check(&program_result, name)
+            {
+                safe_checks.push(sc);
+            }
+            diags.extend(produced);
+        }
         // Total order: rules iterate HashMaps internally, so same-key ties
         // (many `analysis-limit` Infos, several notes on one slot) come back
         // in a run-dependent order — tie-break on position, then content, so
@@ -286,6 +308,12 @@ pub fn run(mut args: CheckArgs) -> i32 {
                 && !args.ignore_rule.iter().any(|r| r == d.rule)
                 && (d.severity != Severity::Info || args.info)
         });
+        // Same allowlist/ignore filtering as diagnostics; deterministic order.
+        safe_checks.retain(|s| {
+            (args.rule.is_empty() || args.rule.iter().any(|r| r == s.rule))
+                && !args.ignore_rule.iter().any(|r| r == s.rule)
+        });
+        safe_checks.sort_by(|a, b| a.rule.cmp(b.rule));
 
         errors += diags
             .iter()
@@ -310,6 +338,7 @@ pub fn run(mut args: CheckArgs) -> i32 {
             file,
             hook_count,
             diagnostics: diags,
+            safe_checks,
         });
     }
 
@@ -334,7 +363,13 @@ pub fn run(mut args: CheckArgs) -> i32 {
 
 fn render(report: &CheckReport, args: &CheckArgs, format: OutputFormat) {
     match format {
-        OutputFormat::Human => super::output_human::render(report, args.no_color),
+        OutputFormat::Human => super::output_human::render(
+            report,
+            args.no_color,
+            args.show_clean,
+            args.info,
+            args.trace,
+        ),
         OutputFormat::Json => super::output_json::render(report),
     }
 }

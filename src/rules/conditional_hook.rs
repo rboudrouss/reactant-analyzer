@@ -17,6 +17,22 @@ impl Rule for ConditionalHook {
         "conditional-hook"
     }
 
+    fn safe_check(
+        &self,
+        result: &ProgramAnalysisResult,
+        component: &Symbol,
+    ) -> Option<super::SafeCheck> {
+        // Applicable as soon as the component calls any hook at all.
+        result
+            .components
+            .get(component)
+            .is_some_and(|c| !c.hook_calls.is_empty())
+            .then_some(super::SafeCheck {
+                rule: self.name(),
+                message: "all hooks run unconditionally, in a stable order",
+            })
+    }
+
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
         let result = &result.components[component];
         let exits: Vec<_> = result
