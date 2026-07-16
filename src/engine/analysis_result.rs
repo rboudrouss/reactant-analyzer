@@ -9,6 +9,7 @@ use crate::{
         SourceRange,
         cfg::{CFG, Terminator},
         expr::Expr,
+        free_vars::AccessPath,
         hooks::HookEntry,
         types::{BlockId, HookLabel, Symbol, Var},
     },
@@ -58,8 +59,10 @@ pub struct EffectInfo {
     pub label: HookLabel,
     /// Which hook this info came from (Effect / Memo / Callback).
     pub kind: HookKind,
-    /// Variables used in the body but not locally defined within it.
-    pub free_vars: HashSet<Var>,
+    /// Access paths read in the body but not locally defined within it —
+    /// member-chain granular (`x.a`, not just `x`) so `missing-deps` matches
+    /// a dep against the exact field used (TODO.md F1b).
+    pub free_paths: HashSet<AccessPath>,
     /// Deps array as declared by the caller (`[]` = empty, `None` = absent).
     pub declared_deps: Vec<Expr>,
     /// `true` when caller wrote an explicit deps array (even `[]`).

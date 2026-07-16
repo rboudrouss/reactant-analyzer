@@ -1118,3 +1118,80 @@ function A() {
         "optional call is a call, not a render-derivable expression: {fired:?}"
     );
 }
+
+// ── F1b: path-granular free variables ─────────────────────────────────────────
+
+#[test]
+fn f1b_sibling_field_dep_mismatch_warns() {
+    // use(x.a) with deps [x.b]: `x.b` is not a prefix of `x.a`. The
+    // var-granular F1 credited `[x.b]` to whole `x` and silenced this;
+    // path granularity recovers the stale-closure warning.
+    let src = r#"
+function A({ x }) {
+  useEffect(() => {
+    console.log(x.a);
+  }, [x.b]);
+  return <div />;
+}
+"#;
+    let diags = diagnostics(src);
+    assert!(
+        diags
+            .iter()
+            .any(|(r, m)| r == "missing-deps" && m.contains("x.a")),
+        "use(x.a) with deps [x.b] must warn on x.a: {diags:?}"
+    );
+}
+
+#[test]
+fn f1b_exact_field_dep_is_covered() {
+    // use(x.a) with deps [x.a]: exact path covered, no warning.
+    let src = r#"
+function A({ x }) {
+  useEffect(() => {
+    console.log(x.a);
+  }, [x.a]);
+  return <div />;
+}
+"#;
+    let fired = rules_fired(src);
+    assert!(
+        !fired.iter().any(|r| r == "missing-deps"),
+        "[x.a] covers use(x.a): {fired:?}"
+    );
+}
+
+#[test]
+fn f1b_field_dep_covers_deeper_use() {
+    // use(x.a.b) with deps [x.a]: declaring x.a covers the deeper read.
+    let src = r#"
+function A({ x }) {
+  useEffect(() => {
+    console.log(x.a.b);
+  }, [x.a]);
+  return <div />;
+}
+"#;
+    let fired = rules_fired(src);
+    assert!(
+        !fired.iter().any(|r| r == "missing-deps"),
+        "[x.a] covers use(x.a.b): {fired:?}"
+    );
+}
+
+#[test]
+fn f1b_whole_object_read_needs_whole_dep() {
+    // memos/LocationPicker repro: `x ?? DEFAULT` reads the whole object, only
+    // covered by declaring `x` — not `[x.a, x.b]`.
+    let src = r#"
+function A({ x }) {
+  const v = useMemo(() => toThing(x ?? DEFAULT), [x.a, x.b]);
+  return <div>{v}</div>;
+}
+"#;
+    let fired = rules_fired(src);
+    assert!(
+        fired.iter().any(|r| r == "missing-deps"),
+        "whole-object read is not covered by field deps: {fired:?}"
+    );
+}

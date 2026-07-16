@@ -6,7 +6,7 @@ use crate::{
     ir::{
         cfg::CFG,
         expr::Expr,
-        free_vars::compute_free_vars,
+        free_vars::{AccessPath, compute_free_vars, dep_paths, path_covered},
         stmt::Stmt,
         types::{Symbol, Var},
     },
@@ -30,25 +30,27 @@ impl Rule for MissingDeps {
         let mut diags = Vec::new();
 
         for (label, info) in &result.effect_info {
-            let declared: HashSet<Var> = dep_var_names(&info.declared_deps);
-
             if !info.has_deps_array {
                 // no deps array → runs every render → no stale capture
                 continue;
             }
 
-            for var in &info.free_vars {
-                if declared.contains(var) {
+            let declared: Vec<AccessPath> = dep_paths(&info.declared_deps);
+
+            for path in &info.free_paths {
+                if path_covered(path, &declared) {
                     continue;
                 }
                 // Globals (fetch, console, …) are not in env_exit → skip.
-                if !env_exit.contains(var) {
+                if !env_exit.contains(&path.root) {
                     continue;
                 }
-                let val = env_exit.lookup(var);
+                // Stability is a property of the whole slot: if the root
+                // reference never changes, no field of it can go stale.
+                let val = env_exit.lookup(&path.root);
                 if !val.is_stable()
                     && !closure_is_behaviorally_stable(
-                        var,
+                        &path.root,
                         &result.render_cfg,
                         &env_exit,
                         &mut HashSet::new(),
@@ -57,16 +59,15 @@ impl Rule for MissingDeps {
                     let mut d = Diagnostic::new(
                         "missing-deps",
                         format!(
-                            "variable `{}` is used in {} {} but not in its deps array, \
-                             and {}",
-                            var,
+                            "`{}` is used in {} {} but not in its deps array, and {}",
+                            path,
                             hook_kind_word(info.kind),
                             label,
                             super::describe_value(&val)
                         ),
                     )
                     .with_label(*label)
-                    .with_var(var.clone());
+                    .with_var(path.root.clone());
                     if let Some(r) = info.span {
                         d = d.with_range(r);
                     }
@@ -159,14 +160,6 @@ fn fn_lit_binding<'c>(var: &str, cfg: &'c CFG) -> Option<(&'c [Var], &'c CFG)> {
     found
 }
 
-/// Variables covered by the deps array: each dep credits its root variable
-/// (`[memo.content]` covers `memo` — see `ir::free_vars::dep_root`).
-fn dep_var_names(deps: &[Expr]) -> HashSet<Var> {
-    deps.iter()
-        .filter_map(|e| crate::ir::free_vars::dep_root(e).cloned())
-        .collect()
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -250,6 +243,17 @@ mod tests {
         env
     }
 
+    /// Free-path set from bare root names (no member segments).
+    fn fp(roots: &[&str]) -> HashSet<AccessPath> {
+        roots
+            .iter()
+            .map(|r| AccessPath {
+                root: (*r).to_string(),
+                segments: vec![],
+            })
+            .collect()
+    }
+
     #[test]
     fn missing_unstable_dep_warns() {
         let mut effect_info = HashMap::new();
@@ -258,7 +262,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Effect,
-                free_vars: HashSet::from(["n".to_string()]),
+                free_paths: fp(&["n"]),
                 declared_deps: vec![Expr::Lit(Prim::Bool(true))],
                 has_deps_array: true,
                 span: None,
@@ -284,7 +288,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Effect,
-                free_vars: HashSet::from(["setN".to_string()]),
+                free_paths: fp(&["setN"]),
                 declared_deps: vec![Expr::Lit(Prim::Unit)],
                 has_deps_array: true,
                 span: None,
@@ -312,7 +316,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Effect,
-                free_vars: HashSet::from(["n".to_string()]),
+                free_paths: fp(&["n"]),
                 declared_deps: vec![Expr::Var("n".to_string())],
                 has_deps_array: true,
                 span: None,
@@ -333,16 +337,19 @@ mod tests {
     }
 
     #[test]
-    fn member_expression_dep_covers_root_var() {
-        // useEffect(() => use(memo.content), [memo.content]) — F1: the
-        // FieldAccess dep must credit `memo`, silencing the FP.
+    fn member_expression_dep_covers_same_path() {
+        // useEffect(() => use(memo.content), [memo.content]) — the exact path
+        // is declared, so no warning (F1).
         let mut effect_info = HashMap::new();
         effect_info.insert(
             0,
             EffectInfo {
                 label: 0,
                 kind: HookKind::Effect,
-                free_vars: HashSet::from(["memo".to_string()]),
+                free_paths: HashSet::from([AccessPath {
+                    root: "memo".to_string(),
+                    segments: vec!["content".to_string()],
+                }]),
                 declared_deps: vec![Expr::FieldAccess {
                     obj: Box::new(Expr::Var("memo".to_string())),
                     field: "content".to_string(),
@@ -362,7 +369,75 @@ mod tests {
             MissingDeps
                 .check(&prog(&result), &"C".to_string())
                 .is_empty(),
-            "[memo.content] must cover uses of `memo`"
+            "[memo.content] must cover use of memo.content"
+        );
+    }
+
+    #[test]
+    fn sibling_field_mismatch_warns() {
+        // F1b: useEffect(() => use(memo.a), [memo.b]) — `memo.b` does NOT
+        // cover `memo.a`. The var-granular F1 silenced this; paths recover it.
+        let mut effect_info = HashMap::new();
+        effect_info.insert(
+            0,
+            EffectInfo {
+                label: 0,
+                kind: HookKind::Effect,
+                free_paths: HashSet::from([AccessPath {
+                    root: "memo".to_string(),
+                    segments: vec!["a".to_string()],
+                }]),
+                declared_deps: vec![Expr::FieldAccess {
+                    obj: Box::new(Expr::Var("memo".to_string())),
+                    field: "b".to_string(),
+                }],
+                has_deps_array: true,
+                span: None,
+            },
+        );
+        let mut block_states = HashMap::new();
+        block_states.insert(
+            0,
+            env_with(&[("memo", StateValue::reference(Stability::PerRender))]),
+        );
+
+        let result = make_result(block_states, effect_info, trivial_cfg());
+        let diags = MissingDeps.check(&prog(&result), &"C".to_string());
+        assert_eq!(diags.len(), 1, "memo.a not covered by [memo.b]");
+        assert!(diags[0].message.contains("memo.a"), "{}", diags[0].message);
+    }
+
+    #[test]
+    fn whole_var_dep_covers_field_use() {
+        // useEffect(() => use(memo.a), [memo]) — declaring whole memo covers
+        // any field.
+        let mut effect_info = HashMap::new();
+        effect_info.insert(
+            0,
+            EffectInfo {
+                label: 0,
+                kind: HookKind::Effect,
+                free_paths: HashSet::from([AccessPath {
+                    root: "memo".to_string(),
+                    segments: vec!["a".to_string()],
+                }]),
+                declared_deps: vec![Expr::Var("memo".to_string())],
+                has_deps_array: true,
+                span: None,
+            },
+        );
+        let mut block_states = HashMap::new();
+        block_states.insert(
+            0,
+            env_with(&[("memo", StateValue::reference(Stability::PerRender))]),
+        );
+
+        let result = make_result(block_states, effect_info, trivial_cfg());
+        assert!(
+            MissingDeps
+                .check(&prog(&result), &"C".to_string())
+                .is_empty(),
+            "[memo] must cover memo.a"
         );
     }
 
@@ -375,7 +450,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Effect,
-                free_vars: HashSet::from(["other".to_string()]),
+                free_paths: fp(&["other"]),
                 declared_deps: vec![Expr::FieldAccess {
                     obj: Box::new(Expr::Var("memo".to_string())),
                     field: "content".to_string(),
@@ -402,7 +477,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Effect,
-                free_vars: HashSet::from(["n".to_string()]),
+                free_paths: fp(&["n"]),
                 declared_deps: vec![],
                 has_deps_array: false,
                 span: None,
@@ -433,7 +508,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Effect,
-                free_vars: HashSet::from(["n".to_string()]),
+                free_paths: fp(&["n"]),
                 declared_deps: vec![],
                 has_deps_array: true,
                 span: None,
@@ -463,7 +538,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Effect,
-                free_vars: HashSet::from(["x".to_string()]),
+                free_paths: fp(&["x"]),
                 declared_deps: vec![Expr::Lit(Prim::Unit)],
                 has_deps_array: true,
                 span: None,
@@ -487,7 +562,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Callback,
-                free_vars: HashSet::from(["n".to_string()]),
+                free_paths: fp(&["n"]),
                 declared_deps: vec![],
                 has_deps_array: true,
                 span: None,
@@ -518,7 +593,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Memo,
-                free_vars: HashSet::from(["n".to_string()]),
+                free_paths: fp(&["n"]),
                 declared_deps: vec![],
                 has_deps_array: true,
                 span: None,
@@ -548,7 +623,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Callback,
-                free_vars: HashSet::from(["n".to_string()]),
+                free_paths: fp(&["n"]),
                 declared_deps: vec![Expr::Var("n".to_string())],
                 has_deps_array: true,
                 span: None,
@@ -576,7 +651,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Effect,
-                free_vars: HashSet::from(["fetch".to_string()]),
+                free_paths: fp(&["fetch"]),
                 declared_deps: vec![Expr::Lit(Prim::Unit)],
                 has_deps_array: true,
                 span: None,

@@ -11,7 +11,7 @@ use crate::{
         cfg::CFG,
         component::{ComponentIR, ModuleConstInit},
         expr::{Expr, SummaryValue},
-        free_vars::compute_free_vars,
+        free_vars::{compute_free_paths, compute_free_vars},
         hooks::HookEntry,
         stmt::Stmt,
         types::{BlockId, HookLabel},
@@ -986,7 +986,7 @@ fn collect_effect_info(hooks: &[HookEntry]) -> HashMap<HookLabel, EffectInfo> {
                 EffectInfo {
                     label: *label,
                     kind: HookKind::Effect,
-                    free_vars: compute_free_vars(body_cfg),
+                    free_paths: compute_free_paths(body_cfg),
                     has_deps_array: deps.is_some(),
                     declared_deps: deps.clone().unwrap_or_default(),
                     span: *span,
@@ -1002,7 +1002,7 @@ fn collect_effect_info(hooks: &[HookEntry]) -> HashMap<HookLabel, EffectInfo> {
                 EffectInfo {
                     label: *label,
                     kind: HookKind::Memo,
-                    free_vars: compute_free_vars(body_cfg),
+                    free_paths: compute_free_paths(body_cfg),
                     has_deps_array: true,
                     declared_deps: deps.clone(),
                     span: *span,
@@ -1019,14 +1019,12 @@ fn collect_effect_info(hooks: &[HookEntry]) -> HashMap<HookLabel, EffectInfo> {
                 EffectInfo {
                     label: *label,
                     kind: HookKind::Callback,
-                    free_vars: {
+                    free_paths: {
                         // The callback's own params are bound, not captured
                         // (they shadow any same-named outer binding).
-                        let mut fv = compute_free_vars(body_cfg);
-                        for p in params {
-                            fv.remove(p);
-                        }
-                        fv
+                        let mut fp = compute_free_paths(body_cfg);
+                        fp.retain(|p| !params.contains(&p.root));
+                        fp
                     },
                     has_deps_array: true,
                     declared_deps: deps.clone(),
@@ -1758,8 +1756,8 @@ mod tests {
         let comp = component(hooks, vec![]);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         let info = &result.effect_info[&0];
-        assert!(info.free_vars.contains("n"));
-        assert!(info.free_vars.contains("setN"));
+        assert!(info.free_paths.iter().any(|p| p.root == "n"));
+        assert!(info.free_paths.iter().any(|p| p.root == "setN"));
     }
 
     #[test]
@@ -2495,9 +2493,9 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         let info = &result.effect_info[&0];
         assert!(
-            info.free_vars.contains("x"),
+            info.free_paths.iter().any(|p| p.root == "x"),
             "x appears only in Branch cond must be a free var"
         );
-        assert!(info.free_vars.contains("setN"));
+        assert!(info.free_paths.iter().any(|p| p.root == "setN"));
     }
 }

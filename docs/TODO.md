@@ -26,9 +26,9 @@
 
 ## Remaining from corpus bench 2026-07-15
 
-Corpus state after the final `missing-deps` pass (regression suite: `tests/corpus_fp_fixes.rs`): bulletproof-react 0, shadcn-admin 0, excalidraw 1 W, memos 1 E + 9 W — every remaining finding is a triaged true positive or advice, except the excalidraw `setValue` warning (per-slot summaries, above).
+Corpus state after F1b (path-granular free vars): bulletproof-react 0, shadcn-admin 0, excalidraw 1 W, memos 1 E + 12 W. F1b recovered 3 previously-silenced findings (memos `App` ×2, `LocationPicker`), all the same class: an object read *whole* (in a `if (!x)` guard or `x ?? default`) while only its fields are declared (`[x?.locale]`, `[latlng?.lat, latlng?.lng]`) — `eslint-plugin-react-hooks` reports these too. Benign in these cases (the whole-ref read is a truthiness/nullish test) but a real path mismatch. Regression suite: `tests/corpus_fp_fixes.rs`.
 
-- **F1b — path-granular free variables** — crediting a member dep (`[x.b]`) to its root var silences the genuine mismatch case `use(x.a)` with deps `[x.b]` (warned *by accident* before F1). Recovering it needs paths as first-class in `compute_free_vars` + path-vs-path dep matching.
+- **Whole-object read via guard/nullish is flagged** — the 3 findings above. A truthiness test (`if (!x)`) or nullish default (`x ?? d`) reads the whole reference, so declaring only fields doesn't cover it. Distinguishing "value use" from "existence check" would need tracking *how* the whole ref is consumed — deferred; keeping the (sound, eslint-aligned) warning.
 - **Never-written state refinement** — `useState(CONST)` with no reachable setter call could read `Stable` (dep omittable) instead of `Versioned`. Needs a post-fixpoint "slot ever written" bit; marginal gain. *(ADR-017 §Limitations)*
 
 ### Diagnostics UX (side-finding)
