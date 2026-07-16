@@ -24,6 +24,10 @@
 
 - **Churn-cycle Warning on convergent multi-writer pairs** — the F5b convergence kill requires a single effect write-site per slot (ADR-018); a guarded fetch-once write coexisting with another writer of the same slot keeps its edge even when the pair in fact converges. Precise alternative: narrow guards against the join of all writers' values.
 
+- **`infinite-loop` — compound guard reading the same slot not proven convergent** (chakra `Provider`, shadow-dom sandbox). `useEffect(() => { if (!ready \|\| cache) return; setCache(fresh()) }, [shadow, cache])`: the early-return guard `\|\| cache` reads the slot it writes, so once `cache` is set the effect no-ops — it converges. `converges_once_written` *should* kill it but `guard_var` only extracts the constrained var from a bare `Var`, a leading `!Var`, or a `BinOp{lhs: Var}`; a compound boolean (`a \|\| b`, `a && b`) yields `None` → no slot narrowed to ⊥ → convergence unproven → Warning FP. Fix: recurse `guard_var` through `&&`/`\|\|` operands (with `narrow_env_for_branch` already handling the compound cond), so a slot narrowed to ⊥ inside any operand proves convergence.
+
+- **`setter-in-render` — guarded render-body setState is a sanctioned pattern** (excalidraw `ToolPopover`). `if (!options.some(...) && isPopupOpen) setIsPopupOpen(false)` — React explicitly allows calling a setter *during render* when it is conditional and adjusts state derived from props/state (the "adjusting state when a prop changes" idiom); the guard reads the slot it writes (`isPopupOpen`), so it converges after one extra render, no loop. The rule has no convergence proof at all — it warns on any reached setter call (Warning for conditional, so severity is right, but still noise). Fix: reuse the same slot-read-guard convergence check as `infinite-loop` to suppress the guarded-and-convergent case.
+
 ## Remaining from corpus bench 2026-07-15
 
 Corpus state: bulletproof-react 0, shadcn-admin 0, excalidraw 1 W, memos 1 E + 12 W — everything triaged TP/advice. Regression suite: `tests/corpus_fp_fixes.rs`.
