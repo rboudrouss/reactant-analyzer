@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::ir::source_range::SourceRange;
 use oxc_ast::ast::*;
+use oxc_span::GetSpan;
 
 use std::sync::Arc;
 
@@ -352,10 +353,12 @@ fn lower_ternary(cond: &ConditionalExpression, builder: &mut BlockBuilder) -> Ex
     let join_id = builder.new_block();
     let tmp = builder.fresh_temp();
 
+    let span = builder.span_at(cond.test.span().start);
     let bid = builder.seal_with(Terminator::Branch {
         cond: test,
         then_: then_id,
         else_: else_id,
+        span,
     });
     builder.add_edge(bid, then_id, EdgeKind::IfTrue);
     builder.add_edge(bid, else_id, EdgeKind::IfFalse);
@@ -414,10 +417,12 @@ fn lower_logical(log: &LogicalExpression, builder: &mut BlockBuilder) -> Expr {
         LogicalOperator::Or | LogicalOperator::Coalesce => (join_id, rhs_id), // truthy → join (keep a); falsy → rhs
     };
 
+    let span = builder.span_at(log.left.span().start);
     let bid = builder.seal_with(Terminator::Branch {
         cond: Expr::Var(tmp.clone()),
         then_,
         else_,
+        span,
     });
     builder.add_edge(
         bid,

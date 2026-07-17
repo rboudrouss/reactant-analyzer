@@ -152,6 +152,7 @@ mod tests {
                 id: 0,
                 stmts: vec![],
                 term: Terminator::Branch {
+                    span: None,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 1,
                     else_: 2,

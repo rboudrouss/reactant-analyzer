@@ -1027,7 +1027,7 @@ fn expand_guard<'a>(
             let diamond = !extra_bindings
                 && matches!(
                     &cfg.blocks.get(&let_block).map(|blk| &blk.term),
-                    Some(Terminator::Branch { cond: c, then_, else_ })
+                    Some(Terminator::Branch { cond: c, then_, else_, .. })
                         if matches!(c, Expr::Var(v) if v == t)
                             && (*then_ == rhs_block || *else_ == rhs_block)
                 );
@@ -1884,6 +1884,7 @@ mod tests {
                 id: 1,
                 stmts: vec![],
                 term: Terminator::Branch {
+                    span: None,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 2,
                     else_: 3,

@@ -93,7 +93,9 @@ pub fn analyze_cfg<'inter, T: Transfer>(
         let outgoing: Vec<(BlockId, AbstractEnv<T::Domain>)> =
             if let Some(block) = cfg.blocks.get(&b) {
                 match &block.term {
-                    Terminator::Branch { cond, then_, else_ } => {
+                    Terminator::Branch {
+                        cond, then_, else_, ..
+                    } => {
                         let then_env = narrow_env_for_branch(&env_out, cond, true);
                         let else_env = narrow_env_for_branch(&env_out, cond, false);
                         vec![(*then_, then_env), (*else_, else_env)]
@@ -356,6 +358,7 @@ mod tests {
                 id: 1,
                 stmts: vec![],
                 term: Terminator::Branch {
+                    span: None,
                     cond: Expr::BinOp {
                         op: crate::ir::expr::BinOp::Lt,
                         lhs: Box::new(Expr::Var("i".to_string())),
@@ -584,6 +587,7 @@ mod tests {
                 id: 0,
                 stmts: vec![],
                 term: Terminator::Branch {
+                    span: None,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 1,
                     else_: 2,
@@ -692,6 +696,7 @@ mod tests {
                     span: None,
                 }],
                 term: Terminator::Branch {
+                    span: None,
                     cond: Expr::BinOp {
                         op: BinOp::Lt,
                         lhs: Box::new(Expr::Var("x".to_string())),

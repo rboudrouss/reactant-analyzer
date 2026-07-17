@@ -907,6 +907,7 @@ mod tests {
                 id: 0,
                 stmts: vec![],
                 term: Terminator::Branch {
+                    span: None,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 1,
                     else_: 2,
@@ -1026,6 +1027,7 @@ mod tests {
                 id: 1,
                 stmts: vec![],
                 term: Terminator::Branch {
+                    span: None,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 2,
                     else_: 3,
@@ -1145,6 +1147,7 @@ mod tests {
                 id: 1,
                 stmts: vec![],
                 term: Terminator::Branch {
+                    span: None,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 2,
                     else_: 4,

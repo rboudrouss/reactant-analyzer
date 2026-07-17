@@ -347,6 +347,7 @@ mod tests {
                     span: None,
                 }],
                 term: Terminator::Branch {
+                    span: None,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 1,
                     else_: 2,

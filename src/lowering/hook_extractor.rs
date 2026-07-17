@@ -377,7 +377,7 @@ fn process_stmt(
                     out.push(Stmt::Let {
                         var,
                         rhs: hook_result_expr(&name, is_react, lbl),
-                        span: None,
+                        span: stmt_span,
                     });
                 }
             }
@@ -385,7 +385,7 @@ fn process_stmt(
                 out.push(Stmt::Let {
                     var,
                     rhs: rewrite_expr(rhs, state_temps),
-                    span: None,
+                    span: stmt_span,
                 });
             }
         },
@@ -409,14 +409,14 @@ fn process_stmt(
                 // useEffect and similar void hooks: no stmt emitted.
             }
             Err(expr) => {
-                out.push(Stmt::ExprStmt(rewrite_expr(expr, state_temps), None));
+                out.push(Stmt::ExprStmt(rewrite_expr(expr, state_temps), stmt_span));
             }
         },
-        Stmt::Assign { var, rhs, .. } => {
+        Stmt::Assign { var, rhs, span } => {
             out.push(Stmt::Assign {
                 var,
                 rhs: rewrite_expr(rhs, state_temps),
-                span: None,
+                span,
             });
         }
     }

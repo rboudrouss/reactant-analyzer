@@ -9,9 +9,27 @@ use crate::{
 
 use super::{Diagnostic, Rule, Severity};
 
-/// Site of the closest dominating `Branch` terminator — the guard that makes
-/// the hook call conditional. Span: the branch block's last statement (the
-/// condition is evaluated there), falling back to `None`.
+/// `true` iff `to` is reachable from `from` by following CFG edges.
+fn reaches(cfg: &CFG, from: BlockId, to: BlockId) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![from];
+    while let Some(b) = stack.pop() {
+        if b == to {
+            return true;
+        }
+        if seen.insert(b) {
+            stack.extend(cfg.successors(b));
+        }
+    }
+    false
+}
+
+/// Site of the closest dominating `Branch` terminator that actually makes the
+/// hook call conditional: at least one of its successors never reaches the
+/// hook block. A dominating diamond that re-joins *before* the hook (e.g. the
+/// internal control flow of an inlined utility) dominates but skips nothing —
+/// it must not be blamed as the guard. Span: the branch's own span (where the
+/// condition is evaluated), falling back to the branch block's last statement.
 fn guard_site(cfg: &CFG, block: BlockId) -> Option<(BlockId, Option<SourceRange>)> {
     let doms = compute_dominators(cfg);
     let dominators = doms.get(&block)?;
@@ -25,17 +43,22 @@ fn guard_site(cfg: &CFG, block: BlockId) -> Option<(BlockId, Option<SourceRange>
                     cfg.blocks.get(&d).map(|b| &b.term),
                     Some(Terminator::Branch { .. })
                 )
+                && cfg.successors(d).iter().any(|&s| !reaches(cfg, s, block))
         })
         .max_by_key(|&&d| doms.get(&d).map_or(0, |s| s.len()))
         .map(|&d| {
-            let span = cfg
-                .blocks
-                .get(&d)
-                .and_then(|b| b.stmts.last())
-                .and_then(|s| match s {
-                    crate::ir::stmt::Stmt::Let { span, .. } => *span,
-                    crate::ir::stmt::Stmt::ExprStmt(_, span) => *span,
-                    crate::ir::stmt::Stmt::Assign { span, .. } => *span,
+            let guard = cfg.blocks.get(&d);
+            let span = guard
+                .and_then(|b| match &b.term {
+                    Terminator::Branch { span, .. } => *span,
+                    _ => None,
+                })
+                .or_else(|| {
+                    guard.and_then(|b| b.stmts.last()).and_then(|s| match s {
+                        crate::ir::stmt::Stmt::Let { span, .. } => *span,
+                        crate::ir::stmt::Stmt::ExprStmt(_, span) => *span,
+                        crate::ir::stmt::Stmt::Assign { span, .. } => *span,
+                    })
                 });
             (d, span)
         })
@@ -216,6 +239,7 @@ mod tests {
                 id: 0,
                 stmts: vec![],
                 term: Terminator::Branch {
+                    span: None,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 1,
                     else_: 2,
@@ -272,6 +296,166 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn guard_note_carries_branch_condition_span() {
+        // Early-return shape: the guard block has no statements, so the note's
+        // location must come from the Branch terminator's own span.
+        let mut cfg = diamond_cfg();
+        let cond_span = crate::ir::SourceRange {
+            file: crate::ir::FileTable::default().intern(std::path::Path::new("t.tsx")),
+            line: 27,
+            col: 6,
+        };
+        if let Some(b) = cfg.blocks.get_mut(&0)
+            && let Terminator::Branch { span, .. } = &mut b.term
+        {
+            *span = Some(cond_span);
+        }
+        let result = make_result(
+            cfg,
+            vec![HookCallInfo {
+                label: 0,
+                kind: HookKind::State,
+                block_id: 1,
+                span: None,
+            }],
+        );
+        let diags = ConditionalHook.check(&prog(&result), &"C".to_string());
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].notes.len(), 1);
+        assert_eq!(diags[0].notes[0].range, Some(cond_span));
+    }
+
+    #[test]
+    fn rejoining_diamond_between_guard_and_hook_is_not_blamed() {
+        // 0: Branch(guard) → 1 (early return) / 2
+        // 2: Branch(diamond, e.g. inlined utility) → 3 / 4, both rejoin at 5
+        // 5: hook block, → Return
+        // The diamond at 2 dominates the hook and is deeper than 0, but both
+        // its paths reach the hook — the guard note must point at 0.
+        let mut files = crate::ir::FileTable::default();
+        let file = files.intern(std::path::Path::new("t.tsx"));
+        let guard_span = crate::ir::SourceRange {
+            file,
+            line: 27,
+            col: 6,
+        };
+        let diamond_span = crate::ir::SourceRange {
+            file,
+            line: 69,
+            col: 9,
+        };
+        let mut blocks = HashMap::new();
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![],
+                term: Terminator::Branch {
+                    span: Some(guard_span),
+                    cond: Expr::Lit(Prim::Bool(true)),
+                    then_: 1,
+                    else_: 2,
+                },
+            },
+        );
+        blocks.insert(
+            1,
+            BasicBlock {
+                id: 1,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        blocks.insert(
+            2,
+            BasicBlock {
+                id: 2,
+                stmts: vec![],
+                term: Terminator::Branch {
+                    span: Some(diamond_span),
+                    cond: Expr::Lit(Prim::Bool(true)),
+                    then_: 3,
+                    else_: 4,
+                },
+            },
+        );
+        blocks.insert(
+            3,
+            BasicBlock {
+                id: 3,
+                stmts: vec![],
+                term: Terminator::Jump(5),
+            },
+        );
+        blocks.insert(
+            4,
+            BasicBlock {
+                id: 4,
+                stmts: vec![],
+                term: Terminator::Jump(5),
+            },
+        );
+        blocks.insert(
+            5,
+            BasicBlock {
+                id: 5,
+                stmts: vec![],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        let edges = vec![
+            Edge {
+                from: 0,
+                to: 1,
+                kind: EdgeKind::IfTrue,
+            },
+            Edge {
+                from: 0,
+                to: 2,
+                kind: EdgeKind::IfFalse,
+            },
+            Edge {
+                from: 2,
+                to: 3,
+                kind: EdgeKind::IfTrue,
+            },
+            Edge {
+                from: 2,
+                to: 4,
+                kind: EdgeKind::IfFalse,
+            },
+            Edge {
+                from: 3,
+                to: 5,
+                kind: EdgeKind::Unconditional,
+            },
+            Edge {
+                from: 4,
+                to: 5,
+                kind: EdgeKind::Unconditional,
+            },
+        ];
+        let cfg = CFG {
+            entry: 0,
+            blocks,
+            edges,
+        };
+        let result = make_result(
+            cfg,
+            vec![HookCallInfo {
+                label: 0,
+                kind: HookKind::State,
+                block_id: 5,
+                span: None,
+            }],
+        );
+        let diags = ConditionalHook.check(&prog(&result), &"C".to_string());
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].notes.len(), 1);
+        assert_eq!(diags[0].notes[0].range, Some(guard_span));
     }
 
     #[test]
@@ -425,6 +609,7 @@ mod tests {
                 id: 0,
                 stmts: vec![],
                 term: Terminator::Branch {
+                    span: None,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 1,
                     else_: 2,

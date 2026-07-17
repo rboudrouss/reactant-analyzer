@@ -16,6 +16,9 @@ pub enum Terminator {
         cond: Expr,
         then_: BlockId,
         else_: BlockId,
+        /// Where the condition is evaluated in the source (None for
+        /// synthetic branches and manual-IR tests).
+        span: Option<crate::ir::SourceRange>,
     },
     Return(Expr),
     Unreachable,

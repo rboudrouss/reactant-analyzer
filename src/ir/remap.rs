@@ -110,10 +110,16 @@ fn remap_stmt(stmt: Stmt, offset: HookLabel) -> Stmt {
 fn remap_terminator(term: Terminator, offset: HookLabel) -> Terminator {
     match term {
         Terminator::Return(e) => Terminator::Return(remap_expr(e, offset)),
-        Terminator::Branch { cond, then_, else_ } => Terminator::Branch {
+        Terminator::Branch {
+            cond,
+            then_,
+            else_,
+            span,
+        } => Terminator::Branch {
             cond: remap_expr(cond, offset),
             then_,
             else_,
+            span,
         },
         t @ (Terminator::Jump(_) | Terminator::Unreachable) => t,
     }

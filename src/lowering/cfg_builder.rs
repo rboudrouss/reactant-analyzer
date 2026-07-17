@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use oxc_ast::ast::*;
+use oxc_span::GetSpan;
 
 use crate::{
     ir::{
@@ -209,10 +210,12 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
             lower_stmt(&dw.body, builder);
             if !builder.is_terminated() {
                 let cond = lower_expr(&dw.test, builder);
+                let span = builder.span_at(dw.test.span().start);
                 let b = builder.seal_with(Terminator::Branch {
                     cond,
                     then_: body_block,
                     else_: exit_block,
+                    span,
                 });
                 builder.add_edge(b, body_block, EdgeKind::Back);
                 builder.add_edge(b, exit_block, EdgeKind::IfFalse);
@@ -283,6 +286,7 @@ fn lower_if(
     builder: &mut BlockBuilder,
 ) {
     let cond = lower_expr(test, builder);
+    let span = builder.span_at(test.span().start);
     let then_block = builder.new_block();
     let else_block = builder.new_block();
     let join_block = builder.new_block();
@@ -291,6 +295,7 @@ fn lower_if(
         cond,
         then_: then_block,
         else_: else_block,
+        span,
     });
     builder.add_edge(branch_id, then_block, EdgeKind::IfTrue);
     builder.add_edge(branch_id, else_block, EdgeKind::IfFalse);
@@ -327,10 +332,12 @@ fn lower_while(test: &Expression, body: &Statement, builder: &mut BlockBuilder) 
 
     builder.start_block(header);
     let cond = lower_expr(test, builder);
+    let span = builder.span_at(test.span().start);
     let h = builder.seal_with(Terminator::Branch {
         cond,
         then_: body_block,
         else_: exit_block,
+        span,
     });
     builder.add_edge(h, body_block, EdgeKind::IfTrue);
     builder.add_edge(h, exit_block, EdgeKind::IfFalse);
@@ -378,6 +385,9 @@ fn lower_for(
     builder.add_edge(pre, header, EdgeKind::Unconditional);
 
     builder.start_block(header);
+    let span = test
+        .map(|e| e.span().start)
+        .and_then(|o| builder.span_at(o));
     let cond = test
         .map(|e| lower_expr(e, builder))
         .unwrap_or(Expr::Lit(Prim::Bool(true)));
@@ -385,6 +395,7 @@ fn lower_for(
         cond,
         then_: body_block,
         else_: exit_block,
+        span,
     });
     builder.add_edge(h, body_block, EdgeKind::IfTrue);
     builder.add_edge(h, exit_block, EdgeKind::IfFalse);
@@ -421,6 +432,7 @@ fn lower_iter_loop(body: &Statement, builder: &mut BlockBuilder) {
         cond: Expr::Lit(Prim::Bool(true)),
         then_: body_block,
         else_: exit_block,
+        span: None,
     });
     builder.add_edge(h, body_block, EdgeKind::IfTrue);
     builder.add_edge(h, exit_block, EdgeKind::IfFalse);

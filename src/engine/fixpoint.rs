@@ -1340,10 +1340,16 @@ fn splice_one_call(
         // Remap embedded BlockIds in terminators.
         block.term = match std::mem::replace(&mut block.term, Terminator::Unreachable) {
             Terminator::Jump(t) => Terminator::Jump(t + block_offset),
-            Terminator::Branch { cond, then_, else_ } => Terminator::Branch {
+            Terminator::Branch {
+                cond,
+                then_,
+                else_,
+                span,
+            } => Terminator::Branch {
                 cond,
                 then_: then_ + block_offset,
                 else_: else_ + block_offset,
+                span,
             },
             Terminator::Return(ret_expr) => {
                 if let Some(var) = &bound_var {
@@ -1505,6 +1511,7 @@ mod tests {
                 id: 0,
                 stmts: vec![],
                 term: Terminator::Branch {
+                    span: None,
                     cond: Expr::BinOp {
                         op: crate::ir::expr::BinOp::Lt,
                         lhs: Box::new(Expr::Var("x".to_string())),
@@ -2124,6 +2131,7 @@ mod tests {
                 id: 1,
                 stmts: vec![],
                 term: Terminator::Branch {
+                    span: None,
                     cond: Expr::Lit(Prim::Bool(true)),
                     then_: 2,
                     else_: 3,
@@ -2323,6 +2331,7 @@ mod tests {
                 id: 0,
                 stmts: vec![],
                 term: Terminator::Branch {
+                    span: None,
                     cond: Expr::BinOp {
                         op: crate::ir::expr::BinOp::Gt,
                         lhs: Box::new(Expr::Var("count".to_string())),
@@ -2480,6 +2489,7 @@ mod tests {
                 id: 0,
                 stmts: vec![],
                 term: Terminator::Branch {
+                    span: None,
                     cond: Expr::BinOp {
                         op: crate::ir::expr::BinOp::Gt,
                         lhs: Box::new(Expr::Var("x".to_string())),
