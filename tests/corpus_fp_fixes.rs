@@ -9,7 +9,7 @@ use oxc_span::SourceType;
 use reactant::{
     domains::StateValueTransfer,
     engine::{Config, analyze_component},
-    lowering::{compute_line_starts, lower_program},
+    lowering::lower_program,
     rules::all_rules,
 };
 
@@ -19,8 +19,12 @@ fn diagnostics(src: &str) -> Vec<(String, String)> {
         .with_options(ParseOptions::default())
         .parse();
     assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
-    let line_starts = compute_line_starts(src);
-    let components = lower_program(&ret.program, &line_starts, std::path::Path::new("test.tsx"));
+    let components = lower_program(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    );
     assert!(!components.is_empty(), "no component detected");
 
     let mut components_map = std::collections::HashMap::new();
@@ -37,6 +41,8 @@ fn diagnostics(src: &str) -> Vec<(String, String)> {
         call_graph: reactant::engine::ComponentCallGraph::new(),
         recursive_components: std::collections::HashSet::new(),
         stats: reactant::engine::AnalysisStats::default(),
+        file_table: Default::default(),
+        function_registry: Default::default(),
     };
 
     let mut out = Vec::new();
@@ -61,8 +67,12 @@ fn diagnostics_sev(src: &str) -> Vec<(String, reactant::rules::Severity, String)
         .with_options(ParseOptions::default())
         .parse();
     assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
-    let line_starts = compute_line_starts(src);
-    let components = lower_program(&ret.program, &line_starts, std::path::Path::new("test.tsx"));
+    let components = lower_program(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    );
     assert!(!components.is_empty(), "no component detected");
 
     let mut components_map = std::collections::HashMap::new();
@@ -79,6 +89,8 @@ fn diagnostics_sev(src: &str) -> Vec<(String, reactant::rules::Severity, String)
         call_graph: reactant::engine::ComponentCallGraph::new(),
         recursive_components: std::collections::HashSet::new(),
         stats: reactant::engine::AnalysisStats::default(),
+        file_table: Default::default(),
+        function_registry: Default::default(),
     };
     let mut out = Vec::new();
     for name in &names {
@@ -330,8 +342,12 @@ function A({ a, ...rest }) {
         .with_options(ParseOptions::default())
         .parse();
     assert!(ret.errors.is_empty());
-    let line_starts = compute_line_starts(src);
-    let components = lower_program(&ret.program, &line_starts, std::path::Path::new("test.tsx"));
+    let components = lower_program(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    );
     let comp = &components[0];
     let has_rest_binding = comp.render_cfg.blocks.values().any(|b| {
         b.stmts
@@ -352,8 +368,12 @@ fn program_rules_fired(src: &str) -> Vec<String> {
         .with_options(ParseOptions::default())
         .parse();
     assert!(ret.errors.is_empty());
-    let line_starts = compute_line_starts(src);
-    let components = lower_program(&ret.program, &line_starts, std::path::Path::new("test.tsx"));
+    let components = lower_program(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    );
     let registry = reactant::engine::ComponentRegistry::from_components(components);
     let hook_registry = reactant::engine::HookRegistry::from_hooks(vec![]);
     let prog = reactant::engine::analyze_program(

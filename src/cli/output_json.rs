@@ -9,7 +9,10 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use reactant::rules::{Diagnostic, Severity};
+use reactant::{
+    ir::FileTable,
+    rules::{Diagnostic, Note, ResolveTarget, Severity, Step},
+};
 
 use super::check::CheckReport;
 
@@ -34,9 +37,7 @@ struct JsonDiagnostic<'a> {
     severity: &'static str,
     /// Registry display name; collision-disambiguated (`Page@src/a/page.tsx`).
     component: &'a str,
-    /// The component's defining file. Notes from cross-file inlined hooks may
-    /// reference positions in another file (SourceRange carries no file —
-    /// ADR-011 limitation).
+    /// The component's defining file.
     file: Option<String>,
     /// 1-indexed; null when the diagnostic has no source range.
     line: Option<u32>,
@@ -48,12 +49,49 @@ struct JsonDiagnostic<'a> {
     notes: Vec<JsonNote<'a>>,
 }
 
+/// One typed witness step (ADR-019). `message` is the rendered prose; `kind`
+/// plus the kind-specific optional fields carry the structured form.
 #[derive(Serialize)]
 struct JsonNote<'a> {
     message: &'a str,
+    /// binding | resolve | call | write | read | branch | handler |
+    /// cycle-edge | widen
+    kind: &'static str,
     hook_label: Option<usize>,
+    /// File the note's position points into — may differ from the
+    /// diagnostic's `file` when the step lives in a cross-file inlined hook.
+    file: Option<String>,
     line: Option<u32>,
     col: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    var: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    /// `import:<path>` | `local-fn` | `setter` | `unknown`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    callee: Option<&'a str>,
+    /// setter | effectful | pure-cheap | unknown
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effect_class: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slot: Option<usize>,
+    /// fresh | same-as-current | unknown
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value_class: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    what: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    desc: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    from: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    to: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iteration: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -82,10 +120,82 @@ fn relative_display(path: &Path) -> String {
         .to_string()
 }
 
+fn to_json_note<'a>(n: &'a Note, files: &FileTable) -> JsonNote<'a> {
+    let mut j = JsonNote {
+        message: &n.message,
+        kind: n.step.kind(),
+        hook_label: n.hook_label,
+        file: n
+            .range
+            .and_then(|r| files.path(r.file))
+            .map(relative_display),
+        line: n.range.map(|r| r.line),
+        col: n.range.map(|r| r.col),
+        var: None,
+        name: None,
+        target: None,
+        callee: None,
+        effect_class: None,
+        slot: None,
+        value_class: None,
+        what: None,
+        desc: None,
+        event: None,
+        from: None,
+        to: None,
+        iteration: None,
+    };
+    match &n.step {
+        Step::Binding { var } => j.var = Some(var),
+        Step::Resolve { name, target } => {
+            j.name = Some(name);
+            j.target = Some(match target {
+                ResolveTarget::Import(p) => format!("import:{}", p.display()),
+                ResolveTarget::LocalFn => "local-fn".into(),
+                ResolveTarget::Setter => "setter".into(),
+                ResolveTarget::Unknown => "unknown".into(),
+            });
+        }
+        Step::Call { callee, class } => {
+            j.callee = Some(callee);
+            j.effect_class = Some(match class {
+                reactant::rules::EffectClass::Setter => "setter",
+                reactant::rules::EffectClass::Effectful => "effectful",
+                reactant::rules::EffectClass::PureCheap => "pure-cheap",
+                reactant::rules::EffectClass::Unknown => "unknown",
+            });
+        }
+        Step::Write { slot, value } => {
+            j.slot = Some(*slot);
+            j.value_class = Some(match value {
+                reactant::rules::ValueClass::Fresh => "fresh",
+                reactant::rules::ValueClass::SameAsCurrent => "same-as-current",
+                reactant::rules::ValueClass::Unknown => "unknown",
+            });
+        }
+        Step::Read { what } => j.what = Some(what),
+        Step::Branch { desc } => j.desc = Some(desc),
+        Step::Handler { event, slot } => {
+            j.event = Some(event);
+            j.slot = Some(*slot);
+        }
+        Step::CycleEdge { from, to } => {
+            j.from = Some(from);
+            j.to = Some(to);
+        }
+        Step::Widen { slot, iteration } => {
+            j.slot = Some(*slot);
+            j.iteration = Some(*iteration);
+        }
+    }
+    j
+}
+
 fn to_json_diag<'a>(
     d: &'a Diagnostic,
     component: &'a str,
     file: Option<&'a Path>,
+    files: &FileTable,
 ) -> JsonDiagnostic<'a> {
     JsonDiagnostic {
         rule: d.rule,
@@ -97,16 +207,7 @@ fn to_json_diag<'a>(
         hook_label: d.hook_label,
         var: d.var.as_deref(),
         message: &d.message,
-        notes: d
-            .notes
-            .iter()
-            .map(|n| JsonNote {
-                message: &n.message,
-                hook_label: n.hook_label,
-                line: n.range.map(|r| r.line),
-                col: n.range.map(|r| r.col),
-            })
-            .collect(),
+        notes: d.notes.iter().map(|n| to_json_note(n, files)).collect(),
     }
 }
 
@@ -117,7 +218,7 @@ pub fn render(report: &CheckReport) {
         .flat_map(|c| {
             c.diagnostics
                 .iter()
-                .map(|d| to_json_diag(d, &c.name, c.file.as_deref()))
+                .map(|d| to_json_diag(d, &c.name, c.file.as_deref(), &report.file_table))
         })
         .collect();
 

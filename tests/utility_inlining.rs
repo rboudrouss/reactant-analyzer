@@ -12,7 +12,7 @@ use reactant::{
         ComponentRegistry, Config, FunctionRegistry, HookRegistry, RootStrategy, analyze_program,
     },
     ir::FunctionIR,
-    lowering::{compute_line_starts, lower_custom_hooks, lower_program, lower_utilities},
+    lowering::{lower_custom_hooks, lower_program, lower_utilities},
     rules::{Severity, all_rules},
 };
 
@@ -67,11 +67,10 @@ fn lower_file(
         .with_options(ParseOptions::default())
         .parse();
     assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
-    let line_starts = compute_line_starts(&source);
     (
-        lower_program(&ret.program, &line_starts, path),
-        lower_custom_hooks(&ret.program, &line_starts, path),
-        lower_utilities(&ret.program, &line_starts, path),
+        lower_program(&ret.program, &source, path, &mut Default::default()),
+        lower_custom_hooks(&ret.program, &source, path, &mut Default::default()),
+        lower_utilities(&ret.program, &source, path, &mut Default::default()),
     )
 }
 

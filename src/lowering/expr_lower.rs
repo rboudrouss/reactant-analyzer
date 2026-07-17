@@ -169,13 +169,13 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         // ── Functions ─────────────────────────────────────────────────────────
         Expression::ArrowFunctionExpression(arrow) => {
             let id = builder.next_expr_id();
-            let line_starts = builder.line_starts.clone();
+            let smap = builder.smap.clone();
             // Concise body (`x => expr`) carries an implicit return; block body
             // (`x => { ... }`) lowers like any function body.
             let (params, body_cfg) = if arrow.expression {
-                build_expr_fn_body_cfg(&arrow.params, &arrow.body, &line_starts)
+                build_expr_fn_body_cfg(&arrow.params, &arrow.body, &smap)
             } else {
-                build_fn_body_cfg(&arrow.params, &arrow.body, &line_starts)
+                build_fn_body_cfg(&arrow.params, &arrow.body, &smap)
             };
             Expr::FnLit {
                 id,
@@ -185,9 +185,9 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         }
         Expression::FunctionExpression(func) => {
             let id = builder.next_expr_id();
-            let line_starts = builder.line_starts.clone();
+            let smap = builder.smap.clone();
             let (params, body_cfg) = if let Some(body) = func.body.as_deref() {
-                build_fn_body_cfg(&func.params, body, &line_starts)
+                build_fn_body_cfg(&func.params, body, &smap)
             } else {
                 (vec![], empty_cfg())
             };
@@ -681,7 +681,10 @@ mod tests {
             .parse();
         assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
         let func = ret.program.body.iter().find_map(|s| match s {
-            Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| build_cfg(b, &[])),
+            Statement::FunctionDeclaration(f) => f
+                .body
+                .as_ref()
+                .map(|b| build_cfg(b, &crate::ir::SourceMap::empty())),
             _ => None,
         });
         func.expect("no function found")

@@ -86,6 +86,15 @@ impl Rule for MissingDeps {
                     if let Some(r) = info.span {
                         d = d.with_range(r);
                     }
+                    // Witness (ADR-019): the undeclared read.
+                    d = d.with_step(
+                        super::Step::Read {
+                            what: path.to_string(),
+                        },
+                        Some(*label),
+                        info.span,
+                        &super::witness::fallback_name,
+                    );
                     diags.push(d);
                 }
             }
@@ -206,6 +215,8 @@ mod tests {
             call_graph: ComponentCallGraph::new(),
             recursive_components: HashSet::new(),
             stats: AnalysisStats::default(),
+            file_table: Default::default(),
+            function_registry: Default::default(),
         }
     }
 
@@ -233,6 +244,7 @@ mod tests {
     ) -> AnalysisResult<StateValue> {
         AnalysisResult {
             component: "C".to_string(),
+            file: Default::default(),
             state_store: StateStore::bottom(),
             memo_store: MemoStore::new(),
             block_states,
@@ -241,7 +253,8 @@ mod tests {
             effect_info,
             handler_block_states: HashMap::new(),
             handler_info: HashMap::new(),
-            widened_labels: HashSet::new(),
+            widen_trace: HashMap::new(),
+            inline_origins: Vec::new(),
             render_cfg,
             hooks: vec![],
             iterations: 0,

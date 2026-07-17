@@ -16,7 +16,7 @@ use reactant::{
         analyze_program,
     },
     ir::{ComponentIR, HookEntry},
-    lowering::{compute_line_starts, lower_custom_hooks, lower_program},
+    lowering::{lower_custom_hooks, lower_program},
 };
 
 fn lower(src: &str) -> Vec<ComponentIR> {
@@ -25,8 +25,12 @@ fn lower(src: &str) -> Vec<ComponentIR> {
         .with_options(ParseOptions::default())
         .parse();
     assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
-    let line_starts = compute_line_starts(src);
-    lower_program(&ret.program, &line_starts, std::path::Path::new("test.tsx"))
+    lower_program(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    )
 }
 
 fn hook_kinds(comp: &ComponentIR) -> Vec<&'static str> {
@@ -179,9 +183,18 @@ function C() {
         .with_options(ParseOptions::default())
         .parse();
     assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
-    let line_starts = compute_line_starts(src);
-    let components = lower_program(&ret.program, &line_starts, std::path::Path::new("test.tsx"));
-    let hook_irs = lower_custom_hooks(&ret.program, &line_starts, std::path::Path::new("test.tsx"));
+    let components = lower_program(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    );
+    let hook_irs = lower_custom_hooks(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    );
     let reg = ComponentRegistry::from_components(components);
     let hook_reg = HookRegistry::from_hooks(hook_irs);
     let result: ProgramAnalysisResult = analyze_program(

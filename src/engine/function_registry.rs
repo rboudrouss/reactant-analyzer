@@ -9,7 +9,7 @@ use crate::ir::{FunctionIR, types::Symbol};
 /// `(file, name)` key same shape as the other registries.
 pub type FunctionKey = (PathBuf, Symbol);
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct FunctionRegistry {
     functions: HashMap<FunctionKey, FunctionIR>,
 }

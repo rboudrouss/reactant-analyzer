@@ -185,6 +185,17 @@ impl Rule for UnnecessaryRerender {
                     if let Some(r) = eff_span {
                         d = d.with_range(r);
                     }
+                    // Witness (ADR-019): the mount-effect write that overrides
+                    // the initial value.
+                    d = d.with_step(
+                        super::Step::Write {
+                            slot: state_label,
+                            value: super::ValueClass::Unknown,
+                        },
+                        Some(*eff_label),
+                        eff_span,
+                        &|l| state_slot_name(l, &state_names),
+                    );
                     diags.push(d);
                 }
             }
@@ -226,6 +237,8 @@ mod tests {
             call_graph: ComponentCallGraph::new(),
             recursive_components: HashSet::new(),
             stats: AnalysisStats::default(),
+            file_table: Default::default(),
+            function_registry: Default::default(),
         }
     }
 

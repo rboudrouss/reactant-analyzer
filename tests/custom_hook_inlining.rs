@@ -8,7 +8,7 @@ use reactant::{
         ComponentRegistry, Config, HookRegistry, ProgramAnalysisResult, RootStrategy,
         analyze_program,
     },
-    lowering::{compute_line_starts, lower_custom_hooks, lower_program},
+    lowering::{lower_custom_hooks, lower_program},
     rules::{Diagnostic, all_rules},
 };
 
@@ -24,9 +24,18 @@ fn parse_and_analyze(src: &str) -> ProgramAnalysisResult {
         .with_options(ParseOptions::default())
         .parse();
     assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
-    let line_starts = compute_line_starts(src);
-    let components = lower_program(&ret.program, &line_starts, std::path::Path::new("test.tsx"));
-    let hook_irs = lower_custom_hooks(&ret.program, &line_starts, std::path::Path::new("test.tsx"));
+    let components = lower_program(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    );
+    let hook_irs = lower_custom_hooks(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    );
     let reg = ComponentRegistry::from_components(components);
     let hook_reg = HookRegistry::from_hooks(hook_irs);
     analyze_program(
@@ -70,10 +79,10 @@ fn infinite_loop_via_custom_hook_detected() {
 
     let counter_result = &result.components["Counter"];
     assert!(
-        !counter_result.widened_labels.is_empty(),
+        !counter_result.widen_trace.is_empty(),
         "Expected widened labels (infinite loop) in Counter but got none.\n\
          widened_labels: {:?}",
-        counter_result.widened_labels
+        counter_result.widen_trace
     );
 }
 
@@ -99,9 +108,9 @@ fn clean_custom_hook_no_widening() {
 
     let counter_result = &result.components["Counter"];
     assert!(
-        counter_result.widened_labels.is_empty(),
+        counter_result.widen_trace.is_empty(),
         "Expected no widened labels in Counter but got: {:?}",
-        counter_result.widened_labels
+        counter_result.widen_trace
     );
 }
 

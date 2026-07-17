@@ -24,14 +24,6 @@ use super::{
     resolve_setter_aliases, setter_var_labels, state_slot_name, state_val_labels,
 };
 
-fn capitalize_first(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        None => String::new(),
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-    }
-}
-
 /// Fires when an effect causes an infinite render loop.
 ///
 /// - `"infinite-loop"` local state widens in fixpoint.
@@ -120,7 +112,7 @@ impl Rule for InfiniteLoop {
             for call in &calls {
                 if let Some(&state_label) = local_setter_labels.get(&call.var) {
                     // ── Intra ─────────────────────────────────────────────────
-                    if !comp_result.widened_labels.contains(&state_label) {
+                    if !comp_result.widen_trace.contains_key(&state_label) {
                         continue; // state didn't diverge → bounded
                     }
                     let writes = comp_result.effect_setter_writes.get(state_label);
@@ -163,18 +155,25 @@ impl Rule for InfiniteLoop {
                             && !collect_setter_calls(h_cfg, &setter_vars_for_label, 1).is_empty()
                         {
                             let h_span = comp_result.handler_info.get(h_label).and_then(|i| i.span);
-                            diag = diag.with_note(
-                                format!(
-                                    "handler `on{}` also calls this setter \
-                                     and keeps growing state {}",
-                                    capitalize_first(event),
-                                    state_slot_name(state_label, &state_names)
-                                ),
+                            diag = diag.with_step(
+                                super::Step::Handler {
+                                    event: event.clone(),
+                                    slot: state_label,
+                                },
                                 Some(*h_label),
                                 h_span,
+                                &|l| state_slot_name(l, &state_names),
                             );
                         }
                     }
+
+                    // Fixpoint evidence (ADR-019): which effects were writing
+                    // the slot when it widened, and at which iteration.
+                    diag = diag.with_notes(super::witness::slot_history(
+                        comp_result,
+                        state_label,
+                        &|l| state_slot_name(l, &state_names),
+                    ));
 
                     reported_effects.insert(*eff_label);
                     diags.push(diag);
@@ -315,10 +314,15 @@ fn check_multi_effect_cycles(
                 diag = diag.with_range(r);
             }
             if let Some(r) = e.write_span {
-                diag = diag.with_note(
-                    format!("fresh value stored into state {to_name} here"),
+                diag = diag.with_step(
+                    super::Step::Write {
+                        slot: e.to.1,
+                        value: super::ValueClass::Fresh,
+                    },
                     Some(e.effect_label),
                     Some(r),
+                    // Qualified display (may name a parent component's slot).
+                    &|_| to_name.clone(),
                 );
             }
             // Point at the cycle's other steps living in this component.
@@ -326,11 +330,16 @@ fn check_multi_effect_cycles(
                 if other.effect_label == e.effect_label || other.component != *component {
                     continue;
                 }
+                let other_from = node_display(&other.from, component, result, &mut names);
                 let other_to = node_display(&other.to, component, result, &mut names);
-                diag = diag.with_note(
-                    format!("cycle continues: this effect freshly stores state {other_to}"),
+                diag = diag.with_step(
+                    super::Step::CycleEdge {
+                        from: other_from,
+                        to: other_to,
+                    },
                     Some(other.effect_label),
                     other.write_span,
+                    &super::witness::fallback_name,
                 );
             }
             diags.push(diag);
@@ -574,13 +583,14 @@ fn check_object_churn(
                 diag = diag.with_range(r);
             }
             if let Some(r) = call_span {
-                diag = diag.with_note(
-                    format!(
-                        "setter of state {} called here with a fresh value",
-                        state_slot_name(state_label, &state_vals)
-                    ),
+                diag = diag.with_step(
+                    super::Step::Write {
+                        slot: state_label,
+                        value: super::ValueClass::Fresh,
+                    },
                     Some(*eff_label),
                     Some(r),
+                    &|l| state_slot_name(l, &state_vals),
                 );
             }
             diags.push(diag);
@@ -1123,6 +1133,8 @@ mod tests {
             call_graph: ComponentCallGraph::new(),
             recursive_components: HashSet::new(),
             stats: AnalysisStats::default(),
+            file_table: Default::default(),
+            function_registry: Default::default(),
         }
     }
 
@@ -1159,6 +1171,7 @@ mod tests {
         );
         AnalysisResult {
             component: "C".to_string(),
+            file: Default::default(),
             state_store: StateStore::bottom(),
             memo_store: MemoStore::new(),
             block_states: HashMap::new(),
@@ -1167,7 +1180,11 @@ mod tests {
             effect_info: HashMap::new(),
             handler_block_states: HashMap::new(),
             handler_info: HashMap::new(),
-            widened_labels: widened,
+            widen_trace: widened
+                .into_iter()
+                .map(|l| (l, crate::engine::WidenEvent::default()))
+                .collect(),
+            inline_origins: Vec::new(),
             render_cfg: CFG {
                 entry: 0,
                 blocks,
@@ -1522,7 +1539,7 @@ mod tests {
             ..Default::default()
         };
         let result = analyze_component(comp, &StateValueTransfer, &config);
-        assert!(result.widened_labels.contains(&0), "count should widen");
+        assert!(result.widen_trace.contains_key(&0), "count should widen");
         let diags = InfiniteLoop.check(&prog("Counter", &result), &"Counter".to_string());
         assert!(
             !diags.is_empty(),
@@ -1717,7 +1734,7 @@ mod tests {
             },
         );
         assert!(
-            result.widened_labels.contains(&0),
+            result.widen_trace.contains_key(&0),
             "n should widen via the .then callback"
         );
         assert!(
@@ -1751,7 +1768,7 @@ mod tests {
             },
         );
         assert!(
-            !result.widened_labels.contains(&0),
+            !result.widen_trace.contains_key(&0),
             "event handler must not widen state (would be a false positive)"
         );
         assert!(
@@ -1778,7 +1795,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(!result.widened_labels.contains(&0));
+        assert!(!result.widen_trace.contains_key(&0));
         assert!(
             InfiniteLoop
                 .check(&prog("C", &result), &"C".to_string())
@@ -1838,7 +1855,7 @@ mod tests {
             },
         );
         assert!(
-            result.widened_labels.contains(&0),
+            result.widen_trace.contains_key(&0),
             "back-edge in callback body → side-effect traversal → setN fires → widening"
         );
         assert!(
@@ -1942,7 +1959,7 @@ mod tests {
             },
         );
         assert!(
-            !result.widened_labels.contains(&0),
+            !result.widen_trace.contains_key(&0),
             "bounded setter in a loop stabilises → must not widen"
         );
         assert!(
@@ -2085,7 +2102,7 @@ mod tests {
             },
         );
         assert!(
-            result.widened_labels.contains(&0),
+            result.widen_trace.contains_key(&0),
             "n should widen via the variable callback"
         );
         assert!(
@@ -2160,7 +2177,7 @@ mod tests {
             },
         );
         assert!(
-            result.widened_labels.contains(&0),
+            result.widen_trace.contains_key(&0),
             "n should widen via the variable .then callback"
         );
         assert!(
@@ -2260,7 +2277,7 @@ mod tests {
             },
         );
         assert!(
-            result.widened_labels.contains(&0),
+            result.widen_trace.contains_key(&0),
             "n should widen via B6→B5 nested chain"
         );
         assert!(
@@ -2326,11 +2343,24 @@ mod tests {
         let diags = InfiniteLoop.check(&prog("C", &result), &"C".to_string());
 
         assert!(!diags.is_empty(), "should detect infinite loop");
-        assert_eq!(diags[0].notes.len(), 1, "one note for the handler");
+        let handler_notes: Vec<_> = diags[0]
+            .notes
+            .iter()
+            .filter(|n| matches!(n.step, crate::rules::Step::Handler { .. }))
+            .collect();
+        assert_eq!(handler_notes.len(), 1, "one Handler step for the handler");
         assert_eq!(
-            diags[0].notes[0].hook_label,
+            handler_notes[0].hook_label,
             Some(2),
             "note → handler label 2"
+        );
+        // The fixpoint evidence closes the chain (ADR-019).
+        assert!(
+            diags[0]
+                .notes
+                .iter()
+                .any(|n| matches!(n.step, crate::rules::Step::Widen { slot: 0, .. })),
+            "widen step present"
         );
     }
 
@@ -2358,6 +2388,12 @@ mod tests {
         let diags = InfiniteLoop.check(&prog("C", &result), &"C".to_string());
 
         assert!(!diags.is_empty(), "should detect infinite loop");
-        assert!(diags[0].notes.is_empty(), "no handler notes must be empty");
+        assert!(
+            !diags[0]
+                .notes
+                .iter()
+                .any(|n| matches!(n.step, crate::rules::Step::Handler { .. })),
+            "no Handler step when no handler calls the setter"
+        );
     }
 }

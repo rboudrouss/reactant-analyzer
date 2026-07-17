@@ -51,8 +51,8 @@ impl Rule for AlwaysUnstableDeps {
             })
     }
 
-    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
-        let result = &result.components[component];
+    fn check(&self, program: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+        let result = &program.components[component];
         let env_exit = result.exit_env();
         let mut diags = Vec::new();
         let transfer = StateValueTransfer;
@@ -112,6 +112,17 @@ impl Rule for AlwaysUnstableDeps {
             .with_label(label);
             if let Some(r) = span {
                 d = d.with_range(r);
+            }
+            // Witness (ADR-019): where each unstable dep's identity comes
+            // from — the binding it flows through, and the call/resolution
+            // that mints a fresh reference.
+            for i in &unstable_idx {
+                d = d.with_notes(super::witness::chase_value(
+                    &result.render_cfg,
+                    &deps_ref[*i],
+                    &program.function_registry,
+                    &result.file,
+                ));
             }
             diags.push(d);
         }
@@ -193,6 +204,8 @@ mod tests {
             call_graph: ComponentCallGraph::new(),
             recursive_components: HashSet::new(),
             stats: AnalysisStats::default(),
+            file_table: Default::default(),
+            function_registry: Default::default(),
         }
     }
 

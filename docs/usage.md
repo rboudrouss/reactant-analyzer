@@ -38,7 +38,7 @@ reactant check src/ --ignore-rule lazy-init      # all but this one
 | `--ignore-rule <name>` | Suppress this diagnostic (repeatable). |
 | `--info` | Also display `Info` diagnostics (known analysis limits: widening, recursion cutoff, unknown hooks), plus — per shown component — the applicable checks that ran and found nothing (`verified: …`). A check is listed only when it was applicable (e.g. `infinite-loop` appears only when the component has both a state slot and an effect). |
 | `--show-clean` | Show components with no findings (hidden by default). Without it, a trailing note reports how many clean components were hidden. |
-| `--trace` | Show each finding's causal chain — the `→` trace notes (e.g. "handler `onClick` also calls this setter"). Hidden by default; a finding with notes shows a `(N trace step(s) — rerun with --trace)` hint instead. `json` output always includes notes. |
+| `--trace` | Show each finding's **witness chain** (ADR-019) — typed `→` steps explaining why the rule fired (e.g. `` `loadPrefs` resolves to an import from ./prefs.ts `` → `` `fetch` has side effects ``). Steps pointing into another file (cross-file inlining) show `file:line:col`. Capped at 8 steps (`… n more step(s)`). Hidden by default; a finding with steps shows a `(N trace step(s) — rerun with --trace)` hint instead. `json` output always includes the chain. |
 | `--entry <names>` | Explicit root components. Repeatable or comma-separated (`--entry Foo,Bar`). On a name collision across files, use `Foo@/abs/path.tsx` (shown in the output). |
 | `--all-roots` | Analyze every component as an entry point (`props = ⊤`). |
 | `--verbose` | Debug output on stderr: symbol graph topo order, fixpoint stats, per-component iterations/widened labels. |
@@ -100,7 +100,18 @@ Recursive walk of the given directories for `.ts/.tsx/.js/.jsx`, excluding
       "hook_label": 2,
       "var": null,
       "message": "...",
-      "notes": [ { "message": "...", "hook_label": null, "line": 3, "col": 2 } ]
+      "notes": [
+        {
+          "message": "...",
+          "kind": "handler",
+          "hook_label": 3,
+          "file": "src/users/page.tsx",
+          "line": 3,
+          "col": 2,
+          "event": "click",
+          "slot": 1
+        }
+      ]
     }
   ],
   "summary": {
@@ -115,9 +126,15 @@ Semantics:
 - `component` — registry display name; the `@<file>` suffix appears only when
   two files define the same component name.
 - `file` — the component's defining file, relative to the CWD when possible.
-  `SourceRange` carries no file (ADR-011), so `line`/`col` of notes emitted
-  from a cross-file **inlined hook** may reference positions in the hook's
-  source file while `file` names the component's.
+- `notes` — the finding's **witness chain** (ADR-019): typed steps explaining
+  why the rule fired. `kind` ∈ `binding | resolve | call | write | read |
+  branch | handler | cycle-edge | widen`; each kind adds its structured
+  fields (`var`, `name`/`target`, `callee`/`effect_class`,
+  `slot`/`value_class`, `what`, `desc`, `event`, `from`/`to`, `iteration`).
+  `notes[].file` names the file the step's position points into — it may
+  differ from the diagnostic's `file` when the step lives in a cross-file
+  inlined hook/utility. `message` is the rendered prose (same text as
+  `--trace`).
 - `line` is 1-indexed, `col` is 0-indexed; both `null` when the diagnostic has
   no source range.
 - `severity` ∈ `"error" | "warning" | "info"`. Info entries appear only with

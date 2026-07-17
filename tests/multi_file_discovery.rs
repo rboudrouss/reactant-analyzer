@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use reactant::{
     engine::{ComponentRegistry, Config, HookRegistry, RootStrategy, analyze_program},
-    lowering::{compute_line_starts, lower_custom_hooks, lower_program},
+    lowering::{lower_custom_hooks, lower_program},
     resolver::{DefaultFileDiscoverer, FileDiscoverer},
 };
 
@@ -69,9 +69,8 @@ fn parse_file(path: &Path) -> (Vec<reactant::ir::ComponentIR>, Vec<reactant::ir:
         .with_options(ParseOptions::default())
         .parse();
     assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
-    let line_starts = compute_line_starts(&source);
-    let components = lower_program(&ret.program, &line_starts, path);
-    let hooks = lower_custom_hooks(&ret.program, &line_starts, path);
+    let components = lower_program(&ret.program, &source, path, &mut Default::default());
+    let hooks = lower_custom_hooks(&ret.program, &source, path, &mut Default::default());
     (components, hooks)
 }
 

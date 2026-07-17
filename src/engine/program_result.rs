@@ -3,7 +3,10 @@ use std::collections::{HashMap, HashSet};
 use crate::{
     domains::{impls::StateValue, stores::SharedStateStore},
     engine::analysis_result::AnalysisResult,
-    ir::{source_range::SourceRange, types::Symbol},
+    ir::{
+        source_range::{FileTable, SourceRange},
+        types::Symbol,
+    },
 };
 
 pub type SymbolPair = (Symbol, Symbol);
@@ -18,6 +21,13 @@ pub struct ProgramAnalysisResult {
     /// Components whose recursion was cut off (received ⊤ result).
     pub recursive_components: HashSet<Symbol>,
     pub stats: AnalysisStats,
+    /// Resolves the [`crate::ir::FileId`] carried by every [`SourceRange`]
+    /// (ADR-019). Empty when the IR was built by hand (unit tests).
+    pub file_table: FileTable,
+    /// Lowered utility functions, exposed to witness producers so rules can
+    /// resolve a callee name to its body (`witness::resolve_and_classify`,
+    /// ADR-019). Empty for hand-built IR.
+    pub function_registry: crate::engine::FunctionRegistry,
 }
 
 /// Directed call graph: caller → list of call sites.

@@ -7,6 +7,7 @@ use clap::Args;
 
 use reactant::{
     engine::{ComponentRegistry, Config, RootStrategy, SymbolGraph},
+    ir::FileTable,
     project::{self, ProjectKind},
     resolver::{DefaultFileDiscoverer, FileDiscoverer, analyze_lowered, lower_files},
     rules::{Diagnostic, SafeCheck, Severity, all_rules, rule_doc},
@@ -91,6 +92,9 @@ pub struct CheckReport {
     pub warnings: usize,
     pub infos: usize,
     pub exit_code: i32,
+    /// Resolves the `FileId` carried by every diagnostic/note span (ADR-019),
+    /// so renderers can name the file a cross-file trace step points into.
+    pub file_table: FileTable,
 }
 
 pub fn run(mut args: CheckArgs) -> i32 {
@@ -218,6 +222,7 @@ pub fn run(mut args: CheckArgs) -> i32 {
             warnings: 0,
             infos: 0,
             exit_code: EXIT_OK,
+            file_table: lowered.file_table,
         };
         render(&report, &args, format);
         return report.exit_code;
@@ -258,7 +263,7 @@ pub fn run(mut args: CheckArgs) -> i32 {
     for name in names {
         if args.verbose {
             let result = &program_result.components[name];
-            let mut labels: Vec<_> = result.widened_labels.iter().copied().collect();
+            let mut labels: Vec<_> = result.widen_trace.keys().copied().collect();
             labels.sort_unstable();
             eprintln!(
                 "  [verbose] {name}: {} iteration(s), widened: {labels:?}",
@@ -356,6 +361,7 @@ pub fn run(mut args: CheckArgs) -> i32 {
         warnings,
         infos,
         exit_code,
+        file_table: program_result.file_table,
     };
     render(&report, &args, format);
     report.exit_code

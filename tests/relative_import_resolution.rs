@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use reactant::{
     ir::hooks::HookEntry,
-    lowering::{compute_line_starts, lower_custom_hooks, lower_program},
+    lowering::{lower_custom_hooks, lower_program},
 };
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -56,10 +56,9 @@ fn lower_file(path: &Path) -> (Vec<reactant::ir::ComponentIR>, Vec<reactant::ir:
         .with_options(ParseOptions::default())
         .parse();
     assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
-    let line_starts = compute_line_starts(&source);
     (
-        lower_program(&ret.program, &line_starts, path),
-        lower_custom_hooks(&ret.program, &line_starts, path),
+        lower_program(&ret.program, &source, path, &mut Default::default()),
+        lower_custom_hooks(&ret.program, &source, path, &mut Default::default()),
     )
 }
 

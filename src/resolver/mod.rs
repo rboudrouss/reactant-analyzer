@@ -13,9 +13,9 @@ use crate::{
         ComponentRegistry, Config, FunctionRegistry, HookRegistry, ProgramAnalysisResult,
         RootStrategy, analyze_program,
     },
-    ir::{component::ComponentIR, function_ir::FunctionIR, hook_ir::HookIR},
+    ir::{FileTable, component::ComponentIR, function_ir::FunctionIR, hook_ir::HookIR},
     lowering::{
-        compute_line_starts, lower_custom_hooks_with_resolver, lower_program_with_resolver,
+        lower_custom_hooks_with_resolver, lower_program_with_resolver,
         utility_lowerer::lower_utilities_with_resolver,
     },
 };
@@ -51,6 +51,10 @@ pub struct LoweredProgram {
     /// Files skipped due to read or parse errors, with the error message.
     /// Not printed here — the caller decides how to report them.
     pub parse_errors: Vec<(PathBuf, String)>,
+    /// `FileId ↔ path` interning table shared by every span produced during
+    /// this lowering (ADR-019). Moved into the analysis result by
+    /// [`analyze_lowered`].
+    pub file_table: FileTable,
 }
 
 /// Parse and lower an explicit list of files with the given `ImportResolver`.
@@ -68,6 +72,7 @@ pub fn lower_files(files: &[PathBuf], resolver: &dyn ImportResolver) -> LoweredP
         utilities: Vec::new(),
         file_count: 0,
         parse_errors: Vec::new(),
+        file_table: FileTable::default(),
     };
 
     for path in files {
@@ -94,23 +99,25 @@ pub fn lower_files(files: &[PathBuf], resolver: &dyn ImportResolver) -> LoweredP
                 .push((path.clone(), ret.errors[0].message.to_string()));
             continue;
         }
-        let line_starts = compute_line_starts(&source);
         lowered.components.extend(lower_program_with_resolver(
             &ret.program,
-            &line_starts,
+            &source,
             path,
+            &mut lowered.file_table,
             resolver,
         ));
         lowered.hooks.extend(lower_custom_hooks_with_resolver(
             &ret.program,
-            &line_starts,
+            &source,
             path,
+            &mut lowered.file_table,
             resolver,
         ));
         lowered.utilities.extend(lower_utilities_with_resolver(
             &ret.program,
-            &line_starts,
+            &source,
             path,
+            &mut lowered.file_table,
             resolver,
         ));
         lowered.file_count += 1;
@@ -133,7 +140,9 @@ pub fn analyze_lowered(
     config.function_registry = FunctionRegistry::from_functions(lowered.utilities);
     let registry = ComponentRegistry::from_components(lowered.components);
     let hook_registry = HookRegistry::from_hooks(lowered.hooks);
-    analyze_program(registry, hook_registry, strategy, &config)
+    let mut result = analyze_program(registry, hook_registry, strategy, &config);
+    result.file_table = lowered.file_table;
+    result
 }
 
 /// Parse, lower, and analyze an explicit list of files.

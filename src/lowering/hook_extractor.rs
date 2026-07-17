@@ -790,7 +790,10 @@ mod tests {
             .body
             .iter()
             .find_map(|s| match s {
-                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| build_cfg(b, &[])),
+                Statement::FunctionDeclaration(f) => f
+                    .body
+                    .as_ref()
+                    .map(|b| build_cfg(b, &crate::ir::SourceMap::empty())),
                 _ => None,
             })
             .expect("no function found");
@@ -1033,7 +1036,10 @@ mod tests {
             .body
             .iter()
             .find_map(|s| match s {
-                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| build_cfg(b, &[])),
+                Statement::FunctionDeclaration(f) => f
+                    .body
+                    .as_ref()
+                    .map(|b| build_cfg(b, &crate::ir::SourceMap::empty())),
                 _ => None,
             })
             .expect("no function found");
@@ -1148,15 +1154,14 @@ mod tests {
             .with_options(ParseOptions::default())
             .parse();
         assert!(ret.errors.is_empty());
-        let line_starts = crate::ir::compute_line_starts(src);
+        let mut files = crate::ir::FileTable::default();
+        let smap = crate::ir::SourceMap::new(src, files.intern(std::path::Path::new("test.tsx")));
         let mut cfg = ret
             .program
             .body
             .iter()
             .find_map(|s| match s {
-                Statement::FunctionDeclaration(f) => {
-                    f.body.as_ref().map(|b| build_cfg(b, &line_starts))
-                }
+                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| build_cfg(b, &smap)),
                 _ => None,
             })
             .expect("no function found");
@@ -1185,7 +1190,10 @@ mod tests {
             .body
             .iter()
             .find_map(|s| match s {
-                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| build_cfg(b, &[])),
+                Statement::FunctionDeclaration(f) => f
+                    .body
+                    .as_ref()
+                    .map(|b| build_cfg(b, &crate::ir::SourceMap::empty())),
                 _ => None,
             })
             .expect("no function found");

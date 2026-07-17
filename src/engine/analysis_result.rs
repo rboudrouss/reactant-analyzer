@@ -15,6 +15,38 @@ use crate::{
     },
 };
 
+/// Provenance of a forced widening (ADR-019): which fixpoint iteration gave
+/// up on convergence for a slot, and which effects were writing it then.
+/// Feeds the `infinite-loop` / `widening-info` witness chains (`Step::Widen`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WidenEvent {
+    /// Outer fixpoint iteration at which the slot was widened (first time).
+    pub iteration: usize,
+    /// Effects whose pass wrote this slot during the widening iteration.
+    /// Empty when the growth came from render or handlers only.
+    pub writers: Vec<HookLabel>,
+}
+
+/// What kind of symbol was inlined into a component's CFG (ADR-019).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineKind {
+    /// A custom hook expanded by `expand_custom_hooks`.
+    Hook,
+    /// A utility function spliced by `expand_utility_calls`.
+    Utility,
+}
+
+/// One symbol inlined into the component during analysis: feeds
+/// `Step::Resolve` witness steps ("`useMedia` was inlined from ./hooks.ts"),
+/// and lets rules know spans inside the CFG may point into `from`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineOrigin {
+    pub name: String,
+    /// File the inlined body came from.
+    pub from: std::path::PathBuf,
+    pub kind: InlineKind,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookKind {
     State,
@@ -79,6 +111,10 @@ pub struct AnalysisResult<D: AbstractDomain> {
     /// expressions against the result use it as the `AnalysisCtx` component
     /// (state-slot provenance).
     pub component: Symbol,
+    /// The component's defining file — registry-resolution key for witness
+    /// producers (`witness::resolve_and_classify`, ADR-019). Empty for
+    /// hand-built IR (unit tests).
+    pub file: std::path::PathBuf,
     pub state_store: StateStore<D>,
     pub memo_store: MemoStore<D>,
     /// Abstract environment at the *exit* of each render-CFG block.
@@ -92,8 +128,12 @@ pub struct AnalysisResult<D: AbstractDomain> {
     /// Populated at each fixpoint iteration; last iteration's values survive.
     pub handler_block_states: HashMap<HookLabel, HashMap<BlockId, AbstractEnv<D>>>,
     pub handler_info: HashMap<HookLabel, HandlerInfo>,
-    /// Labels whose state was widened to force convergence.
-    pub widened_labels: HashSet<HookLabel>,
+    /// Labels whose state was widened to force convergence, with the
+    /// provenance of each widening (iteration, writing effects) — ADR-019.
+    pub widen_trace: HashMap<HookLabel, WidenEvent>,
+    /// Symbols (custom hooks, utilities) inlined into this component's CFGs
+    /// during analysis, with their source file (ADR-019).
+    pub inline_origins: Vec<InlineOrigin>,
     /// Join of all values written to the state store by effects in the final fixpoint
     /// iteration, starting from ⊥ (i.e. excludes the pre-existing state value).
     ///

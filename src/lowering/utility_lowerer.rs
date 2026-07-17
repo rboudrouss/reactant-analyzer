@@ -9,29 +9,38 @@ use std::path::Path;
 use oxc_ast::ast::Program;
 
 use crate::{
-    ir::FunctionIR,
+    ir::{FileTable, FunctionIR, SourceMap},
     lowering::{cfg_builder::build_fn_body_cfg, utility_detector::detect_utilities},
     resolver::{DefaultImportResolver, ImportResolver},
 };
 
 /// Lower every top-level utility function in `program`, attaching `file` to
 /// each [`FunctionIR`] so registry keys remain `(file, name)`-unique.
-pub fn lower_utilities(program: &Program, line_starts: &[u32], file: &Path) -> Vec<FunctionIR> {
-    lower_utilities_with_resolver(program, line_starts, file, &DefaultImportResolver)
+///
+/// `source` is the file's text (for the span line table); `files` interns
+/// `file` so every produced span carries its [`crate::ir::FileId`] (ADR-019).
+pub fn lower_utilities(
+    program: &Program,
+    source: &str,
+    file: &Path,
+    files: &mut FileTable,
+) -> Vec<FunctionIR> {
+    lower_utilities_with_resolver(program, source, file, files, &DefaultImportResolver)
 }
 
 /// Plugin-friendly variant of [`lower_utilities`].
 pub fn lower_utilities_with_resolver(
     program: &Program,
-    line_starts: &[u32],
+    source: &str,
     file: &Path,
+    files: &mut FileTable,
     _resolver: &dyn ImportResolver,
 ) -> Vec<FunctionIR> {
+    let smap = SourceMap::new(source, files.intern(file));
     detect_utilities(program)
         .into_iter()
         .map(|candidate| {
-            let (params, body_cfg) =
-                build_fn_body_cfg(candidate.params, candidate.body, line_starts);
+            let (params, body_cfg) = build_fn_body_cfg(candidate.params, candidate.body, &smap);
             FunctionIR {
                 file: file.to_path_buf(),
                 name: candidate.name,

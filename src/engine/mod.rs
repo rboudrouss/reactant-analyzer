@@ -10,7 +10,10 @@ pub mod program_result;
 pub mod root_detector;
 pub mod symbol_graph;
 
-pub use analysis_result::{AnalysisResult, EffectInfo, HandlerInfo, HookCallInfo, HookKind};
+pub use analysis_result::{
+    AnalysisResult, EffectInfo, HandlerInfo, HookCallInfo, HookKind, InlineKind, InlineOrigin,
+    WidenEvent,
+};
 pub use cfg_analyzer::analyze_cfg;
 pub use component_cache::ComponentCache;
 pub use component_registry::{ComponentKey, ComponentRegistry};

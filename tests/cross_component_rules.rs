@@ -19,15 +19,19 @@ fn parse_and_analyze(src: &str) -> ProgramAnalysisResult {
     use oxc_allocator::Allocator;
     use oxc_parser::{ParseOptions, Parser};
     use oxc_span::SourceType;
-    use reactant::lowering::{compute_line_starts, lower_program};
+    use reactant::lowering::lower_program;
 
     let alloc = Allocator::default();
     let ret = Parser::new(&alloc, src, SourceType::tsx())
         .with_options(ParseOptions::default())
         .parse();
     assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
-    let line_starts = compute_line_starts(src);
-    let components = lower_program(&ret.program, &line_starts, std::path::Path::new("test.tsx"));
+    let components = lower_program(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    );
     let reg = ComponentRegistry::from_components(components);
     analyze_program(
         reg,

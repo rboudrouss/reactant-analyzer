@@ -98,7 +98,8 @@ impl Rule for DerivedState {
                 _ => continue,
             };
 
-            let Some(setter_name) = find_uncond_setter_call(body_cfg, &setter_vars) else {
+            let Some((setter_name, write_span)) = find_uncond_setter_call(body_cfg, &setter_vars)
+            else {
                 continue;
             };
 
@@ -149,6 +150,29 @@ impl Rule for DerivedState {
             if let Some(r) = span {
                 d = d.with_range(*r);
             }
+            // Witness (ADR-019): the mirrored source is read, then its
+            // function is written to the derived slot.
+            let name_of =
+                |l: crate::ir::types::HookLabel| super::state_slot_name(l, &state_val_label);
+            d = d.with_step(
+                super::Step::Read {
+                    what: dep_var.clone(),
+                },
+                state_val_label.get(&dep_var).copied(),
+                *span,
+                &name_of,
+            );
+            if let Some(slot) = setter_label.get(&setter_name) {
+                d = d.with_step(
+                    super::Step::Write {
+                        slot: *slot,
+                        value: super::ValueClass::Unknown,
+                    },
+                    Some(*eff_label),
+                    write_span,
+                    &name_of,
+                );
+            }
             diags.push(d);
         }
 
@@ -159,21 +183,24 @@ impl Rule for DerivedState {
 /// Returns `Some(var)` if `cfg` unconditionally calls exactly one setter with call-free args on all paths.
 ///
 /// Must-forward dataflow: `must_out[B] = (∩ must_out[preds]) || called_in[B]`.
-fn find_uncond_setter_call(cfg: &CFG, setter_vars: &HashSet<Var>) -> Option<Var> {
-    // Collect all call sites: (block_id, setter_var, arg).
-    let mut call_sites: Vec<(BlockId, Var, Expr)> = vec![];
+fn find_uncond_setter_call(
+    cfg: &CFG,
+    setter_vars: &HashSet<Var>,
+) -> Option<(Var, Option<crate::ir::SourceRange>)> {
+    // Collect all call sites: (block_id, setter_var, arg, span).
+    let mut call_sites: Vec<(BlockId, Var, Expr, Option<crate::ir::SourceRange>)> = vec![];
     for (bid, block) in &cfg.blocks {
         for stmt in &block.stmts {
-            if let Stmt::ExprStmt(expr, _) = stmt
+            if let Stmt::ExprStmt(expr, span) = stmt
                 && let Some((var, arg)) = try_extract_setter_call(expr, setter_vars)
             {
-                call_sites.push((*bid, var, arg.clone()));
+                call_sites.push((*bid, var, arg.clone(), *span));
             }
         }
         if let Terminator::Return(expr) = &block.term
             && let Some((var, arg)) = try_extract_setter_call(expr, setter_vars)
         {
-            call_sites.push((*bid, var, arg.clone()));
+            call_sites.push((*bid, var, arg.clone(), None));
         }
     }
 
@@ -183,7 +210,8 @@ fn find_uncond_setter_call(cfg: &CFG, setter_vars: &HashSet<Var>) -> Option<Var>
 
     // All call sites must target the same setter var.
     let target = call_sites[0].1.clone();
-    if !call_sites.iter().all(|(_, v, _)| v == &target) {
+    let target_span = call_sites[0].3;
+    if !call_sites.iter().all(|(_, v, _, _)| v == &target) {
         return None;
     }
 
@@ -194,7 +222,7 @@ fn find_uncond_setter_call(cfg: &CFG, setter_vars: &HashSet<Var>) -> Option<Var>
     let bindings = local_bindings(cfg);
     if !call_sites
         .iter()
-        .all(|(_, _, arg)| arg_is_call_free(arg, &bindings, &mut HashSet::new()))
+        .all(|(_, _, arg, _)| arg_is_call_free(arg, &bindings, &mut HashSet::new()))
     {
         return None;
     }
@@ -204,7 +232,7 @@ fn find_uncond_setter_call(cfg: &CFG, setter_vars: &HashSet<Var>) -> Option<Var>
         .blocks
         .keys()
         .map(|&bid| {
-            let hits = call_sites.iter().any(|(b, _, _)| b == &bid);
+            let hits = call_sites.iter().any(|(b, _, _, _)| b == &bid);
             (bid, hits)
         })
         .collect();
@@ -247,7 +275,11 @@ fn find_uncond_setter_call(cfg: &CFG, setter_vars: &HashSet<Var>) -> Option<Var>
         .iter()
         .all(|b| *must_out.get(&b.id).unwrap_or(&false));
 
-    if all_covered { Some(target) } else { None }
+    if all_covered {
+        Some((target, target_span))
+    } else {
+        None
+    }
 }
 
 fn try_extract_setter_call<'a>(

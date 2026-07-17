@@ -1,9 +1,45 @@
 use crate::{
-    engine::{ProgramAnalysisResult, dominates},
-    ir::{cfg::Terminator, types::Symbol},
+    engine::{ProgramAnalysisResult, compute_dominators, dominates},
+    ir::{
+        SourceRange,
+        cfg::{CFG, Terminator},
+        types::{BlockId, Symbol},
+    },
 };
 
 use super::{Diagnostic, Rule, Severity};
+
+/// Site of the closest dominating `Branch` terminator — the guard that makes
+/// the hook call conditional. Span: the branch block's last statement (the
+/// condition is evaluated there), falling back to `None`.
+fn guard_site(cfg: &CFG, block: BlockId) -> Option<(BlockId, Option<SourceRange>)> {
+    let doms = compute_dominators(cfg);
+    let dominators = doms.get(&block)?;
+    // Closest = the dominating branch block with the largest dominator set
+    // (deepest in the dominator order).
+    dominators
+        .iter()
+        .filter(|&&d| {
+            d != block
+                && matches!(
+                    cfg.blocks.get(&d).map(|b| &b.term),
+                    Some(Terminator::Branch { .. })
+                )
+        })
+        .max_by_key(|&&d| doms.get(&d).map_or(0, |s| s.len()))
+        .map(|&d| {
+            let span = cfg
+                .blocks
+                .get(&d)
+                .and_then(|b| b.stmts.last())
+                .and_then(|s| match s {
+                    crate::ir::stmt::Stmt::Let { span, .. } => *span,
+                    crate::ir::stmt::Stmt::ExprStmt(_, span) => *span,
+                    crate::ir::stmt::Stmt::Assign { span, .. } => *span,
+                });
+            (d, span)
+        })
+}
 
 /// Fires when a hook is called inside a conditional branch.
 ///
@@ -62,6 +98,18 @@ impl Rule for ConditionalHook {
                 if let Some(r) = call.span {
                     d = d.with_range(r);
                 }
+                // Witness (ADR-019): point at the guard that splits the paths.
+                if let Some((_, guard_span)) = guard_site(&result.render_cfg, call.block_id) {
+                    d = d.with_step(
+                        super::Step::Branch {
+                            desc: "a condition evaluated here — some render paths skip the hook"
+                                .to_string(),
+                        },
+                        None,
+                        guard_span,
+                        &super::witness::fallback_name,
+                    );
+                }
                 d
             })
             .collect()
@@ -104,12 +152,15 @@ mod tests {
             call_graph: ComponentCallGraph::new(),
             recursive_components: HashSet::new(),
             stats: AnalysisStats::default(),
+            file_table: Default::default(),
+            function_registry: Default::default(),
         }
     }
 
     fn make_result(render_cfg: CFG, hook_calls: Vec<HookCallInfo>) -> AnalysisResult<StateValue> {
         AnalysisResult {
             component: "C".to_string(),
+            file: Default::default(),
             state_store: StateStore::bottom(),
             memo_store: MemoStore::new(),
             block_states: HashMap::new(),
@@ -118,7 +169,8 @@ mod tests {
             effect_info: HashMap::new(),
             handler_block_states: HashMap::new(),
             handler_info: HashMap::new(),
-            widened_labels: HashSet::new(),
+            widen_trace: HashMap::new(),
+            inline_origins: Vec::new(),
             render_cfg,
             hooks: vec![],
             iterations: 0,

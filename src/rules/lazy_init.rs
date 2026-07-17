@@ -80,8 +80,8 @@ impl Rule for LazyInit {
         })
     }
 
-    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
-        let result = &result.components[component];
+    fn check(&self, program: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+        let result = &program.components[component];
         // #1 chases a call through a local binding, but only when that binding is
         // used exactly once (at the init). A `const x = f()` statement runs on
         // every render regardless, so if `x` is read elsewhere the call is not
@@ -147,6 +147,16 @@ impl Rule for LazyInit {
             if let Some(r) = span {
                 d = d.with_range(*r);
             }
+            // Witness chain (ADR-019): resolve the init's callee through the
+            // function registry — "`f` resolves to ./util.ts" → "its body
+            // calls `fetch`". Refinement only: an unresolved callee just
+            // yields a Resolve(Unknown) step, never a weaker severity.
+            d = d.with_notes(super::witness::chase_value(
+                &result.render_cfg,
+                init,
+                &program.function_registry,
+                &result.file,
+            ));
             diags.push(d);
         }
 
@@ -217,7 +227,8 @@ enum Callee {
 }
 
 /// Classify a single call target. Setters are proven (the engine tracks them);
-/// the effectful/pure sets are small, high-precision name heuristics.
+/// the effectful/pure name heuristics are shared witness infrastructure
+/// ([`super::witness::classify_callee_name`], ADR-019).
 fn classify_callee(fn_: &Expr, setters: &HashSet<Var>) -> Callee {
     let fn_ = match fn_ {
         Expr::TSAnnotated(inner, _) => inner.as_ref(),
@@ -226,56 +237,15 @@ fn classify_callee(fn_: &Expr, setters: &HashSet<Var>) -> Callee {
     match fn_ {
         Expr::StateSetter(_) => Callee::Setter,
         Expr::Var(v) if setters.contains(v) => Callee::Setter,
-        Expr::Var(name) => name_class(name.as_str(), None),
-        Expr::FieldAccess { obj, field } => {
-            let root = match obj.as_ref() {
-                Expr::Var(v) => Some(v.as_str()),
-                _ => None,
-            };
-            name_class(field.as_str(), root)
-        }
-        _ => Callee::Other,
+        _ => match super::witness::callee_parts(fn_) {
+            Some((method, root)) => match super::witness::classify_callee_name(method, root) {
+                (super::EffectClass::Effectful, n) => Callee::Effectful(n),
+                (super::EffectClass::PureCheap, n) => Callee::PureCheap(n),
+                _ => Callee::Other,
+            },
+            None => Callee::Other,
+        },
     }
-}
-
-/// Map a callee `method` (with an optional receiver root, e.g. `Math` in
-/// `Math.floor`) to its effect class. Side-effecting/async methods are matched
-/// by method name regardless of receiver; the pure set is restricted to O(1)
-/// builtins so demotion to `Info` never hides genuinely expensive work.
-fn name_class(method: &str, obj_root: Option<&str>) -> Callee {
-    const EFFECTFUL: &[&str] = &[
-        "fetch",
-        "subscribe",
-        "addEventListener",
-        "removeEventListener",
-        "setInterval",
-        "setTimeout",
-        "requestAnimationFrame",
-        "requestIdleCallback",
-        "postMessage",
-    ];
-    if EFFECTFUL.contains(&method) {
-        return Callee::Effectful(match obj_root {
-            Some(r) => format!("{r}.{method}"),
-            None => method.to_string(),
-        });
-    }
-    match obj_root {
-        Some("Math") => return Callee::PureCheap(format!("Math.{method}")),
-        Some("Date") if method == "now" => return Callee::PureCheap("Date.now".to_string()),
-        Some("performance") if method == "now" => {
-            return Callee::PureCheap("performance.now".to_string());
-        }
-        None if matches!(
-            method,
-            "parseInt" | "parseFloat" | "isNaN" | "isFinite" | "Number" | "Boolean"
-        ) =>
-        {
-            return Callee::PureCheap(method.to_string());
-        }
-        _ => {}
-    }
-    Callee::Other
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -311,6 +281,8 @@ mod tests {
             call_graph: ComponentCallGraph::new(),
             recursive_components: HashSet::new(),
             stats: AnalysisStats::default(),
+            file_table: Default::default(),
+            function_registry: Default::default(),
         }
     }
 

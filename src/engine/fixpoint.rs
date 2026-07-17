@@ -158,6 +158,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         }
     }
 
+    // Provenance of every splice below (ADR-019) — ends up on the result.
+    let mut inline_origins: Vec<crate::engine::InlineOrigin> = Vec::new();
+
     // Utility-function inlining. Runs before `expand_custom_hooks` so utility
     // bodies containing hook calls become visible to the hook expansion pass.
     expand_utility_calls(
@@ -166,10 +169,11 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         &config.function_registry,
         &comp_file,
         config.max_inline_depth,
+        &mut inline_origins,
     );
 
     // Expand Custom entries before seeding so inlined State entries are seeded.
-    expand_custom_hooks(&mut hooks, &mut render_cfg, inter);
+    expand_custom_hooks(&mut hooks, &mut render_cfg, inter, &mut inline_origins);
 
     // Threshold set for widening up-to (ADR-014); harvested once, post-expansion.
     let thresholds = collect_thresholds(&render_cfg, &hooks);
@@ -194,7 +198,10 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     let mut state: StateStore<StateValue> = StateStore::bottom();
     let mut memo_store: MemoStore<StateValue> = MemoStore::new();
     let mut heap = initial_heap;
-    let mut widened_labels: HashSet<HookLabel> = HashSet::new();
+    let mut widen_trace: HashMap<HookLabel, crate::engine::WidenEvent> = HashMap::new();
+    // Which effects wrote each slot during the current iteration — provenance
+    // for the widening events (ADR-019). Rebuilt every iteration.
+    let mut slot_writers: HashMap<HookLabel, Vec<HookLabel>> = HashMap::new();
     let mut iteration: usize = 0;
     let mut block_states: HashMap<BlockId, AbstractEnv<StateValue>>;
     let mut env_exit: AbstractEnv<StateValue>;
@@ -293,6 +300,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 
         // ── Effect passes ─────────────────────────────────────────────────────
         let mut state_from_effects = StateStore::bottom();
+        slot_writers.clear();
         for hook in &hooks {
             if let HookEntry::Effect {
                 label, body_cfg, ..
@@ -319,6 +327,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     )
                 };
                 effect_block_states.insert(*label, eff_bs);
+                for slot in eff_state.labels() {
+                    slot_writers.entry(slot).or_default().push(*label);
+                }
                 state_from_effects = state_from_effects.join(&eff_state);
             }
         }
@@ -375,16 +386,28 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         if iteration >= 100 {
             // Pathological input: force widening on all labels to guarantee convergence.
             for label in state.labels() {
-                widened_labels.insert(label);
+                widen_trace
+                    .entry(label)
+                    .or_insert_with(|| crate::engine::WidenEvent {
+                        iteration,
+                        writers: slot_writers.get(&label).cloned().unwrap_or_default(),
+                    });
             }
             state = state.widen(&new_state);
             break;
         }
 
         if iteration >= config.widen_threshold {
-            // widened_labels: render+effects only handler widening is not a bug.
+            // widen_trace: render+effects only handler widening is not a bug.
+            // `or_insert_with` keeps the FIRST widening iteration (the most
+            // informative one for the witness chain).
             for label in new_state_incycle.changed_labels(&state) {
-                widened_labels.insert(label);
+                widen_trace
+                    .entry(label)
+                    .or_insert_with(|| crate::engine::WidenEvent {
+                        iteration,
+                        writers: slot_writers.get(&label).cloned().unwrap_or_default(),
+                    });
             }
             state = state.widen_to(&new_state, &thresholds);
         } else {
@@ -430,6 +453,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 
     AnalysisResult {
         component: comp_name,
+        file: comp_file,
         state_store: final_state,
         memo_store,
         block_states,
@@ -438,7 +462,8 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         effect_info,
         handler_block_states,
         handler_info,
-        widened_labels,
+        widen_trace,
+        inline_origins,
         effect_setter_writes,
         render_cfg,
         hooks: hooks_clone,
@@ -534,6 +559,12 @@ pub fn analyze_program(
         call_graph: call_graph.into_inner(),
         recursive_components,
         stats: final_stats,
+        // Filled by `analyze_lowered` — the registry-based entry point has no
+        // file table of its own (hand-built IR).
+        file_table: Default::default(),
+        // Exposed for witness producers (ADR-019): rules resolve callee
+        // names against the same registry the inliner used.
+        function_registry: config.function_registry.clone(),
     }
 }
 
@@ -553,6 +584,7 @@ fn expand_custom_hooks(
     hooks: &mut Vec<HookEntry>,
     render_cfg: &mut CFG,
     inter: Option<&InterCtx<'_>>,
+    origins: &mut Vec<crate::engine::InlineOrigin>,
 ) {
     let Some(inter) = inter else { return };
     let Some(reg) = inter.hook_registry else {
@@ -685,6 +717,14 @@ fn expand_custom_hooks(
             new_stmts.extend(std::mem::take(&mut entry_block.stmts));
             entry_block.stmts = new_stmts;
         }
+
+        // Provenance (ADR-019): the hook's body now lives inside this
+        // component's CFG; spans in it point into `hook_ir.file`.
+        origins.push(crate::engine::InlineOrigin {
+            name: name.clone(),
+            from: hook_ir.file.clone(),
+            kind: crate::engine::InlineKind::Hook,
+        });
 
         // Mark before inserting so re-encountered Custom entries for this hook are guarded.
         expanding.insert(name.clone());
@@ -1079,6 +1119,7 @@ fn expand_utility_calls(
     registry: &FunctionRegistry,
     caller_file: &std::path::Path,
     max_depth: usize,
+    origins: &mut Vec<crate::engine::InlineOrigin>,
 ) {
     if registry.is_empty() {
         return;
@@ -1089,6 +1130,7 @@ fn expand_utility_calls(
         caller_file,
         max_depth,
         &mut HashSet::new(),
+        origins,
     );
     for hook in hooks.iter_mut() {
         match hook {
@@ -1102,6 +1144,7 @@ fn expand_utility_calls(
                     caller_file,
                     max_depth,
                     &mut HashSet::new(),
+                    origins,
                 );
             }
             _ => {}
@@ -1122,6 +1165,7 @@ fn inline_in_cfg(
     caller_file: &std::path::Path,
     max_depth: usize,
     expanding: &mut HashSet<String>,
+    origins: &mut Vec<crate::engine::InlineOrigin>,
 ) {
     let mut budget = max_depth;
     loop {
@@ -1133,6 +1177,15 @@ fn inline_in_cfg(
         else {
             break;
         };
+        // Provenance (ADR-019): record what was spliced and where it lives,
+        // before the splice consumes the call statement.
+        if let Some(util) = resolve_utility(registry, caller_file, &name) {
+            origins.push(crate::engine::InlineOrigin {
+                name: name.clone(),
+                from: util.file.clone(),
+                kind: crate::engine::InlineKind::Utility,
+            });
+        }
         // Mark before splicing so a self-recursive call inside the spliced
         // body is skipped on the next scan.
         expanding.insert(name);
@@ -1484,7 +1537,7 @@ mod tests {
         let comp = component(vec![], vec![]);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert_eq!(result.state_store.get(0), StateValue::bottom());
-        assert!(result.widened_labels.is_empty());
+        assert!(result.widen_trace.is_empty());
         assert_eq!(result.hook_calls.len(), 0);
     }
 
@@ -1507,7 +1560,7 @@ mod tests {
             result.state_store.get(0),
             StateValue::number(Interval::point(0.0))
         );
-        assert!(result.widened_labels.is_empty());
+        assert!(result.widen_trace.is_empty());
     }
 
     #[test]
@@ -1575,7 +1628,7 @@ mod tests {
             result.state_store.get(0),
             StateValue::number(Interval { lo: 0.0, hi: 42.0 })
         );
-        assert!(result.widened_labels.is_empty());
+        assert!(result.widen_trace.is_empty());
     }
 
     #[test]
@@ -1634,7 +1687,7 @@ mod tests {
         assert_eq!(v.num, Interval::point(0.0));
         assert_eq!(v.reference, crate::domains::impls::Stability::PerRender);
         assert!(!v.is_top_value());
-        assert!(result.widened_labels.is_empty());
+        assert!(result.widen_trace.is_empty());
     }
 
     #[test]
@@ -1690,7 +1743,7 @@ mod tests {
             ..Default::default()
         };
         let result = analyze_component(comp, &StateValueTransfer, &config);
-        assert!(result.widened_labels.contains(&0));
+        assert!(result.widen_trace.contains_key(&0));
     }
 
     #[test]
@@ -2044,11 +2097,11 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &config);
 
         assert!(
-            !result.widened_labels.contains(&0),
+            !result.widen_trace.contains_key(&0),
             "handler's setN(n+1) must not cause widening of state 0 (would be false positive InfiniteLoop)"
         );
         assert!(
-            !result.widened_labels.contains(&1),
+            !result.widen_trace.contains_key(&1),
             "handler label itself must not appear in widened_labels"
         );
     }
@@ -2183,11 +2236,11 @@ mod tests {
         );
 
         assert!(
-            !result.widened_labels.contains(&0),
+            !result.widen_trace.contains_key(&0),
             "handler loop setter must not widen state 0 (would be false positive)"
         );
         assert!(
-            !result.widened_labels.contains(&1),
+            !result.widen_trace.contains_key(&1),
             "handler label itself must not appear in widened_labels"
         );
     }
@@ -2375,7 +2428,7 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
 
         assert!(
-            result.widened_labels.contains(&0),
+            result.widen_trace.contains_key(&0),
             "state label 0 must widen: conditional effect + handler causes InfiniteLoop"
         );
     }

@@ -11,7 +11,7 @@ use oxc_span::SourceType;
 use reactant::{
     domains::StateValueTransfer,
     engine::{Config, analyze_component},
-    lowering::{compute_line_starts, lower_program},
+    lowering::lower_program,
     rules::{Diagnostic, LazyInit, Rule, Severity},
 };
 
@@ -27,6 +27,8 @@ fn make_prog(
         call_graph: reactant::engine::ComponentCallGraph::new(),
         recursive_components: std::collections::HashSet::new(),
         stats: reactant::engine::AnalysisStats::default(),
+        file_table: Default::default(),
+        function_registry: Default::default(),
     }
 }
 
@@ -36,8 +38,12 @@ fn hits(src: &str) -> usize {
         .with_options(ParseOptions::default())
         .parse();
     assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
-    let line_starts = compute_line_starts(src);
-    let components = lower_program(&ret.program, &line_starts, std::path::Path::new("test.tsx"));
+    let components = lower_program(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    );
     assert!(!components.is_empty(), "no component detected");
     components
         .into_iter()
@@ -57,8 +63,12 @@ fn diags(src: &str) -> Vec<Diagnostic> {
         .with_options(ParseOptions::default())
         .parse();
     assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
-    let line_starts = compute_line_starts(src);
-    let components = lower_program(&ret.program, &line_starts, std::path::Path::new("test.tsx"));
+    let components = lower_program(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    );
     assert!(!components.is_empty(), "no component detected");
     components
         .into_iter()

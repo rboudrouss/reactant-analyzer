@@ -101,16 +101,34 @@ pub fn render(report: &CheckReport, no_color: bool, show_clean: bool, info: bool
                 sev_color, sev_tag, p.reset, d.rule, label_info, var_info, range_info, d.message
             );
             if trace {
-                for note in &d.notes {
+                // Depth gate (ADR-019): pathological chains stay bounded.
+                const MAX_STEPS: usize = 8;
+                for note in d.notes.iter().take(MAX_STEPS) {
                     let note_hook = note
                         .hook_label
                         .map(|l| format!(" [hook:{l}]"))
                         .unwrap_or_default();
+                    // A witness step may point into another file (cross-file
+                    // inlining): name it whenever it differs from the
+                    // component's own file.
                     let note_range = note
                         .range
-                        .map(|r| format!(" (line {}:{})", r.line, r.col))
+                        .map(|r| match report.file_table.path(r.file) {
+                            Some(f) if comp.file.as_deref() != Some(f) => {
+                                format!(" ({}:{}:{})", display_path(f), r.line, r.col)
+                            }
+                            _ => format!(" (line {}:{})", r.line, r.col),
+                        })
                         .unwrap_or_default();
                     println!("       → {}{}{}", note.message, note_hook, note_range);
+                }
+                if d.notes.len() > MAX_STEPS {
+                    println!(
+                        "       {}… {} more step(s){}",
+                        p.dim,
+                        d.notes.len() - MAX_STEPS,
+                        p.reset
+                    );
                 }
             } else if !d.notes.is_empty() {
                 println!(

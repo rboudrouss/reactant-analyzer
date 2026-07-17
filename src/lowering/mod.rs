@@ -7,7 +7,7 @@ pub mod import_resolution;
 pub mod utility_detector;
 pub mod utility_lowerer;
 
-pub use crate::ir::{compute_line_starts, offset_to_range};
+pub use crate::ir::{FileId, FileTable, SourceMap, compute_line_starts, offset_to_range};
 pub use cfg_builder::{build_cfg, build_fn_body_cfg};
 pub use component_detector::{ComponentCandidate, detect_components};
 pub use hook_detector::{HookCandidate, detect_custom_hooks};
@@ -190,18 +190,28 @@ fn collect_module_consts(program: &Program) -> HashMap<Var, ModuleConstInit> {
 /// Uses [`DefaultImportResolver`] for relative-import resolution. Callers that
 /// need a custom resolver should use
 /// [`lower_custom_hooks_with_resolver`].
-pub fn lower_custom_hooks(program: &Program, line_starts: &[u32], file: &Path) -> Vec<HookIR> {
-    lower_custom_hooks_with_resolver(program, line_starts, file, &DefaultImportResolver)
+///
+/// `source` is the file's text (for the span line table); `files` interns
+/// `file` so every produced span carries its [`FileId`] (ADR-019).
+pub fn lower_custom_hooks(
+    program: &Program,
+    source: &str,
+    file: &Path,
+    files: &mut FileTable,
+) -> Vec<HookIR> {
+    lower_custom_hooks_with_resolver(program, source, file, files, &DefaultImportResolver)
 }
 
 /// Plugin-friendly variant of [`lower_custom_hooks`] that accepts a custom
 /// `ImportResolver`.
 pub fn lower_custom_hooks_with_resolver(
     program: &Program,
-    line_starts: &[u32],
+    source: &str,
     file: &Path,
+    files: &mut FileTable,
     resolver: &dyn ImportResolver,
 ) -> Vec<HookIR> {
+    let smap = SourceMap::new(source, files.intern(file));
     let import_map = build_import_map(program);
     let resolved_import_map: HashMap<String, PathBuf> =
         build_resolved_import_map(program, file, resolver);
@@ -217,8 +227,7 @@ pub fn lower_custom_hooks_with_resolver(
     candidates
         .into_iter()
         .map(|candidate| {
-            let (params, mut body_cfg) =
-                build_fn_body_cfg(candidate.params, candidate.body, line_starts);
+            let (params, mut body_cfg) = build_fn_body_cfg(candidate.params, candidate.body, &smap);
             let (mut hooks, mut next_label) = extract_hooks(&mut body_cfg, &imports);
             extract_handlers(&body_cfg, &mut hooks, &mut next_label);
             extract_subscriptions(&mut hooks, &mut next_label);
@@ -239,17 +248,24 @@ pub fn lower_custom_hooks_with_resolver(
 /// `file` is the absolute path of the source file. Uses
 /// [`DefaultImportResolver`]; see [`lower_program_with_resolver`] for the
 /// plugin variant.
-pub fn lower_program(program: &Program, line_starts: &[u32], file: &Path) -> Vec<ComponentIR> {
-    lower_program_with_resolver(program, line_starts, file, &DefaultImportResolver)
+pub fn lower_program(
+    program: &Program,
+    source: &str,
+    file: &Path,
+    files: &mut FileTable,
+) -> Vec<ComponentIR> {
+    lower_program_with_resolver(program, source, file, files, &DefaultImportResolver)
 }
 
 /// Plugin-friendly variant of [`lower_program`].
 pub fn lower_program_with_resolver(
     program: &Program,
-    line_starts: &[u32],
+    source: &str,
     file: &Path,
+    files: &mut FileTable,
     resolver: &dyn ImportResolver,
 ) -> Vec<ComponentIR> {
+    let smap = SourceMap::new(source, files.intern(file));
     let import_map = build_import_map(program);
     let resolved_import_map: HashMap<String, PathBuf> =
         build_resolved_import_map(program, file, resolver);
@@ -269,7 +285,7 @@ pub fn lower_program_with_resolver(
         .into_iter()
         .map(|candidate| {
             let (param_names, mut render_cfg) =
-                build_fn_body_cfg(candidate.params, candidate.body, line_starts);
+                build_fn_body_cfg(candidate.params, candidate.body, &smap);
             let (mut hooks, mut next_label) = extract_hooks(&mut render_cfg, &imports);
             extract_handlers(&render_cfg, &mut hooks, &mut next_label);
             extract_subscriptions(&mut hooks, &mut next_label);

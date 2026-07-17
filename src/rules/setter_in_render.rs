@@ -179,6 +179,16 @@ impl Rule for SetterInRender {
                 if let Some(r) = call.span {
                     d = d.with_range(r);
                 }
+                // Witness (ADR-019): the render-time setter call itself.
+                d = d.with_step(
+                    super::Step::Call {
+                        callee: call.var.clone(),
+                        class: super::EffectClass::Setter,
+                    },
+                    None,
+                    call.span,
+                    &super::witness::fallback_name,
+                );
                 Some(d)
             })
             .collect()
@@ -235,6 +245,8 @@ mod tests {
             call_graph: ComponentCallGraph::new(),
             recursive_components: HashSet::new(),
             stats: AnalysisStats::default(),
+            file_table: Default::default(),
+            function_registry: Default::default(),
         }
     }
 
@@ -250,6 +262,7 @@ mod tests {
         );
         AnalysisResult {
             component: "C".to_string(),
+            file: Default::default(),
             state_store: StateStore::bottom(),
             memo_store: MemoStore::new(),
             block_states: HashMap::new(),
@@ -258,7 +271,8 @@ mod tests {
             effect_info: HashMap::new(),
             handler_block_states: HashMap::new(),
             handler_info: HashMap::new(),
-            widened_labels: Default::default(),
+            widen_trace: Default::default(),
+            inline_origins: Default::default(),
             render_cfg: CFG {
                 entry: 0,
                 blocks,
@@ -363,6 +377,7 @@ mod tests {
         );
         let result = AnalysisResult {
             component: "C".to_string(),
+            file: Default::default(),
             state_store: StateStore::bottom(),
             memo_store: MemoStore::new(),
             block_states: HashMap::new(),
@@ -371,7 +386,8 @@ mod tests {
             effect_info: HashMap::new(),
             handler_block_states: HashMap::new(),
             handler_info: HashMap::new(),
-            widened_labels: Default::default(),
+            widen_trace: Default::default(),
+            inline_origins: Default::default(),
             effect_setter_writes: StateStore::bottom(),
             render_cfg: CFG {
                 entry: 0,

@@ -134,7 +134,7 @@ mod tests {
             expr::{Expr, Prim},
         },
     };
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     fn trivial_result() -> AnalysisResult<StateValue> {
         let mut blocks = HashMap::new();
@@ -148,6 +148,7 @@ mod tests {
         );
         AnalysisResult {
             component: "C".to_string(),
+            file: Default::default(),
             state_store: StateStore::bottom(),
             memo_store: MemoStore::new(),
             block_states: HashMap::new(),
@@ -156,7 +157,8 @@ mod tests {
             effect_info: HashMap::new(),
             handler_block_states: HashMap::new(),
             handler_info: HashMap::new(),
-            widened_labels: HashSet::new(),
+            widen_trace: HashMap::new(),
+            inline_origins: Vec::new(),
             effect_setter_writes: StateStore::bottom(),
             render_cfg: CFG {
                 entry: 0,

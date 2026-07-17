@@ -9,7 +9,7 @@ use reactant::{
         ComponentRegistry, Config, HookRegistry, ProgramAnalysisResult, RootStrategy,
         analyze_program,
     },
-    lowering::{compute_line_starts, lower_custom_hooks, lower_program},
+    lowering::{lower_custom_hooks, lower_program},
     registry::{HookSummary, SummaryRegistry},
     rules::{Diagnostic, all_rules},
 };
@@ -26,9 +26,18 @@ fn parse_and_analyze_with_config(src: &str, config: Config) -> ProgramAnalysisRe
         .with_options(ParseOptions::default())
         .parse();
     assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
-    let line_starts = compute_line_starts(src);
-    let components = lower_program(&ret.program, &line_starts, std::path::Path::new("test.tsx"));
-    let hook_irs = lower_custom_hooks(&ret.program, &line_starts, std::path::Path::new("test.tsx"));
+    let components = lower_program(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    );
+    let hook_irs = lower_custom_hooks(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    );
     let reg = ComponentRegistry::from_components(components);
     let hook_reg = HookRegistry::from_hooks(hook_irs);
     analyze_program(reg, hook_reg, RootStrategy::AllComponents, &config)

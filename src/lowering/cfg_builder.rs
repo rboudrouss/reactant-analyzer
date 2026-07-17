@@ -4,6 +4,7 @@ use oxc_ast::ast::*;
 
 use crate::{
     ir::{
+        SourceMap,
         cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator},
         expr::{Expr, Prim},
         stmt::Stmt,
@@ -23,11 +24,11 @@ pub(super) struct BlockBuilder {
     terminated: bool,
     temp_counter: usize,
     expr_counter: usize,
-    pub(super) line_starts: Vec<u32>,
+    pub(super) smap: SourceMap,
 }
 
 impl BlockBuilder {
-    pub(super) fn new_with_line_starts(line_starts: &[u32]) -> Self {
+    pub(super) fn new_with_smap(smap: &SourceMap) -> Self {
         Self {
             blocks: HashMap::new(),
             edges: Vec::new(),
@@ -37,7 +38,7 @@ impl BlockBuilder {
             terminated: false,
             temp_counter: 0,
             expr_counter: 0,
-            line_starts: line_starts.to_vec(),
+            smap: smap.clone(),
         }
     }
 
@@ -114,18 +115,14 @@ impl BlockBuilder {
     }
 
     pub(super) fn span_at(&self, offset: u32) -> Option<crate::ir::SourceRange> {
-        if self.line_starts.is_empty() {
-            None
-        } else {
-            Some(crate::ir::offset_to_range(&self.line_starts, offset))
-        }
+        self.smap.span_at(offset)
     }
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-pub fn build_cfg(body: &FunctionBody, line_starts: &[u32]) -> CFG {
-    let mut builder = BlockBuilder::new_with_line_starts(line_starts);
+pub fn build_cfg(body: &FunctionBody, smap: &SourceMap) -> CFG {
+    let mut builder = BlockBuilder::new_with_smap(smap);
     builder.start_block(0);
     lower_stmts(&body.statements, &mut builder);
     builder.into_cfg(0)
@@ -136,8 +133,8 @@ pub fn build_cfg(body: &FunctionBody, line_starts: &[u32]) -> CFG {
 /// Oxc stores the implicit return as a single `ExpressionStatement`. Using
 /// [`build_cfg`] would discard it (no `Return`); here it's lowered as `Return`
 /// so the body yields its value (`map(x => x*2)`, `setN(c => c+1)`, …).
-pub fn build_expr_body_cfg(body: &FunctionBody, line_starts: &[u32]) -> CFG {
-    let mut builder = BlockBuilder::new_with_line_starts(line_starts);
+pub fn build_expr_body_cfg(body: &FunctionBody, smap: &SourceMap) -> CFG {
+    let mut builder = BlockBuilder::new_with_smap(smap);
     builder.start_block(0);
     if let Some(Statement::ExpressionStatement(es)) = body.statements.first() {
         let expr = lower_expr(&es.expression, &mut builder);
@@ -254,9 +251,9 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
         // Hoisted declarations: bind name but emit no CFG node
         Statement::FunctionDeclaration(func) => {
             if let Some(id) = &func.id {
-                let line_starts = builder.line_starts.clone();
+                let smap = builder.smap.clone();
                 let (params, body_cfg) = if let Some(body) = func.body.as_deref() {
-                    build_fn_body_cfg(&func.params, body, &line_starts)
+                    build_fn_body_cfg(&func.params, body, &smap)
                 } else {
                     (vec![], empty_cfg())
                 };
@@ -569,9 +566,9 @@ pub(super) fn inject_param_preamble(
 pub fn build_fn_body_cfg(
     params: &FormalParameters,
     body: &FunctionBody,
-    line_starts: &[u32],
+    smap: &SourceMap,
 ) -> (Vec<String>, CFG) {
-    let mut builder = BlockBuilder::new_with_line_starts(line_starts);
+    let mut builder = BlockBuilder::new_with_smap(smap);
     builder.start_block(0);
     let param_names = inject_param_preamble(params, &mut builder);
     lower_stmts(&body.statements, &mut builder);
@@ -582,9 +579,9 @@ pub fn build_fn_body_cfg(
 pub fn build_expr_fn_body_cfg(
     params: &FormalParameters,
     body: &FunctionBody,
-    line_starts: &[u32],
+    smap: &SourceMap,
 ) -> (Vec<String>, CFG) {
-    let mut builder = BlockBuilder::new_with_line_starts(line_starts);
+    let mut builder = BlockBuilder::new_with_smap(smap);
     builder.start_block(0);
     let param_names = inject_param_preamble(params, &mut builder);
     if let Some(Statement::ExpressionStatement(es)) = body.statements.first() {

@@ -11,6 +11,7 @@ pub mod redundant_set_state;
 pub mod setter_in_render;
 pub mod unnecessary_rerender;
 pub mod widening_info;
+pub mod witness;
 
 pub use always_unstable_deps::AlwaysUnstableDeps;
 pub use analysis_limit_info::AnalysisLimitInfo;
@@ -24,6 +25,7 @@ pub use redundant_set_state::RedundantSetState;
 pub use setter_in_render::SetterInRender;
 pub use unnecessary_rerender::UnnecessaryRerender;
 pub use widening_info::WideningInfo;
+pub use witness::{EffectClass, ResolveTarget, Step, ValueClass};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -91,13 +93,21 @@ pub enum Severity {
     Info,
 }
 
-/// Secondary evidence item attached to a diagnostic.
+/// One step of a diagnostic's witness chain (ADR-019).
+///
+/// `message` is the pre-rendered prose ([`Step::render`] is the single
+/// rendering point — rules never format trace text); `step` is the typed
+/// judgment JSON consumers read.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Note {
     pub message: String,
+    /// The typed witness step this note carries.
+    pub step: Step,
     /// Hook label this note points to, if any.
     pub hook_label: Option<HookLabel>,
-    /// Source location this note points to, if available.
+    /// Source location this note points to, if available. Carries the
+    /// [`crate::ir::FileId`] of the file it points into (may differ from the
+    /// component's file after cross-file inlining).
     pub range: Option<SourceRange>,
 }
 
@@ -150,17 +160,29 @@ impl Diagnostic {
         self
     }
 
-    pub fn with_note(
+    /// Append a typed witness step (ADR-019). `name` maps a state slot to its
+    /// user-facing name — pass a closure over the rule's `state_slot_name`
+    /// table, or [`witness::fallback_name`] when no table applies.
+    pub fn with_step(
         mut self,
-        message: impl Into<String>,
+        step: Step,
         hook_label: Option<HookLabel>,
         range: Option<SourceRange>,
+        name: &dyn Fn(HookLabel) -> String,
     ) -> Self {
         self.notes.push(Note {
-            message: message.into(),
+            message: step.render(name),
+            step,
             hook_label,
             range,
         });
+        self
+    }
+
+    /// Append pre-built witness notes (from the `witness` producers —
+    /// [`witness::chase_value`], [`witness::slot_history`], …).
+    pub fn with_notes(mut self, notes: Vec<Note>) -> Self {
+        self.notes.extend(notes);
         self
     }
 }

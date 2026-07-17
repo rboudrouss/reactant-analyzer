@@ -224,7 +224,7 @@ fn check_setter_calls(
     skip_labels: &HashSet<HookLabel>,
 ) {
     for stmt in stmts {
-        if let Stmt::ExprStmt(Expr::Call { fn_, args }, _) = stmt
+        if let Stmt::ExprStmt(Expr::Call { fn_, args }, call_span) = stmt
             && let Expr::Var(name) = fn_.as_ref()
             && let Some(label) = env.setter_label(name)
         {
@@ -258,7 +258,18 @@ fn check_setter_calls(
                             label
                         ),
                     )
-                    .with_label(label),
+                    .with_label(label)
+                    // Witness (ADR-019): the write provably stores what the
+                    // state already holds.
+                    .with_step(
+                        super::Step::Write {
+                            slot: label,
+                            value: super::ValueClass::SameAsCurrent,
+                        },
+                        Some(label),
+                        *call_span,
+                        &super::witness::fallback_name,
+                    ),
                 );
             }
         }
@@ -297,6 +308,8 @@ mod tests {
             call_graph: ComponentCallGraph::new(),
             recursive_components: HashSet::new(),
             stats: AnalysisStats::default(),
+            file_table: Default::default(),
+            function_registry: Default::default(),
         }
     }
 
@@ -340,6 +353,7 @@ mod tests {
 
         AnalysisResult {
             component: "C".to_string(),
+            file: Default::default(),
             state_store,
             memo_store: MemoStore::new(),
             block_states,
@@ -348,7 +362,8 @@ mod tests {
             effect_info: HashMap::new(),
             handler_block_states: HashMap::new(),
             handler_info: HashMap::new(),
-            widened_labels: HashSet::new(),
+            widen_trace: HashMap::new(),
+            inline_origins: Vec::new(),
             render_cfg,
             hooks: vec![],
             iterations: 0,
@@ -546,6 +561,7 @@ mod tests {
 
         AnalysisResult {
             component: "C".to_string(),
+            file: Default::default(),
             state_store,
             memo_store: MemoStore::new(),
             block_states,
@@ -554,7 +570,8 @@ mod tests {
             effect_info: HashMap::new(),
             handler_block_states: HashMap::new(),
             handler_info: HashMap::new(),
-            widened_labels: HashSet::new(),
+            widen_trace: HashMap::new(),
+            inline_origins: Vec::new(),
             render_cfg,
             hooks: vec![HookEntry::Effect {
                 label: 1,
