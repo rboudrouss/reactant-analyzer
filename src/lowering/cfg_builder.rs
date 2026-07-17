@@ -233,6 +233,18 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
                 // Not on a real control-flow edge, but we walk the catch body
                 // so hook extraction can find hooks inside catch blocks.
                 if !builder.is_terminated() {
+                    // Bind the catch param (`catch (e)`) so `compute_free_vars`
+                    // doesn't see it as a component-scope capture. The thrown
+                    // value is unknowable → Top.
+                    if let Some(param) = &handler.param {
+                        let span = builder.span_at(param.span.start);
+                        lower_binding_pattern(
+                            &param.pattern,
+                            Expr::SummaryVal(crate::ir::expr::SummaryValue::Top),
+                            span,
+                            builder,
+                        );
+                    }
                     lower_stmts(&handler.body.body, builder);
                 }
             }

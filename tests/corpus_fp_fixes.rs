@@ -1385,6 +1385,83 @@ function A() {
     );
 }
 
+// ── Catch-clause param binding ────────────────────────────────────────────────
+
+#[test]
+fn catch_param_is_not_a_free_var() {
+    // excalidraw useTTDChatStorage repro: `catch (error)` inside a
+    // useCallback — the param is handler-local, not a component-scope
+    // capture, so missing-deps must not ask for it.
+    let src = r#"
+function A() {
+  const cb = useCallback(() => {
+    try {
+      doThing();
+    } catch (error) {
+      console.warn(error);
+    }
+  }, []);
+  return <button onClick={cb} />;
+}
+"#;
+    let diags = diagnostics(src);
+    assert!(
+        !diags
+            .iter()
+            .any(|(r, m)| r == "missing-deps" && m.contains("`error`")),
+        "catch param leaked as free var: {diags:?}"
+    );
+}
+
+#[test]
+fn destructured_catch_param_is_not_a_free_var() {
+    // `catch ({ message })` binds through the object pattern.
+    let src = r#"
+function A() {
+  const cb = useCallback(() => {
+    try {
+      doThing();
+    } catch ({ message }) {
+      console.warn(message);
+    }
+  }, []);
+  return <button onClick={cb} />;
+}
+"#;
+    let diags = diagnostics(src);
+    assert!(
+        !diags
+            .iter()
+            .any(|(r, m)| r == "missing-deps" && m.contains("`message`")),
+        "destructured catch param leaked as free var: {diags:?}"
+    );
+}
+
+#[test]
+fn real_capture_inside_catch_body_still_warns() {
+    // FN guard: binding the catch param must not eat a genuine capture read
+    // inside the handler body.
+    let src = r#"
+function A({ user }) {
+  const cb = useCallback(() => {
+    try {
+      doThing();
+    } catch (error) {
+      report(error, user);
+    }
+  }, []);
+  return <button onClick={cb} />;
+}
+"#;
+    let diags = diagnostics(src);
+    assert!(
+        diags
+            .iter()
+            .any(|(r, m)| r == "missing-deps" && m.contains("`user`")),
+        "capture in catch body must still warn: {diags:?}"
+    );
+}
+
 // ── setter-in-render: sanctioned adjust-during-render idiom ───────────────────
 
 #[test]
