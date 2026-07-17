@@ -255,6 +255,7 @@ pub(crate) fn arg_is_call_free(
         | Expr::StateSetter(_)
         | Expr::MemoVal(_)
         | Expr::CallbackVal(_)
+        | Expr::HookMarker(_)
         | Expr::SummaryVal(_)
         | Expr::FnLit { .. } => true,
         Expr::ObjectLit { fields, .. } => fields

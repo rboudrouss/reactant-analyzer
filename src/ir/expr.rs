@@ -119,6 +119,14 @@ pub enum Expr {
     MemoVal(HookLabel),
     CallbackVal(HookLabel),
 
+    /// Marks the call site of a hook whose result carries no tracked value
+    /// (`useEffect`, `useRef`, custom hooks, …). Evaluates to unit; its only
+    /// role is to keep the hook's label anchored in the CFG so call-site
+    /// blocks survive inlining and renumbering (`collect_hook_calls`,
+    /// conditional-hook). Every extracted hook leaves its label in the CFG —
+    /// value-bearing kinds via `StateVal`/`MemoVal`/…, all others via this.
+    HookMarker(HookLabel),
+
     /// Injected by `expand_custom_hooks` for library hooks with a `HookSummary`.
     /// Evaluates directly to the encoded abstract value without going through the
     /// concrete expression language (avoids a circular dep between `ir` and `domains`).
@@ -157,6 +165,7 @@ impl Expr {
             | Expr::StateSetter(_)
             | Expr::MemoVal(_)
             | Expr::CallbackVal(_)
+            | Expr::HookMarker(_)
             | Expr::SummaryVal(_) => {}
             Expr::ObjectLit { fields, .. } => {
                 for (_, v) in fields {
@@ -206,7 +215,8 @@ impl Expr {
             | Expr::StateVal(_)
             | Expr::StateSetter(_)
             | Expr::MemoVal(_)
-            | Expr::CallbackVal(_) => true,
+            | Expr::CallbackVal(_)
+            | Expr::HookMarker(_) => true,
             Expr::ObjectLit { fields, .. } => fields.iter().all(|(_, v)| v.is_call_free()),
             Expr::ArrayLit { elems, .. } => elems.iter().all(|e| e.is_call_free()),
             Expr::FnLit { .. } => true,

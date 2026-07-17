@@ -321,6 +321,7 @@ fn collect_callees_in_expr(expr: &Expr, out: &mut Vec<Symbol>) {
         | Expr::StateSetter(_)
         | Expr::MemoVal(_)
         | Expr::CallbackVal(_)
+        | Expr::HookMarker(_)
         | Expr::SummaryVal(_) => {}
     }
 }

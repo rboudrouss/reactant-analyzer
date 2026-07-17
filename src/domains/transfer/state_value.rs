@@ -112,6 +112,9 @@ fn eval_state_value(
         }
         Expr::StateSetter(label) => StateValue::component_setter(ctx.component.clone(), *label),
         Expr::MemoVal(label) | Expr::CallbackVal(label) => ctx.memo.get(*label),
+        // Call-site marker for value-less hooks: same abstraction as the
+        // `Lit(Unit)` it replaced.
+        Expr::HookMarker(_) => StateValue::undefined(),
 
         Expr::ObjectLit { .. } => StateValue::reference(Stability::PerRender),
         Expr::ArrayLit { .. } => StateValue::reference(Stability::PerRender),

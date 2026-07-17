@@ -406,7 +406,9 @@ fn process_stmt(
                     *import_source = imports.import_map.get(&name).cloned();
                     *resolved_file = imports.resolved_import_map.get(&name).cloned();
                 }
-                // useEffect and similar void hooks: no stmt emitted.
+                // Void hooks (useEffect, bare custom calls): leave a marker so
+                // the call-site block stays recoverable from the CFG.
+                out.push(Stmt::ExprStmt(Expr::HookMarker(lbl), stmt_span));
             }
             Err(expr) => {
                 out.push(Stmt::ExprStmt(rewrite_expr(expr, state_temps), stmt_span));
@@ -643,15 +645,16 @@ fn make_hook_entry(
 /// IR expression that replaces a hook call at its binding site.
 fn hook_result_expr(name: &str, is_react: bool, label: HookLabel) -> Expr {
     if !is_react {
-        // Custom hooks bind an opaque unit; the engine resolves the real
-        // value via HookRegistry inlining or a summary.
-        return Expr::Lit(Prim::Unit);
+        // Custom hooks bind an opaque marker (evaluates to unit); the engine
+        // resolves the real value via HookRegistry inlining or a summary. The
+        // marker keeps the call-site block recoverable (`collect_hook_calls`).
+        return Expr::HookMarker(label);
     }
     match name {
         "useState" | "useReducer" => Expr::StateVal(label),
         "useMemo" => Expr::MemoVal(label),
         "useCallback" => Expr::CallbackVal(label),
-        _ => Expr::Lit(Prim::Unit),
+        _ => Expr::HookMarker(label),
     }
 }
 
@@ -874,11 +877,11 @@ mod tests {
         assert!(
             matches!(&hooks[0], HookEntry::Effect { label: 0, deps: Some(deps), .. } if deps.len() == 1)
         );
-        // No ExprStmt for useEffect in the entry block
+        // useEffect leaves a call-site marker in the entry block
         assert!(
-            !entry_stmts(&cfg)
+            entry_stmts(&cfg)
                 .iter()
-                .any(|s| matches!(s, Stmt::ExprStmt(_, _)))
+                .any(|s| matches!(s, Stmt::ExprStmt(Expr::HookMarker(0), _)))
         );
     }
 
@@ -941,11 +944,11 @@ mod tests {
                 ..
             }
         ));
-        // useRef result is opaque Lit(Unit)
+        // useRef result is an opaque call-site marker
         let stmts = entry_stmts(&cfg);
         assert!(matches!(
             find_let_rhs(stmts, "r"),
-            Some(Expr::Lit(Prim::Unit))
+            Some(Expr::HookMarker(0))
         ));
     }
 
@@ -960,7 +963,7 @@ mod tests {
         let stmts = entry_stmts(&cfg);
         assert!(matches!(
             find_let_rhs(stmts, "data"),
-            Some(Expr::Lit(Prim::Unit))
+            Some(Expr::HookMarker(0))
         ));
     }
 

@@ -19,6 +19,7 @@ pub fn remap_expr(expr: Expr, offset: HookLabel) -> Expr {
         Expr::StateSetter(l) => Expr::StateSetter(l + offset),
         Expr::MemoVal(l) => Expr::MemoVal(l + offset),
         Expr::CallbackVal(l) => Expr::CallbackVal(l + offset),
+        Expr::HookMarker(l) => Expr::HookMarker(l + offset),
 
         Expr::FnLit {
             id,

@@ -6,6 +6,8 @@
 
 - **Unknown callees without `Loc`** — `myHelper(() => setX())` → FN if `myHelper` is imported from an npm package (not in the analyzed files) or if inlining was cut off by depth. Local utilities are inlined (ADR-013 Phase 3) but only in **statement** position; in expression position they stay opaque. *(ADR-010, ADR-013)*
 
+- **Summarized library hooks invisible to `conditional-hook`** — `expand_custom_hooks` *removes* the `HookEntry::Custom` of a hook served by the `SummaryRegistry` (jotai `useAtom`, TanStack…) and patches its binding to `SummaryVal`, so no label survives into `hook_calls` → a conditional `useAtom()` is not flagged. The `Expr::HookMarker` invariant (every extracted hook leaves its label in the CFG) covers everything else; fixing this one means keeping the entry (or its label→kind row) alive through summarization instead of dropping it.
+
 - **`cross-component-infinite-loop` FN if the parent is only analyzed intra** — if the parent component isn't reached by top-down analysis (Phase 2 fallback, props = ⊤), the `SharedStateStore` isn't populated → the rule doesn't fire. *(ADR-012)*
 
 - **Loop-carried values inside callbacks** — `exec_body` doesn't widen on back-edges → `setX(arr[i])` records a partial value. Minor FN on the *value*, never an FP. *(ADR-009)*

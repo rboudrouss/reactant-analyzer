@@ -876,9 +876,12 @@ fn exit_env<D: AbstractDomain>(
 
 /// Scan `render_cfg` for hook-related expressions and build `HookCallInfo` list.
 ///
-/// State/Memo/Callback/Ref hooks are identified by the binding expression in the
-/// render CFG.  Effect hooks emit no statement in the render CFG, so their
-/// `block_id` defaults to `cfg.entry`.
+/// Every extracted hook leaves its label in the render CFG at its call site —
+/// value-bearing kinds via their binding expression (`StateVal`, `MemoVal`, …),
+/// void kinds via `Expr::HookMarker` — so `block_id` is recovered by scanning
+/// the final CFG (positions survive inlining and block renumbering). A label
+/// with no CFG occurrence (Handler entries, markers lost to a transformation)
+/// falls back to `cfg.entry`.
 fn collect_hook_calls(hooks: &[HookEntry], cfg: &CFG) -> Vec<HookCallInfo> {
     // Build label → kind and label → span maps from hook entries.
     let label_to_kind: HashMap<HookLabel, HookKind> = hooks
@@ -907,33 +910,9 @@ fn collect_hook_calls(hooks: &[HookEntry], cfg: &CFG) -> Vec<HookCallInfo> {
         })
         .collect();
 
-    // Effect and Handler hooks have no render-CFG binding stmt; pre-populate with entry block.
-    let mut call_map: HashMap<HookLabel, HookCallInfo> = hooks
-        .iter()
-        .filter_map(|h| match h {
-            HookEntry::Effect { label, .. } => Some((
-                *label,
-                HookCallInfo {
-                    label: *label,
-                    kind: HookKind::Effect,
-                    block_id: cfg.entry,
-                    span: label_to_span.get(label).copied().flatten(),
-                },
-            )),
-            HookEntry::Handler { label, .. } => Some((
-                *label,
-                HookCallInfo {
-                    label: *label,
-                    kind: HookKind::Handler,
-                    block_id: cfg.entry,
-                    span: label_to_span.get(label).copied().flatten(),
-                },
-            )),
-            _ => None,
-        })
-        .collect();
-
-    // Scan blocks for StateVal / StateSetter / MemoVal / CallbackVal
+    // Scan blocks for label-bearing exprs (StateVal / StateSetter / MemoVal /
+    // CallbackVal / HookMarker); first occurrence in block order wins.
+    let mut call_map: HashMap<HookLabel, HookCallInfo> = HashMap::new();
     let mut sorted_ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
     sorted_ids.sort_unstable();
 
@@ -954,6 +933,16 @@ fn collect_hook_calls(hooks: &[HookEntry], cfg: &CFG) -> Vec<HookCallInfo> {
         }
     }
 
+    // Labels absent from the CFG (Handlers, lost markers): entry-block fallback.
+    for (&label, &kind) in &label_to_kind {
+        call_map.entry(label).or_insert(HookCallInfo {
+            label,
+            kind,
+            block_id: cfg.entry,
+            span: label_to_span.get(&label).copied().flatten(),
+        });
+    }
+
     let mut result: Vec<HookCallInfo> = call_map.into_values().collect();
     result.sort_by_key(|h| h.label);
     result
@@ -972,7 +961,11 @@ fn hook_labels_in_stmt(stmt: &Stmt) -> Vec<HookLabel> {
 
 fn collect_hook_labels_expr(expr: &Expr, out: &mut Vec<HookLabel>) {
     match expr {
-        Expr::StateVal(l) | Expr::StateSetter(l) | Expr::MemoVal(l) | Expr::CallbackVal(l) => {
+        Expr::StateVal(l)
+        | Expr::StateSetter(l)
+        | Expr::MemoVal(l)
+        | Expr::CallbackVal(l)
+        | Expr::HookMarker(l) => {
             out.push(*l);
         }
         Expr::ObjectLit { fields, .. } => fields

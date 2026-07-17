@@ -105,6 +105,8 @@ impl Rule for ConditionalHook {
         result
             .hook_calls
             .iter()
+            // Handlers are plain event callbacks, not hooks — conditional is legal.
+            .filter(|call| !matches!(call.kind, crate::engine::HookKind::Handler))
             .filter(|call| {
                 // Conditional = doesn't dominate every exit.
                 exits
