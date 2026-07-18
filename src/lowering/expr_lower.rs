@@ -612,7 +612,7 @@ fn lower_jsx_child(child: &JSXChild, builder: &mut BlockBuilder) -> Option<Expr>
 
 /// Identifier name of a plain assignment target, or `None` for member/index/
 /// pattern targets (which the abstract env does not track as a single cell).
-fn assign_target_ident(target: &AssignmentTarget) -> Option<String> {
+pub(super) fn assign_target_ident(target: &AssignmentTarget) -> Option<String> {
     match target {
         AssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.to_string()),
         _ => None,

@@ -1462,6 +1462,150 @@ function A({ user }) {
     );
 }
 
+// ── For-of / for-in loop-head lowering ────────────────────────────────────────
+
+#[test]
+fn for_of_loop_var_shadowing_prop_is_not_a_free_var() {
+    // memos useResolvedRelationMemos repro: the loop var `memo` shadows the
+    // component's `memo` prop inside a useMemo — it is loop-local, not a
+    // capture, so missing-deps must not ask for it.
+    let src = r#"
+function A({ memo, list }) {
+  const resolved = useMemo(() => {
+    const out = [];
+    for (const memo of list) {
+      out.push(memo.name);
+    }
+    return out;
+  }, [list]);
+  return <div>{resolved}</div>;
+}
+"#;
+    let diags = diagnostics(src);
+    // Pre-fix message named the path (`memo.name`), so match on the root.
+    assert!(
+        !diags
+            .iter()
+            .any(|(r, m)| r == "missing-deps" && m.contains("memo")),
+        "for-of loop var leaked as free var: {diags:?}"
+    );
+}
+
+#[test]
+fn for_of_destructured_loop_var_is_not_a_free_var() {
+    // `for (const { id } of list)` binds through the object pattern.
+    let src = r#"
+function A({ id, list }) {
+  const cb = useCallback(() => {
+    for (const { id } of list) {
+      console.log(id);
+    }
+  }, [list]);
+  return <button onClick={cb} />;
+}
+"#;
+    let diags = diagnostics(src);
+    assert!(
+        !diags
+            .iter()
+            .any(|(r, m)| r == "missing-deps" && m.contains("`id`")),
+        "destructured for-of loop var leaked as free var: {diags:?}"
+    );
+}
+
+#[test]
+fn for_in_loop_var_shadowing_prop_is_not_a_free_var() {
+    let src = r#"
+function A({ field, obj }) {
+  const cb = useCallback(() => {
+    for (const field in obj) {
+      console.log(field);
+    }
+  }, [obj]);
+  return <button onClick={cb} />;
+}
+"#;
+    let diags = diagnostics(src);
+    assert!(
+        !diags
+            .iter()
+            .any(|(r, m)| r == "missing-deps" && m.contains("`field`")),
+        "for-in loop var leaked as free var: {diags:?}"
+    );
+}
+
+#[test]
+fn for_of_iterated_expression_is_a_missing_dep() {
+    // Dual FN killed by the same fix: `for (const x of items)` READS `items`
+    // in the loop head — omitting it from the deps array must be flagged.
+    let src = r#"
+function A({ items }) {
+  useEffect(() => {
+    for (const x of items) {
+      console.log(x);
+    }
+  }, []);
+  return <div />;
+}
+"#;
+    let diags = diagnostics(src);
+    assert!(
+        diags
+            .iter()
+            .any(|(r, m)| r == "missing-deps" && m.contains("`items`")),
+        "iterated expression read must be a dep: {diags:?}"
+    );
+}
+
+#[test]
+fn real_capture_inside_for_of_body_still_warns() {
+    // FN guard: binding the loop var must not eat a genuine capture read
+    // inside the loop body.
+    let src = r#"
+function A({ user, list }) {
+  const cb = useCallback(() => {
+    for (const item of list) {
+      send(item, user);
+    }
+  }, [list]);
+  return <button onClick={cb} />;
+}
+"#;
+    let diags = diagnostics(src);
+    assert!(
+        diags
+            .iter()
+            .any(|(r, m)| r == "missing-deps" && m.contains("`user`")),
+        "capture in for-of body must still warn: {diags:?}"
+    );
+}
+
+// ── Sync-HOF callback descent (classify_callee completeness) ──────────────────
+
+#[test]
+fn setter_inside_sort_comparator_is_executed() {
+    // A `.sort()` comparator runs synchronously in the effect — the setter
+    // write inside it must reach the state store (numeric widening →
+    // infinite-loop). Pre-fix `sort` was Unknown → not descended → FN.
+    let src = r#"
+function A() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    [3, 1, 2].sort((a, b) => {
+      setN(n + 1);
+      return a - b;
+    });
+  }, [n]);
+  return <div>{n}</div>;
+}
+"#;
+    let fired = rules_fired(src);
+    assert!(
+        fired.iter().any(|r| r == "infinite-loop"),
+        "setter in sort comparator must be seen: {fired:?}"
+    );
+}
+
 // ── setter-in-render: sanctioned adjust-during-render idiom ───────────────────
 
 #[test]

@@ -39,14 +39,95 @@ pub fn classify_callee<D: AbstractDomain>(fn_: &Expr, env: &AbstractEnv<D>) -> T
                 }
             }
         }
-        Expr::FieldAccess { field, .. } => match field.as_str() {
+        Expr::FieldAccess { obj, field } => match field.as_str() {
             "then" | "catch" | "finally" | "allSettled" | "any" => TriggerClass::InCycle,
-            "map" | "forEach" | "reduce" | "filter" | "find" | "flatMap" | "some" | "every" => {
+            "map" | "forEach" | "reduce" | "filter" | "find" | "flatMap" | "some" | "every"
+            | "findIndex" | "findLast" | "findLastIndex" | "reduceRight" | "sort" | "toSorted"
+            | "replace" | "replaceAll" => TriggerClass::InCycle,
+            // `Array.from(iterable, mapFn)`: the map callback runs
+            // synchronously. Receiver-restricted — a bare `.from` on an
+            // unknown object could be anything.
+            "from" if matches!(obj.as_ref(), Expr::Var(v) if v == "Array") => {
                 TriggerClass::InCycle
             }
             "addEventListener" | "removeEventListener" => TriggerClass::Subscription,
             _ => TriggerClass::Unknown,
         },
         _ => TriggerClass::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domains::StateValue;
+
+    fn env() -> AbstractEnv<StateValue> {
+        AbstractEnv::new()
+    }
+
+    fn method(obj: &str, field: &str) -> Expr {
+        Expr::FieldAccess {
+            obj: Box::new(Expr::Var(obj.to_string())),
+            field: field.to_string(),
+        }
+    }
+
+    #[test]
+    fn sync_array_hofs_are_in_cycle() {
+        for f in [
+            "map",
+            "forEach",
+            "sort",
+            "toSorted",
+            "findIndex",
+            "findLast",
+            "findLastIndex",
+            "reduceRight",
+        ] {
+            assert_eq!(
+                classify_callee(&method("arr", f), &env()),
+                TriggerClass::InCycle,
+                "{f} must be in-cycle"
+            );
+        }
+    }
+
+    #[test]
+    fn string_replacer_callbacks_are_in_cycle() {
+        assert_eq!(
+            classify_callee(&method("s", "replace"), &env()),
+            TriggerClass::InCycle
+        );
+        assert_eq!(
+            classify_callee(&method("s", "replaceAll"), &env()),
+            TriggerClass::InCycle
+        );
+    }
+
+    #[test]
+    fn array_from_is_receiver_restricted() {
+        assert_eq!(
+            classify_callee(&method("Array", "from"), &env()),
+            TriggerClass::InCycle
+        );
+        // `.from` on an unknown receiver could be anything (e.g. a query
+        // builder) — stays Unknown, FP-averse.
+        assert_eq!(
+            classify_callee(&method("router", "from"), &env()),
+            TriggerClass::Unknown
+        );
+    }
+
+    #[test]
+    fn subscriptions_and_unknowns_unchanged() {
+        assert_eq!(
+            classify_callee(&method("el", "addEventListener"), &env()),
+            TriggerClass::Subscription
+        );
+        assert_eq!(
+            classify_callee(&method("api", "subscribe"), &env()),
+            TriggerClass::Unknown
+        );
     }
 }

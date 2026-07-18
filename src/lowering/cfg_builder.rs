@@ -11,7 +11,7 @@ use crate::{
         stmt::Stmt,
         types::{BlockId, ExprId},
     },
-    lowering::expr_lower::{empty_cfg, lower_expr},
+    lowering::expr_lower::{assign_target_ident, empty_cfg, lower_expr},
 };
 
 // ── BlockBuilder ──────────────────────────────────────────────────────────────
@@ -196,10 +196,10 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
             );
         }
         Statement::ForInStatement(f) => {
-            lower_iter_loop(&f.body, builder);
+            lower_iter_loop(&f.left, &f.right, &f.body, builder);
         }
         Statement::ForOfStatement(f) => {
-            lower_iter_loop(&f.body, builder);
+            lower_iter_loop(&f.left, &f.right, &f.body, builder);
         }
         Statement::DoWhileStatement(dw) => {
             let body_block = builder.new_block();
@@ -431,7 +431,25 @@ fn lower_for(
 }
 
 /// Simplified for-in / for-of: single loop with unknown bound.
-fn lower_iter_loop(body: &Statement, builder: &mut BlockBuilder) {
+///
+/// The head is lowered in full (TODO.md loop-head FP/FN):
+/// - the iterated expression is evaluated in the preheader, so
+///   `for (const x of foo)` registers a read of `foo` (dep soundness);
+/// - the loop variable is bound at the top of the body to `Top` — the
+///   per-iteration element/key is unknowable, same treatment as HOF
+///   callback params and catch params — so a loop var shadowing an outer
+///   binding is not read as a capture of it.
+fn lower_iter_loop(
+    left: &ForStatementLeft,
+    right: &Expression,
+    body: &Statement,
+    builder: &mut BlockBuilder,
+) {
+    // Preheader: the iterated expression is read once at loop entry.
+    let iterated = lower_expr(right, builder);
+    let iter_span = builder.span_at(right.span().start);
+    builder.push_stmt(Stmt::ExprStmt(iterated, iter_span));
+
     let header = builder.new_block();
     let body_block = builder.new_block();
     let exit_block = builder.new_block();
@@ -450,6 +468,27 @@ fn lower_iter_loop(body: &Statement, builder: &mut BlockBuilder) {
     builder.add_edge(h, exit_block, EdgeKind::IfFalse);
 
     builder.start_block(body_block);
+    let top = Expr::SummaryVal(crate::ir::expr::SummaryValue::Top);
+    match left {
+        ForStatementLeft::VariableDeclaration(decl) => {
+            for d in &decl.declarations {
+                let span = builder.span_at(d.span.start);
+                lower_binding_pattern(&d.id, top.clone(), span, builder);
+            }
+        }
+        // Pre-declared target (`for (x of arr)`): re-assign the outer var.
+        // Member/pattern targets are not tracked as a single cell — skipped.
+        other => {
+            if let Some(var) = other.as_assignment_target().and_then(assign_target_ident) {
+                let span = builder.span_at(other.span().start);
+                builder.push_stmt(Stmt::Assign {
+                    var,
+                    rhs: top,
+                    span,
+                });
+            }
+        }
+    }
     lower_stmt(body, builder);
     if !builder.is_terminated() {
         let b = builder.seal_with(Terminator::Jump(header));
