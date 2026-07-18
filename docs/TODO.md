@@ -12,7 +12,7 @@
 
 - **Loop-carried values inside callbacks** — `exec_body` doesn't widen on back-edges → `setX(arr[i])` records a partial value. Minor FN on the *value*, never an FP. *(ADR-009)*
 
-- **Kind-ambiguous fresh methods stay ⊤** — fresh-array method returns are modeled as PerRender references (`returns_fresh_reference`), but `slice`/`concat` are deliberately excluded: on a *string* receiver they return a value-compared primitive, and claiming a per-render reference for `id.slice(0, 8)` in a deps array would be a false proof. Cost: `const copy = arr.slice()` in deps is a missed `always-unstable-deps` TP. Fixing it needs receiver *kind* (string vs array) in the product domain. Related minor imprecision, by design: HOF callback params and for-of/for-in loop vars are bound to ⊤, not to the receiver's element join — refine both together if a real case ever needs it.
+- **Kind-ambiguous fresh methods stay ⊤** — `slice`/`concat` are deliberately excluded from `returns_fresh_reference`: on a *string* receiver they return a value-compared primitive, and claiming a per-render reference for `id.slice(0, 8)` in a deps array would be a false proof. Cost: `const copy = arr.slice()` in deps is a missed `always-unstable-deps` TP. Fixing it needs receiver *kind* (string vs array) in the product domain. Related minor imprecision, by design: HOF callback params and for-of/for-in loop vars are bound to ⊤, not to the receiver's element join — refine both together if a real case ever needs it.
 
 - **`state-mutation` v1 scope** — the rule proves the pair (in-place mutation of the slot's reference, same-identity set) through `const`-alias chains only. Out of scope, all FNs: functional updaters that mutate (`set(p => { p.x = 1; return p })` — same identity returned), direct **prop** mutation (needs cross-component identity), mutation through an *escaped* alias (stored in a ref/object then mutated), and plain field writes (`obj.x = v` — member-assignment lowering doesn't produce a trackable event yet). Mutation + set in *sibling* handlers is deliberately unpaired (same-scope-chain gate, FP-averse).
 
@@ -34,13 +34,12 @@
 
 - **Churn-cycle Warning on convergent multi-writer pairs** — the F5b convergence kill requires a single effect write-site per slot (ADR-018); a guarded fetch-once write coexisting with another writer of the same slot keeps its edge even when the pair in fact converges. Precise alternative: narrow guards against the join of all writers' values.
 
-
 - **Whole-object read via guard/nullish is flagged** — 3 advice-class findings (memos `App` ×2, `LocationPicker`): a truthiness test (`if (!x)`) or nullish default (`x ?? d`) reads the whole reference, so declaring only fields (`[x?.locale]`) doesn't cover it. Distinguishing "value use" from "existence check" would need tracking *how* the whole ref is consumed — deferred; keeping the (sound, eslint-aligned) warning.
 - **Never-written state refinement** — `useState(CONST)` with no reachable setter call could read `Stable` (dep omittable) instead of `Versioned`. Needs a post-fixpoint "slot ever written" bit; marginal gain. *(ADR-017 §Limitations)*
 
 ### Diagnostics UX (side-finding)
 
-- **Cross-file anchors print bare line numbers** — a finding anchored inside an *inlined* hook renders `(line N:C)` under the component header, but N points into the hook's source file, not the component file shown in the header (excalidraw: `EyeDropper … EyeDropper.tsx` + `(line 26:2)` = `useOutsideClick.ts:26`; memos: `App` ×2 → `useUserTheme.ts`/`useUserLocale.ts`, `MemoDetailSidebar` → `useResolvedRelationMemos.ts`; `TextToDiagramContent` → `useTTDChatStorage.ts:78/146`). The `--trace` steps do print the true path; the primary finding line should carry the origin file whenever the `InlineOrigin` (ADR-019) differs from the component's file.
+- **Cross-file anchors print bare line numbers** — a finding anchored inside an *inlined* hook renders `(line N:C)` under the component header, but N points into the hook's source file, not the component file shown in the header (excalidraw: `EyeDropper … EyeDropper.tsx` + `(line 26:2)` = `useOutsideClick.ts:26`; memos: `App` ×2 → `useUserTheme.ts`/`useUserLocale.ts`; `TextToDiagramContent` → `useTTDChatStorage.ts:78/146`). The `--trace` steps do print the true path; the primary finding line should carry the origin file whenever the `InlineOrigin` (ADR-019) differs from the component's file.
 
 - **Cross-component blame** — `always-unstable-deps` on a prop-rooted dep blames the *child* (memos `MentionResolutionProvider`; zustand `Fireflies` — `colors` dep fed by the literal `['orange']` at the `Scene.jsx:92` call site) when the instability comes from a specific parent call site (`MemoDetail.tsx` passes an unmemoized array). The propagation is semantically correct (verified: the provider analyzed alone is silent); the message should carry the provenance ("unstable because `<Parent>` passes a fresh array at file:line"). An `OnProps` label family in the ADR-017 frame would make this provenance first-class — worth doing for the *message*, no FP to fix.
 
@@ -94,8 +93,6 @@ Error→Warning. Rules that would just re-do eslint AST pattern-matching (raw ex
 rules-of-hooks, index-as-key, naming) are explicitly out of scope.
 
 ### Tier 1 — differentiators (engine already has the domains)
-
-- ~~**`state-mutation`**~~ — **implemented** (`rules/state_mutation.rs`): mutation + same-identity set proven through `const`-alias resolution to the `useState` binding, Error. Remaining sub-cases tracked in the FN section above (§ `state-mutation` v1 scope).
 
 - **`stale-closure`** — a callback that outlives the render (`setInterval`/`setTimeout`/`addEventListener`/`.then`/subscribe) captures a state value under empty/stable deps → the captured version is frozen at mount. `useEffect(() => { setInterval(() => setN(n+1), 1000) }, [])` → `n` stays 0 forever. Engine: version domain (ADR-017) — compare the version captured in the closure vs the current slot version. **FN gate: fire only when a `Versioned` slot is read/written inside an auto-run callback whose deps are stable.** Opposite angle to `always-unstable-deps` (deps too empty vs too unstable).
 
