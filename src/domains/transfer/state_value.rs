@@ -134,6 +134,9 @@ fn eval_state_value(
             eval_unary(op, v)
         }
 
+        Expr::Call { fn_, .. } if returns_fresh_reference(fn_) => {
+            StateValue::reference(Stability::PerRender)
+        }
         Expr::Call { .. } => StateValue::top(),
 
         Expr::FieldAccess { obj, field } => eval_field_access(obj, field, env, ctx),
@@ -148,6 +151,43 @@ fn eval_state_value(
                 StateValue::reference(Stability::PerRender)
             }
         },
+    }
+}
+
+/// Callees whose return value is a *freshly allocated reference* on every
+/// call — never the receiver, never a cached object. Modeled as
+/// `reference(PerRender)` instead of ⊤ (same seeding as `ArrayLit`), which
+/// lets `always-unstable-deps` *prove* that `const items = arr.map(f)` in a
+/// deps array defeats memoization.
+///
+/// Two exclusions keep the proof honest (FP-averse):
+/// - **kind-ambiguous methods** (`slice`, `concat`): on a string receiver
+///   they return a *primitive*, which `Object.is` value-compares — claiming
+///   a per-render reference for `id.slice(0, 8)` would be a false proof.
+///   They stay ⊤ (silent).
+/// - **in-place methods** (`sort`, `reverse`, `fill`, `copyWithin`,
+///   `Object.assign`): they return the receiver itself — same identity, the
+///   opposite fact.
+fn returns_fresh_reference(callee: &Expr) -> bool {
+    match callee {
+        // `structuredClone(x)` always allocates a deep copy.
+        Expr::Var(v) => v == "structuredClone",
+        Expr::FieldAccess { obj, field } => match field.as_str() {
+            // Array methods returning a NEW array, array-only names (a
+            // string receiver has none of these).
+            "map" | "filter" | "flat" | "flatMap" | "toSorted" | "toReversed" | "toSpliced"
+            | "with" | "split" => true,
+            // Static allocators — receiver-restricted: a bare `.from`/`.keys`
+            // on an unknown object could be anything.
+            "from" | "of" => matches!(obj.as_ref(), Expr::Var(v) if v == "Array"),
+            "keys" | "values" | "entries" | "fromEntries" => {
+                matches!(obj.as_ref(), Expr::Var(v) if v == "Object")
+            }
+            "parse" => matches!(obj.as_ref(), Expr::Var(v) if v == "JSON"),
+            _ => false,
+        },
+        Expr::TSAnnotated(inner, _) => returns_fresh_reference(inner),
+        _ => false,
     }
 }
 

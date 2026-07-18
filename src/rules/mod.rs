@@ -9,6 +9,7 @@ pub mod lazy_init;
 pub mod missing_deps;
 pub mod redundant_set_state;
 pub mod setter_in_render;
+pub mod state_mutation;
 pub mod unnecessary_rerender;
 pub mod widening_info;
 pub mod witness;
@@ -23,6 +24,7 @@ pub use lazy_init::LazyInit;
 pub use missing_deps::MissingDeps;
 pub use redundant_set_state::RedundantSetState;
 pub use setter_in_render::SetterInRender;
+pub use state_mutation::StateMutation;
 pub use unnecessary_rerender::UnnecessaryRerender;
 pub use widening_info::WideningInfo;
 pub use witness::{EffectClass, ResolveTarget, Step, ValueClass};
@@ -671,6 +673,7 @@ pub fn all_rules() -> Vec<Box<dyn Rule>> {
         Box::new(RedundantSetState),
         Box::new(UnnecessaryRerender),
         Box::new(SetterInRender),
+        Box::new(StateMutation),
         Box::new(InfiniteLoop),
         Box::new(DerivedState),
         Box::new(WideningInfo),

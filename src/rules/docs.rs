@@ -151,6 +151,20 @@ pub const RULE_DOCS: &[RuleDoc] = &[
               compute it during render without state.",
     },
     RuleDoc {
+        name: "state-mutation",
+        summary: "state mutated in place, then set with the same reference — React bails out",
+        explanation: "React compares the value passed to a setter with `Object.is`. Mutating \
+                      a state object in place (`push`, `splice`, `sort`, `Map.set`, \
+                      `Object.assign`…) does not change its identity, so handing the same \
+                      reference back to the setter is a proven no-op: React skips the \
+                      re-render and the mutated data never reaches the screen. Nothing \
+                      loops and nothing warns at runtime — the UI is silently stale.",
+        example: "const [arr, setArr] = useState([]);\nconst add = (x) => { arr.push(x); setArr(arr); };",
+        fix: "Never mutate state in place. Build a fresh value and set that: \
+              `setArr([...arr, x])` — or for objects `setObj({ ...obj, k: v })`, for Maps \
+              `setMap(new Map(map).set(k, v))`.",
+    },
+    RuleDoc {
         name: "unnecessary-rerender",
         summary: "mount-only effect immediately overwrites the initial state",
         explanation: "A `deps: []` effect sets a state slot to a stable constant different \

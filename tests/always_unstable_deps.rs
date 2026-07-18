@@ -209,6 +209,107 @@ fn all_primitive_deps_no_fire() {
     assert_eq!(h, 0, "all-primitive deps must not fire");
 }
 
+// ── Fresh-array method returns (TODO.md — `.map` & co read PerRender, not ⊤) ──
+
+#[test]
+fn map_result_var_dep_fires() {
+    // `const items = arr.map(f)` is a fresh array each render — using it as a
+    // dep defeats the memo. Pre-fix `Expr::Call` read ⊤ → silent FN.
+    let h = hits(
+        r#"
+        import { useEffect } from "react";
+        function C({ arr }) {
+            const items = arr.map((x) => x * 2);
+            useEffect(() => {}, [items]);
+            return <div/>;
+        }
+        "#,
+    );
+    assert_eq!(h, 1, "map result in deps must fire");
+}
+
+#[test]
+fn inline_filter_dep_fires() {
+    let h = hits(
+        r#"
+        import { useEffect } from "react";
+        function C({ arr }) {
+            useEffect(() => {}, [arr.filter(Boolean)]);
+            return <div/>;
+        }
+        "#,
+    );
+    assert_eq!(h, 1, "inline filter call in deps must fire");
+}
+
+#[test]
+fn object_keys_dep_fires_but_unknown_receiver_stays_silent() {
+    // `Object.keys(x)` is receiver-restricted; `router.keys()` could be
+    // anything (⊤, silent).
+    let h = hits(
+        r#"
+        import { useEffect } from "react";
+        function C({ obj, router }) {
+            useEffect(() => {}, [Object.keys(obj)]);
+            useEffect(() => {}, [router.keys()]);
+            return <div/>;
+        }
+        "#,
+    );
+    assert_eq!(h, 1, "Object.keys fires, unknown .keys() stays silent");
+}
+
+#[test]
+fn kind_ambiguous_slice_stays_silent() {
+    // `id.slice(0, 8)` on a string returns a value-compared *primitive* —
+    // claiming a per-render reference would be a false proof. Stays ⊤.
+    let h = hits(
+        r#"
+        import { useEffect } from "react";
+        function C({ id }) {
+            const prefix = id.slice(0, 8);
+            useEffect(() => {}, [prefix]);
+            return <div/>;
+        }
+        "#,
+    );
+    assert_eq!(h, 0, "kind-ambiguous slice must not fire");
+}
+
+#[test]
+fn in_place_sort_stays_silent() {
+    // `.sort()` returns the RECEIVER (same identity), not a fresh array —
+    // the opposite fact. Must not read PerRender.
+    let h = hits(
+        r#"
+        import { useEffect } from "react";
+        function C({ arr }) {
+            const sorted = arr.sort();
+            useEffect(() => {}, [sorted]);
+            return <div/>;
+        }
+        "#,
+    );
+    assert_eq!(h, 0, "in-place sort returns the receiver, must not fire");
+}
+
+#[test]
+fn memoized_map_result_stays_silent() {
+    // The same `.map` under `useMemo` is recomputed only when `arr` changes —
+    // the memo conversion must absorb the PerRender allocation freshness.
+    let h = hits(
+        r#"
+        import { useEffect, useMemo } from "react";
+        function C({ arr }) {
+            const items = useMemo(() => arr.map((x) => x * 2), [arr]);
+            useEffect(() => {}, [items]);
+            return <div/>;
+        }
+        "#,
+    );
+    assert_eq!(h, 0, "memoized map result must stay silent");
+}
+
 // ── Fixture regression ────────────────────────────────────────────────────────
 
 #[test]
