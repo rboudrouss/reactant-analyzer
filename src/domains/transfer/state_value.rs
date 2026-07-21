@@ -516,7 +516,20 @@ fn eval_field_access(
             return vals.into_iter().reduce(|a, b| a.join(&b)).unwrap();
         }
     }
-    StateValue::top()
+    // A field of a versioned object can change only at the object's own
+    // setter events: keep the version labels instead of degrading to ⊤
+    // (the field's *kind* stays unknown — every other slot is ⊤). Same
+    // no-mutation-during-render assumption as the `StateVal` read-side
+    // conversion above; in-place writes have their own diagnostics
+    // (`state-mutation`). ADR-017 §Limitations, member-deps.
+    let obj_val = eval_state_value(obj, env, ctx);
+    match &obj_val.reference {
+        v @ (Stability::Versioned(_) | Stability::VersionedTop) => StateValue {
+            reference: v.clone(),
+            ..StateValue::top()
+        },
+        _ => StateValue::top(),
+    }
 }
 
 /// Convert an `EnvVal` stored in a heap `Obj` field to a `StateValue`.

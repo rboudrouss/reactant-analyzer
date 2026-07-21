@@ -453,21 +453,7 @@ impl Rule for FrozenInitialState {
                     };
                 }
                 let val = eval_with_heap(&expr, comp);
-                let mut motion = classify_motion(&val, result);
-                if matches!(motion, Motion::Unproven)
-                    && !seed.orig.segments.is_empty()
-                    && seed.orig.root != comp.param
-                {
-                    // A FieldAccess on a versioned object degrades to ⊤ in
-                    // the product domain (ADR-017 §Limitations). A field read
-                    // through an un-reassigned binding changes only when the
-                    // object itself does — the root's verdict is a sound may
-                    // bound for the field. (Root `Still` assumes no in-place
-                    // mutation, which `state-mutation` owns.)
-                    let root_val = eval_with_heap(&Expr::Var(seed.orig.root.clone()), comp);
-                    motion = classify_motion(&root_val, result);
-                }
-                match motion {
+                match classify_motion(&val, result) {
                     Motion::Still => continue,
                     Motion::Proven {
                         slot,

@@ -86,10 +86,9 @@ fn proven_versioned_object_prop_errors() {
 }
 
 #[test]
-fn proven_versioned_field_seed_errors_via_root_fallback() {
-    // `useState(user.name)` — the field access degrades to ⊤ in the domain,
-    // but the root binding is proven versioned: the field can only change
-    // when the object does.
+fn proven_versioned_field_seed_errors() {
+    // `useState(user.name)` — the field of a versioned object carries the
+    // object's version labels (field reads propagate `Versioned`, ADR-017).
     let d = diags_for(
         r#"
         import { useState } from "react";
