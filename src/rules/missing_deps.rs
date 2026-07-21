@@ -158,8 +158,9 @@ fn closure_is_behaviorally_stable(
 
 /// The params and body of the unique `FnLit` bound to `var` in `cfg`, if any.
 /// Conditional or repeated re-binding bails out (`None`): the captured
-/// environment is no longer syntactically certain.
-fn fn_lit_binding<'c>(var: &str, cfg: &'c CFG) -> Option<(&'c [Var], &'c CFG)> {
+/// environment is no longer syntactically certain. Shared with `stale-closure`,
+/// which resolves registered callback variables under the same certainty bar.
+pub(super) fn fn_lit_binding<'c>(var: &str, cfg: &'c CFG) -> Option<(&'c [Var], &'c CFG)> {
     let mut found: Option<(&[Var], &CFG)> = None;
     for block in cfg.blocks.values() {
         for stmt in &block.stmts {

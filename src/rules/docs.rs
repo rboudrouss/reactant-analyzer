@@ -151,6 +151,25 @@ pub const RULE_DOCS: &[RuleDoc] = &[
               compute it during render without state.",
     },
     RuleDoc {
+        name: "stale-closure",
+        summary: "long-lived callback keeps a state value frozen at registration time",
+        explanation: "A callback handed to `setInterval`, `addEventListener`, `subscribe`, \
+                      `setTimeout` or a promise `.then` inside an effect closes over the \
+                      variable values from the render that last ran the effect. When the \
+                      effect's deps array does not cover a captured state value, the callback \
+                      keeps reading that old value after the state changes — with `[]` deps, \
+                      forever. When the callback also writes the slot it reads \
+                      (`setN(n + 1)` in an interval), the state can never advance past its \
+                      first update: every firing recomputes from the same frozen capture \
+                      (Error).",
+        example: "const [n, setN] = useState(0);\n\
+                  useEffect(() => { setInterval(() => setN(n + 1), 1000); }, []);",
+        fix: "Use the functional updater (`setN(n => n + 1)`) so the callback never reads \
+              the captured value; mirror the latest value into a `useRef` and read \
+              `ref.current`; or add the value to the deps array and return a cleanup so \
+              the callback is re-registered with a fresh capture.",
+    },
+    RuleDoc {
         name: "state-mutation",
         summary: "state or prop object mutated in place — same reference, no re-render",
         explanation: "Mutating a state object (`arr.push(x)`, `obj.f = v`) keeps its reference \

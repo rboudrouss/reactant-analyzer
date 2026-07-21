@@ -16,6 +16,8 @@
 
 - **`state-mutation` escaped-alias FN** — the rule chases reference identity through local `let`/`const` binding chains only; an alias that *escapes* (stored into a ref or object field, then mutated through that path: `ref.current = arr; ref.current.push(x); setArr(arr)`) is not chased — the mutation roots at `.current` (exempt) and the pairing is missed. Functional updaters, prop mutation, plain field writes (`Stmt::MemberWrite`) and cross-trigger pairing (Warning) are covered.
 
+- **`stale-closure` resolution bounds** — the registered callback must resolve syntactically: an imported/opaque function, a conditionally re-bound variable (`let cb = a ? f : g`, same bail as `missing-deps`' `fn_lit_binding`), or a registrar hidden behind a non-inlined wrapper (`myAddListener(cb)`) is skipped. Effect-local captures resolve through alias hops (`const cur = n`) but not through expressions (`const cur = n + 1` roots nowhere). Handler-attached `useCallback`s with stale deps are out of scope (that's `missing-deps` on the callback's own deps array).
+
 - **Churn-graph residuals (ADR-018)** — auto-run nested callbacks (`.then(() => set(fresh))`) in **no-deps** effects create no self-edge (event-vs-async callback classification lives in the engine, not the syntactic collector); cross-component edges are lost when a prop dep degrades to `Unknown` (FieldAccess on versioned, ADR-017 §Limitations).
 
 ## Known false positives (FP)
@@ -37,7 +39,9 @@
 - **Churn-cycle Warning on convergent multi-writer pairs** — the F5b convergence kill requires a single effect write-site per slot (ADR-018); a guarded fetch-once write coexisting with another writer of the same slot keeps its edge even when the pair in fact converges. Precise alternative: narrow guards against the join of all writers' values.
 
 - **Whole-object read via guard/nullish is flagged** — 3 advice-class findings (memos `App` ×2, `LocationPicker`): a truthiness test (`if (!x)`) or nullish default (`x ?? d`) reads the whole reference, so declaring only fields (`[x?.locale]`) doesn't cover it. Distinguishing "value use" from "existence check" would need tracking *how* the whole ref is consumed — deferred; keeping the (sound, eslint-aligned) warning.
-- **Never-written state refinement** — `useState(CONST)` with no reachable setter call could read `Stable` (dep omittable) instead of `Versioned`. Needs a post-fixpoint "slot ever written" bit; marginal gain. *(ADR-017 §Limitations)*
+- **Never-written state refinement** — `useState(CONST)` with no reachable setter call could read `Stable` (dep omittable) instead of `Versioned`. Needs a post-fixpoint "slot ever written" bit; marginal gain. *(ADR-017 §Limitations)* — `stale-closure` implements the syntactic half locally (setter var never referenced → slot never changes → capture can't go stale); promoting it to the domain remains open.
+
+- **`stale-closure` emitter-name heuristic** — a 2-arg method call named `on`/`addListener` (or 1-arg `subscribe`) with a function argument is treated as a long-lived registration; a custom method with one of those names on a non-emitter object can warn on an uncovered state capture. Warning-ceiling by construction.
 
 ### Diagnostics UX (side-finding)
 
@@ -95,8 +99,6 @@ Error→Warning. Rules that would just re-do eslint AST pattern-matching (raw ex
 rules-of-hooks, index-as-key, naming) are explicitly out of scope.
 
 ### Tier 1 — differentiators (engine already has the domains)
-
-- **`stale-closure`** — a callback that outlives the render (`setInterval`/`setTimeout`/`addEventListener`/`.then`/subscribe) captures a state value under empty/stable deps → the captured version is frozen at mount. `useEffect(() => { setInterval(() => setN(n+1), 1000) }, [])` → `n` stays 0 forever. Engine: version domain (ADR-017) — compare the version captured in the closure vs the current slot version. **FN gate: fire only when a `Versioned` slot is read/written inside an auto-run callback whose deps are stable.** Opposite angle to `always-unstable-deps` (deps too empty vs too unstable).
 
 - **`frozen-initial-state`** — a versioned prop seeded into `useState` initial with no sync path → the local state freezes at the first prop value. `const [v, setV] = useState(props.value)` where `value` later changes. Engine: `useState` initial is a `Versioned` expr rooted on a prop, no syncing effect, prop proven versioned cross-component (ADR-012). **FN gate: require the prop proven versioned; else Warning.** Distinct from `derived-state` (an effect that *does* sync) — here there is no sync at all.
 

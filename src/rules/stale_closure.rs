@@ -1,0 +1,753 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+
+use crate::{
+    domains::impls::Stability,
+    engine::ProgramAnalysisResult,
+    ir::{
+        SourceRange,
+        cfg::{CFG, Terminator},
+        expr::Expr,
+        free_vars::{AccessPath, collect_used_vars, compute_free_paths, dep_paths, path_covered},
+        hooks::HookEntry,
+        stmt::Stmt,
+        types::{BlockId, HookLabel, Symbol, Var},
+    },
+};
+
+use super::{
+    Diagnostic, EffectClass, Rule, Severity, Step, ValueClass, collect_fn_bindings,
+    collect_setter_calls_with_extra,
+    infinite_loop::{eval_in_exit_env, on_all_paths},
+    memo_val_labels,
+    missing_deps::fn_lit_binding,
+    resolve_setter_aliases, setter_var_labels, state_slot_name, state_val_labels,
+};
+
+/// Fires when a callback that **outlives the render** — handed to
+/// `setInterval`, `addEventListener`, `subscribe`, `setTimeout`, a promise
+/// `.then`… inside a `useEffect` — captures a state value the effect's deps
+/// array does not cover. The callback keeps the value from the render that
+/// last ran the effect; the state moves on without it.
+///
+/// Distinct from `missing-deps` (eslint-parity: *any* uncovered capture):
+/// this rule proves the *consequence*. The version domain (ADR-017) says the
+/// slot changes only at setter events; the deps array says the effect never
+/// re-runs at those events; the registration says the stale copy keeps
+/// executing. When the callback also **writes** the slot it reads
+/// (`setN(n + 1)` in an interval), the freeze is self-inflicted and certain:
+/// the state can never advance past its first update — Error.
+///
+/// Stratification (three-level doctrine — Error only on a triple must):
+/// - **Error**: repeating registrar ∧ deps `[]` (never re-runs) ∧ the
+///   registration is on all paths of the effect body ∧ the callback writes a
+///   slot it captures.
+/// - **Warning**: everything else that survives the kills below — one-shot
+///   registrars (`setTimeout`, `.then`: bounded staleness window), non-empty
+///   deps (freeze lasts until an unrelated dep changes), conditional or
+///   nested registration, foreign/unknown slots.
+///
+/// Stays silent when (each kill is a proof, not a heuristic):
+/// - the captured path is covered by the deps array (the effect re-runs and
+///   re-registers when the value changes) — includes the *identity* form:
+///   the registered callback variable itself is a dep (`[tick]` where `tick`
+///   is re-created when its captures change);
+/// - the capture reads `ref.current` or any `Stable` value (the canonical
+///   ref-mirror fix);
+/// - the callback uses the functional updater (`setN(n => n + 1)`): the
+///   updater's parameter shadows the slot, nothing stale is read;
+/// - the effect has no deps array (re-runs every render → fresh capture);
+/// - the slot's setter is never referenced anywhere in the component: the
+///   slot provably never changes, so the capture can never go stale.
+pub struct StaleClosure;
+
+/// How a registered callback re-fires after the render commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Firing {
+    /// Fires an unbounded number of times (timer tick, event, subscription).
+    Repeating,
+    /// Fires once, shortly after registration (timeout, promise, rAF).
+    Once,
+}
+
+/// A callee that registers a callback surviving the render.
+/// `method_only` — must be called as `recv.name(…)`; a bare `then(…)` or
+/// `subscribe(…)` global is too ambiguous to claim.
+struct Registrar {
+    name: &'static str,
+    /// Index of the callback argument (`addEventListener('click', cb)` → 1).
+    cb_arg: usize,
+    firing: Firing,
+    method_only: bool,
+}
+
+const REGISTRARS: &[Registrar] = &[
+    Registrar {
+        name: "setInterval",
+        cb_arg: 0,
+        firing: Firing::Repeating,
+        method_only: false,
+    },
+    Registrar {
+        name: "addEventListener",
+        cb_arg: 1,
+        firing: Firing::Repeating,
+        method_only: false,
+    },
+    Registrar {
+        name: "subscribe",
+        cb_arg: 0,
+        firing: Firing::Repeating,
+        method_only: true,
+    },
+    Registrar {
+        name: "on",
+        cb_arg: 1,
+        firing: Firing::Repeating,
+        method_only: true,
+    },
+    Registrar {
+        name: "addListener",
+        cb_arg: 1,
+        firing: Firing::Repeating,
+        method_only: true,
+    },
+    Registrar {
+        name: "setTimeout",
+        cb_arg: 0,
+        firing: Firing::Once,
+        method_only: false,
+    },
+    Registrar {
+        name: "requestAnimationFrame",
+        cb_arg: 0,
+        firing: Firing::Once,
+        method_only: false,
+    },
+    Registrar {
+        name: "requestIdleCallback",
+        cb_arg: 0,
+        firing: Firing::Once,
+        method_only: false,
+    },
+    Registrar {
+        name: "queueMicrotask",
+        cb_arg: 0,
+        firing: Firing::Once,
+        method_only: false,
+    },
+    Registrar {
+        name: "then",
+        cb_arg: 0,
+        firing: Firing::Once,
+        method_only: true,
+    },
+    Registrar {
+        name: "catch",
+        cb_arg: 0,
+        firing: Firing::Once,
+        method_only: true,
+    },
+    Registrar {
+        name: "finally",
+        cb_arg: 0,
+        firing: Firing::Once,
+        method_only: true,
+    },
+];
+
+/// One callback registration found in an effect body.
+struct Registration<'a> {
+    /// Display name (`setInterval`, `socket.addEventListener`, `.then`).
+    display: String,
+    firing: Firing,
+    callback: &'a Expr,
+    /// Top-level block of the effect body carrying the registration;
+    /// `None` when nested in another callback (then never must-reached).
+    block_id: Option<BlockId>,
+    span: Option<SourceRange>,
+}
+
+fn peel(mut e: &Expr) -> &Expr {
+    while let Expr::TSAnnotated(inner, _) = e {
+        e = inner;
+    }
+    e
+}
+
+/// Match a callee expression against the registrar table.
+/// Returns the registrar and its display name.
+fn match_registrar(fn_: &Expr) -> Option<(&'static Registrar, String)> {
+    let (method, root, is_method) = match peel(fn_) {
+        Expr::Var(name) => (name.as_str(), None, false),
+        Expr::FieldAccess { obj, field } => {
+            let root = match peel(obj) {
+                Expr::Var(v) => Some(v.as_str()),
+                _ => None,
+            };
+            (field.as_str(), root, true)
+        }
+        _ => return None,
+    };
+    let reg = REGISTRARS
+        .iter()
+        .find(|r| r.name == method && (!r.method_only || is_method))?;
+    let display = match (root, is_method) {
+        (Some(r), _) => format!("{r}.{method}"),
+        (None, true) => format!(".{method}"),
+        (None, false) => method.to_string(),
+    };
+    Some((reg, display))
+}
+
+/// Scan a CFG for callback registrations. `fixed_block`:
+/// - `None` → this IS the effect body; each statement carries its own block ID
+///   (usable for must-reach);
+/// - `Some(b)` → nested context (helper called inline keeps the caller's
+///   block, a callback body gets `Some(None)`).
+fn collect_registrations<'a>(
+    cfg: &'a CFG,
+    fn_bodies: &'a HashMap<Var, Arc<CFG>>,
+    depth: usize,
+    fixed_block: Option<Option<BlockId>>,
+    out: &mut Vec<Registration<'a>>,
+) {
+    let mut block_ids: Vec<_> = cfg.blocks.keys().copied().collect();
+    block_ids.sort_unstable();
+    for bid in block_ids {
+        let block_id = fixed_block.unwrap_or(Some(bid));
+        let block = &cfg.blocks[&bid];
+        for stmt in &block.stmts {
+            let (expr, span) = match stmt {
+                Stmt::ExprStmt(e, span) => (e, *span),
+                Stmt::Let { rhs, span, .. }
+                | Stmt::Assign { rhs, span, .. }
+                | Stmt::MemberWrite { rhs, span, .. } => (rhs, *span),
+            };
+            registrations_in_expr(expr, span, block_id, fn_bodies, depth, out);
+        }
+        match &block.term {
+            Terminator::Return(e) | Terminator::Branch { cond: e, .. } => {
+                registrations_in_expr(e, None, block_id, fn_bodies, depth, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn registrations_in_expr<'a>(
+    expr: &'a Expr,
+    span: Option<SourceRange>,
+    block_id: Option<BlockId>,
+    fn_bodies: &'a HashMap<Var, Arc<CFG>>,
+    depth: usize,
+    out: &mut Vec<Registration<'a>>,
+) {
+    match expr {
+        Expr::Call { fn_, args } => {
+            if let Some((reg, display)) = match_registrar(fn_)
+                && let Some(cb) = args.get(reg.cb_arg)
+            {
+                out.push(Registration {
+                    display,
+                    firing: reg.firing,
+                    callback: cb,
+                    block_id,
+                    span,
+                });
+            }
+            // Direct call of a locally-bound helper executes inline: the
+            // registration inside it happens on the caller's block (B6).
+            if depth > 0
+                && let Expr::Var(name) = peel(fn_)
+                && let Some(body) = fn_bodies.get(name)
+            {
+                collect_registrations(body, fn_bodies, depth - 1, Some(block_id), out);
+            }
+            // Descend: chained receivers (`p.then(a).then(b)`), callback
+            // bodies (a registration inside another callback is never
+            // must-reached), plain args.
+            registrations_in_expr(fn_, span, block_id, fn_bodies, depth, out);
+            for arg in args {
+                match arg {
+                    Expr::FnLit { body_cfg, .. } if depth > 0 => {
+                        collect_registrations(body_cfg, fn_bodies, depth - 1, Some(None), out);
+                    }
+                    _ => registrations_in_expr(arg, span, block_id, fn_bodies, depth, out),
+                }
+            }
+        }
+        other => {
+            other.for_each_child(&mut |c| {
+                registrations_in_expr(c, span, block_id, fn_bodies, depth, out)
+            });
+        }
+    }
+}
+
+/// Resolve the registered callback expression to `(params, body)`.
+/// `None` = opaque (imported fn, conditional re-binding) — skipped, matching
+/// the certainty bar of `missing-deps`' `fn_lit_binding`.
+///
+/// A callback **variable that is itself a dep** resolves to `None` on
+/// purpose: the effect re-runs whenever the function's identity changes, and
+/// a render-created closure (or a `useCallback` keyed on its captures)
+/// changes identity exactly when its captures do — the re-registration
+/// carries a fresh capture.
+fn resolve_callback<'a>(
+    cb: &'a Expr,
+    declared: &[AccessPath],
+    effect_body: &'a CFG,
+    render_cfg: &'a CFG,
+    memo_vars: &HashMap<Var, HookLabel>,
+    callback_hooks: &HashMap<HookLabel, (&'a [Var], &'a CFG)>,
+) -> Option<(Option<&'a str>, &'a [Var], &'a CFG)> {
+    match peel(cb) {
+        Expr::FnLit {
+            params, body_cfg, ..
+        } => Some((None, params, body_cfg)),
+        Expr::Var(v) => {
+            let as_path = AccessPath {
+                root: v.clone(),
+                segments: vec![],
+            };
+            if path_covered(&as_path, declared) {
+                return None; // identity-covered: re-registered on change
+            }
+            if let Some((params, body)) = fn_lit_binding(v, effect_body) {
+                return Some((Some(v.as_str()), params, body));
+            }
+            if let Some((params, body)) = fn_lit_binding(v, render_cfg) {
+                return Some((Some(v.as_str()), params, body));
+            }
+            if let Some(label) = memo_vars.get(v.as_str())
+                && let Some((params, body)) = callback_hooks.get(label)
+            {
+                return Some((Some(v.as_str()), params, body));
+            }
+            None
+        }
+        Expr::CallbackVal(label) => callback_hooks
+            .get(label)
+            .map(|(params, body)| (None, *params, *body)),
+        _ => None,
+    }
+}
+
+/// State slots that *may* ever be written: their setter variable (or an
+/// alias of it) is referenced anywhere in the component — called, passed as
+/// a prop, captured by a closure. A slot whose setter is never referenced
+/// provably never changes (React state only moves through its setter), so a
+/// capture of it can never go stale — sound to skip.
+fn may_written_slots(
+    render_cfg: &CFG,
+    hooks: &[HookEntry],
+    setter_labels: &HashMap<Var, HookLabel>,
+) -> HashSet<HookLabel> {
+    fn scan_cfg(cfg: &CFG, used: &mut HashSet<Var>) {
+        for block in cfg.blocks.values() {
+            for stmt in &block.stmts {
+                match stmt {
+                    Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => {
+                        collect_used_vars(rhs, used)
+                    }
+                    Stmt::MemberWrite { obj, key, rhs, .. } => {
+                        collect_used_vars(obj, used);
+                        if let crate::ir::stmt::MemberKey::Index(idx) = key {
+                            collect_used_vars(idx, used);
+                        }
+                        collect_used_vars(rhs, used);
+                    }
+                    Stmt::ExprStmt(e, _) => collect_used_vars(e, used),
+                }
+            }
+            match &block.term {
+                Terminator::Return(e) | Terminator::Branch { cond: e, .. } => {
+                    collect_used_vars(e, used)
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut used: HashSet<Var> = HashSet::new();
+    scan_cfg(render_cfg, &mut used);
+    for hook in hooks {
+        match hook {
+            HookEntry::Effect { body_cfg, .. }
+            | HookEntry::Memo { body_cfg, .. }
+            | HookEntry::Callback { body_cfg, .. }
+            | HookEntry::Handler { body_cfg, .. } => scan_cfg(body_cfg, &mut used),
+            HookEntry::State { init, .. } | HookEntry::Ref { init, .. } => {
+                collect_used_vars(init, &mut used)
+            }
+            HookEntry::Custom { args, .. } => {
+                for a in args {
+                    collect_used_vars(a, &mut used);
+                }
+            }
+        }
+    }
+    setter_labels
+        .iter()
+        .filter(|(v, _)| used.contains(*v))
+        .map(|(_, l)| *l)
+        .collect()
+}
+
+/// Slots a captured path's root resolves to.
+struct RootSlots {
+    /// This component's slots (nameable, self-write provable).
+    local: Vec<HookLabel>,
+    /// Versioned by another component's slot, or by unknown slots
+    /// (`VersionedTop`) — real staleness, but nothing local to prove
+    /// against: Warning ceiling, no never-written kill.
+    foreign: bool,
+}
+
+fn resolve_root_slots(
+    root: &Var,
+    state_vals: &HashMap<Var, HookLabel>,
+    component: &Symbol,
+    comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+) -> RootSlots {
+    // Syntactic first: state bindings and their aliases. This is what makes
+    // primitive slots work — a counter's product value has a ⊥ reference
+    // slot, so the read-side `Versioned` conversion (ADR-017) never applies
+    // to it; the binding chain is the proof instead.
+    if let Some(&l) = state_vals.get(root) {
+        return RootSlots {
+            local: vec![l],
+            foreign: false,
+        };
+    }
+    // Domain fallback: memo chains, destructured props, object state
+    // aliases — anything whose reference slot carries version labels.
+    let env_exit = comp_result.exit_env();
+    if !env_exit.contains(root) {
+        return RootSlots {
+            local: vec![],
+            foreign: false,
+        };
+    }
+    let val = eval_in_exit_env(&Expr::Var(root.clone()), comp_result);
+    match &val.reference {
+        Stability::Versioned(labels) => {
+            let mut local: Vec<HookLabel> = labels
+                .iter()
+                .filter(|(c, _)| c == component)
+                .map(|(_, l)| *l)
+                .collect();
+            local.sort_unstable();
+            let foreign = labels.iter().any(|(c, _)| c != component);
+            RootSlots { local, foreign }
+        }
+        Stability::VersionedTop => RootSlots {
+            local: vec![],
+            foreign: true,
+        },
+        _ => RootSlots {
+            local: vec![],
+            foreign: false,
+        },
+    }
+}
+
+/// Best finding for one captured path within one effect.
+struct PathFinding {
+    severity: Severity,
+    registrar: String,
+    reg_span: Option<SourceRange>,
+    resolved_via: Option<String>,
+    slots: Vec<HookLabel>,
+    /// Span of the callback's own write to a captured slot, when proven.
+    self_write: Option<(HookLabel, Option<SourceRange>)>,
+    mount_only: bool,
+}
+
+impl Rule for StaleClosure {
+    fn name(&self) -> &'static str {
+        "stale-closure"
+    }
+
+    fn safe_check(
+        &self,
+        result: &ProgramAnalysisResult,
+        component: &Symbol,
+    ) -> Option<super::SafeCheck> {
+        // Applicable when some deps-gated effect registers a long-lived
+        // callback at all.
+        let comp_result = result.components.get(component)?;
+        let render_fns = collect_fn_bindings(&comp_result.render_cfg);
+        let applicable = comp_result.hooks.iter().any(|h| {
+            let HookEntry::Effect {
+                body_cfg,
+                deps: Some(_),
+                ..
+            } = h
+            else {
+                return false;
+            };
+            let mut fn_bodies = collect_fn_bindings(body_cfg);
+            for (k, v) in &render_fns {
+                fn_bodies.entry(k.clone()).or_insert_with(|| Arc::clone(v));
+            }
+            let mut regs = Vec::new();
+            collect_registrations(body_cfg, &fn_bodies, 2, None, &mut regs);
+            !regs.is_empty()
+        });
+        applicable.then_some(super::SafeCheck {
+            rule: self.name(),
+            message: "no long-lived callback captures a stale state value",
+        })
+    }
+
+    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+        let comp_result = &result.components[component];
+        let render_cfg = &comp_result.render_cfg;
+
+        let state_vals_render = resolve_setter_aliases(render_cfg, &state_val_labels(render_cfg));
+        let memo_vars = resolve_setter_aliases(render_cfg, &memo_val_labels(render_cfg));
+
+        let mut setter_labels = setter_var_labels(render_cfg);
+        for cfg in
+            std::iter::once(render_cfg).chain(comp_result.hooks.iter().filter_map(|h| match h {
+                HookEntry::Effect { body_cfg, .. }
+                | HookEntry::Memo { body_cfg, .. }
+                | HookEntry::Callback { body_cfg, .. }
+                | HookEntry::Handler { body_cfg, .. } => Some(body_cfg),
+                _ => None,
+            }))
+        {
+            setter_labels = resolve_setter_aliases(cfg, &setter_labels);
+        }
+        let written = may_written_slots(render_cfg, &comp_result.hooks, &setter_labels);
+        let render_fns = collect_fn_bindings(render_cfg);
+        let callback_hooks: HashMap<HookLabel, (&[Var], &CFG)> = comp_result
+            .hooks
+            .iter()
+            .filter_map(|h| match h {
+                HookEntry::Callback {
+                    label,
+                    body_cfg,
+                    params,
+                    ..
+                } => Some((*label, (params.as_slice(), body_cfg))),
+                _ => None,
+            })
+            .collect();
+        let name_of = |l: HookLabel| state_slot_name(l, &state_vals_render);
+
+        let mut diags = Vec::new();
+
+        for hook in &comp_result.hooks {
+            let HookEntry::Effect {
+                label: eff_label,
+                body_cfg,
+                deps: Some(dep_exprs),
+                span: eff_span,
+            } = hook
+            else {
+                // No deps array: the effect re-runs every render, every
+                // registration gets a fresh capture (the *old* one leaking is
+                // a cleanup problem, not a staleness one).
+                continue;
+            };
+            let declared = dep_paths(dep_exprs);
+            let mount_only = dep_exprs.is_empty();
+
+            let mut fn_bodies = collect_fn_bindings(body_cfg);
+            for (k, v) in &render_fns {
+                fn_bodies.entry(k.clone()).or_insert_with(|| Arc::clone(v));
+            }
+            let mut regs = Vec::new();
+            collect_registrations(body_cfg, &fn_bodies, 2, None, &mut regs);
+            if regs.is_empty() {
+                continue;
+            }
+
+            // Effect-local aliases (`const cur = n;` inside the body) extend
+            // the render map so captures of them still root at the slot.
+            let state_vals = resolve_setter_aliases(body_cfg, &state_vals_render);
+
+            // Best finding per captured path (BTreeMap: deterministic order).
+            let mut best: BTreeMap<String, PathFinding> = BTreeMap::new();
+
+            for reg in &regs {
+                let Some((via, params, cb_body)) = resolve_callback(
+                    reg.callback,
+                    &declared,
+                    body_cfg,
+                    render_cfg,
+                    &memo_vars,
+                    &callback_hooks,
+                ) else {
+                    continue;
+                };
+                let mut caps: Vec<AccessPath> = compute_free_paths(cb_body)
+                    .into_iter()
+                    .filter(|p| !params.contains(&p.root))
+                    .collect();
+                caps.sort_by_key(|p| p.to_string());
+
+                for path in caps {
+                    if path_covered(&path, &declared) {
+                        continue;
+                    }
+                    let roots = resolve_root_slots(&path.root, &state_vals, component, comp_result);
+                    if roots.local.is_empty() && !roots.foreign {
+                        continue;
+                    }
+                    // Never-written kill: all resolved slots are local and
+                    // none can ever be written → the capture never goes stale.
+                    let live_local: Vec<HookLabel> = roots
+                        .local
+                        .iter()
+                        .copied()
+                        .filter(|l| written.contains(l))
+                        .collect();
+                    if live_local.is_empty() && !roots.foreign {
+                        continue;
+                    }
+
+                    // Does the callback itself write a slot it captures?
+                    let slot_setters: HashSet<Var> = setter_labels
+                        .iter()
+                        .filter(|(_, l)| live_local.contains(l))
+                        .map(|(v, _)| v.clone())
+                        .collect();
+                    let self_write = if slot_setters.is_empty() {
+                        None
+                    } else {
+                        let mut calls =
+                            collect_setter_calls_with_extra(cb_body, &slot_setters, 2, &fn_bodies);
+                        calls.sort_by_key(|c| {
+                            c.span.map_or((u32::MAX, u32::MAX), |r| (r.line, r.col))
+                        });
+                        calls
+                            .first()
+                            .and_then(|c| setter_labels.get(&c.var).map(|l| (*l, c.span)))
+                    };
+
+                    let must_reach = reg
+                        .block_id
+                        .is_some_and(|b| on_all_paths(body_cfg, &HashSet::from([b])));
+                    let severity = if reg.firing == Firing::Repeating
+                        && mount_only
+                        && must_reach
+                        && self_write.is_some()
+                    {
+                        Severity::Error
+                    } else {
+                        Severity::Warning
+                    };
+
+                    let rank = |s: Severity| match s {
+                        Severity::Error => 2,
+                        Severity::Warning => 1,
+                        Severity::Info => 0,
+                    };
+                    let pos = |s: Option<SourceRange>| {
+                        s.map_or((u32::MAX, u32::MAX), |r| (r.line, r.col))
+                    };
+                    let candidate = PathFinding {
+                        severity,
+                        registrar: reg.display.clone(),
+                        reg_span: reg.span,
+                        resolved_via: via.map(str::to_string),
+                        slots: live_local.clone(),
+                        self_write,
+                        mount_only,
+                    };
+                    match best.entry(path.to_string()) {
+                        std::collections::btree_map::Entry::Vacant(e) => {
+                            e.insert(candidate);
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut e) => {
+                            let cur = e.get();
+                            if rank(severity) > rank(cur.severity)
+                                || (rank(severity) == rank(cur.severity)
+                                    && pos(reg.span) < pos(cur.reg_span))
+                            {
+                                e.insert(candidate);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (path, f) in best {
+                let message = match (f.severity, f.mount_only) {
+                    (Severity::Error, _) => format!(
+                        "the `{reg}` callback registered by this mount-only effect reads \
+                         `{path}` and writes it back — `{path}` was captured once at mount, \
+                         so every firing recomputes from the same frozen value and the \
+                         state can never advance past its first update",
+                        reg = f.registrar,
+                    ),
+                    (_, true) => format!(
+                        "`{path}` is captured by the `{reg}` callback registered in this \
+                         mount-only effect — the callback outlives the render and keeps \
+                         reading the mount-time value after `{path}` changes",
+                        reg = f.registrar,
+                    ),
+                    (_, false) => format!(
+                        "`{path}` is captured by the `{reg}` callback registered in this \
+                         effect, but the deps array does not cover it — after `{path}` \
+                         changes, the callback keeps reading the value from the effect's \
+                         last run",
+                        reg = f.registrar,
+                    ),
+                };
+                let mut d = Diagnostic::new("stale-closure", message)
+                    .with_severity(f.severity)
+                    .with_label(*eff_label)
+                    .with_var(path.clone());
+                if let Some(r) = f.reg_span.or(*eff_span) {
+                    d = d.with_range(r);
+                }
+                // Witness (ADR-019): the registration, the resolution of a
+                // named callback, the capture, and the self-write when proven.
+                d = d.with_step(
+                    Step::Call {
+                        callee: f.registrar.clone(),
+                        class: EffectClass::Effectful,
+                    },
+                    Some(*eff_label),
+                    f.reg_span,
+                    &name_of,
+                );
+                if let Some(via) = &f.resolved_via {
+                    d = d.with_step(
+                        Step::Resolve {
+                            name: via.clone(),
+                            target: super::ResolveTarget::LocalFn,
+                        },
+                        None,
+                        None,
+                        &name_of,
+                    );
+                }
+                d = d.with_step(
+                    Step::Capture { what: path.clone() },
+                    f.slots.first().copied(),
+                    f.reg_span,
+                    &name_of,
+                );
+                if let Some((slot, span)) = f.self_write {
+                    d = d.with_step(
+                        Step::Write {
+                            slot,
+                            value: ValueClass::Unknown,
+                        },
+                        Some(slot),
+                        span,
+                        &name_of,
+                    );
+                }
+                diags.push(d);
+            }
+        }
+
+        diags
+    }
+}

@@ -47,9 +47,7 @@ pub fn classify_callee<D: AbstractDomain>(fn_: &Expr, env: &AbstractEnv<D>) -> T
             // `Array.from(iterable, mapFn)`: the map callback runs
             // synchronously. Receiver-restricted — a bare `.from` on an
             // unknown object could be anything.
-            "from" if matches!(obj.as_ref(), Expr::Var(v) if v == "Array") => {
-                TriggerClass::InCycle
-            }
+            "from" if matches!(obj.as_ref(), Expr::Var(v) if v == "Array") => TriggerClass::InCycle,
             "addEventListener" | "removeEventListener" => TriggerClass::Subscription,
             _ => TriggerClass::Unknown,
         },

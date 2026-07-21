@@ -89,6 +89,9 @@ pub enum Step {
     Widen { slot: HookLabel, iteration: u32 },
     /// In-place mutation: the object's contents change, its reference doesn't.
     Mutate { target: String },
+    /// A long-lived callback closes over this value at registration time —
+    /// later firings keep the captured value, not the current one.
+    Capture { what: String },
 }
 
 impl Step {
@@ -105,6 +108,7 @@ impl Step {
             Step::CycleEdge { .. } => "cycle-edge",
             Step::Widen { .. } => "widen",
             Step::Mutate { .. } => "mutate",
+            Step::Capture { .. } => "capture",
         }
     }
 
@@ -170,6 +174,10 @@ impl Step {
             Step::Mutate { target } => {
                 format!("`{target}` is mutated in place here — its reference identity is unchanged")
             }
+            Step::Capture { what } => format!(
+                "`{what}` is captured at registration time — the callback keeps this value, \
+                 not the latest one"
+            ),
         }
     }
 }
