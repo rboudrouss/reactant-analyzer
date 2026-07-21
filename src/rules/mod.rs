@@ -4,6 +4,7 @@ mod churn_graph;
 pub mod conditional_hook;
 pub mod derived_state;
 pub mod docs;
+pub mod frozen_initial_state;
 pub mod infinite_loop;
 pub mod lazy_init;
 pub mod missing_deps;
@@ -20,6 +21,7 @@ pub use analysis_limit_info::AnalysisLimitInfo;
 pub use conditional_hook::ConditionalHook;
 pub use derived_state::DerivedState;
 pub use docs::{RULE_DOCS, RuleDoc, rule_doc};
+pub use frozen_initial_state::FrozenInitialState;
 pub use infinite_loop::InfiniteLoop;
 pub use lazy_init::LazyInit;
 pub use missing_deps::MissingDeps;
@@ -71,15 +73,16 @@ pub(crate) fn describe_value(val: &StateValue) -> &'static str {
 /// source variable it binds to (`` `count` ``); falls back to `state #N` when the
 /// slot has no syntactic name (destructured indirectly, cross-component, …).
 ///
-/// Messages must never print a bare internal `HookLabel` ("state 46"): the
-/// number is a post-inlining counter meaningless next to source.
+/// Messages must never print a bare internal `HookLabel` ("state 46") or a
+/// lowering temp (`__obj_N` for `const [{ a, b }] = useState(...)`): both are
+/// meaningless next to source.
 pub(crate) fn state_slot_name(
     label: HookLabel,
     state_val_labels: &HashMap<Var, HookLabel>,
 ) -> String {
     state_val_labels
         .iter()
-        .find(|(_, l)| **l == label)
+        .find(|(v, l)| **l == label && !v.starts_with("__"))
         .map(|(v, _)| format!("`{v}`"))
         .unwrap_or_else(|| format!("state #{label}"))
 }
@@ -680,6 +683,7 @@ pub fn all_rules() -> Vec<Box<dyn Rule>> {
         Box::new(StateMutation),
         Box::new(InfiniteLoop),
         Box::new(DerivedState),
+        Box::new(FrozenInitialState),
         Box::new(WideningInfo),
         Box::new(AnalysisLimitInfo),
     ]

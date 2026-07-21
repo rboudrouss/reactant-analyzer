@@ -92,6 +92,9 @@ pub enum Step {
     /// A long-lived callback closes over this value at registration time —
     /// later firings keep the captured value, not the current one.
     Capture { what: String },
+    /// `useState`/`useRef` evaluate their initializer on the first render
+    /// only — later renders ignore it.
+    InitOnce { slot: HookLabel },
 }
 
 impl Step {
@@ -109,6 +112,7 @@ impl Step {
             Step::Widen { .. } => "widen",
             Step::Mutate { .. } => "mutate",
             Step::Capture { .. } => "capture",
+            Step::InitOnce { .. } => "init-once",
         }
     }
 
@@ -177,6 +181,11 @@ impl Step {
             Step::Capture { what } => format!(
                 "`{what}` is captured at registration time — the callback keeps this value, \
                  not the latest one"
+            ),
+            Step::InitOnce { slot } => format!(
+                "state {} reads its initializer on the first render only — later renders \
+                 ignore it",
+                name(*slot)
             ),
         }
     }

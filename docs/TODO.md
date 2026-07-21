@@ -18,6 +18,8 @@
 
 - **`stale-closure` resolution bounds** — the registered callback must resolve syntactically: an imported/opaque function, a conditionally re-bound variable (`let cb = a ? f : g`, same bail as `missing-deps`' `fn_lit_binding`), or a registrar hidden behind a non-inlined wrapper (`myAddListener(cb)`) is skipped. Effect-local captures resolve through alias hops (`const cur = n`) but not through expressions (`const cur = n + 1` roots nowhere). Handler-attached `useCallback`s with stale deps are out of scope (that's `missing-deps` on the callback's own deps array).
 
+- **`frozen-initial-state` residuals** — (1) *primitive props can't reach the Error tier*: version labels live on the `reference` slot only (ADR-017), so a parent **string/number** state passed down arrives as a plain interval/StrConst — proven-changing evidence caps at Warning (the reference-prop path, plus the root-binding fallback for `useState(user.name)`, does reach Error). (2) *Memo-chained seeds not rooted*: `const v = useMemo(() => props.a, …); useState(v)` — the binding chase stops at `MemoVal`, the seed is not recognized as prop-rooted → silent. (3) *Root-`Still` kill assumes no in-place mutation* of the feeding object (`state-mutation`'s territory). (4) Never-written local slot (mount snapshot, `const [{ snap }] = useState(...)`) and `initial*`/`default*`-named props are graded down to Info by declared intent — a real freeze behind those idioms is only visible with `--info`.
+
 - **Churn-graph residuals (ADR-018)** — auto-run nested callbacks (`.then(() => set(fresh))`) in **no-deps** effects create no self-edge (event-vs-async callback classification lives in the engine, not the syntactic collector); cross-component edges are lost when a prop dep degrades to `Unknown` (FieldAccess on versioned, ADR-017 §Limitations).
 
 ## Known false positives (FP)
@@ -99,8 +101,6 @@ Error→Warning. Rules that would just re-do eslint AST pattern-matching (raw ex
 rules-of-hooks, index-as-key, naming) are explicitly out of scope.
 
 ### Tier 1 — differentiators (engine already has the domains)
-
-- **`frozen-initial-state`** — a versioned prop seeded into `useState` initial with no sync path → the local state freezes at the first prop value. `const [v, setV] = useState(props.value)` where `value` later changes. Engine: `useState` initial is a `Versioned` expr rooted on a prop, no syncing effect, prop proven versioned cross-component (ADR-012). **FN gate: require the prop proven versioned; else Warning.** Distinct from `derived-state` (an effect that *does* sync) — here there is no sync at all.
 
 - **`stale-update`** — new state depends on old without the functional updater. `setCount(count + 1)` twice in one tick = +1 not +2 (batching); or a setter in an async/long-lived closure reading a captured slot, where `set(prev => …)` would be safe. Engine: ≥2 sync writes to one slot reading the captured value, or a setter in an async callback reading a captured slot. Overlaps `stale-closure` but the fix differs (updater vs deps). **Warning — batching semantics are React-version-dependent.**
 

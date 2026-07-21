@@ -189,6 +189,7 @@ fn to_json_note<'a>(n: &'a Note, files: &FileTable) -> JsonNote<'a> {
         }
         Step::Mutate { target } => j.what = Some(target),
         Step::Capture { what } => j.what = Some(what),
+        Step::InitOnce { slot } => j.slot = Some(*slot),
     }
     j
 }

@@ -339,7 +339,10 @@ fn resolve_callback<'a>(
 /// a prop, captured by a closure. A slot whose setter is never referenced
 /// provably never changes (React state only moves through its setter), so a
 /// capture of it can never go stale — sound to skip.
-fn may_written_slots(
+///
+/// Shared with `frozen-initial-state`, which runs the same proof on the
+/// *parent* component to decide whether a versioned prop can actually change.
+pub(super) fn may_written_slots(
     render_cfg: &CFG,
     hooks: &[HookEntry],
     setter_labels: &HashMap<Var, HookLabel>,

@@ -93,6 +93,30 @@ pub const RULE_DOCS: &[RuleDoc] = &[
               it's expensive. Delete the state slot.",
     },
     RuleDoc {
+        name: "frozen-initial-state",
+        summary: "useState seeded from a prop that changes — the state freezes at the first value",
+        explanation: "`useState` reads its initializer on the first render only; every later \
+                      render ignores it. When the initializer reads a prop and no effect keyed \
+                      on that prop (and no render-time write) ever syncs the slot, the state \
+                      stays frozen at the first prop value while the prop moves on — the \
+                      classic \"my component doesn't update when props change\". Error when \
+                      the prop is proven to be fed by another component's state that is \
+                      actually written (cross-component analysis); Warning when the prop's \
+                      motion is uncertain or the setter escapes the component; Info when \
+                      intent is declared — every seeding prop is named for seed-once \
+                      (`initial*`/`default*`), or the slot is never written at all (a \
+                      deliberate mount-time snapshot). Silent when the feeding state provably \
+                      never changes or a sync path exists (that quality is `derived-state`'s \
+                      concern).",
+        example: "function Row({ user }) {\n\
+                  \x20 const [name, setName] = useState(user.name); // user changes later\n\
+                  }",
+        fix: "Pick an ownership model: use the prop directly and lift updates up (controlled); \
+              remount with `key={...}` at the call site to re-seed; or sync deliberately with \
+              `useEffect(() => setName(user.name), [user.name])`. If seed-once is intended, \
+              name the prop `initialName`.",
+    },
+    RuleDoc {
         name: "infinite-loop",
         summary: "effect sets state that re-triggers the effect — state diverges",
         explanation: "The render → effect → setState → render cycle never stabilizes: the \

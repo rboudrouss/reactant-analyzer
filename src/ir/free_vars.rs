@@ -171,7 +171,9 @@ fn extract_path<'e>(e: &'e Expr, side: &mut Vec<&'e Expr>) -> Option<(Var, Vec<S
     }
 }
 
-fn collect_used_paths(expr: &Expr, out: &mut HashSet<AccessPath>) {
+/// Collect the access paths read by a single expression (the per-`Expr`
+/// kernel of [`compute_free_paths`]; no local-definition subtraction).
+pub fn collect_used_paths(expr: &Expr, out: &mut HashSet<AccessPath>) {
     match expr {
         Expr::Var(_) | Expr::FieldAccess { .. } | Expr::IndexAccess { .. } => {
             let mut side = Vec::new();
