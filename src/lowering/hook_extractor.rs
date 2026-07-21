@@ -6,7 +6,7 @@ use crate::ir::{
     expr::{Expr, Prim},
     hooks::HookEntry,
     source_range::SourceRange,
-    stmt::Stmt,
+    stmt::{MemberKey, Stmt},
     types::{BlockId, HookLabel},
 };
 
@@ -34,6 +34,7 @@ fn collect_subscriptions_in_cfg(cfg: &CFG, out: &mut Vec<HookEntry>, next_label:
             let (expr, span) = match stmt {
                 Stmt::Let { rhs, span, .. } => (rhs, *span),
                 Stmt::Assign { rhs, span, .. } => (rhs, *span),
+                Stmt::MemberWrite { rhs, span, .. } => (rhs, *span),
                 Stmt::ExprStmt(e, span) => (e, *span),
             };
             collect_subscriptions_in_expr(expr, span, out, next_label);
@@ -174,6 +175,7 @@ pub fn extract_handlers(cfg: &CFG, hooks: &mut Vec<HookEntry>, next_label: &mut 
         for stmt in &block.stmts {
             let expr = match stmt {
                 Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => rhs,
+                Stmt::MemberWrite { rhs, .. } => rhs,
                 Stmt::ExprStmt(e, _) => e,
             };
             collect_handlers_in_expr(expr, &var_bodies, &mut found, next_label);
@@ -417,6 +419,22 @@ fn process_stmt(
         Stmt::Assign { var, rhs, span } => {
             out.push(Stmt::Assign {
                 var,
+                rhs: rewrite_expr(rhs, state_temps),
+                span,
+            });
+        }
+        Stmt::MemberWrite {
+            obj,
+            key,
+            rhs,
+            span,
+        } => {
+            out.push(Stmt::MemberWrite {
+                obj: rewrite_expr(obj, state_temps),
+                key: match key {
+                    MemberKey::Field(f) => MemberKey::Field(f),
+                    MemberKey::Index(idx) => MemberKey::Index(rewrite_expr(idx, state_temps)),
+                },
                 rhs: rewrite_expr(rhs, state_temps),
                 span,
             });

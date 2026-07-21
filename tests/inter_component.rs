@@ -53,6 +53,7 @@ fn leaf_component(name: &str) -> ComponentIR {
         file: std::path::PathBuf::new(),
         name: name.to_string(),
         param: "props".to_string(),
+        dom_props: Default::default(),
         render_cfg: empty_cfg(),
         hooks: vec![],
         module_consts: Default::default(),
@@ -95,6 +96,7 @@ fn heuristic_detects_parent_not_child_as_root() {
             file: std::path::PathBuf::new(),
             name: "Parent".to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: CFG {
                 entry: 0,
                 blocks,
@@ -147,6 +149,7 @@ fn analyze_program_populates_call_graph_for_parent_child() {
             file: std::path::PathBuf::new(),
             name: "Parent".to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: CFG {
                 entry: 0,
                 blocks,
@@ -235,6 +238,7 @@ fn setter_prop_propagates_to_shared_state() {
             file: std::path::PathBuf::new(),
             name: "Child".to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: render,
             hooks: vec![HookEntry::Effect {
                 label: 0,
@@ -288,6 +292,7 @@ fn setter_prop_propagates_to_shared_state() {
             file: std::path::PathBuf::new(),
             name: "Parent".to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: render,
             hooks: vec![HookEntry::State {
                 label: 0,
@@ -337,6 +342,7 @@ fn recursive_component_does_not_crash() {
             file: std::path::PathBuf::new(),
             name: "TreeNode".to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: CFG {
                 entry: 0,
                 blocks,
@@ -575,6 +581,7 @@ fn prop_drilling_direct_ir() {
             file: std::path::PathBuf::new(),
             name: "Leaf".to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: empty_cfg(),
             hooks: vec![HookEntry::Effect {
                 label: 0,
@@ -612,6 +619,7 @@ fn prop_drilling_direct_ir() {
             file: std::path::PathBuf::new(),
             name: "Middle".to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: CFG {
                 entry: 0,
                 blocks,
@@ -653,6 +661,7 @@ fn prop_drilling_direct_ir() {
             file: std::path::PathBuf::new(),
             name: "Root".to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: CFG {
                 entry: 0,
                 blocks,

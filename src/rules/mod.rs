@@ -573,6 +573,7 @@ fn check_stmt_for_setters(
         // Also descend Let rhs FnLits.
         Stmt::Let { rhs, .. } => (rhs, None),
         Stmt::Assign { rhs, .. } => (rhs, None),
+        Stmt::MemberWrite { rhs, .. } => (rhs, None),
     };
     check_expr_for_setters(expr, span, block_id, setter_vars, depth, fn_bindings, found);
 }

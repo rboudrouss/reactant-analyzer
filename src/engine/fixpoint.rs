@@ -117,6 +117,8 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     let ComponentIR {
         file: comp_file,
         name: comp_name,
+        param: comp_param,
+        dom_props: comp_dom_props,
         mut render_cfg,
         hooks,
         module_consts,
@@ -454,6 +456,8 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     AnalysisResult {
         component: comp_name,
         file: comp_file,
+        param: comp_param,
+        dom_props: comp_dom_props,
         state_store: final_state,
         memo_store,
         block_states,
@@ -804,6 +808,13 @@ fn collect_lits_cfg(cfg: &CFG, out: &mut Vec<f64>) {
         for stmt in &block.stmts {
             match stmt {
                 Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => collect_lits_expr(rhs, out),
+                Stmt::MemberWrite { obj, key, rhs, .. } => {
+                    collect_lits_expr(obj, out);
+                    if let crate::ir::stmt::MemberKey::Index(idx) = key {
+                        collect_lits_expr(idx, out);
+                    }
+                    collect_lits_expr(rhs, out);
+                }
                 Stmt::ExprStmt(e, _) => collect_lits_expr(e, out),
             }
         }
@@ -952,6 +963,13 @@ fn hook_labels_in_stmt(stmt: &Stmt) -> Vec<HookLabel> {
     let mut out = Vec::new();
     match stmt {
         Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => {
+            collect_hook_labels_expr(rhs, &mut out);
+        }
+        Stmt::MemberWrite { obj, key, rhs, .. } => {
+            collect_hook_labels_expr(obj, &mut out);
+            if let crate::ir::stmt::MemberKey::Index(idx) = key {
+                collect_hook_labels_expr(idx, &mut out);
+            }
             collect_hook_labels_expr(rhs, &mut out);
         }
         Stmt::ExprStmt(e, _) => collect_hook_labels_expr(e, &mut out),
@@ -1221,7 +1239,7 @@ fn utility_call_target(stmt: &Stmt) -> Option<String> {
     let call_expr = match stmt {
         Stmt::Let { rhs, .. } => rhs,
         Stmt::ExprStmt(expr, _) => expr,
-        Stmt::Assign { .. } => return None,
+        Stmt::Assign { .. } | Stmt::MemberWrite { .. } => return None,
     };
     let (fn_, _) = match call_expr {
         Expr::Call { fn_, args } => (fn_, args),
@@ -1484,6 +1502,7 @@ mod tests {
             file: std::path::PathBuf::new(),
             name: "TestComp".to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: CFG {
                 entry: 0,
                 blocks,
@@ -1842,6 +1861,7 @@ mod tests {
             file: std::path::PathBuf::new(),
             name: "C".to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: CFG {
                 entry: 0,
                 blocks,

@@ -87,6 +87,8 @@ pub enum Step {
     CycleEdge { from: String, to: String },
     /// Fixpoint evidence: the slot's abstract value grew until widening.
     Widen { slot: HookLabel, iteration: u32 },
+    /// In-place mutation: the object's contents change, its reference doesn't.
+    Mutate { target: String },
 }
 
 impl Step {
@@ -102,6 +104,7 @@ impl Step {
             Step::Handler { .. } => "handler",
             Step::CycleEdge { .. } => "cycle-edge",
             Step::Widen { .. } => "widen",
+            Step::Mutate { .. } => "mutate",
         }
     }
 
@@ -164,6 +167,9 @@ impl Step {
                 name(*slot),
                 iteration
             ),
+            Step::Mutate { target } => {
+                format!("`{target}` is mutated in place here — its reference identity is unchanged")
+            }
         }
     }
 }
@@ -278,7 +284,7 @@ pub fn find_effectful_call(cfg: &CFG) -> Option<(String, Option<SourceRange>)> {
             let (expr, span) = match stmt {
                 Stmt::Let { rhs, span, .. } => (rhs, span),
                 Stmt::ExprStmt(e, span) => (e, span),
-                Stmt::Assign { rhs, span, .. } => (rhs, span),
+                Stmt::Assign { rhs, span, .. } | Stmt::MemberWrite { rhs, span, .. } => (rhs, span),
             };
             if let Some(found) = first_effectful_in_expr(expr) {
                 return Some((found, *span));

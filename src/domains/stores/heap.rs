@@ -44,6 +44,10 @@ impl Heap {
         self.0.get(&id)
     }
 
+    pub fn get_mut(&mut self, id: ExprId) -> Option<&mut HeapValue> {
+        self.0.get_mut(&id)
+    }
+
     /// Pointwise join: union of keys, join values at shared keys.
     /// For `Fn` entries: body CFG is structural (same site → same body); captured is joined.
     /// For `Obj`/`Arr`, values are joined per element.

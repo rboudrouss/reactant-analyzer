@@ -115,6 +115,13 @@ pub struct AnalysisResult<D: AbstractDomain> {
     /// producers (`witness::resolve_and_classify`, ADR-019). Empty for
     /// hand-built IR (unit tests).
     pub file: std::path::PathBuf,
+    /// The component's props parameter binding (`props`, or the `__pN` temp
+    /// for a destructured parameter). Root of prop-owned objects for rules
+    /// that chase reference identity (state-mutation).
+    pub param: Var,
+    /// Props whose declared TypeScript type is a DOM interface — mutating
+    /// them is imperative DOM manipulation, exempt from state-mutation.
+    pub dom_props: std::sync::Arc<HashSet<Var>>,
     pub state_store: StateStore<D>,
     pub memo_store: MemoStore<D>,
     /// Abstract environment at the *exit* of each render-CFG block.

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -33,6 +33,11 @@ pub struct ComponentIR {
     pub file: PathBuf,
     pub name: Symbol,
     pub param: Var,
+    /// Names of props whose TypeScript type is a DOM interface
+    /// (`HTMLCanvasElement`, `SVGElement`, `Node`…). Mutating these is
+    /// imperative DOM manipulation, not a write into React-owned data —
+    /// the state-mutation rule exempts them.
+    pub dom_props: Arc<HashSet<Var>>,
     pub render_cfg: CFG,
     pub hooks: Vec<HookEntry>,
     /// Module-level `const` bindings of the source file with syntactically

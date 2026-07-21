@@ -57,6 +57,13 @@ impl CFG {
                 match stmt {
                     crate::ir::stmt::Stmt::Let { rhs, .. }
                     | crate::ir::stmt::Stmt::Assign { rhs, .. } => f(rhs),
+                    crate::ir::stmt::Stmt::MemberWrite { obj, key, rhs, .. } => {
+                        f(obj);
+                        if let crate::ir::stmt::MemberKey::Index(idx) = key {
+                            f(idx);
+                        }
+                        f(rhs);
+                    }
                     crate::ir::stmt::Stmt::ExprStmt(e, _) => f(e),
                 }
             }

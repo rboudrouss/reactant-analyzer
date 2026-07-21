@@ -263,6 +263,8 @@ mod tests {
         AnalysisResult {
             component: "C".to_string(),
             file: Default::default(),
+            param: "props".to_string(),
+            dom_props: Default::default(),
             state_store: StateStore::bottom(),
             memo_store: MemoStore::new(),
             block_states: HashMap::new(),
@@ -379,6 +381,8 @@ mod tests {
         let result = AnalysisResult {
             component: "C".to_string(),
             file: Default::default(),
+            param: "props".to_string(),
+            dom_props: Default::default(),
             state_store: StateStore::bottom(),
             memo_store: MemoStore::new(),
             block_states: HashMap::new(),
@@ -492,6 +496,7 @@ mod tests {
             file: std::path::PathBuf::new(),
             name: "Counter".to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: CFG {
                 entry: 0,
                 blocks,

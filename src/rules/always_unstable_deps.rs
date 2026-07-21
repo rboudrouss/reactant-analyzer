@@ -240,6 +240,7 @@ mod tests {
             file: std::path::PathBuf::new(),
             name: "C".to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: CFG {
                 entry: 0,
                 blocks,

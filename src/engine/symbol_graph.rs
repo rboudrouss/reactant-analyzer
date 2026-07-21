@@ -255,6 +255,13 @@ fn collect_callees_in_cfg(cfg: &CFG, out: &mut Vec<Symbol>) {
                 Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => {
                     collect_callees_in_expr(rhs, out)
                 }
+                Stmt::MemberWrite { obj, key, rhs, .. } => {
+                    collect_callees_in_expr(obj, out);
+                    if let crate::ir::stmt::MemberKey::Index(idx) = key {
+                        collect_callees_in_expr(idx, out);
+                    }
+                    collect_callees_in_expr(rhs, out);
+                }
                 Stmt::ExprStmt(expr, _) => collect_callees_in_expr(expr, out),
             }
         }
@@ -371,6 +378,7 @@ mod tests {
             file: PathBuf::from(file),
             name: name.to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: cfg_calling(callees),
             hooks: vec![],
             module_consts: Default::default(),

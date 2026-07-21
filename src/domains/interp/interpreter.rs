@@ -10,7 +10,7 @@ use crate::{
         cfg::{CFG, EdgeKind, Terminator},
         expr::Expr,
         free_vars::compute_free_vars,
-        stmt::Stmt,
+        stmt::{MemberKey, Stmt},
         types::BlockId,
     },
 };
@@ -73,17 +73,27 @@ fn exec_full_stmt<T: Transfer>(
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) {
-    let main_expr = match stmt {
-        Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => rhs,
-        Stmt::ExprStmt(expr, _) => expr,
-    };
-    exec_callbacks_depth(transfer, main_expr, env, ctx, depth);
+    match stmt {
+        Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => {
+            exec_callbacks_depth(transfer, rhs, env, ctx, depth);
+        }
+        Stmt::MemberWrite { obj, key, rhs, .. } => {
+            exec_callbacks_depth(transfer, obj, env, ctx, depth);
+            if let MemberKey::Index(idx) = key {
+                exec_callbacks_depth(transfer, idx, env, ctx, depth);
+            }
+            exec_callbacks_depth(transfer, rhs, env, ctx, depth);
+        }
+        Stmt::ExprStmt(expr, _) => {
+            exec_callbacks_depth(transfer, expr, env, ctx, depth);
+        }
+    }
     exec_stmt_core(transfer, stmt, env, ctx, depth);
     // `CompApp` in ExprStmt position (including Return-turned-ExprStmt by cfg_analyzer)
     // must also go through eval_expr so that inter-component analysis fires.
     // exec_stmt_core only handles setter calls; eval_comp_app lives in eval_expr.
-    if let Stmt::ExprStmt(Expr::CompApp { .. }, _) = stmt {
-        transfer.eval_expr(main_expr, env, ctx);
+    if let Stmt::ExprStmt(expr @ Expr::CompApp { .. }, _) = stmt {
+        transfer.eval_expr(expr, env, ctx);
     }
 }
 
@@ -210,6 +220,61 @@ fn exec_stmt_core<T: Transfer>(
             }
             let val = transfer.eval_expr(rhs, env, ctx);
             env.extend(var.clone(), val);
+        }
+        // `obj.f = v`: the identity of `obj` is untouched (that is what makes
+        // it a mutation); only the field's content moves. Weak-update the heap
+        // object(s) the variable may point to — the write may run on one path
+        // among several and the Loc set may name several allocation sites, so
+        // join, never replace.
+        Stmt::MemberWrite { obj, key, rhs, .. } => {
+            if let Expr::FnLit {
+                id,
+                params,
+                body_cfg,
+            } = rhs
+            {
+                let free = compute_free_vars(body_cfg);
+                let captured = free
+                    .iter()
+                    .filter_map(|v| env.lookup(v).as_state_value().map(|sv| (v.clone(), sv)))
+                    .collect();
+                ctx.heap.insert(
+                    *id,
+                    HeapValue::Fn {
+                        params: params.clone(),
+                        body_cfg: Arc::clone(body_cfg),
+                        captured,
+                    },
+                );
+            }
+            let val = transfer.eval_expr(rhs, env, ctx);
+            if let (Expr::Var(v), MemberKey::Field(field)) = (obj, key)
+                && let Some(EnvVal::Loc(ids)) = env.lookup_env_val(v)
+            {
+                let new_val = match rhs {
+                    Expr::FnLit { id, .. } => EnvVal::Loc(std::collections::HashSet::from([*id])),
+                    _ => match val.as_state_value() {
+                        Some(sv) => EnvVal::Val(sv),
+                        None => return,
+                    },
+                };
+                for id in ids.iter().copied().collect::<Vec<_>>() {
+                    if let Some(HeapValue::Obj(fields)) = ctx.heap.get_mut(id) {
+                        let joined = match (fields.get(field), &new_val) {
+                            (Some(EnvVal::Val(old)), EnvVal::Val(new)) => {
+                                EnvVal::Val(old.join(new))
+                            }
+                            (Some(EnvVal::Loc(old)), EnvVal::Loc(new)) => {
+                                EnvVal::Loc(old.union(new).copied().collect())
+                            }
+                            // Mixed Loc/Val: no common representation — ⊤.
+                            (Some(_), _) => EnvVal::Val(crate::domains::impls::StateValue::top()),
+                            (None, new) => new.clone(),
+                        };
+                        fields.insert(field.clone(), joined);
+                    }
+                }
+            }
         }
         Stmt::ExprStmt(expr, _) => {
             // Callback pre-pass already ran in `exec_full_stmt`; fire the setter.

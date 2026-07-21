@@ -762,7 +762,9 @@ pub(super) fn collect_churn_calls(
         for stmt in &block.stmts {
             let (expr, span) = match stmt {
                 Stmt::ExprStmt(e, span) => (e, *span),
-                Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => (rhs, None),
+                Stmt::Let { rhs, .. }
+                | Stmt::Assign { rhs, .. }
+                | Stmt::MemberWrite { rhs, .. } => (rhs, None),
             };
             churn_calls_in_expr(
                 expr,
@@ -1172,6 +1174,8 @@ mod tests {
         AnalysisResult {
             component: "C".to_string(),
             file: Default::default(),
+            param: "props".to_string(),
+            dom_props: Default::default(),
             state_store: StateStore::bottom(),
             memo_store: MemoStore::new(),
             block_states: HashMap::new(),
@@ -1436,6 +1440,7 @@ mod tests {
             file: std::path::PathBuf::new(),
             name: "C".to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: CFG {
                 entry: 0,
                 blocks,
@@ -1526,6 +1531,7 @@ mod tests {
             file: std::path::PathBuf::new(),
             name: "Counter".to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: CFG {
                 entry: 0,
                 blocks,
@@ -1672,6 +1678,7 @@ mod tests {
             file: std::path::PathBuf::new(),
             name: "C".to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: CFG {
                 entry: 0,
                 blocks,
@@ -2035,6 +2042,7 @@ mod tests {
             file: std::path::PathBuf::new(),
             name: "C".to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: CFG {
                 entry: 0,
                 blocks,

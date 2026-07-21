@@ -14,7 +14,7 @@
 
 - **Kind-ambiguous fresh methods stay ⊤** — `slice`/`concat` are deliberately excluded from `returns_fresh_reference`: on a *string* receiver they return a value-compared primitive, and claiming a per-render reference for `id.slice(0, 8)` in a deps array would be a false proof. Cost: `const copy = arr.slice()` in deps is a missed `always-unstable-deps` TP. Fixing it needs receiver *kind* (string vs array) in the product domain. Related minor imprecision, by design: HOF callback params and for-of/for-in loop vars are bound to ⊤, not to the receiver's element join — refine both together if a real case ever needs it.
 
-- **`state-mutation` v1 scope** — the rule proves the pair (in-place mutation of the slot's reference, same-identity set) through `const`-alias chains only. Out of scope, all FNs: functional updaters that mutate (`set(p => { p.x = 1; return p })` — same identity returned), direct **prop** mutation (needs cross-component identity), mutation through an *escaped* alias (stored in a ref/object then mutated), and plain field writes (`obj.x = v` — member-assignment lowering doesn't produce a trackable event yet). Mutation + set in *sibling* handlers is deliberately unpaired (same-scope-chain gate, FP-averse).
+- **`state-mutation` escaped-alias FN** — the rule chases reference identity through local `let`/`const` binding chains only; an alias that *escapes* (stored into a ref or object field, then mutated through that path: `ref.current = arr; ref.current.push(x); setArr(arr)`) is not chased — the mutation roots at `.current` (exempt) and the pairing is missed. Functional updaters, prop mutation, plain field writes (`Stmt::MemberWrite`) and cross-trigger pairing (Warning) are covered.
 
 - **Churn-graph residuals (ADR-018)** — auto-run nested callbacks (`.then(() => set(fresh))`) in **no-deps** effects create no self-edge (event-vs-async callback classification lives in the engine, not the syntactic collector); cross-component edges are lost when a prop dep degrades to `Unknown` (FieldAccess on versioned, ADR-017 §Limitations).
 
@@ -31,6 +31,8 @@
 - **Module consts don't cross files into inlined hooks** — a custom hook inlined from another file reads the *component's* module consts, not its own file's → its module-const references stay ⊤ (same FP class as above, one level removed).
 
 - **Per-slot hook summaries** — `SummaryRegistry` returns ONE `StateValue` per hook; tuple-returning third-party hooks (jotai `useAtom` → `[value, setValue]`) can't expose a Stable setter slot → `missing-deps` flags `setValue` (⊤) even though it is stable (excalidraw `useAtomWithInitialValue`, author eslint-disabled the same warning). Needs summaries that describe destructured slots.
+
+- **`state-mutation` DOM exemption is same-file only** — DOM-typed props (`canvas: HTMLCanvasElement`) are exempted by reading the props `type`/`interface` in the component's own file; a props type imported from another file isn't resolved → advice-level Warning FP on imperative DOM props (never a hidden bug). Mutation *without* a same-identity set is out of scope by design.
 
 - **Churn-cycle Warning on convergent multi-writer pairs** — the F5b convergence kill requires a single effect write-site per slot (ADR-018); a guarded fetch-once write coexisting with another writer of the same slot keeps its edge even when the pair in fact converges. Precise alternative: narrow guards against the join of all writers' values.
 

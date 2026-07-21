@@ -248,6 +248,105 @@ fn ts_type_name_is_component(name: &TSTypeName) -> bool {
     }
 }
 
+// ── DOM-typed props ───────────────────────────────────────────────────────────
+
+/// Names of props whose declared TypeScript type is a DOM interface
+/// (`canvas: HTMLCanvasElement`). Looks through the props parameter's
+/// annotation: inline type literal, or a same-file `type`/`interface`
+/// declaration referenced by name. Cross-file props types are not resolved —
+/// missing an exemption only costs a Warning-level advice, never a hidden bug.
+pub fn collect_dom_props(
+    params: &FormalParameters,
+    program: &Program,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let Some(first) = params.items.first() else {
+        return out;
+    };
+    let Some(ann) = &first.type_annotation else {
+        return out;
+    };
+    match &ann.type_annotation {
+        TSType::TSTypeLiteral(lit) => collect_dom_members(&lit.members, &mut out),
+        TSType::TSTypeReference(tr) => {
+            if let TSTypeName::IdentifierReference(id) = &tr.type_name {
+                resolve_dom_members(program, id.name.as_str(), &mut out);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Find a same-file `type X = {…}` / `interface X {…}` and collect its
+/// DOM-typed members.
+fn resolve_dom_members(program: &Program, name: &str, out: &mut std::collections::HashSet<String>) {
+    for stmt in &program.body {
+        let decl = match stmt {
+            Statement::TSTypeAliasDeclaration(d) => Some(TypeDecl::Alias(d)),
+            Statement::TSInterfaceDeclaration(d) => Some(TypeDecl::Interface(d)),
+            Statement::ExportNamedDeclaration(exp) => match &exp.declaration {
+                Some(Declaration::TSTypeAliasDeclaration(d)) => Some(TypeDecl::Alias(d)),
+                Some(Declaration::TSInterfaceDeclaration(d)) => Some(TypeDecl::Interface(d)),
+                _ => None,
+            },
+            _ => None,
+        };
+        match decl {
+            Some(TypeDecl::Alias(d)) if d.id.name == name => {
+                if let TSType::TSTypeLiteral(lit) = &d.type_annotation {
+                    collect_dom_members(&lit.members, out);
+                }
+                return;
+            }
+            Some(TypeDecl::Interface(d)) if d.id.name == name => {
+                collect_dom_members(&d.body.body, out);
+                return;
+            }
+            _ => {}
+        }
+    }
+}
+
+enum TypeDecl<'a, 'b> {
+    Alias(&'b TSTypeAliasDeclaration<'a>),
+    Interface(&'b TSInterfaceDeclaration<'a>),
+}
+
+fn collect_dom_members(members: &[TSSignature], out: &mut std::collections::HashSet<String>) {
+    for m in members {
+        if let TSSignature::TSPropertySignature(p) = m
+            && let Some(key) = static_key_name(&p.key)
+            && let Some(ann) = &p.type_annotation
+            && ts_type_is_dom(&ann.type_annotation)
+        {
+            out.insert(key);
+        }
+    }
+}
+
+fn static_key_name(key: &PropertyKey) -> Option<String> {
+    match key {
+        PropertyKey::StaticIdentifier(id) => Some(id.name.to_string()),
+        PropertyKey::StringLiteral(s) => Some(s.value.to_string()),
+        _ => None,
+    }
+}
+
+fn ts_type_is_dom(ty: &TSType) -> bool {
+    if let TSType::TSTypeReference(tr) = ty
+        && let TSTypeName::IdentifierReference(id) = &tr.type_name
+    {
+        let n = id.name.as_str();
+        return ((n.starts_with("HTML") || n.starts_with("SVG")) && n.ends_with("Element"))
+            || matches!(
+                n,
+                "Element" | "HTMLElement" | "SVGElement" | "Node" | "EventTarget" | "Document"
+            );
+    }
+    false
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

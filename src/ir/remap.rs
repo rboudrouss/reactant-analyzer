@@ -4,7 +4,7 @@ use crate::ir::{
     cfg::{BasicBlock, CFG, Terminator},
     expr::Expr,
     hooks::HookEntry,
-    stmt::Stmt,
+    stmt::{MemberKey, Stmt},
     types::HookLabel,
 };
 
@@ -101,6 +101,20 @@ fn remap_stmt(stmt: Stmt, offset: HookLabel) -> Stmt {
         },
         Stmt::Assign { var, rhs, span } => Stmt::Assign {
             var,
+            rhs: remap_expr(rhs, offset),
+            span,
+        },
+        Stmt::MemberWrite {
+            obj,
+            key,
+            rhs,
+            span,
+        } => Stmt::MemberWrite {
+            obj: remap_expr(obj, offset),
+            key: match key {
+                MemberKey::Field(f) => MemberKey::Field(f),
+                MemberKey::Index(idx) => MemberKey::Index(remap_expr(idx, offset)),
+            },
             rhs: remap_expr(rhs, offset),
             span,
         },

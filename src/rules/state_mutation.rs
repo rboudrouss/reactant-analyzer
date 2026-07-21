@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     engine::ProgramAnalysisResult,
@@ -7,46 +7,19 @@ use crate::{
         cfg::{CFG, Terminator},
         expr::Expr,
         hooks::HookEntry,
-        stmt::Stmt,
+        stmt::{MemberKey, Stmt},
         types::{HookLabel, Symbol, Var},
     },
 };
 
-use super::witness::{EffectClass, Step, ValueClass};
 use super::{
-    Diagnostic, Rule, Severity, resolve_setter_aliases, state_slot_name, state_val_labels,
+    Diagnostic, Rule, Severity, Step, ValueClass, resolve_setter_aliases, setter_var_labels,
+    state_slot_name, state_val_labels,
 };
 
-/// In-place mutation of a state object followed by a setter call with the
-/// **same reference**: `arr.push(x); setArr(arr)`.
-///
-/// React compares the incoming value with `Object.is`; a same-identity set is
-/// a proven bail-out — no re-render, the mutated data never reaches the
-/// screen. This is a *silent* bug (nothing loops, nothing warns at runtime)
-/// that no syntactic linter can prove.
-///
-/// Both facts are identity-exact, so the severity is `Error`:
-/// - the mutation receiver resolves (through `const` alias chains) to the
-///   `useState` value binding — the mutated object IS the slot's current
-///   value;
-/// - the setter argument resolves to the same slot's value binding — the
-///   stored reference is handed back unchanged. A clone (`[...arr]`,
-///   `arr.filter(…)`, `structuredClone(arr)`) evaluates to a fresh
-///   reference and never matches.
-///
-/// The two sites must share a scope chain (same function body, or one nested
-/// in the other): a mutation in one handler and a set in an unrelated handler
-/// is not paired.
-///
-/// Out of scope (v1): functional updaters that mutate (`set(p => { p.x = 1;
-/// return p })`), direct prop mutation, mutation through an escaped alias.
-pub struct StateMutation;
-
-/// Methods that mutate their receiver in place (arrays, Map/Set,
-/// URLSearchParams). The receiver must resolve to a state binding before any
-/// of these counts as a mutation — the liberal name list is gated by an exact
-/// identity fact, so a same-named pure method on a non-state object never
-/// fires.
+/// Methods that mutate their receiver in place (Array, Map/Set, typed arrays).
+/// The receiver's reference identity is unchanged — that is the bug when the
+/// receiver is state: React compares with `Object.is` and bails out.
 const MUTATING_METHODS: &[&str] = &[
     "push",
     "pop",
@@ -57,28 +30,349 @@ const MUTATING_METHODS: &[&str] = &[
     "reverse",
     "fill",
     "copyWithin",
-    "set",
     "add",
     "delete",
     "clear",
+    "set",
 ];
 
-const MAX_SCOPE_DEPTH: usize = 4;
+/// Fires when a state or prop object is mutated in place.
+///
+/// Two arms:
+/// - **state + same-identity set** (Error): a state-rooted object is mutated
+///   (`arr.push(x)`, `obj.f = v`, `Object.assign(obj, …)`) and the slot's
+///   setter is called with the *same reference* (`setArr(arr)`, or an updater
+///   that mutates and returns its own parameter). React sees `Object.is(old,
+///   new)` → skips the re-render: the UI silently freezes. Identity is chased
+///   through alias bindings, so the pairing is near-exact.
+/// - **prop mutation** (Warning): a props-rooted object is mutated — the
+///   component writes into an object owned by its parent.
+///
+/// Excluded by construction: refs (`ref.current…` and any path through a
+/// `.current` field), fresh copies (`[...arr]` roots at an allocation, not a
+/// slot), updater-style libraries (Immer's `draft` is an unknown callback
+/// param, not a slot root).
+pub struct StateMutation;
 
-#[derive(Debug)]
-struct MutationEvent {
-    label: HookLabel,
-    method: String,
-    span: Option<SourceRange>,
-    scope: Vec<usize>,
+/// Where an object expression's reference identity roots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutRoot {
+    State(HookLabel),
+    Props,
+    Other,
 }
 
-#[derive(Debug)]
-struct SameIdentitySet {
-    label: HookLabel,
-    setter: Var,
+/// One recorded site (mutation or same-identity setter call).
+#[derive(Debug, Clone)]
+struct Site {
     span: Option<SourceRange>,
-    scope: Vec<usize>,
+    /// Top-level container the site runs under (render body, one effect, one
+    /// handler…). A mutation and a set in the same container run on the same
+    /// trigger → the bug is certain (Error); across containers the pairing is
+    /// conservative (Warning).
+    container: usize,
+    /// Display text of the mutated object expression (`items`, `user.tags`).
+    desc: String,
+}
+
+/// One lexical scope of the chase: local `let`/`assign` bindings, plus names
+/// that must NOT resolve outward (function params shadow their surroundings),
+/// plus updater params known to BE the current slot value (`setX(p => …)`).
+struct Scope<'a> {
+    bindings: HashMap<&'a str, Vec<&'a Expr>>,
+    shadowed: HashSet<&'a str>,
+    param_roots: HashMap<&'a str, HookLabel>,
+}
+
+impl<'a> Scope<'a> {
+    fn from_cfg(cfg: &'a CFG) -> Self {
+        let mut bindings: HashMap<&'a str, Vec<&'a Expr>> = HashMap::new();
+        for block in cfg.blocks.values() {
+            for stmt in &block.stmts {
+                if let Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } = stmt {
+                    bindings.entry(var.as_str()).or_default().push(rhs);
+                }
+            }
+        }
+        Scope {
+            bindings,
+            shadowed: HashSet::new(),
+            param_roots: HashMap::new(),
+        }
+    }
+
+    fn params(params: &'a [Var]) -> Self {
+        Scope {
+            bindings: HashMap::new(),
+            shadowed: params.iter().map(|p| p.as_str()).collect(),
+            param_roots: HashMap::new(),
+        }
+    }
+}
+
+struct Collector<'a> {
+    state_val_label: &'a HashMap<Var, HookLabel>,
+    setter_label: &'a HashMap<Var, HookLabel>,
+    param: &'a str,
+    /// Props whose declared TS type is a DOM interface — imperative DOM
+    /// manipulation, not React-owned data.
+    dom_props: &'a HashSet<Var>,
+    mutations: Vec<(MutRoot, Site)>,
+    /// Setter calls whose argument is provably the slot's current reference.
+    ident_sets: Vec<(HookLabel, Site)>,
+}
+
+/// DOM-only fields: a write path through one of these manipulates a DOM
+/// node, never React-owned data (`el.style.width = …`, `el.classList.add`).
+const DOM_FIELDS: &[&str] = &["style", "classList", "dataset"];
+
+impl<'a> Collector<'a> {
+    /// Chase the reference identity of `expr` back to its root. May-analysis:
+    /// a variable bound on several paths roots at the first slot found.
+    fn chase(&self, expr: &'a Expr, scopes: &[Scope<'a>], seen: &mut HashSet<&'a str>) -> MutRoot {
+        match expr {
+            Expr::TSAnnotated(inner, _) => self.chase(inner, scopes, seen),
+            // A path through `.current` is ref semantics — mutation sanctioned.
+            Expr::FieldAccess { field, .. } if field == "current" => MutRoot::Other,
+            // A path through a DOM-only field is DOM manipulation.
+            Expr::FieldAccess { field, .. } if DOM_FIELDS.contains(&field.as_str()) => {
+                MutRoot::Other
+            }
+            // A DOM-typed prop read directly off the props param
+            // (`props.canvas.…`) is a DOM node handed down for imperative use.
+            Expr::FieldAccess { obj, field }
+                if self.dom_props.contains(field.as_str())
+                    && matches!(obj.as_ref(), Expr::Var(v) if v == self.param) =>
+            {
+                MutRoot::Other
+            }
+            // An element/field shares the container's identity for our
+            // purposes: mutating `items[0]` mutates what `items` holds.
+            Expr::FieldAccess { obj, .. } => self.chase(obj, scopes, seen),
+            Expr::IndexAccess { arr, .. } => self.chase(arr, scopes, seen),
+            Expr::StateVal(l) => MutRoot::State(*l),
+            Expr::Var(v) => {
+                if !seen.insert(v.as_str()) {
+                    return MutRoot::Other;
+                }
+                for scope in scopes.iter().rev() {
+                    if let Some(l) = scope.param_roots.get(v.as_str()) {
+                        return MutRoot::State(*l);
+                    }
+                    if scope.shadowed.contains(v.as_str()) {
+                        return MutRoot::Other;
+                    }
+                    if let Some(rhss) = scope.bindings.get(v.as_str()) {
+                        let mut best = MutRoot::Other;
+                        for rhs in rhss {
+                            match self.chase(rhs, scopes, seen) {
+                                s @ MutRoot::State(_) => return s,
+                                MutRoot::Props => best = MutRoot::Props,
+                                MutRoot::Other => {}
+                            }
+                        }
+                        return best;
+                    }
+                }
+                if let Some(l) = self.state_val_label.get(v.as_str()) {
+                    return MutRoot::State(*l);
+                }
+                if v == self.param {
+                    return MutRoot::Props;
+                }
+                MutRoot::Other
+            }
+            _ => MutRoot::Other,
+        }
+    }
+
+    fn record_mutation(
+        &mut self,
+        obj: &'a Expr,
+        scopes: &[Scope<'a>],
+        span: Option<SourceRange>,
+        container: usize,
+    ) {
+        let root = self.chase(obj, scopes, &mut HashSet::new());
+        if root != MutRoot::Other {
+            self.mutations.push((
+                root,
+                Site {
+                    span,
+                    container,
+                    desc: display_expr(obj),
+                },
+            ));
+        }
+    }
+
+    /// Walk one CFG: record mutation sites and same-identity setter calls,
+    /// descending into nested `FnLit` bodies (same container — they run as a
+    /// consequence of the same trigger).
+    fn walk_cfg(&mut self, cfg: &'a CFG, scopes: &mut Vec<Scope<'a>>, container: usize) {
+        scopes.push(Scope::from_cfg(cfg));
+        for block in cfg.blocks.values() {
+            for stmt in &block.stmts {
+                match stmt {
+                    Stmt::MemberWrite {
+                        obj,
+                        key,
+                        rhs,
+                        span,
+                    } => {
+                        self.record_mutation(obj, scopes, *span, container);
+                        self.walk_expr(obj, scopes, *span, container);
+                        if let MemberKey::Index(idx) = key {
+                            self.walk_expr(idx, scopes, *span, container);
+                        }
+                        self.walk_expr(rhs, scopes, *span, container);
+                    }
+                    Stmt::Let { rhs, span, .. } | Stmt::Assign { rhs, span, .. } => {
+                        self.walk_expr(rhs, scopes, *span, container);
+                    }
+                    Stmt::ExprStmt(e, span) => self.walk_expr(e, scopes, *span, container),
+                }
+            }
+            match &block.term {
+                Terminator::Return(e) | Terminator::Branch { cond: e, .. } => {
+                    self.walk_expr(e, scopes, None, container);
+                }
+                _ => {}
+            }
+        }
+        scopes.pop();
+    }
+
+    fn walk_expr(
+        &mut self,
+        expr: &'a Expr,
+        scopes: &mut Vec<Scope<'a>>,
+        span: Option<SourceRange>,
+        container: usize,
+    ) {
+        match expr {
+            Expr::Call { fn_, args } => {
+                match fn_.as_ref() {
+                    // Mutating method on a chased receiver: `items.push(x)`.
+                    Expr::FieldAccess { obj, field }
+                        if MUTATING_METHODS.contains(&field.as_str()) =>
+                    {
+                        // `Object.assign(target, …)` is caught below, not here.
+                        self.record_mutation(obj, scopes, span, container);
+                    }
+                    // `Object.assign(target, …)` mutates its first argument.
+                    Expr::FieldAccess { obj, field }
+                        if field == "assign"
+                            && matches!(obj.as_ref(), Expr::Var(v) if v == "Object") =>
+                    {
+                        if let Some(target) = args.first() {
+                            self.record_mutation(target, scopes, span, container);
+                        }
+                    }
+                    // Setter call: is the argument the slot's own reference?
+                    Expr::Var(name) => {
+                        if let Some(&label) = self.setter_label.get(name.as_str()) {
+                            match args.first() {
+                                Some(Expr::FnLit {
+                                    params, body_cfg, ..
+                                }) => {
+                                    self.walk_updater(
+                                        label, params, body_cfg, scopes, span, container,
+                                    );
+                                    // Updater handled; don't double-descend below.
+                                    for a in &args[1..] {
+                                        self.walk_expr(a, scopes, span, container);
+                                    }
+                                    return;
+                                }
+                                Some(arg)
+                                    if self.chase(arg, scopes, &mut HashSet::new())
+                                        == MutRoot::State(label) =>
+                                {
+                                    self.ident_sets.push((
+                                        label,
+                                        Site {
+                                            span,
+                                            container,
+                                            desc: display_expr(arg),
+                                        },
+                                    ));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                self.walk_expr(fn_, scopes, span, container);
+                for a in args {
+                    self.walk_expr(a, scopes, span, container);
+                }
+            }
+            // A nested function runs on the same trigger family: same container.
+            Expr::FnLit {
+                params, body_cfg, ..
+            } => {
+                scopes.push(Scope::params(params));
+                self.walk_cfg(body_cfg, scopes, container);
+                scopes.pop();
+            }
+            other => other.for_each_child(&mut |c| self.walk_expr(c, scopes, span, container)),
+        }
+    }
+
+    /// Functional updater `setX(p => …)`: React passes the slot's current
+    /// value as `p`, so `p` IS the slot reference. A mutation of `p` is a
+    /// state mutation; returning `p` afterwards is a same-identity set.
+    fn walk_updater(
+        &mut self,
+        label: HookLabel,
+        params: &'a [Var],
+        body_cfg: &'a CFG,
+        scopes: &mut Vec<Scope<'a>>,
+        span: Option<SourceRange>,
+        container: usize,
+    ) {
+        let mut scope = Scope::params(params);
+        if let Some(p) = params.first() {
+            scope.shadowed.remove(p.as_str());
+            scope.param_roots.insert(p.as_str(), label);
+        }
+        scopes.push(scope);
+        self.walk_cfg(body_cfg, scopes, container);
+        // Same-identity set = some return path yields the parameter itself
+        // (possibly through a local alias — chase with the body's bindings).
+        scopes.push(Scope::from_cfg(body_cfg));
+        for block in body_cfg.blocks.values() {
+            if let Terminator::Return(e) = &block.term
+                && self.chase(e, scopes, &mut HashSet::new()) == MutRoot::State(label)
+            {
+                self.ident_sets.push((
+                    label,
+                    Site {
+                        span,
+                        container,
+                        desc: display_expr(e),
+                    },
+                ));
+                break;
+            }
+        }
+        scopes.pop();
+        scopes.pop();
+    }
+}
+
+/// Source-like display for a chased object expression.
+fn display_expr(e: &Expr) -> String {
+    match e {
+        Expr::Var(v) => v.clone(),
+        Expr::StateVal(_) => "state".to_string(),
+        Expr::FieldAccess { obj, field } => format!("{}.{field}", display_expr(obj)),
+        Expr::IndexAccess { arr, .. } => format!("{}[…]", display_expr(arr)),
+        Expr::TSAnnotated(inner, _) => display_expr(inner),
+        _ => "this object".to_string(),
+    }
 }
 
 impl Rule for StateMutation {
@@ -94,364 +388,171 @@ impl Rule for StateMutation {
         use crate::engine::HookKind;
         super::has_hook_kind(result, component, HookKind::State).then_some(super::SafeCheck {
             rule: self.name(),
-            message: "no state object is mutated in place and re-set with the same reference",
+            message: "no state or prop object is mutated in place",
         })
     }
 
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
-        let comp_result = &result.components[component];
-        let render_cfg = &comp_result.render_cfg;
+        let result = &result.components[component];
+        let state_val_label = state_val_labels(&result.render_cfg);
 
-        // `var → state slot` for the useState value bindings, plus `const`
-        // aliases (`const a = arr`). Identity-preserving chains only.
-        let state_vars = resolve_setter_aliases(render_cfg, &state_val_labels(render_cfg));
-        if state_vars.is_empty() {
-            return vec![];
-        }
-
-        // `var → state slot` for the setter bindings.
-        let setter_base: HashMap<Var, HookLabel> = render_cfg
-            .blocks
-            .values()
-            .flat_map(|b| b.stmts.iter())
-            .filter_map(|stmt| match stmt {
-                Stmt::Let {
-                    var,
-                    rhs: Expr::StateSetter(label),
-                    ..
-                } => Some((var.clone(), *label)),
-                _ => None,
-            })
-            .collect();
-        let setter_vars = resolve_setter_aliases(render_cfg, &setter_base);
-        if setter_vars.is_empty() {
-            return vec![];
-        }
-
-        let mut mutations: Vec<MutationEvent> = Vec::new();
-        let mut sets: Vec<SameIdentitySet> = Vec::new();
-
-        // Scope roots: the render body and every hook body. Nested FnLits get
-        // child scopes; events pair only along a scope chain.
-        scan_cfg(
-            render_cfg,
-            &[0],
-            &state_vars,
-            &setter_vars,
-            &mut mutations,
-            &mut sets,
-            0,
-        );
-        for (i, hook) in comp_result.hooks.iter().enumerate() {
-            let body = match hook {
+        let mut setter_label = setter_var_labels(&result.render_cfg);
+        for cfg in
+            std::iter::once(&result.render_cfg).chain(result.hooks.iter().filter_map(|h| match h {
                 HookEntry::Effect { body_cfg, .. }
                 | HookEntry::Memo { body_cfg, .. }
                 | HookEntry::Callback { body_cfg, .. }
-                | HookEntry::Handler { body_cfg, .. } => body_cfg,
-                _ => continue,
-            };
-            let mut vars = state_vars.clone();
-            if let HookEntry::Callback { params, .. } = hook {
-                for p in params {
-                    vars.remove(p);
-                }
-            }
-            scan_cfg(
-                body,
-                &[i + 1],
-                &vars,
-                &setter_vars,
-                &mut mutations,
-                &mut sets,
-                0,
-            );
+                | HookEntry::Handler { body_cfg, .. } => Some(body_cfg),
+                _ => None,
+            }))
+        {
+            setter_label = resolve_setter_aliases(cfg, &setter_label);
         }
 
-        let mut diags = Vec::new();
-        for set in &sets {
-            let paired: Vec<&MutationEvent> = mutations
-                .iter()
-                .filter(|m| {
-                    m.label == set.label
-                        && (m.scope.starts_with(&set.scope) || set.scope.starts_with(&m.scope))
-                })
-                .collect();
-            let Some(first) = paired.first() else {
-                continue;
+        let mut collector = Collector {
+            state_val_label: &state_val_label,
+            setter_label: &setter_label,
+            param: &result.param,
+            dom_props: &result.dom_props,
+            mutations: Vec::new(),
+            ident_sets: Vec::new(),
+        };
+
+        // Container 0 = render body; hooks get 1 + their position.
+        let render_scope = Scope::from_cfg(&result.render_cfg);
+        collector.walk_cfg(&result.render_cfg, &mut vec![], 0);
+        for (i, hook) in result.hooks.iter().enumerate() {
+            let (body_cfg, params): (&CFG, &[Var]) = match hook {
+                HookEntry::Effect { body_cfg, .. }
+                | HookEntry::Memo { body_cfg, .. }
+                | HookEntry::Handler { body_cfg, .. } => (body_cfg, &[]),
+                HookEntry::Callback {
+                    body_cfg, params, ..
+                } => (body_cfg, params.as_slice()),
+                _ => continue,
             };
-            let slot = state_slot_name(set.label, &state_vars);
-            let mut diag = Diagnostic::new(
-                self.name(),
+            let mut scopes = vec![
+                Scope {
+                    bindings: render_scope.bindings.clone(),
+                    shadowed: HashSet::new(),
+                    param_roots: HashMap::new(),
+                },
+                Scope::params(params),
+            ];
+            // Hook bodies close over the render scope; container = 1 + i.
+            collector.walk_cfg(body_cfg, &mut scopes, 1 + i);
+        }
+
+        let name_of = |l: HookLabel| state_slot_name(l, &state_val_label);
+        let mut diags = Vec::new();
+
+        // ── Arm A: state mutated + setter called with the same reference ──
+        let mut by_label: HashMap<HookLabel, Vec<&Site>> = HashMap::new();
+        for (root, site) in &collector.mutations {
+            if let MutRoot::State(l) = root {
+                by_label.entry(*l).or_default().push(site);
+            }
+        }
+        let mut labels: Vec<_> = by_label.keys().copied().collect();
+        labels.sort_unstable();
+        for label in labels {
+            let sets: Vec<&Site> = collector
+                .ident_sets
+                .iter()
+                .filter(|(l, _)| *l == label)
+                .map(|(_, s)| s)
+                .collect();
+            if sets.is_empty() {
+                continue;
+            }
+            let mut mut_sites = by_label.remove(&label).unwrap_or_default();
+            mut_sites.sort_by_key(|s| s.span.map(|r| (r.line, r.col)));
+            let same_trigger = mut_sites
+                .iter()
+                .any(|m| sets.iter().any(|s| s.container == m.container));
+            let slot = name_of(label);
+            let setter_name = setter_label
+                .iter()
+                .find(|(_, l)| **l == label)
+                .map(|(v, _)| v.clone())
+                .unwrap_or_else(|| "its setter".to_string());
+            let site = mut_sites[0];
+            let set_site = sets
+                .iter()
+                .find(|s| s.container == site.container)
+                .unwrap_or(&sets[0]);
+            let mut d = Diagnostic::new(
+                "state-mutation",
                 format!(
-                    "{slot} is mutated in place (`.{}()`) and then `{}` is called with the \
-                     same reference — `Object.is` sees no change, so React skips the \
-                     re-render and the mutated data never reaches the screen; clone before \
-                     setting (e.g. `{}([...{}])`)",
-                    first.method,
-                    set.setter,
-                    set.setter,
-                    slot.trim_matches('`'),
+                    "{slot} is mutated in place and `{setter_name}` is called with the same \
+                     reference — React compares with `Object.is`, sees no change, and skips \
+                     the re-render"
                 ),
             )
-            .with_severity(Severity::Error)
-            .with_label(set.label)
-            .with_var(slot.trim_matches('`').to_string());
-            if let Some(r) = set.span {
-                diag = diag.with_range(r);
+            .with_severity(if same_trigger {
+                Severity::Error
+            } else {
+                Severity::Warning
+            })
+            .with_label(label)
+            .with_var(site.desc.clone());
+            if let Some(r) = site.span {
+                d = d.with_range(r);
             }
-            let name = |l: HookLabel| state_slot_name(l, &state_vars);
-            for m in &paired {
-                diag = diag.with_step(
-                    Step::Call {
-                        callee: format!("{}.{}", slot.trim_matches('`'), m.method),
-                        class: EffectClass::Effectful,
-                    },
-                    Some(m.label),
-                    m.span,
-                    &name,
-                );
-            }
-            diag = diag.with_step(
+            d = d.with_step(
+                Step::Mutate {
+                    target: site.desc.clone(),
+                },
+                Some(label),
+                site.span,
+                &name_of,
+            );
+            d = d.with_step(
                 Step::Write {
-                    slot: set.label,
+                    slot: label,
                     value: ValueClass::SameAsCurrent,
                 },
-                Some(set.label),
-                set.span,
-                &name,
+                Some(label),
+                set_site.span,
+                &name_of,
             );
-            diags.push(diag);
+            diags.push(d);
         }
 
-        // Deterministic output order (byte-identical reports).
-        diags.sort_by_key(|d| d.range.map(|r| (r.line, r.col)));
-        diags
-    }
-}
-
-/// Refine the inherited `var → slot` map with this scope's own bindings:
-/// a `const a = arr` alias extends it, any other re-binding shadows it.
-/// Conservative on flow (a shadowed name is dropped everywhere in the scope):
-/// losing an event is an acceptable FN, a wrong pairing is not.
-fn refine_scope(cfg: &CFG, base: &HashMap<Var, HookLabel>) -> HashMap<Var, HookLabel> {
-    let mut map = base.clone();
-    for block in cfg.blocks.values() {
-        for stmt in &block.stmts {
-            let (var, rhs) = match stmt {
-                Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } => (var, rhs),
-                _ => continue,
-            };
-            match peel(rhs) {
-                Expr::Var(src) => match map.get(src).copied() {
-                    Some(l) => {
-                        map.insert(var.clone(), l);
-                    }
-                    None => {
-                        map.remove(var);
-                    }
+        // ── Arm B: prop object mutated ────────────────────────────────────
+        let mut prop_sites: Vec<&Site> = collector
+            .mutations
+            .iter()
+            .filter(|(root, _)| *root == MutRoot::Props)
+            .map(|(_, s)| s)
+            .collect();
+        prop_sites.sort_by_key(|s| s.span.map(|r| (r.line, r.col)));
+        prop_sites.dedup_by_key(|s| s.span.map(|r| (r.line, r.col)));
+        for site in prop_sites {
+            let mut d = Diagnostic::new(
+                "state-mutation",
+                format!(
+                    "`{}` roots in this component's props — mutating it writes into an object \
+                     owned by the parent; copy it before changing",
+                    site.desc
+                ),
+            )
+            .with_severity(Severity::Warning)
+            .with_var(site.desc.clone());
+            if let Some(r) = site.span {
+                d = d.with_range(r);
+            }
+            d = d.with_step(
+                Step::Mutate {
+                    target: site.desc.clone(),
                 },
-                Expr::StateVal(l) => {
-                    map.insert(var.clone(), *l);
-                }
-                _ => {
-                    map.remove(var);
-                }
-            }
-        }
-    }
-    map
-}
-
-fn peel(e: &Expr) -> &Expr {
-    match e {
-        Expr::TSAnnotated(inner, _) => peel(inner),
-        other => other,
-    }
-}
-
-/// The state slot an expression's *identity* resolves to: the exact
-/// `useState` value binding or a `const` alias of it. Field accesses, calls,
-/// literals — anything that is not the slot's own reference — resolve to
-/// `None`.
-fn identity_slot(e: &Expr, vars: &HashMap<Var, HookLabel>) -> Option<HookLabel> {
-    match peel(e) {
-        Expr::Var(v) => vars.get(v).copied(),
-        Expr::StateVal(l) => Some(*l),
-        _ => None,
-    }
-}
-
-fn scan_cfg(
-    cfg: &CFG,
-    scope: &[usize],
-    state_vars: &HashMap<Var, HookLabel>,
-    setter_vars: &HashMap<Var, HookLabel>,
-    mutations: &mut Vec<MutationEvent>,
-    sets: &mut Vec<SameIdentitySet>,
-    depth: usize,
-) {
-    if depth > MAX_SCOPE_DEPTH {
-        return;
-    }
-    let vars = refine_scope(cfg, state_vars);
-    let mut child_counter = 0usize;
-
-    // Deterministic traversal: block IDs sorted.
-    let mut block_ids: Vec<_> = cfg.blocks.keys().copied().collect();
-    block_ids.sort_unstable();
-    for bid in block_ids {
-        let block = &cfg.blocks[&bid];
-        for stmt in &block.stmts {
-            let (expr, span) = match stmt {
-                Stmt::Let { rhs, span, .. } | Stmt::Assign { rhs, span, .. } => (rhs, *span),
-                Stmt::ExprStmt(e, span) => (e, *span),
-            };
-            scan_expr(
-                expr,
-                span,
-                scope,
-                &vars,
-                setter_vars,
-                mutations,
-                sets,
-                &mut child_counter,
-                depth,
-            );
-        }
-        match &block.term {
-            Terminator::Return(e) | Terminator::Branch { cond: e, .. } => scan_expr(
-                e,
                 None,
-                scope,
-                &vars,
-                setter_vars,
-                mutations,
-                sets,
-                &mut child_counter,
-                depth,
-            ),
-            _ => {}
+                site.span,
+                &name_of,
+            );
+            diags.push(d);
         }
-    }
-}
 
-#[allow(clippy::too_many_arguments)]
-fn scan_expr(
-    e: &Expr,
-    span: Option<SourceRange>,
-    scope: &[usize],
-    vars: &HashMap<Var, HookLabel>,
-    setter_vars: &HashMap<Var, HookLabel>,
-    mutations: &mut Vec<MutationEvent>,
-    sets: &mut Vec<SameIdentitySet>,
-    child_counter: &mut usize,
-    depth: usize,
-) {
-    match e {
-        Expr::Call { fn_, args } => {
-            match peel(fn_) {
-                // `arr.push(x)`, `map.set(k, v)`, …
-                Expr::FieldAccess { obj, field }
-                    if MUTATING_METHODS.contains(&field.as_str()) =>
-                {
-                    if let Some(label) = identity_slot(obj, vars) {
-                        mutations.push(MutationEvent {
-                            label,
-                            method: field.clone(),
-                            span,
-                            scope: scope.to_vec(),
-                        });
-                    }
-                }
-                // `Object.assign(state, …)` mutates its first argument.
-                Expr::FieldAccess { obj, field }
-                    if field == "assign" && matches!(peel(obj), Expr::Var(v) if v == "Object") =>
-                {
-                    if let Some(label) = args.first().and_then(|a| identity_slot(a, vars)) {
-                        mutations.push(MutationEvent {
-                            label,
-                            method: "Object.assign".to_string(),
-                            span,
-                            scope: scope.to_vec(),
-                        });
-                    }
-                }
-                // `setArr(arr)` — the stored reference handed back unchanged.
-                Expr::Var(callee) => {
-                    if let Some(&slot) = setter_vars.get(callee)
-                        && let Some(arg_slot) = args.first().and_then(|a| identity_slot(a, vars))
-                        && arg_slot == slot
-                    {
-                        sets.push(SameIdentitySet {
-                            label: slot,
-                            setter: callee.clone(),
-                            span,
-                            scope: scope.to_vec(),
-                        });
-                    }
-                }
-                _ => {}
-            }
-            scan_expr(
-                fn_,
-                span,
-                scope,
-                vars,
-                setter_vars,
-                mutations,
-                sets,
-                child_counter,
-                depth,
-            );
-            for a in args {
-                scan_expr(
-                    a,
-                    span,
-                    scope,
-                    vars,
-                    setter_vars,
-                    mutations,
-                    sets,
-                    child_counter,
-                    depth,
-                );
-            }
-        }
-        // A nested function body is a child scope on the same chain.
-        Expr::FnLit {
-            params, body_cfg, ..
-        } => {
-            *child_counter += 1;
-            let mut child_scope = scope.to_vec();
-            child_scope.push(*child_counter);
-            let mut vars = vars.clone();
-            for p in params {
-                vars.remove(p);
-            }
-            scan_cfg(
-                body_cfg,
-                &child_scope,
-                &vars,
-                setter_vars,
-                mutations,
-                sets,
-                depth + 1,
-            );
-        }
-        other => {
-            other.for_each_child(&mut |c| {
-                scan_expr(
-                    c,
-                    span,
-                    scope,
-                    vars,
-                    setter_vars,
-                    mutations,
-                    sets,
-                    child_counter,
-                    depth,
-                )
-            });
-        }
+        diags
     }
 }

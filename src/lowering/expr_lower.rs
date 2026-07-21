@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::ir::{
     cfg::{BasicBlock, CFG, EdgeKind, Terminator},
     expr::{BinOp as IrBinOp, Expr, Prim, UnaryOp as IrUnaryOp},
-    stmt::Stmt,
+    stmt::{MemberKey, Stmt},
 };
 
 use super::cfg_builder::{BlockBuilder, build_expr_fn_body_cfg, build_fn_body_cfg};
@@ -61,6 +61,18 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
             rhs: Box::new(lower_expr(&bin.right, builder)),
         },
         Expression::UnaryExpression(un) => {
+            // `delete obj.f` is a mutation of `obj`'s pointee, not a read.
+            if un.operator == UnaryOperator::Delete
+                && let Some((obj, key)) = lower_member_target_expr(&un.argument, builder)
+            {
+                builder.push_stmt(Stmt::MemberWrite {
+                    obj,
+                    key,
+                    rhs: Expr::Lit(Prim::Unit),
+                    span: builder.span_at(un.span.start),
+                });
+                return Expr::Lit(Prim::Bool(true));
+            }
             let arg = lower_expr(&un.argument, builder);
             match un.operator {
                 UnaryOperator::UnaryNegation => Expr::UnaryOp {
@@ -95,6 +107,29 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                     span: builder.span_at(upd.span.start),
                 });
                 Expr::Var(name)
+            }
+            // `obj.f++` / `arr[i]--`: an in-place write to an untracked cell —
+            // the new value is unknown, the mutation of `obj` is the payload.
+            SimpleAssignmentTarget::StaticMemberExpression(m) => {
+                let obj = lower_expr(&m.object, builder);
+                builder.push_stmt(Stmt::MemberWrite {
+                    obj,
+                    key: MemberKey::Field(m.property.name.to_string()),
+                    rhs: Expr::Var("__opaque".to_string()),
+                    span: builder.span_at(upd.span.start),
+                });
+                Expr::Var("__opaque".to_string())
+            }
+            SimpleAssignmentTarget::ComputedMemberExpression(m) => {
+                let obj = lower_expr(&m.object, builder);
+                let idx = lower_expr(&m.expression, builder);
+                builder.push_stmt(Stmt::MemberWrite {
+                    obj,
+                    key: MemberKey::Index(idx),
+                    rhs: Expr::Var("__opaque".to_string()),
+                    span: builder.span_at(upd.span.start),
+                });
+                Expr::Var("__opaque".to_string())
             }
             _ => Expr::Var("__opaque".to_string()),
         },
@@ -230,8 +265,9 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         // Assignment is both a value (its RHS) and an effect (the write). Emit
         // the write as `Stmt::Assign` when the target is a plain identifier so
         // reassignments / compound updates flow into the abstract env (loop
-        // counters, accumulators). Non-identifier targets (`obj.f`, `arr[i]`)
-        // are untracked cells → no write (their abstract value stays Top).
+        // counters, accumulators). Member targets (`obj.f`, `arr[i]`) emit
+        // `Stmt::MemberWrite`: the cell is untracked but the *mutation* of the
+        // object is an observable fact (state-mutation rule, heap field update).
         Expression::AssignmentExpression(assign) => {
             let rhs_val = lower_expr(&assign.right, builder);
             match assign_target_ident(&assign.left) {
@@ -258,7 +294,26 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                     });
                     Expr::Var(name)
                 }
-                None => rhs_val,
+                None => match assign_target_member(&assign.left, builder) {
+                    Some((obj, key)) => {
+                        // Compound ops read the old cell value (untracked → the
+                        // written value is unknown); plain `=` writes the RHS.
+                        let (rhs, value) = if assign.operator.is_assign() {
+                            (rhs_val.clone(), rhs_val)
+                        } else {
+                            let opaque = Expr::Var("__opaque".to_string());
+                            (opaque.clone(), opaque)
+                        };
+                        builder.push_stmt(Stmt::MemberWrite {
+                            obj,
+                            key,
+                            rhs,
+                            span: builder.span_at(assign.span.start),
+                        });
+                        value
+                    }
+                    None => rhs_val,
+                },
             }
         }
         Expression::SequenceExpression(seq) => seq
@@ -615,6 +670,50 @@ fn lower_jsx_child(child: &JSXChild, builder: &mut BlockBuilder) -> Option<Expr>
 pub(super) fn assign_target_ident(target: &AssignmentTarget) -> Option<String> {
     match target {
         AssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.to_string()),
+        _ => None,
+    }
+}
+
+/// Lower a member assignment target (`obj.f = …`, `arr[i] = …`) to its object
+/// expression and member key. `None` for identifier/pattern targets.
+fn assign_target_member(
+    target: &AssignmentTarget,
+    builder: &mut BlockBuilder,
+) -> Option<(Expr, MemberKey)> {
+    match target {
+        AssignmentTarget::StaticMemberExpression(m) => Some((
+            lower_expr(&m.object, builder),
+            MemberKey::Field(m.property.name.to_string()),
+        )),
+        AssignmentTarget::ComputedMemberExpression(m) => {
+            let obj = lower_expr(&m.object, builder);
+            let idx = lower_expr(&m.expression, builder);
+            Some((obj, MemberKey::Index(idx)))
+        }
+        AssignmentTarget::PrivateFieldExpression(p) => Some((
+            lower_expr(&p.object, builder),
+            MemberKey::Field(format!("#{}", p.field.name)),
+        )),
+        _ => None,
+    }
+}
+
+/// Like [`assign_target_member`] but for a member *expression* in write
+/// position (`delete obj.f`).
+fn lower_member_target_expr(
+    expr: &Expression,
+    builder: &mut BlockBuilder,
+) -> Option<(Expr, MemberKey)> {
+    match expr {
+        Expression::StaticMemberExpression(m) => Some((
+            lower_expr(&m.object, builder),
+            MemberKey::Field(m.property.name.to_string()),
+        )),
+        Expression::ComputedMemberExpression(m) => {
+            let obj = lower_expr(&m.object, builder);
+            let idx = lower_expr(&m.expression, builder);
+            Some((obj, MemberKey::Index(idx)))
+        }
         _ => None,
     }
 }

@@ -152,17 +152,16 @@ pub const RULE_DOCS: &[RuleDoc] = &[
     },
     RuleDoc {
         name: "state-mutation",
-        summary: "state mutated in place, then set with the same reference — React bails out",
-        explanation: "React compares the value passed to a setter with `Object.is`. Mutating \
-                      a state object in place (`push`, `splice`, `sort`, `Map.set`, \
-                      `Object.assign`…) does not change its identity, so handing the same \
-                      reference back to the setter is a proven no-op: React skips the \
-                      re-render and the mutated data never reaches the screen. Nothing \
-                      loops and nothing warns at runtime — the UI is silently stale.",
-        example: "const [arr, setArr] = useState([]);\nconst add = (x) => { arr.push(x); setArr(arr); };",
-        fix: "Never mutate state in place. Build a fresh value and set that: \
-              `setArr([...arr, x])` — or for objects `setObj({ ...obj, k: v })`, for Maps \
-              `setMap(new Map(map).set(k, v))`.",
+        summary: "state or prop object mutated in place — same reference, no re-render",
+        explanation: "Mutating a state object (`arr.push(x)`, `obj.f = v`) keeps its reference \
+                      identity; calling the setter with that same reference makes React bail \
+                      out (`Object.is(old, new)` is true) and skip the re-render — the UI \
+                      silently freezes (Error). Mutating an object received via props writes \
+                      into data owned by the parent (Warning).",
+        example: "const [items, setItems] = useState([]);\n\
+                  const add = (x) => { items.push(x); setItems(items); };",
+        fix: "Create a new reference: `setItems([...items, x])` — or for objects, \
+              `setUser({ ...user, name })`. Never write through the current state value.",
     },
     RuleDoc {
         name: "unnecessary-rerender",

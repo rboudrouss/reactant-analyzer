@@ -83,6 +83,13 @@ fn collect_compapp_in_cfg(cfg: &CFG, out: &mut HashSet<Symbol>) {
                 Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => {
                     collect_compapp_in_expr(rhs, out);
                 }
+                Stmt::MemberWrite { obj, key, rhs, .. } => {
+                    collect_compapp_in_expr(obj, out);
+                    if let crate::ir::stmt::MemberKey::Index(idx) = key {
+                        collect_compapp_in_expr(idx, out);
+                    }
+                    collect_compapp_in_expr(rhs, out);
+                }
                 Stmt::ExprStmt(expr, _) => {
                     collect_compapp_in_expr(expr, out);
                 }
@@ -177,6 +184,7 @@ mod tests {
             file: std::path::PathBuf::new(),
             name: name.to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: trivial_cfg(),
             hooks: vec![],
             module_consts: Default::default(),
@@ -200,6 +208,7 @@ mod tests {
             file: std::path::PathBuf::new(),
             name: name.to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: CFG {
                 entry: 0,
                 blocks,

@@ -58,6 +58,7 @@ fn guard_site(cfg: &CFG, block: BlockId) -> Option<(BlockId, Option<SourceRange>
                         crate::ir::stmt::Stmt::Let { span, .. } => *span,
                         crate::ir::stmt::Stmt::ExprStmt(_, span) => *span,
                         crate::ir::stmt::Stmt::Assign { span, .. } => *span,
+                        crate::ir::stmt::Stmt::MemberWrite { span, .. } => *span,
                     })
                 });
             (d, span)
@@ -186,6 +187,8 @@ mod tests {
         AnalysisResult {
             component: "C".to_string(),
             file: Default::default(),
+            param: "props".to_string(),
+            dom_props: Default::default(),
             state_store: StateStore::bottom(),
             memo_store: MemoStore::new(),
             block_states: HashMap::new(),
@@ -581,6 +584,7 @@ mod tests {
             file: std::path::PathBuf::new(),
             name: "C".to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: CFG {
                 entry: 0,
                 blocks,
@@ -657,6 +661,7 @@ mod tests {
             file: std::path::PathBuf::new(),
             name: "C".to_string(),
             param: "props".to_string(),
+            dom_props: Default::default(),
             render_cfg: CFG {
                 entry: 0,
                 blocks,

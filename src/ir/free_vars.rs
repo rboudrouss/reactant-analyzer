@@ -53,6 +53,14 @@ pub fn compute_free_vars(cfg: &CFG) -> HashSet<Var> {
                     collect_used_vars(rhs, &mut used);
                     defined.insert(var.clone());
                 }
+                // Writing `obj.f` reads `obj` (and the index); nothing is defined.
+                Stmt::MemberWrite { obj, key, rhs, .. } => {
+                    collect_used_vars(obj, &mut used);
+                    if let crate::ir::stmt::MemberKey::Index(idx) = key {
+                        collect_used_vars(idx, &mut used);
+                    }
+                    collect_used_vars(rhs, &mut used);
+                }
                 Stmt::ExprStmt(e, _) => collect_used_vars(e, &mut used),
             }
         }
@@ -85,6 +93,14 @@ pub fn compute_free_paths(cfg: &CFG) -> HashSet<AccessPath> {
                 Stmt::Assign { var, rhs, .. } => {
                     collect_used_paths(rhs, &mut used);
                     defined.insert(var.clone());
+                }
+                // Writing `obj.f` reads `obj` (and the index); nothing is defined.
+                Stmt::MemberWrite { obj, key, rhs, .. } => {
+                    collect_used_paths(obj, &mut used);
+                    if let crate::ir::stmt::MemberKey::Index(idx) = key {
+                        collect_used_paths(idx, &mut used);
+                    }
+                    collect_used_paths(rhs, &mut used);
                 }
                 Stmt::ExprStmt(e, _) => collect_used_paths(e, &mut used),
             }

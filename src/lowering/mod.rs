@@ -293,10 +293,15 @@ pub fn lower_program_with_resolver(
                 .into_iter()
                 .next()
                 .unwrap_or_else(|| "props".to_string());
+            let dom_props = Arc::new(component_detector::collect_dom_props(
+                candidate.params,
+                program,
+            ));
             ComponentIR {
                 file: file.to_path_buf(),
                 name: candidate.name,
                 param,
+                dom_props,
                 render_cfg,
                 hooks,
                 module_consts: module_consts.clone(),
