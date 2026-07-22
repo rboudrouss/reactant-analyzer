@@ -1,6 +1,7 @@
 use oxc_ast::ast::*;
 
 use super::Candidate;
+use super::detector::{self, Classify, FnItem};
 use super::jsx_detect::body_returns_jsx;
 
 /// A React component function detected in the AST, ready for lowering.
@@ -8,124 +9,35 @@ pub type ComponentCandidate<'a> = Candidate<'a>;
 
 /// Detect all React component functions in `program`.
 pub fn detect_components<'a>(program: &'a Program<'a>) -> Vec<ComponentCandidate<'a>> {
-    let mut out = Vec::new();
-    for stmt in &program.body {
-        collect_from_stmt(stmt, &mut out);
-    }
-    out
+    detector::detect_fns(program, classify, Some(default))
 }
 
-// ── Top-level statement dispatch ──────────────────────────────────────────────
-
-fn collect_from_stmt<'a>(stmt: &'a Statement<'a>, out: &mut Vec<ComponentCandidate<'a>>) {
-    match stmt {
-        Statement::FunctionDeclaration(func) => try_add_fn(func, None, out),
-        Statement::VariableDeclaration(decl) => {
-            for vd in &decl.declarations {
-                try_add_var_decl(vd, out);
-            }
-        }
-        Statement::ExportDefaultDeclaration(exp) => match &exp.declaration {
-            ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
-                let name = func
-                    .id
-                    .as_ref()
-                    .map(|id| id.name.as_str())
-                    .unwrap_or("DefaultExport");
-                try_add_fn(func, Some(name), out);
-            }
-            ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => {
-                try_add_arrow("DefaultExport", arrow, None, out);
-            }
-            _ => {}
-        },
-        Statement::ExportNamedDeclaration(exp) => {
-            if let Some(decl) = &exp.declaration {
-                collect_from_decl(decl, out);
-            }
-        }
-        _ => {}
-    }
+/// A function is a component iff [`is_component`] accepts its name, body (for
+/// the JSX-return rule) and return type (for the TS annotation rule).
+fn classify(item: &FnItem) -> bool {
+    is_component(item.name, &item.body.statements, item.return_type)
 }
 
-fn collect_from_decl<'a>(decl: &'a Declaration<'a>, out: &mut Vec<ComponentCandidate<'a>>) {
-    match decl {
-        Declaration::FunctionDeclaration(func) => try_add_fn(func, None, out),
-        Declaration::VariableDeclaration(vd) => {
-            for vd in &vd.declarations {
-                try_add_var_decl(vd, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-// ── Candidate construction ─────────────────────────────────────────────────────
-
-fn try_add_fn<'a>(
-    func: &'a Function<'a>,
-    name_override: Option<&str>,
-    out: &mut Vec<ComponentCandidate<'a>>,
+/// `export default function App()` / `export default () => <.../>` — the most
+/// common component shape. Anonymous default exports get the name `DefaultExport`.
+fn default<'a>(
+    exp: &'a ExportDefaultDeclaration<'a>,
+    classify: Classify,
+    out: &mut Vec<Candidate<'a>>,
 ) {
-    let name =
-        name_override.unwrap_or_else(|| func.id.as_ref().map(|id| id.name.as_str()).unwrap_or(""));
-    if name.is_empty() {
-        return;
-    }
-    let Some(body) = func.body.as_deref() else {
-        return;
-    };
-    if is_component(name, &body.statements, func.return_type.as_deref()) {
-        out.push(Candidate {
-            name: name.to_owned(),
-            params: &func.params,
-            body,
-        });
-    }
-}
-
-fn try_add_var_decl<'a>(vd: &'a VariableDeclarator<'a>, out: &mut Vec<ComponentCandidate<'a>>) {
-    let name = match &vd.id {
-        BindingPattern::BindingIdentifier(id) => id.name.as_str(),
-        _ => return,
-    };
-    // Type annotation on `const Foo: React.FC = ...`
-    let var_type_ann = vd.type_annotation.as_deref();
-    let Some(init) = &vd.init else { return };
-    match init {
-        Expression::ArrowFunctionExpression(arrow) => {
-            try_add_arrow(name, arrow, var_type_ann, out);
+    match &exp.declaration {
+        ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
+            let name = func
+                .id
+                .as_ref()
+                .map(|id| id.name.as_str())
+                .unwrap_or("DefaultExport");
+            detector::consider_fn(func, Some(name), None, classify, out);
         }
-        Expression::FunctionExpression(func) => {
-            let Some(body) = func.body.as_deref() else {
-                return;
-            };
-            let return_type = func.return_type.as_deref().or(var_type_ann);
-            if is_component(name, &body.statements, return_type) {
-                out.push(Candidate {
-                    name: name.to_owned(),
-                    params: &func.params,
-                    body,
-                });
-            }
+        ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => {
+            detector::consider_arrow("DefaultExport", arrow, None, classify, out);
         }
         _ => {}
-    }
-}
-
-fn try_add_arrow<'a>(
-    name: &str,
-    arrow: &'a ArrowFunctionExpression<'a>,
-    extra_type_ann: Option<&'a TSTypeAnnotation<'a>>,
-    out: &mut Vec<ComponentCandidate<'a>>,
-) {
-    let return_type = arrow.return_type.as_deref().or(extra_type_ann);
-    if is_component(name, &arrow.body.statements, return_type) {
-        out.push(Candidate {
-            name: name.to_owned(),
-            params: &arrow.params,
-            body: &arrow.body,
-        });
     }
 }
 
@@ -357,6 +269,14 @@ mod tests {
             names("export function Header() { return <header/>; }"),
             vec!["Header"]
         );
+    }
+
+    #[test]
+    fn export_default_anonymous_arrow() {
+        // Anonymous default-export arrow component → named `DefaultExport`
+        // (the `export default` arrow path, handled per-detector on top of the
+        // shared walker).
+        assert_eq!(names("export default () => <div/>;"), vec!["DefaultExport"]);
     }
 
     #[test]

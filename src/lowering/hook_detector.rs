@@ -1,6 +1,7 @@
 use oxc_ast::ast::*;
 
 use super::Candidate;
+use super::detector::{self, Classify, FnItem};
 
 /// A user-defined custom hook function detected in the AST.
 pub type HookCandidate<'a> = Candidate<'a>;
@@ -8,121 +9,26 @@ pub type HookCandidate<'a> = Candidate<'a>;
 /// Detect all user-defined custom hook functions (`use*`) in `program`.
 /// Excludes React built-in hooks.
 pub fn detect_custom_hooks<'a>(program: &'a Program<'a>) -> Vec<HookCandidate<'a>> {
-    let mut out = Vec::new();
-    for stmt in &program.body {
-        collect_from_stmt(stmt, &mut out);
-    }
-    out
+    detector::detect_fns(program, classify, Some(default))
 }
 
-// ── Top-level statement dispatch ──────────────────────────────────────────────
-
-fn collect_from_stmt<'a>(stmt: &'a Statement<'a>, out: &mut Vec<HookCandidate<'a>>) {
-    match stmt {
-        Statement::FunctionDeclaration(func) => try_add_fn(func, None, out),
-        Statement::VariableDeclaration(decl) => {
-            for vd in &decl.declarations {
-                try_add_var_decl(vd, out);
-            }
-        }
-        Statement::ExportDefaultDeclaration(exp) => match &exp.declaration {
-            ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
-                try_add_fn(func, None, out);
-            }
-            ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => {
-                // Anonymous default export of a hook is unusual but handle gracefully.
-                if let Some(name) = extract_arrow_hook_name(arrow) {
-                    try_add_arrow_with_name(&name, arrow, out);
-                }
-            }
-            _ => {}
-        },
-        Statement::ExportNamedDeclaration(exp) => {
-            if let Some(decl) = &exp.declaration {
-                collect_from_decl(decl, out);
-            }
-        }
-        _ => {}
-    }
+/// A function is a custom hook iff its name follows the hook convention. The
+/// body is irrelevant (a hook may or may not return JSX).
+fn classify(item: &FnItem) -> bool {
+    is_custom_hook(item.name)
 }
 
-fn collect_from_decl<'a>(decl: &'a Declaration<'a>, out: &mut Vec<HookCandidate<'a>>) {
-    match decl {
-        Declaration::FunctionDeclaration(func) => try_add_fn(func, None, out),
-        Declaration::VariableDeclaration(vd) => {
-            for vd in &vd.declarations {
-                try_add_var_decl(vd, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-// ── Candidate construction ─────────────────────────────────────────────────────
-
-fn try_add_fn<'a>(
-    func: &'a Function<'a>,
-    name_override: Option<&str>,
-    out: &mut Vec<HookCandidate<'a>>,
+/// `export default function useThing()`. Only a *named* function declaration
+/// qualifies: an anonymous arrow default export carries no hook name to match
+/// against, so it is not a hook (there is nothing to classify).
+fn default<'a>(
+    exp: &'a ExportDefaultDeclaration<'a>,
+    classify: Classify,
+    out: &mut Vec<Candidate<'a>>,
 ) {
-    let name =
-        name_override.unwrap_or_else(|| func.id.as_ref().map(|id| id.name.as_str()).unwrap_or(""));
-    if !is_custom_hook(name) {
-        return;
+    if let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &exp.declaration {
+        detector::consider_fn(func, None, None, classify, out);
     }
-    let Some(body) = func.body.as_deref() else {
-        return;
-    };
-    out.push(Candidate {
-        name: name.to_owned(),
-        params: &func.params,
-        body,
-    });
-}
-
-fn try_add_var_decl<'a>(vd: &'a VariableDeclarator<'a>, out: &mut Vec<HookCandidate<'a>>) {
-    let name = match &vd.id {
-        BindingPattern::BindingIdentifier(id) => id.name.as_str(),
-        _ => return,
-    };
-    if !is_custom_hook(name) {
-        return;
-    }
-    let Some(init) = &vd.init else { return };
-    match init {
-        Expression::ArrowFunctionExpression(arrow) => {
-            try_add_arrow_with_name(name, arrow, out);
-        }
-        Expression::FunctionExpression(func) => {
-            let Some(body) = func.body.as_deref() else {
-                return;
-            };
-            out.push(Candidate {
-                name: name.to_owned(),
-                params: &func.params,
-                body,
-            });
-        }
-        _ => {}
-    }
-}
-
-fn try_add_arrow_with_name<'a>(
-    name: &str,
-    arrow: &'a ArrowFunctionExpression<'a>,
-    out: &mut Vec<HookCandidate<'a>>,
-) {
-    out.push(Candidate {
-        name: name.to_owned(),
-        params: &arrow.params,
-        body: &arrow.body,
-    });
-}
-
-fn extract_arrow_hook_name(arrow: &ArrowFunctionExpression) -> Option<String> {
-    // Anonymous arrow exports rarely have hook names; return None.
-    let _ = arrow;
-    None
 }
 
 // ── Detection rules ────────────────────────────────────────────────────────────
