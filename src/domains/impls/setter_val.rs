@@ -1,6 +1,3 @@
-use std::cmp::Ordering;
-
-use crate::domains::AbstractDomain;
 use crate::ir::types::{HookLabel, Symbol};
 
 /// Flat lattice for the component-setter slot of `StateValue`.
@@ -35,55 +32,16 @@ impl SetterVal {
     }
 }
 
-impl PartialOrd for SetterVal {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        match (self, other) {
-            (a, b) if a == b => Some(Ordering::Equal),
-            (SetterVal::Bottom, _) | (_, SetterVal::Top) => Some(Ordering::Less),
-            (SetterVal::Top, _) | (_, SetterVal::Bottom) => Some(Ordering::Greater),
-            _ => None, // two distinct One(..) are incomparable
-        }
-    }
-}
-
-impl AbstractDomain for SetterVal {
-    fn bottom() -> Self {
-        SetterVal::Bottom
-    }
-    fn top() -> Self {
-        SetterVal::Top
-    }
-    fn is_bottom(&self) -> bool {
-        matches!(self, SetterVal::Bottom)
-    }
-
-    fn join(&self, other: &Self) -> Self {
-        match (self, other) {
-            (a, b) if a == b => a.clone(),
-            (SetterVal::Bottom, x) | (x, SetterVal::Bottom) => x.clone(),
-            _ => SetterVal::Top,
-        }
-    }
-
-    fn meet(&self, other: &Self) -> Self {
-        match (self, other) {
-            (a, b) if a == b => a.clone(),
-            (SetterVal::Top, x) | (x, SetterVal::Top) => x.clone(),
-            _ => SetterVal::Bottom,
-        }
-    }
-
-    fn widen(&self, other: &Self) -> Self {
-        // Finite-height lattice: widen = join.
-        self.join(other)
-    }
-}
+// Flat lattice: `⊥ < One(..) < ⊤`, distinct `One(..)` incomparable. React
+// guarantees setter identity across renders, so any non-⊥ value is `Stable`.
+flat_lattice!(SetterVal, bottom = Bottom, top = Top);
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domains::AbstractDomain;
 
     fn one(c: &str, l: usize) -> SetterVal {
         SetterVal::One(c.to_string(), l)
