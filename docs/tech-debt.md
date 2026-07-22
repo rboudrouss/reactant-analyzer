@@ -451,10 +451,8 @@ et corrige l'imprécision latente. **765 tests**, clippy inchangé (23).
 **Restent (grands, comportement-changeant → design + tests dédiés, hors passe soundness)** :
 - **Thème 5/10** — traité en Partie 11 (2026-07) : `eval_in` + chemin d'effet unique FAITS ;
   `ComponentResolution` global REFUSÉ (unsound — voir Partie 11).
-- **Thème 9** — combinateurs de lattice (`Flat`/`BoundedPowerset`, déjà différés P2 en Partie 6)
-  et surtout retrait du choke-point `to_stability` (ARCH 3) : chaque règle raisonne à travers,
-  le remplacer par des prédicats produit direct doit être exactement équivalent sous peine de
-  FN/FP.
+- **Thème 9** — traité en Partie 12 (2026-07) : macro `flat_lattice!` FAITE (D5) ; `BoundedPowerset`
+  (D6), retrait `to_stability` (ARCH 3), D3, D7 REFUSÉS/déjà-faits — voir Partie 12.
 - **Thème 12** — charpente `detect`/`Candidate` des détecteurs (E4) : structure divergente.
 
 ---
@@ -536,6 +534,49 @@ ci-dessus ; à traiter comme amélioration dédiée si le besoin se confirme.
 
 ---
 
+## Partie 12 — Thème 9 : lattices de domaine — APPLIQUÉ (2026-07)
+
+Le thème visait des combinateurs de lattice + le retrait du choke-point `to_stability`. Après
+lecture, un seul item est un vrai gain ouvert.
+
+### FAIT
+
+- **Macro `flat_lattice!` (D5)** (commit *flat_lattice!*) : `BoolVal` et `SetterVal` sont le
+  **même** lattice plat (`⊥ < mids < ⊤`, mids distincts incomparables ; join/meet/widen/
+  partial_cmp identiques au payload des mids près). La macro (`domains/impls/mod.rs`, scope
+  textuel) génère les impls `PartialOrd` + `AbstractDomain` ; enums/derives/`as_one`/tests
+  inchangés. Neutre. Absorbe une partie de ARCH 11.
+
+### REFUSÉ / DÉJÀ FAIT (raison)
+
+- **`BoundedPowerset<T,N>` (D6) — REFUSÉ.** Un seul consommateur *pur* : `StrConst`. La prémisse
+  « même pattern que `Stability::Versioned` » est trompeuse : `Stability` est un lattice **plus
+  riche** (⊥, `PerRender`, `Unknown` coexistent avec le fragment `Stable`/`Versioned`/
+  `VersionedTop`, avec des cas croisés `PerRender`) — le réduire à un combinateur = restructurer
+  un type **soundness-critique central** (ADR-017) fortement testé, pour dédupliquer une seule
+  vraie occurrence. Abstraction prématurée (P2) + risque > valeur. `StrConst` seul ne justifie
+  pas un générique.
+- **Retrait du choke-point `to_stability` (ARCH 3) — REFUSÉ (non-problème).** `to_stability`
+  est une **projection légitime, documentée et testée** du domaine produit vers les catégories
+  de stabilité (motion-wins, cross-kind → `Unknown`, setter-stable). Les prédicats « première
+  classe » réclamés (`is_stable`/`is_unstable`) **existent déjà** sur `StateValue`. Appelants
+  directs hors domaine : seulement `describe_value` (frontière rule→message, a *besoin* des 4
+  cas pour la prose) et `frozen:217` (= `is_stable() || is_bottom()`). **Aucun couplage lossy
+  ne cause de FN/FP** ; le remplacer serait soit du renommage (churn), soit un risque sur un
+  chemin soundness. Le raisonnement « les règles passent par un lattice superséded » ne se
+  matérialise pas en bug.
+- **`versioned_reference().unwrap_or_else(to_stability)` (D3) — REFUSÉ (divergé).** Les sites
+  ont divergé : 1 seul `unwrap_or_else(to_stability)` + 1 `unwrap_or(Unknown)` (fallbacks
+  différents) → pas de dedup à ≥ 2 sites identiques.
+- **Boucles de store point-à-point (D7) — DÉJÀ FAIT.** `merge_with` (privé sur `StateStore`,
+  collapse join/widen/widen_to), `map_get_or` et `leq_pointwise` (`stores/mod.rs`) sont en
+  place. Résidu : la boucle `join` unique de `SharedStateStore` (clé `(Symbol,HookLabel)` vs
+  `HookLabel` → un générique n'aiderait qu'un site) — non extrait (P2).
+
+**766 tests**, clippy inchangé (23), fmt clean.
+
+---
+
 ## Annexe A — 18 workarounds
 
 `P2 = ⚠️` : justification > 1 paragraphe (viole le principe 2).
@@ -567,7 +608,7 @@ ci-dessus ; à traiter comme amélioration dédiée si le besoin se confirme.
 |---|--------|---------|---------------------|
 | 1 | ✅ fait | Two divergent, duplicated implementations of “splice a callee CFG into a caller CFG” (Thème 1 : primitif unique `ir/splice.rs` routé par les deux chemins ; α-renommage ajouté) | `engine/fixpoint.rs`, `ir/splice.rs` |
 | 2 | requalifié | Self-churn arm and the churn graph : **PAS** des implémentations parallèles — partitions disjointes (with-deps same-slot vs no-deps/cross-slot), gardes `continue` explicites. Fusionner = FN + perte du diag Info. Conservées séparées (Thème 8). | `rules/infinite_loop.rs`, `rules/churn.rs` |
-| 3 | L | Rules reason through the lossy legacy Stability lattice via to_stability instead of querying the product domain | `domains/impls/state_value.rs`, `rules/missing_deps.rs`, `rules/unnecessary_rerender.rs` |
+| 3 | requalifié | Rules reason through the legacy Stability lattice via to_stability — **non-problème** (Thème 9, Partie 12) : `to_stability` est une projection légitime testée ; les prédicats première-classe (`is_stable`/`is_unstable`) existent déjà ; les 2 appelants directs (`describe_value`, `frozen`) en ont légitimement besoin. Aucun FN/FP. | `domains/impls/state_value.rs` |
 | 4 | requalifié | Every rule reconstructs the same per-component resolution context — **prémisse fausse** (Thème 5, Partie 11) : les résolutions divergent délibérément (scope render-only vs render+bodies, re-seeding par-effet, résolution cross-composant). Les briques communes sont déjà partagées (`all_setter_labels`/`state_val_labels`/`collect_fn_bindings`/`pos_key`/`peel_ts`/`body_cfg` dans `rules/mod.rs`) ; un contexte unique serait unsound (force un scope) ou un sac d'indirection. Factoring actuel confirmé bon. | `rules/mod.rs` |
 | 5 | ✅ partiel | Three detector modules diverge on the naming predicate (**FAIT** : `is_hook_name` partagé, Thème 12) — plus de double classification `useful`. Reste : scaffolding `Candidate`/dispatch (dedup non-neutre, charpente divergente). | `lowering/mod.rs`, `lowering/hook_detector.rs`, `lowering/utility_detector.rs` |
 | 6 | M | Engine hard-codes a rule-specific second analysis pass (effect_setter_writes) | `engine/fixpoint.rs`, `rules/infinite_loop.rs`, `engine/analysis_result.rs` |
@@ -575,7 +616,7 @@ ci-dessus ; à traiter comme amélioration dédiée si le besoin se confirme.
 | 8 | M | ADR-017 'keep Versioned labels, degrade kind to Top' logic is copy-pasted across three sites | `domains/transfer/state_value.rs` |
 | 9 | ✅ fait | Stringly-typed IR sentinels duplicate an existing typed representation (Thème 12 : `__opaque`/`this` → `SummaryVal(Top)`) | `lowering/expr_lower.rs` |
 | 10 | M | Two divergent expr-traversal styles; no owned/mutating visitor for transforms | `lowering/hook_extractor.rs`, `ir/expr.rs` |
-| 11 | M | No reusable lattice combinators — flat and bounded-powerset patterns are hand-rolled per type | `domains/impls/bool_val.rs`, `domains/impls/setter_val.rs`, `domains/impls/str_const.rs` |
+| 11 | ✅ partiel | No reusable lattice combinators — **flat** pattern factorisé via `flat_lattice!` (BoolVal+SetterVal, D5, Partie 12). **Bounded-powerset (D6) refusé** : 1 seul consommateur pur (StrConst) ; Stability est un lattice plus riche → restructuration risquée d'un type soundness-critique. | `domains/impls/mod.rs`, `bool_val.rs`, `setter_val.rs` |
 | 12 | M | Three hand-rolled registries duplicate the same (PathBuf, Symbol) map + lookup logic | `engine/component_registry.rs`, `engine/hook_registry.rs`, `engine/function_registry.rs` |
 | 13 | M | IR tree-walking is re-implemented per consumer instead of a shared visitor | `engine/symbol_graph.rs`, `engine/root_detector.rs`, `ir/free_vars.rs` |
 | 14 | M | No `HookEntry::body_cfg()` accessor — Effect|Memo|Callback|Handler match arm duplicated everywhere | `ir/hooks.rs`, `rules/frozen_initial_state.rs`, `rules/stale_closure.rs` |
@@ -639,9 +680,9 @@ walkers sont donc « déléguer à l'helper déjà présent », coût ~0.
 | D2 arms `Let` vs `Assign` de `exec_stmt_core` | 2 quasi-clones | `interp/interpreter:115` / `:177` | `bind_rhs(var,rhs,env,ctx)` — bloc alias devient inconditionnel (**corrige le FN**) | Partie 2, ARCH 22, Thème 10 |
 | D3 ADR-017 « garder labels `Versioned`, kind→⊤ » | 3 | `transfer/state_value:73/525/108` | `StateValue::to_stability_preserving_labels()` | ARCH 8, Thème 4 |
 | D4 🆕 ⚠ garde « un seul slot actif » (chaîne `&&` sur 8 slots) | 7 (ré-énumérées à la main) | `impls/state_value:134/158/177/258`, `transfer/state_value:619/641/699` | `StateValue::populated_kinds()->KindMask` — **ajouter un slot de kind = 7 prédicats faux en silence (latent FN)** | 🆕 (Partie 2 Latents) |
-| D5 lattice plat `AbstractDomain`+`PartialOrd` | 2 types × 5 méthodes | `impls/bool_val` ≈ `impls/setter_val` (join/meet/widen/⊥/⊤) | macro `flat_lattice!` ou trait `FlatLattice` | ARCH 11, Thème 9 |
-| D6 powerset borné à seuil | 2 | `impls/str_const` ≈ `impls/stability` (frag. `Versioned` ; `stability:11` dit déjà « same pattern as StrConst ») | domaine générique `PowerSet<T,N>` | ARCH 11, Thème 9 |
-| D7 🆕 boucles de store point-à-point | trio join/widen/widen_to (3) + 13 get-or-default + 3 `leq` | `state_store:34/45/56`, `shared_state_store:42`, `abstract_env:110/162`, `heap:69` ; get-or-default ×13 ; `leq` via `partial_cmp` : `state_store:71`, `shared_state_store:52`, `abstract_env:196` | `merge_with(other,f)` (collapse le trio), `map_get_or(map,k,D::bottom)`, `leq_pointwise` dans `stores/mod` | 🆕 / Thème 9 |
+| D5 lattice plat `AbstractDomain`+`PartialOrd` — ✅ FAIT | 2 types × 5 méthodes | `impls/bool_val` ≈ `impls/setter_val` (join/meet/widen/⊥/⊤) | macro `flat_lattice!` (Partie 12) | ARCH 11, Thème 9 |
+| D6 powerset borné à seuil — ❌ REFUSÉ | 2 | `impls/str_const` ≈ `impls/stability` (frag. `Versioned`) | 1 seul consommateur pur (StrConst) ; Stability trop riche → restructuration risquée (Partie 12) | ARCH 11, Thème 9 |
+| D7 boucles de store point-à-point — ✅ FAIT | trio join/widen/widen_to (3) + 13 get-or-default + 3 `leq` | `state_store:34/45/56`, `shared_state_store:42`, `abstract_env:110/162`, `heap:69` ; get-or-default ×13 ; `leq` via `partial_cmp` : `state_store:71`, `shared_state_store:52`, `abstract_env:196` | `merge_with(other,f)` (collapse le trio), `map_get_or(map,k,D::bottom)`, `leq_pointwise` dans `stores/mod` | 🆕 / Thème 9 |
 | D8 peel/recurse `TSAnnotated` | 5 | `transfer/state_value:60/144/188/285/392` | `Expr::peel_ts()` (cf. R1) | ARCH 26, Thème 5 |
 
 ### C3 — `src/engine/`, `src/lowering/`, `src/ir/`
