@@ -1,5 +1,6 @@
 pub mod always_unstable_deps;
 pub mod analysis_limit_info;
+mod churn;
 mod churn_graph;
 pub mod conditional_hook;
 pub mod derived_state;

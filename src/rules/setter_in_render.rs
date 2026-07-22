@@ -10,7 +10,7 @@ use crate::{
     },
 };
 
-use super::infinite_loop::{converges_once_written, eval_in_exit_env};
+use super::churn::{converges_once_written, eval_in_exit_env};
 use super::{
     Diagnostic, Rule, Severity, collect_component_setter_vars, collect_setter_calls,
     resolve_setter_aliases, state_val_labels,

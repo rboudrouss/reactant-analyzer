@@ -17,9 +17,8 @@ use crate::{
 
 use super::{
     Diagnostic, EffectClass, Rule, Severity, Step, ValueClass, all_setter_labels,
-    collect_fn_bindings, collect_setter_calls_with_extra,
-    infinite_loop::{eval_in_exit_env, on_all_paths},
-    memo_val_labels,
+    churn::{eval_in_exit_env, on_all_paths},
+    collect_fn_bindings, collect_setter_calls_with_extra, memo_val_labels,
     missing_deps::fn_lit_binding,
     resolve_setter_aliases, state_slot_name, state_val_labels,
 };

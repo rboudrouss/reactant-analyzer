@@ -187,6 +187,23 @@ les dominateurs une fois dans un `DominatorTree` caché. Absorbe WA 5, 7, ARCH 2
 dont dépendent les deux bras (unidirectionnel) ; faire du graphe la source unique. Absorbe
 ARCH 2, 18. Dépend du Thème 7.
 
+> **Dépendance circulaire — ✅ FAITE (2026-07).** Vocabulaire churn partagé (`SlotNode`,
+> `Freshness`, `ChurnSetterCall`, `classify_effect_deps`, `reference_part`, `eval_in_exit_env`,
+> `collect_churn_calls`, `converges_once_written`, `expand_guard`, `on_all_paths` + helpers)
+> extrait dans `src/rules/churn.rs` (~525 l déplacées, neutre). `churn_graph` et `infinite_loop`
+> dépendent maintenant tous deux de `churn` (unidirectionnel) ; `churn_graph` n'importe **plus
+> rien** d'`infinite_loop`. 765 tests, clippy inchangé. (Le nœud type-level
+> `ChurnSetterCall.node: SlotNode` disparaît.)
+>
+> **« Source unique » (supprimer `check_object_churn`) — décision : NE PAS FAIRE.** La prémisse
+> « deux implémentations parallèles » est **fausse** : les deux bras couvrent des partitions
+> **disjointes** — self-edge longueur-1 seulement pour effets **sans deps** (graphe) ; churn
+> même-slot **avec deps** (bras self-churn) ; cycles cross-slot (graphe) — via des gardes `continue`
+> explicites (`churn_graph.rs:261-262, 278-279`). Supprimer le bras self-churn = **FN** sur
+> `useEffect(() => setObj({...obj}), [obj])` + perte du diagnostic **Info** (couverture-limite
+> cross-effet) que le graphe ne produit pas. Non comportement-neutre → conservé. ARCH 18 fait ;
+> ARCH 2 requalifié (pas des « parallèles », des complémentaires).
+
 ### Thème 9 — Lattices de domaine : combinateurs + retrait du choke-point `to_stability` *(L ; bit « ever-written » S)*
 Deux formes de lattice recopiées par type : plat (`BoolVal`/`SetterVal` identiques au
 byte près) et powerset borné à seuil (`StrConst`/`Stability::Versioned`, commenté « same
@@ -435,7 +452,7 @@ et corrige l'imprécision latente. **765 tests**, clippy inchangé (23).
 | # | Effort | Finding | Fichiers principaux |
 |---|--------|---------|---------------------|
 | 1 | ✅ fait | Two divergent, duplicated implementations of “splice a callee CFG into a caller CFG” (Thème 1 : primitif unique `ir/splice.rs` routé par les deux chemins ; α-renommage ajouté) | `engine/fixpoint.rs`, `ir/splice.rs` |
-| 2 | L | Self-churn arm and the churn graph are two parallel implementations of the same analysis | `rules/infinite_loop.rs`, `rules/churn_graph.rs` |
+| 2 | requalifié | Self-churn arm and the churn graph : **PAS** des implémentations parallèles — partitions disjointes (with-deps same-slot vs no-deps/cross-slot), gardes `continue` explicites. Fusionner = FN + perte du diag Info. Conservées séparées (Thème 8). | `rules/infinite_loop.rs`, `rules/churn.rs` |
 | 3 | L | Rules reason through the lossy legacy Stability lattice via to_stability instead of querying the product domain | `domains/impls/state_value.rs`, `rules/missing_deps.rs`, `rules/unnecessary_rerender.rs` |
 | 4 | L | Every rule reconstructs the same per-component name/slot resolution context | `rules/stale_closure.rs`, `rules/missing_deps.rs`, `rules/frozen_initial_state.rs` |
 | 5 | L | Three detector modules duplicate their scaffolding AND diverge on the naming predicate that classifies top-level functions | `lowering/component_detector.rs`, `lowering/hook_detector.rs`, `lowering/utility_detector.rs` |
@@ -451,7 +468,7 @@ et corrige l'imprécision latente. **765 tests**, clippy inchangé (23).
 | 15 | M | No shared 'evaluate expr against a component's converged stores' primitive | `rules/mod.rs`, `rules/infinite_loop.rs`, `rules/frozen_initial_state.rs` |
 | 16 | M | Duplicated abstract-expression evaluation boilerplate across rules | `rules/mod.rs`, `rules/always_unstable_deps.rs`, `rules/unnecessary_rerender.rs` |
 | 17 | M | ProgramAnalysisResult test fixtures reimplemented in every rule module | `rules/always_unstable_deps.rs`, `rules/unnecessary_rerender.rs`, `rules/setter_in_render.rs` |
-| 18 | M | churn_graph and infinite_loop form a bidirectional module dependency | `rules/churn_graph.rs`, `rules/infinite_loop.rs` |
+| 18 | ✅ fait | churn_graph and infinite_loop form a bidirectional module dependency (Thème 8 : vocabulaire partagé hissé dans `rules/churn.rs` ; deux arêtes unidirectionnelles) | `rules/churn.rs`, `rules/churn_graph.rs`, `rules/infinite_loop.rs` |
 | 19 | M | Pure Expr walkers hand-roll exhaustive matches instead of delegating to the canonical for_each_child | `ir/free_vars.rs`, `ir/expr.rs`, `ir/cfg.rs` |
 | 20 | M | TypeScript annotation payload is threaded through the whole IR but consumed by nobody | `ir/expr.rs`, `ir/remap.rs`, `lowering/expr_lower.rs` |
 | 21 | ✅ fait | Entire cross-domain-query + product-transfer framework is dead speculative generality | `domains/query.rs`, `domains/product.rs`, `domains/mod.rs` |

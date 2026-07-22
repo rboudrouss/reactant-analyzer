@@ -46,17 +46,14 @@ use crate::{
     },
 };
 
-use super::infinite_loop::{
-    Freshness, classify_effect_deps, collect_churn_calls, converges_once_written, on_all_paths,
-    reference_part,
+use super::churn::{
+    ChurnSetterCall, Freshness, SlotNode, classify_effect_deps, collect_churn_calls,
+    converges_once_written, on_all_paths, reference_part,
 };
 use super::{
     collect_component_setter_vars, collect_fn_bindings, memo_val_labels, resolve_setter_aliases,
     setter_var_labels, state_val_labels,
 };
-
-/// A state slot qualified by its owning component.
-pub(super) type SlotNode = (Symbol, HookLabel);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum EdgeStrength {
@@ -103,7 +100,7 @@ pub(super) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec<ChurnEdge
         no_deps: bool,
         exact_local: HashSet<HookLabel>,
         versioned: HashSet<SlotNode>,
-        calls: Vec<super::infinite_loop::ChurnSetterCall>,
+        calls: Vec<ChurnSetterCall>,
     }
 
     let mut writer_sites: HashMap<SlotNode, usize> = HashMap::new();
