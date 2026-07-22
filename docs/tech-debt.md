@@ -449,14 +449,90 @@ et corrige l'imprécision latente. **765 tests**, clippy inchangé (23).
   *sound* ; une version observée au point fixe risquerait de sous-compter les écritures → FN.
 
 **Restent (grands, comportement-changeant → design + tests dédiés, hors passe soundness)** :
-- **Thème 5/10** — `ComponentResolution` partagé + `eval_in`/`eval_for_effect`. Risqué : les
-  résolutions par-règle divergent subtilement, en unifier une change potentiellement des
-  diagnostics (choisir « celle qui fait autorité »).
+- **Thème 5/10** — traité en Partie 11 (2026-07) : `eval_in` + chemin d'effet unique FAITS ;
+  `ComponentResolution` global REFUSÉ (unsound — voir Partie 11).
 - **Thème 9** — combinateurs de lattice (`Flat`/`BoundedPowerset`, déjà différés P2 en Partie 6)
   et surtout retrait du choke-point `to_stability` (ARCH 3) : chaque règle raisonne à travers,
   le remplacer par des prédicats produit direct doit être exactement équivalent sous peine de
   FN/FP.
 - **Thème 12** — charpente `detect`/`Candidate` des détecteurs (E4) : structure divergente.
+
+---
+
+## Partie 11 — Thèmes 5 + 10 : contexte de règle & évaluation d'effet — APPLIQUÉ (2026-07)
+
+Précédé d'un mapping exhaustif (1 sous-agent par règle + 3 sur le moteur) qui a relevé, par
+`check()`, quel calcul de résolution est fait, son **scope** (render-only vs render+bodies) et
+son traitement d'alias. Conclusion structurante : **les « variantes subtiles » de résolution
+sont délibérées et load-bearing**, pas de la dérive accidentelle.
+
+### Thème 10 — FAIT
+
+- **Parité `Let`/`Assign` + factorisation `exec_stmt_core` : déjà faite** (Vague 0). Les deux
+  bras sont un or-pattern unique délégant à `bind_rhs` (`interpreter.rs`) ; le FN est
+  structurellement éliminé. Rien à refaire (WA D2).
+- **`ConvergedEval::eval_in(env, expr, heap)`** (commit `eval_in`) : `churn::eval_in_exit_env`
+  et `frozen::eval_with_heap` étaient byte-identiques sauf le seed heap (`Heap::new()` vs
+  `heap.clone()`) ; +4 sites re-threadaient le bundle convergé `(component, state, memo)` à la
+  main. Trait d'extension sur `AnalysisResult<StateValue>` liant les 3 champs de `self`, `env`
+  + `heap` restant explicites. **Le seed heap reste un argument** (empty vs convergé ≠
+  interchangeables — le convergé résout un `FieldAccess` props au lieu de ⊤) : aucun seed
+  unifié → neutre. `eval_in_stores` reste le primitif (site mount-time empty-store). Absorbe
+  WA 13, la duplication D3-adjacente.
+- **Chemin d'effet unique `exec_expr_effects`** (commit *single effect-firing path*) :
+  supprime WA 16 (le moteur fabriquait `Stmt::ExprStmt(expr.clone(), None)` pour atteindre le
+  firing d'effet) et WA 18 (le re-dispatch `CompApp` après coup). « Faire tourner une
+  expression pour ses effets » (callbacks + setter + eval inter-composant du `CompApp`) est
+  hissé dans un `exec_expr_effects` unique, exposé en `Transfer::exec_expr_effects` ; `check`
+  fixpoint (`Return`) et `exec_full_stmt` (`ExprStmt`) l'appellent. `exec_stmt_core` devient
+  bindings-only (param `depth` retiré). **Position-retour (`exec_body_impl`) reste distincte** :
+  elle a besoin de la *valeur* de l'expression donc garde `eval_expr` — la réduire au helper
+  void jetterait la valeur (FN). Équivalent prouvé (la fabrication routait déjà exactement ces
+  trois opérations à depth 0).
+
+**Non fait (différé, documenté)** : `Terminator::Return(Expr)` n'a **pas de slot de span**
+(`ir/cfg.rs`) → un appel de setter dans un corps arrow concis (`() => setX(1)`) n'a pas de
+localisation source. C'est un défaut de **qualité de diagnostic, pas de soundness**, et un
+changement d'IR touchant ~76 sites / 27 fichiers. Séparable de la suppression des workarounds
+ci-dessus ; à traiter comme amélioration dédiée si le besoin se confirme.
+
+### Thème 5 — dedup ciblé FAIT, `ComponentResolution` global REFUSÉ
+
+- **FAIT** : `cross_component_setters(comp, component)` (commit *cross_component_setters*) —
+  seul bloc multi-lignes **byte-identique** restant entre règles (`infinite-loop` +
+  `setter-in-render` : `collect_component_setter_vars` filtré `parent_comp != component`).
+- **Quick-wins déjà faits** (vagues antérieures, confirmés par le mapping) : `Expr::peel_ts()`
+  (R1), `HookEntry::body_cfg()` (R4), `hook_kind_word` (R5), `SourceRange::pos_key()` (R6),
+  `state_slot_name` (R8), `all_setter_labels`/`state_val_labels`/`collect_fn_bindings`/
+  `resolve_setter_aliases` (R3/R7) — tous centralisés dans `rules/mod.rs`.
+
+- **REFUSÉ : un `ComponentResolution` unique passé à `Rule::check`.** La prémisse tech-debt
+  (« ~9 règles partagent une résolution recalculée en variantes subtiles, personne ne sait
+  laquelle fait autorité ») est **fausse** : le mapping montre que les variantes sont des choix
+  **corrects et nécessaires**, pas de la dérive. Preuves (chacune un risque FN/FP documenté) :
+  - **Scope setters divergent** : `infinite-loop`/`derived-state`/`state-mutation`/`frozen`/
+    `stale-closure` utilisent `all_setter_labels` (render+**tous** les bodies, alias-résolu,
+    fold accumulant) ; `unnecessary-rerender`/`lazy-init`/`setter-in-render` utilisent une base
+    **render-only**. Forcer un scope unique = FN (rétrécir → aliases spliced ratés) ou FP/
+    misattribution (élargir → `unnecessary-rerender` accumule au lieu de re-seeder par-effet).
+  - **Re-seeding par-effet** : `unnecessary-rerender` et `stale-closure` recomposent la
+    résolution **par corps d'effet** (seed frais depuis la base render) ; une map pré-calculée
+    une fois par composant leur fait fuiter l'alias de l'effet A dans l'effet B (findings
+    décalés/ajoutés).
+  - **Résolution cross-composant** : `frozen` (contre le composant **propriétaire**) et
+    `infinite-loop` (`node_display` par composant parent, mémoïsé) résolvent contre un **autre**
+    composant que `component` ; une résolution scopée à un seul composant les casse.
+  - **3 règles sans résolution** (`conditional-hook`, `always-unstable-deps`, `missing-deps`) :
+    injecter un contexte partagé y ajoute du scope orthogonal inutile.
+
+  Les helpers réellement partagés sont **déjà** centralisés (mod.rs). Un `ComponentResolution`
+  global serait soit unsound (force un scope), soit un sac ré-exposant ces helpers derrière une
+  indirection, au prix d'un changement de signature du trait `Rule` (14 impls + ~40 sites de
+  test) pour un gain perf mineur sur un sous-ensemble de règles. Ne se justifie pas en un
+  paragraphe (P2) → refusé. Absorbe ARCH 4/14/15/16/17/25/26/30/31/32 par **confirmation que le
+  factoring actuel (helpers partagés) est le bon**, pas par un objet contexte.
+
+**766 tests**, clippy inchangé (23), fmt clean sur les 3 commits.
 
 ---
 
@@ -467,7 +543,7 @@ et corrige l'imprécision latente. **765 tests**, clippy inchangé (23).
 | # | Sévérité | P2? | Workaround | Emplacement | Couche du fix |
 |---|----------|-----|------------|-------------|---------------|
 | 1 | high | — | Template-literal interpolations are dropped at lowering -> silent read FN | `lowering/expr_lower.rs:36` | lowering |
-| 2 | high | — | `all_setter_labels` recipe reimplemented per rule instead of shared | `rules/frozen_initial_state.rs:160` | rule |
+| 2 | ✅ fait | `all_setter_labels` recipe reimplemented per rule instead of shared → helper unique dans `rules/mod.rs`, appelé par les 5 règles (Thème 5, Partie 11) | `rules/mod.rs` | rule |
 | 3 | ✅ fait | Custom-hook expansion grafts only the hook body's ENTRY block, dropping all other blocks (Thème 1 : splice le corps entier via `splice_callee_into_cfg`) | `engine/fixpoint.rs`, `ir/splice.rs` | lowering |
 | 4 | ✅ fait | subst_vars does ad-hoc partial Expr traversal for hook-param substitution (remplacé par `subst_vars_expr` exhaustif, Thème 1) | `ir/splice.rs` | engine |
 | 5 | med | — | Summary-registry hook handled by dropping the HookEntry and string-patching the CFG binding | `engine/fixpoint.rs:639` | domain |
@@ -478,12 +554,12 @@ et corrige l'imprécision latente. **765 tests**, clippy inchangé (23).
 | 10 | medium | — | collect_subscriptions_in_expr hand-rolls the central expr walk with a lossy catch-all | `lowering/hook_extractor.rs:46` | lowering |
 | 11 | med | ⚠️ | Interval narrowing assumes integer steps (v±1), unsound for float states | `domains/impls/interval.rs:162` | domain |
 | 12 | med | — | may_written_slots reimplements a domain 'slot-ever-written' fact syntactically at the rule layer | `rules/stale_closure.rs:345` | domain |
-| 13 | med | — | `eval_with_heap` is a near-clone of `eval_in_exit_env` | `rules/frozen_initial_state.rs:585` | rule |
+| 13 | ✅ fait | `eval_with_heap` is a near-clone of `eval_in_exit_env` (Thème 10 : les deux délèguent à `ConvergedEval::eval_in`, seed heap explicite par-site — Partie 11) | `rules/mod.rs` | rule |
 | 14 | requalifié | Per-rule `resolve_setter_aliases` — **plus** un artefact d'inlining depuis Thème 1 (le splice α-renomme, n'émet plus d'alias de param). Reste nécessaire pour les alias **écrits par l'utilisateur** (`const s1 = setX; s2 = s1`) sur le render CFG → le retirer = FN. N'est donc plus de la dette « inlining ». | `rules/churn_graph.rs`, `rules/mod.rs` | rule |
 | 15 | low | — | Hard 100-iteration cap force-widens all labels as a termination backstop | `engine/fixpoint.rs:388` | engine |
-| 16 | low | — | Engine fabricates a synthetic Stmt::ExprStmt to run a Return terminator's side effects | `engine/cfg_analyzer.rs:82` | engine |
+| 16 | ✅ fait | Engine fabricates a synthetic Stmt::ExprStmt to run a Return terminator's side effects (Thème 10 : `Transfer::exec_expr_effects`, plus de fabrication — Partie 11) | `engine/cfg_analyzer.rs`, `domains/interp/interpreter.rs` | engine |
 | 17 | low | — | extract_arrow_hook_name is a no-op stub that dead-codes its caller branch | `lowering/hook_detector.rs:125` | lowering |
-| 18 | low | — | ExprStmt(CompApp) re-dispatched to eval_expr after exec_stmt_core | `domains/interp/interpreter.rs:95` | lowering |
+| 18 | ✅ fait | ExprStmt(CompApp) re-dispatched to eval_expr after exec_stmt_core (Thème 10 : le re-dispatch vit dans `exec_expr_effects`, défini une fois — Partie 11) | `domains/interp/interpreter.rs` | engine |
 
 ## Annexe B — 36 findings d'architecture
 
@@ -492,7 +568,7 @@ et corrige l'imprécision latente. **765 tests**, clippy inchangé (23).
 | 1 | ✅ fait | Two divergent, duplicated implementations of “splice a callee CFG into a caller CFG” (Thème 1 : primitif unique `ir/splice.rs` routé par les deux chemins ; α-renommage ajouté) | `engine/fixpoint.rs`, `ir/splice.rs` |
 | 2 | requalifié | Self-churn arm and the churn graph : **PAS** des implémentations parallèles — partitions disjointes (with-deps same-slot vs no-deps/cross-slot), gardes `continue` explicites. Fusionner = FN + perte du diag Info. Conservées séparées (Thème 8). | `rules/infinite_loop.rs`, `rules/churn.rs` |
 | 3 | L | Rules reason through the lossy legacy Stability lattice via to_stability instead of querying the product domain | `domains/impls/state_value.rs`, `rules/missing_deps.rs`, `rules/unnecessary_rerender.rs` |
-| 4 | L | Every rule reconstructs the same per-component name/slot resolution context | `rules/stale_closure.rs`, `rules/missing_deps.rs`, `rules/frozen_initial_state.rs` |
+| 4 | requalifié | Every rule reconstructs the same per-component resolution context — **prémisse fausse** (Thème 5, Partie 11) : les résolutions divergent délibérément (scope render-only vs render+bodies, re-seeding par-effet, résolution cross-composant). Les briques communes sont déjà partagées (`all_setter_labels`/`state_val_labels`/`collect_fn_bindings`/`pos_key`/`peel_ts`/`body_cfg` dans `rules/mod.rs`) ; un contexte unique serait unsound (force un scope) ou un sac d'indirection. Factoring actuel confirmé bon. | `rules/mod.rs` |
 | 5 | ✅ partiel | Three detector modules diverge on the naming predicate (**FAIT** : `is_hook_name` partagé, Thème 12) — plus de double classification `useful`. Reste : scaffolding `Candidate`/dispatch (dedup non-neutre, charpente divergente). | `lowering/mod.rs`, `lowering/hook_detector.rs`, `lowering/utility_detector.rs` |
 | 6 | M | Engine hard-codes a rule-specific second analysis pass (effect_setter_writes) | `engine/fixpoint.rs`, `rules/infinite_loop.rs`, `engine/analysis_result.rs` |
 | 7 | M | analyze_component_impl is a ~370-line monolith mixing seeding, expansion, fixpoint, and result assembly | `engine/fixpoint.rs` |
