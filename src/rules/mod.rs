@@ -421,6 +421,22 @@ pub(super) fn collect_component_setter_vars(
     result
 }
 
+/// Cross-component setter props: the [`collect_component_setter_vars`] result
+/// restricted to setters owned by a component *other* than `component`. A
+/// component passing its own setter down as a prop is not a cross-component
+/// write, so self-owned entries are filtered out. Shared by the two rules that
+/// reason about parent setters called in render (`infinite-loop`,
+/// `setter-in-render`).
+pub(super) fn cross_component_setters(
+    comp: &AnalysisResult<StateValue>,
+    component: &Symbol,
+) -> HashMap<Var, (Symbol, HookLabel)> {
+    collect_component_setter_vars(&comp.render_cfg, &comp.block_states, &comp.heap)
+        .into_iter()
+        .filter(|(_, (parent_comp, _))| parent_comp != component)
+        .collect()
+}
+
 /// Scan all Let stmts in `cfg` for `let X = FnLit{...}` and return X → body_cfg.
 pub(super) fn collect_fn_bindings(cfg: &CFG) -> HashMap<Var, Arc<CFG>> {
     let mut map: HashMap<Var, Arc<CFG>> = HashMap::new();

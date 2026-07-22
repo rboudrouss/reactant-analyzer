@@ -12,8 +12,7 @@ use crate::{
 
 use super::churn::{converges_once_written, eval_in_exit_env};
 use super::{
-    Diagnostic, Rule, Severity, collect_component_setter_vars, collect_setter_calls,
-    resolve_setter_aliases, state_val_labels,
+    Diagnostic, Rule, Severity, collect_setter_calls, resolve_setter_aliases, state_val_labels,
 };
 
 /// Fires when a state setter is called directly in the render body either a
@@ -84,14 +83,7 @@ impl Rule for SetterInRender {
 
         // Cross-component setters: ComponentSetter-valued props, excluding self-references.
         let cs_vars: HashMap<Var, (crate::ir::types::Symbol, crate::ir::types::HookLabel)> =
-            collect_component_setter_vars(
-                &comp_result.render_cfg,
-                &comp_result.block_states,
-                &comp_result.heap,
-            )
-            .into_iter()
-            .filter(|(_, (parent_comp, _))| parent_comp != component)
-            .collect();
+            super::cross_component_setters(comp_result, component);
 
         let mut all_setter_vars: HashSet<Var> = local_setter_info.keys().cloned().collect();
         all_setter_vars.extend(cs_vars.keys().cloned());

@@ -16,10 +16,9 @@ use super::churn::{
     on_all_paths, reference_part,
 };
 use super::{
-    Diagnostic, Rule, Severity, all_deps_unstable, all_setter_labels,
-    collect_component_setter_vars, collect_fn_bindings, collect_setter_calls,
-    collect_setter_calls_with_extra, memo_val_labels, resolve_setter_aliases, setter_var_labels,
-    state_slot_name, state_val_labels,
+    Diagnostic, Rule, Severity, all_deps_unstable, all_setter_labels, collect_fn_bindings,
+    collect_setter_calls, collect_setter_calls_with_extra, memo_val_labels, resolve_setter_aliases,
+    setter_var_labels, state_slot_name, state_val_labels,
 };
 
 /// Fires when an effect causes an infinite render loop.
@@ -62,14 +61,8 @@ impl Rule for InfiniteLoop {
         let state_names = state_val_labels(&comp_result.render_cfg);
 
         // ComponentSetter props, excluding self-references.
-        let cs_vars: HashMap<Var, (Symbol, HookLabel)> = collect_component_setter_vars(
-            &comp_result.render_cfg,
-            &comp_result.block_states,
-            &comp_result.heap,
-        )
-        .into_iter()
-        .filter(|(_, (parent_comp, _))| parent_comp != component)
-        .collect();
+        let cs_vars: HashMap<Var, (Symbol, HookLabel)> =
+            super::cross_component_setters(comp_result, component);
 
         let mut all_setter_vars: HashSet<Var> = local_setter_labels.keys().cloned().collect();
         all_setter_vars.extend(cs_vars.keys().cloned());
