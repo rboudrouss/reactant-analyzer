@@ -36,6 +36,23 @@ use crate::{
     resolver::{DefaultImportResolver, ImportResolver},
 };
 
+/// React's naming rule for a custom hook: `use` followed by an uppercase letter
+/// or a digit (`useCounter`, `use2FA`). A lowercase 4th char (`useful`,
+/// `userId`) is NOT a hook — such a function cannot legally call hooks (Rules of
+/// Hooks), so it is a plain utility.
+///
+/// Single source of truth for the hook/utility classification boundary: the
+/// hook detector and the utility detector used to hard-code divergent rules
+/// (`starts_with("use") && len > 3` vs this one), so `useful` was classified as
+/// BOTH a hook and a utility. Both now call this.
+pub(crate) fn is_hook_name(name: &str) -> bool {
+    name.starts_with("use")
+        && name
+            .chars()
+            .nth(3)
+            .is_some_and(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
 /// A top-level function picked out by one of the detectors, ready for lowering:
 /// its binding name, parameter list, and body. Shared by the component, hook,
 /// and utility detectors — they differ in how they *classify* a function, not

@@ -236,11 +236,16 @@ qu'en tests, donc tout `reactant check` réel traite `useQuery`/`useNavigate` co
 supprimer le clone de registry jetable. Absorbe ARCH 12, 24, 36 (23 fait).
 
 ### Thème 12 — Détecteurs, sentinelles typées, cruft défensif *(S ; unification détecteurs L)*
-- **Divergence des prédicats de détection (L, bug de classification latent).**
-  `hook_detector::is_custom_hook` accepte tout `use`+len>3, alors que `utility_detector::is_utility`
-  exige `use`+Majuscule/chiffre. Un helper `userId`/`useful` est lowered à la fois en `HookIR`
-  **et** en utilitaire, et injecté dans `local_hooks`. **Fix** : un walker + un `classify(name,
-  returns_jsx) -> FnKind` central, aligné sur la règle React-correcte ; hisser le trio JSX dupliqué.
+- **Divergence des prédicats de détection — ✅ FAIT (2026-07, le bug de classification).**
+  `hook_detector::is_custom_hook` acceptait `use`+len>3, alors que `utility_detector::is_utility`
+  exigeait `use`+Majuscule/chiffre → `userId`/`useful` lowered à la fois en `HookIR` **et** en
+  utilitaire. **Fix** : un prédicat unique `lowering::is_hook_name` (règle React : `use`+Maj/chiffre),
+  appelé par les deux détecteurs → plus de double classification. Sûr : un nom à 4e char minuscule
+  ne peut légalement appeler de hooks (Rules of Hooks) donc le traiter en utilitaire ne crée pas de
+  FN. Neutre (766 tests). *(regression : `hook_detector::tests::lowercase_fourth_char_is_not_a_hook`.)*
+  **Reste** (dedup non-comportemental) : le scaffolding `Candidate`/dispatch + le walker `detect`
+  générique + `classify(name, returns_jsx) -> FnKind` central (E4) — la charpente diverge vraiment
+  (gestion `ExportDefault`, ordre des checks) donc non fusionnable sans changer une classification.
 - **Vars magiques `__opaque`/`this` — ✅ FAIT (2026-07).** Le lowering émettait
   `Expr::Var("__opaque")` / `Expr::Var("this")` et comptait sur le lookup manquant → ⊤ (couplage
   par nommage ; une vraie var `__opaque` collisionnerait, et `this` polluait les free-vars comme
@@ -455,7 +460,7 @@ et corrige l'imprécision latente. **765 tests**, clippy inchangé (23).
 | 2 | requalifié | Self-churn arm and the churn graph : **PAS** des implémentations parallèles — partitions disjointes (with-deps same-slot vs no-deps/cross-slot), gardes `continue` explicites. Fusionner = FN + perte du diag Info. Conservées séparées (Thème 8). | `rules/infinite_loop.rs`, `rules/churn.rs` |
 | 3 | L | Rules reason through the lossy legacy Stability lattice via to_stability instead of querying the product domain | `domains/impls/state_value.rs`, `rules/missing_deps.rs`, `rules/unnecessary_rerender.rs` |
 | 4 | L | Every rule reconstructs the same per-component name/slot resolution context | `rules/stale_closure.rs`, `rules/missing_deps.rs`, `rules/frozen_initial_state.rs` |
-| 5 | L | Three detector modules duplicate their scaffolding AND diverge on the naming predicate that classifies top-level functions | `lowering/component_detector.rs`, `lowering/hook_detector.rs`, `lowering/utility_detector.rs` |
+| 5 | ✅ partiel | Three detector modules diverge on the naming predicate (**FAIT** : `is_hook_name` partagé, Thème 12) — plus de double classification `useful`. Reste : scaffolding `Candidate`/dispatch (dedup non-neutre, charpente divergente). | `lowering/mod.rs`, `lowering/hook_detector.rs`, `lowering/utility_detector.rs` |
 | 6 | M | Engine hard-codes a rule-specific second analysis pass (effect_setter_writes) | `engine/fixpoint.rs`, `rules/infinite_loop.rs`, `engine/analysis_result.rs` |
 | 7 | M | analyze_component_impl is a ~370-line monolith mixing seeding, expansion, fixpoint, and result assembly | `engine/fixpoint.rs` |
 | 8 | M | ADR-017 'keep Versioned labels, degrade kind to Top' logic is copy-pasted across three sites | `domains/transfer/state_value.rs` |

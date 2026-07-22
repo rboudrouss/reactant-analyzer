@@ -128,14 +128,17 @@ fn extract_arrow_hook_name(arrow: &ArrowFunctionExpression) -> Option<String> {
 // ── Detection rules ────────────────────────────────────────────────────────────
 
 /// Returns `true` iff `name` is a user-defined custom hook.
-/// Rule: starts with `use`, length > 3, not a React built-in hook.
-/// Any locally-defined `use*` function is a custom hook — INCLUDING one named
-/// like a React built-in (`function useMemo(name, options)`, memos): JS
+/// Rule: React's hook-name convention (`use` + uppercase/digit), shared with
+/// the utility detector via [`super::is_hook_name`] so the two never diverge
+/// (a lowercase-4th-char name like `useful` is a utility, not a hook, and must
+/// not be classified as both).
+/// Any locally-defined hook-named function is a custom hook — INCLUDING one
+/// named like a React built-in (`function useMemo(name, options)`, memos): JS
 /// scoping makes the local definition shadow the React import/global, and the
 /// call-site classification (`ImportCtx::callee_is_react`) relies on these
 /// names to resolve the collision.
 fn is_custom_hook(name: &str) -> bool {
-    name.starts_with("use") && name.len() > 3
+    super::is_hook_name(name)
 }
 
 #[cfg(test)]
@@ -205,6 +208,20 @@ mod tests {
     #[test]
     fn component_not_detected() {
         assert!(hook_names("function Counter() { return <div/>; }").is_empty());
+    }
+
+    #[test]
+    fn lowercase_fourth_char_is_not_a_hook() {
+        // `useful`/`userId` are NOT hooks by React's rule (a lowercase 4th char).
+        // They used to be caught by the loose `len > 3` predicate and end up
+        // classified as BOTH a hook and a utility. Now they are utility-only.
+        assert!(hook_names("function useful(x) { return x; }").is_empty());
+        assert!(hook_names("function userId(u) { return u.id; }").is_empty());
+        // Genuine hook names (uppercase or digit after `use`) still detected.
+        assert_eq!(
+            hook_names("function use2FA() { return null; }"),
+            vec!["use2FA"]
+        );
     }
 
     #[test]

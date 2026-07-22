@@ -122,13 +122,8 @@ fn is_utility(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    // Hooks
-    if name.starts_with("use")
-        && name
-            .chars()
-            .nth(3)
-            .is_some_and(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-    {
+    // Hooks (shared predicate — see `super::is_hook_name`).
+    if super::is_hook_name(name) {
         return false;
     }
     // Components uppercase first letter
