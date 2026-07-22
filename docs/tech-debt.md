@@ -166,6 +166,18 @@ chaque appel** → `setter_in_render`/`conditional_hook` deviennent O(appels × 
 **Fix** : garder un nœud IR `LogicalOp{op,lhs,rhs}` (ou une table temp→opérandes) ; calculer
 les dominateurs une fois dans un `DominatorTree` caché. Absorbe WA 5, 7, ARCH 29.
 
+> **Partie (b) FAITE** (`DominatorTree`, Vague 1). **Partie (a) — décision : NE PAS FAIRE
+> (2026-07).** Retirer le diamant de `lower_logical` au profit d'un nœud `LogicalOp` plat est un
+> mauvais compromis risque/valeur : (1) le diamant modélise correctement les **effets de bord
+> court-circuités** (`a && setX()` n'exécute `setX()` que si `a` truthy — via le bloc rhs
+> conditionnel) ; un nœud plat imposerait de rejouer cette exécution conditionnelle dans l'éval,
+> au risque de **droper l'appel → FN**. (2) Le narrowing relationnel à travers `&&`/`||` est
+> **déjà perdu** aujourd'hui (le diamant branche sur `Var(__tN)`, jamais sur les comparaisons des
+> opérandes) — donc `LogicalOp` n'apporte rien côté précision sans un nouveau bras de narrowing
+> `And`/`Or`. Bénéfice réel = retirer ~50 lignes de reconstruction dans `expand_guard` (WA 6, P2),
+> qui **fonctionne et est testée**. Le diamant est la bonne représentation ; la reconstruction est
+> son coût assumé. WA 6/7 restent documentés mais non « à corriger ».
+
 ### Thème 8 — Analyse de churn : un module cœur, une source de vérité (archétype P3) *(L)*
 `check_object_churn` (self-churn) et `build_churn_graph` calculent la même chose (le graphe
 émet déjà des self-edges de longueur 1). Ils sont coordonnés par un handshake fragile
@@ -212,9 +224,13 @@ supprimer le clone de registry jetable. Absorbe ARCH 12, 24, 36 (23 fait).
   exige `use`+Majuscule/chiffre. Un helper `userId`/`useful` est lowered à la fois en `HookIR`
   **et** en utilitaire, et injecté dans `local_hooks`. **Fix** : un walker + un `classify(name,
   returns_jsx) -> FnKind` central, aligné sur la règle React-correcte ; hisser le trio JSX dupliqué.
-- **Vars magiques `__opaque`/`this` (M).** Le lowering se couple au moteur par convention de
-  nommage (marche seulement parce que le lookup manquant renvoie Top) ; une vraie var `__opaque`
-  collisionnerait. **Fix** : `Expr::Opaque`/`Expr::This` (ou réutiliser `SummaryVal(Top)`).
+- **Vars magiques `__opaque`/`this` — ✅ FAIT (2026-07).** Le lowering émettait
+  `Expr::Var("__opaque")` / `Expr::Var("this")` et comptait sur le lookup manquant → ⊤ (couplage
+  par nommage ; une vraie var `__opaque` collisionnerait, et `this` polluait les free-vars comme
+  fausse capture). **Fix** : réutilise le sentinelle typé existant `Expr::SummaryVal(SummaryValue::Top)`
+  (déjà employé par `cfg_builder`), via un helper `opaque()` dans `expr_lower.rs`. Équivalent à
+  l'éval (`SummaryVal(Top)` → `StateValue::top()` = lookup manquant → `D::top()`), retire le risque
+  de collision ET les captures parasites `__opaque`/`this`. Neutre (765 tests).
 - **Déjà supprimés** (Partie 1) : cap 100 itérations (backstop mort — le widening ADR-014
   termine déjà) était encore présent ; garde de récursion hook morte (fait) ;
   `extract_arrow_hook_name` stub (à traiter avec l'unification des détecteurs).
@@ -426,7 +442,7 @@ et corrige l'imprécision latente. **765 tests**, clippy inchangé (23).
 | 6 | M | Engine hard-codes a rule-specific second analysis pass (effect_setter_writes) | `engine/fixpoint.rs`, `rules/infinite_loop.rs`, `engine/analysis_result.rs` |
 | 7 | M | analyze_component_impl is a ~370-line monolith mixing seeding, expansion, fixpoint, and result assembly | `engine/fixpoint.rs` |
 | 8 | M | ADR-017 'keep Versioned labels, degrade kind to Top' logic is copy-pasted across three sites | `domains/transfer/state_value.rs` |
-| 9 | M | Stringly-typed IR sentinels duplicate an existing typed representation | `lowering/expr_lower.rs`, `ir/expr.rs`, `domains/transfer/state_value.rs` |
+| 9 | ✅ fait | Stringly-typed IR sentinels duplicate an existing typed representation (Thème 12 : `__opaque`/`this` → `SummaryVal(Top)`) | `lowering/expr_lower.rs` |
 | 10 | M | Two divergent expr-traversal styles; no owned/mutating visitor for transforms | `lowering/hook_extractor.rs`, `ir/expr.rs` |
 | 11 | M | No reusable lattice combinators — flat and bounded-powerset patterns are hand-rolled per type | `domains/impls/bool_val.rs`, `domains/impls/setter_val.rs`, `domains/impls/str_const.rs` |
 | 12 | M | Three hand-rolled registries duplicate the same (PathBuf, Symbol) map + lookup logic | `engine/component_registry.rs`, `engine/hook_registry.rs`, `engine/function_registry.rs` |

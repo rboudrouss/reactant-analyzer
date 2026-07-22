@@ -8,11 +8,21 @@ use std::sync::Arc;
 
 use crate::ir::{
     cfg::{BasicBlock, CFG, EdgeKind, Terminator},
-    expr::{BinOp as IrBinOp, Expr, Prim, UnaryOp as IrUnaryOp},
+    expr::{BinOp as IrBinOp, Expr, Prim, SummaryValue, UnaryOp as IrUnaryOp},
     stmt::{MemberKey, Stmt},
 };
 
 use super::cfg_builder::{BlockBuilder, build_expr_fn_body_cfg, build_fn_body_cfg};
+
+/// An opaque value of unknown kind (⊤). Used for expressions the analysis does
+/// not model (exotic operators, `this`/`super`, unhandled syntax). A typed
+/// sentinel rather than a magic `Expr::Var("__opaque")`: it evaluates directly
+/// to `StateValue::top()` instead of relying on a name lookup missing in the
+/// env, so a real user variable can never collide with it and it never shows up
+/// as a spurious free-variable capture.
+fn opaque() -> Expr {
+    Expr::SummaryVal(SummaryValue::Top)
+}
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -71,7 +81,9 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 Expr::Var(id.name.to_string())
             }
         }
-        Expression::ThisExpression(_) | Expression::Super(_) => Expr::Var("this".to_string()),
+        // `this`/`super` carry no tracked value in a function component; model
+        // them as an opaque ⊤ rather than a magic `Var("this")` binding.
+        Expression::ThisExpression(_) | Expression::Super(_) => opaque(),
 
         // ── Arithmetic / comparison ───────────────────────────────────────────
         Expression::BinaryExpression(bin) => Expr::BinOp {
@@ -134,10 +146,10 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 builder.push_stmt(Stmt::MemberWrite {
                     obj,
                     key: MemberKey::Field(m.property.name.to_string()),
-                    rhs: Expr::Var("__opaque".to_string()),
+                    rhs: opaque(),
                     span: builder.span_at(upd.span.start),
                 });
-                Expr::Var("__opaque".to_string())
+                opaque()
             }
             SimpleAssignmentTarget::ComputedMemberExpression(m) => {
                 let obj = lower_expr(&m.object, builder);
@@ -145,12 +157,12 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 builder.push_stmt(Stmt::MemberWrite {
                     obj,
                     key: MemberKey::Index(idx),
-                    rhs: Expr::Var("__opaque".to_string()),
+                    rhs: opaque(),
                     span: builder.span_at(upd.span.start),
                 });
-                Expr::Var("__opaque".to_string())
+                opaque()
             }
-            _ => Expr::Var("__opaque".to_string()),
+            _ => opaque(),
         },
 
         // ── Short-circuit / ternary → block-splitting ─────────────────────────
@@ -312,7 +324,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                             rhs: Box::new(rhs_val),
                         }
                     } else {
-                        Expr::Var("__opaque".to_string())
+                        opaque()
                     };
                     builder.push_stmt(Stmt::Assign {
                         var: name.clone(),
@@ -328,7 +340,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                         let (rhs, value) = if assign.operator.is_assign() {
                             (rhs_val.clone(), rhs_val)
                         } else {
-                            let opaque = Expr::Var("__opaque".to_string());
+                            let opaque = opaque();
                             (opaque.clone(), opaque)
                         };
                         builder.push_stmt(Stmt::MemberWrite {
@@ -367,7 +379,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
             .map(|e| lower_expr(e, builder))
             .unwrap_or(Expr::Lit(Prim::Unit)),
 
-        _ => Expr::Var("__opaque".to_string()),
+        _ => opaque(),
     }
 }
 
@@ -1042,7 +1054,7 @@ mod tests {
 
     #[test]
     fn exotic_compound_havocs_target() {
-        // `x %= 3`: `%` has no faithful IrBinOp → havoc to `__opaque` (Top),
+        // `x %= 3`: `%` has no faithful IrBinOp → havoc to opaque ⊤,
         // never silently aliased onto `Add`.
         let cfg = build("function f() { let x = 9; x %= 3; }");
         let assigns = entry_assigns(&cfg);
@@ -1051,7 +1063,7 @@ mod tests {
             .find(|(v, _)| v == "x")
             .expect("expected Assign for x");
         assert!(
-            matches!(rhs, Expr::Var(v) if v == "__opaque"),
+            matches!(rhs, Expr::SummaryVal(SummaryValue::Top)),
             "exotic compound must havoc, got {rhs:?}"
         );
     }
