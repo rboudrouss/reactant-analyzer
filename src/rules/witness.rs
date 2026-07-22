@@ -223,8 +223,7 @@ pub fn note(
 }
 
 // ── Callee-name effect classification ────────────────────────────────────────
-// Moved from `lazy-init` (ADR-019): the sets are shared by every producer
-// that needs to judge a call by name.
+// Shared by every producer that needs to judge a call by name.
 
 /// Known side-effecting or async callee names, matched regardless of receiver.
 pub(crate) const EFFECTFUL: &[&str] = &[

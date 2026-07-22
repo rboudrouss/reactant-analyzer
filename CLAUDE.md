@@ -29,3 +29,4 @@ Analyseur statique React (niveau 3, interprétation abstraite) en Rust.
 
 - Décisions d'architecture : `docs/adr/`
 - TODO courant : `docs/TODO.md`
+- Dette technique (workarounds + architecture, chiffrés et séquencés) : `docs/tech-debt.md`

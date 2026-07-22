@@ -196,7 +196,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         .collect();
 
     // Fixpoint carrier: the product StateValue tracks every JS kind per label
-    // (ADR-015), so no per-type sub-store dispatch is needed anymore.
+    // (ADR-015), so one store holds all slots — no per-type sub-store dispatch.
     let mut state: StateStore<StateValue> = StateStore::bottom();
     let mut memo_store: MemoStore<StateValue> = MemoStore::new();
     let mut heap = initial_heap;
@@ -231,9 +231,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                         &mut init_memo_mut,
                         &mut heap,
                     );
-                    // A null/undefined init needs no TS-hint override anymore:
-                    // the product value joins the null slot with whatever the
-                    // setters write, and the num slot widens independently.
+                    // A null/undefined init needs no TS-hint override: the product
+                    // value joins the null slot with whatever the setters write,
+                    // and the num slot widens independently.
                     match init {
                         // Lazy initializer `useState(() => expr)`: React runs
                         // the thunk once at mount and stores its RETURN value

@@ -12,11 +12,11 @@ use std::collections::HashMap;
 use reactant::{
     domains::{
         impls::{Stability, StateValue, interval::Interval},
-        stores::{AbstractEnv, EnvVal, MemoStore, SharedStateStore, StateStore},
+        stores::{AbstractEnv, EnvVal, MemoStore, StateStore},
     },
     engine::{
-        AnalysisResult, AnalysisStats, ComponentCallGraph, ComponentRegistry, Config, HookRegistry,
-        ProgramAnalysisResult, RootStrategy, analyze_program,
+        ComponentRegistry, Config, HookRegistry, ProgramAnalysisResult, RootStrategy,
+        analyze_program,
     },
     ir::{
         cfg::{BasicBlock, CFG, Terminator},
@@ -57,20 +57,6 @@ fn leaf_component(name: &str) -> ComponentIR {
         render_cfg: empty_cfg(),
         hooks: vec![],
         module_consts: Default::default(),
-    }
-}
-
-fn make_prog(name: &str, result: AnalysisResult<StateValue>) -> ProgramAnalysisResult {
-    let mut components = HashMap::new();
-    components.insert(name.to_string(), result);
-    ProgramAnalysisResult {
-        components,
-        shared_state: SharedStateStore::new(),
-        call_graph: ComponentCallGraph::new(),
-        recursive_components: std::collections::HashSet::new(),
-        stats: AnalysisStats::default(),
-        file_table: Default::default(),
-        function_registry: Default::default(),
     }
 }
 

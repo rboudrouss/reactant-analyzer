@@ -392,7 +392,6 @@ mod tests {
             params: vec![],
             body_cfg: cfg_calling(callees),
             hooks: vec![],
-            next_label: 0,
         }
     }
 

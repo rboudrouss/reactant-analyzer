@@ -31,10 +31,6 @@ impl<D: AbstractDomain> MemoStore<D> {
     pub fn set(&mut self, label: HookLabel, val: D) {
         self.0.insert(label, val);
     }
-
-    pub fn bottom() -> Self {
-        Self::default()
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

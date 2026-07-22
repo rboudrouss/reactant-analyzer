@@ -22,8 +22,6 @@ pub enum HeapValue {
     },
     /// An abstract object: fields may be plain values or heap locations (for FnLit props).
     Obj(HashMap<Symbol, EnvVal<StateValue>>),
-    /// Reserved for future array-index domain.
-    Arr(Vec<StateValue>),
 }
 
 /// Abstract heap: maps allocation-site `ExprId`s to `HeapValue`s.
@@ -49,8 +47,8 @@ impl Heap {
     }
 
     /// Pointwise join: union of keys, join values at shared keys.
-    /// For `Fn` entries: body CFG is structural (same site → same body); captured is joined.
-    /// For `Obj`/`Arr`, values are joined per element.
+    /// `Fn` entries join their captured env (body CFG is structural: same site → same body);
+    /// `Obj` entries are kept structural.
     pub fn join(&self, other: &Self) -> Self {
         let mut result = self.0.clone();
         for (id, val) in &other.0 {
@@ -86,7 +84,7 @@ impl Heap {
                         );
                     }
                 }
-                Some(_) => {} // Obj/Arr: keep self (structural)
+                Some(_) => {} // Obj: keep self (structural)
             }
         }
         Heap(result)

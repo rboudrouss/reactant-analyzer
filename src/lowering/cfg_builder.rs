@@ -129,24 +129,6 @@ pub fn build_cfg(body: &FunctionBody, smap: &SourceMap) -> CFG {
     builder.into_cfg(0)
 }
 
-/// Build a CFG for an expression-bodied arrow (`x => expr`).
-///
-/// Oxc stores the implicit return as a single `ExpressionStatement`. Using
-/// [`build_cfg`] would discard it (no `Return`); here it's lowered as `Return`
-/// so the body yields its value (`map(x => x*2)`, `setN(c => c+1)`, …).
-pub fn build_expr_body_cfg(body: &FunctionBody, smap: &SourceMap) -> CFG {
-    let mut builder = BlockBuilder::new_with_smap(smap);
-    builder.start_block(0);
-    if let Some(Statement::ExpressionStatement(es)) = body.statements.first() {
-        let expr = lower_expr(&es.expression, &mut builder);
-        // `lower_expr` may open blocks (ternary, `&&`…); seal current block.
-        if !builder.is_terminated() {
-            builder.seal_with(Terminator::Return(expr));
-        }
-    }
-    builder.into_cfg(0)
-}
-
 // ── Statement lowering ────────────────────────────────────────────────────────
 
 fn lower_stmts(stmts: &[Statement], builder: &mut BlockBuilder) {

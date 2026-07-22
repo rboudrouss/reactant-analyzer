@@ -3,10 +3,7 @@ use std::collections::BTreeSet;
 
 use crate::{
     domains::AbstractDomain,
-    ir::{
-        expr::{Expr, SummaryValue},
-        types::{HookLabel, Symbol},
-    },
+    ir::types::{HookLabel, Symbol},
 };
 
 /// Threshold on `Versioned` label sets before widening to `VersionedTop`
@@ -170,30 +167,11 @@ impl AbstractDomain for Stability {
     }
 }
 
-impl Stability {
-    /// Static stability of an expression, without an environment.
-    /// Used as a fast path when the value is structurally determined.
-    pub fn from_expr_static(expr: &Expr) -> Stability {
-        match expr {
-            Expr::Lit(_) => Stability::Stable,
-            Expr::ObjectLit { .. } => Stability::PerRender,
-            Expr::ArrayLit { .. } => Stability::PerRender,
-            Expr::FnLit { .. } => Stability::PerRender,
-            Expr::StateSetter(_) => Stability::Stable,
-            Expr::SummaryVal(SummaryValue::StableRef) => Stability::Stable,
-            Expr::SummaryVal(SummaryValue::UnstableRef) => Stability::PerRender,
-            Expr::SummaryVal(SummaryValue::Top) => Stability::Unknown,
-            _ => Stability::Unknown,
-        }
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::expr::{Expr, Prim};
 
     fn v(labels: &[(&str, HookLabel)]) -> Stability {
         Stability::Versioned(labels.iter().map(|(c, l)| (c.to_string(), *l)).collect())
@@ -380,92 +358,5 @@ mod tests {
                 assert_eq!(a.widen(&b), a.join(&b), "widen({a:?}, {b:?}) ≠ join");
             }
         }
-    }
-
-    // ── from_expr_static ──────────────────────────────────────────────────────
-
-    #[test]
-    fn literal_is_stable() {
-        assert_eq!(
-            Stability::from_expr_static(&Expr::Lit(Prim::Int(0))),
-            Stability::Stable
-        );
-        assert_eq!(
-            Stability::from_expr_static(&Expr::Lit(Prim::Bool(true))),
-            Stability::Stable
-        );
-        assert_eq!(
-            Stability::from_expr_static(&Expr::Lit(Prim::Null)),
-            Stability::Stable
-        );
-    }
-
-    #[test]
-    fn object_lit_is_per_render() {
-        assert_eq!(
-            Stability::from_expr_static(&Expr::ObjectLit {
-                id: crate::ir::types::ExprId(0),
-                fields: vec![]
-            }),
-            Stability::PerRender
-        );
-    }
-
-    #[test]
-    fn array_lit_is_per_render() {
-        assert_eq!(
-            Stability::from_expr_static(&Expr::ArrayLit {
-                id: crate::ir::types::ExprId(0),
-                elems: vec![]
-            }),
-            Stability::PerRender
-        );
-    }
-
-    #[test]
-    fn fn_lit_is_per_render() {
-        use crate::ir::cfg::{BasicBlock, CFG, Terminator};
-        let mut blocks = std::collections::HashMap::new();
-        blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: vec![],
-                term: Terminator::Unreachable,
-            },
-        );
-        let cfg = CFG {
-            entry: 0,
-            blocks,
-            edges: vec![],
-        };
-        assert_eq!(
-            Stability::from_expr_static(&Expr::FnLit {
-                id: crate::ir::types::ExprId(0),
-                params: vec![],
-                body_cfg: std::sync::Arc::new(cfg)
-            }),
-            Stability::PerRender
-        );
-    }
-
-    #[test]
-    fn state_setter_is_stable() {
-        assert_eq!(
-            Stability::from_expr_static(&Expr::StateSetter(0)),
-            Stability::Stable
-        );
-        assert_eq!(
-            Stability::from_expr_static(&Expr::StateSetter(99)),
-            Stability::Stable
-        );
-    }
-
-    #[test]
-    fn var_is_unknown() {
-        assert_eq!(
-            Stability::from_expr_static(&Expr::Var("x".to_string())),
-            Stability::Unknown
-        );
     }
 }

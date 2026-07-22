@@ -242,8 +242,7 @@ pub(super) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec<ChurnEdge
                 // Re-runs after every render → its own write re-triggers it.
                 // Top-level calls only (`block_id` set): a write nested in a
                 // callback may be event-driven (`addEventListener`) — not
-                // self-sustaining. Auto-run callbacks (`.then`) are a known
-                // FN here, matching their pre-F5b silence.
+                // self-sustaining. Auto-run callbacks (`.then`) are a known FN here.
                 if call.block_id.is_some() {
                     push(
                         call.node.clone(),

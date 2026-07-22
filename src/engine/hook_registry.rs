@@ -43,15 +43,6 @@ impl HookRegistry {
         matches.into_iter().next().and_then(|k| self.hooks.get(k))
     }
 
-    pub fn contains(&self, key: &HookKey) -> bool {
-        self.hooks.contains_key(key)
-    }
-
-    #[doc(hidden)]
-    pub fn contains_name(&self, name: &Symbol) -> bool {
-        self.hooks.keys().any(|(_, n)| n == name)
-    }
-
     pub fn all_keys(&self) -> Vec<HookKey> {
         let mut keys: Vec<HookKey> = self.hooks.keys().cloned().collect();
         keys.sort();
@@ -101,7 +92,6 @@ mod tests {
             params: vec![],
             body_cfg: trivial_cfg(),
             hooks: vec![],
-            next_label: 0,
         }
     }
 

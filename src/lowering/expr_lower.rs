@@ -867,11 +867,10 @@ mod tests {
 
     #[test]
     fn concise_arrow_body_returns_its_expression() {
-        // Regression: a concise-body arrow (`c => c + 1`) must lower its implicit
-        // return into a `Return` terminator carrying the expression. The old bug
-        // lowered it as a value-discarding `ExprStmt` (terminator `Unreachable`),
-        // so the body evaluated to Bottom and functional-updater infinite loops
-        // (`setCount(c => c + 1)`) went undetected.
+        // A concise-body arrow (`c => c + 1`) must lower its implicit return into a
+        // `Return` terminator carrying the expression; otherwise the body evaluates
+        // to Bottom and functional-updater infinite loops (`setCount(c => c + 1)`)
+        // go undetected.
         let cfg = build("function f() { const cb = (c) => c + 1; return cb; }");
         let entry = cfg.blocks.get(&cfg.entry).unwrap();
         let body = match entry.stmts.first() {
@@ -933,7 +932,7 @@ mod tests {
 
     #[test]
     fn reassignment_emits_assign() {
-        // `i = i + 1` must write back to `i` (previously the target was dropped).
+        // `i = i + 1` must write back to `i` via a `Stmt::Assign`.
         let cfg = build("function f() { let i = 0; i = i + 1; }");
         let assigns = entry_assigns(&cfg);
         assert!(

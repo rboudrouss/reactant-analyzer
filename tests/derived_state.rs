@@ -4,16 +4,7 @@
 //! and `setB` is not called anywhere else.  Should be replaced by `useMemo` or
 //! inlined into the render body.
 
-use oxc_allocator::Allocator;
-use oxc_parser::{ParseOptions, Parser};
-use oxc_span::SourceType;
-
-use reactant::{
-    domains::StateValueTransfer,
-    engine::{Config, analyze_component},
-    lowering::lower_program,
-    rules::{DerivedState, Rule},
-};
+use reactant::rules::{DerivedState, Rule};
 
 fn make_prog(
     name: &str,
@@ -30,25 +21,6 @@ fn make_prog(
         file_table: Default::default(),
         function_registry: Default::default(),
     }
-}
-
-fn run(src: &str) -> Vec<reactant::engine::AnalysisResult<reactant::domains::StateValue>> {
-    let alloc = Allocator::default();
-    let ret = Parser::new(&alloc, src, SourceType::tsx())
-        .with_options(ParseOptions::default())
-        .parse();
-    assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
-    let components = lower_program(
-        &ret.program,
-        src,
-        std::path::Path::new("test.tsx"),
-        &mut Default::default(),
-    );
-    assert!(!components.is_empty(), "no component detected");
-    components
-        .into_iter()
-        .map(|comp| analyze_component(comp, &StateValueTransfer, &Config::default()))
-        .collect()
 }
 
 fn derived_state_hits(src: &str) -> usize {

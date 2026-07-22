@@ -152,14 +152,9 @@ impl<D: AbstractDomain> AbstractEnv<D> {
         }
     }
 
-    /// Pointwise widening. Used for back-edge merging in `analyze_cfg`.
-    pub fn widen(&self, other: &Self) -> Self {
-        self.widen_with(other, &[])
-    }
-
-    /// Threshold ("up-to") pointwise widening (ADR-014). Back-edge merging in
-    /// `analyze_cfg` passes the component's threshold set so loop-counter bounds
-    /// jump to the guard constant instead of ±∞.
+    /// Threshold ("up-to") pointwise widening (ADR-014). Back-edge merging
+    /// passes the component's threshold set so loop-counter bounds jump to the
+    /// guard constant instead of ±∞.
     pub fn widen_to(&self, other: &Self, thresholds: &[f64]) -> Self {
         self.widen_with(other, thresholds)
     }

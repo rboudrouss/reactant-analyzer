@@ -47,12 +47,6 @@ impl FunctionRegistry {
         self.functions.contains_key(key)
     }
 
-    pub fn all_keys(&self) -> Vec<FunctionKey> {
-        let mut keys: Vec<FunctionKey> = self.functions.keys().cloned().collect();
-        keys.sort();
-        keys
-    }
-
     pub fn all_functions(&self) -> impl Iterator<Item = &FunctionIR> {
         self.functions.values()
     }

@@ -44,7 +44,7 @@ pub struct StateValue {
 }
 
 impl StateValue {
-    // ── Constructors (one per kind, mirroring the old enum variants) ──────────
+    // ── Constructors (one per kind) ───────────────────────────────────────────
 
     pub fn number(i: Interval) -> Self {
         StateValue {
@@ -155,7 +155,6 @@ impl StateValue {
     }
 
     /// Exact setter identity, only when the value can be nothing else.
-    /// Mirrors the old exact `ComponentSetter { .. }` match.
     pub fn as_setter(&self) -> Option<(&Symbol, &HookLabel)> {
         if self.num.is_bottom()
             && self.boolean == BoolVal::Bottom
@@ -206,15 +205,14 @@ impl StateValue {
 
     /// Derive a `Stability` approximation from this value.
     ///
-    /// Per-kind mapping (same as the pre-ADR-015 flat lattice), combined with
-    /// *motion-wins* priority: a slot known to be in motion across renders
-    /// (non-point number interval, per-render-fresh reference) makes the whole
-    /// value `PerRender` even if another slot is individually stable — a state
-    /// that widened through `null ∪ number[0,+∞)` genuinely changes every
-    /// render. (`PerRender` here is kind-agnostic: "may change every render",
-    /// not necessarily a reference — ADR-017.)
+    /// Per-kind mapping combined with *motion-wins* priority: a slot known to be
+    /// in motion across renders (non-point number interval, per-render-fresh
+    /// reference) makes the whole value `PerRender` even if another slot is
+    /// individually stable — a state that widened through `null ∪ number[0,+∞)`
+    /// genuinely changes every render. (`PerRender` here is kind-agnostic: "may
+    /// change every render", not necessarily a reference — ADR-017.)
     /// The residual `other` slot forces `Unknown` (an opaque value must never
-    /// claim definite (in)stability — Top stayed Unknown before ADR-015 too).
+    /// claim definite (in)stability).
     ///
     /// Used by rules and `recompute_memo` that still reason in stability terms.
     pub fn to_stability(&self) -> Stability {
@@ -961,8 +959,8 @@ mod tests {
 
     #[test]
     fn component_setter_join_different_loses_identity_stays_stable() {
-        // Old lattice collapsed to Reference(Stable); the product keeps the
-        // setter slot at ⊤ — still Stable, identity lost.
+        // Joining distinct setters keeps the setter slot at ⊤ — still Stable,
+        // identity lost.
         for j in [
             cs("Foo", 0).join(&cs("Bar", 0)),
             cs("Foo", 0).join(&cs("Foo", 1)),

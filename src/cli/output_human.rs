@@ -1,5 +1,5 @@
-//! Human-readable renderer — same layout as the historical CLI, plus colors
-//! and a per-component file suffix.
+//! Human-readable renderer: findings grouped per component, colorized, with a
+//! per-component file suffix.
 
 use std::path::Path;
 

@@ -154,7 +154,7 @@ pub struct AnalysisResult<D: AbstractDomain> {
     /// Number of outer fixpoint iterations before convergence.  Useful for
     /// --verbose output and for Info diagnostics about analysis depth.
     pub iterations: usize,
-    /// Final heap after convergence: allocation-site → HeapValue (Fn/Obj/Arr).
+    /// Final heap after convergence: allocation-site → HeapValue (Fn/Obj).
     ///
     /// Primarily used by rules (e.g. `CrossSetterInRender`) to resolve Loc
     /// variables in `block_states` to their function bodies and captured envs.

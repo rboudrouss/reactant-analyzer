@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use crate::ir::{
     cfg::CFG,
     hooks::HookEntry,
-    types::{HookLabel, Symbol, Var},
+    types::{Symbol, Var},
 };
 
 /// Lowered representation of a user-defined custom hook function.
@@ -17,6 +17,4 @@ pub struct HookIR {
     pub body_cfg: CFG,
     /// Hook calls declared inside this hook's body (useState, useEffect, etc.).
     pub hooks: Vec<HookEntry>,
-    /// First available label after extraction used to compute offset when inlining.
-    pub next_label: HookLabel,
 }

@@ -112,8 +112,7 @@ fn eval_state_value(
         }
         Expr::StateSetter(label) => StateValue::component_setter(ctx.component.clone(), *label),
         Expr::MemoVal(label) | Expr::CallbackVal(label) => ctx.memo.get(*label),
-        // Call-site marker for value-less hooks: same abstraction as the
-        // `Lit(Unit)` it replaced.
+        // Call-site marker for value-less hooks; reads as `undefined`.
         Expr::HookMarker(_) => StateValue::undefined(),
 
         Expr::ObjectLit { .. } => StateValue::reference(Stability::PerRender),
@@ -1028,9 +1027,9 @@ mod tests {
 
     #[test]
     fn back_edge_in_fnlit_body_returns_top() {
-        // A back edge no longer bails the whole body; instead the return value is
-        // conservatively joined to Top. This empty self-loop has no statements, so
-        // it exercises the forced-Top-on-back-edge path with no side effects.
+        // A back edge conservatively joins the return value to Top. This empty
+        // self-loop has no statements, so it exercises the forced-Top-on-back-edge
+        // path with no side effects.
         let mut blocks = std::collections::HashMap::new();
         blocks.insert(
             0,
@@ -2084,9 +2083,9 @@ mod tests {
     #[test]
     fn depth_guard_still_holds_with_back_edge() {
         // Same f4 → f3 → f2 → f1 → setN chain as above, but every wrapper body is
-        // a loop (back edge). Removing the bail means loop bodies are now traversed,
-        // so the test confirms (a) it terminates and (b) MAX_INLINE_DEPTH still caps
-        // the chain: setN at depth 4 is never reached → state stays Bottom.
+        // a loop (back edge). Loop bodies are traversed, so the test confirms (a) it
+        // terminates and (b) MAX_INLINE_DEPTH still caps the chain: setN at depth 4
+        // is never reached → state stays Bottom.
         let (mut env, mut state, mut memo) = empty();
         env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));

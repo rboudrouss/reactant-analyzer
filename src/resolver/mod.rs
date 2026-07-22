@@ -1,6 +1,5 @@
-//! File discovery and import resolution.
-//!
 //! File discovery and import resolution extension points.
+//!
 //! Default implementations cover the common case (recursive `*.ts*` discovery
 //! + relative imports with `.ts`/`.tsx`/index fallbacks).
 //! See `docs/plugins.md` for an end-to-end plugin example.

@@ -37,8 +37,8 @@ impl FileTable {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceRange {
     pub file: FileId,
-    pub line: u32, // 1-indexed
-    pub col: u32,  // 0-indexed
+    pub line: u32,
+    pub col: u32,
 }
 
 /// Everything the lowering needs to mint [`SourceRange`]s for one file:
@@ -58,7 +58,7 @@ impl SourceMap {
     }
 
     /// Map with no line table: `span_at` always yields `None`. For manual-IR
-    /// tests that don't care about spans (the historical `&[]` line_starts).
+    /// tests that don't care about spans.
     pub fn empty() -> Self {
         Self {
             line_starts: Vec::new(),

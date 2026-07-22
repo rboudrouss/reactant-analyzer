@@ -69,8 +69,6 @@ pub struct InterCtx<'a> {
     pub analyze_child: AnalyzeChildFn,
     /// User-defined custom hook registry for inlining (None = no inlining).
     pub hook_registry: Option<&'a HookRegistry>,
-    /// Custom hooks currently being inlined (recursion guard).
-    pub hook_inline_stack: RefCell<Vec<Symbol>>,
 }
 
 impl<'a> InterCtx<'a> {
@@ -98,7 +96,6 @@ impl<'a> InterCtx<'a> {
             config,
             analyze_child,
             hook_registry,
-            hook_inline_stack: RefCell::new(vec![]),
         }
     }
 
@@ -119,24 +116,11 @@ impl<'a> InterCtx<'a> {
             config: self.config,
             analyze_child: self.analyze_child,
             hook_registry: self.hook_registry,
-            hook_inline_stack: RefCell::new(vec![]),
         }
     }
 
     pub fn is_recursive(&self, name: &Symbol) -> bool {
         self.call_stack.borrow().contains(name) || &self.component_name == name
-    }
-
-    pub fn is_hook_recursive(&self, name: &Symbol) -> bool {
-        self.hook_inline_stack.borrow().contains(name)
-    }
-
-    pub fn push_hook_inline(&self, name: Symbol) {
-        self.hook_inline_stack.borrow_mut().push(name);
-    }
-
-    pub fn pop_hook_inline(&self) {
-        self.hook_inline_stack.borrow_mut().pop();
     }
 }
 

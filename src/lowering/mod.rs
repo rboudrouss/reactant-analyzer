@@ -237,7 +237,6 @@ pub fn lower_custom_hooks_with_resolver(
                 params,
                 body_cfg,
                 hooks,
-                next_label,
             }
         })
         .collect()
