@@ -427,6 +427,39 @@ et corrige l'imprécision latente. **765 tests**, clippy inchangé (23).
 
 ---
 
+## Partie 10 — Bilan campagne « grands thèmes structurels » (2026-07)
+
+**Faits** (chacun son commit, suite verte, clippy inchangé) :
+- **Thème 1** — splice CFG unifié + α-renommage (`ir/splice.rs`). Fixe le FN hook multi-bloc +
+  le FP `useMermaidRenderer`. (Partie 8.)
+- **Thème 4** — `recompute_memo` reçoit les vrais stores. (Partie 9.)
+- **Thème 8 (partie cycle)** — vocabulaire churn extrait dans `rules/churn.rs`, dépendance
+  circulaire `churn_graph ↔ infinite_loop` cassée. (ARCH 18.)
+- **Thème 12 (partie sentinelles + classification)** — `__opaque`/`this` → `SummaryVal(Top)`
+  (ARCH 9) ; prédicat de nom de hook unique `is_hook_name` → fin de la double classification
+  `useful` (ARCH 5 partiel).
+
+**Décidés « NE PAS FAIRE » (documentés, raison soundness/P2)** :
+- **Thème 7 (retirer le diamant `&&`/`||`)** — le diamant modélise les effets de bord
+  court-circuités (`a && setX()`) ; l'aplatir risque un FN. Narrowing relationnel déjà perdu.
+  `expand_guard` (WA 6) marche et est testé. (Voir Thème 7 ci-dessus.)
+- **Thème 8 (fusionner les deux bras churn)** — partitions disjointes ; fusionner = FN + perte
+  du diag Info.
+- **Thème 9 « ever-written bit »** — `may_written_slots` syntaxique est une sur-approximation
+  *sound* ; une version observée au point fixe risquerait de sous-compter les écritures → FN.
+
+**Restent (grands, comportement-changeant → design + tests dédiés, hors passe soundness)** :
+- **Thème 5/10** — `ComponentResolution` partagé + `eval_in`/`eval_for_effect`. Risqué : les
+  résolutions par-règle divergent subtilement, en unifier une change potentiellement des
+  diagnostics (choisir « celle qui fait autorité »).
+- **Thème 9** — combinateurs de lattice (`Flat`/`BoundedPowerset`, déjà différés P2 en Partie 6)
+  et surtout retrait du choke-point `to_stability` (ARCH 3) : chaque règle raisonne à travers,
+  le remplacer par des prédicats produit direct doit être exactement équivalent sous peine de
+  FN/FP.
+- **Thème 12** — charpente `detect`/`Candidate` des détecteurs (E4) : structure divergente.
+
+---
+
 ## Annexe A — 18 workarounds
 
 `P2 = ⚠️` : justification > 1 paragraphe (viole le principe 2).
