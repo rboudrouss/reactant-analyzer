@@ -132,11 +132,15 @@ pub trait Transfer {
 
     /// Compute the abstract value for a memoized hook from its dependency list.
     /// Called by the engine after each render-pass to refresh the memo store.
+    ///
+    /// `ctx` carries the real analysis stores so a dep can be evaluated through
+    /// the normal path (`MemoVal`/heap reads resolve against the current
+    /// fixpoint state instead of a fabricated empty store).
     fn recompute_memo(
         &self,
         component: &crate::ir::types::Symbol,
         deps: &[Expr],
         env: &AbstractEnv<Self::Domain>,
-        ctx: &dyn QueryContext,
+        ctx: &mut context::AnalysisCtx<Self::Domain>,
     ) -> Self::Domain;
 }

@@ -261,7 +261,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     }
 
     loop {
-        let state_store = state.clone();
+        let mut state_store = state.clone();
 
         // ── Render pass ───────────────────────────────────────────────────────
         // Use initial_env as entry: child analyses start with props bound.
@@ -288,23 +288,36 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         block_states = bs;
 
         // ── Recompute memo store from exit env ────────────────────────────────
+        // Deps evaluate through the normal path against the real fixpoint stores
+        // (so a memo depending on another memo, or on a heap field, resolves
+        // instead of reading a fabricated ⊥ store). Sets are deferred to a
+        // second pass so each recompute reads a consistent snapshot — the
+        // fixpoint converges any memo-to-memo dependency across iterations.
         env_exit = exit_env(&render_cfg, &block_states);
-        for hook in &hooks {
-            match hook {
-                HookEntry::Memo { label, deps, .. } => {
-                    memo_store.set(
+        let memo_updates: Vec<(HookLabel, StateValue)> = {
+            let null_query = NullCtx;
+            let mut memo_ctx = AnalysisCtx {
+                component: comp_name.clone(),
+                state: &mut state_store,
+                memo: &mut memo_store,
+                heap: &mut heap,
+                query: &null_query,
+                inter,
+            };
+            hooks
+                .iter()
+                .filter_map(|hook| match hook {
+                    HookEntry::Memo { label, deps, .. }
+                    | HookEntry::Callback { label, deps, .. } => Some((
                         *label,
-                        transfer.recompute_memo(&comp_name, deps, &env_exit, &NullCtx),
-                    );
-                }
-                HookEntry::Callback { label, deps, .. } => {
-                    memo_store.set(
-                        *label,
-                        transfer.recompute_memo(&comp_name, deps, &env_exit, &NullCtx),
-                    );
-                }
-                _ => {}
-            }
+                        transfer.recompute_memo(&comp_name, deps, &env_exit, &mut memo_ctx),
+                    )),
+                    _ => None,
+                })
+                .collect()
+        };
+        for (label, val) in memo_updates {
+            memo_store.set(label, val);
         }
 
         // ── Effect passes ─────────────────────────────────────────────────────

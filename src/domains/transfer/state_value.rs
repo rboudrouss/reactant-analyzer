@@ -4,10 +4,10 @@ use std::collections::HashMap;
 
 use crate::{
     domains::{
-        AbstractDomain, AnalysisCtx, QueryContext, Transfer,
+        AbstractDomain, AnalysisCtx, Transfer,
         impls::{BoolVal, Interval, SetterVal, Stability, StateValue, StrConst},
         interp::exec_stmt_with_callbacks,
-        stores::{AbstractEnv, EnvVal, Heap, HeapValue, MemoStore, StateStore},
+        stores::{AbstractEnv, EnvVal, Heap, HeapValue},
     },
     ir::{
         expr::{BinOp, Expr, Prim, UnaryOp},
@@ -46,28 +46,26 @@ impl Transfer for StateValueTransfer {
         component: &Symbol,
         deps: &[Expr],
         env: &AbstractEnv<StateValue>,
-        _ctx: &dyn QueryContext,
+        ctx: &mut AnalysisCtx<StateValue>,
     ) -> StateValue {
         if deps.is_empty() {
             return StateValue::reference(Stability::Stable);
         }
         let stability = deps.iter().fold(Stability::Bottom, |acc, dep| {
-            // Structural shortcut (ADR-017): a dep that IS a state slot
-            // changes only at that slot's setter events — `Versioned({l})`
-            // by React semantics, no store read needed (the null ctx below
-            // has an empty store, which would erase the labels via ⊤).
-            let mut peeled = dep;
-            while let Expr::TSAnnotated(inner, _) = peeled {
-                peeled = inner;
-            }
-            if let Expr::StateVal(l) = peeled {
+            // Structural projection (ADR-017): a dep that IS a state slot
+            // versions the memo by that slot regardless of the slot's kind —
+            // it changes only at the slot's setter events, `Versioned({l})`.
+            // `eval_state_value` can't express this: version labels live on
+            // the reference slot, so a numeric/bool state dep would collapse
+            // to a plain `Stable`/`PerRender` via `to_stability`. Not a store
+            // workaround — a genuine memo-side projection.
+            if let Expr::StateVal(l) = dep.peel_ts() {
                 return acc.join(&Stability::versioned_by(component.clone(), *l));
             }
-            let mut s = StateStore::bottom();
-            let mut m = MemoStore::new();
-            let mut h = crate::domains::stores::Heap::new();
-            let mut tmp_ctx = AnalysisCtx::null(component.clone(), &mut s, &mut m, &mut h);
-            let val = eval_state_value(dep, env, &mut tmp_ctx);
+            // Every other dep is evaluated through the normal path against the
+            // real fixpoint stores in `ctx` (so `MemoVal`, heap fields, and
+            // compound deps resolve instead of reading a fabricated ⊥ store).
+            let val = eval_state_value(dep, env, ctx);
             // A dep whose reference kind is already versioned keeps its
             // labels (`to_stability` would erase them if another slot is ⊤).
             acc.join(

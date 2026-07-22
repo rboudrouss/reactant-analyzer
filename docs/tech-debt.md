@@ -363,6 +363,32 @@ d'Annexe C **ne sont PAS** absorbés — voir ci-dessus (alias utilisateur = FN 
 
 ---
 
+## Partie 9 — Thème 4 : `recompute_memo` reçoit les vrais stores — APPLIQUÉ (2026-07)
+
+`recompute_memo` fabriquait un `StateStore::bottom()` + `MemoStore::new()` vides à chaque
+dep non-`StateVal` (`_ctx: &dyn QueryContext` ignoré). Une dep qui est un **autre mémo**
+(`useMemo(.., [autreMemo])`) ou un champ de heap lisait donc ⊥ → stabilité fausse (FN/FP
+latent).
+
+**Fix** : la signature du trait devient `recompute_memo(.., ctx: &mut AnalysisCtx<Self::Domain>)`.
+Les deps passent par `eval_state_value` contre les **vrais** stores du point fixe. Au site
+d'appel (`fixpoint.rs`), un `AnalysisCtx` est construit sur `&mut state_store/&mut
+memo_store/&mut heap` ; les `set` sont **différés** (2e passe) pour que chaque recompute lise
+un snapshot cohérent — le point fixe converge les dépendances mémo→mémo.
+
+**Gardé** : le raccourci `Expr::StateVal(l) → Versioned({l})`. Ce n'est PAS un workaround de
+store : `eval_state_value` ne peut pas l'exprimer — les labels de version vivent sur le slot
+`reference`, donc une dep d'état **numérique/booléen** s'effondrerait en `Stable`/`PerRender`
+via `to_stability` (respectivement FN et FP). C'est une projection côté-mémo légitime.
+
+Neutre sur la suite observable (les cas mal évalués — deps `MemoVal`/champ-heap — ne
+faisaient pas basculer un diagnostic), mais retire la fabrication de stores vides (WA 8, P2)
+et corrige l'imprécision latente. **765 tests**, clippy inchangé (23).
+*(regression : `tests/memo_recompute.rs`.)* Non absorbé : ARCH 8 (le motif
+`versioned_reference().unwrap_or_else(to_stability)` reste inline — Thème 9 / D3).
+
+---
+
 ## Annexe A — 18 workarounds
 
 `P2 = ⚠️` : justification > 1 paragraphe (viole le principe 2).
@@ -376,7 +402,7 @@ d'Annexe C **ne sont PAS** absorbés — voir ci-dessus (alias utilisateur = FN 
 | 5 | med | — | Summary-registry hook handled by dropping the HookEntry and string-patching the CFG binding | `engine/fixpoint.rs:639` | domain |
 | 6 | med | ⚠️ | Rule reconstructs short-circuit boolean lowering by scanning CFG blocks | `rules/infinite_loop.rs:985` | lowering |
 | 7 | med | — | converges_once_written re-implements dominator/guard-context analysis inside the rule | `rules/infinite_loop.rs:910` | engine |
-| 8 | med | ⚠️ | recompute_memo fabricates empty stores, then patches around the label loss it causes | `domains/transfer/state_value.rs:44` | engine |
+| 8 | ✅ fait | recompute_memo fabricates empty stores (Thème 4 : reçoit `&mut AnalysisCtx`, deps évaluées contre les vrais stores ; le raccourci `StateVal → Versioned` reste — projection mémo légitime, pas un workaround de store) | `domains/transfer/state_value.rs`, `engine/fixpoint.rs` | engine |
 | 9 | medium | — | SequenceExpression lowers only its last operand -> side effects in earlier operands lost | `lowering/expr_lower.rs:319` | lowering |
 | 10 | medium | — | collect_subscriptions_in_expr hand-rolls the central expr walk with a lossy catch-all | `lowering/hook_extractor.rs:46` | lowering |
 | 11 | med | ⚠️ | Interval narrowing assumes integer steps (v±1), unsound for float states | `domains/impls/interval.rs:162` | domain |
