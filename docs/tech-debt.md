@@ -448,12 +448,13 @@ et corrige l'imprécision latente. **765 tests**, clippy inchangé (23).
 - **Thème 9 « ever-written bit »** — `may_written_slots` syntaxique est une sur-approximation
   *sound* ; une version observée au point fixe risquerait de sous-compter les écritures → FN.
 
-**Restent (grands, comportement-changeant → design + tests dédiés, hors passe soundness)** :
-- **Thème 5/10** — traité en Partie 11 (2026-07) : `eval_in` + chemin d'effet unique FAITS ;
-  `ComponentResolution` global REFUSÉ (unsound — voir Partie 11).
-- **Thème 9** — traité en Partie 12 (2026-07) : macro `flat_lattice!` FAITE (D5) ; `BoundedPowerset`
-  (D6), retrait `to_stability` (ARCH 3), D3, D7 REFUSÉS/déjà-faits — voir Partie 12.
-- **Thème 12** — charpente `detect`/`Candidate` des détecteurs (E4) : structure divergente.
+**Tous les grands thèmes structurels sont désormais traités** (chacun sa partie dédiée) :
+- **Thème 5/10** — Partie 11 : `eval_in` + chemin d'effet unique FAITS ; `ComponentResolution`
+  global REFUSÉ (unsound).
+- **Thème 9** — Partie 12 : macro `flat_lattice!` FAITE (D5) ; `BoundedPowerset` (D6), retrait
+  `to_stability` (ARCH 3), D3, D7 REFUSÉS/déjà-faits.
+- **Thème 12** — Partie 13 : walker de détecteur partagé FAIT (E4) + stub `extract_arrow_hook_name`
+  retiré (WA 17) ; ExportDefault gardé par-détecteur (pas de changement de classification).
 
 ---
 
@@ -577,6 +578,42 @@ lecture, un seul item est un vrai gain ouvert.
 
 ---
 
+## Partie 13 — Thème 12 : walker de détecteur partagé — APPLIQUÉ (2026-07)
+
+Les détecteurs `component`/`hook`/`utility` recopiaient le **même** parcours top-level
+(dispatch sur déclarations de fonction, bindings `const`/`let` arrow & function-expression,
+exports nommés + construction de `Candidate`), ne différant que par un prédicat de
+classification et par le traitement d'`export default`.
+
+### FAIT
+
+- **`lowering/detector.rs` (E4)** (commit *shared detector walker*) : `detect_fns(program,
+  classify, default)` où `classify: fn(&FnItem) -> bool` est le prédicat par-détecteur et
+  `default` un handler `export default` optionnel exécuté **en ordre source**. Chaque détecteur
+  se réduit à son `classify` (+ son handler default pour component/hook). `FnItem` porte
+  l'annotation de type retour (la règle TS du component continue) ; hook/utility l'ignorent.
+- **Stub `extract_arrow_hook_name` retiré (WA 17)** : no-op renvoyant `None` qui code-mort la
+  branche default-export-arrow du hook detector. Branche supprimée (un arrow anonyme n'a pas de
+  nom de hook à matcher → comportement identique).
+
+### Neutralité (pas de changement de classification — la crainte de la note initiale)
+
+La note Thème 12 disait « non fusionnable sans changer une classification (ExportDefault, ordre
+des checks) ». Vrai pour une fusion naïve ; évité ici en **gardant ExportDefault par-détecteur** :
+component nomme l'export anonyme et prend les arrows, hook ne prend que les déclarations de
+fonction nommées, utility ignore les default exports (`default: None`). La divergence est
+**conservée**, pas collapsée → aucune classification ne change. Ordre source préservé (default
+traité dans la même passe). **767 tests** (+1 : composant arrow default-export anonyme), clippy
+inchangé (23), fmt clean.
+
+**Bilan campagne** : tous les grands thèmes structurels (1, 4, 5/10, 7, 8, 9, 12) sont traités.
+Leçon récurrente confirmée sur 6 thèmes : les items tech-debt à gros effort ont souvent une
+**prémisse optimiste fausse** (duplication apparente = variantes délibérées load-bearing, ou
+« choke-point nuisible » qui ne cause aucun FN/FP). Mapper avant de corriger ; ne jamais
+introduire de FN pour dédupliquer.
+
+---
+
 ## Annexe A — 18 workarounds
 
 `P2 = ⚠️` : justification > 1 paragraphe (viole le principe 2).
@@ -599,7 +636,7 @@ lecture, un seul item est un vrai gain ouvert.
 | 14 | requalifié | Per-rule `resolve_setter_aliases` — **plus** un artefact d'inlining depuis Thème 1 (le splice α-renomme, n'émet plus d'alias de param). Reste nécessaire pour les alias **écrits par l'utilisateur** (`const s1 = setX; s2 = s1`) sur le render CFG → le retirer = FN. N'est donc plus de la dette « inlining ». | `rules/churn_graph.rs`, `rules/mod.rs` | rule |
 | 15 | low | — | Hard 100-iteration cap force-widens all labels as a termination backstop | `engine/fixpoint.rs:388` | engine |
 | 16 | ✅ fait | Engine fabricates a synthetic Stmt::ExprStmt to run a Return terminator's side effects (Thème 10 : `Transfer::exec_expr_effects`, plus de fabrication — Partie 11) | `engine/cfg_analyzer.rs`, `domains/interp/interpreter.rs` | engine |
-| 17 | low | — | extract_arrow_hook_name is a no-op stub that dead-codes its caller branch | `lowering/hook_detector.rs:125` | lowering |
+| 17 | ✅ fait | extract_arrow_hook_name is a no-op stub that dead-codes its caller branch — retiré (Thème 12, Partie 13) : branche default-export-arrow du hook detector supprimée (arrow anonyme = pas de nom de hook) | `lowering/hook_detector.rs` | lowering |
 | 18 | ✅ fait | ExprStmt(CompApp) re-dispatched to eval_expr after exec_stmt_core (Thème 10 : le re-dispatch vit dans `exec_expr_effects`, défini une fois — Partie 11) | `domains/interp/interpreter.rs` | engine |
 
 ## Annexe B — 36 findings d'architecture
@@ -610,7 +647,7 @@ lecture, un seul item est un vrai gain ouvert.
 | 2 | requalifié | Self-churn arm and the churn graph : **PAS** des implémentations parallèles — partitions disjointes (with-deps same-slot vs no-deps/cross-slot), gardes `continue` explicites. Fusionner = FN + perte du diag Info. Conservées séparées (Thème 8). | `rules/infinite_loop.rs`, `rules/churn.rs` |
 | 3 | requalifié | Rules reason through the legacy Stability lattice via to_stability — **non-problème** (Thème 9, Partie 12) : `to_stability` est une projection légitime testée ; les prédicats première-classe (`is_stable`/`is_unstable`) existent déjà ; les 2 appelants directs (`describe_value`, `frozen`) en ont légitimement besoin. Aucun FN/FP. | `domains/impls/state_value.rs` |
 | 4 | requalifié | Every rule reconstructs the same per-component resolution context — **prémisse fausse** (Thème 5, Partie 11) : les résolutions divergent délibérément (scope render-only vs render+bodies, re-seeding par-effet, résolution cross-composant). Les briques communes sont déjà partagées (`all_setter_labels`/`state_val_labels`/`collect_fn_bindings`/`pos_key`/`peel_ts`/`body_cfg` dans `rules/mod.rs`) ; un contexte unique serait unsound (force un scope) ou un sac d'indirection. Factoring actuel confirmé bon. | `rules/mod.rs` |
-| 5 | ✅ partiel | Three detector modules diverge on the naming predicate (**FAIT** : `is_hook_name` partagé, Thème 12) — plus de double classification `useful`. Reste : scaffolding `Candidate`/dispatch (dedup non-neutre, charpente divergente). | `lowering/mod.rs`, `lowering/hook_detector.rs`, `lowering/utility_detector.rs` |
+| 5 | ✅ fait | Three detector modules diverge (naming predicate + scaffolding) — `is_hook_name` partagé PUIS walker partagé `detect_fns(program, classify, default)` dans `lowering/detector.rs` (Thème 12, Partie 13). ExportDefault gardé par-détecteur → neutre. | `lowering/detector.rs`, `component_detector.rs`, `hook_detector.rs`, `utility_detector.rs` |
 | 6 | M | Engine hard-codes a rule-specific second analysis pass (effect_setter_writes) | `engine/fixpoint.rs`, `rules/infinite_loop.rs`, `engine/analysis_result.rs` |
 | 7 | M | analyze_component_impl is a ~370-line monolith mixing seeding, expansion, fixpoint, and result assembly | `engine/fixpoint.rs` |
 | 8 | M | ADR-017 'keep Versioned labels, degrade kind to Top' logic is copy-pasted across three sites | `domains/transfer/state_value.rs` |
@@ -692,7 +729,7 @@ walkers sont donc « déléguer à l'helper déjà présent », coût ~0.
 | E1 3 registres `(PathBuf,Symbol)→IR` | 3 types ≈ 12 méthodes | `engine/component_registry`, `hook_registry`, `function_registry` (struct+`new`+`from`+`get`+`get_by_name`+`all_keys`+`all_names`+`len`) | `KeyedRegistry<V>` dans `registry/keyed.rs` ; 3 newtypes fins (~180→~40 l) | ARCH 12, Thème 11 |
 | E2 marche CFG ré-implémente `CFG::for_each_expr` | 6 | `ir/free_vars:45/86`, `engine/root_detector:80`, `engine/symbol_graph:252`, `engine/fixpoint:806`, `lowering/hook_extractor:174` | appeler `cfg.for_each_expr(&mut …)` (existe déjà) | ARCH 19, Thème 6 |
 | E3 récursion `Expr` ré-implémente `Expr::for_each_child` | 6 | `ir/free_vars:176/220`, `engine/symbol_graph:276`, `engine/root_detector:106`, `engine/fixpoint:829`, `ir/expr:210` (`is_call_free`) | déléguer le bras défaut à `for_each_child` ; ajouter `Expr::any_child` pour `is_call_free` | ARCH 19/13, Thème 6 |
-| E4 3 détecteurs : scaffolding + trio JSX + prédicat de nom | `Candidate` ×3, dispatch ×3, trio JSX verbatim ×2 (~54 l), nom ×3 | `component_detector`, `hook_detector`, `utility_detector` (`utility_detector:143` : « duplicate of component_detector logic ») | `lowering/detector.rs` : 1 `Candidate`, 1 `detect(program,classify)`, 1 `body_returns_jsx`, 1 `NameKind::classify` (~250→~120 l) | ARCH 5, Thème 12 |
+| E4 3 détecteurs : scaffolding + trio JSX + prédicat de nom — ✅ FAIT | `Candidate` ×3, dispatch ×3, nom ×3 | `component_detector`, `hook_detector`, `utility_detector` | `lowering/detector.rs` : 1 `detect_fns(program, classify, default)` + `FnItem` ; `Candidate`/`body_returns_jsx`/`is_hook_name` déjà partagés ; ExportDefault par-détecteur (neutre) — Partie 13 | ARCH 5, Thème 12 |
 | E5 🆕 préambule pipeline de lowering | 2 complets + 1 partiel | `lowering/mod:207` (`lower_custom_hooks`) ≈ `:260` (`lower_program`) ; `utility_lowerer:32` partiel | `build_import_ctx(program,file,resolver)` + `lower_body(candidate,&smap,&imports)` | 🆕 |
 | E6 fallback `get().or_else(get_by_name)` + zip param→arg | 2 + 2 | `fixpoint:1264/629`, `:1327/676` | absorbé par `Registry::resolve` (E1) + Thème 1. NB : `remap.rs` et `splice_one_call` **ne sont pas** des clones (remap décale `HookLabel`, splice décale `BlockId`+réécrit terminators) | Thèmes 1/11 |
 
