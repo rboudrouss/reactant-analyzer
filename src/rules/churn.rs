@@ -115,14 +115,8 @@ pub(super) fn eval_in_exit_env(
     expr: &Expr,
     comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
 ) -> crate::domains::StateValue {
-    super::eval_in_stores(
-        expr,
-        &comp_result.exit_env(),
-        &comp_result.component,
-        &comp_result.state_store,
-        &comp_result.memo_store,
-        &mut Heap::new(),
-    )
+    use super::ConvergedEval;
+    comp_result.eval_in(&comp_result.exit_env(), expr, &mut Heap::new())
 }
 
 /// Must the argument of a setter call store a fresh reference?

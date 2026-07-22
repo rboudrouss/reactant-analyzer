@@ -131,14 +131,8 @@ impl Rule for UnnecessaryRerender {
                     let arg_val = args
                         .first()
                         .map(|a| {
-                            super::eval_in_stores(
-                                a,
-                                &empty_env,
-                                &result.component,
-                                &result.state_store,
-                                &result.memo_store,
-                                &mut crate::domains::Heap::new(),
-                            )
+                            use super::ConvergedEval;
+                            result.eval_in(&empty_env, a, &mut crate::domains::Heap::new())
                         })
                         .unwrap_or(StateValue::top());
 

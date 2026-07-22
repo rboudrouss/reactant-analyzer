@@ -554,12 +554,6 @@ fn eval_with_heap(expr: &Expr, comp: &AnalysisResult<StateValue>) -> StateValue 
     // props-param-rooted `FieldAccess` resolves through the props `Obj` rather
     // than degrading to ⊤. The heap choice is exactly what distinguishes this
     // wrapper — it must stay comp-seeded here.
-    super::eval_in_stores(
-        expr,
-        &comp.exit_env(),
-        &comp.component,
-        &comp.state_store,
-        &comp.memo_store,
-        &mut comp.heap.clone(),
-    )
+    use super::ConvergedEval;
+    comp.eval_in(&comp.exit_env(), expr, &mut comp.heap.clone())
 }

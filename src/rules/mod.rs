@@ -717,6 +717,36 @@ pub(crate) fn eval_in_stores(
     )
 }
 
+/// Evaluate an expression against a component's *converged* stores.
+///
+/// The convenience layer over [`eval_in_stores`] for the common case where the
+/// state store, memo store and component name all come from one
+/// [`AnalysisResult`]: it binds those three and leaves `env` and `heap` — the
+/// two things that genuinely vary per call site — as explicit parameters.
+///
+/// The `heap` seed stays a caller argument on purpose: an empty
+/// [`Heap::new()`] and the component's converged `heap.clone()` are NOT
+/// interchangeable (the converged heap resolves a props-rooted `FieldAccess`
+/// instead of degrading to ⊤), so each site keeps its own choice.
+/// [`eval_in_stores`] remains the primitive for the mount-time site, which
+/// evaluates against *empty* stores rather than a converged result.
+pub(crate) trait ConvergedEval {
+    fn eval_in(&self, env: &AbstractEnv<StateValue>, expr: &Expr, heap: &mut Heap) -> StateValue;
+}
+
+impl ConvergedEval for AnalysisResult<StateValue> {
+    fn eval_in(&self, env: &AbstractEnv<StateValue>, expr: &Expr, heap: &mut Heap) -> StateValue {
+        eval_in_stores(
+            expr,
+            env,
+            &self.component,
+            &self.state_store,
+            &self.memo_store,
+            heap,
+        )
+    }
+}
+
 /// `true` when every dep in `deps` is unstable in the render-exit env.
 /// Empty `deps` returns `false` (`[]` is mount-only, not all-unstable).
 pub(super) fn all_deps_unstable(deps: &[Expr], result: &AnalysisResult<StateValue>) -> bool {
@@ -725,15 +755,9 @@ pub(super) fn all_deps_unstable(deps: &[Expr], result: &AnalysisResult<StateValu
     }
     let exit_env = result.exit_env();
     deps.iter().all(|dep| {
-        eval_in_stores(
-            dep,
-            &exit_env,
-            &result.component,
-            &result.state_store,
-            &result.memo_store,
-            &mut Heap::new(),
-        )
-        .is_unstable()
+        result
+            .eval_in(&exit_env, dep, &mut Heap::new())
+            .is_unstable()
     })
 }
 
