@@ -272,20 +272,7 @@ mod tests {
     };
 
     fn single_block_cfg(stmts: Vec<Stmt>) -> CFG {
-        let mut blocks = HashMap::new();
-        blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts,
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            },
-        );
-        CFG {
-            entry: 0,
-            blocks,
-            edges: vec![],
-        }
+        crate::test_support::single_block_cfg(stmts)
     }
 
     #[test]

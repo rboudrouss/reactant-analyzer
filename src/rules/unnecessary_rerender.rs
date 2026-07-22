@@ -1,10 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    domains::{
-        AbstractDomain, AbstractEnv, AnalysisCtx, BoolVal, MemoStore, StateStore, StateValue,
-        StateValueTransfer, Transfer,
-    },
+    domains::{AbstractDomain, AbstractEnv, BoolVal, MemoStore, StateStore, StateValue},
     engine::ProgramAnalysisResult,
     ir::{
         expr::Expr,
@@ -65,13 +62,15 @@ impl Rule for UnnecessaryRerender {
             .iter()
             .filter_map(|h| {
                 if let HookEntry::State { label, init, .. } = h {
-                    let mut s = empty_state.clone();
-                    let mut m = empty_memo.clone();
-                    let mut h = crate::domains::Heap::new();
-                    let val = StateValueTransfer.eval_expr(
+                    // Mount-time init eval: empty stores + empty heap, NOT the
+                    // converged bundle.
+                    let val = super::eval_in_stores(
                         init,
                         &empty_env,
-                        &mut AnalysisCtx::null(result.component.clone(), &mut s, &mut m, &mut h),
+                        &result.component,
+                        &empty_state,
+                        &empty_memo,
+                        &mut crate::domains::Heap::new(),
                     );
                     Some((*label, val))
                 } else {
@@ -132,18 +131,13 @@ impl Rule for UnnecessaryRerender {
                     let arg_val = args
                         .first()
                         .map(|a| {
-                            let mut s = result.state_store.clone();
-                            let mut m = result.memo_store.clone();
-                            let mut h = crate::domains::Heap::new();
-                            StateValueTransfer.eval_expr(
+                            super::eval_in_stores(
                                 a,
                                 &empty_env,
-                                &mut AnalysisCtx::null(
-                                    result.component.clone(),
-                                    &mut s,
-                                    &mut m,
-                                    &mut h,
-                                ),
+                                &result.component,
+                                &result.state_store,
+                                &result.memo_store,
+                                &mut crate::domains::Heap::new(),
                             )
                         })
                         .unwrap_or(StateValue::top());
@@ -214,7 +208,7 @@ mod tests {
         domains::StateValueTransfer,
         engine::{Config, ProgramAnalysisResult, analyze_component},
         ir::{
-            cfg::{BasicBlock, CFG, Terminator},
+            cfg::CFG,
             component::ComponentIR,
             expr::{Expr, Prim},
             hooks::HookEntry,
@@ -222,41 +216,15 @@ mod tests {
         },
         rules::Rule,
     };
-    use std::collections::{HashMap, HashSet};
 
     fn prog(
         r: &crate::engine::AnalysisResult<crate::domains::StateValue>,
     ) -> ProgramAnalysisResult {
-        use crate::domains::stores::SharedStateStore;
-        use crate::engine::program_result::{AnalysisStats, ComponentCallGraph};
-        let mut components = HashMap::new();
-        components.insert("C".to_string(), r.clone());
-        ProgramAnalysisResult {
-            components,
-            shared_state: SharedStateStore::default(),
-            call_graph: ComponentCallGraph::new(),
-            recursive_components: HashSet::new(),
-            stats: AnalysisStats::default(),
-            file_table: Default::default(),
-            function_registry: Default::default(),
-        }
+        crate::test_support::prog("C", r.clone())
     }
 
     fn effect_cfg(stmts: Vec<Stmt>) -> CFG {
-        let mut blocks = HashMap::new();
-        blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts,
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            },
-        );
-        CFG {
-            entry: 0,
-            blocks,
-            edges: vec![],
-        }
+        crate::test_support::single_block_cfg(stmts)
     }
 
     fn component_with(init: Expr, effect_stmts: Vec<Stmt>, deps: Option<Vec<Expr>>) -> ComponentIR {
@@ -285,25 +253,12 @@ mod tests {
                 span: None,
             },
         ];
-        let mut blocks = HashMap::new();
-        blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: render_stmts,
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            },
-        );
         ComponentIR {
             file: std::path::PathBuf::new(),
             name: "C".to_string(),
             param: "props".to_string(),
             dom_props: Default::default(),
-            render_cfg: CFG {
-                entry: 0,
-                blocks,
-                edges: vec![],
-            },
+            render_cfg: crate::test_support::single_block_cfg(render_stmts),
             hooks,
             module_consts: Default::default(),
         }

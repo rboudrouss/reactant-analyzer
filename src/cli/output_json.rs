@@ -111,15 +111,6 @@ fn severity_str(s: Severity) -> &'static str {
     }
 }
 
-fn relative_display(path: &Path) -> String {
-    std::env::current_dir()
-        .ok()
-        .and_then(|cwd| path.strip_prefix(&cwd).ok())
-        .unwrap_or(path)
-        .display()
-        .to_string()
-}
-
 fn to_json_note<'a>(n: &'a Note, files: &FileTable) -> JsonNote<'a> {
     let mut j = JsonNote {
         message: &n.message,
@@ -128,7 +119,7 @@ fn to_json_note<'a>(n: &'a Note, files: &FileTable) -> JsonNote<'a> {
         file: n
             .range
             .and_then(|r| files.path(r.file))
-            .map(relative_display),
+            .map(super::display_relative),
         line: n.range.map(|r| r.line),
         col: n.range.map(|r| r.col),
         var: None,
@@ -204,7 +195,7 @@ fn to_json_diag<'a>(
         rule: d.rule,
         severity: severity_str(d.severity),
         component,
-        file: file.map(relative_display),
+        file: file.map(super::display_relative),
         line: d.range.map(|r| r.line),
         col: d.range.map(|r| r.col),
         hook_label: d.hook_label,
@@ -232,7 +223,7 @@ pub fn render(report: &CheckReport) {
             .parse_errors
             .iter()
             .map(|(f, m)| JsonParseError {
-                file: relative_display(f),
+                file: super::display_relative(f),
                 message: m.clone(),
             })
             .collect(),

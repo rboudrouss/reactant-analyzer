@@ -129,23 +129,10 @@ mod tests {
             stores::{MemoStore, StateStore},
         },
         engine::AnalysisResult,
-        ir::{
-            cfg::{BasicBlock, CFG, Terminator},
-            expr::{Expr, Prim},
-        },
     };
     use std::collections::HashMap;
 
     fn trivial_result() -> AnalysisResult<StateValue> {
-        let mut blocks = HashMap::new();
-        blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            },
-        );
         AnalysisResult {
             component: "C".to_string(),
             file: Default::default(),
@@ -162,11 +149,7 @@ mod tests {
             widen_trace: HashMap::new(),
             inline_origins: Vec::new(),
             effect_setter_writes: StateStore::bottom(),
-            render_cfg: CFG {
-                entry: 0,
-                blocks,
-                edges: vec![],
-            },
+            render_cfg: crate::test_support::single_block_cfg(vec![]),
             hooks: vec![],
             iterations: 1,
             heap: crate::domains::stores::Heap::new(),

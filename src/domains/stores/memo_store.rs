@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use crate::{domains::AbstractDomain, ir::types::HookLabel};
 
+use super::map_get_or;
+
 /// Maps each `useMemo` / `useCallback` hook label to its current abstract value.
 ///
 /// Unlike `StateStore`, this store is NOT a fixpoint subject it is fully
@@ -24,7 +26,7 @@ impl<D: AbstractDomain> MemoStore<D> {
 
     /// Returns `D::top()` for labels not yet computed (conservative).
     pub fn get(&self, label: HookLabel) -> D {
-        self.0.get(&label).cloned().unwrap_or_else(D::top)
+        map_get_or(&self.0, &label, D::top)
     }
 
     /// Store a precomputed domain value for a label.

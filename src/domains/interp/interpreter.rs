@@ -9,7 +9,6 @@ use crate::{
     ir::{
         cfg::{CFG, EdgeKind, Terminator},
         expr::Expr,
-        free_vars::compute_free_vars,
         stmt::{MemberKey, Stmt},
         types::BlockId,
     },
@@ -126,19 +125,7 @@ fn exec_stmt_core<T: Transfer>(
             } = rhs
             {
                 env.extend_loc(var.clone(), *id);
-                let free = compute_free_vars(body_cfg);
-                let captured = free
-                    .iter()
-                    .filter_map(|v| env.lookup(v).as_state_value().map(|sv| (v.clone(), sv)))
-                    .collect();
-                ctx.heap.insert(
-                    *id,
-                    HeapValue::Fn {
-                        params: params.clone(),
-                        body_cfg: Arc::clone(body_cfg),
-                        captured,
-                    },
-                );
+                ctx.heap.alloc_fn(*id, params, body_cfg, env);
             }
             // Propagate heap locs for variable aliases (e.g. destructuring preamble:
             // `let __obj = __p0` where __p0 carries the props heap location).
@@ -188,19 +175,7 @@ fn exec_stmt_core<T: Transfer>(
             } = rhs
             {
                 env.extend_loc(var.clone(), *id);
-                let free = compute_free_vars(body_cfg);
-                let captured = free
-                    .iter()
-                    .filter_map(|v| env.lookup(v).as_state_value().map(|sv| (v.clone(), sv)))
-                    .collect();
-                ctx.heap.insert(
-                    *id,
-                    HeapValue::Fn {
-                        params: params.clone(),
-                        body_cfg: Arc::clone(body_cfg),
-                        captured,
-                    },
-                );
+                ctx.heap.alloc_fn(*id, params, body_cfg, env);
             }
             // Propagate heap locs from field access (e.g. `let f = props.onClick`
             // where onClick is a FnLit stored in the parent's heap under the Obj).
@@ -233,19 +208,7 @@ fn exec_stmt_core<T: Transfer>(
                 body_cfg,
             } = rhs
             {
-                let free = compute_free_vars(body_cfg);
-                let captured = free
-                    .iter()
-                    .filter_map(|v| env.lookup(v).as_state_value().map(|sv| (v.clone(), sv)))
-                    .collect();
-                ctx.heap.insert(
-                    *id,
-                    HeapValue::Fn {
-                        params: params.clone(),
-                        body_cfg: Arc::clone(body_cfg),
-                        captured,
-                    },
-                );
+                ctx.heap.alloc_fn(*id, params, body_cfg, env);
             }
             let val = transfer.eval_expr(rhs, env, ctx);
             if let (Expr::Var(v), MemberKey::Field(field)) = (obj, key)

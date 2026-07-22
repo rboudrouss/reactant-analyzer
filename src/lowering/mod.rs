@@ -4,6 +4,7 @@ pub mod expr_lower;
 pub mod hook_detector;
 pub mod hook_extractor;
 pub mod import_resolution;
+pub mod jsx_detect;
 pub mod utility_detector;
 pub mod utility_lowerer;
 
@@ -21,8 +22,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use oxc_ast::ast::{
-    BindingPattern, Declaration, Expression, ImportDeclarationSpecifier, Program, Statement,
-    VariableDeclarationKind,
+    BindingPattern, Declaration, Expression, FormalParameters, FunctionBody,
+    ImportDeclarationSpecifier, Program, Statement, VariableDeclarationKind,
 };
 
 use crate::{
@@ -34,6 +35,17 @@ use crate::{
     },
     resolver::{DefaultImportResolver, ImportResolver},
 };
+
+/// A top-level function picked out by one of the detectors, ready for lowering:
+/// its binding name, parameter list, and body. Shared by the component, hook,
+/// and utility detectors — they differ in how they *classify* a function, not
+/// in this output shape (all three feed `build_fn_body_cfg(params, body)`).
+#[derive(Debug)]
+pub struct Candidate<'a> {
+    pub name: String,
+    pub params: &'a FormalParameters<'a>,
+    pub body: &'a FunctionBody<'a>,
+}
 
 /// Build a map from locally-bound hook name → NPM package source for every
 /// named import in `program`.

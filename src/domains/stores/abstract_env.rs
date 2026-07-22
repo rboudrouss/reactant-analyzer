@@ -5,6 +5,8 @@ use crate::{
     ir::types::{ExprId, HookLabel, Var},
 };
 
+use super::{leq_pointwise, map_get_or};
+
 /// An entry in the abstract environment.
 ///
 /// Variables bound to locally-defined function/object/array literals carry
@@ -110,7 +112,7 @@ impl<D: AbstractDomain> AbstractEnv<D> {
     fn join_stabs(a: &HashMap<Var, D>, b: &HashMap<Var, D>) -> HashMap<Var, D> {
         let mut out = HashMap::new();
         for (k, v) in a {
-            let w = b.get(k).cloned().unwrap_or_else(D::top);
+            let w = map_get_or(b, k, D::top);
             out.insert(k.clone(), v.join(&w));
         }
         for k in b.keys() {
@@ -162,7 +164,7 @@ impl<D: AbstractDomain> AbstractEnv<D> {
     fn widen_with(&self, other: &Self, thresholds: &[f64]) -> Self {
         let mut stabs = HashMap::new();
         for (k, v) in &self.stabs {
-            let w = other.stabs.get(k).cloned().unwrap_or_else(D::top);
+            let w = map_get_or(&other.stabs, k, D::top);
             stabs.insert(k.clone(), v.widen_to(&w, thresholds));
         }
         for k in other.stabs.keys() {
@@ -195,11 +197,8 @@ impl<D: AbstractDomain> AbstractEnv<D> {
     /// `self ⊑ other` in the lattice order.
     pub fn leq(&self, other: &Self) -> bool {
         for (k, a) in &self.stabs {
-            let b = other.stabs.get(k).cloned().unwrap_or_else(D::bottom);
-            if !matches!(
-                a.partial_cmp(&b),
-                Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)
-            ) {
+            let b = map_get_or(&other.stabs, k, D::bottom);
+            if !leq_pointwise(a, &b) {
                 return false;
             }
         }

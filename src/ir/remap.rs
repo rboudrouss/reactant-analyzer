@@ -267,24 +267,17 @@ fn remap_hook_entry(entry: HookEntry, offset: HookLabel) -> HookEntry {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
 
     use super::*;
     use crate::ir::{
-        cfg::{BasicBlock, Terminator},
+        cfg::Terminator,
         expr::{Expr, Prim},
         hooks::HookEntry,
         stmt::Stmt,
     };
 
     fn single_block_cfg(stmts: Vec<Stmt>, term: Terminator) -> CFG {
-        let mut blocks = HashMap::new();
-        blocks.insert(0, BasicBlock { id: 0, stmts, term });
-        CFG {
-            entry: 0,
-            blocks,
-            edges: vec![],
-        }
+        crate::test_support::single_block_cfg_term(stmts, term)
     }
 
     #[test]

@@ -1,7 +1,7 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::ir::{component::ComponentIR, types::Symbol};
+use crate::registry::KeyedRegistry;
 
 /// Maps `(file, name)` pairs to their lowered IR, built from all files before
 /// analysis. The composite key prevents two components with the same name in
@@ -9,9 +9,7 @@ use crate::ir::{component::ComponentIR, types::Symbol};
 pub type ComponentKey = (PathBuf, Symbol);
 
 #[derive(Debug, Default)]
-pub struct ComponentRegistry {
-    components: HashMap<ComponentKey, ComponentIR>,
-}
+pub struct ComponentRegistry(KeyedRegistry<ComponentIR>);
 
 impl ComponentRegistry {
     pub fn new() -> Self {
@@ -19,17 +17,16 @@ impl ComponentRegistry {
     }
 
     pub fn from_components(comps: Vec<ComponentIR>) -> Self {
-        let mut registry = Self::new();
-        for comp in comps {
-            let key = (comp.file.clone(), comp.name.clone());
-            registry.components.insert(key, comp);
-        }
-        registry
+        Self(KeyedRegistry::from_keyed(
+            comps
+                .into_iter()
+                .map(|comp| ((comp.file.clone(), comp.name.clone()), comp)),
+        ))
     }
 
     /// Primary lookup: by full `(file, name)` key.
     pub fn get(&self, key: &ComponentKey) -> Option<&ComponentIR> {
-        self.components.get(key)
+        self.0.get(key)
     }
 
     /// Legacy lookup by name only returns the first match (sorted by file path)
@@ -40,19 +37,13 @@ impl ComponentRegistry {
     /// `(file, name)` resolution via `ImportResolver`.
     #[doc(hidden)]
     pub fn get_by_name(&self, name: &Symbol) -> Option<&ComponentIR> {
-        let mut matches: Vec<&ComponentKey> =
-            self.components.keys().filter(|(_, n)| n == name).collect();
-        matches.sort();
-        matches
-            .into_iter()
-            .next()
-            .and_then(|k| self.components.get(k))
+        self.0.get_by_name(name)
     }
 
     /// All components defined with `name`, across every file.
     pub fn find_all_by_name(&self, name: &Symbol) -> Vec<&ComponentIR> {
         let mut found: Vec<&ComponentIR> = self
-            .components
+            .0
             .iter()
             .filter(|((_, n), _)| n == name)
             .map(|(_, c)| c)
@@ -64,32 +55,25 @@ impl ComponentRegistry {
     /// Iterate every distinct component, sorted by `(file, name)` for
     /// deterministic order.
     pub fn all_components(&self) -> impl Iterator<Item = &ComponentIR> {
-        let mut keys: Vec<&ComponentKey> = self.components.keys().collect();
-        keys.sort();
-        keys.into_iter().map(move |k| &self.components[k])
+        self.0.values_sorted()
     }
 
     /// Distinct component names (deduplicated across files), sorted.
     pub fn all_names(&self) -> Vec<Symbol> {
-        let mut names: Vec<Symbol> = self.components.keys().map(|(_, n)| n.clone()).collect();
-        names.sort();
-        names.dedup();
-        names
+        self.0.all_names()
     }
 
     /// Iterate every `(file, name)` key, sorted.
     pub fn all_keys(&self) -> Vec<ComponentKey> {
-        let mut keys: Vec<ComponentKey> = self.components.keys().cloned().collect();
-        keys.sort();
-        keys
+        self.0.all_keys()
     }
 
     pub fn len(&self) -> usize {
-        self.components.len()
+        self.0.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.components.is_empty()
+        self.0.is_empty()
     }
 
     /// Produce a stable display name for `(file, name)` that disambiguates
@@ -97,7 +81,7 @@ impl ComponentRegistry {
     /// `name@<file>` when it occurs in multiple files.
     pub fn display_name(&self, key: &ComponentKey) -> String {
         let (file, name) = key;
-        let count = self.components.keys().filter(|(_, n)| n == name).count();
+        let count = self.0.keys().filter(|(_, n)| n == name).count();
         if count <= 1 {
             name.clone()
         } else {
@@ -112,12 +96,12 @@ impl ComponentRegistry {
         match display.split_once('@') {
             Some((name, path)) => {
                 let key = (Path::new(path).to_path_buf(), name.to_string());
-                self.components.contains_key(&key).then_some(key)
+                self.0.contains(&key).then_some(key)
             }
             None => {
                 let name = display.to_string();
                 let mut matches: Vec<&ComponentKey> =
-                    self.components.keys().filter(|(_, n)| n == &name).collect();
+                    self.0.keys().filter(|(_, n)| n == &name).collect();
                 matches.sort();
                 matches.into_iter().next().cloned()
             }

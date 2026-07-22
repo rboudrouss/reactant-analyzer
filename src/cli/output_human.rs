@@ -1,12 +1,11 @@
 //! Human-readable renderer: findings grouped per component, colorized, with a
 //! per-component file suffix.
 
-use std::path::Path;
-
 use reactant::rules::Severity;
 
 use super::check::{CheckReport, ComponentReport};
 use super::color::Palette;
+use super::display_relative;
 
 /// Under `--info`, list the applicable checks that ran on this component and
 /// found nothing — positive assurance, distinct from an unchecked region.
@@ -20,16 +19,6 @@ fn render_safe_checks(comp: &ComponentReport, info: bool, p: &Palette) {
             p.green, p.reset, p.dim, s.rule, p.reset, s.message
         );
     }
-}
-
-/// Render `path` relative to the current directory when possible.
-fn display_path(path: &Path) -> String {
-    std::env::current_dir()
-        .ok()
-        .and_then(|cwd| path.strip_prefix(&cwd).ok())
-        .unwrap_or(path)
-        .display()
-        .to_string()
 }
 
 /// `show_clean` unhides components with no findings; `info` adds Info
@@ -56,7 +45,7 @@ pub fn render(report: &CheckReport, no_color: bool, show_clean: bool, info: bool
         let file_suffix = comp
             .file
             .as_deref()
-            .map(|f| format!("  {}{}{}", p.dim, display_path(f), p.reset))
+            .map(|f| format!("  {}{}{}", p.dim, display_relative(f), p.reset))
             .unwrap_or_default();
 
         if comp.diagnostics.is_empty() {
@@ -115,7 +104,7 @@ pub fn render(report: &CheckReport, no_color: bool, show_clean: bool, info: bool
                         .range
                         .map(|r| match report.file_table.path(r.file) {
                             Some(f) if comp.file.as_deref() != Some(f) => {
-                                format!(" ({}:{}:{})", display_path(f), r.line, r.col)
+                                format!(" ({}:{}:{})", display_relative(f), r.line, r.col)
                             }
                             _ => format!(" (line {}:{})", r.line, r.col),
                         })

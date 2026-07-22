@@ -171,19 +171,7 @@ pub fn extract_handlers(cfg: &CFG, hooks: &mut Vec<HookEntry>, next_label: &mut 
     }
 
     let mut found: Vec<HookEntry> = Vec::new();
-    for block in cfg.blocks.values() {
-        for stmt in &block.stmts {
-            let expr = match stmt {
-                Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => rhs,
-                Stmt::MemberWrite { rhs, .. } => rhs,
-                Stmt::ExprStmt(e, _) => e,
-            };
-            collect_handlers_in_expr(expr, &var_bodies, &mut found, next_label);
-        }
-        if let Terminator::Return(e) = &block.term {
-            collect_handlers_in_expr(e, &var_bodies, &mut found, next_label);
-        }
-    }
+    cfg.for_each_expr(&mut |e| collect_handlers_in_expr(e, &var_bodies, &mut found, next_label));
     hooks.extend(found);
 }
 

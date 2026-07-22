@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{domains::AbstractDomain, ir::types::HookLabel};
 
+use super::{leq_pointwise, map_get_or};
+
 /// Maps each `useState` / `useReducer` hook label to the current abstract value
 /// of its state.  Starts at `D::bottom()` and is refined by detected setter
 /// calls during the worklist analysis.
@@ -21,7 +23,7 @@ impl<D: AbstractDomain> StateStore<D> {
 
     /// Returns `D::bottom()` for labels not yet updated by any setter call.
     pub fn get(&self, label: HookLabel) -> D {
-        self.0.get(&label).cloned().unwrap_or_else(D::bottom)
+        map_get_or(&self.0, &label, D::bottom)
     }
 
     /// Monotone update: `self[label] = self[label] ⊔ val`.
@@ -30,36 +32,33 @@ impl<D: AbstractDomain> StateStore<D> {
         self.0.insert(label, current.join(&val));
     }
 
-    /// Pointwise join of two stores.
-    pub fn join(&self, other: &Self) -> Self {
+    /// Pointwise merge over the union of keys, absent keys read as `D::bottom`.
+    /// The per-key combinator `f` is the only thing `join`/`widen`/`widen_to`
+    /// differ by.
+    fn merge_with(&self, other: &Self, f: impl Fn(&D, &D) -> D) -> Self {
         let mut out = self.0.clone();
         for (&k, v) in &other.0 {
-            let cur = out.get(&k).cloned().unwrap_or_else(D::bottom);
-            out.insert(k, cur.join(v));
+            let cur = map_get_or(&out, &k, D::bottom);
+            out.insert(k, f(&cur, v));
         }
         StateStore(out)
+    }
+
+    /// Pointwise join of two stores.
+    pub fn join(&self, other: &Self) -> Self {
+        self.merge_with(other, |a, b| a.join(b))
     }
 
     /// Widening pointwise `D::widen`. Critical for interval domains where
     /// widen ≠ join (bounds jump to ±∞ instead of hull).
     pub fn widen(&self, other: &Self) -> Self {
-        let mut out = self.0.clone();
-        for (&k, v) in &other.0 {
-            let cur = out.get(&k).cloned().unwrap_or_else(D::bottom);
-            out.insert(k, cur.widen(v));
-        }
-        StateStore(out)
+        self.merge_with(other, |a, b| a.widen(b))
     }
 
     /// Threshold widening pointwise `D::widen_to`. Domains without thresholds
     /// (default impl) fall back to plain `widen`.
     pub fn widen_to(&self, other: &Self, thresholds: &[f64]) -> Self {
-        let mut out = self.0.clone();
-        for (&k, v) in &other.0 {
-            let cur = out.get(&k).cloned().unwrap_or_else(D::bottom);
-            out.insert(k, cur.widen_to(v, thresholds));
-        }
-        StateStore(out)
+        self.merge_with(other, |a, b| a.widen_to(b, thresholds))
     }
 
     /// Lattice bottom all labels have `D::bottom()`.
@@ -70,9 +69,8 @@ impl<D: AbstractDomain> StateStore<D> {
     /// `self ⊑ other`: for every label, `self.get(L) ≤ other.get(L)`.
     pub fn leq(&self, other: &Self) -> bool {
         for &k in self.0.keys() {
-            match self.get(k).partial_cmp(&other.get(k)) {
-                Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) => {}
-                _ => return false,
+            if !leq_pointwise(&self.get(k), &other.get(k)) {
+                return false;
             }
         }
         true

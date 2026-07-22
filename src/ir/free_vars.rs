@@ -1,12 +1,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use crate::ir::{
-    cfg::{CFG, Terminator},
-    expr::Expr,
-    stmt::Stmt,
-    types::Var,
-};
+use crate::ir::{cfg::CFG, expr::Expr, stmt::Stmt, types::Var};
 
 /// A read access rooted at a variable, refined by a chain of field names.
 ///
@@ -40,34 +35,15 @@ impl fmt::Display for AccessPath {
 /// Compute free variables of a CFG: variables read anywhere minus variables locally defined.
 pub fn compute_free_vars(cfg: &CFG) -> HashSet<Var> {
     let mut used: HashSet<Var> = HashSet::new();
-    let mut defined: HashSet<Var> = HashSet::new();
+    cfg.for_each_expr(&mut |e| collect_used_vars(e, &mut used));
 
+    // Locally-defined roots (`let`/assignment targets) are bound, not free.
+    let mut defined: HashSet<Var> = HashSet::new();
     for block in cfg.blocks.values() {
         for stmt in &block.stmts {
-            match stmt {
-                Stmt::Let { var, rhs, .. } => {
-                    collect_used_vars(rhs, &mut used);
-                    defined.insert(var.clone());
-                }
-                Stmt::Assign { var, rhs, .. } => {
-                    collect_used_vars(rhs, &mut used);
-                    defined.insert(var.clone());
-                }
-                // Writing `obj.f` reads `obj` (and the index); nothing is defined.
-                Stmt::MemberWrite { obj, key, rhs, .. } => {
-                    collect_used_vars(obj, &mut used);
-                    if let crate::ir::stmt::MemberKey::Index(idx) = key {
-                        collect_used_vars(idx, &mut used);
-                    }
-                    collect_used_vars(rhs, &mut used);
-                }
-                Stmt::ExprStmt(e, _) => collect_used_vars(e, &mut used),
+            if let Stmt::Let { var, .. } | Stmt::Assign { var, .. } = stmt {
+                defined.insert(var.clone());
             }
-        }
-        match &block.term {
-            Terminator::Branch { cond, .. } => collect_used_vars(cond, &mut used),
-            Terminator::Return(expr) => collect_used_vars(expr, &mut used),
-            _ => {}
         }
     }
 
@@ -81,34 +57,15 @@ pub fn compute_free_vars(cfg: &CFG) -> HashSet<Var> {
 /// the field-chain suffix so `missing-deps` can distinguish `x.a` from `x.b`.
 pub fn compute_free_paths(cfg: &CFG) -> HashSet<AccessPath> {
     let mut used: HashSet<AccessPath> = HashSet::new();
-    let mut defined: HashSet<Var> = HashSet::new();
+    cfg.for_each_expr(&mut |e| collect_used_paths(e, &mut used));
 
+    // Locally-defined roots are bound, not free (matches `compute_free_vars`).
+    let mut defined: HashSet<Var> = HashSet::new();
     for block in cfg.blocks.values() {
         for stmt in &block.stmts {
-            match stmt {
-                Stmt::Let { var, rhs, .. } => {
-                    collect_used_paths(rhs, &mut used);
-                    defined.insert(var.clone());
-                }
-                Stmt::Assign { var, rhs, .. } => {
-                    collect_used_paths(rhs, &mut used);
-                    defined.insert(var.clone());
-                }
-                // Writing `obj.f` reads `obj` (and the index); nothing is defined.
-                Stmt::MemberWrite { obj, key, rhs, .. } => {
-                    collect_used_paths(obj, &mut used);
-                    if let crate::ir::stmt::MemberKey::Index(idx) = key {
-                        collect_used_paths(idx, &mut used);
-                    }
-                    collect_used_paths(rhs, &mut used);
-                }
-                Stmt::ExprStmt(e, _) => collect_used_paths(e, &mut used),
+            if let Stmt::Let { var, .. } | Stmt::Assign { var, .. } = stmt {
+                defined.insert(var.clone());
             }
-        }
-        match &block.term {
-            Terminator::Branch { cond, .. } => collect_used_paths(cond, &mut used),
-            Terminator::Return(expr) => collect_used_paths(expr, &mut used),
-            _ => {}
         }
     }
 
@@ -175,6 +132,9 @@ fn extract_path<'e>(e: &'e Expr, side: &mut Vec<&'e Expr>) -> Option<(Var, Vec<S
 /// kernel of [`compute_free_paths`]; no local-definition subtraction).
 pub fn collect_used_paths(expr: &Expr, out: &mut HashSet<AccessPath>) {
     match expr {
+        // Member chains are read whole by `extract_path` (which peels
+        // TSAnnotated and records the maximal chain), recursing only into the
+        // off-chain sub-exprs it collects — never a generic child descent.
         Expr::Var(_) | Expr::FieldAccess { .. } | Expr::IndexAccess { .. } => {
             let mut side = Vec::new();
             if let Some((root, segments, _)) = extract_path(expr, &mut side) {
@@ -184,36 +144,16 @@ pub fn collect_used_paths(expr: &Expr, out: &mut HashSet<AccessPath>) {
                 collect_used_paths(s, out);
             }
         }
-        Expr::TSAnnotated(inner, _) => collect_used_paths(inner, out),
-        Expr::ObjectLit { fields, .. } => {
-            fields.iter().for_each(|(_, v)| collect_used_paths(v, out))
-        }
-        Expr::ArrayLit { elems, .. } => elems.iter().for_each(|e| collect_used_paths(e, out)),
+        // `for_each_child` does not cross `FnLit`; the capture set is the
+        // body's free paths minus the lambda's own params (shadowing).
         Expr::FnLit {
             params, body_cfg, ..
         } => {
-            // The lambda's own params shadow outer bindings (same as
-            // `collect_used_vars`): subtract them from the captured paths.
             let inner = compute_free_paths(body_cfg);
             out.extend(inner.into_iter().filter(|p| !params.contains(&p.root)));
         }
-        Expr::BinOp { lhs, rhs, .. } => {
-            collect_used_paths(lhs, out);
-            collect_used_paths(rhs, out);
-        }
-        Expr::UnaryOp { arg, .. } => collect_used_paths(arg, out),
-        Expr::Call { fn_, args } => {
-            collect_used_paths(fn_, out);
-            args.iter().for_each(|a| collect_used_paths(a, out));
-        }
-        Expr::CompApp { props, .. } => collect_used_paths(props, out),
-        Expr::NativeElem {
-            props, children, ..
-        } => {
-            collect_used_paths(props, out);
-            children.iter().for_each(|c| collect_used_paths(c, out));
-        }
-        _ => {}
+        // Everything else: structural descent via the canonical child walker.
+        _ => expr.for_each_child(&mut |c| collect_used_paths(c, out)),
     }
 }
 
@@ -222,44 +162,20 @@ pub fn collect_used_vars(expr: &Expr, out: &mut HashSet<Var>) {
         Expr::Var(v) => {
             out.insert(v.clone());
         }
-        Expr::ObjectLit { fields, .. } => {
-            fields.iter().for_each(|(_, v)| collect_used_vars(v, out))
-        }
-        Expr::ArrayLit { elems, .. } => elems.iter().for_each(|e| collect_used_vars(e, out)),
+        // `for_each_child` does not cross `FnLit`; the lambda's own params
+        // shadow outer bindings (`(open) => !open` reads no outer `open`).
         Expr::FnLit {
             params, body_cfg, ..
         } => {
-            // The lambda's own params shadow outer bindings: they are bound,
-            // not free, inside its body (`(open) => !open` reads no outer `open`).
             let mut inner = compute_free_vars(body_cfg);
             for p in params {
                 inner.remove(p);
             }
             out.extend(inner);
         }
-        Expr::FieldAccess { obj, .. } => collect_used_vars(obj, out),
-        Expr::IndexAccess { arr, idx } => {
-            collect_used_vars(arr, out);
-            collect_used_vars(idx, out);
-        }
-        Expr::BinOp { lhs, rhs, .. } => {
-            collect_used_vars(lhs, out);
-            collect_used_vars(rhs, out);
-        }
-        Expr::UnaryOp { arg, .. } => collect_used_vars(arg, out),
-        Expr::Call { fn_, args } => {
-            collect_used_vars(fn_, out);
-            args.iter().for_each(|a| collect_used_vars(a, out));
-        }
-        Expr::CompApp { props, .. } => collect_used_vars(props, out),
-        Expr::NativeElem {
-            props, children, ..
-        } => {
-            collect_used_vars(props, out);
-            children.iter().for_each(|c| collect_used_vars(c, out));
-        }
-        Expr::TSAnnotated(e, _) => collect_used_vars(e, out),
-        _ => {}
+        // Everything else (incl. member chains — every base is read here):
+        // structural descent via the canonical child walker.
+        _ => expr.for_each_child(&mut |c| collect_used_vars(c, out)),
     }
 }
 
@@ -268,27 +184,14 @@ pub fn collect_used_vars(expr: &Expr, out: &mut HashSet<Var>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::cfg::{BasicBlock, CFG, Terminator};
+    use crate::ir::cfg::{CFG, Terminator};
     use crate::ir::expr::Prim;
     use crate::ir::types::ExprId;
-    use std::collections::HashMap;
+
     use std::sync::Arc;
 
     fn single_return_cfg(expr: Expr) -> CFG {
-        let mut blocks = HashMap::new();
-        blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: vec![],
-                term: Terminator::Return(expr),
-            },
-        );
-        CFG {
-            entry: 0,
-            blocks,
-            edges: vec![],
-        }
+        crate::test_support::single_block_cfg_term(vec![], Terminator::Return(expr))
     }
 
     fn lambda(params: &[&str], body: Expr) -> Expr {
@@ -449,26 +352,10 @@ mod tests {
     #[test]
     fn param_of_inner_lambda_does_not_leak() {
         // outer body also uses `open` directly → free despite inner shadowing.
-        let mut blocks = HashMap::new();
-        blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: vec![
-                    crate::ir::stmt::Stmt::ExprStmt(Expr::Var("open".to_string()), None),
-                    crate::ir::stmt::Stmt::ExprStmt(
-                        lambda(&["open"], Expr::Var("open".to_string())),
-                        None,
-                    ),
-                ],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            },
-        );
-        let cfg = CFG {
-            entry: 0,
-            blocks,
-            edges: vec![],
-        };
+        let cfg = crate::test_support::single_block_cfg(vec![
+            crate::ir::stmt::Stmt::ExprStmt(Expr::Var("open".to_string()), None),
+            crate::ir::stmt::Stmt::ExprStmt(lambda(&["open"], Expr::Var("open".to_string())), None),
+        ]);
         assert!(compute_free_vars(&cfg).contains("open"));
     }
 }

@@ -69,6 +69,18 @@ pub(crate) fn describe_value(val: &StateValue) -> &'static str {
     }
 }
 
+/// User-facing noun for a hook kind in a diagnostic message
+/// (`useEffect` → "effect", `useMemo` → "memo", `useCallback` → "callback").
+/// Falls back to "hook" for kinds without a distinct word.
+pub(crate) fn hook_kind_word(kind: HookKind) -> &'static str {
+    match kind {
+        HookKind::Effect => "effect",
+        HookKind::Memo => "memo",
+        HookKind::Callback => "callback",
+        _ => "hook",
+    }
+}
+
 /// User-facing name for a state slot identified by its hook label. Prefers the
 /// source variable it binds to (`` `count` ``); falls back to `state #N` when the
 /// slot has no syntactic name (destructured indirectly, cross-component, …).
@@ -565,6 +577,22 @@ pub(crate) fn resolve_setter_aliases(
     map
 }
 
+/// Alias-resolved `setter var → state label` across the render body and every
+/// hook body. Utility inlining binds setter params via aliases (`let setter =
+/// setX`) inside spliced bodies; rules matching a setter by name must follow
+/// those aliases through every body or a spliced setter call goes unseen (false
+/// negative). The shared recipe of `derived-state`, `state-mutation`,
+/// `stale-closure` and `frozen-initial-state`.
+pub(crate) fn all_setter_labels(comp: &AnalysisResult<StateValue>) -> HashMap<Var, HookLabel> {
+    let mut labels = setter_var_labels(&comp.render_cfg);
+    for cfg in
+        std::iter::once(&comp.render_cfg).chain(comp.hooks.iter().filter_map(|h| h.body_cfg()))
+    {
+        labels = resolve_setter_aliases(cfg, &labels);
+    }
+    labels
+}
+
 fn check_stmt_for_setters(
     stmt: &Stmt,
     block_id: Option<BlockId>,
@@ -648,6 +676,35 @@ fn check_expr_for_setters(
     }
 }
 
+/// Evaluate `expr` in `env` against *copies* of the given stores and `heap`,
+/// through a null [`AnalysisCtx`]. The shared core of every post-fixpoint value
+/// probe in the rules.
+///
+/// The state and memo stores are cloned internally and the heap is borrowed
+/// mutably (callers pass a throwaway), so the caller's fixpoint result is never
+/// disturbed. Each call site passes its OWN store bundle — the component's
+/// converged stores (`comp.state_store` + a seeded `comp.heap.clone()`), or an
+/// empty bundle (`StateStore::bottom()` + `Heap::new()`, for a mount-time init
+/// eval). This primitive fixes none of them: it is the mechanical eval core,
+/// not the store/heap policy (which is deliberately per-site — an empty vs a
+/// converged heap are NOT interchangeable).
+pub(crate) fn eval_in_stores(
+    expr: &Expr,
+    env: &AbstractEnv<StateValue>,
+    component: &Symbol,
+    state: &StateStore<StateValue>,
+    memo: &MemoStore<StateValue>,
+    heap: &mut Heap,
+) -> StateValue {
+    let mut s = state.clone();
+    let mut m = memo.clone();
+    StateValueTransfer.eval_expr(
+        expr,
+        env,
+        &mut AnalysisCtx::null(component.clone(), &mut s, &mut m, heap),
+    )
+}
+
 /// `true` when every dep in `deps` is unstable in the render-exit env.
 /// Empty `deps` returns `false` (`[]` is mount-only, not all-unstable).
 pub(super) fn all_deps_unstable(deps: &[Expr], result: &AnalysisResult<StateValue>) -> bool {
@@ -655,17 +712,16 @@ pub(super) fn all_deps_unstable(deps: &[Expr], result: &AnalysisResult<StateValu
         return false;
     }
     let exit_env = result.exit_env();
-    let transfer = StateValueTransfer;
     deps.iter().all(|dep| {
-        let mut s: StateStore<StateValue> = result.state_store.clone();
-        let mut m: MemoStore<StateValue> = result.memo_store.clone();
-        let mut h = Heap::new();
-        let val = transfer.eval_expr(
+        eval_in_stores(
             dep,
             &exit_env,
-            &mut AnalysisCtx::null(result.component.clone(), &mut s, &mut m, &mut h),
-        );
-        val.is_unstable()
+            &result.component,
+            &result.state_store,
+            &result.memo_store,
+            &mut Heap::new(),
+        )
+        .is_unstable()
     })
 }
 

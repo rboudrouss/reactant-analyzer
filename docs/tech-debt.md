@@ -238,6 +238,60 @@ unification des détecteurs + `Expr::Opaque`/`This` (Thème 12) ; découpe du mo
 
 ---
 
+## Partie 6 — Passe de refactor boilerplate (2026-07, APPLIQUÉE)
+
+Consolidation **strictement comportement-neutre** de l'Annexe C : aucun changement de
+diagnostic, suite verte à chaque étape (**745 tests, 0 échec**, `cargo fmt` clean).
+**~1276 lignes nettes retirées** (762 ins / 2038 del sur 46 fichiers) + 3 modules partagés
+créés (`registry/keyed.rs`, `lowering/jsx_detect.rs`, `test_support.rs`). Les bugs de
+soundness (FN) restent **non touchés**, déplacés en tête de `docs/TODO.md` (Vague 0) — ils
+seront implémentés séparément avec leurs propres tests pour garder la suite verte.
+
+**Fait :**
+- **Helpers IR feuilles** : `HookEntry::body_cfg()`, `Expr::peel_ts()`, `SourceRange::pos_key()` ;
+  `Expr::is_call_free` délègue à `for_each_child`. *(Annexe C R1, R4, R6, D8)*
+- **rules/** : `hook_kind_word` centralisé (C R5), `peel`→`peel_ts` (R1), `pos_key` ×7 (R6),
+  `body_cfg()` ×7 (R4), `all_setter_labels` promu + 4 sites (R3), core `eval_in_stores`
+  extrait — **le piège de divergence de heap préservé** (`frozen` seed converged, autres vides ;
+  + `unnecessary_rerender` site 1 sur stores vides) via paramètre explicite (R2).
+- **Walkers → visiteurs canoniques** : 11 marches ré-implémentées délèguent maintenant à
+  `CFG::for_each_expr` / `Expr::for_each_child` ; **tous les `_ => {}` avaleurs de variantes
+  supprimés** (−265 l). Bonus : `hook_extractor` sous-visitait (latent FN) → couverture élargie,
+  sound, tests verts. *(Annexe C E2, E3 — clôt une partie du Thème 6)*
+- **domaines** : `Heap::alloc_fn` (bloc capture ×4, C D1), `leq_pointwise` (3 sites, C D7),
+  `map_get_or` (10 sites, C D7), `merge_with` sur `state_store` (trio join/widen/widen_to → 1),
+  `StateValue::versioned_reference()` (ADR-017, C D3 — **fallbacks par site conservés** :
+  fusionner aurait introduit un FN au site B).
+- **registres** : `KeyedRegistry<V>` générique ; les 3 registres deviennent des newtypes fins,
+  **zéro site appelant modifié**, ordre déterministe préservé (hash vs trié gardés par wrapper).
+  *(Thème 11 partie générique — fait ; reste : câbler `new_with_common()` = FP, dans TODO)*
+- **CLI** : `display_relative` partagé (3 sites). *(Annexe C C-C1)*
+- **détecteurs** : trio JSX (`body_returns_jsx`+2) → `lowering/jsx_detect.rs` (verbatim ×2) ;
+  struct `Candidate` unifiée via alias. *(Annexe C E4 partie neutre)*
+- **tests** : `test_support` partagé — `single_block_cfg`(+`_term`), `prog`, `analysis_result` ;
+  ~535 lignes d'échafaudage retirées (C T1/T2/T3). Les CFG multi-blocs laissés inline.
+
+**Différé, par principe (skip propre > drift) :**
+- `flat_lattice!` macro (C D5) : `Copy` (BoolVal) vs `Clone` (SetterVal) → macro conditionnelle
+  laide, viole P2. Skip.
+- powerset générique `PowerSet<T,N>` (C D6, Thème 9) : refactor plus lourd, hors passe neutre.
+- generic `detect(classify)` des détecteurs (C E4 Thème 12) : la charpente **diverge**
+  réellement (gestion `ExportDefault`, ordre des checks) — ne peut être unifiée sans changer
+  une classification. Skip. **Prédicats de nommage jamais touchés** (leur divergence = bug de
+  classification, dans TODO).
+- `severity_tag` CLI (C C-C2) : json (`"warning"`) ≠ humain (`"warn "` padué) — chaînes
+  différentes, non-neutre.
+- `merge_with`/`map_get_or` sur quelques sites (store à 1 boucle, `lookup` clé `&str`/`String`) :
+  n'auraient pas simplifié → laissés.
+- Masque « slots peuplés » de `StateValue` (C D4) et parité `Let`/`Assign` (C D2) : sensibles à
+  la soundness → `docs/TODO.md` Vague 0.
+
+Ne restent des grands thèmes que les **changements de conception qui modifient le comportement**
+(Thèmes 1 splice, 4 recompute_memo, 7 dominateurs/logical-op, 8 churn, 9 to_stability, 12
+détecteurs/`Expr::Opaque`) — à décider et à tester séparément.
+
+---
+
 ## Annexe A — 18 workarounds
 
 `P2 = ⚠️` : justification > 1 paragraphe (viole le principe 2).
@@ -310,6 +364,10 @@ Passe dédiée : blocs littéralement recopiés (copie-collé ou quasi-clone) su
 avec comptage exhaustif par grep et cible de centralisation. La plupart raffinent un
 thème / une ligne d'Annexe B avec le nombre exact d'occurrences ; **🆕** = non documenté
 avant ; **⚠** = enjeu de soundness à trancher, pas un simple gain de lignes.
+
+> **État (2026-07)** : la majorité de cet inventaire est **APPLIQUÉE** — voir Partie 6 pour
+> le détail fait/différé. Restent différés : D4/D2 (soundness → TODO Vague 0), D5/D6 (lattice,
+> Thème 9), E4 charpente détecteurs (Thème 12), C-C2 severity_tag (non-neutre).
 
 Deux visiteurs canoniques **existent déjà** — `Expr::for_each_child` (`ir/expr.rs:159`) et
 `CFG::for_each_expr` (`ir/cfg.rs:54`). Les règles récentes les utilisent ; `engine/`,

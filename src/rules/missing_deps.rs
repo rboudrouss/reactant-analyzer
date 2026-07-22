@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::{
     domains::{impls::StateValue, stores::AbstractEnv},
-    engine::{HookKind, ProgramAnalysisResult},
+    engine::ProgramAnalysisResult,
     ir::{
         cfg::CFG,
         expr::Expr,
@@ -77,7 +77,7 @@ impl Rule for MissingDeps {
                         format!(
                             "`{}` is used in this {} but not in its deps array, and {}",
                             path,
-                            hook_kind_word(info.kind),
+                            super::hook_kind_word(info.kind),
                             super::describe_value(&val)
                         ),
                     )
@@ -101,15 +101,6 @@ impl Rule for MissingDeps {
         }
 
         diags
-    }
-}
-
-fn hook_kind_word(kind: HookKind) -> &'static str {
-    match kind {
-        HookKind::Effect => "effect",
-        HookKind::Memo => "memo",
-        HookKind::Callback => "callback",
-        _ => "hook",
     }
 }
 
@@ -170,11 +161,7 @@ pub(super) fn fn_lit_binding<'c>(var: &str, cfg: &'c CFG) -> Option<(&'c [Var], 
             if v != var {
                 continue;
             }
-            let mut e = rhs;
-            while let Expr::TSAnnotated(inner, _) = e {
-                e = inner;
-            }
-            match e {
+            match rhs.peel_ts() {
                 Expr::FnLit {
                     params, body_cfg, ..
                 } if found.is_none() => found = Some((params, body_cfg)),
@@ -191,13 +178,10 @@ pub(super) fn fn_lit_binding<'c>(var: &str, cfg: &'c CFG) -> Option<(&'c [Var], 
 mod tests {
     use super::*;
     use crate::{
-        domains::{
-            AbstractDomain, Stability, StateValue,
-            stores::{AbstractEnv, MemoStore, StateStore},
-        },
+        domains::{AbstractDomain, Stability, StateValue, stores::AbstractEnv},
         engine::{AnalysisResult, EffectInfo, HookKind, ProgramAnalysisResult},
         ir::{
-            cfg::{BasicBlock, CFG, Terminator},
+            cfg::CFG,
             expr::{Expr, Prim},
             types::{BlockId, HookLabel},
         },
@@ -206,36 +190,11 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     fn prog(r: &AnalysisResult<StateValue>) -> ProgramAnalysisResult {
-        use crate::domains::stores::SharedStateStore;
-        use crate::engine::program_result::{AnalysisStats, ComponentCallGraph};
-        let mut components = HashMap::new();
-        components.insert("C".to_string(), r.clone());
-        ProgramAnalysisResult {
-            components,
-            shared_state: SharedStateStore::default(),
-            call_graph: ComponentCallGraph::new(),
-            recursive_components: HashSet::new(),
-            stats: AnalysisStats::default(),
-            file_table: Default::default(),
-            function_registry: Default::default(),
-        }
+        crate::test_support::prog("C", r.clone())
     }
 
     fn trivial_cfg() -> CFG {
-        let mut blocks = HashMap::new();
-        blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            },
-        );
-        CFG {
-            entry: 0,
-            blocks,
-            edges: vec![],
-        }
+        crate::test_support::single_block_cfg(vec![])
     }
 
     fn make_result(
@@ -244,25 +203,9 @@ mod tests {
         render_cfg: CFG,
     ) -> AnalysisResult<StateValue> {
         AnalysisResult {
-            component: "C".to_string(),
-            file: Default::default(),
-            param: "props".to_string(),
-            dom_props: Default::default(),
-            state_store: StateStore::bottom(),
-            memo_store: MemoStore::new(),
             block_states,
-            effect_block_states: HashMap::new(),
-            hook_calls: vec![],
             effect_info,
-            handler_block_states: HashMap::new(),
-            handler_info: HashMap::new(),
-            widen_trace: HashMap::new(),
-            inline_origins: Vec::new(),
-            render_cfg,
-            hooks: vec![],
-            iterations: 0,
-            effect_setter_writes: StateStore::bottom(),
-            heap: crate::domains::stores::Heap::new(),
+            ..crate::test_support::analysis_result(render_cfg)
         }
     }
 

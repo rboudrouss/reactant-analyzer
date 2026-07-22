@@ -70,10 +70,10 @@ impl Transfer for StateValueTransfer {
             let val = eval_state_value(dep, env, &mut tmp_ctx);
             // A dep whose reference kind is already versioned keeps its
             // labels (`to_stability` would erase them if another slot is ⊤).
-            match &val.reference {
-                v @ (Stability::Versioned(_) | Stability::VersionedTop) => acc.join(v),
-                _ => acc.join(&val.to_stability()),
-            }
+            acc.join(
+                &val.versioned_reference()
+                    .unwrap_or_else(|| val.to_stability()),
+            )
         });
         StateValue::reference(stability)
     }
@@ -522,12 +522,9 @@ fn eval_field_access(
     // conversion above; in-place writes have their own diagnostics
     // (`state-mutation`). ADR-017 §Limitations, member-deps.
     let obj_val = eval_state_value(obj, env, ctx);
-    match &obj_val.reference {
-        v @ (Stability::Versioned(_) | Stability::VersionedTop) => StateValue {
-            reference: v.clone(),
-            ..StateValue::top()
-        },
-        _ => StateValue::top(),
+    StateValue {
+        reference: obj_val.versioned_reference().unwrap_or(Stability::Unknown),
+        ..StateValue::top()
     }
 }
 
@@ -554,7 +551,6 @@ fn eval_props_map(
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> HashMap<Symbol, EnvVal<StateValue>> {
-    use crate::ir::free_vars::compute_free_vars;
     match props_expr {
         Expr::ObjectLit { fields, .. } => fields
             .iter()
@@ -569,19 +565,7 @@ fn eval_props_map(
                 } = v
                 {
                     // Inline FnLit prop: allocate a heap entry so the child can inline it.
-                    let free = compute_free_vars(body_cfg);
-                    let captured = free
-                        .iter()
-                        .filter_map(|v| env.lookup(v).as_state_value().map(|sv| (v.clone(), sv)))
-                        .collect();
-                    ctx.heap.insert(
-                        *id,
-                        HeapValue::Fn {
-                            params: params.clone(),
-                            body_cfg: std::sync::Arc::clone(body_cfg),
-                            captured,
-                        },
-                    );
+                    ctx.heap.alloc_fn(*id, params, body_cfg, env);
                     EnvVal::Loc(std::iter::once(*id).collect())
                 } else {
                     EnvVal::Val(eval_state_value(v, env, ctx))
@@ -746,20 +730,7 @@ mod tests {
     }
 
     fn single_block_cfg(stmts: Vec<Stmt>, ret: Expr) -> CFG {
-        let mut blocks = std::collections::HashMap::new();
-        blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts,
-                term: Terminator::Return(ret),
-            },
-        );
-        CFG {
-            entry: 0,
-            blocks,
-            edges: vec![],
-        }
+        crate::test_support::single_block_cfg_term(stmts, Terminator::Return(ret))
     }
 
     // ── eval_expr ─────────────────────────────────────────────────────────────

@@ -1,8 +1,5 @@
 use crate::{
-    domains::{
-        AbstractEnv, AnalysisCtx, MemoStore, StateStore, StateValueTransfer, Transfer,
-        impls::StateValue,
-    },
+    domains::{AbstractEnv, MemoStore, StateStore, StateValueTransfer, impls::StateValue},
     engine::{HookKind, ProgramAnalysisResult},
     ir::{expr::Expr, hooks::HookEntry, types::Symbol},
 };
@@ -98,7 +95,7 @@ impl Rule for AlwaysUnstableDeps {
                 continue;
             }
 
-            let word = hook_kind_word(kind);
+            let word = super::hook_kind_word(kind);
             let mut d = Diagnostic::new(
                 "always-unstable-deps",
                 format!(
@@ -137,15 +134,17 @@ fn eval_dep_is_unstable(
     env: &AbstractEnv<StateValue>,
     state: &StateStore<StateValue>,
     memo: &MemoStore<StateValue>,
-    transfer: &StateValueTransfer,
+    // Retained for the test-facing signature; the shared eval core builds its
+    // own (zero-size) transfer.
+    _transfer: &StateValueTransfer,
 ) -> bool {
-    let mut s = state.clone();
-    let mut m = memo.clone();
-    let mut h = crate::domains::Heap::new();
-    let val = transfer.eval_expr(
+    let val = super::eval_in_stores(
         dep,
         env,
-        &mut AnalysisCtx::null(component.clone(), &mut s, &mut m, &mut h),
+        component,
+        state,
+        memo,
+        &mut crate::domains::Heap::new(),
     );
     // Only a freshly-allocated reference breaks `Object.is` every render.
     // Primitives (Number/Bool/Str) are value-compared — never flagged here, even
@@ -159,15 +158,6 @@ fn fmt_indices(idx: &[usize]) -> String {
         .map(usize::to_string)
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-fn hook_kind_word(kind: HookKind) -> &'static str {
-    match kind {
-        HookKind::Effect => "effect",
-        HookKind::Memo => "memo",
-        HookKind::Callback => "callback",
-        _ => "hook",
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -188,42 +178,17 @@ mod tests {
         },
         rules::Rule,
     };
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     fn prog(
         r: &crate::engine::AnalysisResult<crate::domains::StateValue>,
     ) -> ProgramAnalysisResult {
-        use crate::domains::stores::SharedStateStore;
-        use crate::engine::program_result::{AnalysisStats, ComponentCallGraph};
-        let mut components = HashMap::new();
-        components.insert("C".to_string(), r.clone());
-        ProgramAnalysisResult {
-            components,
-            shared_state: SharedStateStore::default(),
-            call_graph: ComponentCallGraph::new(),
-            recursive_components: HashSet::new(),
-            stats: AnalysisStats::default(),
-            file_table: Default::default(),
-            function_registry: Default::default(),
-        }
+        crate::test_support::prog("C", r.clone())
     }
 
     fn empty_cfg() -> CFG {
-        let mut blocks = HashMap::new();
-        blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            },
-        );
-        CFG {
-            entry: 0,
-            blocks,
-            edges: vec![],
-        }
+        crate::test_support::single_block_cfg(vec![])
     }
 
     fn component(hooks: Vec<HookEntry>, render_stmts: Vec<Stmt>) -> ComponentIR {

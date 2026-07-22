@@ -1,12 +1,9 @@
 use oxc_ast::ast::*;
 
+use super::Candidate;
+
 /// A user-defined custom hook function detected in the AST.
-#[derive(Debug)]
-pub struct HookCandidate<'a> {
-    pub name: String,
-    pub params: &'a FormalParameters<'a>,
-    pub body: &'a FunctionBody<'a>,
-}
+pub type HookCandidate<'a> = Candidate<'a>;
 
 /// Detect all user-defined custom hook functions (`use*`) in `program`.
 /// Excludes React built-in hooks.
@@ -76,7 +73,7 @@ fn try_add_fn<'a>(
     let Some(body) = func.body.as_deref() else {
         return;
     };
-    out.push(HookCandidate {
+    out.push(Candidate {
         name: name.to_owned(),
         params: &func.params,
         body,
@@ -100,7 +97,7 @@ fn try_add_var_decl<'a>(vd: &'a VariableDeclarator<'a>, out: &mut Vec<HookCandid
             let Some(body) = func.body.as_deref() else {
                 return;
             };
-            out.push(HookCandidate {
+            out.push(Candidate {
                 name: name.to_owned(),
                 params: &func.params,
                 body,
@@ -115,7 +112,7 @@ fn try_add_arrow_with_name<'a>(
     arrow: &'a ArrowFunctionExpression<'a>,
     out: &mut Vec<HookCandidate<'a>>,
 ) {
-    out.push(HookCandidate {
+    out.push(Candidate {
         name: name.to_owned(),
         params: &arrow.params,
         body: &arrow.body,

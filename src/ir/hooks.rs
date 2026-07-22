@@ -81,4 +81,16 @@ impl HookEntry {
             | HookEntry::Handler { label, .. } => *label,
         }
     }
+
+    /// The body CFG of hook kinds that have one (`Effect`, `Memo`, `Callback`,
+    /// `Handler`); `None` for `State`/`Ref`/`Custom`.
+    pub fn body_cfg(&self) -> Option<&CFG> {
+        match self {
+            HookEntry::Effect { body_cfg, .. }
+            | HookEntry::Memo { body_cfg, .. }
+            | HookEntry::Callback { body_cfg, .. }
+            | HookEntry::Handler { body_cfg, .. } => Some(body_cfg),
+            _ => None,
+        }
+    }
 }

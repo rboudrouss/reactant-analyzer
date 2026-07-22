@@ -265,42 +265,17 @@ mod tests {
         },
         rules::Rule,
     };
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     fn prog(
         r: &crate::engine::AnalysisResult<crate::domains::StateValue>,
     ) -> ProgramAnalysisResult {
-        use crate::domains::stores::SharedStateStore;
-        use crate::engine::program_result::{AnalysisStats, ComponentCallGraph};
-        let mut components = HashMap::new();
-        components.insert("C".to_string(), r.clone());
-        ProgramAnalysisResult {
-            components,
-            shared_state: SharedStateStore::default(),
-            call_graph: ComponentCallGraph::new(),
-            recursive_components: HashSet::new(),
-            stats: AnalysisStats::default(),
-            file_table: Default::default(),
-            function_registry: Default::default(),
-        }
+        crate::test_support::prog("C", r.clone())
     }
 
     fn empty_cfg() -> CFG {
-        let mut blocks = HashMap::new();
-        blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            },
-        );
-        CFG {
-            entry: 0,
-            blocks,
-            edges: vec![],
-        }
+        crate::test_support::single_block_cfg(vec![])
     }
 
     fn component(hooks: Vec<HookEntry>) -> ComponentIR {

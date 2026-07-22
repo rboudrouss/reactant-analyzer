@@ -13,8 +13,8 @@ use crate::{
 };
 
 use super::{
-    Diagnostic, Rule, Severity, Step, ValueClass, resolve_setter_aliases, setter_var_labels,
-    state_slot_name, state_val_labels,
+    Diagnostic, Rule, Severity, Step, ValueClass, all_setter_labels, state_slot_name,
+    state_val_labels,
 };
 
 /// Methods that mutate their receiver in place (Array, Map/Set, typed arrays).
@@ -395,19 +395,7 @@ impl Rule for StateMutation {
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
         let result = &result.components[component];
         let state_val_label = state_val_labels(&result.render_cfg);
-
-        let mut setter_label = setter_var_labels(&result.render_cfg);
-        for cfg in
-            std::iter::once(&result.render_cfg).chain(result.hooks.iter().filter_map(|h| match h {
-                HookEntry::Effect { body_cfg, .. }
-                | HookEntry::Memo { body_cfg, .. }
-                | HookEntry::Callback { body_cfg, .. }
-                | HookEntry::Handler { body_cfg, .. } => Some(body_cfg),
-                _ => None,
-            }))
-        {
-            setter_label = resolve_setter_aliases(cfg, &setter_label);
-        }
+        let setter_label = all_setter_labels(result);
 
         let mut collector = Collector {
             state_val_label: &state_val_label,
@@ -466,7 +454,7 @@ impl Rule for StateMutation {
                 continue;
             }
             let mut mut_sites = by_label.remove(&label).unwrap_or_default();
-            mut_sites.sort_by_key(|s| s.span.map(|r| (r.line, r.col)));
+            mut_sites.sort_by_key(|s| s.span.map(|r| r.pos_key()));
             let same_trigger = mut_sites
                 .iter()
                 .any(|m| sets.iter().any(|s| s.container == m.container));
@@ -526,8 +514,8 @@ impl Rule for StateMutation {
             .filter(|(root, _)| *root == MutRoot::Props)
             .map(|(_, s)| s)
             .collect();
-        prop_sites.sort_by_key(|s| s.span.map(|r| (r.line, r.col)));
-        prop_sites.dedup_by_key(|s| s.span.map(|r| (r.line, r.col)));
+        prop_sites.sort_by_key(|s| s.span.map(|r| r.pos_key()));
+        prop_sites.dedup_by_key(|s| s.span.map(|r| r.pos_key()));
         for site in prop_sites {
             let mut d = Diagnostic::new(
                 "state-mutation",

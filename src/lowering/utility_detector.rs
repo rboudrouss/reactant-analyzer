@@ -8,12 +8,10 @@
 
 use oxc_ast::ast::*;
 
-#[derive(Debug)]
-pub struct UtilityCandidate<'a> {
-    pub name: String,
-    pub params: &'a FormalParameters<'a>,
-    pub body: &'a FunctionBody<'a>,
-}
+use super::Candidate;
+use super::jsx_detect::body_returns_jsx;
+
+pub type UtilityCandidate<'a> = Candidate<'a>;
 
 /// Detect every top-level utility function in `program`.
 pub fn detect_utilities<'a>(program: &'a Program<'a>) -> Vec<UtilityCandidate<'a>> {
@@ -74,7 +72,7 @@ fn try_add_fn<'a>(
     if body_returns_jsx(&body.statements) {
         return;
     }
-    out.push(UtilityCandidate {
+    out.push(Candidate {
         name,
         params: &func.params,
         body,
@@ -95,7 +93,7 @@ fn try_add_var_decl<'a>(vd: &'a VariableDeclarator<'a>, out: &mut Vec<UtilityCan
             if body_returns_jsx(&arrow.body.statements) {
                 return;
             }
-            out.push(UtilityCandidate {
+            out.push(Candidate {
                 name,
                 params: &arrow.params,
                 body: &arrow.body,
@@ -108,7 +106,7 @@ fn try_add_var_decl<'a>(vd: &'a VariableDeclarator<'a>, out: &mut Vec<UtilityCan
             if body_returns_jsx(&body.statements) {
                 return;
             }
-            out.push(UtilityCandidate {
+            out.push(Candidate {
                 name,
                 params: &func.params,
                 body,
@@ -138,63 +136,6 @@ fn is_utility(name: &str) -> bool {
         return false;
     }
     true
-}
-
-// JSX-return detection: duplicate of component_detector logic (kept here so
-// utility_detector stays a self-contained module).
-
-fn body_returns_jsx(stmts: &[Statement]) -> bool {
-    stmts.iter().any(stmt_has_jsx_return)
-}
-
-fn stmt_has_jsx_return(stmt: &Statement) -> bool {
-    match stmt {
-        Statement::ReturnStatement(ret) => {
-            ret.argument.as_ref().is_some_and(|e| expr_contains_jsx(e))
-        }
-        Statement::ExpressionStatement(es) => expr_contains_jsx(&es.expression),
-        Statement::BlockStatement(block) => body_returns_jsx(&block.body),
-        Statement::IfStatement(if_) => {
-            stmt_has_jsx_return(&if_.consequent)
-                || if_
-                    .alternate
-                    .as_ref()
-                    .is_some_and(|alt| stmt_has_jsx_return(alt))
-        }
-        Statement::WhileStatement(w) => stmt_has_jsx_return(&w.body),
-        Statement::ForStatement(f) => stmt_has_jsx_return(&f.body),
-        Statement::LabeledStatement(l) => stmt_has_jsx_return(&l.body),
-        Statement::TryStatement(tr) => {
-            body_returns_jsx(&tr.block.body)
-                || tr
-                    .handler
-                    .as_ref()
-                    .is_some_and(|h| body_returns_jsx(&h.body.body))
-                || tr
-                    .finalizer
-                    .as_ref()
-                    .is_some_and(|f| body_returns_jsx(&f.body))
-        }
-        _ => false,
-    }
-}
-
-fn expr_contains_jsx(expr: &Expression) -> bool {
-    match expr {
-        Expression::JSXElement(_) | Expression::JSXFragment(_) => true,
-        Expression::ConditionalExpression(c) => {
-            expr_contains_jsx(&c.consequent) || expr_contains_jsx(&c.alternate)
-        }
-        Expression::LogicalExpression(l) => {
-            expr_contains_jsx(&l.left) || expr_contains_jsx(&l.right)
-        }
-        Expression::ParenthesizedExpression(p) => expr_contains_jsx(&p.expression),
-        Expression::TSAsExpression(a) => expr_contains_jsx(&a.expression),
-        Expression::TSNonNullExpression(a) => expr_contains_jsx(&a.expression),
-        Expression::TSSatisfiesExpression(a) => expr_contains_jsx(&a.expression),
-        Expression::TSTypeAssertion(a) => expr_contains_jsx(&a.expression),
-        _ => false,
-    }
 }
 
 #[cfg(test)]

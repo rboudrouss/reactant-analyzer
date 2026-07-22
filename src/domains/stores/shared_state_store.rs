@@ -5,6 +5,8 @@ use crate::{
     ir::types::{HookLabel, Symbol},
 };
 
+use super::{leq_pointwise, map_get_or};
+
 /// Cross-component state store: maps `(component_name, hook_label)` → abstract value.
 ///
 /// Written when a `ComponentSetter` call is detected in a child component's analysis.
@@ -21,20 +23,13 @@ impl SharedStateStore {
 
     /// Returns `StateValue::bottom()` for unknown entries.
     pub fn get(&self, comp: &Symbol, label: HookLabel) -> StateValue {
-        self.entries
-            .get(&(comp.clone(), label))
-            .cloned()
-            .unwrap_or(StateValue::bottom())
+        map_get_or(&self.entries, &(comp.clone(), label), StateValue::bottom)
     }
 
     /// Monotone update: `self[(comp, label)] = self[(comp, label)] ⊔ val`.
     pub fn update(&mut self, comp: &Symbol, label: HookLabel, val: StateValue) {
         let key = (comp.clone(), label);
-        let current = self
-            .entries
-            .get(&key)
-            .cloned()
-            .unwrap_or(StateValue::bottom());
+        let current = map_get_or(&self.entries, &key, StateValue::bottom);
         self.entries.insert(key, current.join(&val));
     }
 
@@ -42,7 +37,7 @@ impl SharedStateStore {
     pub fn join(&self, other: &Self) -> Self {
         let mut out = self.entries.clone();
         for (k, v) in &other.entries {
-            let cur = out.get(k).cloned().unwrap_or(StateValue::bottom());
+            let cur = map_get_or(&out, k, StateValue::bottom);
             out.insert(k.clone(), cur.join(v));
         }
         SharedStateStore { entries: out }
@@ -52,9 +47,8 @@ impl SharedStateStore {
     pub fn leq(&self, other: &Self) -> bool {
         for (k, v) in &self.entries {
             let other_v = other.get(&k.0, k.1);
-            match v.partial_cmp(&other_v) {
-                Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) => {}
-                _ => return false,
+            if !leq_pointwise(v, &other_v) {
+                return false;
             }
         }
         true

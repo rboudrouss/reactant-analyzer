@@ -11,11 +11,23 @@ mod output_human;
 mod output_json;
 mod rules_cmd;
 
+use std::path::Path;
+
 use clap::{Parser, Subcommand, ValueEnum};
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_FINDINGS: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
+
+/// Render `path` relative to the current directory when possible, else as-is.
+pub(crate) fn display_relative(path: &Path) -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| path.strip_prefix(&cwd).ok())
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
 
 #[derive(Parser)]
 #[command(

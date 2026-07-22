@@ -1,12 +1,10 @@
 use oxc_ast::ast::*;
 
+use super::Candidate;
+use super::jsx_detect::body_returns_jsx;
+
 /// A React component function detected in the AST, ready for lowering.
-#[derive(Debug)]
-pub struct ComponentCandidate<'a> {
-    pub name: String,
-    pub params: &'a FormalParameters<'a>,
-    pub body: &'a FunctionBody<'a>,
-}
+pub type ComponentCandidate<'a> = Candidate<'a>;
 
 /// Detect all React component functions in `program`.
 pub fn detect_components<'a>(program: &'a Program<'a>) -> Vec<ComponentCandidate<'a>> {
@@ -78,7 +76,7 @@ fn try_add_fn<'a>(
         return;
     };
     if is_component(name, &body.statements, func.return_type.as_deref()) {
-        out.push(ComponentCandidate {
+        out.push(Candidate {
             name: name.to_owned(),
             params: &func.params,
             body,
@@ -104,7 +102,7 @@ fn try_add_var_decl<'a>(vd: &'a VariableDeclarator<'a>, out: &mut Vec<ComponentC
             };
             let return_type = func.return_type.as_deref().or(var_type_ann);
             if is_component(name, &body.statements, return_type) {
-                out.push(ComponentCandidate {
+                out.push(Candidate {
                     name: name.to_owned(),
                     params: &func.params,
                     body,
@@ -123,7 +121,7 @@ fn try_add_arrow<'a>(
 ) {
     let return_type = arrow.return_type.as_deref().or(extra_type_ann);
     if is_component(name, &arrow.body.statements, return_type) {
-        out.push(ComponentCandidate {
+        out.push(Candidate {
             name: name.to_owned(),
             params: &arrow.params,
             body: &arrow.body,
@@ -153,63 +151,6 @@ fn is_component(name: &str, stmts: &[Statement], return_type: Option<&TSTypeAnno
         return true;
     }
     false
-}
-
-// ── JSX return detection ──────────────────────────────────────────────────────
-
-fn body_returns_jsx(stmts: &[Statement]) -> bool {
-    stmts.iter().any(stmt_has_jsx_return)
-}
-
-fn stmt_has_jsx_return(stmt: &Statement) -> bool {
-    match stmt {
-        Statement::ReturnStatement(ret) => {
-            ret.argument.as_ref().is_some_and(|e| expr_contains_jsx(e))
-        }
-        // Expression-body arrows (`() => <div/>`) store the expression as an ExpressionStatement
-        Statement::ExpressionStatement(es) => expr_contains_jsx(&es.expression),
-        Statement::BlockStatement(block) => body_returns_jsx(&block.body),
-        Statement::IfStatement(if_) => {
-            stmt_has_jsx_return(&if_.consequent)
-                || if_
-                    .alternate
-                    .as_ref()
-                    .is_some_and(|alt| stmt_has_jsx_return(alt))
-        }
-        Statement::WhileStatement(w) => stmt_has_jsx_return(&w.body),
-        Statement::ForStatement(f) => stmt_has_jsx_return(&f.body),
-        Statement::LabeledStatement(l) => stmt_has_jsx_return(&l.body),
-        Statement::TryStatement(tr) => {
-            body_returns_jsx(&tr.block.body)
-                || tr
-                    .handler
-                    .as_ref()
-                    .is_some_and(|h| body_returns_jsx(&h.body.body))
-                || tr
-                    .finalizer
-                    .as_ref()
-                    .is_some_and(|f| body_returns_jsx(&f.body))
-        }
-        _ => false,
-    }
-}
-
-fn expr_contains_jsx(expr: &Expression) -> bool {
-    match expr {
-        Expression::JSXElement(_) | Expression::JSXFragment(_) => true,
-        Expression::ConditionalExpression(c) => {
-            expr_contains_jsx(&c.consequent) || expr_contains_jsx(&c.alternate)
-        }
-        Expression::LogicalExpression(l) => {
-            expr_contains_jsx(&l.left) || expr_contains_jsx(&l.right)
-        }
-        Expression::ParenthesizedExpression(p) => expr_contains_jsx(&p.expression),
-        Expression::TSAsExpression(a) => expr_contains_jsx(&a.expression),
-        Expression::TSNonNullExpression(a) => expr_contains_jsx(&a.expression),
-        Expression::TSSatisfiesExpression(a) => expr_contains_jsx(&a.expression),
-        Expression::TSTypeAssertion(a) => expr_contains_jsx(&a.expression),
-        _ => false,
-    }
 }
 
 // ── TypeScript annotation check ───────────────────────────────────────────────

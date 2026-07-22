@@ -14,8 +14,8 @@ use crate::{
 };
 
 use super::{
-    Diagnostic, Rule, Severity, Step, ValueClass, collect_fn_bindings, collect_setter_calls,
-    collect_setter_calls_with_extra, local_bindings, resolve_setter_aliases, setter_var_labels,
+    Diagnostic, Rule, Severity, Step, ValueClass, all_setter_labels, collect_fn_bindings,
+    collect_setter_calls, collect_setter_calls_with_extra, local_bindings,
     stale_closure::may_written_slots, state_slot_name, state_val_labels,
 };
 
@@ -56,16 +56,9 @@ use super::{
 ///   adjust-state-during-render pattern (`setter-in-render` owns misuse).
 pub struct FrozenInitialState;
 
-fn peel(mut e: &Expr) -> &Expr {
-    while let Expr::TSAnnotated(inner, _) = e {
-        e = inner;
-    }
-    e
-}
-
 /// `props.a.b` / `value` as a plain member chain, `None` for anything else.
 fn as_member_chain(e: &Expr) -> Option<AccessPath> {
-    match peel(e) {
+    match e.peel_ts() {
         Expr::Var(v) => Some(AccessPath {
             root: v.clone(),
             segments: vec![],
@@ -155,22 +148,6 @@ enum Motion {
     Unproven,
 }
 
-/// Alias-resolved `setter var → label` across the render body and every hook
-/// body (the shared recipe of `derived-state` / `stale-closure`).
-fn all_setter_labels(comp: &AnalysisResult<StateValue>) -> HashMap<Var, HookLabel> {
-    let mut labels = setter_var_labels(&comp.render_cfg);
-    for cfg in std::iter::once(&comp.render_cfg).chain(comp.hooks.iter().filter_map(|h| match h {
-        HookEntry::Effect { body_cfg, .. }
-        | HookEntry::Memo { body_cfg, .. }
-        | HookEntry::Callback { body_cfg, .. }
-        | HookEntry::Handler { body_cfg, .. } => Some(body_cfg),
-        _ => None,
-    })) {
-        labels = resolve_setter_aliases(cfg, &labels);
-    }
-    labels
-}
-
 /// Can `slot` ever be written in its owning component, and if so, where is
 /// the first provable write site? `(false, _)` is a proof of stillness;
 /// `(true, None)` means "referenced somewhere" without a direct call site
@@ -191,17 +168,11 @@ fn slot_write_evidence(
         .collect();
     let render_fns = collect_fn_bindings(&owner.render_cfg);
     let mut spans: Vec<SourceRange> = std::iter::once(&owner.render_cfg)
-        .chain(owner.hooks.iter().filter_map(|h| match h {
-            HookEntry::Effect { body_cfg, .. }
-            | HookEntry::Memo { body_cfg, .. }
-            | HookEntry::Callback { body_cfg, .. }
-            | HookEntry::Handler { body_cfg, .. } => Some(body_cfg),
-            _ => None,
-        }))
+        .chain(owner.hooks.iter().filter_map(|h| h.body_cfg()))
         .flat_map(|cfg| collect_setter_calls_with_extra(cfg, &setters, 2, &render_fns))
         .filter_map(|c| c.span)
         .collect();
-    spans.sort_by_key(|r| (r.line, r.col));
+    spans.sort_by_key(|r| r.pos_key());
     (true, spans.first().copied())
 }
 
@@ -280,7 +251,7 @@ fn setter_escapes(comp: &AnalysisResult<StateValue>, aliases: &HashSet<Var>) -> 
         match e {
             Expr::Var(v) => aliases.contains(v),
             Expr::Call { fn_, args } => {
-                let callee_is_alias = matches!(peel(fn_), Expr::Var(v) if aliases.contains(v));
+                let callee_is_alias = matches!(fn_.peel_ts(), Expr::Var(v) if aliases.contains(v));
                 (!callee_is_alias && in_expr(fn_, aliases))
                     || args.iter().any(|a| in_expr(a, aliases))
             }
@@ -308,7 +279,7 @@ fn setter_escapes(comp: &AnalysisResult<StateValue>, aliases: &HashSet<Var>) -> 
             block.stmts.iter().any(|stmt| match stmt {
                 // `let s2 = s1` where both sides are known aliases is the
                 // alias chain itself, not an escape.
-                Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } => match peel(rhs) {
+                Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } => match rhs.peel_ts() {
                     Expr::Var(v) if aliases.contains(v) => !aliases.contains(var),
                     _ => in_expr(rhs, aliases),
                 },
@@ -324,13 +295,8 @@ fn setter_escapes(comp: &AnalysisResult<StateValue>, aliases: &HashSet<Var>) -> 
             }
         })
     }
-    let cfgs = std::iter::once(&comp.render_cfg).chain(comp.hooks.iter().filter_map(|h| match h {
-        HookEntry::Effect { body_cfg, .. }
-        | HookEntry::Memo { body_cfg, .. }
-        | HookEntry::Callback { body_cfg, .. }
-        | HookEntry::Handler { body_cfg, .. } => Some(body_cfg),
-        _ => None,
-    }));
+    let cfgs =
+        std::iter::once(&comp.render_cfg).chain(comp.hooks.iter().filter_map(|h| h.body_cfg()));
     for cfg in cfgs {
         if in_cfg(cfg, aliases) {
             return true;
@@ -340,7 +306,7 @@ fn setter_escapes(comp: &AnalysisResult<StateValue>, aliases: &HashSet<Var>) -> 
     comp.hooks.iter().any(|h| match h {
         HookEntry::Custom { args, .. } => args.iter().any(|a| in_expr(a, aliases)),
         HookEntry::State { init, .. } | HookEntry::Ref { init, .. } => {
-            !matches!(peel(init), Expr::StateSetter(_)) && in_expr(init, aliases)
+            !matches!(init.peel_ts(), Expr::StateSetter(_)) && in_expr(init, aliases)
         }
         _ => false,
     })
@@ -583,17 +549,17 @@ impl Rule for FrozenInitialState {
 /// props-param-rooted `FieldAccess` resolves through the props `Obj` instead
 /// of degrading to ⊤.
 fn eval_with_heap(expr: &Expr, comp: &AnalysisResult<StateValue>) -> StateValue {
-    use crate::domains::{
-        AnalysisCtx, StateValueTransfer, Transfer,
-        stores::{MemoStore, StateStore},
-    };
-    let exit_env = comp.exit_env();
-    let mut s: StateStore<StateValue> = comp.state_store.clone();
-    let mut m: MemoStore<StateValue> = comp.memo_store.clone();
-    let mut h = comp.heap.clone();
-    StateValueTransfer.eval_expr(
+    // Same eval core as `eval_in_exit_env`, but seeded from the component's
+    // converged heap (`comp.heap.clone()`) instead of an empty one, so a
+    // props-param-rooted `FieldAccess` resolves through the props `Obj` rather
+    // than degrading to ⊤. The heap choice is exactly what distinguishes this
+    // wrapper — it must stay comp-seeded here.
+    super::eval_in_stores(
         expr,
-        &exit_env,
-        &mut AnalysisCtx::null(comp.component.clone(), &mut s, &mut m, &mut h),
+        &comp.exit_env(),
+        &comp.component,
+        &comp.state_store,
+        &comp.memo_store,
+        &mut comp.heap.clone(),
     )
 }

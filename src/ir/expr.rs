@@ -207,25 +207,24 @@ impl Expr {
     }
 
     /// Returns `true` iff the expression tree contains no `Call` or `CompApp` node.
+    /// `FnLit` bodies are not crossed (they are leaves for `for_each_child`).
     pub fn is_call_free(&self) -> bool {
         match self {
             Expr::Call { .. } | Expr::CompApp { .. } | Expr::NativeElem { .. } => false,
-            Expr::Lit(_)
-            | Expr::Var(_)
-            | Expr::StateVal(_)
-            | Expr::StateSetter(_)
-            | Expr::MemoVal(_)
-            | Expr::CallbackVal(_)
-            | Expr::HookMarker(_) => true,
-            Expr::ObjectLit { fields, .. } => fields.iter().all(|(_, v)| v.is_call_free()),
-            Expr::ArrayLit { elems, .. } => elems.iter().all(|e| e.is_call_free()),
-            Expr::FnLit { .. } => true,
-            Expr::FieldAccess { obj, .. } => obj.is_call_free(),
-            Expr::IndexAccess { arr, idx } => arr.is_call_free() && idx.is_call_free(),
-            Expr::BinOp { lhs, rhs, .. } => lhs.is_call_free() && rhs.is_call_free(),
-            Expr::UnaryOp { arg, .. } => arg.is_call_free(),
-            Expr::TSAnnotated(inner, _) => inner.is_call_free(),
-            Expr::SummaryVal(_) => true,
+            _ => {
+                let mut free = true;
+                self.for_each_child(&mut |c| free &= c.is_call_free());
+                free
+            }
         }
+    }
+
+    /// Strip any `TSAnnotated` wrappers, returning the underlying expression.
+    pub fn peel_ts(&self) -> &Expr {
+        let mut e = self;
+        while let Expr::TSAnnotated(inner, _) = e {
+            e = inner;
+        }
+        e
     }
 }

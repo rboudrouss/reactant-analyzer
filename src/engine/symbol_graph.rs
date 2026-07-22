@@ -14,14 +14,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::ir::{
-    cfg::{CFG, Terminator},
-    component::ComponentIR,
-    expr::Expr,
-    hook_ir::HookIR,
-    hooks::HookEntry,
-    stmt::Stmt,
-    types::Symbol,
+    cfg::CFG, component::ComponentIR, expr::Expr, hook_ir::HookIR, hooks::HookEntry, types::Symbol,
 };
+// Consumed only by the `tests` module (via `use super::*`); no longer used by
+// production code now that the CFG walk delegates to `CFG::for_each_expr`.
+#[cfg(test)]
+use crate::ir::stmt::Stmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SymbolKind {
@@ -249,100 +247,30 @@ fn collect_callees_in_hook_body(entry: &HookEntry, out: &mut Vec<Symbol>) {
 }
 
 fn collect_callees_in_cfg(cfg: &CFG, out: &mut Vec<Symbol>) {
-    for block in cfg.blocks.values() {
-        for stmt in &block.stmts {
-            match stmt {
-                Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => {
-                    collect_callees_in_expr(rhs, out)
-                }
-                Stmt::MemberWrite { obj, key, rhs, .. } => {
-                    collect_callees_in_expr(obj, out);
-                    if let crate::ir::stmt::MemberKey::Index(idx) = key {
-                        collect_callees_in_expr(idx, out);
-                    }
-                    collect_callees_in_expr(rhs, out);
-                }
-                Stmt::ExprStmt(expr, _) => collect_callees_in_expr(expr, out),
-            }
-        }
-        match &block.term {
-            Terminator::Branch { cond, .. } => collect_callees_in_expr(cond, out),
-            Terminator::Return(expr) => collect_callees_in_expr(expr, out),
-            _ => {}
-        }
-    }
+    cfg.for_each_expr(&mut |e| collect_callees_in_expr(e, out));
 }
 
 fn collect_callees_in_expr(expr: &Expr, out: &mut Vec<Symbol>) {
     match expr {
-        Expr::Call { fn_, args } => {
+        Expr::Call { fn_, .. } => {
             if let Expr::Var(name) = fn_.as_ref() {
                 out.push(name.clone());
             }
-            collect_callees_in_expr(fn_, out);
-            for a in args {
-                collect_callees_in_expr(a, out);
-            }
         }
-        Expr::CompApp { name, props } => {
-            out.push(name.clone());
-            collect_callees_in_expr(props, out);
-        }
-        Expr::NativeElem {
-            props, children, ..
-        } => {
-            collect_callees_in_expr(props, out);
-            for c in children {
-                collect_callees_in_expr(c, out);
-            }
-        }
-        Expr::FieldAccess { obj, .. } => collect_callees_in_expr(obj, out),
-        Expr::IndexAccess { arr, idx } => {
-            collect_callees_in_expr(arr, out);
-            collect_callees_in_expr(idx, out);
-        }
-        Expr::BinOp { lhs, rhs, .. } => {
-            collect_callees_in_expr(lhs, out);
-            collect_callees_in_expr(rhs, out);
-        }
-        Expr::UnaryOp { arg, .. } => collect_callees_in_expr(arg, out),
-        Expr::TSAnnotated(inner, _) => collect_callees_in_expr(inner, out),
-        Expr::ArrayLit { elems, .. } => {
-            for it in elems {
-                collect_callees_in_expr(it, out);
-            }
-        }
-        Expr::ObjectLit { fields, .. } => {
-            for (_, v) in fields {
-                collect_callees_in_expr(v, out);
-            }
-        }
-        // FnLit bodies are scanned through the IR's CFG separately; skipping
-        // their inline traversal here avoids double-counting and preserves the
-        // existing free-vars contract.
-        Expr::FnLit { .. } => {}
-        // Literals, vars, hook value handles, summaries no callees.
-        Expr::Lit(_)
-        | Expr::Var(_)
-        | Expr::StateVal(_)
-        | Expr::StateSetter(_)
-        | Expr::MemoVal(_)
-        | Expr::CallbackVal(_)
-        | Expr::HookMarker(_)
-        | Expr::SummaryVal(_) => {}
+        Expr::CompApp { name, .. } => out.push(name.clone()),
+        _ => {}
     }
+    // Structural descent. `for_each_child` does not cross `FnLit`, which is
+    // exactly the intended behaviour: function-body CFGs are scanned
+    // separately, so inlining them here would double-count callees.
+    expr.for_each_child(&mut |c| collect_callees_in_expr(c, out));
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
 
     use super::*;
-    use crate::ir::{
-        cfg::{BasicBlock, CFG, Terminator},
-        expr::{Expr, Prim},
-        hook_ir::HookIR,
-    };
+    use crate::ir::{cfg::CFG, expr::Expr, hook_ir::HookIR};
 
     fn cfg_calling(callees: &[&str]) -> CFG {
         let stmts = callees
@@ -357,20 +285,7 @@ mod tests {
                 )
             })
             .collect();
-        let mut blocks = HashMap::new();
-        blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts,
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            },
-        );
-        CFG {
-            entry: 0,
-            blocks,
-            edges: vec![],
-        }
+        crate::test_support::single_block_cfg(stmts)
     }
 
     fn comp(name: &str, file: &str, callees: &[&str]) -> ComponentIR {

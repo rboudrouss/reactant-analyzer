@@ -16,12 +16,12 @@ use crate::{
 };
 
 use super::{
-    Diagnostic, EffectClass, Rule, Severity, Step, ValueClass, collect_fn_bindings,
-    collect_setter_calls_with_extra,
+    Diagnostic, EffectClass, Rule, Severity, Step, ValueClass, all_setter_labels,
+    collect_fn_bindings, collect_setter_calls_with_extra,
     infinite_loop::{eval_in_exit_env, on_all_paths},
     memo_val_labels,
     missing_deps::fn_lit_binding,
-    resolve_setter_aliases, setter_var_labels, state_slot_name, state_val_labels,
+    resolve_setter_aliases, state_slot_name, state_val_labels,
 };
 
 /// Fires when a callback that **outlives the render** — handed to
@@ -168,20 +168,13 @@ struct Registration<'a> {
     span: Option<SourceRange>,
 }
 
-fn peel(mut e: &Expr) -> &Expr {
-    while let Expr::TSAnnotated(inner, _) = e {
-        e = inner;
-    }
-    e
-}
-
 /// Match a callee expression against the registrar table.
 /// Returns the registrar and its display name.
 fn match_registrar(fn_: &Expr) -> Option<(&'static Registrar, String)> {
-    let (method, root, is_method) = match peel(fn_) {
+    let (method, root, is_method) = match fn_.peel_ts() {
         Expr::Var(name) => (name.as_str(), None, false),
         Expr::FieldAccess { obj, field } => {
-            let root = match peel(obj) {
+            let root = match obj.peel_ts() {
                 Expr::Var(v) => Some(v.as_str()),
                 _ => None,
             };
@@ -259,7 +252,7 @@ fn registrations_in_expr<'a>(
             // Direct call of a locally-bound helper executes inline: the
             // registration inside it happens on the caller's block (B6).
             if depth > 0
-                && let Expr::Var(name) = peel(fn_)
+                && let Expr::Var(name) = fn_.peel_ts()
                 && let Some(body) = fn_bodies.get(name)
             {
                 collect_registrations(body, fn_bodies, depth - 1, Some(block_id), out);
@@ -302,7 +295,7 @@ fn resolve_callback<'a>(
     memo_vars: &HashMap<Var, HookLabel>,
     callback_hooks: &HashMap<HookLabel, (&'a [Var], &'a CFG)>,
 ) -> Option<(Option<&'a str>, &'a [Var], &'a CFG)> {
-    match peel(cb) {
+    match cb.peel_ts() {
         Expr::FnLit {
             params, body_cfg, ..
         } => Some((None, params, body_cfg)),
@@ -375,11 +368,11 @@ pub(super) fn may_written_slots(
     let mut used: HashSet<Var> = HashSet::new();
     scan_cfg(render_cfg, &mut used);
     for hook in hooks {
+        if let Some(body_cfg) = hook.body_cfg() {
+            scan_cfg(body_cfg, &mut used);
+            continue;
+        }
         match hook {
-            HookEntry::Effect { body_cfg, .. }
-            | HookEntry::Memo { body_cfg, .. }
-            | HookEntry::Callback { body_cfg, .. }
-            | HookEntry::Handler { body_cfg, .. } => scan_cfg(body_cfg, &mut used),
             HookEntry::State { init, .. } | HookEntry::Ref { init, .. } => {
                 collect_used_vars(init, &mut used)
             }
@@ -388,6 +381,7 @@ pub(super) fn may_written_slots(
                     collect_used_vars(a, &mut used);
                 }
             }
+            _ => {}
         }
     }
     setter_labels
@@ -511,18 +505,7 @@ impl Rule for StaleClosure {
         let state_vals_render = resolve_setter_aliases(render_cfg, &state_val_labels(render_cfg));
         let memo_vars = resolve_setter_aliases(render_cfg, &memo_val_labels(render_cfg));
 
-        let mut setter_labels = setter_var_labels(render_cfg);
-        for cfg in
-            std::iter::once(render_cfg).chain(comp_result.hooks.iter().filter_map(|h| match h {
-                HookEntry::Effect { body_cfg, .. }
-                | HookEntry::Memo { body_cfg, .. }
-                | HookEntry::Callback { body_cfg, .. }
-                | HookEntry::Handler { body_cfg, .. } => Some(body_cfg),
-                _ => None,
-            }))
-        {
-            setter_labels = resolve_setter_aliases(cfg, &setter_labels);
-        }
+        let setter_labels = all_setter_labels(comp_result);
         let written = may_written_slots(render_cfg, &comp_result.hooks, &setter_labels);
         let render_fns = collect_fn_bindings(render_cfg);
         let callback_hooks: HashMap<HookLabel, (&[Var], &CFG)> = comp_result
@@ -623,9 +606,7 @@ impl Rule for StaleClosure {
                     } else {
                         let mut calls =
                             collect_setter_calls_with_extra(cb_body, &slot_setters, 2, &fn_bodies);
-                        calls.sort_by_key(|c| {
-                            c.span.map_or((u32::MAX, u32::MAX), |r| (r.line, r.col))
-                        });
+                        calls.sort_by_key(|c| c.span.map_or((u32::MAX, u32::MAX), |r| r.pos_key()));
                         calls
                             .first()
                             .and_then(|c| setter_labels.get(&c.var).map(|l| (*l, c.span)))
@@ -649,9 +630,8 @@ impl Rule for StaleClosure {
                         Severity::Warning => 1,
                         Severity::Info => 0,
                     };
-                    let pos = |s: Option<SourceRange>| {
-                        s.map_or((u32::MAX, u32::MAX), |r| (r.line, r.col))
-                    };
+                    let pos =
+                        |s: Option<SourceRange>| s.map_or((u32::MAX, u32::MAX), |r| r.pos_key());
                     let candidate = PathFinding {
                         severity,
                         registrar: reg.display.clone(),

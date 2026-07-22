@@ -1,10 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    domains::{
-        AbstractDomain, AbstractEnv, AnalysisCtx, MemoStore, StateStore, StateValue,
-        StateValueTransfer, Transfer,
-    },
+    domains::{AbstractDomain, AbstractEnv, MemoStore, StateStore, StateValue},
     engine::ProgramAnalysisResult,
     ir::{
         cfg::CFG,
@@ -43,7 +40,6 @@ impl Rule for RedundantSetState {
 
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
         let result = &result.components[component];
-        let transfer = StateValueTransfer;
         let mut diags = Vec::new();
 
         // ── Render body ───────────────────────────────────────────────────────
@@ -65,7 +61,6 @@ impl Rule for RedundantSetState {
                 env,
                 &result.state_store,
                 &result.memo_store,
-                &transfer,
                 &mut diags,
                 &HashSet::new(),
             );
@@ -88,7 +83,6 @@ impl Rule for RedundantSetState {
                     &env_exit,
                     &result.state_store,
                     &result.memo_store,
-                    &transfer,
                     &mut diags,
                 );
                 if let Some(r) = result.effect_info.get(eff_label).and_then(|i| i.span) {
@@ -113,10 +107,9 @@ fn check_cfg_for_redundant_sets(
     env: &AbstractEnv<StateValue>,
     state: &StateStore<StateValue>,
     memo: &MemoStore<StateValue>,
-    transfer: &StateValueTransfer,
     diags: &mut Vec<Diagnostic>,
 ) {
-    let skip_labels = collect_transition_setters(component, cfg, env, state, memo, transfer);
+    let skip_labels = collect_transition_setters(component, cfg, env, state, memo);
     let mut sorted: Vec<_> = cfg.blocks.keys().copied().collect();
     sorted.sort_unstable();
     for block_id in sorted {
@@ -127,7 +120,6 @@ fn check_cfg_for_redundant_sets(
                 env,
                 state,
                 memo,
-                transfer,
                 diags,
                 &skip_labels,
             );
@@ -142,12 +134,11 @@ fn collect_transition_setters(
     env: &AbstractEnv<StateValue>,
     state: &StateStore<StateValue>,
     memo: &MemoStore<StateValue>,
-    transfer: &StateValueTransfer,
 ) -> HashSet<HookLabel> {
     // per label: (first seen arg value, has seen a different value)
     let mut tracker: HashMap<HookLabel, (StateValue, bool)> = HashMap::new();
     cfg.for_each_expr(&mut |e| {
-        collect_setter_vals_in_expr(component, e, env, state, memo, transfer, &mut tracker)
+        collect_setter_vals_in_expr(component, e, env, state, memo, &mut tracker)
     });
     tracker
         .into_iter()
@@ -162,7 +153,6 @@ fn collect_setter_vals_in_expr(
     env: &AbstractEnv<StateValue>,
     state: &StateStore<StateValue>,
     memo: &MemoStore<StateValue>,
-    transfer: &StateValueTransfer,
     tracker: &mut HashMap<HookLabel, (StateValue, bool)>,
 ) {
     match expr {
@@ -173,13 +163,13 @@ fn collect_setter_vals_in_expr(
                 let arg_val = args
                     .first()
                     .map(|a| {
-                        let mut s = state.clone();
-                        let mut m = memo.clone();
-                        let mut h = crate::domains::Heap::new();
-                        transfer.eval_expr(
+                        super::eval_in_stores(
                             a,
                             env,
-                            &mut AnalysisCtx::null(component.clone(), &mut s, &mut m, &mut h),
+                            component,
+                            state,
+                            memo,
+                            &mut crate::domains::Heap::new(),
                         )
                     })
                     .unwrap_or(StateValue::top());
@@ -195,17 +185,17 @@ fn collect_setter_vals_in_expr(
                 }
             }
             expr.for_each_child(&mut |c| {
-                collect_setter_vals_in_expr(component, c, env, state, memo, transfer, tracker)
+                collect_setter_vals_in_expr(component, c, env, state, memo, tracker)
             });
         }
         Expr::FnLit { body_cfg, .. } => {
             body_cfg.for_each_expr(&mut |e| {
-                collect_setter_vals_in_expr(component, e, env, state, memo, transfer, tracker)
+                collect_setter_vals_in_expr(component, e, env, state, memo, tracker)
             });
         }
         other => {
             other.for_each_child(&mut |c| {
-                collect_setter_vals_in_expr(component, c, env, state, memo, transfer, tracker)
+                collect_setter_vals_in_expr(component, c, env, state, memo, tracker)
             });
         }
     }
@@ -219,7 +209,6 @@ fn check_setter_calls(
     env: &AbstractEnv<StateValue>,
     state: &StateStore<StateValue>,
     memo: &MemoStore<StateValue>,
-    transfer: &StateValueTransfer,
     diags: &mut Vec<Diagnostic>,
     skip_labels: &HashSet<HookLabel>,
 ) {
@@ -235,13 +224,13 @@ fn check_setter_calls(
             let arg_val = args
                 .first()
                 .map(|a| {
-                    let mut s = state.clone();
-                    let mut m = memo.clone();
-                    let mut h = crate::domains::Heap::new();
-                    transfer.eval_expr(
+                    super::eval_in_stores(
                         a,
                         env,
-                        &mut AnalysisCtx::null(component.clone(), &mut s, &mut m, &mut h),
+                        component,
+                        state,
+                        memo,
+                        &mut crate::domains::Heap::new(),
                     )
                 })
                 .unwrap_or(StateValue::top());
@@ -284,7 +273,7 @@ mod tests {
     use crate::{
         domains::{
             Stability, StateValue,
-            stores::{AbstractEnv, MemoStore, StateStore},
+            stores::{AbstractEnv, StateStore},
         },
         engine::{AnalysisResult, ProgramAnalysisResult},
         ir::{
@@ -295,22 +284,10 @@ mod tests {
         },
         rules::Rule,
     };
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     fn prog(r: &AnalysisResult<StateValue>) -> ProgramAnalysisResult {
-        use crate::domains::stores::SharedStateStore;
-        use crate::engine::program_result::{AnalysisStats, ComponentCallGraph};
-        let mut components = HashMap::new();
-        components.insert("C".to_string(), r.clone());
-        ProgramAnalysisResult {
-            components,
-            shared_state: SharedStateStore::default(),
-            call_graph: ComponentCallGraph::new(),
-            recursive_components: HashSet::new(),
-            stats: AnalysisStats::default(),
-            file_table: Default::default(),
-            function_registry: Default::default(),
-        }
+        crate::test_support::prog("C", r.clone())
     }
 
     fn make_result(
@@ -352,25 +329,9 @@ mod tests {
         }
 
         AnalysisResult {
-            component: "C".to_string(),
-            file: Default::default(),
-            param: "props".to_string(),
-            dom_props: Default::default(),
             state_store,
-            memo_store: MemoStore::new(),
             block_states,
-            effect_block_states: HashMap::new(),
-            hook_calls: vec![],
-            effect_info: HashMap::new(),
-            handler_block_states: HashMap::new(),
-            handler_info: HashMap::new(),
-            widen_trace: HashMap::new(),
-            inline_origins: Vec::new(),
-            render_cfg,
-            hooks: vec![],
-            iterations: 0,
-            effect_setter_writes: StateStore::bottom(),
-            heap: crate::domains::stores::Heap::new(),
+            ..crate::test_support::analysis_result(render_cfg)
         }
     }
 
@@ -516,20 +477,7 @@ mod tests {
     ) -> AnalysisResult<StateValue> {
         use crate::ir::hooks::HookEntry;
 
-        let mut blocks = HashMap::new();
-        blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: render_stmts,
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            },
-        );
-        let render_cfg = CFG {
-            entry: 0,
-            blocks,
-            edges: vec![],
-        };
+        let render_cfg = crate::test_support::single_block_cfg(render_stmts);
 
         let mut env = AbstractEnv::<StateValue>::new();
         for (name, val, setter) in &env_bindings {
@@ -541,20 +489,7 @@ mod tests {
         let mut block_states = HashMap::new();
         block_states.insert(0usize, env);
 
-        let mut eff_blocks = HashMap::new();
-        eff_blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: effect_stmts,
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            },
-        );
-        let eff_cfg = CFG {
-            entry: 0,
-            blocks: eff_blocks,
-            edges: vec![],
-        };
+        let eff_cfg = crate::test_support::single_block_cfg(effect_stmts);
 
         let mut state_store = StateStore::new();
         for (label, val) in state_values {
@@ -562,30 +497,15 @@ mod tests {
         }
 
         AnalysisResult {
-            component: "C".to_string(),
-            file: Default::default(),
-            param: "props".to_string(),
-            dom_props: Default::default(),
             state_store,
-            memo_store: MemoStore::new(),
             block_states,
-            effect_block_states: HashMap::new(),
-            hook_calls: vec![],
-            effect_info: HashMap::new(),
-            handler_block_states: HashMap::new(),
-            handler_info: HashMap::new(),
-            widen_trace: HashMap::new(),
-            inline_origins: Vec::new(),
-            render_cfg,
             hooks: vec![HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
                 deps: Some(vec![]),
                 span: None,
             }],
-            iterations: 0,
-            effect_setter_writes: StateStore::bottom(),
-            heap: crate::domains::stores::Heap::new(),
+            ..crate::test_support::analysis_result(render_cfg)
         }
     }
 

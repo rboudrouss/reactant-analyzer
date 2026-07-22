@@ -148,10 +148,7 @@ impl Rule for ConditionalHook {
 mod tests {
     use super::*;
     use crate::{
-        domains::{
-            StateValue, StateValueTransfer,
-            stores::{MemoStore, StateStore},
-        },
+        domains::{StateValue, StateValueTransfer},
         engine::{
             AnalysisResult, Config, HookCallInfo, HookKind, ProgramAnalysisResult,
             analyze_component,
@@ -165,45 +162,16 @@ mod tests {
         },
         rules::Rule,
     };
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     fn prog(r: &AnalysisResult<StateValue>) -> ProgramAnalysisResult {
-        use crate::domains::stores::SharedStateStore;
-        use crate::engine::program_result::{AnalysisStats, ComponentCallGraph};
-        let mut components = HashMap::new();
-        components.insert("C".to_string(), r.clone());
-        ProgramAnalysisResult {
-            components,
-            shared_state: SharedStateStore::default(),
-            call_graph: ComponentCallGraph::new(),
-            recursive_components: HashSet::new(),
-            stats: AnalysisStats::default(),
-            file_table: Default::default(),
-            function_registry: Default::default(),
-        }
+        crate::test_support::prog("C", r.clone())
     }
 
     fn make_result(render_cfg: CFG, hook_calls: Vec<HookCallInfo>) -> AnalysisResult<StateValue> {
         AnalysisResult {
-            component: "C".to_string(),
-            file: Default::default(),
-            param: "props".to_string(),
-            dom_props: Default::default(),
-            state_store: StateStore::bottom(),
-            memo_store: MemoStore::new(),
-            block_states: HashMap::new(),
-            effect_block_states: HashMap::new(),
             hook_calls,
-            effect_info: HashMap::new(),
-            handler_block_states: HashMap::new(),
-            handler_info: HashMap::new(),
-            widen_trace: HashMap::new(),
-            inline_origins: Vec::new(),
-            render_cfg,
-            hooks: vec![],
-            iterations: 0,
-            effect_setter_writes: StateStore::bottom(),
-            heap: crate::domains::stores::Heap::new(),
+            ..crate::test_support::analysis_result(render_cfg)
         }
     }
 

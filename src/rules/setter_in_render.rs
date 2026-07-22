@@ -218,10 +218,7 @@ fn setter_call_arg<'a>(
 mod tests {
     use super::*;
     use crate::{
-        domains::{
-            StateValue, StateValueTransfer,
-            stores::{MemoStore, StateStore},
-        },
+        domains::{StateValue, StateValueTransfer},
         engine::{AnalysisResult, Config, ProgramAnalysisResult, analyze_component},
         ir::{
             cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator},
@@ -232,58 +229,18 @@ mod tests {
         },
         rules::Rule,
     };
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     fn prog(name: &str, r: &AnalysisResult<StateValue>) -> ProgramAnalysisResult {
-        use crate::domains::stores::SharedStateStore;
-        use crate::engine::program_result::{AnalysisStats, ComponentCallGraph};
-        let mut components = HashMap::new();
-        components.insert(name.to_string(), r.clone());
-        ProgramAnalysisResult {
-            components,
-            shared_state: SharedStateStore::default(),
-            call_graph: ComponentCallGraph::new(),
-            recursive_components: HashSet::new(),
-            stats: AnalysisStats::default(),
-            file_table: Default::default(),
-            function_registry: Default::default(),
-        }
+        crate::test_support::prog(name, r.clone())
     }
 
     fn make_result(hooks: Vec<HookEntry>, render_stmts: Vec<Stmt>) -> AnalysisResult<StateValue> {
-        let mut blocks = HashMap::new();
-        blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: render_stmts,
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            },
-        );
         AnalysisResult {
-            component: "C".to_string(),
-            file: Default::default(),
-            param: "props".to_string(),
-            dom_props: Default::default(),
-            state_store: StateStore::bottom(),
-            memo_store: MemoStore::new(),
-            block_states: HashMap::new(),
-            effect_block_states: HashMap::new(),
-            hook_calls: vec![],
-            effect_info: HashMap::new(),
-            handler_block_states: HashMap::new(),
-            handler_info: HashMap::new(),
-            widen_trace: Default::default(),
-            inline_origins: Default::default(),
-            render_cfg: CFG {
-                entry: 0,
-                blocks,
-                edges: vec![],
-            },
             hooks,
-            iterations: 0,
-            effect_setter_writes: StateStore::bottom(),
-            heap: crate::domains::stores::Heap::new(),
+            ..crate::test_support::analysis_result(crate::test_support::single_block_cfg(
+                render_stmts,
+            ))
         }
     }
 
@@ -378,42 +335,22 @@ mod tests {
                 term: Terminator::Return(Expr::Lit(Prim::Unit)),
             },
         );
-        let result = AnalysisResult {
-            component: "C".to_string(),
-            file: Default::default(),
-            param: "props".to_string(),
-            dom_props: Default::default(),
-            state_store: StateStore::bottom(),
-            memo_store: MemoStore::new(),
-            block_states: HashMap::new(),
-            effect_block_states: HashMap::new(),
-            hook_calls: vec![],
-            effect_info: HashMap::new(),
-            handler_block_states: HashMap::new(),
-            handler_info: HashMap::new(),
-            widen_trace: Default::default(),
-            inline_origins: Default::default(),
-            effect_setter_writes: StateStore::bottom(),
-            render_cfg: CFG {
-                entry: 0,
-                blocks,
-                edges: vec![
-                    Edge {
-                        from: 0,
-                        to: 1,
-                        kind: EdgeKind::IfTrue,
-                    },
-                    Edge {
-                        from: 0,
-                        to: 2,
-                        kind: EdgeKind::IfFalse,
-                    },
-                ],
-            },
-            hooks: vec![],
-            iterations: 0,
-            heap: crate::domains::stores::Heap::new(),
-        };
+        let result = crate::test_support::analysis_result(CFG {
+            entry: 0,
+            blocks,
+            edges: vec![
+                Edge {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::IfTrue,
+                },
+                Edge {
+                    from: 0,
+                    to: 2,
+                    kind: EdgeKind::IfFalse,
+                },
+            ],
+        });
         let diags = SetterInRender.check(&prog("C", &result), &"C".to_string());
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].severity, Severity::Warning);
@@ -514,26 +451,13 @@ mod tests {
     #[test]
     fn setter_inside_callback_arg_is_warning() {
         // someCall((u) => { setN(u) }) setter in FnLit arg → Warning
-        let mut cb_blocks = HashMap::new();
-        cb_blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: vec![Stmt::ExprStmt(
-                    Expr::Call {
-                        fn_: Box::new(Expr::Var("setN".to_string())),
-                        args: vec![Expr::Var("u".to_string())],
-                    },
-                    None,
-                )],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+        let cb_cfg = crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Var("u".to_string())],
             },
-        );
-        let cb_cfg = CFG {
-            entry: 0,
-            blocks: cb_blocks,
-            edges: vec![],
-        };
+            None,
+        )]);
 
         let render_stmts = vec![
             Stmt::Let {

@@ -1,18 +1,16 @@
 //! Registry of utility [`FunctionIR`]s, mirroring [`ComponentRegistry`] /
 //! [`HookRegistry`].
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::ir::{FunctionIR, types::Symbol};
+use crate::registry::KeyedRegistry;
 
 /// `(file, name)` key same shape as the other registries.
 pub type FunctionKey = (PathBuf, Symbol);
 
 #[derive(Debug, Default, Clone)]
-pub struct FunctionRegistry {
-    functions: HashMap<FunctionKey, FunctionIR>,
-}
+pub struct FunctionRegistry(KeyedRegistry<FunctionIR>);
 
 impl FunctionRegistry {
     pub fn new() -> Self {
@@ -20,16 +18,15 @@ impl FunctionRegistry {
     }
 
     pub fn from_functions(functions: Vec<FunctionIR>) -> Self {
-        let mut reg = Self::new();
-        for f in functions {
-            let key = (f.file.clone(), f.name.clone());
-            reg.functions.insert(key, f);
-        }
-        reg
+        Self(KeyedRegistry::from_keyed(
+            functions
+                .into_iter()
+                .map(|f| ((f.file.clone(), f.name.clone()), f)),
+        ))
     }
 
     pub fn get(&self, key: &FunctionKey) -> Option<&FunctionIR> {
-        self.functions.get(key)
+        self.0.get(key)
     }
 
     /// Legacy lookup by name only, returning the first match (sorted) when
@@ -37,54 +34,34 @@ impl FunctionRegistry {
     /// is available at the call site.
     #[doc(hidden)]
     pub fn get_by_name(&self, name: &Symbol) -> Option<&FunctionIR> {
-        let mut keys: Vec<&FunctionKey> =
-            self.functions.keys().filter(|(_, n)| n == name).collect();
-        keys.sort();
-        keys.into_iter().next().and_then(|k| self.functions.get(k))
+        self.0.get_by_name(name)
     }
 
     pub fn contains(&self, key: &FunctionKey) -> bool {
-        self.functions.contains_key(key)
+        self.0.contains(key)
     }
 
     pub fn all_functions(&self) -> impl Iterator<Item = &FunctionIR> {
-        self.functions.values()
+        self.0.values()
     }
 
     pub fn len(&self) -> usize {
-        self.functions.len()
+        self.0.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.functions.is_empty()
+        self.0.is_empty()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
-    use crate::ir::{
-        cfg::{BasicBlock, CFG, Terminator},
-        expr::{Expr, Prim},
-    };
+    use crate::ir::cfg::CFG;
 
     fn trivial_cfg() -> CFG {
-        let mut blocks = HashMap::new();
-        blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            },
-        );
-        CFG {
-            entry: 0,
-            blocks,
-            edges: vec![],
-        }
+        crate::test_support::single_block_cfg(vec![])
     }
 
     fn fn_ir(file: &str, name: &str) -> FunctionIR {

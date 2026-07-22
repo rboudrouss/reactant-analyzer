@@ -41,6 +41,13 @@ pub struct SourceRange {
     pub col: u32,
 }
 
+impl SourceRange {
+    /// `(line, col)` sort key for ordering diagnostics within a file.
+    pub fn pos_key(&self) -> (u32, u32) {
+        (self.line, self.col)
+    }
+}
+
 /// Everything the lowering needs to mint [`SourceRange`]s for one file:
 /// the line-start table plus the file's interned identity.
 #[derive(Debug, Clone)]

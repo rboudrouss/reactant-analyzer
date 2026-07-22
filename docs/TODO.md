@@ -1,5 +1,41 @@
 # TODO — remaining analysis limits
 
+## Soundness fixes to implement (planned — Wave 0)
+
+These are *defects*, not documented limits: the soundness invariant forbids false
+negatives. Each is a lowering/domain shortcut that drops an observable read or effect.
+Deferred out of the 2026-07 cleanup pass so the tidy refactors stay behavior-neutral and
+the suite stays green; to be implemented next, each with its own regression test.
+
+- **Template-literal interpolations dropped at lowering** (`lowering/expr_lower.rs`).
+  `TemplateLiteral` only descends into `quasis`; the `${…}` expressions are lost (same for
+  `TaggedTemplateExpression`, `args: vec![]`). `` `Count: ${n}` `` loses the read of `n` →
+  `missing-deps`/`stale-closure` never see it. Fix: lower each `tl.expressions`, fold with
+  the quasis. *(tech-debt Part 2 / WA 1, 9)*
+- **`SequenceExpression` lowers only its last operand** (`lowering/expr_lower.rs`).
+  `(setOpen(false), doThing())` loses the setter write. Fix: iterate all operands, keep the
+  last as the value. *(tech-debt Part 2 / WA 9)*
+- **Interval narrowing unsound on floats** (`domains/impls/interval.rs`, P2).
+  `narrow_lt(v)` does `hi = v − 1.0` (assumes integer steps). For `x = 1.7` under `x < 2`,
+  both branches drop `1.7`. Fix: `narrow_lt(v) → hi = min(hi, v)` (sound over-approx); keep
+  the integer tightening behind a proven-integrality bit. *(tech-debt Part 2 / WA 11)*
+- **`Let`/`Assign` setter-alias divergence** (`domains/interp/interpreter.rs`).
+  The `Let` arm propagates `let s = setX` aliases (loc/setter/callback binding); the `Assign`
+  arm does not — and `s2 = setX` now lowers to `Assign`, so the alias is lost → FN. Fix:
+  factor the shared RHS-binding sequence (`bind_rhs`) called by both arms, making the alias
+  block unconditional. *(tech-debt Part 2 / ARCH 22 / Annexe C-D2)*
+
+### Latent (surface as FN when the code grows)
+
+- **Custom-hook graft keeps only the entry block** — `expand_custom_hooks` concatenates only
+  the hook body's ENTRY block; other blocks/edges are dropped, no α-renaming. Multi-block
+  hook bodies lose reads/effects. Root cause of the `useMermaidRenderer` FP too. Fix: unify
+  the CFG-splice primitive (tech-debt Thème 1). *(WA 3, 4, 14 / ARCH 1)*
+- **`StateValue` single-active-slot guards re-enumerate 8 slots by hand** (`domains/impls/state_value.rs`,
+  `domains/transfer/state_value.rs`, ×7). Adding a new kind slot silently leaves 7 predicates
+  wrong → FN. Fix: a `populated_kinds()`/mask method so a new slot is a compile-time concern.
+  *(tech-debt Annexe C-D4)*
+
 ## Known false negatives (FN)
 
 - **Aliased React hook imports stay Custom** — `import { useMemo as useM } from "react"`: classification keys on the LOCAL name (`useM` matches no React arm) → Custom with `import_source: "react"` → not analyzed as a memo. Rare pattern; fixing it needs the *imported* name in the import map, not just the local binding.

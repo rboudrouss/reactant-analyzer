@@ -284,6 +284,17 @@ impl StateValue {
             || self.other
     }
 
+    /// The reference slot's change-trace labels when it carries them
+    /// (`Versioned`/`VersionedTop`), else `None`. Lets a caller preserve the
+    /// version labels while degrading the value's *kind* — the recurring
+    /// ADR-017 "keep Versioned labels, don't erase them via ⊤" move.
+    pub fn versioned_reference(&self) -> Option<Stability> {
+        match &self.reference {
+            Stability::Versioned(_) | Stability::VersionedTop => Some(self.reference.clone()),
+            _ => None,
+        }
+    }
+
     /// True if this value is definitively stable (won't cause a re-render).
     pub fn is_stable(&self) -> bool {
         matches!(self.to_stability(), Stability::Stable)

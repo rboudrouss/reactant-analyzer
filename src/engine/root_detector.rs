@@ -2,14 +2,7 @@ use std::collections::HashSet;
 
 use crate::{
     engine::component_registry::{ComponentKey, ComponentRegistry},
-    ir::{
-        cfg::{CFG, Terminator},
-        component::ComponentIR,
-        expr::Expr,
-        hooks::HookEntry,
-        stmt::Stmt,
-        types::Symbol,
-    },
+    ir::{cfg::CFG, component::ComponentIR, expr::Expr, hooks::HookEntry, types::Symbol},
 };
 
 /// Strategy for selecting root components (entry points for top-down analysis).
@@ -77,76 +70,21 @@ fn collect_compapp_in_component(comp: &ComponentIR, out: &mut HashSet<Symbol>) {
 }
 
 fn collect_compapp_in_cfg(cfg: &CFG, out: &mut HashSet<Symbol>) {
-    for block in cfg.blocks.values() {
-        for stmt in &block.stmts {
-            match stmt {
-                Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => {
-                    collect_compapp_in_expr(rhs, out);
-                }
-                Stmt::MemberWrite { obj, key, rhs, .. } => {
-                    collect_compapp_in_expr(obj, out);
-                    if let crate::ir::stmt::MemberKey::Index(idx) = key {
-                        collect_compapp_in_expr(idx, out);
-                    }
-                    collect_compapp_in_expr(rhs, out);
-                }
-                Stmt::ExprStmt(expr, _) => {
-                    collect_compapp_in_expr(expr, out);
-                }
-            }
-        }
-        match &block.term {
-            Terminator::Branch { cond, .. } => collect_compapp_in_expr(cond, out),
-            Terminator::Return(expr) => collect_compapp_in_expr(expr, out),
-            _ => {}
-        }
-    }
+    cfg.for_each_expr(&mut |e| collect_compapp_in_expr(e, out));
 }
 
 fn collect_compapp_in_expr(expr: &Expr, out: &mut HashSet<Symbol>) {
     match expr {
-        Expr::CompApp { name, props } => {
+        Expr::CompApp { name, .. } => {
             out.insert(name.clone());
-            collect_compapp_in_expr(props, out);
         }
+        // `for_each_child` does not cross `FnLit`; render helpers can still
+        // instantiate components, so descend into the body CFG explicitly.
         Expr::FnLit { body_cfg, .. } => collect_compapp_in_cfg(body_cfg, out),
-        Expr::ObjectLit { fields, .. } => {
-            for (_, e) in fields {
-                collect_compapp_in_expr(e, out);
-            }
-        }
-        Expr::ArrayLit { elems, .. } => {
-            for e in elems {
-                collect_compapp_in_expr(e, out);
-            }
-        }
-        Expr::FieldAccess { obj, .. } => collect_compapp_in_expr(obj, out),
-        Expr::IndexAccess { arr, idx } => {
-            collect_compapp_in_expr(arr, out);
-            collect_compapp_in_expr(idx, out);
-        }
-        Expr::BinOp { lhs, rhs, .. } => {
-            collect_compapp_in_expr(lhs, out);
-            collect_compapp_in_expr(rhs, out);
-        }
-        Expr::UnaryOp { arg, .. } => collect_compapp_in_expr(arg, out),
-        Expr::Call { fn_, args } => {
-            collect_compapp_in_expr(fn_, out);
-            for a in args {
-                collect_compapp_in_expr(a, out);
-            }
-        }
-        Expr::NativeElem {
-            props, children, ..
-        } => {
-            collect_compapp_in_expr(props, out);
-            for c in children {
-                collect_compapp_in_expr(c, out);
-            }
-        }
-        Expr::TSAnnotated(e, _) => collect_compapp_in_expr(e, out),
         _ => {}
     }
+    // Structural descent (a no-op on `FnLit`, whose body was handled above).
+    expr.for_each_child(&mut |c| collect_compapp_in_expr(c, out));
 }
 
 #[cfg(test)]
@@ -163,20 +101,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn trivial_cfg() -> CFG {
-        let mut blocks = HashMap::new();
-        blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            },
-        );
-        CFG {
-            entry: 0,
-            blocks,
-            edges: vec![],
-        }
+        crate::test_support::single_block_cfg(vec![])
     }
 
     fn component(name: &str) -> ComponentIR {

@@ -804,26 +804,7 @@ fn collect_thresholds(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<f64> {
 }
 
 fn collect_lits_cfg(cfg: &CFG, out: &mut Vec<f64>) {
-    for block in cfg.blocks.values() {
-        for stmt in &block.stmts {
-            match stmt {
-                Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => collect_lits_expr(rhs, out),
-                Stmt::MemberWrite { obj, key, rhs, .. } => {
-                    collect_lits_expr(obj, out);
-                    if let crate::ir::stmt::MemberKey::Index(idx) = key {
-                        collect_lits_expr(idx, out);
-                    }
-                    collect_lits_expr(rhs, out);
-                }
-                Stmt::ExprStmt(e, _) => collect_lits_expr(e, out),
-            }
-        }
-        match &block.term {
-            Terminator::Branch { cond, .. } => collect_lits_expr(cond, out),
-            Terminator::Return(e) => collect_lits_expr(e, out),
-            _ => {}
-        }
-    }
+    cfg.for_each_expr(&mut |e| collect_lits_expr(e, out));
 }
 
 fn collect_lits_expr(expr: &Expr, out: &mut Vec<f64>) {
@@ -831,45 +812,13 @@ fn collect_lits_expr(expr: &Expr, out: &mut Vec<f64>) {
     match expr {
         Expr::Lit(Prim::Int(n)) => out.push(*n as f64),
         Expr::Lit(Prim::Float(f)) => out.push(*f),
-        Expr::BinOp { lhs, rhs, .. } => {
-            collect_lits_expr(lhs, out);
-            collect_lits_expr(rhs, out);
-        }
-        Expr::UnaryOp { arg, .. } => collect_lits_expr(arg, out),
-        Expr::FieldAccess { obj, .. } => collect_lits_expr(obj, out),
-        Expr::IndexAccess { arr, idx } => {
-            collect_lits_expr(arr, out);
-            collect_lits_expr(idx, out);
-        }
-        Expr::Call { fn_, args } => {
-            collect_lits_expr(fn_, out);
-            for a in args {
-                collect_lits_expr(a, out);
-            }
-        }
-        Expr::ObjectLit { fields, .. } => {
-            for (_, v) in fields {
-                collect_lits_expr(v, out);
-            }
-        }
-        Expr::ArrayLit { elems, .. } => {
-            for e in elems {
-                collect_lits_expr(e, out);
-            }
-        }
-        Expr::CompApp { props, .. } => collect_lits_expr(props, out),
-        Expr::NativeElem {
-            props, children, ..
-        } => {
-            collect_lits_expr(props, out);
-            for c in children {
-                collect_lits_expr(c, out);
-            }
-        }
-        Expr::TSAnnotated(inner, _) => collect_lits_expr(inner, out),
+        // `for_each_child` does not cross `FnLit`; thresholds inside closures
+        // (event handlers, render helpers) still bound guarded growth.
         Expr::FnLit { body_cfg, .. } => collect_lits_cfg(body_cfg, out),
         _ => {}
     }
+    // Structural descent (a no-op on `FnLit`, whose body was handled above).
+    expr.for_each_child(&mut |c| collect_lits_expr(c, out));
 }
 
 fn exit_env<D: AbstractDomain>(
@@ -1472,42 +1421,16 @@ mod tests {
     use std::sync::Arc;
 
     fn trivial_cfg() -> CFG {
-        let mut blocks = HashMap::new();
-        blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: vec![],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            },
-        );
-        CFG {
-            entry: 0,
-            blocks,
-            edges: vec![],
-        }
+        crate::test_support::single_block_cfg(vec![])
     }
 
     fn component(hooks: Vec<HookEntry>, render_stmts: Vec<Stmt>) -> ComponentIR {
-        let mut blocks = HashMap::new();
-        blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: render_stmts,
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            },
-        );
         ComponentIR {
             file: std::path::PathBuf::new(),
             name: "TestComp".to_string(),
             param: "props".to_string(),
             dom_props: Default::default(),
-            render_cfg: CFG {
-                entry: 0,
-                blocks,
-                edges: vec![],
-            },
+            render_cfg: crate::test_support::single_block_cfg(render_stmts),
             hooks,
             module_consts: Default::default(),
         }
@@ -1586,33 +1509,20 @@ mod tests {
     fn effect_with_stable_setstate_converges() {
         // useEffect(() => { setN(42); }, [])
         // 42 → Number([42,42]); init is 0 → Number([0,0]); settles at Number([42,42]).
-        let mut eff_blocks = HashMap::new();
-        eff_blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: vec![
-                    Stmt::Let {
-                        var: "setN".to_string(),
-                        rhs: Expr::StateSetter(0),
-                        span: None,
-                    },
-                    Stmt::ExprStmt(
-                        Expr::Call {
-                            fn_: Box::new(Expr::Var("setN".to_string())),
-                            args: vec![Expr::Lit(Prim::Int(42))],
-                        },
-                        None,
-                    ),
-                ],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+        let eff_cfg = crate::test_support::single_block_cfg(vec![
+            Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+                span: None,
             },
-        );
-        let eff_cfg = CFG {
-            entry: 0,
-            blocks: eff_blocks,
-            edges: vec![],
-        };
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::Lit(Prim::Int(42))],
+                },
+                None,
+            ),
+        ]);
 
         let hooks = vec![
             HookEntry::State {
@@ -1654,36 +1564,23 @@ mod tests {
     fn effect_with_unstable_setstate_converges() {
         // useEffect(() => { setN({}); }, [])
         // {} → Reference(Unstable); cross-type join with init Number → Top; stable at Top.
-        let mut eff_blocks = HashMap::new();
-        eff_blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: vec![
-                    Stmt::Let {
-                        var: "setN".to_string(),
-                        rhs: Expr::StateSetter(0),
-                        span: None,
-                    },
-                    Stmt::ExprStmt(
-                        Expr::Call {
-                            fn_: Box::new(Expr::Var("setN".to_string())),
-                            args: vec![Expr::ObjectLit {
-                                id: crate::ir::types::ExprId(0),
-                                fields: vec![],
-                            }],
-                        },
-                        None,
-                    ),
-                ],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+        let eff_cfg = crate::test_support::single_block_cfg(vec![
+            Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+                span: None,
             },
-        );
-        let eff_cfg = CFG {
-            entry: 0,
-            blocks: eff_blocks,
-            edges: vec![],
-        };
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::ObjectLit {
+                        id: crate::ir::types::ExprId(0),
+                        fields: vec![],
+                    }],
+                },
+                None,
+            ),
+        ]);
 
         let hooks = vec![
             HookEntry::State {
@@ -1712,36 +1609,23 @@ mod tests {
     #[test]
     fn widened_labels_triggered_with_low_threshold() {
         // With widen_threshold = 1, any state change on iter 1 marks widened_labels.
-        let mut eff_blocks = HashMap::new();
-        eff_blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: vec![
-                    Stmt::Let {
-                        var: "setN".to_string(),
-                        rhs: Expr::StateSetter(0),
-                        span: None,
-                    },
-                    Stmt::ExprStmt(
-                        Expr::Call {
-                            fn_: Box::new(Expr::Var("setN".to_string())),
-                            args: vec![Expr::ObjectLit {
-                                id: crate::ir::types::ExprId(0),
-                                fields: vec![],
-                            }],
-                        },
-                        None,
-                    ),
-                ],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+        let eff_cfg = crate::test_support::single_block_cfg(vec![
+            Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+                span: None,
             },
-        );
-        let eff_cfg = CFG {
-            entry: 0,
-            blocks: eff_blocks,
-            edges: vec![],
-        };
+            Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::Var("setN".to_string())),
+                    args: vec![Expr::ObjectLit {
+                        id: crate::ir::types::ExprId(0),
+                        fields: vec![],
+                    }],
+                },
+                None,
+            ),
+        ]);
 
         let hooks = vec![
             HookEntry::State {
@@ -1798,26 +1682,13 @@ mod tests {
     #[test]
     fn effect_info_captures_free_vars() {
         // Effect body uses "n" and "setN" both are free vars
-        let mut eff_blocks = HashMap::new();
-        eff_blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: vec![Stmt::ExprStmt(
-                    Expr::Call {
-                        fn_: Box::new(Expr::Var("setN".to_string())),
-                        args: vec![Expr::Var("n".to_string())],
-                    },
-                    None,
-                )],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+        let eff_cfg = crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::Var("n".to_string())],
             },
-        );
-        let eff_cfg = CFG {
-            entry: 0,
-            blocks: eff_blocks,
-            edges: vec![],
-        };
+            None,
+        )]);
 
         let hooks = vec![HookEntry::Effect {
             label: 0,
@@ -1891,51 +1762,25 @@ mod tests {
         // With heap persistence: setter fires → cross-type join → Top.
 
         // cb body CFG: ExprStmt(setN({}))
-        let mut cb_blocks = HashMap::new();
-        cb_blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: vec![Stmt::ExprStmt(
-                    Expr::Call {
-                        fn_: Box::new(Expr::Var("setN".to_string())),
-                        args: vec![Expr::ObjectLit {
-                            id: ExprId(0),
-                            fields: vec![],
-                        }],
-                    },
-                    None,
-                )],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+        let cb_body = Arc::new(crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::ObjectLit {
+                    id: ExprId(0),
+                    fields: vec![],
+                }],
             },
-        );
-        let cb_body = Arc::new(CFG {
-            entry: 0,
-            blocks: cb_blocks,
-            edges: vec![],
-        });
+            None,
+        )]));
 
         // Effect body CFG: ExprStmt(setTimeout(cb, 0))
-        let mut eff_blocks = HashMap::new();
-        eff_blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts: vec![Stmt::ExprStmt(
-                    Expr::Call {
-                        fn_: Box::new(Expr::Var("setTimeout".to_string())),
-                        args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(0))],
-                    },
-                    None,
-                )],
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+        let eff_cfg = crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setTimeout".to_string())),
+                args: vec![Expr::Var("cb".to_string()), Expr::Lit(Prim::Int(0))],
             },
-        );
-        let eff_cfg = CFG {
-            entry: 0,
-            blocks: eff_blocks,
-            edges: vec![],
-        };
+            None,
+        )]);
 
         let hooks = vec![
             HookEntry::State {
@@ -1987,20 +1832,7 @@ mod tests {
     // ── Handler entry point tests ─────────────────────────────────────────────
 
     fn handler_cfg(stmts: Vec<Stmt>) -> CFG {
-        let mut blocks = HashMap::new();
-        blocks.insert(
-            0,
-            BasicBlock {
-                id: 0,
-                stmts,
-                term: Terminator::Return(Expr::Lit(Prim::Unit)),
-            },
-        );
-        CFG {
-            entry: 0,
-            blocks,
-            edges: vec![],
-        }
+        crate::test_support::single_block_cfg(stmts)
     }
 
     #[test]

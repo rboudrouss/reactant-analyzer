@@ -4,11 +4,12 @@ use crate::{
     domains::{AbstractDomain, impls::StateValue},
     ir::{
         cfg::CFG,
+        free_vars::compute_free_vars,
         types::{ExprId, Symbol, Var},
     },
 };
 
-use super::EnvVal;
+use super::{AbstractEnv, EnvVal, map_get_or};
 
 /// Value stored at a heap location (indexed by `ExprId` allocation site).
 #[derive(Debug, Clone)]
@@ -36,6 +37,33 @@ impl Heap {
 
     pub fn insert(&mut self, id: ExprId, val: HeapValue) {
         self.0.insert(id, val);
+    }
+
+    /// Allocate a `HeapValue::Fn` at site `id`, snapshotting the closure's
+    /// captured `StateValue`s (the body's free vars resolved in `env`).
+    ///
+    /// The single place a FnLit becomes a heap closure — shared by every
+    /// statement arm (`Let`/`Assign`/`MemberWrite`) and by prop evaluation.
+    pub fn alloc_fn<D: AbstractDomain>(
+        &mut self,
+        id: ExprId,
+        params: &[Var],
+        body_cfg: &Arc<CFG>,
+        env: &AbstractEnv<D>,
+    ) {
+        let free = compute_free_vars(body_cfg);
+        let captured = free
+            .iter()
+            .filter_map(|v| env.lookup(v).as_state_value().map(|sv| (v.clone(), sv)))
+            .collect();
+        self.insert(
+            id,
+            HeapValue::Fn {
+                params: params.to_vec(),
+                body_cfg: Arc::clone(body_cfg),
+                captured,
+            },
+        );
     }
 
     pub fn get(&self, id: ExprId) -> Option<&HeapValue> {
@@ -68,10 +96,7 @@ impl Heap {
                     {
                         let mut joined_cap = cap_self.clone();
                         for (k, v) in cap_other {
-                            let cur = joined_cap
-                                .get(k)
-                                .cloned()
-                                .unwrap_or_else(StateValue::bottom);
+                            let cur = map_get_or(&joined_cap, k, StateValue::bottom);
                             joined_cap.insert(k.clone(), cur.join(v));
                         }
                         result.insert(
