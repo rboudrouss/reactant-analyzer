@@ -130,6 +130,19 @@ pub trait Transfer {
         ctx: &mut context::AnalysisCtx<Self::Domain>,
     );
 
+    /// Fire the side effects of `expr` evaluated in *effect position* — a bare
+    /// `expr;` statement or a concise-arrow `Return` body: the callback
+    /// pre-pass, the setter-call weak-update, and the inter-component eval a
+    /// component application performs. This is the single definition of
+    /// "run an expression for its effects"; the fixpoint engine's `Return`
+    /// handling calls it instead of fabricating a throwaway `Stmt::ExprStmt`.
+    fn exec_expr_effects(
+        &self,
+        expr: &Expr,
+        env: &mut AbstractEnv<Self::Domain>,
+        ctx: &mut context::AnalysisCtx<Self::Domain>,
+    );
+
     /// Compute the abstract value for a memoized hook from its dependency list.
     /// Called by the engine after each render-pass to refresh the memo store.
     ///

@@ -8,7 +8,6 @@ use crate::{
     ir::{
         cfg::{CFG, EdgeKind, Terminator},
         expr::{BinOp, Expr, Prim},
-        stmt::Stmt,
         types::{BlockId, Symbol},
     },
 };
@@ -77,14 +76,12 @@ pub fn analyze_cfg<'inter, T: Transfer>(
             for stmt in &block.stmts {
                 transfer.exec_stmt(stmt, &mut env_out, &mut ac);
             }
-            // Concise-arrow bodies lower `expr` to Terminator::Return rather than
-            // an ExprStmt process for setter side effects (`() => setN(1)`).
+            // A concise-arrow body (`() => setN(1)`) lowers its expression to a
+            // `Return` terminator, not an `ExprStmt` — but its side effects must
+            // still fire. Run them through the shared effect-firing path instead
+            // of fabricating a throwaway `Stmt::ExprStmt`.
             if let Terminator::Return(return_expr) = &block.term {
-                transfer.exec_stmt(
-                    &Stmt::ExprStmt(return_expr.clone(), None),
-                    &mut env_out,
-                    &mut ac,
-                );
+                transfer.exec_expr_effects(return_expr, &mut env_out, &mut ac);
             }
         }
 

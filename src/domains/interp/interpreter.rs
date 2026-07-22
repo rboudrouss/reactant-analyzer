@@ -73,8 +73,18 @@ fn exec_full_stmt<T: Transfer>(
     depth: usize,
 ) {
     match stmt {
+        // An expression statement (`expr;`) contributes only its side effects.
+        // The same is true of a concise-arrow `Return` body, which the fixpoint
+        // engine feeds through here — both share the single definition in
+        // [`exec_expr_effects`] (callback pre-pass + setter + inter-component).
+        Stmt::ExprStmt(expr, _) => {
+            exec_expr_effects(transfer, expr, env, ctx, depth);
+        }
+        // Binding statements: callback pre-pass over the RHS parts, then the
+        // binding core.
         Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => {
             exec_callbacks_depth(transfer, rhs, env, ctx, depth);
+            exec_stmt_core(transfer, stmt, env, ctx);
         }
         Stmt::MemberWrite { obj, key, rhs, .. } => {
             exec_callbacks_depth(transfer, obj, env, ctx, depth);
@@ -82,33 +92,51 @@ fn exec_full_stmt<T: Transfer>(
                 exec_callbacks_depth(transfer, idx, env, ctx, depth);
             }
             exec_callbacks_depth(transfer, rhs, env, ctx, depth);
-        }
-        Stmt::ExprStmt(expr, _) => {
-            exec_callbacks_depth(transfer, expr, env, ctx, depth);
+            exec_stmt_core(transfer, stmt, env, ctx);
         }
     }
-    exec_stmt_core(transfer, stmt, env, ctx, depth);
-    // `CompApp` in ExprStmt position (including Return-turned-ExprStmt by cfg_analyzer)
-    // must also go through eval_expr so that inter-component analysis fires.
-    // exec_stmt_core only handles setter calls; eval_comp_app lives in eval_expr.
-    if let Stmt::ExprStmt(expr @ Expr::CompApp { .. }, _) = stmt {
+}
+
+/// Fire the side effects of an expression evaluated in *effect position* — a
+/// bare `expr;` statement or a concise-arrow `Return` body. Runs the callback
+/// pre-pass, the setter-call weak-update, and — for a component application —
+/// the inter-component `eval_expr` (setter handling alone does not fire it).
+///
+/// This is the single definition of "run an expression for its effects". The
+/// interpreter's `ExprStmt` handling and the fixpoint engine's `Return`
+/// handling both go through it (via [`Transfer::exec_expr_effects`]); the
+/// engine no longer fabricates a throwaway `Stmt::ExprStmt` to reach it.
+///
+/// Return *position* differs: [`exec_body_impl`] also needs the expression's
+/// value, so it fires the same effects then keeps `eval_expr`'s result — it
+/// cannot reduce to this helper without discarding that value.
+pub(crate) fn exec_expr_effects<T: Transfer>(
+    transfer: &T,
+    expr: &Expr,
+    env: &mut AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+    depth: usize,
+) {
+    exec_callbacks_depth(transfer, expr, env, ctx, depth);
+    exec_setter_call(transfer, expr, env, ctx, depth);
+    if let Expr::CompApp { .. } = expr {
         transfer.eval_expr(expr, env, ctx);
     }
 }
 
-/// Generic core statement semantics (no callback traversal).
+/// Binding-statement core semantics (no callback traversal, no effect firing).
 ///
-/// Handles:
+/// Handles the statements that bind or mutate storage:
 /// - `Let` / `Assign`: setter binding, heap allocation, env extension via
 ///   `transfer.eval_expr`.
-/// - `ExprStmt(Call { setter, args })`: setter call weak-update on `state`,
-///   including functional updaters (FnLit arg → `exec_body_depth`).
+/// - `MemberWrite`: weak field update on the heap object(s) `obj` may name.
+///
+/// Expression statements are executed by [`exec_expr_effects`] instead.
 fn exec_stmt_core<T: Transfer>(
     transfer: &T,
     stmt: &Stmt,
     env: &mut AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
-    depth: usize,
 ) {
     match stmt {
         // `let x = e` and `x = e` bind `x` identically: alias tracking, heap
@@ -161,10 +189,10 @@ fn exec_stmt_core<T: Transfer>(
                 }
             }
         }
-        Stmt::ExprStmt(expr, _) => {
-            // Callback pre-pass already ran in `exec_full_stmt`; fire the setter.
-            exec_setter_call(transfer, expr, env, ctx, depth);
-        }
+        // Expression statements never reach the binding core — `exec_full_stmt`
+        // routes them to `exec_expr_effects`. Kept as an explicit arm (not `_`)
+        // so a new `Stmt` variant still breaks this match.
+        Stmt::ExprStmt(..) => {}
     }
 }
 

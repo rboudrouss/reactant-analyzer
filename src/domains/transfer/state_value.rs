@@ -6,7 +6,7 @@ use crate::{
     domains::{
         AbstractDomain, AnalysisCtx, Transfer,
         impls::{BoolVal, Interval, SetterVal, Stability, StateValue, StrConst},
-        interp::exec_stmt_with_callbacks,
+        interp::{exec_expr_effects, exec_stmt_with_callbacks},
         stores::{AbstractEnv, EnvVal, Heap, HeapValue},
     },
     ir::{
@@ -39,6 +39,15 @@ impl Transfer for StateValueTransfer {
         ctx: &mut AnalysisCtx<StateValue>,
     ) {
         exec_stmt_with_callbacks(self, stmt, env, ctx);
+    }
+
+    fn exec_expr_effects(
+        &self,
+        expr: &Expr,
+        env: &mut AbstractEnv<StateValue>,
+        ctx: &mut AnalysisCtx<StateValue>,
+    ) {
+        exec_expr_effects(self, expr, env, ctx, 0);
     }
 
     fn recompute_memo(
