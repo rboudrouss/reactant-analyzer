@@ -174,7 +174,11 @@ fn addeventlistener_handler_lifted_and_analyzed() {
     use reactant::domains::{Interval, StateValue};
     assert_eq!(
         result.state_store.get(0),
-        StateValue::number(Interval { lo: 0.0, hi: 99.0 }),
+        StateValue::number(Interval {
+            lo: 0.0,
+            hi: 99.0,
+            is_int: true
+        }),
         "handler's setN(99) must be joined into state_store"
     );
 }

@@ -104,6 +104,34 @@ fn library_hook_no_analysis_limit_diagnostic() {
     );
 }
 
+#[test]
+fn new_with_common_recognizes_tanstack_usequery() {
+    // The shipped CLI wires `new_with_common()`; a real `useQuery` imported from
+    // @tanstack/react-query must be recognised (package-scoped) as a known
+    // library hook → no `analysis-limit/unknown-hook` noise. The summary is ⊤,
+    // so this is sound (no stability is claimed).
+    let src = r#"
+        import { useQuery } from "@tanstack/react-query";
+        function Users() {
+            const q = useQuery({ queryKey: ["users"] });
+            return <div>{q}</div>;
+        }
+    "#;
+    let config = Config {
+        summary_registry: SummaryRegistry::new_with_common(),
+        ..Config::default()
+    };
+    let result = parse_and_analyze_with_config(src, config);
+    let limit_diags: Vec<_> = diags_for(&result, "Users")
+        .into_iter()
+        .filter(|d| d.rule == "analysis-limit")
+        .collect();
+    assert!(
+        limit_diags.is_empty(),
+        "@tanstack useQuery must be a known hook under new_with_common, got: {limit_diags:?}"
+    );
+}
+
 // ── Test: StableRef summary → no missing-deps false positive ─────────────────
 
 #[test]

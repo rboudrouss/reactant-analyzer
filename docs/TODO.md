@@ -1,29 +1,31 @@
 # TODO — remaining analysis limits
 
-## Soundness fixes to implement (planned — Wave 0)
+## Soundness fixes — Wave 0 (DONE, 2026-07)
 
-These are *defects*, not documented limits: the soundness invariant forbids false
-negatives. Each is a lowering/domain shortcut that drops an observable read or effect.
-Deferred out of the 2026-07 cleanup pass so the tidy refactors stay behavior-neutral and
-the suite stays green; to be implemented next, each with its own regression test.
+The four soundness FN defects below were **fixed** (each with its own regression test;
+suite green at 753). Kept here as a record.
 
-- **Template-literal interpolations dropped at lowering** (`lowering/expr_lower.rs`).
-  `TemplateLiteral` only descends into `quasis`; the `${…}` expressions are lost (same for
-  `TaggedTemplateExpression`, `args: vec![]`). `` `Count: ${n}` `` loses the read of `n` →
-  `missing-deps`/`stale-closure` never see it. Fix: lower each `tl.expressions`, fold with
-  the quasis. *(tech-debt Part 2 / WA 1, 9)*
-- **`SequenceExpression` lowers only its last operand** (`lowering/expr_lower.rs`).
-  `(setOpen(false), doThing())` loses the setter write. Fix: iterate all operands, keep the
-  last as the value. *(tech-debt Part 2 / WA 9)*
-- **Interval narrowing unsound on floats** (`domains/impls/interval.rs`, P2).
-  `narrow_lt(v)` does `hi = v − 1.0` (assumes integer steps). For `x = 1.7` under `x < 2`,
-  both branches drop `1.7`. Fix: `narrow_lt(v) → hi = min(hi, v)` (sound over-approx); keep
-  the integer tightening behind a proven-integrality bit. *(tech-debt Part 2 / WA 11)*
-- **`Let`/`Assign` setter-alias divergence** (`domains/interp/interpreter.rs`).
-  The `Let` arm propagates `let s = setX` aliases (loc/setter/callback binding); the `Assign`
-  arm does not — and `s2 = setX` now lowers to `Assign`, so the alias is lost → FN. Fix:
-  factor the shared RHS-binding sequence (`bind_rhs`) called by both arms, making the alias
-  block unconditional. *(tech-debt Part 2 / ARCH 22 / Annexe C-D2)*
+- **Template-literal interpolations** (`lowering/expr_lower.rs`) — `` `Count: ${n}` `` now
+  lowers to a string-concat chain over the quasis + interpolated expressions, so the reads
+  survive. `TaggedTemplateExpression` passes its interpolations as call args. *(regression:
+  `tests/missing_deps.rs::template_literal_interpolation_is_a_tracked_read`)*
+- **`SequenceExpression`** (`lowering/expr_lower.rs`) — every operand is lowered; non-last
+  operands are emitted as `ExprStmt` so their setter calls fire. *(regression:
+  `tests/narrowing.rs::sequence_expression_setter_side_effect_not_dropped`)*
+- **Interval narrowing on floats** (`domains/impls/interval.rs`) — `Interval` now carries an
+  `is_int` bit (proven-integer, propagated through arithmetic/joins). `<`/`>` narrow to the
+  bound itself over reals (keeps `x = 1.7` under `x < 2`) and tighten to `v∓1` only when
+  `is_int` — preserving ADR-014 threshold widening for integer counters. `PartialEq`/`PartialOrd`
+  compare bounds only. *(regression: `interval.rs::narrow_lt_float_keeps_boundary_value` +
+  `narrow_lt_integer_still_tightens`)*
+- **`Let`/`Assign` setter-alias divergence** (`domains/interp/interpreter.rs`) — both arms now
+  route through one `bind_rhs` helper, so `s2 = setX` (Assign) propagates the alias like
+  `let s = setX`. The rule layer was aligned too: `resolve_setter_aliases` chases `Assign`
+  aliases (not just `Let`), and `infinite-loop`'s intra path uses the alias-resolving
+  `all_setter_labels` instead of the raw syntactic map — fixing a related FN where a setter
+  called through an alias inside an effect was not attributed to its state slot. *(regression:
+  `cfg_analyzer.rs::assign_propagates_setter_alias_like_let` +
+  `tests/narrowing.rs::aliased_setter_in_effect_{let,assign}_is_tracked`)*
 
 ### Latent (surface as FN when the code grows)
 

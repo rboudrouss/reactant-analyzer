@@ -108,7 +108,11 @@ fn guarded_counter_converges_bounded() {
     );
     assert_eq!(
         state0(&r, "GuardedCounter"),
-        StateValue::number(Interval { lo: 0.0, hi: 10.0 }),
+        StateValue::number(Interval {
+            lo: 0.0,
+            hi: 10.0,
+            is_int: true
+        }),
         "guarded counter must converge to [0, 10]"
     );
     // Regression: `[count]` is a primitive (value-compared) dep, not a fresh
@@ -127,7 +131,11 @@ fn bounded_local_loop_is_precise() {
     assert_eq!(infinite_loop_hits(&r, "BoundedLocalLoop"), 0);
     assert_eq!(
         state0(&r, "BoundedLocalLoop"),
-        StateValue::number(Interval { lo: 0.0, hi: 5.0 }),
+        StateValue::number(Interval {
+            lo: 0.0,
+            hi: 5.0,
+            is_int: true
+        }),
         "loop counter bounded by guard constant 5 → setter writes total ∈ [0, 5]"
     );
 }

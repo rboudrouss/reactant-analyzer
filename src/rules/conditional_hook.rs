@@ -1,5 +1,5 @@
 use crate::{
-    engine::{ProgramAnalysisResult, compute_dominators, dominates},
+    engine::{DominatorTree, ProgramAnalysisResult, compute_dominators},
     ir::{
         SourceRange,
         cfg::{CFG, Terminator},
@@ -103,6 +103,9 @@ impl Rule for ConditionalHook {
             .map(|b| b.id)
             .collect();
 
+        // Dominators computed once (was recomputed per hook call × exit).
+        let domtree = DominatorTree::new(&result.render_cfg);
+
         result
             .hook_calls
             .iter()
@@ -112,7 +115,7 @@ impl Rule for ConditionalHook {
                 // Conditional = doesn't dominate every exit.
                 exits
                     .iter()
-                    .any(|&exit| !dominates(&result.render_cfg, call.block_id, exit))
+                    .any(|&exit| !domtree.dominates(call.block_id, exit))
             })
             .map(|call| {
                 let mut d = Diagnostic::new(

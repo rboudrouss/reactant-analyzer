@@ -915,7 +915,11 @@ mod tests {
 
         assert_eq!(
             state.get(0),
-            StateValue::number(Interval { lo: 5.0, hi: 6.0 })
+            StateValue::number(Interval {
+                lo: 5.0,
+                hi: 6.0,
+                is_int: true
+            })
         );
     }
 
@@ -992,7 +996,11 @@ mod tests {
 
         assert_eq!(
             state.get(0),
-            StateValue::number(Interval { lo: 0.0, hi: 3.0 })
+            StateValue::number(Interval {
+                lo: 0.0,
+                hi: 3.0,
+                is_int: true
+            })
         );
     }
 
@@ -1143,7 +1151,11 @@ mod tests {
         // setN(state[0] + 1) fired once → state[0] grew off the initial point.
         assert_eq!(
             state.get(0),
-            StateValue::number(Interval { lo: 0.0, hi: 1.0 })
+            StateValue::number(Interval {
+                lo: 0.0,
+                hi: 1.0,
+                is_int: true
+            })
         );
         // Back edge present → return value conservatively Top.
         assert_eq!(ret, StateValue::top());
@@ -1253,7 +1265,11 @@ mod tests {
 
         assert_eq!(
             state.get(0),
-            StateValue::number(Interval { lo: 0.0, hi: 1.0 })
+            StateValue::number(Interval {
+                lo: 0.0,
+                hi: 1.0,
+                is_int: true
+            })
         );
         assert_eq!(ret, StateValue::top());
     }

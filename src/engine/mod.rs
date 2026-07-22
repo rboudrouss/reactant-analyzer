@@ -17,7 +17,7 @@ pub use analysis_result::{
 pub use cfg_analyzer::analyze_cfg;
 pub use component_cache::ComponentCache;
 pub use component_registry::{ComponentKey, ComponentRegistry};
-pub use dominance::{compute_dominators, dominates, rpo};
+pub use dominance::{DominatorTree, compute_dominators, dominates, rpo};
 pub use fixpoint::{Config, analyze_component, analyze_component_inter, analyze_program};
 pub use function_registry::{FunctionKey, FunctionRegistry};
 pub use hook_registry::{HookKey, HookRegistry};

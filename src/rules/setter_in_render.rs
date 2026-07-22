@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    engine::{ProgramAnalysisResult, dominates},
+    engine::{DominatorTree, ProgramAnalysisResult},
     ir::{
         cfg::Terminator,
         expr::Expr,
@@ -113,15 +113,16 @@ impl Rule for SetterInRender {
             &state_val_labels(&comp_result.render_cfg),
         );
 
+        // Dominators computed once for the whole render CFG (was recomputed per
+        // call × exit — quadratic). A call block dominating every exit ⟹ it runs
+        // unconditionally ⟹ Error; otherwise conditional ⟹ Warning.
+        let domtree = DominatorTree::new(&comp_result.render_cfg);
+
         collect_setter_calls(&comp_result.render_cfg, &all_setter_vars, 2)
             .into_iter()
             .filter_map(|call| {
                 let severity = match call.block_id {
-                    Some(bid)
-                        if exits
-                            .iter()
-                            .all(|&e| dominates(&comp_result.render_cfg, bid, e)) =>
-                    {
+                    Some(bid) if exits.iter().all(|&e| domtree.dominates(bid, e)) => {
                         Severity::Error
                     }
                     _ => Severity::Warning,

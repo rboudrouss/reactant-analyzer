@@ -557,11 +557,22 @@ pub(crate) fn resolve_setter_aliases(
         let mut changed = false;
         for block in cfg.blocks.values() {
             for stmt in &block.stmts {
-                if let Stmt::Let {
-                    var,
-                    rhs: Expr::Var(src),
-                    ..
-                } = stmt
+                // `let s = setX` and `s = setX` both alias the setter — mirror
+                // the interpreter's `bind_rhs`, which treats Let/Assign alike.
+                let alias = match stmt {
+                    Stmt::Let {
+                        var,
+                        rhs: Expr::Var(src),
+                        ..
+                    }
+                    | Stmt::Assign {
+                        var,
+                        rhs: Expr::Var(src),
+                        ..
+                    } => Some((var, src)),
+                    _ => None,
+                };
+                if let Some((var, src)) = alias
                     && !map.contains_key(var)
                     && let Some(&label) = map.get(src)
                 {

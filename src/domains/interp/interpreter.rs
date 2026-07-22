@@ -111,90 +111,12 @@ fn exec_stmt_core<T: Transfer>(
     depth: usize,
 ) {
     match stmt {
-        Stmt::Let { var, rhs, .. } => {
-            if let Expr::StateSetter(label) = rhs {
-                env.bind_setter(var.clone(), *label);
-            }
-            if let Expr::CallbackVal(label) = rhs {
-                env.bind_callback(var.clone(), *label);
-            }
-            if let Expr::FnLit {
-                id,
-                params,
-                body_cfg,
-            } = rhs
-            {
-                env.extend_loc(var.clone(), *id);
-                ctx.heap.alloc_fn(*id, params, body_cfg, env);
-            }
-            // Propagate heap locs for variable aliases (e.g. destructuring preamble:
-            // `let __obj = __p0` where __p0 carries the props heap location).
-            if let Expr::Var(src) = rhs {
-                if let Some(EnvVal::Loc(ids)) = env.lookup_env_val(src) {
-                    for &id in ids.iter().collect::<Vec<_>>() {
-                        env.extend_loc(var.clone(), id);
-                    }
-                }
-                if let Some(label) = env.setter_label(src) {
-                    env.bind_setter(var.clone(), label);
-                }
-                if let Some(label) = env.callback_label(src) {
-                    env.bind_callback(var.clone(), label);
-                }
-            }
-            // Propagate heap locs from field access (e.g. `let f = props.onClick`
-            // where onClick is a FnLit stored in the parent's heap under the Obj).
-            if let Expr::FieldAccess { obj, field } = rhs
-                && let Expr::Var(v) = obj.as_ref()
-                && let Some(EnvVal::Loc(obj_ids)) = env.lookup_env_val(v)
-            {
-                for obj_id in obj_ids.iter().copied().collect::<Vec<_>>() {
-                    if let Some(HeapValue::Obj(fields)) = ctx.heap.get(obj_id)
-                        && let Some(EnvVal::Loc(field_ids)) = fields.get(field)
-                    {
-                        for &fid in field_ids {
-                            env.extend_loc(var.clone(), fid);
-                        }
-                    }
-                }
-            }
-            let val = transfer.eval_expr(rhs, env, ctx);
-            env.extend(var.clone(), val);
-        }
-        Stmt::Assign { var, rhs, .. } => {
-            if let Expr::StateSetter(label) = rhs {
-                env.bind_setter(var.clone(), *label);
-            }
-            if let Expr::CallbackVal(label) = rhs {
-                env.bind_callback(var.clone(), *label);
-            }
-            if let Expr::FnLit {
-                id,
-                params,
-                body_cfg,
-            } = rhs
-            {
-                env.extend_loc(var.clone(), *id);
-                ctx.heap.alloc_fn(*id, params, body_cfg, env);
-            }
-            // Propagate heap locs from field access (e.g. `let f = props.onClick`
-            // where onClick is a FnLit stored in the parent's heap under the Obj).
-            if let Expr::FieldAccess { obj, field } = rhs
-                && let Expr::Var(v) = obj.as_ref()
-                && let Some(EnvVal::Loc(obj_ids)) = env.lookup_env_val(v)
-            {
-                for obj_id in obj_ids.iter().copied().collect::<Vec<_>>() {
-                    if let Some(HeapValue::Obj(fields)) = ctx.heap.get(obj_id)
-                        && let Some(EnvVal::Loc(field_ids)) = fields.get(field)
-                    {
-                        for &fid in field_ids {
-                            env.extend_loc(var.clone(), fid);
-                        }
-                    }
-                }
-            }
-            let val = transfer.eval_expr(rhs, env, ctx);
-            env.extend(var.clone(), val);
+        // `let x = e` and `x = e` bind `x` identically: alias tracking, heap
+        // allocation, then value. Sharing one path is what makes the setter/
+        // callback/loc aliases (`let s = setX`, and now `s2 = setX` via Assign)
+        // reach both — the arms had drifted, dropping the Assign aliases (FN).
+        Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } => {
+            bind_rhs(transfer, var, rhs, env, ctx);
         }
         // `obj.f = v`: the identity of `obj` is untouched (that is what makes
         // it a mutation); only the field's content moves. Weak-update the heap
@@ -244,6 +166,69 @@ fn exec_stmt_core<T: Transfer>(
             exec_setter_call(transfer, expr, env, ctx, depth);
         }
     }
+}
+
+/// Bind `var = rhs` in `env`: the single RHS-handling sequence shared by the
+/// `Let` and `Assign` statement arms. Alias-carrying RHS forms (`StateSetter`,
+/// `CallbackVal`, `FnLit`, a `Var` aliasing one of those, a `FieldAccess` onto a
+/// heap object) propagate their loc/setter/callback binding to `var`; then the
+/// RHS is evaluated and stored. Keeping this in one place is what guarantees
+/// `let s = setX` and `s = setX` behave identically (see the call site).
+fn bind_rhs<T: Transfer>(
+    transfer: &T,
+    var: &str,
+    rhs: &Expr,
+    env: &mut AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) {
+    if let Expr::StateSetter(label) = rhs {
+        env.bind_setter(var.to_string(), *label);
+    }
+    if let Expr::CallbackVal(label) = rhs {
+        env.bind_callback(var.to_string(), *label);
+    }
+    if let Expr::FnLit {
+        id,
+        params,
+        body_cfg,
+    } = rhs
+    {
+        env.extend_loc(var.to_string(), *id);
+        ctx.heap.alloc_fn(*id, params, body_cfg, env);
+    }
+    // Propagate heap locs for variable aliases (e.g. destructuring preamble:
+    // `let __obj = __p0` where __p0 carries the props heap location).
+    if let Expr::Var(src) = rhs {
+        if let Some(EnvVal::Loc(ids)) = env.lookup_env_val(src) {
+            for &id in ids.iter().collect::<Vec<_>>() {
+                env.extend_loc(var.to_string(), id);
+            }
+        }
+        if let Some(label) = env.setter_label(src) {
+            env.bind_setter(var.to_string(), label);
+        }
+        if let Some(label) = env.callback_label(src) {
+            env.bind_callback(var.to_string(), label);
+        }
+    }
+    // Propagate heap locs from field access (e.g. `let f = props.onClick`
+    // where onClick is a FnLit stored in the parent's heap under the Obj).
+    if let Expr::FieldAccess { obj, field } = rhs
+        && let Expr::Var(v) = obj.as_ref()
+        && let Some(EnvVal::Loc(obj_ids)) = env.lookup_env_val(v)
+    {
+        for obj_id in obj_ids.iter().copied().collect::<Vec<_>>() {
+            if let Some(HeapValue::Obj(fields)) = ctx.heap.get(obj_id)
+                && let Some(EnvVal::Loc(field_ids)) = fields.get(field)
+            {
+                for &fid in field_ids {
+                    env.extend_loc(var.to_string(), fid);
+                }
+            }
+        }
+    }
+    let val = transfer.eval_expr(rhs, env, ctx);
+    env.extend(var.to_string(), val);
 }
 
 /// If `expr` is a setter call `setX(arg)`, weak-update the corresponding state

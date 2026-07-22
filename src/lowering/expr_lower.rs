@@ -34,14 +34,33 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         }
         Expression::StringLiteral(s) => Expr::Lit(Prim::String(s.value.to_string())),
         Expression::TemplateLiteral(tl) => {
-            // Simplified: join quasis only; expressions are elided
-            let s: String = tl
+            // Fold quasis and `${…}` interpolations into a left-associated
+            // string-concat chain (`"q0" + e0 + "q1" + …`). The concatenated
+            // value is irrelevant to the numeric domain, but the chain keeps the
+            // reads of every interpolated expression visible to the analysis
+            // (deps, captures) — dropping them was a silent read FN.
+            let first = tl
                 .quasis
-                .iter()
+                .first()
                 .map(|q| q.value.raw.as_str())
-                .collect::<Vec<_>>()
-                .join("${_}");
-            Expr::Lit(Prim::String(s))
+                .unwrap_or_default();
+            let mut acc = Expr::Lit(Prim::String(first.to_string()));
+            for (i, e) in tl.expressions.iter().enumerate() {
+                let interp = lower_expr(e, builder);
+                acc = Expr::BinOp {
+                    op: IrBinOp::Add,
+                    lhs: Box::new(acc),
+                    rhs: Box::new(interp),
+                };
+                if let Some(q) = tl.quasis.get(i + 1) {
+                    acc = Expr::BinOp {
+                        op: IrBinOp::Add,
+                        lhs: Box::new(acc),
+                        rhs: Box::new(Expr::Lit(Prim::String(q.value.raw.to_string()))),
+                    };
+                }
+            }
+            acc
         }
 
         // ── Identifiers ───────────────────────────────────────────────────────
@@ -153,8 +172,16 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
             }
         }
         Expression::TaggedTemplateExpression(t) => Expr::Call {
+            // Pass the `${…}` interpolations as call args so their reads survive
+            // (the constant quasi strings carry none). The tag receives the
+            // cooked-strings array in reality; only the interpolations read vars.
             fn_: Box::new(lower_expr(&t.tag, builder)),
-            args: vec![],
+            args: t
+                .quasi
+                .expressions
+                .iter()
+                .map(|e| lower_expr(e, builder))
+                .collect(),
         },
 
         // ── Member access ─────────────────────────────────────────────────────
@@ -316,11 +343,23 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 },
             }
         }
-        Expression::SequenceExpression(seq) => seq
-            .expressions
-            .last()
-            .map(|e| lower_expr(e, builder))
-            .unwrap_or(Expr::Lit(Prim::Unit)),
+        Expression::SequenceExpression(seq) => {
+            // `(a, b, c)` evaluates every operand for its side effects and yields
+            // the last. Earlier operands are emitted as `ExprStmt` (exactly like
+            // a top-level expression statement) so their setter calls / writes
+            // fire — lowering only the last operand dropped them (effect FN).
+            let n = seq.expressions.len();
+            let mut value = Expr::Lit(Prim::Unit);
+            for (i, e) in seq.expressions.iter().enumerate() {
+                let lowered = lower_expr(e, builder);
+                if i + 1 == n {
+                    value = lowered;
+                } else {
+                    builder.push_stmt(Stmt::ExprStmt(lowered, builder.span_at(e.span().start)));
+                }
+            }
+            value
+        }
         Expression::AwaitExpression(aw) => lower_expr(&aw.argument, builder),
         Expression::YieldExpression(y) => y
             .argument

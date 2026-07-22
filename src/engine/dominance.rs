@@ -58,10 +58,31 @@ pub fn compute_dominators(cfg: &CFG) -> HashMap<BlockId, HashSet<BlockId>> {
 }
 
 /// Returns `true` iff block `a` dominates block `b`.
+///
+/// One-shot: recomputes the whole dominator relation. For repeated queries on
+/// the same CFG (every rule that classifies call sites by domination) build a
+/// [`DominatorTree`] once instead — otherwise this is O(queries × fixpoint).
 pub fn dominates(cfg: &CFG, a: BlockId, b: BlockId) -> bool {
-    compute_dominators(cfg)
-        .get(&b)
-        .is_some_and(|dom_b| dom_b.contains(&a))
+    DominatorTree::new(cfg).dominates(a, b)
+}
+
+/// Precomputed dominator relation for one CFG. Build once, query in O(1)·set —
+/// the fix for `dominates()` driving per-rule quadratic recomputation.
+pub struct DominatorTree {
+    dom: HashMap<BlockId, HashSet<BlockId>>,
+}
+
+impl DominatorTree {
+    pub fn new(cfg: &CFG) -> Self {
+        DominatorTree {
+            dom: compute_dominators(cfg),
+        }
+    }
+
+    /// `true` iff block `a` dominates block `b`.
+    pub fn dominates(&self, a: BlockId, b: BlockId) -> bool {
+        self.dom.get(&b).is_some_and(|dom_b| dom_b.contains(&a))
+    }
 }
 
 /// Reverse Post-Order traversal starting from `cfg.entry`.

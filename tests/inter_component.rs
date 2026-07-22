@@ -716,7 +716,11 @@ fn nativeelem_children_compapps_are_analyzed() {
     use reactant::domains::impls::interval::Interval;
     assert_eq!(
         app_state,
-        StateValue::number(Interval { lo: 1.0, hi: 2.0 }),
+        StateValue::number(Interval {
+            lo: 1.0,
+            hi: 2.0,
+            is_int: true
+        }),
         "Both CompApp children inside NativeElem should be analyzed; \
          SharedStateStore[(App,0)] = join(1,2) = [1,2]"
     );

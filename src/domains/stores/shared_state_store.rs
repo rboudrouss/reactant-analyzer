@@ -97,7 +97,11 @@ mod tests {
         );
         assert_eq!(
             s.get(&"Foo".to_string(), 0),
-            StateValue::number(Interval { lo: 1.0, hi: 2.0 })
+            StateValue::number(Interval {
+                lo: 1.0,
+                hi: 2.0,
+                is_int: true
+            })
         );
     }
 
@@ -173,7 +177,11 @@ mod tests {
         let j = a.join(&b);
         assert_eq!(
             j.get(&"X".to_string(), 0),
-            StateValue::number(Interval { lo: 1.0, hi: 2.0 })
+            StateValue::number(Interval {
+                lo: 1.0,
+                hi: 2.0,
+                is_int: true
+            })
         );
         assert_eq!(
             j.get(&"Y".to_string(), 0),

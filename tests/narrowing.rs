@@ -412,3 +412,73 @@ fn negated_truthy_fetch_pattern_no_false_positive() {
         "negated truthiness guard on a fetch-once pattern: no infinite loop"
     );
 }
+
+// ── Regression: Wave-0 lowering/interp FN fixes ───────────────────────────────
+
+#[test]
+fn sequence_expression_setter_side_effect_not_dropped() {
+    // `(setCount(count + 1), 0)` — the setter is in a non-last operand of a
+    // sequence expression. It must still register as a write: before the fix
+    // only the last operand was lowered, so the write vanished and the loop
+    // went undetected (effect FN).
+    let hits = infinite_loop_hits(
+        r#"
+        import { useState, useEffect } from "react";
+        function C() {
+          const [count, setCount] = useState(0);
+          useEffect(() => { (setCount(count + 1), 0); }, [count]);
+          return <div>{count}</div>;
+        }
+        "#,
+    );
+    assert_eq!(
+        hits, 1,
+        "a setter in a non-last sequence operand must still be seen"
+    );
+}
+
+#[test]
+fn aliased_setter_in_effect_let_is_tracked() {
+    // `const s1 = setCount` then `s1(count + 1)` inside the effect is the same
+    // infinite loop as calling `setCount` directly. The rule must resolve the
+    // `Let` alias when attributing the effect's setter call to its state slot.
+    let hits = infinite_loop_hits(
+        r#"
+        import { useState, useEffect } from "react";
+        function C() {
+          const [count, setCount] = useState(0);
+          const s1 = setCount;
+          useEffect(() => { s1(count + 1); }, [count]);
+          return <div>{count}</div>;
+        }
+        "#,
+    );
+    assert_eq!(
+        hits, 1,
+        "a setter aliased via `let`/`const` must still loop"
+    );
+}
+
+#[test]
+fn aliased_setter_in_effect_assign_is_tracked() {
+    // Same, but the alias is established by a reassignment (`s2 = s1`), which
+    // lowers to `Assign`. Both the interpreter (`bind_rhs`) and the rule's alias
+    // resolution must treat `Assign` like `Let`, else the write is lost (FN).
+    let hits = infinite_loop_hits(
+        r#"
+        import { useState, useEffect } from "react";
+        function C() {
+          const [count, setCount] = useState(0);
+          const s1 = setCount;
+          let s2 = null;
+          s2 = s1;
+          useEffect(() => { s2(count + 1); }, [count]);
+          return <div>{count}</div>;
+        }
+        "#,
+    );
+    assert_eq!(
+        hits, 1,
+        "a setter aliased through an `Assign` reassignment must still loop"
+    );
+}

@@ -117,6 +117,7 @@ impl StateValue {
             num: Interval {
                 lo: f64::INFINITY,
                 hi: f64::NEG_INFINITY,
+                is_int: true,
             },
             boolean: BoolVal::Bottom,
             str: StrConst::Bottom,
@@ -603,7 +604,11 @@ mod tests {
         let b = num_point(1.0);
         assert_eq!(
             a.join(&b),
-            StateValue::number(Interval { lo: 0.0, hi: 1.0 })
+            StateValue::number(Interval {
+                lo: 0.0,
+                hi: 1.0,
+                is_int: true
+            })
         );
     }
 
@@ -659,7 +664,14 @@ mod tests {
 
     #[test]
     fn to_stability_wide_interval_is_unstable() {
-        assert!(StateValue::number(Interval { lo: 0.0, hi: 5.0 }).is_unstable());
+        assert!(
+            StateValue::number(Interval {
+                lo: 0.0,
+                hi: 5.0,
+                is_int: true
+            })
+            .is_unstable()
+        );
         assert!(StateValue::reference(Stability::PerRender).is_unstable());
     }
 
@@ -686,7 +698,8 @@ mod tests {
         assert!(
             StateValue::number(Interval {
                 lo: 0.0,
-                hi: f64::INFINITY
+                hi: f64::INFINITY,
+                is_int: true
             })
             .is_unbounded()
         );
@@ -731,9 +744,12 @@ mod tests {
 
     #[test]
     fn interval_narrow_lt_caps_hi() {
+        // Proven-integer interval: `< 10` tightens to `≤ 9` (ADR-014). A float
+        // interval would keep 10 — covered in interval.rs's integrality tests.
         let i = Interval {
             lo: 0.0,
             hi: f64::INFINITY,
+            is_int: true,
         };
         let n = i.narrow_lt(10.0);
         assert_eq!(n.lo, 0.0);
@@ -745,6 +761,7 @@ mod tests {
         let i = Interval {
             lo: 0.0,
             hi: f64::INFINITY,
+            is_int: true,
         };
         let n = i.narrow_geq(10.0);
         assert_eq!(n.lo, 10.0);
@@ -753,13 +770,21 @@ mod tests {
 
     #[test]
     fn interval_narrow_eq_in_range_gives_point() {
-        let i = Interval { lo: 0.0, hi: 5.0 };
+        let i = Interval {
+            lo: 0.0,
+            hi: 5.0,
+            is_int: true,
+        };
         assert_eq!(i.narrow_eq(3.0), Interval::point(3.0));
     }
 
     #[test]
     fn interval_narrow_eq_out_of_range_gives_bottom() {
-        let i = Interval { lo: 0.0, hi: 5.0 };
+        let i = Interval {
+            lo: 0.0,
+            hi: 5.0,
+            is_int: true,
+        };
         assert!(i.narrow_eq(7.0).is_bottom());
     }
 
@@ -768,9 +793,17 @@ mod tests {
         let v = StateValue::number(Interval {
             lo: 0.0,
             hi: f64::INFINITY,
+            is_int: true,
         });
         let n = v.narrow_lt(10.0);
-        assert_eq!(n, StateValue::number(Interval { lo: 0.0, hi: 9.0 }));
+        assert_eq!(
+            n,
+            StateValue::number(Interval {
+                lo: 0.0,
+                hi: 9.0,
+                is_int: true
+            })
+        );
     }
 
     #[test]
@@ -779,10 +812,18 @@ mod tests {
         let v = StateValue::null().join(&StateValue::number(Interval {
             lo: 0.0,
             hi: f64::INFINITY,
+            is_int: true,
         }));
         let n = v.narrow_lt(10.0);
         assert!(n.null);
-        assert_eq!(n.num, Interval { lo: 0.0, hi: 9.0 });
+        assert_eq!(
+            n.num,
+            Interval {
+                lo: 0.0,
+                hi: 9.0,
+                is_int: true
+            }
+        );
     }
 
     #[test]
@@ -833,10 +874,22 @@ mod tests {
         assert_eq!(t.boolean, BoolVal::Bottom, "false is falsy");
         assert_eq!(t.reference, Stability::Stable, "references are truthy");
         // Wide interval and Top boolean survive (partially truthy).
-        let w = StateValue::number(Interval { lo: 0.0, hi: 5.0 })
-            .join(&StateValue::boolean(BoolVal::Top));
+        let w = StateValue::number(Interval {
+            lo: 0.0,
+            hi: 5.0,
+            is_int: true,
+        })
+        .join(&StateValue::boolean(BoolVal::Top));
         let tw = w.narrow_truthy();
-        assert_eq!(tw.num, Interval { lo: 0.0, hi: 5.0 }, "can't split [0,5]");
+        assert_eq!(
+            tw.num,
+            Interval {
+                lo: 0.0,
+                hi: 5.0,
+                is_int: true
+            },
+            "can't split [0,5]"
+        );
         assert_eq!(tw.boolean, BoolVal::True, "truthy boolean must be true");
     }
 
@@ -844,7 +897,11 @@ mod tests {
     fn falsy_narrowing_keeps_only_falsy_values() {
         // {null, [0,5], "a"|"" , Top-bool, ref} — falsy branch.
         let v = StateValue::null()
-            .join(&StateValue::number(Interval { lo: 0.0, hi: 5.0 }))
+            .join(&StateValue::number(Interval {
+                lo: 0.0,
+                hi: 5.0,
+                is_int: true,
+            }))
             .join(&StateValue::str_set(
                 ["a".to_string(), String::new()].into_iter().collect(),
             ))
@@ -930,7 +987,11 @@ mod tests {
     #[test]
     fn mixed_direction_slots_are_incomparable() {
         // a has a wider num slot, b has a wider str slot → incomparable.
-        let a = StateValue::number(Interval { lo: 0.0, hi: 5.0 });
+        let a = StateValue::number(Interval {
+            lo: 0.0,
+            hi: 5.0,
+            is_int: true,
+        });
         let b = num_point(1.0).join(&str_singleton("s"));
         assert!(a.partial_cmp(&b).is_none());
     }
@@ -1009,6 +1070,7 @@ mod tests {
         let v = StateValue::null().join(&StateValue::number(Interval {
             lo: 0.0,
             hi: f64::INFINITY,
+            is_int: true,
         }));
         assert_eq!(v.to_stability(), Stability::PerRender);
         // Top stays Unknown: opaque values never claim definite instability.

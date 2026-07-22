@@ -431,7 +431,8 @@ mod tests {
             i,
             StateValue::number(Interval {
                 lo: 0.0,
-                hi: f64::INFINITY
+                hi: f64::INFINITY,
+                is_int: true,
             })
         );
     }
@@ -456,9 +457,56 @@ mod tests {
         // Threshold 5 caps the widen → loop-header `i` bounded to [0,5] (vs +∞),
         // and the loop-exit (else) block sees `i = [5,5]`.
         let header_i = exit_envs[&1].lookup("i");
-        assert_eq!(header_i, StateValue::number(Interval { lo: 0.0, hi: 5.0 }));
+        assert_eq!(
+            header_i,
+            StateValue::number(Interval {
+                lo: 0.0,
+                hi: 5.0,
+                is_int: true
+            })
+        );
         let exit_i = exit_envs[&3].lookup("i");
         assert_eq!(exit_i, StateValue::number(Interval::point(5.0)));
+    }
+
+    #[test]
+    fn assign_propagates_setter_alias_like_let() {
+        // Regression (Wave-0, tech-debt ARCH 22 / C-D2): the `Assign` arm must
+        // propagate a `Var`-aliased setter exactly as `Let` does. `let s1 = setX`
+        // binds s1; `s2 = s1` (a reassignment → `Assign` with a `Var` rhs) must
+        // carry the alias to s2. The two arms had drifted — `Assign` dropped the
+        // `Var`-alias block, silently losing the setter (FN).
+        let cfg = single_block_cfg(vec![
+            Stmt::Let {
+                var: "s1".to_string(),
+                rhs: Expr::StateSetter(0),
+                span: None,
+            },
+            Stmt::Assign {
+                var: "s2".to_string(),
+                rhs: Expr::Var("s1".to_string()),
+                span: None,
+            },
+        ]);
+        let mut heap = Heap::new();
+        let (exit_envs, _) = analyze_cfg::<StateValueTransfer>(
+            &"C".to_string(),
+            &cfg,
+            AbstractEnv::bottom(),
+            &StateStore::bottom(),
+            &MemoStore::new(),
+            &StateValueTransfer,
+            3,
+            &[],
+            &mut heap,
+            &NullCtx,
+            None,
+        );
+        assert_eq!(
+            exit_envs[&0].setter_label("s2"),
+            Some(0),
+            "a setter aliased through an `Assign` reassignment must reach s2"
+        );
     }
 
     #[test]
@@ -733,6 +781,7 @@ mod tests {
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: f64::INFINITY,
+                is_int: true,
             }),
         );
 
@@ -920,7 +969,11 @@ mod tests {
         // c=5, c+1=6 → state[0] = join(5, 6) = [5,6].
         assert_eq!(
             state_out.get(0),
-            StateValue::number(Interval { lo: 5.0, hi: 6.0 }),
+            StateValue::number(Interval {
+                lo: 5.0,
+                hi: 6.0,
+                is_int: true
+            }),
             "functional updater in Return terminator must fire"
         );
     }

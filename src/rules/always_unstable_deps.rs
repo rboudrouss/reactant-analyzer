@@ -385,7 +385,14 @@ mod tests {
         use crate::domains::{Interval, StateStore, StateValue, stores::MemoStore};
         let env = AbstractEnv::<StateValue>::default();
         let mut state = StateStore::<StateValue>::bottom();
-        state.update(0, StateValue::number(Interval { lo: 0.0, hi: 10.0 }));
+        state.update(
+            0,
+            StateValue::number(Interval {
+                lo: 0.0,
+                hi: 10.0,
+                is_int: true,
+            }),
+        );
         let memo = MemoStore::<StateValue>::new();
         assert!(
             !eval_dep_is_unstable(

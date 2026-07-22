@@ -15,9 +15,10 @@ use crate::{
 };
 
 use super::{
-    Diagnostic, Rule, Severity, all_deps_unstable, collect_component_setter_vars,
-    collect_fn_bindings, collect_setter_calls, collect_setter_calls_with_extra, memo_val_labels,
-    resolve_setter_aliases, setter_var_labels, state_slot_name, state_val_labels,
+    Diagnostic, Rule, Severity, all_deps_unstable, all_setter_labels,
+    collect_component_setter_vars, collect_fn_bindings, collect_setter_calls,
+    collect_setter_calls_with_extra, memo_val_labels, resolve_setter_aliases, setter_var_labels,
+    state_slot_name, state_val_labels,
 };
 
 /// Fires when an effect causes an infinite render loop.
@@ -52,8 +53,11 @@ impl Rule for InfiniteLoop {
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
         let comp_result = &result.components[component];
 
-        let local_setter_labels: HashMap<Var, HookLabel> =
-            setter_var_labels(&comp_result.render_cfg);
+        // Authoritative setter map: base setters plus alias chains
+        // (`const s1 = setX`, `s2 = s1`) resolved across the render and every
+        // hook body — a setter called in an effect through an alias must still
+        // be attributed to its state slot (else a real loop goes unflagged).
+        let local_setter_labels: HashMap<Var, HookLabel> = all_setter_labels(comp_result);
         let state_names = state_val_labels(&comp_result.render_cfg);
 
         // ComponentSetter props, excluding self-references.

@@ -239,7 +239,15 @@ pub fn run(mut args: CheckArgs) -> i32 {
 
     let file_count = lowered.file_count;
     let parse_errors = std::mem::take(&mut lowered.parse_errors);
-    let program_result = analyze_lowered(lowered, strategy, Config::default());
+    // Ship with the common library-hook summaries (TanStack Query, React Router)
+    // enabled: they resolve these hooks to ⊤ as *known* hooks, so a real
+    // `useQuery`/`useNavigate` no longer emits `analysis-limit/unknown-hook`
+    // noise. `Config::default()` stays empty so unit tests keep their baselines.
+    let config = Config {
+        summary_registry: reactant::registry::SummaryRegistry::new_with_common(),
+        ..Config::default()
+    };
+    let program_result = analyze_lowered(lowered, strategy, config);
 
     if args.verbose {
         eprintln!(

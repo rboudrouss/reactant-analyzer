@@ -61,11 +61,24 @@ comportement de l'analyse.
 
 ---
 
-## Partie 2 — Bugs de soundness (FN) — priorité absolue
+## Partie 2 — Bugs de soundness (FN) — ✅ RÉSOLU (Vague 0, 2026-07)
 
-Ce sont les seuls items qui sont des **bugs** et non de la dette : l'invariant interdit
-les faux négatifs. Chacun vient d'un raccourci de *lowering* ou de *domaine* qui jette
-une lecture / un effet observable. À corriger en premier, indépendamment du reste.
+Ce sont les seuls items qui étaient des **bugs** et non de la dette : l'invariant interdit
+les faux négatifs. Chacun venait d'un raccourci de *lowering* ou de *domaine* qui jetait
+une lecture / un effet observable. **Les quatre sont corrigés** (chacun avec son test de
+régression, suite verte à 753) — voir `docs/TODO.md` § « Wave 0 (DONE) » pour le détail et
+les tests. Notes de conception :
+- **Narrowing flottant** : `Interval` porte désormais un bit `is_int` (entier prouvé,
+  propagé par l'arithmétique/joins). `<`/`>` resserrent vers la borne `v` sur les réels
+  (garde `x = 1.7` sous `x < 2`) et vers `v∓1` seulement si `is_int` — la précision entière
+  d'ADR-014 (threshold widening des compteurs) est donc conservée. `PartialEq`/`PartialOrd`
+  comparent les bornes seules (le bit ne pollue ni l'égalité ni la convergence).
+- **Parité `Let`/`Assign`** : un seul `bind_rhs` pour les deux bras (interpréteur) ;
+  `resolve_setter_aliases` chase aussi les alias `Assign`, et `infinite-loop` (chemin intra)
+  passe par `all_setter_labels` — clôt en prime un FN où un setter appelé via alias dans un
+  effet n'était pas rattaché à son slot.
+
+Historique (avant fix) :
 
 - **Interpolations de template literal jetées** (`lowering/expr_lower.rs`). ``TemplateLiteral``
   ne descend que dans `quasis` ; les `${…}` sont perdus, idem `TaggedTemplateExpression`
@@ -287,8 +300,33 @@ seront implémentés séparément avec leurs propres tests pour garder la suite 
   la soundness → `docs/TODO.md` Vague 0.
 
 Ne restent des grands thèmes que les **changements de conception qui modifient le comportement**
-(Thèmes 1 splice, 4 recompute_memo, 7 dominateurs/logical-op, 8 churn, 9 to_stability, 12
+(Thèmes 1 splice, 4 recompute_memo, 7 logical-op [dominateurs faits], 8 churn, 9 to_stability, 12
 détecteurs/`Expr::Opaque`) — à décider et à tester séparément.
+
+---
+
+## Partie 7 — Vague 0 (soundness) + Vague 1 (primitifs) — APPLIQUÉES (2026-07)
+
+Suite de la passe : les **bugs de soundness** puis les **primitifs centraux bon marché**.
+Suite verte à chaque étape (**754 tests**, `cargo fmt` clean), chaque fix avec son test de
+régression.
+
+**Vague 0 — soundness (FN), voir Partie 2 pour le détail.** Template literals, tagged
+templates, `SequenceExpression`, narrowing flottant (bit `is_int`), parité `Let`/`Assign`
+(`bind_rhs` + `resolve_setter_aliases` chase les `Assign` + `infinite-loop` passe par
+`all_setter_labels`). Absorbe WA 1, 9, 10, 11, 16 (partie interpréteur), 18 (idem), ARCH 22.
+
+**Vague 1 — primitifs centraux :**
+- **`DominatorTree`** (ARCH 29, Thème 7 partie dominateurs) : `dominates()` recalculait le
+  fixpoint des dominateurs à chaque appel → structure calculée une fois par CFG, requête
+  O(1)·set. `setter_in_render` et `conditional_hook` la construisent une fois. Neutre.
+- **`new_with_common()` câblé au CLI** (ARCH 36, Thème 11 partie CLI) : `reactant check`
+  reconnaît TanStack/React-Router (résolus à ⊤ mais *connus*) → supprime le bruit
+  `analysis-limit/unknown-hook`. `Config::default()` reste vide (tests). Sûr (⊤, pas de FN).
+
+Restent les grands thèmes structurels : **Thème 1** (splice CFG + α-renommage, épine
+dorsale), **4** (recompute_memo), **7** (LogicalOp — dominateurs faits), **8** (churn),
+**9** (lattices/to_stability), **12** (détecteurs/`Expr::Opaque`).
 
 ---
 
@@ -349,14 +387,14 @@ détecteurs/`Expr::Opaque`) — à décider et à tester séparément.
 | 26 | S | peel() (TSAnnotated stripping) duplicated across rule files | `rules/infinite_loop.rs`, `rules/frozen_initial_state.rs`, `rules/stale_closure.rs` |
 | 27 | S | env_val_to_state_value is a no-op wrapper that ignores its ctx argument | `domains/transfer/state_value.rs` |
 | 28 | S | Duplicated lowering primitives across files (CFG constructor, event-prop test) | `lowering/hook_extractor.rs`, `lowering/expr_lower.rs`, `ir/cfg.rs` |
-| 29 | S | `dominates()` recomputes the full dominator relation on every call, driving per-rule quadratic recomputation | `engine/dominance.rs`, `rules/setter_in_render.rs`, `rules/conditional_hook.rs` |
+| 29 | ✅ fait | `dominates()` recomputait toute la relation à chaque appel → `DominatorTree` (calcul une fois, requête O(1)) ; `setter_in_render` et `conditional_hook` le construisent une fois avant leur boucle | `engine/dominance.rs`, `rules/setter_in_render.rs`, `rules/conditional_hook.rs` |
 | 30 | S | `peel` (TSAnnotated unwrap) is triplicated verbatim across rule files and inlined a fourth time | `rules/stale_closure.rs`, `rules/frozen_initial_state.rs`, `rules/infinite_loop.rs` |
 | 31 | S | `hook_kind_word` duplicated byte-for-byte in two rule files | `rules/missing_deps.rs`, `rules/always_unstable_deps.rs` |
 | 32 | S | guard_site returns a BlockId its only caller discards | `rules/conditional_hook.rs` |
 | 33 | S | compute_free_vars is a full second CFG traversal duplicating compute_free_paths | `ir/free_vars.rs` |
 | 34 | S | Destructuring temps use span offsets as identifiers while every other temp uses the fresh_temp counter | `lowering/cfg_builder.rs` |
 | 35 | ✅ fait | Two competing custom-hook recursion guards; one is wired, one is dead (moitié morte supprimée de `InterCtx`) | `domains/context.rs`, `engine/fixpoint.rs` |
-| 36 | S | Shipped CLI never enables library-hook summaries | `cli/check.rs`, `registry/summary.rs`, `engine/fixpoint.rs` |
+| 36 | ✅ fait | Le CLI livré câble désormais `new_with_common()` (TanStack/React-Router = ⊤ mais *connus* → plus de bruit `unknown-hook`). `Config::default()` reste vide pour les tests unitaires | `cli/check.rs`, `registry/summary.rs`, `engine/fixpoint.rs` |
 
 ## Annexe C — Inventaire du boilerplate répété (balayage ciblé 2026-07)
 

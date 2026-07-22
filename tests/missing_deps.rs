@@ -213,3 +213,26 @@ fn missing_deps_fixture() {
         "missing_deps.tsx: expected 2 missing-deps hits (callback + memo)"
     );
 }
+
+// ── Regression: reads hidden inside a template literal (Wave-0 FN) ─────────────
+
+#[test]
+fn template_literal_interpolation_is_a_tracked_read() {
+    // `${obj.x}` inside a template literal is a real read of `obj`; an empty
+    // deps array must fire exactly like `() => obj.x`. Before the fix, template
+    // interpolations were dropped at lowering → the capture vanished → silent FN.
+    let hits = missing_deps_hits(
+        r#"
+        import { useState, useCallback } from "react";
+        function C() {
+            const [obj, setObj] = useState({});
+            const cb = useCallback(() => `val: ${obj.x}`, []); // missing obj
+            return <button onClick={cb}>x</button>;
+        }
+        "#,
+    );
+    assert!(
+        hits >= 1,
+        "a capture read only inside a template literal must still fire missing-deps"
+    );
+}

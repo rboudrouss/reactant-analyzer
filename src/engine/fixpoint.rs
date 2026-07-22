@@ -1555,7 +1555,11 @@ mod tests {
         // The interval [0,42] covers both the init value and the set value.
         assert_eq!(
             result.state_store.get(0),
-            StateValue::number(Interval { lo: 0.0, hi: 42.0 })
+            StateValue::number(Interval {
+                lo: 0.0,
+                hi: 42.0,
+                is_int: true
+            })
         );
         assert!(result.widen_trace.is_empty());
     }
@@ -2150,7 +2154,11 @@ mod tests {
 
         assert_eq!(
             result.state_store.get(0),
-            StateValue::number(Interval { lo: 0.0, hi: 99.0 }),
+            StateValue::number(Interval {
+                lo: 0.0,
+                hi: 99.0,
+                is_int: true
+            }),
             "handler's setN(99) must be joined into state_store"
         );
     }
