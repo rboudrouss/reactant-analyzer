@@ -292,10 +292,9 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
 
         // ── TypeScript wrappers ───────────────────────────────────────────────
         Expression::ParenthesizedExpression(p) => lower_expr(&p.expression, builder),
-        Expression::TSAsExpression(ts) => Expr::TSAnnotated(
-            Box::new(lower_expr(&ts.expression, builder)),
-            lower_ts_type(&ts.type_annotation),
-        ),
+        Expression::TSAsExpression(ts) => {
+            Expr::TSAnnotated(Box::new(lower_expr(&ts.expression, builder)))
+        }
         Expression::TSNonNullExpression(ts) => lower_expr(&ts.expression, builder),
         Expression::TSSatisfiesExpression(ts) => lower_expr(&ts.expression, builder),
         Expression::TSTypeAssertion(ts) => lower_expr(&ts.expression, builder),
@@ -395,9 +394,7 @@ fn lower_call(call: &CallExpression, builder: &mut BlockBuilder) -> Expr {
         args,
     };
     match &call.type_arguments {
-        Some(params) if !params.params.is_empty() => {
-            Expr::TSAnnotated(Box::new(call_expr), lower_ts_type(&params.params[0]))
-        }
+        Some(params) if !params.params.is_empty() => Expr::TSAnnotated(Box::new(call_expr)),
         _ => call_expr,
     }
 }
@@ -423,22 +420,6 @@ fn lower_chain_element(elem: &ChainElement, builder: &mut BlockBuilder) -> Expr 
             obj: Box::new(lower_expr(&p.object, builder)),
             field: format!("#{}", p.field.name),
         },
-    }
-}
-
-// ── TypeScript type lowering ──────────────────────────────────────────────────
-
-fn lower_ts_type(ts: &oxc_ast::ast::TSType) -> crate::ir::expr::TSType {
-    use crate::ir::expr::TSType as IrTS;
-    use oxc_ast::ast::TSType as OxcTS;
-    match ts {
-        OxcTS::TSNumberKeyword(_) => IrTS::Number,
-        OxcTS::TSBooleanKeyword(_) => IrTS::Boolean,
-        OxcTS::TSStringKeyword(_) => IrTS::Str,
-        OxcTS::TSObjectKeyword(_) | OxcTS::TSTypeReference(_) | OxcTS::TSArrayType(_) => {
-            IrTS::Reference
-        }
-        _ => IrTS::Unknown,
     }
 }
 

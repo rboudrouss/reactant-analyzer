@@ -280,7 +280,7 @@ pub(crate) fn classify_callee_name(method: &str, obj_root: Option<&str>) -> (Eff
 /// through TS annotations. `None` for computed/complex callees.
 pub(crate) fn callee_parts(fn_: &Expr) -> Option<(&str, Option<&str>)> {
     let fn_ = match fn_ {
-        Expr::TSAnnotated(inner, _) => inner.as_ref(),
+        Expr::TSAnnotated(inner) => inner.as_ref(),
         other => other,
     };
     match fn_ {
@@ -440,7 +440,7 @@ fn binding_span(cfg: &CFG, var: &str) -> Option<SourceRange> {
 fn first_callee_var(e: &Expr) -> Option<String> {
     if let Expr::Call { fn_, .. } = e {
         let inner = match fn_.as_ref() {
-            Expr::TSAnnotated(x, _) => x.as_ref(),
+            Expr::TSAnnotated(x) => x.as_ref(),
             other => other,
         };
         if let Expr::Var(name) = inner {

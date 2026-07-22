@@ -148,7 +148,7 @@ fn eval_state_value(
         Expr::FieldAccess { obj, field } => eval_field_access(obj, field, env, ctx),
         Expr::IndexAccess { .. } => StateValue::top(),
 
-        Expr::TSAnnotated(inner, _) => eval_state_value(inner, env, ctx),
+        Expr::TSAnnotated(inner) => eval_state_value(inner, env, ctx),
 
         Expr::SummaryVal(sv) => match sv {
             crate::ir::expr::SummaryValue::Top => StateValue::top(),
@@ -192,7 +192,7 @@ fn returns_fresh_reference(callee: &Expr) -> bool {
             "parse" => matches!(obj.as_ref(), Expr::Var(v) if v == "JSON"),
             _ => false,
         },
-        Expr::TSAnnotated(inner, _) => returns_fresh_reference(inner),
+        Expr::TSAnnotated(inner) => returns_fresh_reference(inner),
         _ => false,
     }
 }
@@ -289,7 +289,7 @@ fn collect_escaping_setters(
                 }
             }
         }
-        Expr::TSAnnotated(inner, _) => {
+        Expr::TSAnnotated(inner) => {
             collect_escaping_setters(inner, env, heap, own, out, depth);
         }
         Expr::ObjectLit { fields, .. } => {
@@ -396,7 +396,7 @@ fn callee_setter(
             }
             None
         }
-        Expr::TSAnnotated(inner, _) => callee_setter(inner, env, captured, heap, own),
+        Expr::TSAnnotated(inner) => callee_setter(inner, env, captured, heap, own),
         _ => None,
     }
 }

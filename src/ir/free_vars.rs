@@ -110,7 +110,7 @@ pub fn path_covered(used: &AccessPath, declared: &[AccessPath]) -> bool {
 fn extract_path<'e>(e: &'e Expr, side: &mut Vec<&'e Expr>) -> Option<(Var, Vec<String>, bool)> {
     match e {
         Expr::Var(v) => Some((v.clone(), Vec::new(), false)),
-        Expr::TSAnnotated(inner, _) => extract_path(inner, side),
+        Expr::TSAnnotated(inner) => extract_path(inner, side),
         Expr::FieldAccess { obj, field } => {
             extract_path(obj, side).map(|(root, mut segs, opaque)| {
                 if !opaque {

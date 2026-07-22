@@ -1018,7 +1018,7 @@ fn collect_hook_labels_expr(expr: &Expr, out: &mut Vec<HookLabel>) {
                 .iter()
                 .for_each(|c| collect_hook_labels_expr(c, out));
         }
-        Expr::TSAnnotated(e, _) => collect_hook_labels_expr(e, out),
+        Expr::TSAnnotated(e) => collect_hook_labels_expr(e, out),
         _ => {}
     }
 }
@@ -1251,7 +1251,7 @@ fn utility_call_target(stmt: &Stmt) -> Option<String> {
     };
     let (fn_, _) = match call_expr {
         Expr::Call { fn_, args } => (fn_, args),
-        Expr::TSAnnotated(inner, _) => match inner.as_ref() {
+        Expr::TSAnnotated(inner) => match inner.as_ref() {
             Expr::Call { fn_, args } => (fn_, args),
             _ => return None,
         },
@@ -1327,7 +1327,7 @@ fn splice_one_call(
 
 fn strip_ts_annot(expr: &Expr) -> &Expr {
     match expr {
-        Expr::TSAnnotated(inner, _) => inner.as_ref(),
+        Expr::TSAnnotated(inner) => inner.as_ref(),
         other => other,
     }
 }

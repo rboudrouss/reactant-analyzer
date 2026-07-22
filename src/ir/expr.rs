@@ -39,15 +39,6 @@ pub enum UnaryOp {
     Not,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TSType {
-    Number,
-    Boolean,
-    Str,
-    Reference,
-    Unknown,
-}
-
 #[derive(Debug, Clone)]
 pub enum Expr {
     // Primitive literals
@@ -110,8 +101,12 @@ pub enum Expr {
         prop_spans: HashMap<String, Option<SourceRange>>,
     },
 
-    // TypeScript Annotations
-    TSAnnotated(Box<Expr>, TSType),
+    // TypeScript annotation marker (`x as T`, `useState<T>(..)`). The declared
+    // type itself is not retained: TS types are erased at runtime, so narrowing
+    // an abstract value by a type annotation would be unsound (`useState<number>`
+    // can hold `undefined`/`any`-cast values). The wrapper is kept only so
+    // `peel_ts` can see through it to the underlying expression.
+    TSAnnotated(Box<Expr>),
 
     // React Hooks
     StateVal(HookLabel),
@@ -202,7 +197,7 @@ impl Expr {
                     f(c);
                 }
             }
-            Expr::TSAnnotated(inner, _) => f(inner),
+            Expr::TSAnnotated(inner) => f(inner),
         }
     }
 
@@ -222,7 +217,7 @@ impl Expr {
     /// Strip any `TSAnnotated` wrappers, returning the underlying expression.
     pub fn peel_ts(&self) -> &Expr {
         let mut e = self;
-        while let Expr::TSAnnotated(inner, _) = e {
+        while let Expr::TSAnnotated(inner) = e {
             e = inner;
         }
         e

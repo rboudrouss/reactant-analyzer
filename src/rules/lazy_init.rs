@@ -231,7 +231,7 @@ enum Callee {
 /// ([`super::witness::classify_callee_name`], ADR-019).
 fn classify_callee(fn_: &Expr, setters: &HashSet<Var>) -> Callee {
     let fn_ = match fn_ {
-        Expr::TSAnnotated(inner, _) => inner.as_ref(),
+        Expr::TSAnnotated(inner) => inner.as_ref(),
         other => other,
     };
     match fn_ {
@@ -259,7 +259,7 @@ mod tests {
         ir::{
             cfg::{BasicBlock, CFG, Terminator},
             component::ComponentIR,
-            expr::{Expr, Prim, TSType},
+            expr::{Expr, Prim},
             hooks::HookEntry,
             types::ExprId,
         },
@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn ts_annotated_call_init_warns() {
-        // useState<number>(Date.now()) TSAnnotated(Call, Number)
+        // useState<number>(Date.now()) → TSAnnotated(Call)
         let call = Expr::Call {
             fn_: Box::new(Expr::FieldAccess {
                 obj: Box::new(Expr::Var("Date".to_string())),
@@ -333,7 +333,7 @@ mod tests {
         };
         let hooks = vec![HookEntry::State {
             label: 0,
-            init: Expr::TSAnnotated(Box::new(call), TSType::Number),
+            init: Expr::TSAnnotated(Box::new(call)),
             span: None,
         }];
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());

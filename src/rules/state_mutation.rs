@@ -131,7 +131,7 @@ impl<'a> Collector<'a> {
     /// a variable bound on several paths roots at the first slot found.
     fn chase(&self, expr: &'a Expr, scopes: &[Scope<'a>], seen: &mut HashSet<&'a str>) -> MutRoot {
         match expr {
-            Expr::TSAnnotated(inner, _) => self.chase(inner, scopes, seen),
+            Expr::TSAnnotated(inner) => self.chase(inner, scopes, seen),
             // A path through `.current` is ref semantics — mutation sanctioned.
             Expr::FieldAccess { field, .. } if field == "current" => MutRoot::Other,
             // A path through a DOM-only field is DOM manipulation.
@@ -370,7 +370,7 @@ fn display_expr(e: &Expr) -> String {
         Expr::StateVal(_) => "state".to_string(),
         Expr::FieldAccess { obj, field } => format!("{}.{field}", display_expr(obj)),
         Expr::IndexAccess { arr, .. } => format!("{}[…]", display_expr(arr)),
-        Expr::TSAnnotated(inner, _) => display_expr(inner),
+        Expr::TSAnnotated(inner) => display_expr(inner),
         _ => "this object".to_string(),
     }
 }

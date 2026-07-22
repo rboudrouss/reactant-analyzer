@@ -394,9 +394,7 @@ fn rename_vars_expr(expr: Expr, ren: &HashMap<Var, Var>) -> Expr {
                 .collect(),
             prop_spans,
         },
-        Expr::TSAnnotated(inner, ts) => {
-            Expr::TSAnnotated(Box::new(rename_vars_expr(*inner, ren)), ts)
-        }
+        Expr::TSAnnotated(inner) => Expr::TSAnnotated(Box::new(rename_vars_expr(*inner, ren))),
         leaf @ (Expr::Lit(_)
         | Expr::StateVal(_)
         | Expr::StateSetter(_)
@@ -594,9 +592,7 @@ pub fn subst_vars_expr(expr: Expr, subst: &HashMap<Var, Expr>) -> Expr {
                 .collect(),
             prop_spans,
         },
-        Expr::TSAnnotated(inner, ts) => {
-            Expr::TSAnnotated(Box::new(subst_vars_expr(*inner, subst)), ts)
-        }
+        Expr::TSAnnotated(inner) => Expr::TSAnnotated(Box::new(subst_vars_expr(*inner, subst))),
         leaf @ (Expr::Lit(_)
         | Expr::StateVal(_)
         | Expr::StateSetter(_)

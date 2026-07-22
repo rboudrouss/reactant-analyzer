@@ -103,7 +103,7 @@ fn collect_subscriptions_in_expr(
                 collect_subscriptions_in_expr(v, stmt_span, out, next_label);
             }
         }
-        Expr::TSAnnotated(inner, _) => {
+        Expr::TSAnnotated(inner) => {
             collect_subscriptions_in_expr(inner, stmt_span, out, next_label);
         }
         // FnLit, Lit, Var, StateVal, StateSetter, MemoVal, CallbackVal, CompApp,
@@ -180,7 +180,7 @@ fn handler_body(val: &Expr, var_bodies: &HashMap<&str, CFG>) -> Option<CFG> {
     match val {
         Expr::FnLit { body_cfg, .. } => Some((**body_cfg).clone()),
         Expr::Var(v) => var_bodies.get(v.as_str()).cloned(),
-        Expr::TSAnnotated(e, _) => handler_body(e, var_bodies),
+        Expr::TSAnnotated(e) => handler_body(e, var_bodies),
         _ => None,
     }
 }
@@ -441,20 +441,17 @@ fn try_consume_hook_call(
     imports: &ImportCtx<'_>,
 ) -> Result<(String, bool, Vec<Expr>), Expr> {
     match expr {
-        Expr::TSAnnotated(inner, ts_type) => {
+        Expr::TSAnnotated(inner) => {
             if let Expr::Call { fn_, args } = *inner {
                 match hook_name_from_callee(&fn_) {
                     Some(name) => {
                         let is_react = imports.callee_is_react(&fn_, &name);
                         Ok((name, is_react, args))
                     }
-                    None => Err(Expr::TSAnnotated(
-                        Box::new(Expr::Call { fn_, args }),
-                        ts_type,
-                    )),
+                    None => Err(Expr::TSAnnotated(Box::new(Expr::Call { fn_, args }))),
                 }
             } else {
-                Err(Expr::TSAnnotated(inner, ts_type))
+                Err(Expr::TSAnnotated(inner))
             }
         }
         Expr::Call { fn_, args } => match hook_name_from_callee(&fn_) {
@@ -769,9 +766,7 @@ fn rewrite_expr(expr: Expr, state_temps: &HashMap<String, HookLabel>) -> Expr {
                 .map(|(k, v)| (k, rewrite_expr(v, state_temps)))
                 .collect(),
         },
-        Expr::TSAnnotated(inner, ty) => {
-            Expr::TSAnnotated(Box::new(rewrite_expr(*inner, state_temps)), ty)
-        }
+        Expr::TSAnnotated(inner) => Expr::TSAnnotated(Box::new(rewrite_expr(*inner, state_temps))),
         other => other,
     }
 }

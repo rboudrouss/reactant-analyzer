@@ -290,7 +290,7 @@ pub(crate) fn arg_is_call_free(
             arg_is_call_free(lhs, bindings, seen) && arg_is_call_free(rhs, bindings, seen)
         }
         Expr::UnaryOp { arg, .. } => arg_is_call_free(arg, bindings, seen),
-        Expr::TSAnnotated(inner, _) => arg_is_call_free(inner, bindings, seen),
+        Expr::TSAnnotated(inner) => arg_is_call_free(inner, bindings, seen),
     }
 }
 
