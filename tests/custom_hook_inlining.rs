@@ -212,6 +212,97 @@ fn setter_in_render_via_custom_hook_detected() {
     );
 }
 
+// ── PROBE: multi-block hook body (non-entry setter must not be dropped) ────────
+
+#[test]
+fn probe_multiblock_hook_setter_in_join_block_detected() {
+    // useThing's `setCount(1)` sits in the join block AFTER an `if`, i.e. NOT in
+    // the body's entry block. The naive graft copies only the entry block, so the
+    // setter call vanishes → setter-in-render FN. Full-body splice must see it.
+    let src = r#"
+        function useThing(flag) {
+            const [count, setCount] = useState(0);
+            if (flag) {
+                count;
+            }
+            setCount(1);
+            return count;
+        }
+        function Comp() {
+            const c = useThing(true);
+            return <div>{c}</div>;
+        }
+    "#;
+    let result = parse_and_analyze(src);
+    assert!(result.components.contains_key("Comp"));
+    let diags = diags_for(&result, "Comp");
+    let setter_diag = diags.iter().find(|d| d.rule == "setter-in-render");
+    assert!(
+        setter_diag.is_some(),
+        "setter called unconditionally in a hook's non-entry block must fire \
+         setter-in-render (multi-block FN); got: {:?}",
+        diags.iter().map(|d| d.rule).collect::<Vec<_>>()
+    );
+}
+
+// ── Display hygiene: the splice's `#salt` alpha-rename never reaches messages ──
+
+#[test]
+fn spliced_hook_locals_are_not_shown_with_rename_salt() {
+    // A hook's internal state/setter is alpha-renamed to `name#salt` at splice
+    // time to keep the caller's namespace collision-free. That marker is an
+    // internal detail and must be stripped from every user-facing diagnostic.
+    let src = r#"
+        function useBad() {
+            const [count, setCount] = useState(0);
+            setCount(1);
+            return count;
+        }
+        function Comp() {
+            const c = useBad();
+            return <div>{c}</div>;
+        }
+    "#;
+    let result = parse_and_analyze(src);
+    for d in diags_for(&result, "Comp") {
+        assert!(
+            !d.message.contains('#') || d.message.contains("state #"),
+            "internal alpha-rename salt leaked into a diagnostic: {}",
+            d.message
+        );
+    }
+}
+
+// ── FP: a ref returned via object destructure resolves (destructuring rebind) ──
+
+#[test]
+fn destructured_ref_hook_no_false_positive() {
+    // `useRenderer` returns a ref via `{ data }`; the caller destructures it.
+    // Before the full-body splice bound the hook's return, `data` degraded to ⊤
+    // (the `useMermaidRenderer` FP). With the return bound, no spurious
+    // missing-/unstable-deps diagnostic should fire.
+    let src = r#"
+        function useRenderer() {
+            const data = useRef(null);
+            const render = useCallback(() => convert(data), [data]);
+            return { data, render };
+        }
+        function Comp() {
+            const { data, render } = useRenderer();
+            return <div onClick={render} />;
+        }
+    "#;
+    let result = parse_and_analyze(src);
+    let noisy: Vec<_> = diags_for(&result, "Comp")
+        .into_iter()
+        .filter(|d| matches!(d.rule, "missing-deps" | "always-unstable-deps"))
+        .collect();
+    assert!(
+        noisy.is_empty(),
+        "destructured ref hook must not trigger deps FP: {noisy:?}"
+    );
+}
+
 // ── Test 6: recursive custom hook does not loop forever ───────────────────────
 
 #[test]

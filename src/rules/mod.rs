@@ -95,7 +95,7 @@ pub(crate) fn state_slot_name(
     state_val_labels
         .iter()
         .find(|(v, l)| **l == label && !v.starts_with("__"))
-        .map(|(v, _)| format!("`{v}`"))
+        .map(|(v, _)| format!("`{}`", crate::ir::source_name(v)))
         .unwrap_or_else(|| format!("state #{label}"))
 }
 

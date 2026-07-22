@@ -123,33 +123,40 @@ impl Step {
     pub fn render(&self, name: &dyn Fn(HookLabel) -> String) -> String {
         match self {
             Step::Binding { var } => {
+                let var = crate::ir::source_name(var);
                 format!("the value flows through `{var}`, bound here")
             }
-            Step::Resolve { name: n, target } => match target {
-                ResolveTarget::Import(path) => {
-                    format!("`{n}` resolves to an import from {}", path.display())
+            Step::Resolve { name: n, target } => {
+                let n = crate::ir::source_name(n);
+                match target {
+                    ResolveTarget::Import(path) => {
+                        format!("`{n}` resolves to an import from {}", path.display())
+                    }
+                    ResolveTarget::LocalFn => {
+                        format!("`{n}` is a function defined in this file")
+                    }
+                    ResolveTarget::Setter => format!("`{n}` is a state setter"),
+                    ResolveTarget::Unknown => {
+                        format!("`{n}` could not be resolved — treated as opaque")
+                    }
                 }
-                ResolveTarget::LocalFn => {
-                    format!("`{n}` is a function defined in this file")
-                }
-                ResolveTarget::Setter => format!("`{n}` is a state setter"),
-                ResolveTarget::Unknown => {
-                    format!("`{n}` could not be resolved — treated as opaque")
-                }
-            },
-            Step::Call { callee, class } => match class {
-                EffectClass::Setter => {
-                    format!("`{callee}` is a state setter — calling it writes state")
-                }
-                EffectClass::Effectful => format!(
-                    "`{callee}` has side effects (subscriptions/requests/timers re-fire on \
+            }
+            Step::Call { callee, class } => {
+                let callee = crate::ir::source_name(callee);
+                match class {
+                    EffectClass::Setter => {
+                        format!("`{callee}` is a state setter — calling it writes state")
+                    }
+                    EffectClass::Effectful => format!(
+                        "`{callee}` has side effects (subscriptions/requests/timers re-fire on \
                      every call)"
-                ),
-                EffectClass::PureCheap => format!("`{callee}` is a cheap pure builtin"),
-                EffectClass::Unknown => {
-                    format!("the effect of calling `{callee}` is unknown to the analysis")
+                    ),
+                    EffectClass::PureCheap => format!("`{callee}` is a cheap pure builtin"),
+                    EffectClass::Unknown => {
+                        format!("the effect of calling `{callee}` is unknown to the analysis")
+                    }
                 }
-            },
+            }
             Step::Write { slot, value } => match value {
                 ValueClass::Fresh => {
                     format!("a fresh value is written to state {} here", name(*slot))
@@ -160,7 +167,7 @@ impl Step {
                 ),
                 ValueClass::Unknown => format!("state {} is written here", name(*slot)),
             },
-            Step::Read { what } => format!("`{what}` is read here"),
+            Step::Read { what } => format!("`{}` is read here", crate::ir::source_name(what)),
             Step::Branch { desc } => format!("guarded by {desc}"),
             Step::Handler { event, slot } => format!(
                 "handler `on{}` also calls this setter and keeps growing state {}",
@@ -176,11 +183,13 @@ impl Step {
                 iteration
             ),
             Step::Mutate { target } => {
+                let target = crate::ir::source_name(target);
                 format!("`{target}` is mutated in place here — its reference identity is unchanged")
             }
             Step::Capture { what } => format!(
-                "`{what}` is captured at registration time — the callback keeps this value, \
-                 not the latest one"
+                "`{}` is captured at registration time — the callback keeps this value, \
+                 not the latest one",
+                crate::ir::source_name(what)
             ),
             Step::InitOnce { slot } => format!(
                 "state {} reads its initializer on the first render only — later renders \

@@ -14,7 +14,7 @@ use crate::{
         free_vars::{compute_free_paths, compute_free_vars},
         hooks::HookEntry,
         stmt::Stmt,
-        types::{BlockId, HookLabel},
+        types::{BlockId, HookLabel, Var},
     },
 };
 
@@ -30,10 +30,7 @@ use super::{
 };
 use crate::{
     domains::{stores::SharedStateStore, transfer::StateValueTransfer},
-    ir::{
-        cfg::{BasicBlock, Edge, EdgeKind, Terminator},
-        remap::{remap_cfg, remap_hooks},
-    },
+    ir::remap::{remap_cfg, remap_hooks},
     registry::SummaryRegistry,
 };
 
@@ -162,6 +159,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 
     // Provenance of every splice below (ADR-019) — ends up on the result.
     let mut inline_origins: Vec<crate::engine::InlineOrigin> = Vec::new();
+    // Monotonic salt shared by every splice in this component so alpha-renamed
+    // callee locals (`name#salt`) never collide across utility and hook splices.
+    let mut splice_salt: u32 = 0;
 
     // Utility-function inlining. Runs before `expand_custom_hooks` so utility
     // bodies containing hook calls become visible to the hook expansion pass.
@@ -172,10 +172,17 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         &comp_file,
         config.max_inline_depth,
         &mut inline_origins,
+        &mut splice_salt,
     );
 
     // Expand Custom entries before seeding so inlined State entries are seeded.
-    expand_custom_hooks(&mut hooks, &mut render_cfg, inter, &mut inline_origins);
+    expand_custom_hooks(
+        &mut hooks,
+        &mut render_cfg,
+        inter,
+        &mut inline_origins,
+        &mut splice_salt,
+    );
 
     // Threshold set for widening up-to (ADR-014); harvested once, post-expansion.
     let thresholds = collect_thresholds(&render_cfg, &hooks);
@@ -589,6 +596,7 @@ fn expand_custom_hooks(
     render_cfg: &mut CFG,
     inter: Option<&InterCtx<'_>>,
     origins: &mut Vec<crate::engine::InlineOrigin>,
+    salt: &mut u32,
 ) {
     let Some(inter) = inter else { return };
     let Some(reg) = inter.hook_registry else {
@@ -617,6 +625,7 @@ fn expand_custom_hooks(
                 continue;
             }
         };
+        let custom_label = hooks[i].label();
 
         // Recursion guard: skip if we already started expanding this hook.
         if expanding.contains(&name) {
@@ -671,8 +680,9 @@ fn expand_custom_hooks(
         // Offset = first available label after all current entries.
         let offset: HookLabel = hooks.iter().map(|h| h.label() + 1).max().unwrap_or(0);
 
-        // Build param→arg substitution map so State inits that reference hook params
-        // (e.g. `useState(initial)`) resolve to concrete call-site values.
+        // Param→arg substitution for State inits: they are seeded in a separate
+        // env (module consts + props), which the render-body param bindings
+        // never reach, so `useState(initial)` must inline the concrete arg.
         let param_subst: HashMap<String, Expr> = hook_ir
             .params
             .iter()
@@ -680,46 +690,72 @@ fn expand_custom_hooks(
             .map(|(p, a)| (p.clone(), a.clone()))
             .collect();
 
-        let remapped = remap_hooks(hook_ir.hooks.clone(), offset);
+        // One alpha-rename map for this expansion, shared by the body splice and
+        // by every sub-hook body that captures a render-scope local — otherwise
+        // an effect capturing `x` would desync from the body's renamed `x`.
+        let s = *salt;
+        *salt += 1;
+        let rename = crate::ir::callee_rename_map(&hook_ir.body_cfg, &hook_ir.params, s);
 
-        // Substitute call-site args for hook params in State init expressions so
-        // that seeding uses the correct initial value rather than Bottom.
-        let remapped: Vec<HookEntry> = remapped
+        let remapped: Vec<HookEntry> = remap_hooks(hook_ir.hooks.clone(), offset)
             .into_iter()
-            .map(|h| match h {
-                HookEntry::State { label, init, span } => HookEntry::State {
-                    label,
-                    init: subst_vars(init, &param_subst),
-                    span,
-                },
-                other => other,
+            .map(|h| {
+                let h = match h {
+                    HookEntry::State { label, init, span } => HookEntry::State {
+                        label,
+                        init: crate::ir::subst_vars_expr(init, &param_subst),
+                        span,
+                    },
+                    other => other,
+                };
+                crate::ir::rename_hook_entry(h, &rename)
             })
             .collect();
 
-        // Inject the hook's body_cfg entry-block stmts (remapped) into the component's
-        // render_cfg entry block, preceded by param-binding stmts so that any expr in the
-        // body that references a hook param resolves correctly during the render pass.
-        let remapped_body = remap_cfg(hook_ir.body_cfg.clone(), offset);
-        let body_stmts = remapped_body
-            .blocks
-            .get(&remapped_body.entry)
-            .map(|b| b.stmts.clone())
-            .unwrap_or_default();
-        let param_stmts: Vec<crate::ir::stmt::Stmt> = hook_ir
-            .params
-            .iter()
-            .zip(call_args.iter())
-            .map(|(p, a)| crate::ir::stmt::Stmt::Let {
-                var: p.clone(),
-                rhs: a.clone(),
-                span: None,
-            })
-            .collect();
-        if let Some(entry_block) = render_cfg.blocks.get_mut(&render_cfg.entry) {
-            let mut new_stmts = param_stmts;
-            new_stmts.extend(body_stmts);
-            new_stmts.extend(std::mem::take(&mut entry_block.stmts));
-            entry_block.stmts = new_stmts;
+        // Splice the hook's WHOLE body CFG at its call site (the HookMarker
+        // binding), binding the return to the caller variable. Fixes the
+        // multi-block-body FN (only the entry block used to survive) and the
+        // destructuring rebind (the return is now actually bound).
+        let body = remap_cfg(hook_ir.body_cfg.clone(), offset);
+        if let Some((block_id, stmt_idx, bound_var)) = find_hook_marker(render_cfg, custom_label) {
+            crate::ir::splice_callee_into_cfg(
+                render_cfg,
+                block_id,
+                stmt_idx,
+                crate::ir::Splice {
+                    callee: body,
+                    params: &hook_ir.params,
+                    args: &call_args,
+                    bound_var: bound_var.as_ref(),
+                    rename: &rename,
+                },
+            );
+        } else {
+            // Defensive: no marker in the render CFG (should not happen for a
+            // lowered call). Graft the renamed body's entry stmts so nothing is
+            // dropped, preserving the pre-Thème-1 behavior for this rare case.
+            let body = crate::ir::rename_vars_cfg(body, &rename);
+            let param_lets: Vec<Stmt> = hook_ir
+                .params
+                .iter()
+                .zip(call_args.iter())
+                .map(|(p, a)| Stmt::Let {
+                    var: rename.get(p).cloned().unwrap_or_else(|| p.clone()),
+                    rhs: a.clone(),
+                    span: None,
+                })
+                .collect();
+            let body_stmts = body
+                .blocks
+                .get(&body.entry)
+                .map(|b| b.stmts.clone())
+                .unwrap_or_default();
+            if let Some(entry_block) = render_cfg.blocks.get_mut(&render_cfg.entry) {
+                let mut new_stmts = param_lets;
+                new_stmts.extend(body_stmts);
+                new_stmts.extend(std::mem::take(&mut entry_block.stmts));
+                entry_block.stmts = new_stmts;
+            }
         }
 
         // Provenance (ADR-019): the hook's body now lives inside this
@@ -742,6 +778,34 @@ fn expand_custom_hooks(
     }
 }
 
+/// Locate the call site of the custom hook labelled `label` in `render_cfg`:
+/// the `HookMarker(label)` left by lowering, either as `let x = HookMarker(l)`
+/// (returns the bound var) or a bare `ExprStmt(HookMarker(l))` (void call).
+/// Blocks are scanned in id order for determinism.
+fn find_hook_marker(render_cfg: &CFG, label: HookLabel) -> Option<(BlockId, usize, Option<Var>)> {
+    let mut block_ids: Vec<BlockId> = render_cfg.blocks.keys().copied().collect();
+    block_ids.sort_unstable();
+    for bid in block_ids {
+        let block = &render_cfg.blocks[&bid];
+        for (idx, stmt) in block.stmts.iter().enumerate() {
+            match stmt {
+                Stmt::Let { var, rhs, .. } if is_marker(rhs, label) => {
+                    return Some((bid, idx, Some(var.clone())));
+                }
+                Stmt::ExprStmt(e, _) if is_marker(e, label) => {
+                    return Some((bid, idx, None));
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn is_marker(expr: &Expr, label: HookLabel) -> bool {
+    matches!(expr.peel_ts(), Expr::HookMarker(l) if *l == label)
+}
+
 /// Map a `StateValue` returned by `HookSummary::summarize` to the coarse `SummaryValue`
 /// enum that lives in `ir` (no circular dep).  Only three distinctions matter for rules:
 /// stable reference, unstable reference, or unknown (⊤).
@@ -753,28 +817,6 @@ fn state_value_to_summary_value(v: StateValue) -> SummaryValue {
         SummaryValue::UnstableRef
     } else {
         SummaryValue::Top
-    }
-}
-
-/// Shallow variable substitution for hook-param→call-arg replacement in State init exprs.
-/// Only descends into compound exprs that can plausibly appear in a useState initializer.
-fn subst_vars(expr: Expr, subst: &HashMap<String, Expr>) -> Expr {
-    if subst.is_empty() {
-        return expr;
-    }
-    match expr {
-        Expr::Var(ref name) => subst.get(name).cloned().unwrap_or(expr),
-        Expr::BinOp { op, lhs, rhs } => Expr::BinOp {
-            op,
-            lhs: Box::new(subst_vars(*lhs, subst)),
-            rhs: Box::new(subst_vars(*rhs, subst)),
-        },
-        Expr::UnaryOp { op, arg } => Expr::UnaryOp {
-            op,
-            arg: Box::new(subst_vars(*arg, subst)),
-        },
-        Expr::TSAnnotated(inner, t) => Expr::TSAnnotated(Box::new(subst_vars(*inner, subst)), t),
-        other => other,
     }
 }
 
@@ -1080,6 +1122,7 @@ fn expand_utility_calls(
     caller_file: &std::path::Path,
     max_depth: usize,
     origins: &mut Vec<crate::engine::InlineOrigin>,
+    salt: &mut u32,
 ) {
     if registry.is_empty() {
         return;
@@ -1091,6 +1134,7 @@ fn expand_utility_calls(
         max_depth,
         &mut HashSet::new(),
         origins,
+        salt,
     );
     for hook in hooks.iter_mut() {
         match hook {
@@ -1105,6 +1149,7 @@ fn expand_utility_calls(
                     max_depth,
                     &mut HashSet::new(),
                     origins,
+                    salt,
                 );
             }
             _ => {}
@@ -1126,6 +1171,7 @@ fn inline_in_cfg(
     max_depth: usize,
     expanding: &mut HashSet<String>,
     origins: &mut Vec<crate::engine::InlineOrigin>,
+    salt: &mut u32,
 ) {
     let mut budget = max_depth;
     loop {
@@ -1149,7 +1195,7 @@ fn inline_in_cfg(
         // Mark before splicing so a self-recursive call inside the spliced
         // body is skipped on the next scan.
         expanding.insert(name);
-        splice_one_call(cfg, block_id, stmt_idx, registry, caller_file);
+        splice_one_call(cfg, block_id, stmt_idx, registry, caller_file, salt);
         budget -= 1;
     }
 }
@@ -1215,29 +1261,19 @@ fn resolve_utility<'a>(
         .or_else(|| registry.get_by_name(&name.to_string()))
 }
 
-/// Splice a single utility call at `(block_id, stmt_idx)` into `cfg`.
-///
-/// Algorithm:
-///   1. Snapshot the caller's `BasicBlock` and split its `stmts` at `stmt_idx`
-///      into `pre` (kept) and `post` (moved to a new "join" block).
-///   2. Allocate fresh block ids for the callee's blocks (offset to avoid
-///      collisions with the caller).
-///   3. For each callee block:
-///        - remap any embedded `BlockId` in terminators / edges
-///        - rewrite `Terminator::Return(expr)` so it jumps to the join block,
-///          and (for `Let { var, .. }` call sites) assigns `var = expr` at the
-///          end of the returning block.
-///   4. Prepend the param-binding `Let`s to the callee's entry block.
-///   5. Splice into the caller CFG: original block keeps `pre` + `Jump(entry)`;
-///      the join block holds `post` + the caller's original terminator.
+/// Splice a single utility call at `(block_id, stmt_idx)` into `cfg`, via the
+/// shared [`splice_callee_into_cfg`](crate::ir::splice_callee_into_cfg)
+/// primitive. This wrapper only resolves the callee and extracts the call's
+/// bound variable and arguments; the structural graft (fresh blocks, join,
+/// edges, `Return` binding, alpha-renaming) lives in the primitive.
 fn splice_one_call(
     cfg: &mut CFG,
     block_id: BlockId,
     stmt_idx: usize,
     registry: &FunctionRegistry,
     caller_file: &std::path::Path,
+    salt: &mut u32,
 ) {
-    // 1. Inspect the call statement.
     let call_stmt = cfg.blocks[&block_id].stmts[stmt_idx].clone();
     let (bound_var, call_args) = match &call_stmt {
         Stmt::Let { var, rhs, .. } => match strip_ts_annot(rhs) {
@@ -1259,140 +1295,21 @@ fn splice_one_call(
         None => return,
     };
 
-    // 2. Split the caller block.
-    let pre_post = cfg.blocks.get_mut(&block_id).unwrap();
-    let mut post: Vec<Stmt> = pre_post.stmts.split_off(stmt_idx);
-    // Drop the call stmt itself (it's the first stmt of `post`).
-    if !post.is_empty() {
-        post.remove(0);
-    }
-    let old_term = std::mem::replace(&mut pre_post.term, Terminator::Unreachable);
-
-    // 3. Compute fresh BlockId allocations.
-    let block_offset: BlockId = cfg.blocks.keys().copied().max().map(|m| m + 1).unwrap_or(0);
-    let join_block_id: BlockId = block_offset + utility.body_cfg.blocks.len();
-
-    // 4. Build the param-binding prefix.
-    let mut param_lets: Vec<Stmt> = utility
-        .params
-        .iter()
-        .zip(call_args.iter())
-        .map(|(p, a)| Stmt::Let {
-            var: p.clone(),
-            rhs: a.clone(),
-            span: None,
-        })
-        .collect();
-
-    // 5. Insert each callee block with remapped ids, rewriting Returns to jump
-    //    to the join block (and possibly assign `bound_var = ret_expr`).
-    let mut callee_blocks: Vec<(BlockId, BasicBlock)> = utility
-        .body_cfg
-        .blocks
-        .iter()
-        .map(|(bid, block)| (*bid + block_offset, block.clone()))
-        .collect();
-    // Callee blocks whose Return was rewritten into `Jump(join)`; each needs a
-    // fresh edge to the join block.
-    let mut callee_return_blocks: Vec<BlockId> = Vec::new();
-    for (new_id, block) in callee_blocks.iter_mut() {
-        block.id = *new_id;
-        // Remap embedded BlockIds in terminators.
-        block.term = match std::mem::replace(&mut block.term, Terminator::Unreachable) {
-            Terminator::Jump(t) => Terminator::Jump(t + block_offset),
-            Terminator::Branch {
-                cond,
-                then_,
-                else_,
-                span,
-            } => Terminator::Branch {
-                cond,
-                then_: then_ + block_offset,
-                else_: else_ + block_offset,
-                span,
-            },
-            Terminator::Return(ret_expr) => {
-                if let Some(var) = &bound_var {
-                    block.stmts.push(Stmt::Assign {
-                        var: var.clone(),
-                        rhs: ret_expr,
-                        span: None,
-                    });
-                }
-                // Else: discard the return value.
-                callee_return_blocks.push(*new_id);
-                Terminator::Jump(join_block_id)
-            }
-            Terminator::Unreachable => Terminator::Unreachable,
-        };
-    }
-
-    // Prepend param-binding Lets to the callee's entry block.
-    let callee_entry = utility.body_cfg.entry + block_offset;
-    if let Some((_, entry_block)) = callee_blocks.iter_mut().find(|(id, _)| *id == callee_entry) {
-        let mut new_stmts = std::mem::take(&mut param_lets);
-        new_stmts.extend(std::mem::take(&mut entry_block.stmts));
-        entry_block.stmts = new_stmts;
-    } else {
-        // Defensive: entry block missing.
-        return;
-    }
-
-    // 6. Insert callee blocks into the caller CFG.
-    for (id, block) in callee_blocks {
-        cfg.blocks.insert(id, block);
-    }
-
-    // 7. Caller block now jumps to callee entry.
-    cfg.blocks.get_mut(&block_id).unwrap().term = Terminator::Jump(callee_entry);
-
-    // 8. Create the join block holds the original post-call stmts and the
-    //    caller's original terminator.
-    cfg.blocks.insert(
-        join_block_id,
-        BasicBlock {
-            id: join_block_id,
-            stmts: post,
-            term: old_term,
+    let s = *salt;
+    *salt += 1;
+    let rename = crate::ir::callee_rename_map(&utility.body_cfg, &utility.params, s);
+    crate::ir::splice_callee_into_cfg(
+        cfg,
+        block_id,
+        stmt_idx,
+        crate::ir::Splice {
+            callee: utility.body_cfg,
+            params: &utility.params,
+            args: &call_args,
+            bound_var: bound_var.as_ref(),
+            rename: &rename,
         },
     );
-
-    // 9. Edge maintenance. `CFG::successors`/`predecessors` (hence `topo_sort`,
-    //    dominance, and the abstract interpreter) read `edges`, so spliced
-    //    blocks MUST be wired in or they become unreachable — the engine would
-    //    silently skip the inlined body. We patch surgically to preserve the
-    //    callee's own EdgeKind (Back edges drive widening; IfTrue/IfFalse drive
-    //    narrowing) rather than recomputing from terminators.
-    //
-    //  a) The caller's original out-edges now leave the join block (it carries
-    //     `old_term`), not the original block.
-    for edge in cfg.edges.iter_mut() {
-        if edge.from == block_id {
-            edge.from = join_block_id;
-        }
-    }
-    //  b) Original block → callee entry (the splice jump).
-    cfg.edges.push(Edge {
-        from: block_id,
-        to: callee_entry,
-        kind: EdgeKind::Unconditional,
-    });
-    //  c) Callee-internal edges, remapped by block_offset (kinds preserved).
-    for edge in &utility.body_cfg.edges {
-        cfg.edges.push(Edge {
-            from: edge.from + block_offset,
-            to: edge.to + block_offset,
-            kind: edge.kind.clone(),
-        });
-    }
-    //  d) Each rewritten callee Return → join.
-    for ret_block in callee_return_blocks {
-        cfg.edges.push(Edge {
-            from: ret_block,
-            to: join_block_id,
-            kind: EdgeKind::Unconditional,
-        });
-    }
 }
 
 fn strip_ts_annot(expr: &Expr) -> &Expr {

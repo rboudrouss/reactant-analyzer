@@ -153,7 +153,7 @@ impl Rule for SetterInRender {
                         format!(
                             "setter `{}` called directly in the render body, \
                              move this call into a useEffect or an event handler",
-                            call.var
+                            crate::ir::source_name(&call.var)
                         ),
                     )
                     .with_severity(severity)
@@ -164,7 +164,9 @@ impl Rule for SetterInRender {
                         format!(
                             "prop `{}` (a state setter of parent `{}`) called during render of `{}` \
                              triggers parent re-render on every render",
-                            call.var, parent_comp, component
+                            crate::ir::source_name(&call.var),
+                            parent_comp,
+                            component
                         ),
                     )
                     .with_severity(severity)
@@ -172,7 +174,10 @@ impl Rule for SetterInRender {
                 } else {
                     Diagnostic::new(
                         "setter-in-render",
-                        format!("setter `{}` called in the render body", call.var),
+                        format!(
+                            "setter `{}` called in the render body",
+                            crate::ir::source_name(&call.var)
+                        ),
                     )
                     .with_severity(severity)
                 };

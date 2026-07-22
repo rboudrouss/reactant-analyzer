@@ -29,10 +29,17 @@ suite green at 753). Kept here as a record.
 
 ### Latent (surface as FN when the code grows)
 
-- **Custom-hook graft keeps only the entry block** — `expand_custom_hooks` concatenates only
-  the hook body's ENTRY block; other blocks/edges are dropped, no α-renaming. Multi-block
-  hook bodies lose reads/effects. Root cause of the `useMermaidRenderer` FP too. Fix: unify
-  the CFG-splice primitive (tech-debt Thème 1). *(WA 3, 4, 14 / ARCH 1)*
+- **Custom-hook graft keeps only the entry block — RÉSOLU (Thème 1, 2026-07).**
+  `expand_custom_hooks` now routes through the shared `splice_callee_into_cfg` primitive
+  (`ir/splice.rs`): the WHOLE hook body CFG (all blocks/edges) is spliced at the call site,
+  the return binds the caller variable, and callee-bound vars are α-renamed (`name#salt`,
+  capture-aware, stripped at display via `ir::source_name`). Fixed the multi-block FN and the
+  `useMermaidRenderer` FP; `subst_vars` (lossy `_ => _`) replaced by exhaustive
+  `subst_vars_expr`. Rule alias helpers (`resolve_setter_aliases`/`all_setter_labels`) kept
+  intact — they also chase *user-written* aliases, so removing them would be an FN. *(regression:
+  `tests/custom_hook_inlining.rs::{probe_multiblock_hook_setter_in_join_block_detected,
+  destructured_ref_hook_no_false_positive, spliced_hook_locals_are_not_shown_with_rename_salt}`
+  + `ir::splice::tests::*`)* *(WA 1 partiel, 3, 4 / ARCH 1)*
 - **`StateValue` single-active-slot guards re-enumerate 8 slots by hand** (`domains/impls/state_value.rs`,
   `domains/transfer/state_value.rs`, ×7). Adding a new kind slot silently leaves 7 predicates
   wrong → FN. Fix: a `populated_kinds()`/mask method so a new slot is a compile-time concern.
@@ -64,7 +71,7 @@ suite green at 753). Kept here as a record.
 
 - **`missing-deps` on intentionally-omitted unstable callbacks** — mount-only / trigger-keyed effects that call a local `useCallback` fn and deliberately omit it (excalidraw `useTTDChatStorage`: `loadChats` in `[]` effect, `saveCurrentChat` in an effect keyed on `chatHistory.messages?.length` — author eslint-disabled both). The finding is *correct* by exhaustive-deps semantics, but suppressing unstable fns entirely would be an FN (unstable omitted = the stale-closure risk; stable is what's safe to omit). Grade down to advice instead when: (a) an `eslint-disable-next-line react-hooks/exhaustive-deps` covers the deps array (explicit author intent), or (b) the effect's declared deps are derived keys of the same values the omitted callback captures (`chatHistory.messages?.length` covers captured `chatHistory` → the executed closure is never staler than the last deps change), or (c) *split-effect idiom*: the omitted dep is separately synced by a dedicated sibling effect keyed exactly on it (excalidraw `CodeMirrorEditor`: editor created in a `[]` effect reading `theme`/`value` at init, each re-applied by its own `[theme]` / `[value]` effect via compartment reconfigure — author eslint-disabled).
 
-- **Inlined-hook return-object destructuring rebinds same-named vars** — `expand_custom_hooks` splices the hook body into the component CFG in one flat namespace (no α-renaming). `const { data } = useRenderer()` re-binds `data` *after* the hook's internal `Let data = HookMarker(…)`, so `env_exit.lookup("data")` returns the destructured `FieldAccess` on the fresh return ObjectLit (⊤) instead of the ref's value → `missing-deps` validates the hook's *internal* callback captures against the component's degraded re-binding (excalidraw `useMermaidRenderer`: useRef `data` passed whole to `convertMermaidToExcalidraw` in a useCallback, deps complete → FP). Renaming the destructured binding (`{ data: d }`) silences it — the collision, not the capture, is the trigger. Fix: α-rename hook-internal vars at splice time, or resolve field reads on the inlined return object per slot. Related: `HookMarker → StateValue::undefined()` also drops the `UseRef` model's Stable-*reference* fact (benign for `missing-deps` — undef reads Stable — but identity-blind for reference-based reasoning).
+- **Inlined-hook return-object destructuring rebinds same-named vars — RÉSOLU (Thème 1, 2026-07).** The splice now binds the hook's return to the caller variable AND α-renames the hook's internal locals (`data` → `data#salt`), so `const { data } = useRenderer()` no longer collides with the hook's internal `data` and resolves to the ref value. *(regression: `tests/custom_hook_inlining.rs::destructured_ref_hook_no_false_positive`.)* Residual (unchanged): `HookMarker → StateValue::undefined()` still drops the `UseRef` model's Stable-*reference* fact (benign for `missing-deps` — undef reads Stable — but identity-blind for reference-based reasoning).
 
 - **Opaque module-const initializers stay ⊤** — `const X = f()` at module scope: identity is stable (evaluated once per module) but the *kind* is unknown, and the product domain has no encoding for "unknown kind, constant across renders" (a wide primitive slot reads as per-render motion). Only primitive literals (exact value) and reference literals (object/array/new/regexp/JSX → `Stable` reference) are seeded; everything else falls back to ⊤ noise.
 

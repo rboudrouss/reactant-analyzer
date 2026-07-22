@@ -7,6 +7,7 @@ pub mod hook_ir;
 pub mod hooks;
 pub mod remap;
 pub mod source_range;
+pub mod splice;
 pub mod stmt;
 pub mod types;
 
@@ -19,6 +20,10 @@ pub use hooks::HookEntry;
 pub use remap::{remap_cfg, remap_expr, remap_hooks};
 pub use source_range::{
     FileId, FileTable, SourceMap, SourceRange, compute_line_starts, offset_to_range,
+};
+pub use splice::{
+    Splice, callee_rename_map, rename_hook_entry, rename_vars_cfg, source_name,
+    splice_callee_into_cfg, subst_vars_expr,
 };
 pub use stmt::Stmt;
 pub use types::{BlockId, HookLabel, Symbol, Var};

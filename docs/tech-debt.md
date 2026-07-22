@@ -330,6 +330,39 @@ dorsale), **4** (recompute_memo), **7** (LogicalOp — dominateurs faits), **8**
 
 ---
 
+## Partie 8 — Thème 1 : splice de CFG unifié + α-renommage — APPLIQUÉ (2026-07)
+
+L'épine dorsale. Il existait **deux** implémentations de « greffer un CFG appelé dans
+l'appelant » : le chemin utilitaire (`splice_one_call`) correct, et le chemin hook
+(`expand_custom_hooks`) qui ne concaténait que le **bloc d'entrée** du corps — les autres
+blocs/arêtes/`Return` étaient jetés (FN sur tout corps de hook multi-bloc) et sans
+α-renommage (FP `useMermaidRenderer`).
+
+**Fix** : un seul primitif `splice_callee_into_cfg` dans `ir/splice.rs` (blocs frais, bloc de
+join, arêtes préservées, `Return`→bind+jump, α-renommage capture-aware des variables liées de
+l'appelé → `name#salt`). Les **deux** chemins y passent (`Splice { callee, params, args,
+bound_var, rename }`). Détails :
+- **α-renommage** : `callee_rename_map` (params + cibles de `let`) ; appliqué au corps ET à
+  chaque sous-hook (`rename_hook_entry`) pour que les captures d'effets/memos restent liées au
+  binding renommé. `ir::source_name` retire le suffixe `#salt` à l'affichage (state_slot_name,
+  `AccessPath::Display`, witness, setter-in-render) — jamais visible par l'utilisateur.
+- **`subst_vars`** (perte silencieuse via `_ => _`) remplacé par `subst_vars_expr` exhaustif
+  (corrige en prime un FN latent : param dans `useState({x: param})` / `useState(() => param)`).
+- **Salt monotone** par composant (`splice_salt`) partagé entre splices utilitaire et hook.
+
+**Non fait — délibérément** : suppression de `resolve_setter_aliases`/`all_setter_labels` des
+règles (le tech-debt l'espérait). Ces helpers chassent AUSSI des alias **écrits par
+l'utilisateur** (`const s1 = setX; const s2 = s1`) et tournent sur le render CFG directement ;
+les retirer réintroduirait des FN (interdits). Le splice cesse d'*émettre* des alias de
+param, donc ils deviennent des no-ops sur ce cas — mais restent nécessaires et corrects.
+Absorbe WA 1 (partiel), 3, 4 ; ARCH 1. **763 tests**, clippy inchangé (23), fmt clean.
+
+Restent : **4** (recompute_memo), **7** (LogicalOp), **8** (churn), **9** (lattices/to_stability),
+**12** (détecteurs/`Expr::Opaque`). NB : WA 14 (`resolve_setter_aliases` par règle) et R3/R7
+d'Annexe C **ne sont PAS** absorbés — voir ci-dessus (alias utilisateur = FN si retirés).
+
+---
+
 ## Annexe A — 18 workarounds
 
 `P2 = ⚠️` : justification > 1 paragraphe (viole le principe 2).
@@ -338,8 +371,8 @@ dorsale), **4** (recompute_memo), **7** (LogicalOp — dominateurs faits), **8**
 |---|----------|-----|------------|-------------|---------------|
 | 1 | high | — | Template-literal interpolations are dropped at lowering -> silent read FN | `lowering/expr_lower.rs:36` | lowering |
 | 2 | high | — | `all_setter_labels` recipe reimplemented per rule instead of shared | `rules/frozen_initial_state.rs:160` | rule |
-| 3 | med | — | Custom-hook expansion grafts only the hook body's ENTRY block, dropping all other blocks | `engine/fixpoint.rs:702` | lowering |
-| 4 | med | — | subst_vars does ad-hoc partial Expr traversal for hook-param substitution | `engine/fixpoint.rs:761` | engine |
+| 3 | ✅ fait | Custom-hook expansion grafts only the hook body's ENTRY block, dropping all other blocks (Thème 1 : splice le corps entier via `splice_callee_into_cfg`) | `engine/fixpoint.rs`, `ir/splice.rs` | lowering |
+| 4 | ✅ fait | subst_vars does ad-hoc partial Expr traversal for hook-param substitution (remplacé par `subst_vars_expr` exhaustif, Thème 1) | `ir/splice.rs` | engine |
 | 5 | med | — | Summary-registry hook handled by dropping the HookEntry and string-patching the CFG binding | `engine/fixpoint.rs:639` | domain |
 | 6 | med | ⚠️ | Rule reconstructs short-circuit boolean lowering by scanning CFG blocks | `rules/infinite_loop.rs:985` | lowering |
 | 7 | med | — | converges_once_written re-implements dominator/guard-context analysis inside the rule | `rules/infinite_loop.rs:910` | engine |
@@ -349,7 +382,7 @@ dorsale), **4** (recompute_memo), **7** (LogicalOp — dominateurs faits), **8**
 | 11 | med | ⚠️ | Interval narrowing assumes integer steps (v±1), unsound for float states | `domains/impls/interval.rs:162` | domain |
 | 12 | med | — | may_written_slots reimplements a domain 'slot-ever-written' fact syntactically at the rule layer | `rules/stale_closure.rs:345` | domain |
 | 13 | med | — | `eval_with_heap` is a near-clone of `eval_in_exit_env` | `rules/frozen_initial_state.rs:585` | rule |
-| 14 | med | — | Per-rule resolve_setter_aliases to undo un-renamed inlining aliases | `rules/churn_graph.rs:114` | lowering |
+| 14 | requalifié | Per-rule `resolve_setter_aliases` — **plus** un artefact d'inlining depuis Thème 1 (le splice α-renomme, n'émet plus d'alias de param). Reste nécessaire pour les alias **écrits par l'utilisateur** (`const s1 = setX; s2 = s1`) sur le render CFG → le retirer = FN. N'est donc plus de la dette « inlining ». | `rules/churn_graph.rs`, `rules/mod.rs` | rule |
 | 15 | low | — | Hard 100-iteration cap force-widens all labels as a termination backstop | `engine/fixpoint.rs:388` | engine |
 | 16 | low | — | Engine fabricates a synthetic Stmt::ExprStmt to run a Return terminator's side effects | `engine/cfg_analyzer.rs:82` | engine |
 | 17 | low | — | extract_arrow_hook_name is a no-op stub that dead-codes its caller branch | `lowering/hook_detector.rs:125` | lowering |
@@ -359,7 +392,7 @@ dorsale), **4** (recompute_memo), **7** (LogicalOp — dominateurs faits), **8**
 
 | # | Effort | Finding | Fichiers principaux |
 |---|--------|---------|---------------------|
-| 1 | L | Two divergent, duplicated implementations of “splice a callee CFG into a caller CFG” | `engine/fixpoint.rs`, `ir/remap.rs` |
+| 1 | ✅ fait | Two divergent, duplicated implementations of “splice a callee CFG into a caller CFG” (Thème 1 : primitif unique `ir/splice.rs` routé par les deux chemins ; α-renommage ajouté) | `engine/fixpoint.rs`, `ir/splice.rs` |
 | 2 | L | Self-churn arm and the churn graph are two parallel implementations of the same analysis | `rules/infinite_loop.rs`, `rules/churn_graph.rs` |
 | 3 | L | Rules reason through the lossy legacy Stability lattice via to_stability instead of querying the product domain | `domains/impls/state_value.rs`, `rules/missing_deps.rs`, `rules/unnecessary_rerender.rs` |
 | 4 | L | Every rule reconstructs the same per-component name/slot resolution context | `rules/stale_closure.rs`, `rules/missing_deps.rs`, `rules/frozen_initial_state.rs` |
