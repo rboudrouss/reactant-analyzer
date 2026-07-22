@@ -614,6 +614,24 @@ introduire de FN pour dédupliquer.
 
 ---
 
+## Partie 14 — Cruft IR : `TSType` mort + naming des temps — (2026-07)
+
+- **ARCH 20 — payload `TSType` retiré (FAIT).** `Expr::TSAnnotated(Box<Expr>, TSType)` portait un
+  enum `{Number,Boolean,Str,Reference,Unknown}` produit par `lower_ts_type`, traversé par tous les
+  visiteurs, mais **jamais inspecté** (tous les lecteurs regardent à travers via `_` ; seul match
+  sur variante = un test). Câbler pour narrower `useState<number>` serait **unsound** (types TS
+  effacés à l'exécution : `useState<number>()` peut porter `undefined`, un `as any` un objet →
+  traiter comme primitif stable rate l'instabilité de référence = FN). Retiré ; `TSAnnotated(Box<Expr>)`
+  reste un marqueur pour que `peel_ts` voie à travers. Neutre, 767 tests.
+- **ARCH 34 — naming offset des temps de destructuration : NON-PROBLÈME (refusé).** `__arr_{offset}`/
+  `__obj_{offset}` : offset unique par position (collision-free intra-fichier), déterministe,
+  α-renommé post-splice (Thème 1). L'offset n'est **jamais parsé** (la clé `state_temps` est la
+  string entière) et le préfixe `__arr_`/`__obj_` est **load-bearing** (hook_extractor matche
+  `starts_with("__arr_")` pour résoudre la destructuration useState). Passer à `fresh_temp` devrait
+  de toute façon garder le préfixe → renommage sans bénéfice sur le pipeline lowering→extraction.
+
+---
+
 ## Annexe A — 18 workarounds
 
 `P2 = ⚠️` : justification > 1 paragraphe (viole le principe 2).
@@ -662,7 +680,7 @@ introduire de FN pour dédupliquer.
 | 17 | M | ProgramAnalysisResult test fixtures reimplemented in every rule module | `rules/always_unstable_deps.rs`, `rules/unnecessary_rerender.rs`, `rules/setter_in_render.rs` |
 | 18 | ✅ fait | churn_graph and infinite_loop form a bidirectional module dependency (Thème 8 : vocabulaire partagé hissé dans `rules/churn.rs` ; deux arêtes unidirectionnelles) | `rules/churn.rs`, `rules/churn_graph.rs`, `rules/infinite_loop.rs` |
 | 19 | M | Pure Expr walkers hand-roll exhaustive matches instead of delegating to the canonical for_each_child | `ir/free_vars.rs`, `ir/expr.rs`, `ir/cfg.rs` |
-| 20 | M | TypeScript annotation payload is threaded through the whole IR but consumed by nobody | `ir/expr.rs`, `ir/remap.rs`, `lowering/expr_lower.rs` |
+| 20 | ✅ fait | TypeScript annotation payload threaded through the IR but consumed by nobody — **retiré** (Partie 14) : `TSAnnotated(Box<Expr>, TSType)` → `TSAnnotated(Box<Expr>)`, enum `TSType` + `lower_ts_type` supprimés. Câbler = unsound (types TS effaçables → narrowing rate l'instabilité de référence = FN). | `ir/expr.rs`, `lowering/expr_lower.rs` |
 | 21 | ✅ fait | Entire cross-domain-query + product-transfer framework is dead speculative generality | `domains/query.rs`, `domains/product.rs`, `domains/mod.rs` |
 | 22 | M | exec_stmt_core duplicates Let/Assign/MemberWrite RHS handling, with a divergence that can drop setter aliases | `domains/interp/interpreter.rs` |
 | 23 | ✅ partiel | Two unrelated 'registry' concepts share one module; one is dead (cluster mort supprimé ; reste : renommer le module en `summaries`) | `registry/mod.rs`, `registry/summary.rs` |
@@ -676,7 +694,7 @@ introduire de FN pour dédupliquer.
 | 31 | S | `hook_kind_word` duplicated byte-for-byte in two rule files | `rules/missing_deps.rs`, `rules/always_unstable_deps.rs` |
 | 32 | S | guard_site returns a BlockId its only caller discards | `rules/conditional_hook.rs` |
 | 33 | S | compute_free_vars is a full second CFG traversal duplicating compute_free_paths | `ir/free_vars.rs` |
-| 34 | S | Destructuring temps use span offsets as identifiers while every other temp uses the fresh_temp counter | `lowering/cfg_builder.rs` |
+| 34 | ❌ refusé | Destructuring temps use span offsets (`__arr_{offset}`/`__obj_{offset}`) not the fresh_temp counter — **non-problème** (Partie 14) : offset unique par position (collision-free intra-fichier), déterministe, et α-renommé post-splice ; l'offset n'est **jamais parsé** (clé = string complète) ; le préfixe `__arr_`/`__obj_` est load-bearing (hook_extractor `starts_with`). Un swap counter devrait garder le préfixe → churn zéro-bénéfice sur le pipeline central. | `lowering/cfg_builder.rs` |
 | 35 | ✅ fait | Two competing custom-hook recursion guards; one is wired, one is dead (moitié morte supprimée de `InterCtx`) | `domains/context.rs`, `engine/fixpoint.rs` |
 | 36 | ✅ fait | Le CLI livré câble désormais `new_with_common()` (TanStack/React-Router = ⊤ mais *connus* → plus de bruit `unknown-hook`). `Config::default()` reste vide pour les tests unitaires | `cli/check.rs`, `registry/summary.rs`, `engine/fixpoint.rs` |
 
