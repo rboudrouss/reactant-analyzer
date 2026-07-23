@@ -632,6 +632,36 @@ introduire de FN pour dédupliquer.
 
 ---
 
+## Partie 15 — Balayage des quick-wins marginaux (Annexe C restante) — (2026-07)
+
+Revue des items C1/C2/C3 non encore clos. La grande majorité était **déjà faite** en vagues
+antérieures (confirmé par grep) :
+
+- **DÉJÀ FAIT** : E2/E3 (les walkers de `root_detector`/`symbol_graph`/`free_vars` délèguent déjà
+  à `for_each_child`/`for_each_expr` — le `_ => {}` extrait des cas puis la descente exhaustive
+  suit, pas de variante avalée) ; R1 `peel` (aucune fn locale ; `Expr::peel_ts` partout) ; R5
+  `hook_kind_word` (les 2 sites appellent `super::hook_kind_word`) ; D1 `alloc_fn` (les sites
+  d'alloc appellent `Heap::alloc_fn` ; les `HeapValue::Fn {..}` restants sont des **lectures**) ;
+  R4 `body_cfg` (accesseur `HookEntry::body_cfg()` présent + utilisé là où il suffit ; les
+  hand-matches restants extraient AUSSI `label`/`deps`/`span`/`params` que l'accesseur ne donne
+  pas → non réductibles) ; C4-C1 `display_relative` (partagé).
+
+- **FAIT ici — D4 (`KindMask`)** : voir la ligne D4 de l'Annexe C. Seul item restant à vraie
+  valeur — enjeu soundness (FN latent si un slot de kind est ajouté). Neutre, 767 tests.
+
+- **Laissés (vrais marginaux, P2)** : R8 `slot_namer` (8 closures 1-ligne `|l| state_slot_name(l,
+  &labels)` → une factory `impl Fn` ; gain nul, ajoute une indirection) ; D8 peel/recurse dans
+  `transfer/state_value` (la récursion `TSAnnotated(inner) => f(inner)` gère déjà l'imbrication ;
+  pas de « peel » répété à extraire) ; R7 (transitoire) ; C4-C2 `severity_tag` (non-neutre — le
+  rendu humain garde sa couleur).
+
+- **Reste (moyen, PAS marginal)** : E1 `KeyedRegistry<V>` — les 3 registres
+  (`component`/`hook`/`function`, tous `HashMap<(PathBuf,Symbol),IR>` + ~12 méthodes recopiées)
+  → un générique + 3 alias fins (~180→~40 l, ARCH 12). Vrai gain mais effort M (pas un quick-win) ;
+  à traiter comme sujet dédié si voulu. E5 (préambule pipeline de lowering) idem, plus petit.
+
+---
+
 ## Annexe A — 18 workarounds
 
 `P2 = ⚠️` : justification > 1 paragraphe (viole le principe 2).
@@ -734,7 +764,7 @@ walkers sont donc « déléguer à l'helper déjà présent », coût ~0.
 | D1 🆕 bloc capture heap `FnLit` | 4 byte-identiques | `interp/interpreter:122/184/230`, `transfer/state_value:565` | `alloc_fn_capture(heap,id,params,body,env)` (ou `Heap::alloc_fn`) — `compute_free_vars`+`filter_map`+`HeapValue::Fn` verbatim, ~40 l | Thème 10 (précise) |
 | D2 arms `Let` vs `Assign` de `exec_stmt_core` | 2 quasi-clones | `interp/interpreter:115` / `:177` | `bind_rhs(var,rhs,env,ctx)` — bloc alias devient inconditionnel (**corrige le FN**) | Partie 2, ARCH 22, Thème 10 |
 | D3 ADR-017 « garder labels `Versioned`, kind→⊤ » | 3 | `transfer/state_value:73/525/108` | `StateValue::to_stability_preserving_labels()` | ARCH 8, Thème 4 |
-| D4 🆕 ⚠ garde « un seul slot actif » (chaîne `&&` sur 8 slots) | 7 (ré-énumérées à la main) | `impls/state_value:134/158/177/258`, `transfer/state_value:619/641/699` | `StateValue::populated_kinds()->KindMask` — **ajouter un slot de kind = 7 prédicats faux en silence (latent FN)** | 🆕 (Partie 2 Latents) |
+| D4 ⚠ garde « un seul slot actif » (chaîne `&&` sur 8 slots) — ✅ FAIT | 4 prédicats ré-énuméraient les 8 slots | `impls/state_value` : `is_bottom_value`/`as_setter`/`is_unstable_reference_only` + count `to_stability` | `KindMask` + `populated_kinds()` (destructuré sans `..` → ajouter un slot = **erreur compile**, plus de FN latent) ; `is_top_value` (saturation ⊤, question duale) destructuré aussi. Partie 15. | 🆕 (Partie 2 Latents) |
 | D5 lattice plat `AbstractDomain`+`PartialOrd` — ✅ FAIT | 2 types × 5 méthodes | `impls/bool_val` ≈ `impls/setter_val` (join/meet/widen/⊥/⊤) | macro `flat_lattice!` (Partie 12) | ARCH 11, Thème 9 |
 | D6 powerset borné à seuil — ❌ REFUSÉ | 2 | `impls/str_const` ≈ `impls/stability` (frag. `Versioned`) | 1 seul consommateur pur (StrConst) ; Stability trop riche → restructuration risquée (Partie 12) | ARCH 11, Thème 9 |
 | D7 boucles de store point-à-point — ✅ FAIT | trio join/widen/widen_to (3) + 13 get-or-default + 3 `leq` | `state_store:34/45/56`, `shared_state_store:42`, `abstract_env:110/162`, `heap:69` ; get-or-default ×13 ; `leq` via `partial_cmp` : `state_store:71`, `shared_state_store:52`, `abstract_env:196` | `merge_with(other,f)` (collapse le trio), `map_get_or(map,k,D::bottom)`, `leq_pointwise` dans `stores/mod` | 🆕 / Thème 9 |
