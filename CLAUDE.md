@@ -28,5 +28,6 @@ Analyseur statique React (niveau 3, interprétation abstraite) en Rust.
 ## Références
 
 - Décisions d'architecture : `docs/adr/`
-- TODO courant : `docs/TODO.md`
-- Dette technique (workarounds + architecture, chiffrés et séquencés) : `docs/tech-debt.md`
+- TODO courant (limites FN/FP connues) : `docs/TODO.md`
+- Campagne dette technique close : `docs/adr/ADR-020-tech-debt-cleanup-decisions.md`
+  (décisions de non-changement soundness — ne pas re-tenter les fixes qui y sont refusés)

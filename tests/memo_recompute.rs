@@ -1,4 +1,4 @@
-//! Regression tests for `Transfer::recompute_memo` (tech-debt Thème 4).
+//! Regression tests for `Transfer::recompute_memo` (ADR-020, Thème 4).
 //!
 //! `recompute_memo` used to evaluate every non-`StateVal` dep against a freshly
 //! fabricated *empty* store (`StateStore::bottom()`, `MemoStore::new()`), so a

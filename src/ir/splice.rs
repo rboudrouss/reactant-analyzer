@@ -1,5 +1,5 @@
 //! One CFG-splice primitive, shared by utility inlining and custom-hook
-//! expansion (tech-debt Thème 1). Grafting a callee's whole CFG into a caller
+//! expansion (ADR-020, Thème 1). Grafting a callee's whole CFG into a caller
 //! at a call site is subtle — fresh block ids, a join block for the post-call
 //! statements, edge maintenance, and rewriting `Return` into a jump that binds
 //! the result — and used to exist in two divergent copies. The hook copy only

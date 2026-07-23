@@ -40,10 +40,12 @@ suite green at 753). Kept here as a record.
   `tests/custom_hook_inlining.rs::{probe_multiblock_hook_setter_in_join_block_detected,
   destructured_ref_hook_no_false_positive, spliced_hook_locals_are_not_shown_with_rename_salt}`
   + `ir::splice::tests::*`)* *(WA 1 partiel, 3, 4 / ARCH 1)*
-- **`StateValue` single-active-slot guards re-enumerate 8 slots by hand** (`domains/impls/state_value.rs`,
-  `domains/transfer/state_value.rs`, ×7). Adding a new kind slot silently leaves 7 predicates
-  wrong → FN. Fix: a `populated_kinds()`/mask method so a new slot is a compile-time concern.
-  *(tech-debt Annexe C-D4)*
+- **`StateValue` single-active-slot guards re-enumerate 8 slots by hand — RÉSOLU (2026-07).**
+  `populated_kinds() -> KindMask` (`domains/impls/state_value.rs`) fait l'énumération une seule
+  fois, destructurée sans `..` : ajouter un slot de kind est désormais une **erreur de
+  compilation** là, plus un FN silencieux. `is_bottom_value`/`as_setter`/
+  `is_unstable_reference_only` + le count de `to_stability` en dérivent ; `is_top_value`
+  (saturation ⊤) destructuré aussi. *(ADR-020)*
 
 ## Known false negatives (FN)
 

@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn assign_propagates_setter_alias_like_let() {
-        // Regression (Wave-0, tech-debt ARCH 22 / C-D2): the `Assign` arm must
+        // Regression (Wave-0, ADR-020 ARCH 22 / C-D2): the `Assign` arm must
         // propagate a `Var`-aliased setter exactly as `Let` does. `let s1 = setX`
         // binds s1; `s2 = s1` (a reassignment → `Assign` with a `Var` rhs) must
         // carry the alias to s2. The two arms had drifted — `Assign` dropped the

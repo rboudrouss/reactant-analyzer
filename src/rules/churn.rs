@@ -1,4 +1,4 @@
-//! Shared churn-analysis vocabulary (tech-debt Thème 8).
+//! Shared churn-analysis vocabulary (ADR-020, Thème 8).
 //!
 //! `infinite-loop`'s self-churn arm (`check_object_churn`) and the multi-effect
 //! churn graph (`churn_graph`) both reason about "a setter storing a fresh

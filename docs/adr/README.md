@@ -20,3 +20,5 @@
 | [ADR-016](ADR-016-cli-projects-json.md) | CLI subcommands + JSON output + project-kind detection (Vite, tsconfig paths) | Accepted |
 | [ADR-017](ADR-017-versioned-stability.md) | Versioned reference stability — may/must change bounds, read-side state conversion, churn arm of infinite-loop | Accepted |
 | [ADR-018](ADR-018-effect-cycle-graph.md) | Multi-effect churn cycle graph (F5b) — qualified-slot graph, must/may edges, single-writer convergence kill | Accepted |
+| [ADR-019](ADR-019-witness-chain.md) | Typed witness chains — FileId, engine provenance, closed `Step` vocabulary, shared witness library | Implemented |
+| [ADR-020](ADR-020-tech-debt-cleanup-decisions.md) | Technical-debt cleanup — deliberate non-changes (soundness-preserving) | Accepted |
