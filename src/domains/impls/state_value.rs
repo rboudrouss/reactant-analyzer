@@ -43,7 +43,83 @@ pub struct StateValue {
     pub other: bool,
 }
 
+/// Bitset of which kind slots of a [`StateValue`] are non-⊥.
+///
+/// The product's kind enumeration lives in exactly one place —
+/// [`StateValue::populated_kinds`], whose destructuring has no `..`. Adding a
+/// kind field is therefore a compile error there, not a silent omission that
+/// would quietly break every "is this ⊥ / only a setter / how many kinds"
+/// predicate downstream (a latent false negative). Each such predicate derives
+/// from this mask instead of re-listing the eight slots.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct KindMask(u8);
+
+impl KindMask {
+    const NUM: u8 = 1 << 0;
+    const BOOL: u8 = 1 << 1;
+    const STR: u8 = 1 << 2;
+    const REF: u8 = 1 << 3;
+    const NULL: u8 = 1 << 4;
+    const UNDEF: u8 = 1 << 5;
+    const SETTER: u8 = 1 << 6;
+    const OTHER: u8 = 1 << 7;
+
+    fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+    /// Number of populated (non-⊥) kinds.
+    fn count(self) -> u32 {
+        self.0.count_ones()
+    }
+    /// Every populated kind is within `{bit}` (holds when nothing is populated).
+    fn only(self, bit: u8) -> bool {
+        self.0 & !bit == 0
+    }
+}
+
 impl StateValue {
+    /// Bitset of the non-⊥ kind slots — the single enumeration of the product's
+    /// kinds. The `is bottom` / `only setter` / `only reference` / `how many
+    /// kinds` predicates all read this instead of re-listing the slots.
+    fn populated_kinds(&self) -> KindMask {
+        let StateValue {
+            num,
+            boolean,
+            str,
+            reference,
+            null,
+            undef,
+            setter,
+            other,
+        } = self;
+        let mut m = 0u8;
+        if !num.is_bottom() {
+            m |= KindMask::NUM;
+        }
+        if *boolean != BoolVal::Bottom {
+            m |= KindMask::BOOL;
+        }
+        if *str != StrConst::Bottom {
+            m |= KindMask::STR;
+        }
+        if *reference != Stability::Bottom {
+            m |= KindMask::REF;
+        }
+        if *null {
+            m |= KindMask::NULL;
+        }
+        if *undef {
+            m |= KindMask::UNDEF;
+        }
+        if *setter != SetterVal::Bottom {
+            m |= KindMask::SETTER;
+        }
+        if *other {
+            m |= KindMask::OTHER;
+        }
+        KindMask(m)
+    }
+
     // ── Constructors (one per kind) ───────────────────────────────────────────
 
     pub fn number(i: Interval) -> Self {
@@ -133,38 +209,39 @@ impl StateValue {
 
     /// True when every slot is ⊥ (unreachable / not yet set).
     pub fn is_bottom_value(&self) -> bool {
-        self.num.is_bottom()
-            && self.boolean == BoolVal::Bottom
-            && self.str == StrConst::Bottom
-            && self.reference == Stability::Bottom
-            && !self.null
-            && !self.undef
-            && self.setter == SetterVal::Bottom
-            && !self.other
+        self.populated_kinds().is_empty()
     }
 
     /// True when every slot is ⊤ — any JS value, precision lost.
     pub fn is_top_value(&self) -> bool {
-        self.num.is_top()
-            && self.boolean == BoolVal::Top
-            && self.str == StrConst::Top
-            && self.reference == Stability::Unknown
-            && self.null
-            && self.undef
-            && self.setter == SetterVal::Top
-            && self.other
+        // Destructured (no `..`) so a new kind field forces this saturation
+        // check to be updated too. `is_top` is about ⊤-saturation, not
+        // ⊥-population, so it cannot reuse `populated_kinds`.
+        let StateValue {
+            num,
+            boolean,
+            str,
+            reference,
+            null,
+            undef,
+            setter,
+            other,
+        } = self;
+        num.is_top()
+            && *boolean == BoolVal::Top
+            && *str == StrConst::Top
+            && *reference == Stability::Unknown
+            && *null
+            && *undef
+            && *setter == SetterVal::Top
+            && *other
     }
 
     /// Exact setter identity, only when the value can be nothing else.
     pub fn as_setter(&self) -> Option<(&Symbol, &HookLabel)> {
-        if self.num.is_bottom()
-            && self.boolean == BoolVal::Bottom
-            && self.str == StrConst::Bottom
-            && self.reference == Stability::Bottom
-            && !self.null
-            && !self.undef
-            && !self.other
-        {
+        // Only the setter slot may be populated (`as_one` still yields `None`
+        // if the setter itself is ⊥/⊤).
+        if self.populated_kinds().only(KindMask::SETTER) {
             self.setter.as_one()
         } else {
             None
@@ -176,14 +253,7 @@ impl StateValue {
     /// `Versioned` (changes only at setter events) deliberately returns false
     /// (ADR-017).
     pub fn is_unstable_reference_only(&self) -> bool {
-        self.reference == Stability::PerRender
-            && self.num.is_bottom()
-            && self.boolean == BoolVal::Bottom
-            && self.str == StrConst::Bottom
-            && !self.null
-            && !self.undef
-            && self.setter == SetterVal::Bottom
-            && !self.other
+        self.reference == Stability::PerRender && self.populated_kinds().only(KindMask::REF)
     }
 
     /// Derive the best initial abstract value from a `useState(init)` expression.
@@ -256,14 +326,9 @@ impl StateValue {
         // transition between them (`useState<string>()` + `setX("data")` in
         // a handler → {undefined, "data"}). A cross-kind union is never
         // definitely stable.
-        let populated = usize::from(!self.num.is_bottom())
-            + usize::from(self.boolean != BoolVal::Bottom)
-            + usize::from(self.str != StrConst::Bottom)
-            + usize::from(self.reference != Stability::Bottom)
-            + usize::from(self.null)
-            + usize::from(self.undef)
-            + usize::from(self.setter != SetterVal::Bottom);
-        if populated >= 2 {
+        // `other` is already handled by the early return above, so it is ⊥ here
+        // and does not inflate the count.
+        if self.populated_kinds().count() >= 2 {
             acc = acc.join(&Stability::Unknown);
         }
         if in_motion {
