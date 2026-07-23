@@ -655,10 +655,17 @@ antérieures (confirmé par grep) :
   pas de « peel » répété à extraire) ; R7 (transitoire) ; C4-C2 `severity_tag` (non-neutre — le
   rendu humain garde sa couleur).
 
-- **Reste (moyen, PAS marginal)** : E1 `KeyedRegistry<V>` — les 3 registres
-  (`component`/`hook`/`function`, tous `HashMap<(PathBuf,Symbol),IR>` + ~12 méthodes recopiées)
-  → un générique + 3 alias fins (~180→~40 l, ARCH 12). Vrai gain mais effort M (pas un quick-win) ;
-  à traiter comme sujet dédié si voulu. E5 (préambule pipeline de lowering) idem, plus petit.
+- **FAIT ici — WA 10 (`for_each_child`)** : `collect_subscriptions_in_expr` avait un `_ => {}`
+  lossy (future variante + `NativeElem`/`CompApp` avalés → FN Thème 6). Descente déléguée au
+  visiteur exhaustif. Neutre sur la suite, durcit. (Ligne WA 10 Annexe A.)
+
+- **DÉJÀ FAIT (annexe périmée, confirmé)** : E1 `KeyedRegistry<V>` (ARCH 12) — les 3 registres
+  sont déjà des newtypes fins délégant à `KeyedRegistry<V>` ; WA 1 template-literals (chaîne
+  concat, lectures visibles) ; WA 9 SequenceExpression (opérandes antérieures en `ExprStmt`).
+  Ces 3 « open » de l'annexe étaient en réalité corrigés — annexe mise à jour.
+
+- **Reste (petit)** : E5 (préambule pipeline de lowering, `build_import_ctx`/`lower_body`) — 2
+  complets + 1 partiel ; dedup modeste, pas soundness. Non traité (marginal).
 
 ---
 
@@ -668,7 +675,7 @@ antérieures (confirmé par grep) :
 
 | # | Sévérité | P2? | Workaround | Emplacement | Couche du fix |
 |---|----------|-----|------------|-------------|---------------|
-| 1 | high | — | Template-literal interpolations are dropped at lowering -> silent read FN | `lowering/expr_lower.rs:36` | lowering |
+| 1 | ✅ fait | Template-literal interpolations dropped at lowering → silent read FN — **corrigé** : `TemplateLiteral` se lower en chaîne concat `"q0" + e0 + …` gardant les lectures de chaque `${e}` visibles | `lowering/expr_lower.rs` | lowering |
 | 2 | ✅ fait | `all_setter_labels` recipe reimplemented per rule instead of shared → helper unique dans `rules/mod.rs`, appelé par les 5 règles (Thème 5, Partie 11) | `rules/mod.rs` | rule |
 | 3 | ✅ fait | Custom-hook expansion grafts only the hook body's ENTRY block, dropping all other blocks (Thème 1 : splice le corps entier via `splice_callee_into_cfg`) | `engine/fixpoint.rs`, `ir/splice.rs` | lowering |
 | 4 | ✅ fait | subst_vars does ad-hoc partial Expr traversal for hook-param substitution (remplacé par `subst_vars_expr` exhaustif, Thème 1) | `ir/splice.rs` | engine |
@@ -676,8 +683,8 @@ antérieures (confirmé par grep) :
 | 6 | med | ⚠️ | Rule reconstructs short-circuit boolean lowering by scanning CFG blocks | `rules/infinite_loop.rs:985` | lowering |
 | 7 | med | — | converges_once_written re-implements dominator/guard-context analysis inside the rule | `rules/infinite_loop.rs:910` | engine |
 | 8 | ✅ fait | recompute_memo fabricates empty stores (Thème 4 : reçoit `&mut AnalysisCtx`, deps évaluées contre les vrais stores ; le raccourci `StateVal → Versioned` reste — projection mémo légitime, pas un workaround de store) | `domains/transfer/state_value.rs`, `engine/fixpoint.rs` | engine |
-| 9 | medium | — | SequenceExpression lowers only its last operand -> side effects in earlier operands lost | `lowering/expr_lower.rs:319` | lowering |
-| 10 | medium | — | collect_subscriptions_in_expr hand-rolls the central expr walk with a lossy catch-all | `lowering/hook_extractor.rs:46` | lowering |
+| 9 | ✅ fait | SequenceExpression lowered only its last operand → earlier side effects lost — **corrigé** : opérandes antérieures émises en `ExprStmt` (setter calls/writes tirés), dernier = valeur | `lowering/expr_lower.rs` | lowering |
+| 10 | ✅ fait | collect_subscriptions_in_expr hand-rolls the expr walk with a lossy `_ => {}` — **corrigé** : détection `addEventListener` gardée, descente déléguée à `Expr::for_each_child` (exhaustif ; atteint NativeElem/CompApp ; future variante = erreur compile) — Partie 15 | `lowering/hook_extractor.rs` | lowering |
 | 11 | med | ⚠️ | Interval narrowing assumes integer steps (v±1), unsound for float states | `domains/impls/interval.rs:162` | domain |
 | 12 | med | — | may_written_slots reimplements a domain 'slot-ever-written' fact syntactically at the rule layer | `rules/stale_closure.rs:345` | domain |
 | 13 | ✅ fait | `eval_with_heap` is a near-clone of `eval_in_exit_env` (Thème 10 : les deux délèguent à `ConvergedEval::eval_in`, seed heap explicite par-site — Partie 11) | `rules/mod.rs` | rule |
@@ -702,7 +709,7 @@ antérieures (confirmé par grep) :
 | 9 | ✅ fait | Stringly-typed IR sentinels duplicate an existing typed representation (Thème 12 : `__opaque`/`this` → `SummaryVal(Top)`) | `lowering/expr_lower.rs` |
 | 10 | M | Two divergent expr-traversal styles; no owned/mutating visitor for transforms | `lowering/hook_extractor.rs`, `ir/expr.rs` |
 | 11 | ✅ partiel | No reusable lattice combinators — **flat** pattern factorisé via `flat_lattice!` (BoolVal+SetterVal, D5, Partie 12). **Bounded-powerset (D6) refusé** : 1 seul consommateur pur (StrConst) ; Stability est un lattice plus riche → restructuration risquée d'un type soundness-critique. | `domains/impls/mod.rs`, `bool_val.rs`, `setter_val.rs` |
-| 12 | M | Three hand-rolled registries duplicate the same (PathBuf, Symbol) map + lookup logic | `engine/component_registry.rs`, `engine/hook_registry.rs`, `engine/function_registry.rs` |
+| 12 | ✅ fait | Three hand-rolled registries duplicate the same (PathBuf, Symbol) map + lookup — **déjà fait** : `KeyedRegistry<V>` dans `registry/keyed.rs` ; les 3 sont des newtypes fins `struct XRegistry(KeyedRegistry<XIR>)` délégant storage/lookup ; méthodes restantes = spécifiques (display_name, find_all_by_name) | `registry/keyed.rs`, `engine/*_registry.rs` |
 | 13 | M | IR tree-walking is re-implemented per consumer instead of a shared visitor | `engine/symbol_graph.rs`, `engine/root_detector.rs`, `ir/free_vars.rs` |
 | 14 | M | No `HookEntry::body_cfg()` accessor — Effect|Memo|Callback|Handler match arm duplicated everywhere | `ir/hooks.rs`, `rules/frozen_initial_state.rs`, `rules/stale_closure.rs` |
 | 15 | M | No shared 'evaluate expr against a component's converged stores' primitive | `rules/mod.rs`, `rules/infinite_loop.rs`, `rules/frozen_initial_state.rs` |
@@ -774,7 +781,7 @@ walkers sont donc « déléguer à l'helper déjà présent », coût ~0.
 
 | Id | Occ. | Sites | Cible de centralisation | Déjà ? |
 |----|------|-------|-------------------------|--------|
-| E1 3 registres `(PathBuf,Symbol)→IR` | 3 types ≈ 12 méthodes | `engine/component_registry`, `hook_registry`, `function_registry` (struct+`new`+`from`+`get`+`get_by_name`+`all_keys`+`all_names`+`len`) | `KeyedRegistry<V>` dans `registry/keyed.rs` ; 3 newtypes fins (~180→~40 l) | ARCH 12, Thème 11 |
+| E1 3 registres `(PathBuf,Symbol)→IR` — ✅ FAIT | 3 types ≈ 12 méthodes | `engine/component_registry`, `hook_registry`, `function_registry` | `KeyedRegistry<V>` (`registry/keyed.rs`) + 3 newtypes fins `struct XRegistry(KeyedRegistry<XIR>)` délégant | ARCH 12, Thème 11 |
 | E2 marche CFG ré-implémente `CFG::for_each_expr` | 6 | `ir/free_vars:45/86`, `engine/root_detector:80`, `engine/symbol_graph:252`, `engine/fixpoint:806`, `lowering/hook_extractor:174` | appeler `cfg.for_each_expr(&mut …)` (existe déjà) | ARCH 19, Thème 6 |
 | E3 récursion `Expr` ré-implémente `Expr::for_each_child` | 6 | `ir/free_vars:176/220`, `engine/symbol_graph:276`, `engine/root_detector:106`, `engine/fixpoint:829`, `ir/expr:210` (`is_call_free`) | déléguer le bras défaut à `for_each_child` ; ajouter `Expr::any_child` pour `is_call_free` | ARCH 19/13, Thème 6 |
 | E4 3 détecteurs : scaffolding + trio JSX + prédicat de nom — ✅ FAIT | `Candidate` ×3, dispatch ×3, nom ×3 | `component_detector`, `hook_detector`, `utility_detector` | `lowering/detector.rs` : 1 `detect_fns(program, classify, default)` + `FnItem` ; `Candidate`/`body_returns_jsx`/`is_hook_name` déjà partagés ; ExportDefault par-détecteur (neutre) — Partie 13 | ARCH 5, Thème 12 |
