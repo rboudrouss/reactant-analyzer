@@ -438,12 +438,14 @@ fn try_consume_hook_call(
 }
 
 fn hook_name_from_callee(fn_: &Expr) -> Option<String> {
+    // Shared predicate (`super::is_hook_name`): `use` + uppercase/digit. Keying
+    // on the looser `starts_with("use")` misclassified plain calls whose name
+    // merely begins with the letters "use" (`userKeys.userStats()`, `userId()`)
+    // as custom hooks → HookMarker in a ternary arm → spurious conditional-hook.
     match fn_ {
-        Expr::Var(name) if name.starts_with("use") && name.len() > 3 => Some(name.clone()),
+        Expr::Var(name) if super::is_hook_name(name) => Some(name.clone()),
         // React.useState / React.useEffect / etc.
-        Expr::FieldAccess { field, .. } if field.starts_with("use") && field.len() > 3 => {
-            Some(field.clone())
-        }
+        Expr::FieldAccess { field, .. } if super::is_hook_name(field) => Some(field.clone()),
         _ => None,
     }
 }
@@ -1091,6 +1093,29 @@ mod tests {
             hooks.iter().find(|h| matches!(h, HookEntry::Handler { .. })).unwrap(),
             HookEntry::Handler { event, .. } if event == "click"
         ));
+    }
+
+    #[test]
+    fn use_prefix_lowercase_is_not_a_hook() {
+        // `userStats`/`userKeys.userStats` merely BEGIN with the letters "use";
+        // React's rule is `use` + uppercase/digit, so these are plain calls, not
+        // hooks. Misclassifying them (old `starts_with("use") && len > 3`)
+        // planted a HookMarker inside a ternary arm → spurious conditional-hook.
+        let (_, hooks) = parse_and_extract(
+            "function F() {
+                const a = cond ? userStats(x) : userKeys.userStats(x);
+                return <div>{a}</div>;
+            }",
+        );
+        assert!(
+            !hooks.iter().any(|h| matches!(h, HookEntry::Custom { .. })),
+            "no `use`+lowercase call is a hook: {hooks:?}"
+        );
+
+        // Sanity: a real `use`+uppercase call IS still extracted as Custom.
+        let (_, hooks) =
+            parse_and_extract("function F() { const a = useThing(x); return <div>{a}</div>; }");
+        assert!(hooks.iter().any(|h| matches!(h, HookEntry::Custom { .. })));
     }
 
     #[test]
