@@ -49,67 +49,39 @@ fn collect_subscriptions_in_expr(
     out: &mut Vec<HookEntry>,
     next_label: &mut HookLabel,
 ) {
-    match expr {
-        Expr::Call { fn_, args } => {
-            if let Expr::FieldAccess { field, .. } = fn_.as_ref()
-                && field == "addEventListener"
-                && let (
-                    Some(Expr::Lit(Prim::String(event_name))),
-                    Some(Expr::FnLit { body_cfg, .. }),
-                ) = (args.first(), args.get(1))
-            {
-                let label = *next_label;
-                *next_label += 1;
-                out.push(HookEntry::Handler {
-                    label,
-                    event: event_name.clone(),
-                    body_cfg: (**body_cfg).clone(),
-                    span: stmt_span,
-                });
-                // Recurse into callee receiver and remaining args (skip arg[1] FnLit body).
-                collect_subscriptions_in_expr(fn_, stmt_span, out, next_label);
-                for arg in args.iter().skip(2) {
-                    collect_subscriptions_in_expr(arg, stmt_span, out, next_label);
-                }
-                return;
-            }
-            // Not an addEventListener match recurse into all sub-expressions.
-            collect_subscriptions_in_expr(fn_, stmt_span, out, next_label);
-            for arg in args {
-                collect_subscriptions_in_expr(arg, stmt_span, out, next_label);
-            }
-        }
-        Expr::FieldAccess { obj, .. } => {
-            collect_subscriptions_in_expr(obj, stmt_span, out, next_label);
-        }
-        Expr::BinOp { lhs, rhs, .. } => {
-            collect_subscriptions_in_expr(lhs, stmt_span, out, next_label);
-            collect_subscriptions_in_expr(rhs, stmt_span, out, next_label);
-        }
-        Expr::UnaryOp { arg, .. } => {
+    // `target.addEventListener("event", handlerFn)` in an effect body registers
+    // a subscription → emit a Handler. Recurse into the receiver and any extra
+    // args, but NOT arg[1] (the handler FnLit — extracted as the Handler's CFG).
+    if let Expr::Call { fn_, args } = expr
+        && let Expr::FieldAccess { field, .. } = fn_.as_ref()
+        && field == "addEventListener"
+        && let (Some(Expr::Lit(Prim::String(event_name))), Some(Expr::FnLit { body_cfg, .. })) =
+            (args.first(), args.get(1))
+    {
+        let label = *next_label;
+        *next_label += 1;
+        out.push(HookEntry::Handler {
+            label,
+            event: event_name.clone(),
+            body_cfg: (**body_cfg).clone(),
+            span: stmt_span,
+        });
+        collect_subscriptions_in_expr(fn_, stmt_span, out, next_label);
+        for arg in args.iter().skip(2) {
             collect_subscriptions_in_expr(arg, stmt_span, out, next_label);
         }
-        Expr::IndexAccess { arr, idx } => {
-            collect_subscriptions_in_expr(arr, stmt_span, out, next_label);
-            collect_subscriptions_in_expr(idx, stmt_span, out, next_label);
-        }
-        Expr::ArrayLit { elems, .. } => {
-            for e in elems {
-                collect_subscriptions_in_expr(e, stmt_span, out, next_label);
-            }
-        }
-        Expr::ObjectLit { fields, .. } => {
-            for (_, v) in fields {
-                collect_subscriptions_in_expr(v, stmt_span, out, next_label);
-            }
-        }
-        Expr::TSAnnotated(inner) => {
-            collect_subscriptions_in_expr(inner, stmt_span, out, next_label);
-        }
-        // FnLit, Lit, Var, StateVal, StateSetter, MemoVal, CallbackVal, CompApp,
-        // NativeElem: leaf or irrelevant in an effect body.
-        _ => {}
+        return;
     }
+    // Any other expression: descend structurally via the canonical exhaustive
+    // visitor. Delegating to `for_each_child` (instead of a hand-rolled match
+    // ending in `_ => {}`) means a new `Expr` variant is descended automatically
+    // rather than silently dropping a subscription nested inside it (Thème 6 FN);
+    // it also reaches `NativeElem`/`CompApp` args, which the old catch-all
+    // skipped. `for_each_child` does not cross `FnLit` bodies — correct, they are
+    // separate effect/handler scopes.
+    expr.for_each_child(&mut |child| {
+        collect_subscriptions_in_expr(child, stmt_span, out, next_label)
+    });
 }
 
 // ── Handler extraction ────────────────────────────────────────────────────────
