@@ -1,51 +1,10 @@
 # TODO — remaining analysis limits
 
-## Soundness fixes — Wave 0 (DONE, 2026-07)
-
-The four soundness FN defects below were **fixed** (each with its own regression test;
-suite green at 753). Kept here as a record.
-
-- **Template-literal interpolations** (`lowering/expr_lower.rs`) — `` `Count: ${n}` `` now
-  lowers to a string-concat chain over the quasis + interpolated expressions, so the reads
-  survive. `TaggedTemplateExpression` passes its interpolations as call args. *(regression:
-  `tests/missing_deps.rs::template_literal_interpolation_is_a_tracked_read`)*
-- **`SequenceExpression`** (`lowering/expr_lower.rs`) — every operand is lowered; non-last
-  operands are emitted as `ExprStmt` so their setter calls fire. *(regression:
-  `tests/narrowing.rs::sequence_expression_setter_side_effect_not_dropped`)*
-- **Interval narrowing on floats** (`domains/impls/interval.rs`) — `Interval` now carries an
-  `is_int` bit (proven-integer, propagated through arithmetic/joins). `<`/`>` narrow to the
-  bound itself over reals (keeps `x = 1.7` under `x < 2`) and tighten to `v∓1` only when
-  `is_int` — preserving ADR-014 threshold widening for integer counters. `PartialEq`/`PartialOrd`
-  compare bounds only. *(regression: `interval.rs::narrow_lt_float_keeps_boundary_value` +
-  `narrow_lt_integer_still_tightens`)*
-- **`Let`/`Assign` setter-alias divergence** (`domains/interp/interpreter.rs`) — both arms now
-  route through one `bind_rhs` helper, so `s2 = setX` (Assign) propagates the alias like
-  `let s = setX`. The rule layer was aligned too: `resolve_setter_aliases` chases `Assign`
-  aliases (not just `Let`), and `infinite-loop`'s intra path uses the alias-resolving
-  `all_setter_labels` instead of the raw syntactic map — fixing a related FN where a setter
-  called through an alias inside an effect was not attributed to its state slot. *(regression:
-  `cfg_analyzer.rs::assign_propagates_setter_alias_like_let` +
-  `tests/narrowing.rs::aliased_setter_in_effect_{let,assign}_is_tracked`)*
-
-### Latent (surface as FN when the code grows)
-
-- **Custom-hook graft keeps only the entry block — RÉSOLU (Thème 1, 2026-07).**
-  `expand_custom_hooks` now routes through the shared `splice_callee_into_cfg` primitive
-  (`ir/splice.rs`): the WHOLE hook body CFG (all blocks/edges) is spliced at the call site,
-  the return binds the caller variable, and callee-bound vars are α-renamed (`name#salt`,
-  capture-aware, stripped at display via `ir::source_name`). Fixed the multi-block FN and the
-  `useMermaidRenderer` FP; `subst_vars` (lossy `_ => _`) replaced by exhaustive
-  `subst_vars_expr`. Rule alias helpers (`resolve_setter_aliases`/`all_setter_labels`) kept
-  intact — they also chase *user-written* aliases, so removing them would be an FN. *(regression:
-  `tests/custom_hook_inlining.rs::{probe_multiblock_hook_setter_in_join_block_detected,
-  destructured_ref_hook_no_false_positive, spliced_hook_locals_are_not_shown_with_rename_salt}`
-  + `ir::splice::tests::*`)* *(WA 1 partiel, 3, 4 / ARCH 1)*
-- **`StateValue` single-active-slot guards re-enumerate 8 slots by hand — RÉSOLU (2026-07).**
-  `populated_kinds() -> KindMask` (`domains/impls/state_value.rs`) fait l'énumération une seule
-  fois, destructurée sans `..` : ajouter un slot de kind est désormais une **erreur de
-  compilation** là, plus un FN silencieux. `is_bottom_value`/`as_setter`/
-  `is_unstable_reference_only` + le count de `to_stability` en dérivent ; `is_top_value`
-  (saturation ⊤) destructuré aussi. *(ADR-020)*
+> Résolus déplacés hors de ce fichier : les fixes soundness Wave 0 (template
+> literals, SequenceExpression, interval float, parité Let/Assign) et les items
+> « latents » (greffe hook, énumération des slots de kind) sont faits — voir
+> l'historique git et [ADR-020](adr/ADR-020-tech-debt-cleanup-decisions.md).
+> Ce fichier ne liste que les limites **ouvertes**.
 
 ## Known false negatives (FN)
 
@@ -73,7 +32,7 @@ suite green at 753). Kept here as a record.
 
 - **`missing-deps` on intentionally-omitted unstable callbacks** — mount-only / trigger-keyed effects that call a local `useCallback` fn and deliberately omit it (excalidraw `useTTDChatStorage`: `loadChats` in `[]` effect, `saveCurrentChat` in an effect keyed on `chatHistory.messages?.length` — author eslint-disabled both). The finding is *correct* by exhaustive-deps semantics, but suppressing unstable fns entirely would be an FN (unstable omitted = the stale-closure risk; stable is what's safe to omit). Grade down to advice instead when: (a) an `eslint-disable-next-line react-hooks/exhaustive-deps` covers the deps array (explicit author intent), or (b) the effect's declared deps are derived keys of the same values the omitted callback captures (`chatHistory.messages?.length` covers captured `chatHistory` → the executed closure is never staler than the last deps change), or (c) *split-effect idiom*: the omitted dep is separately synced by a dedicated sibling effect keyed exactly on it (excalidraw `CodeMirrorEditor`: editor created in a `[]` effect reading `theme`/`value` at init, each re-applied by its own `[theme]` / `[value]` effect via compartment reconfigure — author eslint-disabled).
 
-- **Inlined-hook return-object destructuring rebinds same-named vars — RÉSOLU (Thème 1, 2026-07).** The splice now binds the hook's return to the caller variable AND α-renames the hook's internal locals (`data` → `data#salt`), so `const { data } = useRenderer()` no longer collides with the hook's internal `data` and resolves to the ref value. *(regression: `tests/custom_hook_inlining.rs::destructured_ref_hook_no_false_positive`.)* Residual (unchanged): `HookMarker → StateValue::undefined()` still drops the `UseRef` model's Stable-*reference* fact (benign for `missing-deps` — undef reads Stable — but identity-blind for reference-based reasoning).
+- **Inlined-hook ref returns are identity-blind** — `HookMarker → StateValue::undefined()` drops the `UseRef` model's Stable-*reference* fact: benign for `missing-deps` (undef reads Stable), but reference-based reasoning cannot use the identity. (The same-named-var rebind collision was resolved — Thème 1 / ADR-020.)
 
 - **Opaque module-const initializers stay ⊤** — `const X = f()` at module scope: identity is stable (evaluated once per module) but the *kind* is unknown, and the product domain has no encoding for "unknown kind, constant across renders" (a wide primitive slot reads as per-render motion). Only primitive literals (exact value) and reference literals (object/array/new/regexp/JSX → `Stable` reference) are seeded; everything else falls back to ⊤ noise.
 

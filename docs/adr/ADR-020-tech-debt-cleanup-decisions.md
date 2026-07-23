@@ -49,7 +49,7 @@ unsound refactors are not re-attempted: the duplication is the correct shape.
   lossy `_ => {}`).
 - **`KeyedRegistry<V>`** already backed the three registries as thin newtypes
   (ARCH 12); the interval-float, template-literal, sequence-expression and
-  `Let`/`Assign` FN fixes were already in place (see `docs/TODO.md` Wave 0).
+  `Let`/`Assign` FN fixes were already in place (Wave 0 — see git history).
 
 ## Decision — deliberate non-changes
 
