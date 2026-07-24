@@ -365,12 +365,6 @@ impl StateValue {
     pub fn is_stable(&self) -> bool {
         matches!(self.to_stability(), Stability::Stable)
     }
-
-    /// True if this value changes every render (always causes re-render).
-    /// `Versioned` values return false — they change only at setter events.
-    pub fn is_unstable(&self) -> bool {
-        matches!(self.to_stability(), Stability::PerRender)
-    }
 }
 
 // ── Debug — concise kind-union rendering (used in diagnostics via {:?}) ───────
@@ -729,15 +723,19 @@ mod tests {
 
     #[test]
     fn to_stability_wide_interval_is_unstable() {
-        assert!(
+        assert_eq!(
             StateValue::number(Interval {
                 lo: 0.0,
                 hi: 5.0,
                 is_int: true
             })
-            .is_unstable()
+            .to_stability(),
+            Stability::PerRender
         );
-        assert!(StateValue::reference(Stability::PerRender).is_unstable());
+        assert_eq!(
+            StateValue::reference(Stability::PerRender).to_stability(),
+            Stability::PerRender
+        );
     }
 
     #[test]
@@ -1079,7 +1077,7 @@ mod tests {
     #[test]
     fn component_setter_is_stable() {
         assert!(cs("Foo", 0).is_stable());
-        assert!(!cs("Foo", 0).is_unstable());
+        assert_ne!(cs("Foo", 0).to_stability(), Stability::PerRender);
         assert!(!cs("Foo", 0).is_unbounded());
         assert!(!cs("Foo", 0).is_bottom());
     }
@@ -1131,7 +1129,7 @@ mod tests {
     fn nullable_widened_number_is_unstable() {
         // {null ∪ number[0,+∞)} — a widened nullable counter changes every
         // render; motion-wins must report Unstable (this is what lets
-        // `all_deps_unstable` see through `useState(null)` counters).
+        // `all_deps_may_change` see through `useState(null)` counters).
         let v = StateValue::null().join(&StateValue::number(Interval {
             lo: 0.0,
             hi: f64::INFINITY,

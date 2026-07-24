@@ -16,11 +16,10 @@ use crate::{
 };
 
 use super::{
-    Diagnostic, EffectClass, Rule, Severity, Step, ValueClass, all_setter_labels,
-    churn::{eval_in_exit_env, on_all_paths},
-    collect_fn_bindings, collect_setter_calls_with_extra, memo_val_labels,
-    missing_deps::fn_lit_binding,
-    resolve_setter_aliases, state_slot_name, state_val_labels,
+    Certified, Diagnostic, EffectClass, MustResult, OnAllPaths, Rule, Severity, Step, ValueClass,
+    all_setter_labels, churn::eval_in_exit_env, collect_fn_bindings,
+    collect_setter_calls_with_extra, memo_val_labels, missing_deps::fn_lit_binding,
+    must_on_all_paths, resolve_setter_aliases, state_slot_name, state_val_labels,
 };
 
 /// Fires when a callback that **outlives the render** — handed to
@@ -451,6 +450,9 @@ fn resolve_root_slots(
 /// Best finding for one captured path within one effect.
 struct PathFinding {
     severity: Severity,
+    /// The must-reach proof backing the Error tier (`None` for Warning). Carried
+    /// through the per-path dedup so `Diagnostic::error` can mint from it.
+    proof: Option<Certified<OnAllPaths>>,
     registrar: String,
     reg_span: Option<SourceRange>,
     resolved_via: Option<String>,
@@ -611,18 +613,23 @@ impl Rule for StaleClosure {
                             .and_then(|c| setter_labels.get(&c.var).map(|l| (*l, c.span)))
                     };
 
-                    let must_reach = reg
-                        .block_id
-                        .is_some_and(|b| on_all_paths(body_cfg, &HashSet::from([b])));
-                    let severity = if reg.firing == Firing::Repeating
+                    // must-reach as a certified proof (the only path to Error).
+                    let reach_proof = reg.block_id.and_then(|b| {
+                        match must_on_all_paths(body_cfg, &HashSet::from([b])) {
+                            MustResult::All(c) => Some(c),
+                            _ => None,
+                        }
+                    });
+                    let is_error = reg.firing == Firing::Repeating
                         && mount_only
-                        && must_reach
-                        && self_write.is_some()
-                    {
+                        && reach_proof.is_some()
+                        && self_write.is_some();
+                    let severity = if is_error {
                         Severity::Error
                     } else {
                         Severity::Warning
                     };
+                    let proof = if is_error { reach_proof } else { None };
 
                     let rank = |s: Severity| match s {
                         Severity::Error => 2,
@@ -633,6 +640,7 @@ impl Rule for StaleClosure {
                         |s: Option<SourceRange>| s.map_or((u32::MAX, u32::MAX), |r| r.pos_key());
                     let candidate = PathFinding {
                         severity,
+                        proof,
                         registrar: reg.display.clone(),
                         reg_span: reg.span,
                         resolved_via: via.map(str::to_string),
@@ -680,10 +688,14 @@ impl Rule for StaleClosure {
                         reg = f.registrar,
                     ),
                 };
-                let mut d = Diagnostic::new("stale-closure", message)
-                    .with_severity(f.severity)
-                    .with_label(*eff_label)
-                    .with_var(path.clone());
+                let mut d = match (f.severity, f.proof) {
+                    (Severity::Error, Some(proof)) => {
+                        Diagnostic::error("stale-closure", proof, message)
+                    }
+                    _ => Diagnostic::warn("stale-closure", message),
+                }
+                .with_label(*eff_label)
+                .with_var(path.clone());
                 if let Some(r) = f.reg_span.or(*eff_span) {
                     d = d.with_range(r);
                 }

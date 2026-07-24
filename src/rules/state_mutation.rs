@@ -13,8 +13,8 @@ use crate::{
 };
 
 use super::{
-    Diagnostic, Rule, Severity, Step, ValueClass, all_setter_labels, state_slot_name,
-    state_val_labels,
+    Diagnostic, MustResult, Rule, Step, ValueClass, all_setter_labels, must_same_ref_mutation,
+    state_slot_name, state_val_labels,
 };
 
 /// Methods that mutate their receiver in place (Array, Map/Set, typed arrays).
@@ -455,9 +455,14 @@ impl Rule for StateMutation {
             }
             let mut mut_sites = by_label.remove(&label).unwrap_or_default();
             mut_sites.sort_by_key(|s| s.span.map(|r| r.pos_key()));
-            let same_trigger = mut_sites
-                .iter()
-                .any(|m| sets.iter().any(|s| s.container == m.container));
+            // same_trigger (mutation and set share a container) ⟹ certain Error;
+            // routed through the must-primitive so the proof is the only path there.
+            let mut_containers: HashSet<usize> = mut_sites.iter().map(|m| m.container).collect();
+            let set_containers: HashSet<usize> = sets.iter().map(|s| s.container).collect();
+            let proof = match must_same_ref_mutation(&mut_containers, &set_containers) {
+                MustResult::All(c) => Some(c),
+                _ => None,
+            };
             let slot = name_of(label);
             let setter_name = setter_label
                 .iter()
@@ -469,19 +474,15 @@ impl Rule for StateMutation {
                 .iter()
                 .find(|s| s.container == site.container)
                 .unwrap_or(&sets[0]);
-            let mut d = Diagnostic::new(
-                "state-mutation",
-                format!(
-                    "{slot} is mutated in place and `{setter_name}` is called with the same \
-                     reference — React compares with `Object.is`, sees no change, and skips \
-                     the re-render"
-                ),
-            )
-            .with_severity(if same_trigger {
-                Severity::Error
-            } else {
-                Severity::Warning
-            })
+            let message = format!(
+                "{slot} is mutated in place and `{setter_name}` is called with the same \
+                 reference — React compares with `Object.is`, sees no change, and skips \
+                 the re-render"
+            );
+            let mut d = match proof {
+                Some(proof) => Diagnostic::error("state-mutation", proof, message),
+                None => Diagnostic::warn("state-mutation", message),
+            }
             .with_label(label)
             .with_var(site.desc.clone());
             if let Some(r) = site.span {
@@ -517,7 +518,7 @@ impl Rule for StateMutation {
         prop_sites.sort_by_key(|s| s.span.map(|r| r.pos_key()));
         prop_sites.dedup_by_key(|s| s.span.map(|r| r.pos_key()));
         for site in prop_sites {
-            let mut d = Diagnostic::new(
+            let mut d = Diagnostic::warn(
                 "state-mutation",
                 format!(
                     "`{}` roots in this component's props — mutating it writes into an object \
@@ -525,7 +526,6 @@ impl Rule for StateMutation {
                     site.desc
                 ),
             )
-            .with_severity(Severity::Warning)
             .with_var(site.desc.clone());
             if let Some(r) = site.span {
                 d = d.with_range(r);

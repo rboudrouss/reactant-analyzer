@@ -239,7 +239,7 @@ fn check_setter_calls(
 
             if arg_val.is_stable() && current_val.is_stable() {
                 diags.push(
-                    Diagnostic::new(
+                    Diagnostic::warn(
                         "redundant-set-state",
                         format!(
                             "setState for hook {} called with a stable value \

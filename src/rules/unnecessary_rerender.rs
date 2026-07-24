@@ -169,7 +169,7 @@ impl Rule for UnnecessaryRerender {
                         )
                     };
                     let mut d =
-                        Diagnostic::new("unnecessary-rerender", message).with_label(state_label);
+                        Diagnostic::warn("unnecessary-rerender", message).with_label(state_label);
                     if let Some(r) = eff_span {
                         d = d.with_range(r);
                     }

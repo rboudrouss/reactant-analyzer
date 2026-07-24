@@ -1,69 +1,6 @@
-use crate::{
-    engine::{DominatorTree, ProgramAnalysisResult, compute_dominators},
-    ir::{
-        SourceRange,
-        cfg::{CFG, Terminator},
-        types::{BlockId, Symbol},
-    },
-};
+use crate::{engine::ProgramAnalysisResult, ir::types::Symbol};
 
-use super::{Diagnostic, Rule, Severity};
-
-/// `true` iff `to` is reachable from `from` by following CFG edges.
-fn reaches(cfg: &CFG, from: BlockId, to: BlockId) -> bool {
-    let mut seen = std::collections::HashSet::new();
-    let mut stack = vec![from];
-    while let Some(b) = stack.pop() {
-        if b == to {
-            return true;
-        }
-        if seen.insert(b) {
-            stack.extend(cfg.successors(b));
-        }
-    }
-    false
-}
-
-/// Site of the closest dominating `Branch` terminator that actually makes the
-/// hook call conditional: at least one of its successors never reaches the
-/// hook block. A dominating diamond that re-joins *before* the hook (e.g. the
-/// internal control flow of an inlined utility) dominates but skips nothing —
-/// it must not be blamed as the guard. Span: the branch's own span (where the
-/// condition is evaluated), falling back to the branch block's last statement.
-fn guard_site(cfg: &CFG, block: BlockId) -> Option<(BlockId, Option<SourceRange>)> {
-    let doms = compute_dominators(cfg);
-    let dominators = doms.get(&block)?;
-    // Closest = the dominating branch block with the largest dominator set
-    // (deepest in the dominator order).
-    dominators
-        .iter()
-        .filter(|&&d| {
-            d != block
-                && matches!(
-                    cfg.blocks.get(&d).map(|b| &b.term),
-                    Some(Terminator::Branch { .. })
-                )
-                && cfg.successors(d).iter().any(|&s| !reaches(cfg, s, block))
-        })
-        .max_by_key(|&&d| doms.get(&d).map_or(0, |s| s.len()))
-        .map(|&d| {
-            let guard = cfg.blocks.get(&d);
-            let span = guard
-                .and_then(|b| match &b.term {
-                    Terminator::Branch { span, .. } => *span,
-                    _ => None,
-                })
-                .or_else(|| {
-                    guard.and_then(|b| b.stmts.last()).and_then(|s| match s {
-                        crate::ir::stmt::Stmt::Let { span, .. } => *span,
-                        crate::ir::stmt::Stmt::ExprStmt(_, span) => *span,
-                        crate::ir::stmt::Stmt::Assign { span, .. } => *span,
-                        crate::ir::stmt::Stmt::MemberWrite { span, .. } => *span,
-                    })
-                });
-            (d, span)
-        })
-}
+use super::{Diagnostic, Rule, RuleCtx};
 
 /// Fires when a hook is called inside a conditional branch.
 ///
@@ -94,52 +31,17 @@ impl Rule for ConditionalHook {
     }
 
     fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
-        let result = &result.components[component];
-        let exits: Vec<_> = result
-            .render_cfg
-            .blocks
-            .values()
-            .filter(|b| matches!(b.term, Terminator::Return(_)))
-            .map(|b| b.id)
-            .collect();
-
-        // Dominators computed once (was recomputed per hook call × exit).
-        let domtree = DominatorTree::new(&result.render_cfg);
-
-        result
-            .hook_calls
-            .iter()
-            // Handlers are plain event callbacks, not hooks — conditional is legal.
-            .filter(|call| !matches!(call.kind, crate::engine::HookKind::Handler))
-            .filter(|call| {
-                // Conditional = doesn't dominate every exit.
-                exits
-                    .iter()
-                    .any(|&exit| !domtree.dominates(call.block_id, exit))
-            })
-            .map(|call| {
-                let mut d = Diagnostic::new(
+        let ctx = RuleCtx::new(result, component);
+        // The dominance ∀-exits check + guard witness live in the primitive; a
+        // conditional hook yields a `Certified`, the only path to `error()`.
+        ctx.hook_is_conditional()
+            .into_iter()
+            .map(|proof| {
+                Diagnostic::error(
                     "conditional-hook",
-                    "this hook is called conditionally (not on every render path)".to_string(),
+                    proof,
+                    "this hook is called conditionally (not on every render path)",
                 )
-                .with_severity(Severity::Error)
-                .with_label(call.label);
-                if let Some(r) = call.span {
-                    d = d.with_range(r);
-                }
-                // Witness (ADR-019): point at the guard that splits the paths.
-                if let Some((_, guard_span)) = guard_site(&result.render_cfg, call.block_id) {
-                    d = d.with_step(
-                        super::Step::Branch {
-                            desc: "a condition evaluated here — some render paths skip the hook"
-                                .to_string(),
-                        },
-                        None,
-                        guard_span,
-                        &super::witness::fallback_name,
-                    );
-                }
-                d
             })
             .collect()
     }

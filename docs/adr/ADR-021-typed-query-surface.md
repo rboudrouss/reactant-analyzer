@@ -1,7 +1,28 @@
 # ADR-021: Typed query surface — engine-certified severity, must/may/⊤ as types
 
-- **Status**: Accepted
+- **Status**: Accepted — implemented (one deferral, below)
 - **Date**: 2026-07-24
+
+> **Implementation status (2026-07-24).** Landed: the typed substrate
+> (`src/rules/query.rs` — `Certified` with a module-private ctor, `MustResult`,
+> `May`, `StabilityVerdict`, `Provenance`, `RuleCtx`, `RuleConfig`); the query
+> primitives (`stability_verdict`/`may_change`, `must_setter_on_all_paths`,
+> `must_on_all_paths`, `ExitDominance`/`must_dominates_all_exits`,
+> `hook_is_conditional`, and the mints `must_init_calls_setter`,
+> `must_same_ref_mutation`, `must_effect_cycle`, `must_frozen_seed`);
+> `Diagnostic::{error,warn,info}` with `error` the sole Error constructor
+> (requires a `Certified`) and `new`/`with_severity` made private — so
+> `Severity::Error` can no longer be attached to a `bool` from rule code. All 14
+> rules route their 8 Error sites through a `Certified` and their Warning/Info
+> through `warn`/`info`. The §5 false negative is fixed (`is_unstable` withdrawn,
+> `all_deps_may_change` re-keys the gate) and pinned by
+> `tests/effect_cycles.rs::top_prop_dep_does_not_silence_self_write_loop`.
+> **Deferred**: the `Rule` trait *signature* swap to `check(&RuleCtx)` (§4).
+> `RuleCtx` exists and is the anchor (rules build/consume it internally), but the
+> dispatcher and tests still pass `(&ProgramAnalysisResult, &Symbol)`; hoisting
+> `RuleCtx::new` to the caller is a mechanical follow-up across ~143 call sites.
+> Also deferred: `stability_verdict` reads the plain exit env (not yet the
+> memo-store refinement), matching the retained `is_stable` readers.
 
 ## Context
 
@@ -55,16 +76,24 @@ The must/may/⊤ distinction is encoded in types the compiler checks, so violati
 it is a build error — even for a first-party Rust rule.
 
 ```rust
-/// A MUST fact. Only `All` is Error-eligible; `Some` is a MAY (Warning).
-enum MustResult<T> { All(T), Some(T), None }
+/// A MUST verdict. `All` carries the certified token (the sole way to obtain a
+/// `Certified` for a single-verdict primitive); `Some`/`None` are MAY facts.
+enum MustResult<T> { All(Certified<T>), Some(T), None }
 
 /// A MAY fact. There is no path from `May<_>` to an Error.
 struct May<T>(T);
 
-/// Total stability classifier. `Unknown` (⊤) is a RETURNED variant, mapped to
-/// Warning — it cannot be forgotten like a missing `match` arm.
-enum StabilityVerdict { Stable, Versioned(Comp, HookLabel), PerRender, Unknown }
+/// Total stability classifier. `Unknown` (⊤) is a RETURNED variant folded to the
+/// may side — it cannot be forgotten like a missing `match` arm. `Versioned`
+/// carries the change-driving slots (empty = threshold-widened `VersionedTop`).
+enum StabilityVerdict { Stable, Versioned(BTreeSet<(Symbol, HookLabel)>), PerRender, Unknown }
 ```
+
+> **Implementation note.** `All` carries the `Certified` (not the ADR-draft's bare
+> `All(T)`): `must_*` single-verdict primitives and the `Vec<Certified<_>>`
+> primitives then share one minting story, and `Certified`'s constructor is
+> private to the `query` module so rule code cannot forge a token. This is the
+> only deviation from the draft §1 sketch.
 
 ⊤/uncertain folds to the **may** side *inside* each primitive, as a
 non-omittable returned variant. A ⊤ can therefore never be silently dropped.

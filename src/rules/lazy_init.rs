@@ -5,7 +5,7 @@ use crate::{
     ir::{expr::Expr, hooks::HookEntry, types::Symbol, types::Var},
 };
 
-use super::{Diagnostic, Rule, Severity, setter_var_labels};
+use super::{Diagnostic, MustResult, Rule, must_init_calls_setter, setter_var_labels};
 
 /// Fires when `useState(...)` is initialised with an expression that contains
 /// any function call (e.g. `useState(expensiveCompute())`, `useState(1 + f())`).
@@ -107,17 +107,23 @@ impl Rule for LazyInit {
                 continue;
             }
 
-            // #2: grade by what the call actually does.
-            let (severity, message) = match classify_init_effect(init, &setters) {
-                InitEffect::Setter => (
-                    Severity::Error,
-                    "this useState init calls a state setter — it runs a state write on \
-                     every render (the result is discarded after mount); move the call \
-                     into an effect or event handler"
-                        .to_string(),
-                ),
-                InitEffect::Effectful(name) => (
-                    Severity::Warning,
+            // #2: grade by what the call actually does. A setter init is the
+            // only Error tier — routed through the must-primitive that mints the
+            // proof; the rest stay Warning/Info (safe over-claims, no proof).
+            let mut d = match classify_init_effect(init, &setters) {
+                InitEffect::Setter => {
+                    let msg = "this useState init calls a state setter — it runs a state write on \
+                               every render (the result is discarded after mount); move the call \
+                               into an effect or event handler";
+                    match must_init_calls_setter(init, &setters) {
+                        MustResult::All(proof) => Diagnostic::error("lazy-init", proof, msg),
+                        // Detection matches classify's `Setter` branch, so this is
+                        // unreachable; fall back to Warning (still reported — no FN).
+                        _ => Diagnostic::warn("lazy-init", msg),
+                    }
+                }
+                InitEffect::Effectful(name) => Diagnostic::warn(
+                    "lazy-init",
                     format!(
                         "this useState init calls `{name}`, which has side effects, on every \
                          render — the result is only used on mount, so every later render \
@@ -125,25 +131,21 @@ impl Rule for LazyInit {
                          just wasted work); wrap as `useState(() => …)`"
                     ),
                 ),
-                InitEffect::PureCheap(name) => (
-                    Severity::Info,
+                InitEffect::PureCheap(name) => Diagnostic::info(
+                    "lazy-init",
                     format!(
                         "this useState init calls `{name}` on every render; the call is cheap \
                          and pure, so wrapping as `useState(() => …)` is optional"
                     ),
                 ),
-                InitEffect::Unknown => (
-                    Severity::Warning,
+                InitEffect::Unknown => Diagnostic::warn(
+                    "lazy-init",
                     "this useState is initialised by a direct function call \
                      the call runs on every render but the result is only used on mount; \
-                     wrap as `useState(() => …)` to defer it"
-                        .to_string(),
+                     wrap as `useState(() => …)` to defer it",
                 ),
-            };
-
-            let mut d = Diagnostic::new("lazy-init", message)
-                .with_severity(severity)
-                .with_label(*label);
+            }
+            .with_label(*label);
             if let Some(r) = span {
                 d = d.with_range(*r);
             }
@@ -198,8 +200,9 @@ fn classify_init_effect(init: &Expr, setters: &HashSet<Var>) -> InitEffect {
 }
 
 /// Collect the callee (`fn_`) of every `Call` syntactically present in `e`,
-/// descending into arguments and composites.
-fn collect_callees<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+/// descending into arguments and composites. Shared with
+/// [`super::query::must_init_calls_setter`] so the setter-detection cannot drift.
+pub(crate) fn collect_callees<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     match e {
         Expr::Call { fn_, args } => {
             out.push(fn_);
@@ -263,7 +266,7 @@ mod tests {
             hooks::HookEntry,
             types::ExprId,
         },
-        rules::Rule,
+        rules::{Rule, Severity},
     };
     use std::collections::HashMap;
     use std::sync::Arc;

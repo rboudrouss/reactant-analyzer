@@ -309,3 +309,29 @@ export function C() {
         "churn-graph arm must not fire on numeric cycles: {diags:?}"
     );
 }
+
+// ── ADR-021 §5 regression: a ⊤ dep must not silence a self-write loop ─────────
+
+#[test]
+fn top_prop_dep_does_not_silence_self_write_loop() {
+    // `data` is a prop → ⊤ (Unknown). The effect writes `n` unboundedly on
+    // every run. The retired gate keyed on `is_unstable` (PerRender-only), so a
+    // ⊤ dep read as "not changing", the effect was skipped, and the loop was
+    // never reported — the shipped false negative. `may_change` (⊤ → true) no
+    // longer un-gates it. Reverting the gate to `is_unstable` fails this test.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ data }: { data: unknown }) {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(n + 1);
+  }, [data]);
+  return <div>{n}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags.iter().any(|(rule, _, _)| rule == "infinite-loop"),
+        "expected an infinite-loop diagnostic for the ⊤-dep self-write loop, got: {diags:?}"
+    );
+}

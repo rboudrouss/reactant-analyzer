@@ -72,7 +72,7 @@ impl Rule for MissingDeps {
                         &mut HashSet::new(),
                     )
                 {
-                    let mut d = Diagnostic::new(
+                    let mut d = Diagnostic::warn(
                         "missing-deps",
                         format!(
                             "`{}` is used in this {} but not in its deps array, and {}",

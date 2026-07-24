@@ -9,6 +9,7 @@ pub mod frozen_initial_state;
 pub mod infinite_loop;
 pub mod lazy_init;
 pub mod missing_deps;
+pub mod query;
 pub mod redundant_set_state;
 pub mod setter_in_render;
 pub mod stale_closure;
@@ -26,6 +27,13 @@ pub use frozen_initial_state::FrozenInitialState;
 pub use infinite_loop::InfiniteLoop;
 pub use lazy_init::LazyInit;
 pub use missing_deps::MissingDeps;
+pub use query::{
+    Certified, ConditionalHookCall, DominatesAllExits, EffectCycleProof, ExitDominance, FrozenSeed,
+    InitSetterCall, May, MustResult, OnAllPaths, Provenance, RuleConfig, RuleCtx, SameRefMutation,
+    StabilityVerdict, may_change_of, must_dominates_all_exits, must_effect_cycle, must_frozen_seed,
+    must_init_calls_setter, must_on_all_paths, must_same_ref_mutation, must_setter_on_all_paths,
+    stability_verdict_of,
+};
 pub use redundant_set_state::RedundantSetState;
 pub use setter_in_render::SetterInRender;
 pub use stale_closure::StaleClosure;
@@ -148,7 +156,10 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
-    pub fn new(rule: &'static str, message: impl Into<String>) -> Self {
+    /// Private (ADR-021): the rule-facing constructors are [`Diagnostic::error`]
+    /// (needs a `Certified` proof), [`Diagnostic::warn`], and [`Diagnostic::info`].
+    /// A bare `Severity::Error` can no longer be attached to any `bool`.
+    fn new(rule: &'static str, message: impl Into<String>) -> Self {
         Diagnostic {
             severity: Severity::default(),
             rule,
@@ -160,7 +171,8 @@ impl Diagnostic {
         }
     }
 
-    pub fn with_severity(mut self, severity: Severity) -> Self {
+    /// Private (ADR-021): severity is set by construction via `error`/`warn`/`info`.
+    fn with_severity(mut self, severity: Severity) -> Self {
         self.severity = severity;
         self
     }
@@ -204,6 +216,41 @@ impl Diagnostic {
     pub fn with_notes(mut self, notes: Vec<Note>) -> Self {
         self.notes.extend(notes);
         self
+    }
+
+    /// The **only** constructor of an `Error` (ADR-021 §2). Builds the finding
+    /// *from* a proof: the certified evidence's span/label/witness ride along, so
+    /// they need not be re-threaded by hand. A `May<_>`/`MustResult::Some` value
+    /// has no `Certified` to pass here — Error-on-may is a type error.
+    ///
+    /// Further `.with_*` builders may still refine/override the absorbed fields.
+    pub fn error<E>(
+        rule: &'static str,
+        proof: query::Certified<E>,
+        message: impl Into<String>,
+    ) -> Self {
+        let prov = proof.provenance();
+        Diagnostic {
+            severity: Severity::Error,
+            rule,
+            message: message.into(),
+            hook_label: prov.hook_label,
+            var: None,
+            range: prov.range,
+            notes: prov.notes.clone(),
+        }
+    }
+
+    /// A Warning: a safe over-claim (conditional path / over-approximation). Free
+    /// to construct — a Warning asserts no MUST fact.
+    pub fn warn(rule: &'static str, message: impl Into<String>) -> Self {
+        Diagnostic::new(rule, message).with_severity(Severity::Warning)
+    }
+
+    /// An Info: a known analysis limitation. Makes no must/may claim; hidden
+    /// unless `--info`.
+    pub fn info(rule: &'static str, message: impl Into<String>) -> Self {
+        Diagnostic::new(rule, message).with_severity(Severity::Info)
     }
 }
 
@@ -763,17 +810,23 @@ impl ConvergedEval for AnalysisResult<StateValue> {
     }
 }
 
-/// `true` when every dep in `deps` is unstable in the render-exit env.
-/// Empty `deps` returns `false` (`[]` is mount-only, not all-unstable).
-pub(super) fn all_deps_unstable(deps: &[Expr], result: &AnalysisResult<StateValue>) -> bool {
+/// `true` when every dep in `deps` *may change* between renders — i.e. none is
+/// provably `Stable` — in the render-exit env. Empty `deps` returns `false`
+/// (`[]` is mount-only, not all-changing).
+///
+/// ADR-021 §5: this keys on [`query::may_change_of`] (⊤/`Versioned`/`PerRender`
+/// → may-change), not the withdrawn `is_unstable` (`PerRender`-only). The
+/// `infinite-loop` gate `!all_deps_may_change(..) → skip` therefore skips an
+/// effect only when a dep is *provably* stable; a ⊤/`Versioned` dep no longer
+/// masquerades as gating (the shipped false negative).
+pub(super) fn all_deps_may_change(deps: &[Expr], result: &AnalysisResult<StateValue>) -> bool {
     if deps.is_empty() {
         return false;
     }
     let exit_env = result.exit_env();
     deps.iter().all(|dep| {
-        result
-            .eval_in(&exit_env, dep, &mut Heap::new())
-            .is_unstable()
+        let val = result.eval_in(&exit_env, dep, &mut Heap::new());
+        query::may_change_of(&val).into_inner()
     })
 }
 

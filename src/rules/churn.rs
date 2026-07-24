@@ -110,7 +110,7 @@ pub(super) fn reference_part(written: &crate::domains::StateValue) -> crate::dom
 }
 
 /// Evaluate `expr` in the render exit environment (same pattern as
-/// `all_deps_unstable`).
+/// `all_deps_may_change`).
 pub(super) fn eval_in_exit_env(
     expr: &Expr,
     comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,

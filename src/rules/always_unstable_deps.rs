@@ -96,7 +96,7 @@ impl Rule for AlwaysUnstableDeps {
             }
 
             let word = super::hook_kind_word(kind);
-            let mut d = Diagnostic::new(
+            let mut d = Diagnostic::warn(
                 "always-unstable-deps",
                 format!(
                     "this {word} has unstable dep(s) at index {idx} \

@@ -1,9 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    engine::{DominatorTree, ProgramAnalysisResult},
+    engine::ProgramAnalysisResult,
     ir::{
-        cfg::Terminator,
         expr::Expr,
         stmt::Stmt,
         types::{BlockId, HookLabel, Symbol, Var},
@@ -12,7 +11,8 @@ use crate::{
 
 use super::churn::{converges_once_written, eval_in_exit_env};
 use super::{
-    Diagnostic, Rule, Severity, collect_setter_calls, resolve_setter_aliases, state_val_labels,
+    Diagnostic, ExitDominance, MustResult, Rule, collect_setter_calls, resolve_setter_aliases,
+    state_val_labels,
 };
 
 /// Fires when a state setter is called directly in the render body either a
@@ -92,38 +92,29 @@ impl Rule for SetterInRender {
             return vec![];
         }
 
-        let exits: Vec<BlockId> = comp_result
-            .render_cfg
-            .blocks
-            .values()
-            .filter(|b| matches!(b.term, Terminator::Return(_)))
-            .map(|b| b.id)
-            .collect();
-
         let state_vals = resolve_setter_aliases(
             &comp_result.render_cfg,
             &state_val_labels(&comp_result.render_cfg),
         );
 
-        // Dominators computed once for the whole render CFG (was recomputed per
-        // call × exit — quadratic). A call block dominating every exit ⟹ it runs
-        // unconditionally ⟹ Error; otherwise conditional ⟹ Warning.
-        let domtree = DominatorTree::new(&comp_result.render_cfg);
+        // Dominance over exits, built once (not per call × exit). A call block
+        // dominating every exit ⟹ it runs unconditionally ⟹ the certified Error;
+        // otherwise conditional ⟹ Warning.
+        let exit_dom = ExitDominance::of(&comp_result.render_cfg);
 
         collect_setter_calls(&comp_result.render_cfg, &all_setter_vars, 2)
             .into_iter()
             .filter_map(|call| {
-                let severity = match call.block_id {
-                    Some(bid) if exits.iter().all(|&e| domtree.dominates(bid, e)) => {
-                        Severity::Error
-                    }
-                    _ => Severity::Warning,
-                };
+                // Unconditional call ⟹ a `Certified` proof — the only path to Error.
+                let proof = call.block_id.and_then(|bid| match exit_dom.certify(bid) {
+                    MustResult::All(c) => Some(c),
+                    _ => None,
+                });
 
-                // Sanctioned adjust-during-render idiom: conditional local
-                // call whose guards die once the written value is in the
-                // slot — converges after one extra render, no diagnostic.
-                if severity == Severity::Warning
+                // Sanctioned adjust-during-render idiom: conditional local call
+                // whose guards die once the written value is in the slot —
+                // converges after one extra render, no diagnostic.
+                if proof.is_none()
                     && let Some(bid) = call.block_id
                     && let Some(&(label, _)) = local_setter_info.get(&call.var)
                     && let Some(arg) = setter_call_arg(&comp_result.render_cfg, bid, &call.var)
@@ -139,19 +130,25 @@ impl Rule for SetterInRender {
                     return None;
                 }
 
-                let mut d = if let Some(&(label, _)) = local_setter_info.get(&call.var) {
-                    Diagnostic::new(
+                // Rule name, message, and primary anchor (local label vs prop var).
+                let (rule_name, message, label, var): (
+                    &'static str,
+                    String,
+                    Option<HookLabel>,
+                    Option<Var>,
+                ) = if let Some(&(label, _)) = local_setter_info.get(&call.var) {
+                    (
                         "setter-in-render",
                         format!(
                             "setter `{}` called directly in the render body, \
                              move this call into a useEffect or an event handler",
                             crate::ir::source_name(&call.var)
                         ),
+                        Some(label),
+                        None,
                     )
-                    .with_severity(severity)
-                    .with_label(label)
                 } else if let Some((parent_comp, _parent_label)) = cs_vars.get(&call.var) {
-                    Diagnostic::new(
+                    (
                         "cross-setter-in-render",
                         format!(
                             "prop `{}` (a state setter of parent `{}`) called during render of `{}` \
@@ -160,20 +157,31 @@ impl Rule for SetterInRender {
                             parent_comp,
                             component
                         ),
+                        None,
+                        Some(call.var.clone()),
                     )
-                    .with_severity(severity)
-                    .with_var(call.var.clone())
                 } else {
-                    Diagnostic::new(
+                    (
                         "setter-in-render",
                         format!(
                             "setter `{}` called in the render body",
                             crate::ir::source_name(&call.var)
                         ),
+                        None,
+                        None,
                     )
-                    .with_severity(severity)
                 };
 
+                let mut d = match proof {
+                    Some(proof) => Diagnostic::error(rule_name, proof, message),
+                    None => Diagnostic::warn(rule_name, message),
+                };
+                if let Some(label) = label {
+                    d = d.with_label(label);
+                }
+                if let Some(var) = var {
+                    d = d.with_var(var);
+                }
                 if let Some(r) = call.span {
                     d = d.with_range(r);
                 }
@@ -225,7 +233,7 @@ mod tests {
             hooks::HookEntry,
             stmt::Stmt,
         },
-        rules::Rule,
+        rules::{Rule, Severity},
     };
     use std::collections::HashMap;
 

@@ -14,9 +14,9 @@ use crate::{
 };
 
 use super::{
-    Diagnostic, Rule, Severity, Step, ValueClass, all_setter_labels, collect_fn_bindings,
-    collect_setter_calls, collect_setter_calls_with_extra, local_bindings,
-    stale_closure::may_written_slots, state_slot_name, state_val_labels,
+    Diagnostic, MustResult, Rule, Severity, Step, ValueClass, all_setter_labels,
+    collect_fn_bindings, collect_setter_calls, collect_setter_calls_with_extra, local_bindings,
+    must_frozen_seed, stale_closure::may_written_slots, state_slot_name, state_val_labels,
 };
 
 /// Fires when a `useState` initializer reads a prop and nothing ever syncs
@@ -502,10 +502,28 @@ impl Rule for FrozenInitialState {
                 .or(unproven_path)
                 .unwrap_or_default();
 
-            let mut d = Diagnostic::new("frozen-initial-state", message)
-                .with_severity(severity)
-                .with_label(*label)
-                .with_var(primary_path.clone());
+            // The Error tier is minted only when the proven feeder survives the
+            // idiomatic downgrades; the primitive re-checks the same conditions,
+            // so `severity == Error` ⟹ `All`. Warning/Info are safe over-claims.
+            let mut d = if severity == Severity::Error {
+                match must_frozen_seed(
+                    proven.is_some(),
+                    escaped,
+                    all_seed_named,
+                    locally_written.contains(label),
+                ) {
+                    MustResult::All(proof) => {
+                        Diagnostic::error("frozen-initial-state", proof, message)
+                    }
+                    _ => Diagnostic::warn("frozen-initial-state", message),
+                }
+            } else if severity == Severity::Info {
+                Diagnostic::info("frozen-initial-state", message)
+            } else {
+                Diagnostic::warn("frozen-initial-state", message)
+            }
+            .with_label(*label)
+            .with_var(primary_path.clone());
             if let Some(r) = span {
                 d = d.with_range(*r);
             }

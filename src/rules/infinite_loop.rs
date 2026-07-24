@@ -13,11 +13,12 @@ use crate::{
 
 use super::churn::{
     ChurnSetterCall, Freshness, classify_effect_deps, collect_churn_calls, converges_once_written,
-    on_all_paths, reference_part,
+    reference_part,
 };
 use super::{
-    Diagnostic, Rule, Severity, all_deps_unstable, all_setter_labels, collect_fn_bindings,
-    collect_setter_calls, collect_setter_calls_with_extra, memo_val_labels, resolve_setter_aliases,
+    Certified, Diagnostic, MustResult, OnAllPaths, Rule, Severity, all_deps_may_change,
+    all_setter_labels, collect_fn_bindings, collect_setter_calls, collect_setter_calls_with_extra,
+    memo_val_labels, must_effect_cycle, must_on_all_paths, resolve_setter_aliases,
     setter_var_labels, state_slot_name, state_val_labels,
 };
 
@@ -93,9 +94,11 @@ impl Rule for InfiniteLoop {
             if matches!(deps, Some(d) if d.is_empty()) {
                 continue;
             }
-            // Non-empty deps with at least one stable value genuinely gate the effect.
+            // Non-empty deps with at least one *provably stable* value genuinely
+            // gate the effect. A ⊤/`Versioned` dep is NOT provably stable, so it
+            // no longer un-gates the check (ADR-021 §5 — the shipped FN).
             if let Some(dep_exprs) = deps
-                && !all_deps_unstable(dep_exprs, comp_result)
+                && !all_deps_may_change(dep_exprs, comp_result)
             {
                 continue;
             }
@@ -119,7 +122,7 @@ impl Rule for InfiniteLoop {
                     } else {
                         ""
                     };
-                    let mut diag = Diagnostic::new(
+                    let mut diag = Diagnostic::warn(
                         "infinite-loop",
                         format!(
                             "this effect keeps pushing state {}{} to new values \
@@ -191,7 +194,7 @@ impl Rule for InfiniteLoop {
                          parent re-renders → child re-renders → effect fires again: infinite loop",
                         call.var, parent_comp, deps_note
                     );
-                    let mut diag = Diagnostic::new("cross-component-infinite-loop", msg)
+                    let mut diag = Diagnostic::warn("cross-component-infinite-loop", msg)
                         .with_label(*eff_label);
 
                     if let Some(r) = comp_result.effect_info.get(eff_label).and_then(|i| i.span) {
@@ -261,13 +264,16 @@ fn check_multi_effect_cycles(
             }
 
             // Cross-component must-rerun is unprovable (prop deps are
-            // `Versioned`, never the exact slot) → Warning ceiling.
-            let (rule, sev) = if cycle.cross_component {
-                ("cross-component-infinite-loop", Severity::Warning)
-            } else if cycle.all_must {
-                ("infinite-loop", Severity::Error)
+            // `Versioned`, never the exact slot) → Warning ceiling. An all-must
+            // intra-component cycle mints the proof — the only path to Error.
+            let rule = if cycle.cross_component {
+                "cross-component-infinite-loop"
             } else {
-                ("infinite-loop", Severity::Warning)
+                "infinite-loop"
+            };
+            let cycle_proof = match must_effect_cycle(cycle.all_must, cycle.cross_component) {
+                MustResult::All(c) => Some(c),
+                _ => None,
             };
 
             let to_name = node_display(&e.to, component, result, &mut names);
@@ -297,9 +303,11 @@ fn check_multi_effect_cycles(
                 )
             };
 
-            let mut diag = Diagnostic::new(rule, msg)
-                .with_severity(sev)
-                .with_label(e.effect_label);
+            let mut diag = match cycle_proof {
+                Some(proof) => Diagnostic::error(rule, proof, msg),
+                None => Diagnostic::warn(rule, msg),
+            }
+            .with_label(e.effect_label);
             if let Some(r) = comp_result
                 .effect_info
                 .get(&e.effect_label)
@@ -437,7 +445,9 @@ fn check_object_churn(
         );
 
         // Strongest verdict per state label.
-        let mut best: HashMap<HookLabel, (Severity, Option<SourceRange>)> = HashMap::new();
+        // Best object-churn finding per slot: (severity, call span, Error proof).
+        type ChurnBest = (Severity, Option<SourceRange>, Option<Certified<OnAllPaths>>);
+        let mut best: HashMap<HookLabel, ChurnBest> = HashMap::new();
         for call in &calls {
             let state_label = call.node.1;
             if call.freshness == Freshness::Not {
@@ -466,32 +476,37 @@ fn check_object_churn(
             {
                 continue;
             }
-            let sev = if exact.contains(&state_label) || versioned.contains(&state_label) {
-                let fresh_blocks: HashSet<BlockId> = calls
-                    .iter()
-                    .filter(|c| c.node == call.node && c.freshness == Freshness::Fresh)
-                    .filter_map(|c| c.block_id)
-                    .collect();
-                if exact.contains(&state_label)
-                    && call.freshness == Freshness::Fresh
-                    && !fresh_blocks.is_empty()
-                    && on_all_paths(body_cfg, &fresh_blocks)
-                {
-                    Severity::Error
+            // The object-churn Error anchors on the fresh write being on all
+            // paths — routed through the must-primitive that mints the proof.
+            let (sev, churn_proof) =
+                if exact.contains(&state_label) || versioned.contains(&state_label) {
+                    let fresh_blocks: HashSet<BlockId> = calls
+                        .iter()
+                        .filter(|c| c.node == call.node && c.freshness == Freshness::Fresh)
+                        .filter_map(|c| c.block_id)
+                        .collect();
+                    if exact.contains(&state_label)
+                        && call.freshness == Freshness::Fresh
+                        && !fresh_blocks.is_empty()
+                    {
+                        match must_on_all_paths(body_cfg, &fresh_blocks) {
+                            MustResult::All(c) => (Severity::Error, Some(c)),
+                            _ => (Severity::Warning, None),
+                        }
+                    } else {
+                        (Severity::Warning, None)
+                    }
                 } else {
-                    Severity::Warning
-                }
-            } else {
-                // Sets a different object state freshly while depending on
-                // object state: a multi-effect cycle candidate. The churn
-                // graph (F5b) analyzes those; when it reported a cycle for
-                // this write the Info would be a duplicate — skip. Otherwise
-                // keep it: deps may be too imprecise to close a real cycle.
-                if covered.contains(&(*eff_label, state_label)) {
-                    continue;
-                }
-                Severity::Info
-            };
+                    // Sets a different object state freshly while depending on
+                    // object state: a multi-effect cycle candidate. The churn
+                    // graph (F5b) analyzes those; when it reported a cycle for
+                    // this write the Info would be a duplicate — skip. Otherwise
+                    // keep it: deps may be too imprecise to close a real cycle.
+                    if covered.contains(&(*eff_label, state_label)) {
+                        continue;
+                    }
+                    (Severity::Info, None)
+                };
             // Severity has no Ord: rank Error > Warning > Info manually.
             let rank = |s: Severity| match s {
                 Severity::Error => 2,
@@ -502,19 +517,24 @@ fn check_object_churn(
             // follows HashMap block order, so "first collected" is not
             // deterministic across runs.
             let pos = |s: Option<SourceRange>| s.map_or((u32::MAX, u32::MAX), |r| r.pos_key());
-            let entry = best.entry(state_label).or_insert((sev, call.span));
-            if rank(sev) > rank(entry.0)
-                || (rank(sev) == rank(entry.0) && pos(call.span) < pos(entry.1))
-            {
-                *entry = (sev, call.span);
+            let replace = match best.get(&state_label) {
+                None => true,
+                Some(entry) => {
+                    rank(sev) > rank(entry.0)
+                        || (rank(sev) == rank(entry.0) && pos(call.span) < pos(entry.1))
+                }
+            };
+            if replace {
+                best.insert(state_label, (sev, call.span, churn_proof));
             }
         }
 
-        for (state_label, (sev, call_span)) in best {
+        for (state_label, (sev, call_span, proof)) in best {
             let eff_span = comp_result.effect_info.get(eff_label).and_then(|i| i.span);
-            let mut diag = match sev {
-                Severity::Error => Diagnostic::new(
+            let mut diag = match (sev, proof) {
+                (Severity::Error, Some(proof)) => Diagnostic::error(
                     "infinite-loop",
+                    proof,
                     format!(
                         "this effect recreates object state {state} it depends on \
                          every run stores a fresh reference (`Object.is` always fails) \
@@ -522,15 +542,7 @@ fn check_object_churn(
                         state = state_slot_name(state_label, &state_vals)
                     ),
                 ),
-                Severity::Warning => Diagnostic::new(
-                    "infinite-loop",
-                    format!(
-                        "this effect may store a fresh reference into state \
-                         {state} which its deps react to possible infinite render loop",
-                        state = state_slot_name(state_label, &state_vals)
-                    ),
-                ),
-                Severity::Info => Diagnostic::new(
+                (Severity::Info, _) => Diagnostic::info(
                     "infinite-loop",
                     format!(
                         "this effect depends on object state but freshly recreates \
@@ -539,8 +551,15 @@ fn check_object_churn(
                         state = state_slot_name(state_label, &state_vals)
                     ),
                 ),
+                _ => Diagnostic::warn(
+                    "infinite-loop",
+                    format!(
+                        "this effect may store a fresh reference into state \
+                         {state} which its deps react to possible infinite render loop",
+                        state = state_slot_name(state_label, &state_vals)
+                    ),
+                ),
             }
-            .with_severity(sev)
             .with_label(state_label);
             if let Some(r) = eff_span {
                 diag = diag.with_range(r);

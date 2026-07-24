@@ -1,6 +1,6 @@
 use crate::{engine::ProgramAnalysisResult, ir::types::Symbol};
 
-use super::{Diagnostic, Rule, Severity};
+use super::{Diagnostic, Rule};
 
 /// Emits an Info diagnostic for each state label that required widening to
 /// force fixpoint convergence.  Widening = over-approximation → abstract
@@ -19,7 +19,7 @@ impl Rule for WideningInfo {
         labels
             .into_iter()
             .map(|label| {
-                Diagnostic::new(
+                Diagnostic::info(
                     "widening-info",
                     format!(
                         "state {label} kept changing during analysis and was \
@@ -27,7 +27,6 @@ impl Rule for WideningInfo {
                          may be imprecise"
                     ),
                 )
-                .with_severity(Severity::Info)
                 // Witness (ADR-019): the engine's own record of the widening.
                 .with_notes(super::witness::slot_history(
                     result,
