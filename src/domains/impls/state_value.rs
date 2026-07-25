@@ -1129,7 +1129,7 @@ mod tests {
     fn nullable_widened_number_is_unstable() {
         // {null ∪ number[0,+∞)} — a widened nullable counter changes every
         // render; motion-wins must report Unstable (this is what lets
-        // `all_deps_may_change` see through `useState(null)` counters).
+        // `all_deps_provably_stable` see through `useState(null)` counters).
         let v = StateValue::null().join(&StateValue::number(Interval {
             lo: 0.0,
             hi: f64::INFINITY,

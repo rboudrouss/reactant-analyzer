@@ -77,7 +77,7 @@ fn interval_self_freezing_counter_errors() {
         "#,
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Error);
+    assert_eq!(d[0].severity(), Severity::Error);
     assert!(d[0].message.contains("`n`"), "message: {}", d[0].message);
     assert!(
         d[0].message.contains("setInterval"),
@@ -105,7 +105,7 @@ fn listener_self_freezing_errors() {
         "#,
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Error);
+    assert_eq!(d[0].severity(), Severity::Error);
 }
 
 #[test]
@@ -127,7 +127,7 @@ fn callback_var_from_render_errors() {
         "#,
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Error);
+    assert_eq!(d[0].severity(), Severity::Error);
     assert!(
         d[0].notes.iter().any(|x| x.step.kind() == "resolve"),
         "witness should record the callback-variable resolution: {:?}",
@@ -155,7 +155,7 @@ fn use_callback_registered_mount_only_errors() {
         "#,
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Error);
+    assert_eq!(d[0].severity(), Severity::Error);
 }
 
 // ── Warning: real staleness, bounded or uncertain ─────────────────────────────
@@ -177,7 +177,7 @@ fn listener_read_only_externally_written_warns() {
         "#,
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Warning);
+    assert_eq!(d[0].severity(), Severity::Warning);
 }
 
 #[test]
@@ -197,7 +197,7 @@ fn then_capture_warns_not_error() {
         "#,
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Warning);
+    assert_eq!(d[0].severity(), Severity::Warning);
     assert!(d[0].message.contains("items"), "message: {}", d[0].message);
 }
 
@@ -216,7 +216,7 @@ fn set_timeout_self_write_warns() {
         "#,
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Warning);
+    assert_eq!(d[0].severity(), Severity::Warning);
 }
 
 #[test]
@@ -237,7 +237,7 @@ fn conditional_registration_warns() {
         "#,
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Warning);
+    assert_eq!(d[0].severity(), Severity::Warning);
 }
 
 #[test]
@@ -258,7 +258,7 @@ fn non_empty_deps_uncovered_capture_warns() {
         "#,
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Warning);
+    assert_eq!(d[0].severity(), Severity::Warning);
 }
 
 // ── Silence: proven-safe patterns ─────────────────────────────────────────────
@@ -447,5 +447,5 @@ fn registration_inside_local_helper_found() {
         "#,
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Error);
+    assert_eq!(d[0].severity(), Severity::Error);
 }

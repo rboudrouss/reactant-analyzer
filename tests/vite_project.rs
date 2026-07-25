@@ -67,7 +67,7 @@ fn infinite_loop_surfaces_on_app_through_alias() {
     assert!(
         diags
             .iter()
-            .any(|d| d.rule == "infinite-loop" && d.severity == Severity::Warning),
+            .any(|d| d.rule == "infinite-loop" && d.severity() == Severity::Warning),
         "infinite-loop must surface on App via the @/ alias; got: {:?}",
         diags.iter().map(|d| d.rule).collect::<Vec<_>>()
     );

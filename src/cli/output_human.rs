@@ -67,7 +67,7 @@ pub fn render(report: &CheckReport, no_color: bool, show_clean: bool, info: bool
             p.bold, comp.name, p.reset, comp.hook_count, file_suffix
         );
         for d in &comp.diagnostics {
-            let (sev_color, sev_tag) = match d.severity {
+            let (sev_color, sev_tag) = match d.severity() {
                 Severity::Error => (p.red, "error"),
                 Severity::Warning => (p.yellow, "warn "),
                 Severity::Info => (p.cyan, "info "),

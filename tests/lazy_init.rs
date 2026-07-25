@@ -271,7 +271,7 @@ fn effectful_init_is_warning_with_effect_message() {
         "#,
     );
     assert_eq!(ds.len(), 1);
-    assert_eq!(ds[0].severity, Severity::Warning);
+    assert_eq!(ds[0].severity(), Severity::Warning);
     assert!(
         ds[0].message.contains("side effects"),
         "effectful call must get the side-effect message, got: {}",
@@ -291,7 +291,7 @@ fn pure_cheap_init_is_info() {
     );
     assert_eq!(ds.len(), 1);
     assert_eq!(
-        ds[0].severity,
+        ds[0].severity(),
         Severity::Info,
         "cheap pure builtin must be demoted to Info"
     );
@@ -311,7 +311,7 @@ fn comp_app_init_is_not_demoted_to_info() {
         "#,
     );
     assert_eq!(ds.len(), 1);
-    assert_eq!(ds[0].severity, Severity::Warning);
+    assert_eq!(ds[0].severity(), Severity::Warning);
 }
 
 #[test]
@@ -327,11 +327,14 @@ fn lazy_init_graded_fixture() {
         "graded fixture: expected 3 hits, got {}",
         ds.len()
     );
-    let errors = ds.iter().filter(|d| d.severity == Severity::Error).count();
+    let errors = ds
+        .iter()
+        .filter(|d| d.severity() == Severity::Error)
+        .count();
     let warns = ds
         .iter()
-        .filter(|d| d.severity == Severity::Warning)
+        .filter(|d| d.severity() == Severity::Warning)
         .count();
-    let infos = ds.iter().filter(|d| d.severity == Severity::Info).count();
+    let infos = ds.iter().filter(|d| d.severity() == Severity::Info).count();
     assert_eq!((errors, warns, infos), (0, 2, 1), "severity mix");
 }

@@ -4,6 +4,7 @@ mod churn;
 mod churn_graph;
 pub mod conditional_hook;
 pub mod derived_state;
+pub mod diagnostic;
 pub mod docs;
 pub mod frozen_initial_state;
 pub mod infinite_loop;
@@ -22,17 +23,18 @@ pub use always_unstable_deps::AlwaysUnstableDeps;
 pub use analysis_limit_info::AnalysisLimitInfo;
 pub use conditional_hook::ConditionalHook;
 pub use derived_state::DerivedState;
+pub use diagnostic::{Diagnostic, Severity};
 pub use docs::{RULE_DOCS, RuleDoc, rule_doc};
 pub use frozen_initial_state::FrozenInitialState;
 pub use infinite_loop::InfiniteLoop;
 pub use lazy_init::LazyInit;
 pub use missing_deps::MissingDeps;
 pub use query::{
-    Certified, ConditionalHookCall, DominatesAllExits, EffectCycleProof, ExitDominance, FrozenSeed,
-    InitSetterCall, May, MustResult, OnAllPaths, Provenance, RuleConfig, RuleCtx, SameRefMutation,
-    StabilityVerdict, may_change_of, must_dominates_all_exits, must_effect_cycle, must_frozen_seed,
-    must_init_calls_setter, must_on_all_paths, must_same_ref_mutation, must_setter_on_all_paths,
-    stability_verdict_of,
+    Certified, ConditionalHookCall, DominatesAllExits, EffectCycleProof, ExitDominance,
+    InitSetterCall, May, Motion, MovingFeeder, MustResult, OnAllPaths, Provenance, RuleConfig,
+    RuleCtx, SameRefMutation, StabilityVerdict, classify_motion, may_change_of,
+    must_dominates_all_exits, must_frozen_seed, must_init_calls_setter, must_on_all_paths,
+    must_same_ref_mutation, must_setter_on_all_paths, stability_verdict_of,
 };
 pub use redundant_set_state::RedundantSetState;
 pub use setter_in_render::SetterInRender;
@@ -108,19 +110,6 @@ pub(crate) fn state_slot_name(
         .unwrap_or_else(|| format!("state #{label}"))
 }
 
-/// Confidence level of a diagnostic.
-///
-/// - `Error`   violation on ALL execution paths.
-/// - `Warning` possible but uncertain (conditional path or over-approx).
-/// - `Info`    known analysis limitation (widening, depth cap). Hidden by default; show with --info.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Severity {
-    Error,
-    #[default]
-    Warning,
-    Info,
-}
-
 /// One step of a diagnostic's witness chain (ADR-019).
 ///
 /// `message` is the pre-rendered prose ([`Step::render`] is the single
@@ -137,121 +126,6 @@ pub struct Note {
     /// [`crate::ir::FileId`] of the file it points into (may differ from the
     /// component's file after cross-file inlining).
     pub range: Option<SourceRange>,
-}
-
-/// Finding produced by a rule against the fixpoint analysis result.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Diagnostic {
-    pub severity: Severity,
-    pub rule: &'static str,
-    pub message: String,
-    /// Hook label most directly involved, if any.
-    pub hook_label: Option<HookLabel>,
-    /// Variable name most directly involved, if any.
-    pub var: Option<Var>,
-    /// Source location of the primary finding, if available.
-    pub range: Option<SourceRange>,
-    /// Secondary evidence items explaining the causal chain.
-    pub notes: Vec<Note>,
-}
-
-impl Diagnostic {
-    /// Private (ADR-021): the rule-facing constructors are [`Diagnostic::error`]
-    /// (needs a `Certified` proof), [`Diagnostic::warn`], and [`Diagnostic::info`].
-    /// A bare `Severity::Error` can no longer be attached to any `bool`.
-    fn new(rule: &'static str, message: impl Into<String>) -> Self {
-        Diagnostic {
-            severity: Severity::default(),
-            rule,
-            message: message.into(),
-            hook_label: None,
-            var: None,
-            range: None,
-            notes: vec![],
-        }
-    }
-
-    /// Private (ADR-021): severity is set by construction via `error`/`warn`/`info`.
-    fn with_severity(mut self, severity: Severity) -> Self {
-        self.severity = severity;
-        self
-    }
-
-    pub fn with_label(mut self, label: HookLabel) -> Self {
-        self.hook_label = Some(label);
-        self
-    }
-
-    pub fn with_var(mut self, var: impl Into<Var>) -> Self {
-        self.var = Some(var.into());
-        self
-    }
-
-    pub fn with_range(mut self, range: SourceRange) -> Self {
-        self.range = Some(range);
-        self
-    }
-
-    /// Append a typed witness step (ADR-019). `name` maps a state slot to its
-    /// user-facing name — pass a closure over the rule's `state_slot_name`
-    /// table, or [`witness::fallback_name`] when no table applies.
-    pub fn with_step(
-        mut self,
-        step: Step,
-        hook_label: Option<HookLabel>,
-        range: Option<SourceRange>,
-        name: &dyn Fn(HookLabel) -> String,
-    ) -> Self {
-        self.notes.push(Note {
-            message: step.render(name),
-            step,
-            hook_label,
-            range,
-        });
-        self
-    }
-
-    /// Append pre-built witness notes (from the `witness` producers —
-    /// [`witness::chase_value`], [`witness::slot_history`], …).
-    pub fn with_notes(mut self, notes: Vec<Note>) -> Self {
-        self.notes.extend(notes);
-        self
-    }
-
-    /// The **only** constructor of an `Error` (ADR-021 §2). Builds the finding
-    /// *from* a proof: the certified evidence's span/label/witness ride along, so
-    /// they need not be re-threaded by hand. A `May<_>`/`MustResult::Some` value
-    /// has no `Certified` to pass here — Error-on-may is a type error.
-    ///
-    /// Further `.with_*` builders may still refine/override the absorbed fields.
-    pub fn error<E>(
-        rule: &'static str,
-        proof: query::Certified<E>,
-        message: impl Into<String>,
-    ) -> Self {
-        let prov = proof.provenance();
-        Diagnostic {
-            severity: Severity::Error,
-            rule,
-            message: message.into(),
-            hook_label: prov.hook_label,
-            var: None,
-            range: prov.range,
-            notes: prov.notes.clone(),
-        }
-    }
-
-    /// A Warning: a safe over-claim (conditional path / over-approximation). Free
-    /// to construct — a Warning asserts no MUST fact.
-    pub fn warn(rule: &'static str, message: impl Into<String>) -> Self {
-        Diagnostic::new(rule, message).with_severity(Severity::Warning)
-    }
-
-    /// An Info: a known analysis limitation. Makes no must/may claim; hidden
-    /// unless `--info`.
-    pub fn info(rule: &'static str, message: impl Into<String>) -> Self {
-        Diagnostic::new(rule, message).with_severity(Severity::Info)
-    }
 }
 
 /// A check that was *applicable* to a component and found nothing wrong —
@@ -810,23 +684,25 @@ impl ConvergedEval for AnalysisResult<StateValue> {
     }
 }
 
-/// `true` when every dep in `deps` *may change* between renders — i.e. none is
-/// provably `Stable` — in the render-exit env. Empty `deps` returns `false`
-/// (`[]` is mount-only, not all-changing).
+/// `true` when **every** dep in `deps` is provably `Stable` in the render-exit
+/// env — the only situation where a deps array genuinely gates an effect for
+/// good: React re-runs an effect when **any** dep changed (OR semantics), so a
+/// single dep that may change (⊤/`Versioned`/`PerRender`) keeps the effect
+/// live no matter how stable its neighbours are. Empty `deps` returns `true`
+/// (`[]` is mount-only — gated by definition; `infinite-loop` handles it
+/// upstream anyway).
 ///
-/// ADR-021 §5: this keys on [`query::may_change_of`] (⊤/`Versioned`/`PerRender`
-/// → may-change), not the withdrawn `is_unstable` (`PerRender`-only). The
-/// `infinite-loop` gate `!all_deps_may_change(..) → skip` therefore skips an
-/// effect only when a dep is *provably* stable; a ⊤/`Versioned` dep no longer
-/// masquerades as gating (the shipped false negative).
-pub(super) fn all_deps_may_change(deps: &[Expr], result: &AnalysisResult<StateValue>) -> bool {
-    if deps.is_empty() {
-        return false;
-    }
+/// ADR-021 §5 + quantifier fix: the first cut of the ⊤-fix
+/// (`all_deps_may_change`) still used the wrong quantifier — it skipped when
+/// *one* dep was provably stable, silently dropping the mixed-deps case
+/// (`[stableConst, topProp]`), the same FN family one stable dep away. The
+/// sound gate quantifies ∀-stable, keyed on [`query::stability_verdict_of`]
+/// (⊤ is a returned variant folded to the may side).
+pub(super) fn all_deps_provably_stable(deps: &[Expr], result: &AnalysisResult<StateValue>) -> bool {
     let exit_env = result.exit_env();
     deps.iter().all(|dep| {
         let val = result.eval_in(&exit_env, dep, &mut Heap::new());
-        query::may_change_of(&val).into_inner()
+        query::stability_verdict_of(&val).is_stable()
     })
 }
 

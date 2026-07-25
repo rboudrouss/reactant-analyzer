@@ -91,7 +91,7 @@ fn warnings_for(result: &reactant::engine::ProgramAnalysisResult, component: &st
     rules
         .iter()
         .flat_map(|r| r.check(result, &component.to_string()))
-        .filter(|d| d.severity == Severity::Warning || d.severity == Severity::Error)
+        .filter(|d| d.severity() == Severity::Warning || d.severity() == Severity::Error)
         .map(|d| d.rule.to_string())
         .collect()
 }

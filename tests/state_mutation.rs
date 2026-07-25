@@ -74,7 +74,7 @@ fn push_then_set_same_reference_errors() {
         "#,
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Error);
+    assert_eq!(d[0].severity(), Severity::Error);
     assert!(
         d[0].message.contains("`items`"),
         "message: {}",
@@ -101,7 +101,7 @@ fn member_write_then_set_same_reference_errors() {
         "#,
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Error);
+    assert_eq!(d[0].severity(), Severity::Error);
 }
 
 #[test]
@@ -120,7 +120,7 @@ fn object_assign_then_set_same_reference_errors() {
         "#,
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Error);
+    assert_eq!(d[0].severity(), Severity::Error);
 }
 
 #[test]
@@ -138,7 +138,7 @@ fn updater_mutating_and_returning_param_errors() {
         "#,
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Error);
+    assert_eq!(d[0].severity(), Severity::Error);
 }
 
 #[test]
@@ -158,7 +158,7 @@ fn mutation_through_alias_errors() {
         "#,
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Error);
+    assert_eq!(d[0].severity(), Severity::Error);
 }
 
 #[test]
@@ -177,7 +177,7 @@ fn mutation_in_effect_set_in_effect_errors() {
         "#,
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Error);
+    assert_eq!(d[0].severity(), Severity::Error);
 }
 
 // ── Arm A negatives ──────────────────────────────────────────────────────────
@@ -304,7 +304,7 @@ fn prop_object_mutation_warns() {
         "#,
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Warning);
+    assert_eq!(d[0].severity(), Severity::Warning);
     assert!(d[0].message.contains("props"), "message: {}", d[0].message);
 }
 
@@ -319,7 +319,7 @@ fn prop_array_push_warns() {
         "#,
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Warning);
+    assert_eq!(d[0].severity(), Severity::Warning);
 }
 
 #[test]
@@ -384,7 +384,7 @@ fn non_dom_typed_prop_mutation_still_warns() {
         "#,
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Warning);
+    assert_eq!(d[0].severity(), Severity::Warning);
 }
 
 #[test]

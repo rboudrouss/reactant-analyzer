@@ -63,7 +63,7 @@ fn cross_setter_in_render_fires_unconditional() {
         "cross-setter-in-render should fire on Section9_Child"
     );
     assert_eq!(
-        diags[0].severity,
+        diags[0].severity(),
         Severity::Error,
         "unconditional call dominates all exits → Error"
     );
@@ -118,7 +118,7 @@ fn cross_setter_in_render_conditional_is_warning() {
         "cross-setter-in-render should fire on Section21_Child (conditional path)"
     );
     assert_eq!(
-        diags[0].severity,
+        diags[0].severity(),
         Severity::Warning,
         "conditional call: call block does not dominate all exits → Warning"
     );
@@ -188,8 +188,8 @@ fn cross_component_infinite_loop_no_fire_mount_only() {
 }
 
 /// Section 23: effect with `[value]` where `value = Number([0,+inf])` (widens) →
-/// all deps are unstable → equivalent to no-deps → cross-component-infinite-loop fires.
-/// The diagnostic message mentions "(all deps unstable effect runs every render)".
+/// no dep provably stable → equivalent to no-deps → cross-component-infinite-loop fires.
+/// The diagnostic message mentions that the deps do not gate the effect.
 #[test]
 fn cross_component_infinite_loop_fires_all_unstable_deps() {
     let result = parse_and_analyze(&fixture());
@@ -204,8 +204,8 @@ fn cross_component_infinite_loop_fires_all_unstable_deps() {
          (Number widens) → effect runs every render → infinite loop"
     );
     assert!(
-        diags[0].message.contains("all deps unstable"),
-        "diagnostic should mention that all deps are unstable"
+        diags[0].message.contains("do not provably gate"),
+        "diagnostic should mention that the deps do not gate the effect"
     );
 }
 
@@ -226,7 +226,7 @@ fn setter_in_render_via_local_wrapper_is_error() {
         "setter-in-render should fire: doReset() calls setCount unconditionally"
     );
     assert_eq!(
-        diags[0].severity,
+        diags[0].severity(),
         Severity::Error,
         "unconditional B6 call propagates outer block_id → Error"
     );
@@ -247,7 +247,7 @@ fn cross_setter_in_render_via_wrapper_is_error() {
         "cross-setter-in-render should fire: handleReset() wraps ComponentSetter prop"
     );
     assert_eq!(
-        diags[0].severity,
+        diags[0].severity(),
         Severity::Error,
         "B6 block_id propagated → unconditional call → Error"
     );
@@ -330,7 +330,7 @@ fn unknown_component_emits_info() {
         diags
     );
     assert!(
-        diags.iter().all(|d| d.severity == Severity::Info),
+        diags.iter().all(|d| d.severity() == Severity::Info),
         "all analysis-limit diags must be Info"
     );
 }
@@ -362,7 +362,7 @@ fn recursive_component_emits_info() {
         diags
     );
     assert!(
-        diags.iter().all(|d| d.severity == Severity::Info),
+        diags.iter().all(|d| d.severity() == Severity::Info),
         "all analysis-limit diags must be Info"
     );
 }

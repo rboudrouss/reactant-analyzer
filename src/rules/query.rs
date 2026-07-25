@@ -82,24 +82,15 @@ impl<E> Certified<E> {
         &self.evidence
     }
 
-    pub fn provenance(&self) -> &Provenance {
-        &self.provenance
+    /// Discard the proof and keep the evidence — a *downgrade* (the safe
+    /// direction: the fact loses its Error eligibility, never gains one).
+    /// The demotion path of [`must_frozen_seed`]'s gate check.
+    pub fn into_evidence(self) -> E {
+        self.evidence
     }
 
-    /// Conjunction of two MUST facts is still a MUST fact. Provenance merges
-    /// (notes concatenated). Safe: it only combines tokens that were already
-    /// certified, so no new assertion is introduced.
-    pub fn and<F>(self, other: Certified<F>) -> Certified<(E, F)> {
-        let mut notes = self.provenance.notes;
-        notes.extend(other.provenance.notes);
-        Certified {
-            evidence: (self.evidence, other.evidence),
-            provenance: Provenance {
-                range: self.provenance.range.or(other.provenance.range),
-                hook_label: self.provenance.hook_label.or(other.provenance.hook_label),
-                notes,
-            },
-        }
+    pub fn provenance(&self) -> &Provenance {
+        &self.provenance
     }
 }
 
@@ -526,26 +517,127 @@ pub fn must_init_calls_setter(init: &Expr, setters: &HashSet<Var>) -> MustResult
     }
 }
 
-/// Evidence that a state slot is frozen at a moving prop's mount-time value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FrozenSeed;
+/// A state slot in an analyzed owner that provably moves: its setter is
+/// referenced in the owner, with the first provable write site when one is
+/// syntactically visible. The evidence carried by [`Motion::Proven`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct MovingFeeder {
+    pub slot: HookLabel,
+    /// Owner's source-level name for the slot, pre-qualified for display
+    /// ("state `text` of `Parent`").
+    pub display: String,
+    pub write_span: Option<SourceRange>,
+}
 
-/// `All` iff a moving prop provably feeds a `useState` seed that is never
-/// re-synced, whose setter does not escape, and the idiomatic downgrades
-/// (all-seed-named / never-locally-written) do not apply — the certain
-/// `frozen-initial-state` Error (ADR-021 §3); `None` otherwise. `proven_feeder`
-/// is `frozen_initial_state::classify_motion`'s `Proven` verdict (a
-/// stability must-fact — part of the trusted core, cf. ADR §Soundness).
+/// What the domain proves about a seeding prop's motion across renders.
+///
+/// `Proven` carries its [`Certified`] token, minted HERE at the point of
+/// knowledge ([`slot_write_evidence`] — the owner's setter is really
+/// referenced), not vouched for by a caller-supplied boolean.
+pub enum Motion {
+    /// Provably never changes — kill.
+    Still,
+    /// Fed by a state slot that may actually be written in its owner.
+    Proven(Certified<MovingFeeder>),
+    /// May change, unproven (⊤ props, per-render values, unverifiable owner).
+    Unproven,
+}
+
+/// Can `slot` ever be written in its owning component, and if so, where is
+/// the first provable write site? `(false, _)` is a proof of stillness;
+/// `(true, None)` means "referenced somewhere" without a direct call site
+/// (setter passed onward).
+fn slot_write_evidence(
+    owner: &AnalysisResult<StateValue>,
+    slot: HookLabel,
+) -> (bool, Option<SourceRange>) {
+    let setter_labels = super::all_setter_labels(owner);
+    let may =
+        super::stale_closure::may_written_slots(&owner.render_cfg, &owner.hooks, &setter_labels);
+    if !may.contains(&slot) {
+        return (false, None);
+    }
+    let setters: HashSet<Var> = setter_labels
+        .iter()
+        .filter(|(_, l)| **l == slot)
+        .map(|(v, _)| v.clone())
+        .collect();
+    let render_fns = super::collect_fn_bindings(&owner.render_cfg);
+    let mut spans: Vec<SourceRange> = std::iter::once(&owner.render_cfg)
+        .chain(owner.hooks.iter().filter_map(|h| h.body_cfg()))
+        .flat_map(|cfg| super::collect_setter_calls_with_extra(cfg, &setters, 2, &render_fns))
+        .filter_map(|c| c.span)
+        .collect();
+    spans.sort_by_key(|r| r.pos_key());
+    (true, spans.first().copied())
+}
+
+/// Classify the motion of a seeding prop from its abstract value (ADR-021 §3).
+/// The `Proven` verdict mints its own [`Certified<MovingFeeder>`] — the only
+/// way to obtain one — so downstream Error tiers consume a real proof.
+pub fn classify_motion(val: &StateValue, result: &ProgramAnalysisResult) -> Motion {
+    // Version labels live on the reference slot only (`to_stability` erases
+    // them when another kind slot is ⊤) — check it first, like
+    // `recompute_memo` does.
+    if let Stability::Versioned(labels) = &val.reference {
+        let mut unverifiable = false;
+        for (owner, slot) in labels {
+            let Some(owner_result) = result.components.get(owner) else {
+                unverifiable = true;
+                continue;
+            };
+            let (writable, write_span) = slot_write_evidence(owner_result, *slot);
+            if writable {
+                let owner_states = super::state_val_labels(&owner_result.render_cfg);
+                let display = format!(
+                    "state {} of `{owner}`",
+                    super::state_slot_name(*slot, &owner_states)
+                );
+                return Motion::Proven(Certified::mint(
+                    MovingFeeder {
+                        slot: *slot,
+                        display,
+                        write_span,
+                    },
+                    Provenance::default(),
+                ));
+            }
+        }
+        return if unverifiable {
+            Motion::Unproven
+        } else {
+            // Every feeding slot is owned by an analyzed component and its
+            // setter is never referenced there: the prop provably never
+            // changes (React state moves only through its setter).
+            Motion::Still
+        };
+    }
+    if val.reference == Stability::VersionedTop {
+        return Motion::Unproven;
+    }
+    match val.to_stability() {
+        Stability::Bottom | Stability::Stable => Motion::Still,
+        _ => Motion::Unproven,
+    }
+}
+
+/// `All` iff a proven moving feeder survives the idiomatic downgrades: the
+/// setter does not escape, the seeds are not all seed-named (`initial*`/
+/// `default*`), and the slot is locally written — the certain
+/// `frozen-initial-state` Error (ADR-021 §3). Any failed gate *demotes* the
+/// proof ([`Certified::into_evidence`]) — the fact survives as a MAY, its
+/// Error eligibility does not. Forging is impossible: the input proof only
+/// comes from [`classify_motion`].
 pub fn must_frozen_seed(
-    proven_feeder: bool,
+    feeder: Certified<MovingFeeder>,
     escaped: bool,
     all_seed_named: bool,
     locally_written: bool,
-) -> MustResult<FrozenSeed> {
-    if proven_feeder && !escaped && !all_seed_named && locally_written {
-        MustResult::All(Certified::mint(FrozenSeed, Provenance::default()))
+) -> MustResult<MovingFeeder> {
+    if !escaped && !all_seed_named && locally_written {
+        MustResult::All(feeder)
     } else {
-        MustResult::None
+        MustResult::Some(feeder.into_evidence())
     }
 }
 
@@ -553,12 +645,29 @@ pub fn must_frozen_seed(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EffectCycleProof;
 
-/// `All` iff a churn cycle is all-must (every edge a proven must-rerun) and
-/// stays within one component — the certain `infinite-loop` Error (ADR-018 +
-/// ADR-021 §3). `None` otherwise (cross-component or any may-edge → a MAY).
-/// `all_must`/`cross_component` are the engine's own [`churn_graph`] verdicts.
-pub fn must_effect_cycle(all_must: bool, cross_component: bool) -> MustResult<EffectCycleProof> {
-    if all_must && !cross_component {
+/// `All` iff every edge of `cycle` is a proven must-rerun and the cycle stays
+/// within one component — the certain `infinite-loop` Error (ADR-018 +
+/// ADR-021 §3); `None` otherwise (cross-component or any may-edge → a MAY).
+///
+/// Both facts are re-derived HERE from the raw edges (strength per edge, slot
+/// owners + effect carriers per component), the point of knowledge — not
+/// trusted from caller-supplied booleans.
+pub(super) fn must_effect_cycle(
+    edges: &[super::churn_graph::ChurnEdge],
+    cycle: &super::churn_graph::ChurnCycle,
+) -> MustResult<EffectCycleProof> {
+    use super::churn_graph::EdgeStrength;
+    let all_must = cycle
+        .edge_idx
+        .iter()
+        .all(|&i| edges[i].strength == EdgeStrength::Must);
+    let mut comps: HashSet<&Symbol> = HashSet::new();
+    for &i in &cycle.edge_idx {
+        comps.insert(&edges[i].from.0);
+        comps.insert(&edges[i].to.0);
+        comps.insert(&edges[i].component);
+    }
+    if all_must && comps.len() == 1 {
         MustResult::All(Certified::mint(EffectCycleProof, Provenance::default()))
     } else {
         MustResult::None

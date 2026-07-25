@@ -72,7 +72,7 @@ fn proven_versioned_object_prop_errors() {
         "Child",
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Error);
+    assert_eq!(d[0].severity(), Severity::Error);
     assert!(d[0].message.contains("`user`"), "message: {}", d[0].message);
     assert!(
         d[0].message.contains("Parent"),
@@ -104,7 +104,7 @@ fn proven_versioned_field_seed_errors() {
         "Child",
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Error);
+    assert_eq!(d[0].severity(), Severity::Error);
     assert!(
         d[0].message.contains("`user.name`"),
         "message names the seed path: {}",
@@ -129,7 +129,7 @@ fn intra_only_prop_seed_warns() {
         "Picker",
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Warning);
+    assert_eq!(d[0].severity(), Severity::Warning);
     assert!(
         d[0].message.contains("`value`"),
         "message: {}",
@@ -151,7 +151,7 @@ fn lazy_initializer_prop_seed_warns() {
         "Picker",
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Warning);
+    assert_eq!(d[0].severity(), Severity::Warning);
 }
 
 #[test]
@@ -169,7 +169,7 @@ fn binding_hop_to_prop_warns() {
         "Panel",
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Warning);
+    assert_eq!(d[0].severity(), Severity::Warning);
 }
 
 #[test]
@@ -191,7 +191,7 @@ fn escaped_setter_caps_proven_at_warning() {
         "Child",
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Warning);
+    assert_eq!(d[0].severity(), Severity::Warning);
 }
 
 // ── Info: seed-once naming ────────────────────────────────────────────────────
@@ -209,7 +209,7 @@ fn initial_named_prop_downgrades_to_info() {
         "Field",
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Info);
+    assert_eq!(d[0].severity(), Severity::Info);
 }
 
 #[test]
@@ -225,7 +225,7 @@ fn default_named_prop_downgrades_to_info() {
         "Tabs",
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Info);
+    assert_eq!(d[0].severity(), Severity::Info);
 }
 
 #[test]
@@ -245,7 +245,7 @@ fn initial_named_proven_prop_downgrades_to_warning() {
         "Child",
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Warning);
+    assert_eq!(d[0].severity(), Severity::Warning);
 }
 
 #[test]
@@ -267,7 +267,7 @@ fn never_written_snapshot_slot_downgrades_to_info() {
         "Dialog",
     );
     assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
-    assert_eq!(d[0].severity, Severity::Info);
+    assert_eq!(d[0].severity(), Severity::Info);
     assert!(
         !d[0].message.contains("__"),
         "message must not leak a lowering temp: {}",
@@ -420,7 +420,7 @@ fn effect_not_keyed_on_prop_does_not_kill() {
         "Child",
     );
     assert_eq!(d.len(), 1, "unrelated effect must not kill: {d:?}");
-    assert_eq!(d[0].severity, Severity::Warning);
+    assert_eq!(d[0].severity(), Severity::Warning);
 }
 
 // ── safe_check ────────────────────────────────────────────────────────────────

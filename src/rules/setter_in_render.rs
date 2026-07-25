@@ -295,7 +295,7 @@ mod tests {
         let diags = SetterInRender.check(&prog("C", &result), &"C".to_string());
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].rule, "setter-in-render");
-        assert_eq!(diags[0].severity, Severity::Error);
+        assert_eq!(diags[0].severity(), Severity::Error);
     }
 
     #[test]
@@ -359,7 +359,7 @@ mod tests {
         });
         let diags = SetterInRender.check(&prog("C", &result), &"C".to_string());
         assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].severity, Severity::Warning);
+        assert_eq!(diags[0].severity(), Severity::Warning);
     }
 
     #[test]
@@ -451,7 +451,7 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         let diags = SetterInRender.check(&prog("Counter", &result), &"Counter".to_string());
         assert!(!diags.is_empty(), "setter in render body should warn");
-        assert_eq!(diags[0].severity, Severity::Error);
+        assert_eq!(diags[0].severity(), Severity::Error);
     }
 
     #[test]
@@ -491,6 +491,6 @@ mod tests {
             "setter inside callback arg should be detected"
         );
         assert_eq!(diags[0].rule, "setter-in-render");
-        assert_eq!(diags[0].severity, Severity::Warning);
+        assert_eq!(diags[0].severity(), Severity::Warning);
     }
 }

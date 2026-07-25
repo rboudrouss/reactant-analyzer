@@ -301,7 +301,7 @@ pub fn run(mut args: CheckArgs) -> i32 {
             let pos = |d: &Diagnostic| d.range.map_or((u32::MAX, u32::MAX), |r| (r.line, r.col));
             (
                 a.rule,
-                a.severity as u8,
+                a.severity() as u8,
                 pos(a),
                 &a.message,
                 &a.var,
@@ -309,7 +309,7 @@ pub fn run(mut args: CheckArgs) -> i32 {
             )
                 .cmp(&(
                     b.rule,
-                    b.severity as u8,
+                    b.severity() as u8,
                     pos(b),
                     &b.message,
                     &b.var,
@@ -319,7 +319,7 @@ pub fn run(mut args: CheckArgs) -> i32 {
         diags.retain(|d| {
             (args.rule.is_empty() || args.rule.iter().any(|r| r == d.rule))
                 && !args.ignore_rule.iter().any(|r| r == d.rule)
-                && (d.severity != Severity::Info || args.info)
+                && (d.severity() != Severity::Info || args.info)
         });
         // Same allowlist/ignore filtering as diagnostics; deterministic order.
         safe_checks.retain(|s| {
@@ -330,15 +330,15 @@ pub fn run(mut args: CheckArgs) -> i32 {
 
         errors += diags
             .iter()
-            .filter(|d| d.severity == Severity::Error)
+            .filter(|d| d.severity() == Severity::Error)
             .count();
         warnings += diags
             .iter()
-            .filter(|d| d.severity == Severity::Warning)
+            .filter(|d| d.severity() == Severity::Warning)
             .count();
         infos += diags
             .iter()
-            .filter(|d| d.severity == Severity::Info)
+            .filter(|d| d.severity() == Severity::Info)
             .count();
 
         let (file, hook_count) = component_meta

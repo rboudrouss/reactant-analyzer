@@ -14,8 +14,8 @@
 > (requires a `Certified`) and `new`/`with_severity` made private — so
 > `Severity::Error` can no longer be attached to a `bool` from rule code. All 14
 > rules route their 8 Error sites through a `Certified` and their Warning/Info
-> through `warn`/`info`. The §5 false negative is fixed (`is_unstable` withdrawn,
-> `all_deps_may_change` re-keys the gate) and pinned by
+> through `warn`/`info`. The §5 false negative is fixed (`is_unstable` withdrawn)
+> and pinned by
 > `tests/effect_cycles.rs::top_prop_dep_does_not_silence_self_write_loop`.
 > **Deferred**: the `Rule` trait *signature* swap to `check(&RuleCtx)` (§4).
 > `RuleCtx` exists and is the anchor (rules build/consume it internally), but the
@@ -23,6 +23,37 @@
 > `RuleCtx::new` to the caller is a mechanical follow-up across ~143 call sites.
 > Also deferred: `stability_verdict` reads the plain exit env (not yet the
 > memo-store refinement), matching the retained `is_stable` readers.
+>
+> **Hardening round (2026-07-24, post-review).** The first cut left three gaps,
+> found by compile-probing the guarantee; all three are closed:
+> 1. *The seal was not real.* Rust privacy is downward — `new`/`with_severity`
+>    "private" in `rules/mod.rs` stayed callable from every rule submodule, and
+>    the `pub severity` field allowed forging an Error by mutation or struct
+>    literal from anywhere. `Diagnostic` now lives in the **leaf** module
+>    `src/rules/diagnostic.rs` with `severity` private behind a getter; all
+>    three forgery probes are now compile errors (E0616/E0624).
+> 2. *Two mints were token vending machines.* `must_effect_cycle(bool, bool)`
+>    and `must_frozen_seed(bool, …)` did no analysis — any caller passing
+>    `true` got a `Certified`. Minting moved to the point of knowledge
+>    (ADR-019 discipline): `classify_motion` lives in `query.rs` and its
+>    `Motion::Proven` variant carries the `Certified<MovingFeeder>` it mints;
+>    `must_frozen_seed` now *consumes* that proof (gates can only demote it,
+>    `Certified::into_evidence`). `must_effect_cycle(edges, cycle)` re-derives
+>    all-must ∧ intra-component from the raw `ChurnEdge` strengths, not from
+>    caller-supplied booleans. (`must_same_ref_mutation`/`must_init_calls_setter`
+>    already compute from raw inputs.)
+> 3. *Wrong quantifier in the §5 gate.* `all_deps_may_change` skipped the
+>    infinite-loop check as soon as ONE dep was provably stable — but React
+>    re-runs an effect when ANY dep changed (OR semantics), so
+>    `[stableConst, topProp]` resurrected the FN one stable dep away. The gate
+>    is now `all_deps_provably_stable` (∀-stable skips, anything else checks),
+>    pinned by `stable_dep_alongside_top_dep_does_not_gate_self_write_loop` +
+>    the complement guard `all_stable_deps_gate_self_write_effect`.
+>
+> Residual trusted surface after hardening: the polarity of the analytical
+> primitives themselves, and `must_frozen_seed`'s three demotion gates
+> (escape/naming/local-write) — mis-set gates can up-label a *genuine* proven
+> feeder, never fabricate one.
 
 ## Context
 

@@ -148,7 +148,7 @@ fn two_pages_in_different_files_coexist_and_only_buggy_one_warns() {
         let warns = rules
             .iter()
             .flat_map(|r| r.check(&result, key))
-            .filter(|d| d.severity == Severity::Warning || d.severity == Severity::Error)
+            .filter(|d| d.severity() == Severity::Warning || d.severity() == Severity::Error)
             .count();
         errors_per_key.push(((**key).clone(), warns));
     }

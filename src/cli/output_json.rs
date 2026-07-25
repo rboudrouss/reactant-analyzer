@@ -193,7 +193,7 @@ fn to_json_diag<'a>(
 ) -> JsonDiagnostic<'a> {
     JsonDiagnostic {
         rule: d.rule,
-        severity: severity_str(d.severity),
+        severity: severity_str(d.severity()),
         component,
         file: file.map(super::display_relative),
         line: d.range.map(|r| r.line),

@@ -96,7 +96,7 @@ fn diagnostics_sev(src: &str) -> Vec<(String, reactant::rules::Severity, String)
     for name in &names {
         for rule in all_rules() {
             for d in rule.check(&prog, name) {
-                out.push((d.rule.to_string(), d.severity, d.message.clone()));
+                out.push((d.rule.to_string(), d.severity(), d.message.clone()));
             }
         }
     }

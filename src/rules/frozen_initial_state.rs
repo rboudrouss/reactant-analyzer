@@ -1,10 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    domains::{StateValue, impls::Stability},
+    domains::StateValue,
     engine::{AnalysisResult, ProgramAnalysisResult},
     ir::{
-        SourceRange,
         cfg::CFG,
         expr::Expr,
         free_vars::{AccessPath, collect_used_paths, dep_paths, path_covered},
@@ -14,9 +13,10 @@ use crate::{
 };
 
 use super::{
-    Diagnostic, MustResult, Rule, Severity, Step, ValueClass, all_setter_labels,
-    collect_fn_bindings, collect_setter_calls, collect_setter_calls_with_extra, local_bindings,
-    must_frozen_seed, stale_closure::may_written_slots, state_slot_name, state_val_labels,
+    Certified, Diagnostic, Motion, MovingFeeder, MustResult, Rule, Severity, Step, ValueClass,
+    all_setter_labels, classify_motion, collect_fn_bindings, collect_setter_calls,
+    collect_setter_calls_with_extra, local_bindings, must_frozen_seed,
+    stale_closure::may_written_slots, state_slot_name, state_val_labels,
 };
 
 /// Fires when a `useState` initializer reads a prop and nothing ever syncs
@@ -130,94 +130,6 @@ fn is_seed_named(p: &AccessPath) -> bool {
     let name = p.segments.last().map(String::as_str).unwrap_or(&p.root);
     let lower = name.to_ascii_lowercase();
     lower.starts_with("initial") || lower.starts_with("default")
-}
-
-/// What the domain proves about a seeding prop's motion across renders.
-enum Motion {
-    /// Provably never changes — kill.
-    Still,
-    /// Fed by a state slot that may actually be written in its owner.
-    Proven {
-        slot: HookLabel,
-        /// Owner's source-level name for the slot, pre-qualified for display
-        /// ("`text` of `Parent`").
-        display: String,
-        write_span: Option<SourceRange>,
-    },
-    /// May change, unproven (⊤ props, per-render values, unverifiable owner).
-    Unproven,
-}
-
-/// Can `slot` ever be written in its owning component, and if so, where is
-/// the first provable write site? `(false, _)` is a proof of stillness;
-/// `(true, None)` means "referenced somewhere" without a direct call site
-/// (setter passed onward).
-fn slot_write_evidence(
-    owner: &AnalysisResult<StateValue>,
-    slot: HookLabel,
-) -> (bool, Option<SourceRange>) {
-    let setter_labels = all_setter_labels(owner);
-    let may = may_written_slots(&owner.render_cfg, &owner.hooks, &setter_labels);
-    if !may.contains(&slot) {
-        return (false, None);
-    }
-    let setters: HashSet<Var> = setter_labels
-        .iter()
-        .filter(|(_, l)| **l == slot)
-        .map(|(v, _)| v.clone())
-        .collect();
-    let render_fns = collect_fn_bindings(&owner.render_cfg);
-    let mut spans: Vec<SourceRange> = std::iter::once(&owner.render_cfg)
-        .chain(owner.hooks.iter().filter_map(|h| h.body_cfg()))
-        .flat_map(|cfg| collect_setter_calls_with_extra(cfg, &setters, 2, &render_fns))
-        .filter_map(|c| c.span)
-        .collect();
-    spans.sort_by_key(|r| r.pos_key());
-    (true, spans.first().copied())
-}
-
-/// Classify the motion of a seeding prop from its abstract value.
-fn classify_motion(val: &StateValue, result: &ProgramAnalysisResult) -> Motion {
-    // Version labels live on the reference slot only (`to_stability` erases
-    // them when another kind slot is ⊤) — check it first, like
-    // `recompute_memo` does.
-    if let Stability::Versioned(labels) = &val.reference {
-        let mut unverifiable = false;
-        for (owner, slot) in labels {
-            let Some(owner_result) = result.components.get(owner) else {
-                unverifiable = true;
-                continue;
-            };
-            let (writable, write_span) = slot_write_evidence(owner_result, *slot);
-            if writable {
-                let owner_states = state_val_labels(&owner_result.render_cfg);
-                let display = format!(
-                    "state {} of `{owner}`",
-                    state_slot_name(*slot, &owner_states)
-                );
-                return Motion::Proven {
-                    slot: *slot,
-                    display,
-                    write_span,
-                };
-            }
-        }
-        return if unverifiable {
-            Motion::Unproven
-        } else {
-            // Every feeding slot is owned by an analyzed component and its
-            // setter is never referenced there: the prop provably never
-            // changes (React state moves only through its setter).
-            Motion::Still
-        };
-    }
-    if val.reference == Stability::VersionedTop {
-        return Motion::Unproven;
-    }
-    match val.to_stability() {
-        Stability::Bottom | Stability::Stable => Motion::Still,
-        _ => Motion::Unproven,
-    }
 }
 
 /// `true` when some declared dep covers `seed` — matched on the syntactic
@@ -406,8 +318,9 @@ impl Rule for FrozenInitialState {
             }
 
             // Classify each seeding prop; keep the strongest surviving verdict.
-            // proven = (seed path, owner slot, qualified display, write span).
-            let mut proven: Option<(String, HookLabel, String, Option<SourceRange>)> = None;
+            // proven = (seed path, certified moving feeder) — the proof is
+            // minted by `classify_motion` at the point of knowledge (ADR-021).
+            let mut proven: Option<(String, Certified<MovingFeeder>)> = None;
             let mut unproven_path: Option<String> = None;
             let mut all_seed_named = true;
             for seed in &seeds {
@@ -421,14 +334,10 @@ impl Rule for FrozenInitialState {
                 let val = eval_with_heap(&expr, comp);
                 match classify_motion(&val, result) {
                     Motion::Still => continue,
-                    Motion::Proven {
-                        slot,
-                        display,
-                        write_span,
-                    } => {
+                    Motion::Proven(proof) => {
                         all_seed_named &= is_seed_named(&seed.orig);
                         if proven.is_none() {
-                            proven = Some((seed.orig.to_string(), slot, display, write_span));
+                            proven = Some((seed.orig.to_string(), proof));
                         }
                     }
                     Motion::Unproven => {
@@ -447,7 +356,8 @@ impl Rule for FrozenInitialState {
             let slot_name = name_of(*label);
 
             let (mut severity, message, proven_evidence) = match (&proven, &unproven_path) {
-                (Some((path, slot, display, write_span)), _) => {
+                (Some((path, proof)), _) => {
+                    let feeder = proof.evidence();
                     let severity = if escaped {
                         // Something outside this component holds the setter —
                         // an unseen sync path may exist.
@@ -461,9 +371,10 @@ impl Rule for FrozenInitialState {
                             "state {slot_name} is seeded from `{path}`, which is fed by \
                              {display} and changes — `useState` reads its initializer on the \
                              first render only and nothing here re-syncs it, so {slot_name} \
-                             stays frozen at the first `{path}` value"
+                             stays frozen at the first `{path}` value",
+                            display = feeder.display
                         ),
-                        Some((*slot, display.clone(), *write_span)),
+                        Some((feeder.slot, feeder.display.clone(), feeder.write_span)),
                     )
                 }
                 (None, Some(path)) => (
@@ -498,16 +409,18 @@ impl Rule for FrozenInitialState {
 
             let primary_path = proven
                 .as_ref()
-                .map(|(p, _, _, _)| p.clone())
+                .map(|(p, _)| p.clone())
                 .or(unproven_path)
                 .unwrap_or_default();
 
-            // The Error tier is minted only when the proven feeder survives the
-            // idiomatic downgrades; the primitive re-checks the same conditions,
-            // so `severity == Error` ⟹ `All`. Warning/Info are safe over-claims.
-            let mut d = if severity == Severity::Error {
-                match must_frozen_seed(
-                    proven.is_some(),
+            // The Error tier consumes the `Certified<MovingFeeder>` minted by
+            // `classify_motion` (the point of knowledge); `must_frozen_seed`
+            // demotes it when an idiomatic downgrade applies, so `severity ==
+            // Error` ⟹ `All`. Warning/Info are safe over-claims.
+            let feeder_proof = proven.map(|(_, proof)| proof);
+            let mut d = match (severity, feeder_proof) {
+                (Severity::Error, Some(proof)) => match must_frozen_seed(
+                    proof,
                     escaped,
                     all_seed_named,
                     locally_written.contains(label),
@@ -516,11 +429,9 @@ impl Rule for FrozenInitialState {
                         Diagnostic::error("frozen-initial-state", proof, message)
                     }
                     _ => Diagnostic::warn("frozen-initial-state", message),
-                }
-            } else if severity == Severity::Info {
-                Diagnostic::info("frozen-initial-state", message)
-            } else {
-                Diagnostic::warn("frozen-initial-state", message)
+                },
+                (Severity::Info, _) => Diagnostic::info("frozen-initial-state", message),
+                _ => Diagnostic::warn("frozen-initial-state", message),
             }
             .with_label(*label)
             .with_var(primary_path.clone());

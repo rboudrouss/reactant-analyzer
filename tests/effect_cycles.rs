@@ -46,7 +46,7 @@ fn infinite_loop_diags(src: &str, component: &str) -> Vec<(String, Severity, Str
     InfiniteLoop
         .check(&result, &component.to_string())
         .into_iter()
-        .map(|d| (d.rule.to_string(), d.severity, d.message))
+        .map(|d| (d.rule.to_string(), d.severity(), d.message))
         .collect()
 }
 
@@ -184,7 +184,7 @@ function Child({ value, onUpdate }) {
         .filter(|d| d.rule == "cross-component-infinite-loop")
         .collect();
     assert_eq!(cross.len(), 1, "cross churn loop must warn: {diags:?}");
-    assert_eq!(cross[0].severity, Severity::Warning, "Warning ceiling");
+    assert_eq!(cross[0].severity(), Severity::Warning, "Warning ceiling");
     assert!(
         cross[0].message.contains("`Parent`"),
         "message should name the parent: {}",
@@ -333,5 +333,57 @@ export function C({ data }: { data: unknown }) {
     assert!(
         diags.iter().any(|(rule, _, _)| rule == "infinite-loop"),
         "expected an infinite-loop diagnostic for the ⊤-dep self-write loop, got: {diags:?}"
+    );
+}
+
+#[test]
+fn stable_dep_alongside_top_dep_does_not_gate_self_write_loop() {
+    // Quantifier sibling of the ⊤ FN above: React re-runs an effect when ANY
+    // dep changed (OR semantics), so one provably-stable dep (`label`) among
+    // moving ones gates nothing — `data` (⊤) can still re-trigger the effect
+    // on every render. The first cut of the gate (`all_deps_may_change`)
+    // skipped as soon as ONE dep was provably stable, resurrecting the FN one
+    // stable dep away. The sound gate skips only when EVERY dep is provably
+    // stable. Reverting `all_deps_provably_stable` to the any-stable
+    // quantifier fails this test.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ data }: { data: unknown }) {
+  const label = "fixed";
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(n + 1);
+  }, [label, data]);
+  return <div>{n}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags.iter().any(|(rule, _, _)| rule == "infinite-loop"),
+        "expected an infinite-loop diagnostic despite the stable dep, got: {diags:?}"
+    );
+}
+
+#[test]
+fn all_stable_deps_gate_self_write_effect() {
+    // Complement guard: when EVERY dep is provably stable the effect re-runs
+    // at most once after mount — it cannot loop, and the gate must kill the
+    // check (this is what keeps the ∀-stable quantifier from over-firing).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const label = "fixed";
+  const other = 42;
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(n + 1);
+  }, [label, other]);
+  return <div>{n}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags.iter().all(|(rule, _, _)| rule != "infinite-loop"),
+        "all-stable deps gate the effect: no infinite-loop expected, got: {diags:?}"
     );
 }

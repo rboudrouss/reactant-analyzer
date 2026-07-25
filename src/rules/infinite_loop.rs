@@ -15,11 +15,12 @@ use super::churn::{
     ChurnSetterCall, Freshness, classify_effect_deps, collect_churn_calls, converges_once_written,
     reference_part,
 };
+use super::query::must_effect_cycle;
 use super::{
-    Certified, Diagnostic, MustResult, OnAllPaths, Rule, Severity, all_deps_may_change,
+    Certified, Diagnostic, MustResult, OnAllPaths, Rule, Severity, all_deps_provably_stable,
     all_setter_labels, collect_fn_bindings, collect_setter_calls, collect_setter_calls_with_extra,
-    memo_val_labels, must_effect_cycle, must_on_all_paths, resolve_setter_aliases,
-    setter_var_labels, state_slot_name, state_val_labels,
+    memo_val_labels, must_on_all_paths, resolve_setter_aliases, setter_var_labels, state_slot_name,
+    state_val_labels,
 };
 
 /// Fires when an effect causes an infinite render loop.
@@ -94,11 +95,13 @@ impl Rule for InfiniteLoop {
             if matches!(deps, Some(d) if d.is_empty()) {
                 continue;
             }
-            // Non-empty deps with at least one *provably stable* value genuinely
-            // gate the effect. A ⊤/`Versioned` dep is NOT provably stable, so it
-            // no longer un-gates the check (ADR-021 §5 — the shipped FN).
+            // A deps array gates the effect for good only when EVERY dep is
+            // provably stable (React re-runs on ANY changed dep — OR
+            // semantics). One stable dep among moving ones gates nothing, and
+            // a ⊤/`Versioned` dep is never provably stable (ADR-021 §5: the
+            // shipped ⊤ FN, plus its all-vs-any quantifier sibling).
             if let Some(dep_exprs) = deps
-                && !all_deps_may_change(dep_exprs, comp_result)
+                && all_deps_provably_stable(dep_exprs, comp_result)
             {
                 continue;
             }
@@ -118,7 +121,7 @@ impl Rule for InfiniteLoop {
                     }
 
                     let deps_note = if deps.is_some() {
-                        " (all deps unstable effect runs every render)"
+                        " (its deps do not provably gate it — the effect can re-run every render)"
                     } else {
                         ""
                     };
@@ -185,7 +188,7 @@ impl Rule for InfiniteLoop {
                     }
 
                     let deps_note = if deps.is_some() {
-                        " (all deps unstable effect runs every render)"
+                        " (its deps do not provably gate it — the effect can re-run every render)"
                     } else {
                         ""
                     };
@@ -271,7 +274,7 @@ fn check_multi_effect_cycles(
             } else {
                 "infinite-loop"
             };
-            let cycle_proof = match must_effect_cycle(cycle.all_must, cycle.cross_component) {
+            let cycle_proof = match must_effect_cycle(&edges, cycle) {
                 MustResult::All(c) => Some(c),
                 _ => None,
             };

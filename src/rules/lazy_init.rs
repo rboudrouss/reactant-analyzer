@@ -473,7 +473,7 @@ mod tests {
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
         let diags = LazyInit.check(&prog(&result), &"C".to_string());
         assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].severity, Severity::Warning);
+        assert_eq!(diags[0].severity(), Severity::Warning);
         assert!(diags[0].message.contains("side effects"));
     }
 
@@ -494,7 +494,7 @@ mod tests {
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
         let diags = LazyInit.check(&prog(&result), &"C".to_string());
         assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].severity, Severity::Info);
+        assert_eq!(diags[0].severity(), Severity::Info);
     }
 
     #[test]
