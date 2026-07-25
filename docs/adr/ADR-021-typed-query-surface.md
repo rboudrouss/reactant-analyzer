@@ -228,6 +228,9 @@ the new FN near-miss fixture.
 
 ## Future direction (deferred — seeds a follow-up ADR)
 
+> **Resolved by [ADR-022](ADR-022-custom-rule-frontends-distribution.md)**
+> (2026-07-25): all five open questions below are decided there.
+
 Everything here is decided *later*, on top of the `RuleCtx` + verdict-type
 substrate this ADR fixes. Relaunch `grill-me` scoped to the frontend and
 distribution, using that substrate as given.

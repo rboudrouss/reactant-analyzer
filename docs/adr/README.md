@@ -23,3 +23,4 @@
 | [ADR-019](ADR-019-witness-chain.md) | Typed witness chains — FileId, engine provenance, closed `Step` vocabulary, shared witness library | Implemented |
 | [ADR-020](ADR-020-tech-debt-cleanup-decisions.md) | Technical-debt cleanup — deliberate non-changes (soundness-preserving) | Accepted |
 | [ADR-021](ADR-021-typed-query-surface.md) | Typed query surface — engine-certified severity, must/may/⊤ as types, `RuleCtx` (frontend deferred) | Accepted |
+| [ADR-022](ADR-022-custom-rule-frontends-distribution.md) | Custom rule frontends & distribution — declarative packs over semantic anchors, pin ⊓ polarity, WASM-only npm | Accepted |

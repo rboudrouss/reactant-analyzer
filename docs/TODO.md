@@ -122,3 +122,11 @@ rules-of-hooks, index-as-key, naming) are explicitly out of scope.
 - **`React.memo` / `forwardRef` wrappers** — `const Memo = React.memo(function Foo() {...})` → the component detector doesn't follow the wrapped expression.
 - **Anonymous default exports** — `export default () => <div/>` mapped to `"DefaultExport"`; multi-file collisions possible if several anonymous default exports exist (mitigated by `(file, name)` keying but the user-visible name stays generic).
 - **Frameworks** — Vite is built in (ADR-016). Next.js / TanStack Router: no built-in plugin — Next.js App Router needs RSC semantics (server components have no hooks; `'use client'` boundary), not just a resolver — see [docs/plugins.md](plugins.md) for custom discovery meanwhile.
+
+## Frontend limits (ADR-022)
+
+- **Tier A is single-anchor** — a declarative rule binds exactly one anchor entity
+  plus typed navigation; cross-component rules (the `cross_component_setters`
+  shape only `stale-closure` uses natively) are inexpressible in Tier A v1.
+  Lifted later by a schema extension or by Tier B (Starlark, bounded joins) —
+  never by a syntactic bypass. *(ADR-022 §2, §7)*
