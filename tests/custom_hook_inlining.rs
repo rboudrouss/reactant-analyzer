@@ -9,7 +9,7 @@ use reactant::{
         analyze_program,
     },
     lowering::{lower_custom_hooks, lower_program},
-    rules::{Diagnostic, all_rules},
+    rules::{Diagnostic, RuleCtx, all_rules},
 };
 
 // ── Helpers ───────────────────────────────────────────────name────────────────
@@ -48,10 +48,9 @@ fn parse_and_analyze(src: &str) -> ProgramAnalysisResult {
 
 fn diags_for(result: &ProgramAnalysisResult, component: &str) -> Vec<Diagnostic> {
     let rules = all_rules();
-    rules
-        .iter()
-        .flat_map(|r| r.check(result, &component.to_string()))
-        .collect()
+    let component = component.to_string();
+    let ctx = RuleCtx::new(result, &component);
+    rules.iter().flat_map(|r| r.check(&ctx)).collect()
 }
 
 // ── Test 1: infinite loop detected through custom hook ────────────────────────

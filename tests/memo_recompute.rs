@@ -10,6 +10,7 @@
 use oxc_allocator::Allocator;
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::SourceType;
+use reactant::rules::RuleCtx;
 
 use reactant::{
     engine::{ComponentRegistry, Config, HookRegistry, RootStrategy, analyze_program},
@@ -44,7 +45,7 @@ fn diags(src: &str, comp: &str) -> Vec<Diagnostic> {
     );
     all_rules()
         .iter()
-        .flat_map(|r| r.check(&result, &comp.to_string()))
+        .flat_map(|r| r.check(&RuleCtx::new(&result, &comp.to_string())))
         .collect()
 }
 

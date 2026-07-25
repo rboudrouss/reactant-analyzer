@@ -10,6 +10,7 @@
 use oxc_allocator::Allocator;
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::SourceType;
+use reactant::rules::RuleCtx;
 
 use reactant::{
     domains::StateValueTransfer,
@@ -54,7 +55,7 @@ fn infinite_loop_hits(src: &str) -> usize {
             let name = comp.name.clone();
             let result = analyze_component(comp, &StateValueTransfer, &Config::default());
             let prog = make_prog(&name, result);
-            InfiniteLoop.check(&prog, &name).len()
+            InfiniteLoop.check(&RuleCtx::new(&prog, &name)).len()
         })
         .sum()
 }

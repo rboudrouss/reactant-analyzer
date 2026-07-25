@@ -8,6 +8,7 @@
 use oxc_allocator::Allocator;
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::SourceType;
+use reactant::rules::RuleCtx;
 
 use reactant::{
     domains::StateValueTransfer,
@@ -52,7 +53,7 @@ fn missing_deps_hits(src: &str) -> usize {
             let name = comp.name.clone();
             let result = analyze_component(comp, &StateValueTransfer, &Config::default());
             let prog = make_prog(&name, result);
-            MissingDeps.check(&prog, &name).len()
+            MissingDeps.check(&RuleCtx::new(&prog, &name)).len()
         })
         .sum()
 }
@@ -155,7 +156,7 @@ fn callback_diagnostic_message_mentions_callback() {
             let name = comp.name.clone();
             let result = analyze_component(comp, &StateValueTransfer, &Config::default());
             let prog = make_prog(&name, result);
-            MissingDeps.check(&prog, &name)
+            MissingDeps.check(&RuleCtx::new(&prog, &name))
         })
         .collect();
     assert!(
@@ -191,7 +192,7 @@ fn memo_diagnostic_message_mentions_memo() {
             let name = comp.name.clone();
             let result = analyze_component(comp, &StateValueTransfer, &Config::default());
             let prog = make_prog(&name, result);
-            MissingDeps.check(&prog, &name)
+            MissingDeps.check(&RuleCtx::new(&prog, &name))
         })
         .collect();
     assert!(

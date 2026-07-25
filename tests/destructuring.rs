@@ -11,6 +11,7 @@
 use oxc_allocator::Allocator;
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::SourceType;
+use reactant::rules::RuleCtx;
 
 use reactant::{
     domains::StateValueTransfer,
@@ -78,7 +79,7 @@ fn any_diags(src: &str) -> usize {
             let prog = make_prog(&name, result);
             all_rules()
                 .iter()
-                .flat_map(|rule| rule.check(&prog, &name))
+                .flat_map(|rule| rule.check(&RuleCtx::new(&prog, &name)))
                 .collect::<Vec<_>>()
         })
         .count()
@@ -197,7 +198,7 @@ fn destructured_state_setter_detected() {
                 &reactant::engine::Config::default(),
             );
             let prog = make_prog(&name, result);
-            SetterInRender.check(&prog, &name).len()
+            SetterInRender.check(&RuleCtx::new(&prog, &name)).len()
         })
         .sum();
     // The setter is inside a nested array destr it must still be recognized.
@@ -235,7 +236,7 @@ fn nested_destr_fixture_no_false_positive() {
                 &reactant::engine::Config::default(),
             );
             let prog = make_prog(&name, result);
-            InfiniteLoop.check(&prog, &name).len()
+            InfiniteLoop.check(&RuleCtx::new(&prog, &name)).len()
         })
         .sum();
     let sir: usize = make_results()
@@ -248,7 +249,7 @@ fn nested_destr_fixture_no_false_positive() {
                 &reactant::engine::Config::default(),
             );
             let prog = make_prog(&name, result);
-            SetterInRender.check(&prog, &name).len()
+            SetterInRender.check(&RuleCtx::new(&prog, &name)).len()
         })
         .sum();
     assert_eq!(il, 0, "nested_destr.tsx: no infinite-loop expected");

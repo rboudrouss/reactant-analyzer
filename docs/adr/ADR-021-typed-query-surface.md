@@ -17,12 +17,13 @@
 > through `warn`/`info`. The §5 false negative is fixed (`is_unstable` withdrawn)
 > and pinned by
 > `tests/effect_cycles.rs::top_prop_dep_does_not_silence_self_write_loop`.
-> **Deferred**: the `Rule` trait *signature* swap to `check(&RuleCtx)` (§4).
-> `RuleCtx` exists and is the anchor (rules build/consume it internally), but the
-> dispatcher and tests still pass `(&ProgramAnalysisResult, &Symbol)`; hoisting
-> `RuleCtx::new` to the caller is a mechanical follow-up across ~143 call sites.
-> Also deferred: `stability_verdict` reads the plain exit env (not yet the
-> memo-store refinement), matching the retained `is_stable` readers.
+> ~~**Deferred**: the `Rule` trait *signature* swap to `check(&RuleCtx)`
+> (§4).~~ Landed 2026-07-25: `check`/`safe_check` now take `&RuleCtx`; the
+> dispatcher builds the ctx once per component and every call site (~150,
+> tests included) constructs it via `RuleCtx::new`. The anchor is frozen —
+> frontend work binds to a fixed surface. Still deferred: `stability_verdict`
+> reads the plain exit env (not yet the memo-store refinement), matching the
+> retained `is_stable` readers.
 >
 > **Hardening round (2026-07-24, post-review).** The first cut left three gaps,
 > found by compile-probing the guarantee; all three are closed:

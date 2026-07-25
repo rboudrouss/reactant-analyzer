@@ -1,8 +1,8 @@
+use super::RuleCtx;
 use std::collections::{HashMap, HashSet};
 
 use crate::{
     domains::{AbstractDomain, AbstractEnv, MemoStore, StateStore, StateValue},
-    engine::ProgramAnalysisResult,
     ir::{
         cfg::CFG,
         expr::Expr,
@@ -24,11 +24,8 @@ impl Rule for RedundantSetState {
         "redundant-set-state"
     }
 
-    fn safe_check(
-        &self,
-        result: &ProgramAnalysisResult,
-        component: &Symbol,
-    ) -> Option<super::SafeCheck> {
+    fn safe_check(&self, ctx: &RuleCtx) -> Option<super::SafeCheck> {
+        let (result, component) = (ctx.program(), ctx.component());
         use crate::engine::HookKind;
         (super::has_hook_kind(result, component, HookKind::State)
             && super::has_hook_kind(result, component, HookKind::Effect))
@@ -38,7 +35,8 @@ impl Rule for RedundantSetState {
         })
     }
 
-    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+    fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
+        let (result, component) = (ctx.program(), ctx.component());
         let result = &result.components[component];
         let mut diags = Vec::new();
 
@@ -357,7 +355,7 @@ mod tests {
             vec![("setN", StateValue::reference(Stability::Stable), Some(0))],
             vec![(0, StateValue::reference(Stability::Stable))],
         );
-        let diags = RedundantSetState.check(&prog(&result), &"C".to_string());
+        let diags = RedundantSetState.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].hook_label, Some(0));
     }
@@ -389,7 +387,7 @@ mod tests {
         );
         assert!(
             RedundantSetState
-                .check(&prog(&result), &"C".to_string())
+                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
                 .is_empty()
         );
     }
@@ -418,7 +416,7 @@ mod tests {
         );
         assert!(
             RedundantSetState
-                .check(&prog(&result), &"C".to_string())
+                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
                 .is_empty()
         );
     }
@@ -435,7 +433,7 @@ mod tests {
         let result = make_result(vec![(0, stmts)], vec![], vec![]);
         assert!(
             RedundantSetState
-                .check(&prog(&result), &"C".to_string())
+                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
                 .is_empty()
         );
     }
@@ -463,7 +461,7 @@ mod tests {
         );
         assert_eq!(
             RedundantSetState
-                .check(&prog(&result), &"C".to_string())
+                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
                 .len(),
             1
         );
@@ -530,7 +528,7 @@ mod tests {
             vec![("setN", StateValue::reference(Stability::Stable), Some(0))],
             vec![(0, StateValue::reference(Stability::Stable))],
         );
-        let diags = RedundantSetState.check(&prog(&result), &"C".to_string());
+        let diags = RedundantSetState.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
         assert_eq!(diags.len(), 1, "effect body setter should be checked");
         assert_eq!(diags[0].hook_label, Some(0));
     }
@@ -561,7 +559,7 @@ mod tests {
         );
         assert!(
             RedundantSetState
-                .check(&prog(&result), &"C".to_string())
+                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
                 .is_empty()
         );
     }
@@ -592,7 +590,7 @@ mod tests {
         );
         assert!(
             RedundantSetState
-                .check(&prog(&result), &"C".to_string())
+                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
                 .is_empty()
         );
     }

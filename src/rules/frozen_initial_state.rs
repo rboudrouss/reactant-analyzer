@@ -1,14 +1,15 @@
+use super::RuleCtx;
 use std::collections::{HashMap, HashSet};
 
 use crate::{
     domains::StateValue,
-    engine::{AnalysisResult, ProgramAnalysisResult},
+    engine::AnalysisResult,
     ir::{
         cfg::CFG,
         expr::Expr,
         free_vars::{AccessPath, collect_used_paths, dep_paths, path_covered},
         hooks::HookEntry,
-        types::{HookLabel, Symbol, Var},
+        types::{HookLabel, Var},
     },
 };
 
@@ -245,11 +246,8 @@ impl Rule for FrozenInitialState {
         "frozen-initial-state"
     }
 
-    fn safe_check(
-        &self,
-        result: &ProgramAnalysisResult,
-        component: &Symbol,
-    ) -> Option<super::SafeCheck> {
+    fn safe_check(&self, ctx: &RuleCtx) -> Option<super::SafeCheck> {
+        let (result, component) = (ctx.program(), ctx.component());
         let comp = result.components.get(component)?;
         let bindings = local_bindings(&comp.render_cfg);
         let applicable = comp.hooks.iter().any(|h| {
@@ -262,7 +260,8 @@ impl Rule for FrozenInitialState {
         })
     }
 
-    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+    fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
+        let (result, component) = (ctx.program(), ctx.component());
         let comp = &result.components[component];
         let render_cfg = &comp.render_cfg;
         let bindings = local_bindings(render_cfg);

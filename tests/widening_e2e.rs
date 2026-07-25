@@ -11,6 +11,7 @@
 //! `Stmt::Assign` (see `expr_lower.rs`), so a local loop counter grows in the IR
 //! and converges to the threshold instead of freezing at its init value.
 
+use reactant::rules::RuleCtx;
 use std::collections::HashMap;
 
 use oxc_allocator::Allocator;
@@ -68,7 +69,7 @@ fn rule_hits<R: Rule>(
         file_table: Default::default(),
         function_registry: Default::default(),
     };
-    rule.check(&prog, &name.to_string()).len()
+    rule.check(&RuleCtx::new(&prog, &name.to_string())).len()
 }
 
 fn infinite_loop_hits(results: &HashMap<String, AnalysisResult<StateValue>>, name: &str) -> usize {

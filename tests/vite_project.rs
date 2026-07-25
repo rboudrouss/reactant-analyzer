@@ -1,6 +1,7 @@
 //! End-to-end Vite project support (ADR-016): detection, tsconfig `paths`
 //! loading through `references`, and alias-resolved cross-file hook inlining.
 
+use reactant::rules::RuleCtx;
 use std::path::{Path, PathBuf};
 
 use reactant::{
@@ -62,7 +63,7 @@ fn infinite_loop_surfaces_on_app_through_alias() {
 
     let diags: Vec<_> = all_rules()
         .iter()
-        .flat_map(|r| r.check(&result, &"App".to_string()))
+        .flat_map(|r| r.check(&RuleCtx::new(&result, &"App".to_string())))
         .collect();
     assert!(
         diags

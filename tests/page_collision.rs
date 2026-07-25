@@ -2,6 +2,7 @@
 //! different files must coexist in the analyzer's output the Next.js
 //! `app/<route>/page.tsx` pattern is no longer silently dropped.
 
+use reactant::rules::RuleCtx;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -147,7 +148,7 @@ fn two_pages_in_different_files_coexist_and_only_buggy_one_warns() {
     for key in &page_like {
         let warns = rules
             .iter()
-            .flat_map(|r| r.check(&result, key))
+            .flat_map(|r| r.check(&RuleCtx::new(&result, key)))
             .filter(|d| d.severity() == Severity::Warning || d.severity() == Severity::Error)
             .count();
         errors_per_key.push(((**key).clone(), warns));

@@ -1,15 +1,13 @@
+use super::RuleCtx;
 use std::collections::{HashMap, HashSet};
 
-use crate::{
-    engine::ProgramAnalysisResult,
-    ir::{
-        SourceRange,
-        cfg::{CFG, Terminator},
-        expr::Expr,
-        hooks::HookEntry,
-        stmt::{MemberKey, Stmt},
-        types::{HookLabel, Symbol, Var},
-    },
+use crate::ir::{
+    SourceRange,
+    cfg::{CFG, Terminator},
+    expr::Expr,
+    hooks::HookEntry,
+    stmt::{MemberKey, Stmt},
+    types::{HookLabel, Var},
 };
 
 use super::{
@@ -380,11 +378,8 @@ impl Rule for StateMutation {
         "state-mutation"
     }
 
-    fn safe_check(
-        &self,
-        result: &ProgramAnalysisResult,
-        component: &Symbol,
-    ) -> Option<super::SafeCheck> {
+    fn safe_check(&self, ctx: &RuleCtx) -> Option<super::SafeCheck> {
+        let (result, component) = (ctx.program(), ctx.component());
         use crate::engine::HookKind;
         super::has_hook_kind(result, component, HookKind::State).then_some(super::SafeCheck {
             rule: self.name(),
@@ -392,7 +387,8 @@ impl Rule for StateMutation {
         })
     }
 
-    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+    fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
+        let (result, component) = (ctx.program(), ctx.component());
         let result = &result.components[component];
         let state_val_label = state_val_labels(&result.render_cfg);
         let setter_label = all_setter_labels(result);

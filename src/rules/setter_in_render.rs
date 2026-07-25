@@ -1,12 +1,10 @@
+use super::RuleCtx;
 use std::collections::{HashMap, HashSet};
 
-use crate::{
-    engine::ProgramAnalysisResult,
-    ir::{
-        expr::Expr,
-        stmt::Stmt,
-        types::{BlockId, HookLabel, Symbol, Var},
-    },
+use crate::ir::{
+    expr::Expr,
+    stmt::Stmt,
+    types::{BlockId, HookLabel, Var},
 };
 
 use super::churn::{converges_once_written, eval_in_exit_env};
@@ -40,11 +38,8 @@ impl Rule for SetterInRender {
         "setter-in-render"
     }
 
-    fn safe_check(
-        &self,
-        result: &ProgramAnalysisResult,
-        component: &Symbol,
-    ) -> Option<super::SafeCheck> {
+    fn safe_check(&self, ctx: &RuleCtx) -> Option<super::SafeCheck> {
+        let (result, component) = (ctx.program(), ctx.component());
         use crate::engine::HookKind;
         // Local setters exist iff the component has a useState slot.
         super::has_hook_kind(result, component, HookKind::State).then_some(super::SafeCheck {
@@ -53,7 +48,8 @@ impl Rule for SetterInRender {
         })
     }
 
-    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+    fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
+        let (result, component) = (ctx.program(), ctx.component());
         let comp_result = &result.components[component];
 
         let local_setter_info: HashMap<Var, (HookLabel, Option<crate::ir::SourceRange>)> =
@@ -255,7 +251,7 @@ mod tests {
         let result = make_result(vec![], vec![]);
         assert!(
             SetterInRender
-                .check(&prog("C", &result), &"C".to_string())
+                .check(&RuleCtx::new(&prog("C", &result), &"C".to_string()))
                 .is_empty()
         );
     }
@@ -270,7 +266,7 @@ mod tests {
         let result = make_result(vec![], render_stmts);
         assert!(
             SetterInRender
-                .check(&prog("C", &result), &"C".to_string())
+                .check(&RuleCtx::new(&prog("C", &result), &"C".to_string()))
                 .is_empty()
         );
     }
@@ -292,7 +288,7 @@ mod tests {
             ),
         ];
         let result = make_result(vec![], render_stmts);
-        let diags = SetterInRender.check(&prog("C", &result), &"C".to_string());
+        let diags = SetterInRender.check(&RuleCtx::new(&prog("C", &result), &"C".to_string()));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].rule, "setter-in-render");
         assert_eq!(diags[0].severity(), Severity::Error);
@@ -357,7 +353,7 @@ mod tests {
                 },
             ],
         });
-        let diags = SetterInRender.check(&prog("C", &result), &"C".to_string());
+        let diags = SetterInRender.check(&RuleCtx::new(&prog("C", &result), &"C".to_string()));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].severity(), Severity::Warning);
     }
@@ -391,7 +387,7 @@ mod tests {
             ),
         ];
         let result = make_result(vec![], render_stmts);
-        let diags = SetterInRender.check(&prog("C", &result), &"C".to_string());
+        let diags = SetterInRender.check(&RuleCtx::new(&prog("C", &result), &"C".to_string()));
         assert_eq!(diags.len(), 2, "both setA and setB should be reported");
     }
 
@@ -449,7 +445,10 @@ mod tests {
             module_consts: Default::default(),
         };
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let diags = SetterInRender.check(&prog("Counter", &result), &"Counter".to_string());
+        let diags = SetterInRender.check(&RuleCtx::new(
+            &prog("Counter", &result),
+            &"Counter".to_string(),
+        ));
         assert!(!diags.is_empty(), "setter in render body should warn");
         assert_eq!(diags[0].severity(), Severity::Error);
     }
@@ -484,7 +483,7 @@ mod tests {
             ),
         ];
         let result = make_result(vec![], render_stmts);
-        let diags = SetterInRender.check(&prog("C", &result), &"C".to_string());
+        let diags = SetterInRender.check(&RuleCtx::new(&prog("C", &result), &"C".to_string()));
         assert_eq!(
             diags.len(),
             1,

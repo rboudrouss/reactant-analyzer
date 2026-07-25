@@ -13,7 +13,7 @@ use reactant::{
     },
     ir::FunctionIR,
     lowering::{lower_custom_hooks, lower_program, lower_utilities},
-    rules::{Severity, all_rules},
+    rules::{RuleCtx, Severity, all_rules},
 };
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -88,9 +88,11 @@ fn analyze(
 
 fn warnings_for(result: &reactant::engine::ProgramAnalysisResult, component: &str) -> Vec<String> {
     let rules = all_rules();
+    let component = component.to_string();
+    let ctx = RuleCtx::new(result, &component);
     rules
         .iter()
-        .flat_map(|r| r.check(result, &component.to_string()))
+        .flat_map(|r| r.check(&ctx))
         .filter(|d| d.severity() == Severity::Warning || d.severity() == Severity::Error)
         .map(|d| d.rule.to_string())
         .collect()

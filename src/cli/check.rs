@@ -10,7 +10,7 @@ use reactant::{
     ir::FileTable,
     project::{self, ProjectKind},
     resolver::{DefaultFileDiscoverer, FileDiscoverer, analyze_lowered, lower_files},
-    rules::{Diagnostic, SafeCheck, Severity, all_rules, rule_doc},
+    rules::{Diagnostic, RuleCtx, SafeCheck, Severity, all_rules, rule_doc},
 };
 
 use super::{EXIT_FINDINGS, EXIT_OK, EXIT_USAGE, FailOn, OutputFormat, ProjectMode};
@@ -282,12 +282,13 @@ pub fn run(mut args: CheckArgs) -> i32 {
         // Per rule: collect its diagnostics; when it produced none, consult
         // `safe_check` — a rule reports "verified safe" only when it was
         // applicable to this component (see the `SafeCheck` doc).
+        let ctx = RuleCtx::new(&program_result, name);
         let mut diags: Vec<Diagnostic> = Vec::new();
         let mut safe_checks: Vec<SafeCheck> = Vec::new();
         for r in &rules {
-            let produced = r.check(&program_result, name);
+            let produced = r.check(&ctx);
             if produced.is_empty()
-                && let Some(sc) = r.safe_check(&program_result, name)
+                && let Some(sc) = r.safe_check(&ctx)
             {
                 safe_checks.push(sc);
             }

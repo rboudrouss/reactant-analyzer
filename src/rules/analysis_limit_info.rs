@@ -1,7 +1,5 @@
-use crate::{
-    engine::{HookKind, ProgramAnalysisResult},
-    ir::{hooks::HookEntry, types::Symbol},
-};
+use super::RuleCtx;
+use crate::{engine::HookKind, ir::hooks::HookEntry};
 
 use super::{Diagnostic, Rule};
 
@@ -25,7 +23,8 @@ impl Rule for AnalysisLimitInfo {
         "analysis-limit"
     }
 
-    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+    fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
+        let (result, component) = (ctx.program(), ctx.component());
         let mut diags = vec![];
         let stats = &result.stats;
 

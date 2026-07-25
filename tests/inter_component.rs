@@ -7,6 +7,7 @@
 ///   - Recursive components (no crash / correct recursion cutoff)
 ///   - `RootStrategy::Heuristic` identifies correct roots
 ///   - `FieldAccess` heap lookup for destructured props
+use reactant::rules::RuleCtx;
 use std::collections::HashMap;
 
 use reactant::{
@@ -498,7 +499,7 @@ fn missing_deps_fires_for_unstable_callback_prop() {
     // The component might be named Section5_Child (root) or analyzed as child of Section5_Parent.
     let child_name = "Section5_Child".to_string();
     if result.components.contains_key(&child_name) {
-        let diags = MissingDeps.check(&result, &child_name);
+        let diags = MissingDeps.check(&RuleCtx::new(&result, &child_name));
         assert!(
             !diags.is_empty(),
             "MissingDeps should fire on Section5_Child: onUpdate is unstable but not in deps"
@@ -519,7 +520,7 @@ fn missing_deps_no_fire_for_stable_setter_prop() {
     // Stable value → MissingDeps must NOT fire.
     let child_name = "Section6_Child".to_string();
     if result.components.contains_key(&child_name) {
-        let diags = MissingDeps.check(&result, &child_name);
+        let diags = MissingDeps.check(&RuleCtx::new(&result, &child_name));
         let missing_update: Vec<_> = diags
             .iter()
             .filter(|d| d.var.as_deref() == Some("onUpdate"))
@@ -789,7 +790,7 @@ fn conditional_hook_fires_on_child_with_prop_gated_hook() {
     // Fires regardless of inter analysis since it's a structural CFG check.
     let child_name = "Section11_Child".to_string();
     if result.components.contains_key(&child_name) {
-        let diags = ConditionalHook.check(&result, &child_name);
+        let diags = ConditionalHook.check(&RuleCtx::new(&result, &child_name));
         assert!(
             !diags.is_empty(),
             "ConditionalHook should fire on Section11_Child: useState inside if(show)"
@@ -809,7 +810,7 @@ fn setter_in_render_fires_on_child_receiving_prop() {
     // SetterInRender fires since setVal IS in setter_bindings (child's own useState).
     let child_name = "Section12_Child".to_string();
     if result.components.contains_key(&child_name) {
-        let diags = SetterInRender.check(&result, &child_name);
+        let diags = SetterInRender.check(&RuleCtx::new(&result, &child_name));
         assert!(
             !diags.is_empty(),
             "SetterInRender should fire on Section12_Child: own setter called in render"
@@ -831,7 +832,7 @@ fn redundant_set_state_inter_specific_stable_string_prop() {
     let result_inter = parse_and_analyze(&src);
     let child_name = "Section13_Child".to_string();
     if result_inter.components.contains_key(&child_name) {
-        let diags = RedundantSetState.check(&result_inter, &child_name);
+        let diags = RedundantSetState.check(&RuleCtx::new(&result_inter, &child_name));
         assert!(
             !diags.is_empty(),
             "Inter analysis: RedundantSetState should fire stableLabel=StrConst(\"hello\") is \
@@ -858,7 +859,7 @@ fn infinite_loop_fires_inter_specific_numeric_step() {
     // step comes from parent as Number(1.0) → count grows numerically → widening.
     let child_name = "Section14_Child".to_string();
     if result.components.contains_key(&child_name) {
-        let diags = InfiniteLoop.check(&result, &child_name);
+        let diags = InfiniteLoop.check(&RuleCtx::new(&result, &child_name));
         assert!(
             !diags.is_empty(),
             "InfiniteLoop should fire on Section14_Child when step=Number(1) from parent. \
@@ -879,7 +880,7 @@ fn derived_state_fires_on_child_mirroring_parent_state() {
     // With inter, total=Number(5.0) so the derivation is concrete and detectable.
     let child_name = "Section15_Child".to_string();
     if result.components.contains_key(&child_name) {
-        let _diags = DerivedState.check(&result, &child_name);
+        let _diags = DerivedState.check(&RuleCtx::new(&result, &child_name));
         // DerivedState rule may or may not fire depending on how it identifies
         // prop-derived state (it currently focuses on state-to-state derivation).
         // Key assertion: no crash during analysis.
@@ -899,7 +900,7 @@ fn missing_deps_fires_on_callback_in_child() {
     // Section16_Child has useCallback(() => data.x, []) capturing unstable data.
     let child_name = "Section16_Child".to_string();
     if result.components.contains_key(&child_name) {
-        let diags = MissingDeps.check(&result, &child_name);
+        let diags = MissingDeps.check(&RuleCtx::new(&result, &child_name));
         assert!(
             diags.iter().any(|d| d.var.as_deref() == Some("data")),
             "MissingDeps should fire on Section16_Child for `data` in useCallback. \
@@ -926,7 +927,7 @@ fn missing_deps_no_fire_on_memo_with_stable_string_prop_inter() {
 
     let child_name = "Section17_Child".to_string();
     if result_inter.components.contains_key(&child_name) {
-        let diags = MissingDeps.check(&result_inter, &child_name);
+        let diags = MissingDeps.check(&RuleCtx::new(&result_inter, &child_name));
         let fp_inter: Vec<_> = diags
             .iter()
             .filter(|d| d.var.as_deref() == Some("label"))
@@ -953,7 +954,7 @@ fn always_unstable_deps_fires_on_child_inline_object_prop() {
     // Inline ObjectLit → Reference(Unstable) propagated via inter → fires.
     let child_name = "Section18_Child".to_string();
     if result.components.contains_key(&child_name) {
-        let diags = AlwaysUnstableDeps.check(&result, &child_name);
+        let diags = AlwaysUnstableDeps.check(&RuleCtx::new(&result, &child_name));
         assert!(
             !diags.is_empty(),
             "AlwaysUnstableDeps should fire on Section18_Child: \
@@ -975,7 +976,7 @@ fn lazy_init_fires_on_child_state() {
     // Section19_Child has useState(expensive(seed)) → structural Expr::Call init.
     let child_name = "Section19_Child".to_string();
     if result.components.contains_key(&child_name) {
-        let diags = LazyInit.check(&result, &child_name);
+        let diags = LazyInit.check(&RuleCtx::new(&result, &child_name));
         assert!(
             !diags.is_empty(),
             "LazyInit should fire on Section19_Child: useState init is Expr::Call."
@@ -997,7 +998,7 @@ fn missing_deps_inter_specific_fp_suppression() {
     let result_inter = parse_and_analyze(&src);
     let child_name = "Section6_Child".to_string();
     if result_inter.components.contains_key(&child_name) {
-        let diags_inter = MissingDeps.check(&result_inter, &child_name);
+        let diags_inter = MissingDeps.check(&RuleCtx::new(&result_inter, &child_name));
         let fp_inter: Vec<_> = diags_inter
             .iter()
             .filter(|d| d.var.as_deref() == Some("onUpdate"))
@@ -1040,7 +1041,8 @@ fn missing_deps_inter_specific_fp_suppression() {
             RootStrategy::AllComponents,
             &Config::default(),
         );
-        let diags_intra = MissingDeps.check(&result_intra, &"Section6_Child".to_string());
+        let diags_intra =
+            MissingDeps.check(&RuleCtx::new(&result_intra, &"Section6_Child".to_string()));
         let fp_intra: Vec<_> = diags_intra
             .iter()
             .filter(|d| d.var.as_deref() == Some("onUpdate"))

@@ -1,13 +1,7 @@
+use super::RuleCtx;
 use std::collections::HashSet;
 
-use crate::{
-    engine::ProgramAnalysisResult,
-    ir::{
-        expr::Expr,
-        hooks::HookEntry,
-        types::{Symbol, Var},
-    },
-};
+use crate::ir::{expr::Expr, hooks::HookEntry, types::Var};
 
 use super::{
     Diagnostic, MustResult, Rule, all_setter_labels, collect_setter_calls,
@@ -30,11 +24,8 @@ impl Rule for DerivedState {
         "derived-state"
     }
 
-    fn safe_check(
-        &self,
-        result: &ProgramAnalysisResult,
-        component: &Symbol,
-    ) -> Option<super::SafeCheck> {
+    fn safe_check(&self, ctx: &RuleCtx) -> Option<super::SafeCheck> {
+        let (result, component) = (ctx.program(), ctx.component());
         use crate::engine::HookKind;
         (super::has_hook_kind(result, component, HookKind::State)
             && super::has_hook_kind(result, component, HookKind::Effect))
@@ -44,7 +35,8 @@ impl Rule for DerivedState {
         })
     }
 
-    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+    fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
+        let (result, component) = (ctx.program(), ctx.component());
         let result = &result.components[component];
         let setter_label = all_setter_labels(result);
         let state_val_label = state_val_labels(&result.render_cfg);

@@ -6,6 +6,7 @@
 //! `Call` step whose span's `FileId` resolves to prefs.ts — the position the
 //! ADR-011 limitation used to mis-attribute.
 
+use reactant::rules::RuleCtx;
 use std::path::PathBuf;
 
 use reactant::{
@@ -27,7 +28,7 @@ fn lazy_init_witness_resolves_cross_file_effectful_call() {
     assert!(lowered.parse_errors.is_empty(), "fixture must parse");
     let program = analyze_lowered(lowered, RootStrategy::AllComponents, Config::default());
 
-    let diags = LazyInit.check(&program, &"Settings".to_string());
+    let diags = LazyInit.check(&RuleCtx::new(&program, &"Settings".to_string()));
     assert_eq!(diags.len(), 1, "one lazy-init finding");
     let d = &diags[0];
 

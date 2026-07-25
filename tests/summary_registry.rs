@@ -11,7 +11,7 @@ use reactant::{
     },
     lowering::{lower_custom_hooks, lower_program},
     registry::{HookSummary, SummaryRegistry},
-    rules::{Diagnostic, all_rules},
+    rules::{Diagnostic, RuleCtx, all_rules},
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -45,10 +45,9 @@ fn parse_and_analyze_with_config(src: &str, config: Config) -> ProgramAnalysisRe
 
 fn diags_for(result: &ProgramAnalysisResult, component: &str) -> Vec<Diagnostic> {
     let rules = all_rules();
-    rules
-        .iter()
-        .flat_map(|r| r.check(result, &component.to_string()))
-        .collect()
+    let component = component.to_string();
+    let ctx = RuleCtx::new(result, &component);
+    rules.iter().flat_map(|r| r.check(&ctx)).collect()
 }
 
 // ── Custom HookSummary implementations used by tests ─────────────────────────

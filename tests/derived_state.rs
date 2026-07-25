@@ -4,6 +4,7 @@
 //! and `setB` is not called anywhere else.  Should be replaced by `useMemo` or
 //! inlined into the render body.
 
+use reactant::rules::RuleCtx;
 use reactant::rules::{DerivedState, Rule};
 
 fn make_prog(
@@ -44,7 +45,7 @@ fn derived_state_hits(src: &str) -> usize {
                 &reactant::engine::Config::default(),
             );
             let prog = make_prog(&name, result);
-            DerivedState.check(&prog, &name).len()
+            DerivedState.check(&RuleCtx::new(&prog, &name)).len()
         })
         .sum()
 }

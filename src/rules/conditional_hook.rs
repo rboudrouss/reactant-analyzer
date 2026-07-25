@@ -1,5 +1,3 @@
-use crate::{engine::ProgramAnalysisResult, ir::types::Symbol};
-
 use super::{Diagnostic, Rule, RuleCtx};
 
 /// Fires when a hook is called inside a conditional branch.
@@ -14,11 +12,8 @@ impl Rule for ConditionalHook {
         "conditional-hook"
     }
 
-    fn safe_check(
-        &self,
-        result: &ProgramAnalysisResult,
-        component: &Symbol,
-    ) -> Option<super::SafeCheck> {
+    fn safe_check(&self, ctx: &RuleCtx) -> Option<super::SafeCheck> {
+        let (result, component) = (ctx.program(), ctx.component());
         // Applicable as soon as the component calls any hook at all.
         result
             .components
@@ -30,8 +25,7 @@ impl Rule for ConditionalHook {
             })
     }
 
-    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
-        let ctx = RuleCtx::new(result, component);
+    fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
         // The dominance ∀-exits check + guard witness live in the primitive; a
         // conditional hook yields a `Certified`, the only path to `error()`.
         ctx.hook_is_conditional()
@@ -200,7 +194,7 @@ mod tests {
                 span: None,
             }],
         );
-        let diags = ConditionalHook.check(&prog(&result), &"C".to_string());
+        let diags = ConditionalHook.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].notes.len(), 1);
         assert_eq!(diags[0].notes[0].range, Some(cond_span));
@@ -330,7 +324,7 @@ mod tests {
                 span: None,
             }],
         );
-        let diags = ConditionalHook.check(&prog(&result), &"C".to_string());
+        let diags = ConditionalHook.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].notes.len(), 1);
         assert_eq!(diags[0].notes[0].range, Some(guard_span));
@@ -350,7 +344,7 @@ mod tests {
         );
         assert!(
             ConditionalHook
-                .check(&prog(&result), &"C".to_string())
+                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
                 .is_empty()
         );
     }
@@ -369,7 +363,7 @@ mod tests {
         );
         assert!(
             ConditionalHook
-                .check(&prog(&result), &"C".to_string())
+                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
                 .is_empty()
         );
     }
@@ -386,7 +380,7 @@ mod tests {
                 span: None,
             }],
         );
-        let diags = ConditionalHook.check(&prog(&result), &"C".to_string());
+        let diags = ConditionalHook.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].hook_label, Some(0));
     }
@@ -405,7 +399,7 @@ mod tests {
         );
         assert!(
             ConditionalHook
-                .check(&prog(&result), &"C".to_string())
+                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
                 .is_empty()
         );
     }
@@ -428,7 +422,7 @@ mod tests {
             },
         ];
         let result = make_result(cfg, hook_calls);
-        let diags = ConditionalHook.check(&prog(&result), &"C".to_string());
+        let diags = ConditionalHook.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].hook_label, Some(1));
     }
@@ -469,7 +463,7 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(
             ConditionalHook
-                .check(&prog(&result), &"C".to_string())
+                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
                 .is_empty()
         );
     }
@@ -567,7 +561,7 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(
             !ConditionalHook
-                .check(&prog(&result), &"C".to_string())
+                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
                 .is_empty()
         );
     }

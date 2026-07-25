@@ -1,9 +1,9 @@
+use super::RuleCtx;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::{
     domains::impls::Stability,
-    engine::ProgramAnalysisResult,
     ir::{
         SourceRange,
         cfg::{CFG, Terminator},
@@ -467,11 +467,8 @@ impl Rule for StaleClosure {
         "stale-closure"
     }
 
-    fn safe_check(
-        &self,
-        result: &ProgramAnalysisResult,
-        component: &Symbol,
-    ) -> Option<super::SafeCheck> {
+    fn safe_check(&self, ctx: &RuleCtx) -> Option<super::SafeCheck> {
+        let (result, component) = (ctx.program(), ctx.component());
         // Applicable when some deps-gated effect registers a long-lived
         // callback at all.
         let comp_result = result.components.get(component)?;
@@ -499,7 +496,8 @@ impl Rule for StaleClosure {
         })
     }
 
-    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+    fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
+        let (result, component) = (ctx.program(), ctx.component());
         let comp_result = &result.components[component];
         let render_cfg = &comp_result.render_cfg;
 

@@ -5,6 +5,7 @@
 use oxc_allocator::Allocator;
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::SourceType;
+use reactant::rules::RuleCtx;
 
 use reactant::{
     domains::StateValueTransfer,
@@ -48,7 +49,7 @@ fn diagnostics(src: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for name in &names {
         for rule in all_rules() {
-            for d in rule.check(&prog, name) {
+            for d in rule.check(&RuleCtx::new(&prog, name)) {
                 out.push((d.rule.to_string(), d.message.clone()));
             }
         }
@@ -95,7 +96,7 @@ fn diagnostics_sev(src: &str) -> Vec<(String, reactant::rules::Severity, String)
     let mut out = Vec::new();
     for name in &names {
         for rule in all_rules() {
-            for d in rule.check(&prog, name) {
+            for d in rule.check(&RuleCtx::new(&prog, name)) {
                 out.push((d.rule.to_string(), d.severity(), d.message.clone()));
             }
         }
@@ -387,7 +388,7 @@ fn program_rules_fired(src: &str) -> Vec<String> {
         .flat_map(|name| {
             all_rules()
                 .iter()
-                .flat_map(|r| r.check(&prog, name))
+                .flat_map(|r| r.check(&RuleCtx::new(&prog, name)))
                 .map(|d| d.rule.to_string())
                 .collect::<Vec<_>>()
         })

@@ -1,4 +1,4 @@
-use crate::{engine::ProgramAnalysisResult, ir::types::Symbol};
+use super::RuleCtx;
 
 use super::{Diagnostic, Rule};
 
@@ -12,7 +12,8 @@ impl Rule for WideningInfo {
         "widening-info"
     }
 
-    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+    fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
+        let (result, component) = (ctx.program(), ctx.component());
         let result = &result.components[component];
         let mut labels: Vec<_> = result.widen_trace.keys().copied().collect();
         labels.sort_unstable();

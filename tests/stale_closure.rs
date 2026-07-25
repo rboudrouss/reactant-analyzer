@@ -10,6 +10,7 @@
 use oxc_allocator::Allocator;
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::SourceType;
+use reactant::rules::RuleCtx;
 
 use reactant::{
     domains::StateValueTransfer,
@@ -53,7 +54,7 @@ fn diags(src: &str) -> Vec<reactant::rules::Diagnostic> {
             let name = comp.name.clone();
             let result = analyze_component(comp, &StateValueTransfer, &Config::default());
             let prog = make_prog(&name, result);
-            StaleClosure.check(&prog, &name)
+            StaleClosure.check(&RuleCtx::new(&prog, &name))
         })
         .collect()
 }

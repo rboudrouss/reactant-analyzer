@@ -1,14 +1,9 @@
+use super::RuleCtx;
 use std::collections::HashMap;
 
 use crate::{
     domains::{AbstractDomain, AbstractEnv, BoolVal, MemoStore, StateStore, StateValue},
-    engine::ProgramAnalysisResult,
-    ir::{
-        expr::Expr,
-        hooks::HookEntry,
-        stmt::Stmt,
-        types::{HookLabel, Symbol},
-    },
+    ir::{expr::Expr, hooks::HookEntry, stmt::Stmt, types::HookLabel},
 };
 
 use super::{
@@ -29,11 +24,8 @@ impl Rule for UnnecessaryRerender {
         "unnecessary-rerender"
     }
 
-    fn safe_check(
-        &self,
-        result: &ProgramAnalysisResult,
-        component: &Symbol,
-    ) -> Option<super::SafeCheck> {
+    fn safe_check(&self, ctx: &RuleCtx) -> Option<super::SafeCheck> {
+        let (result, component) = (ctx.program(), ctx.component());
         use crate::engine::HookKind;
         // Needs a state slot and a mount-only (`deps: []`) effect to overwrite it.
         result
@@ -51,7 +43,8 @@ impl Rule for UnnecessaryRerender {
             })
     }
 
-    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic> {
+    fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
+        let (result, component) = (ctx.program(), ctx.component());
         let result = &result.components[component];
         let empty_env = AbstractEnv::bottom();
         let empty_state = StateStore::bottom();
@@ -274,7 +267,7 @@ mod tests {
             Some(vec![]),
         );
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let diags = UnnecessaryRerender.check(&prog(&result), &"C".to_string());
+        let diags = UnnecessaryRerender.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].rule, "unnecessary-rerender");
         assert_eq!(diags[0].hook_label, Some(0));
@@ -304,7 +297,7 @@ mod tests {
             Some(vec![]),
         );
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let diags = UnnecessaryRerender.check(&prog(&result), &"C".to_string());
+        let diags = UnnecessaryRerender.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
         assert_eq!(diags.len(), 1, "aliased setter should still warn");
         assert_eq!(diags[0].hook_label, Some(0));
     }
@@ -327,7 +320,7 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(
             UnnecessaryRerender
-                .check(&prog(&result), &"C".to_string())
+                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
                 .is_empty()
         );
     }
@@ -346,7 +339,7 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(
             UnnecessaryRerender
-                .check(&prog(&result), &"C".to_string())
+                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
                 .is_empty()
         );
     }
@@ -365,7 +358,7 @@ mod tests {
         )];
         let comp = component_with(Expr::Lit(Prim::Bool(false)), eff_stmts, Some(vec![]));
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let diags = UnnecessaryRerender.check(&prog(&result), &"C".to_string());
+        let diags = UnnecessaryRerender.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
         assert_eq!(diags.len(), 1);
         assert!(
             diags[0].message.contains("useSyncExternalStore"),
@@ -392,7 +385,7 @@ mod tests {
         )];
         let comp = component_with(Expr::Lit(Prim::Bool(true)), eff_stmts, Some(vec![]));
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let diags = UnnecessaryRerender.check(&prog(&result), &"C".to_string());
+        let diags = UnnecessaryRerender.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
         assert_eq!(diags.len(), 1);
         assert!(
             diags[0].message.contains("initialising directly"),
@@ -415,7 +408,7 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(
             !UnnecessaryRerender
-                .check(&prog(&result), &"C".to_string())
+                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
                 .is_empty()
         );
     }

@@ -218,22 +218,22 @@ pub(crate) fn arg_is_call_free(
 /// Post-pass analysis rule operating on a fully-computed `AnalysisResult`.
 ///
 /// Rules are stateless; adding a new rule = new struct + `impl Rule`.
+///
+/// Both methods bind to [`RuleCtx`] (ADR-021 §4): the caller resolves the
+/// component once (`RuleCtx::new`), and the ctx is the stable anchor the
+/// future external frontends bind to.
 pub trait Rule {
     fn name(&self) -> &'static str;
-    fn check(&self, result: &ProgramAnalysisResult, component: &Symbol) -> Vec<Diagnostic>;
+    fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic>;
 
-    /// When this rule is *applicable* to `component` but `check` found nothing,
-    /// the positive assurance to surface under `--info`.
+    /// When this rule is *applicable* to the ctx's component but `check` found
+    /// nothing, the positive assurance to surface under `--info`.
     ///
     /// Only consulted after `check` returned no diagnostics for the component,
     /// so implementations decide *applicability* only — they need not re-check.
     /// Default `None`: the rule opts out (e.g. Info-limitation rules, which have
     /// no "safe" state to report).
-    fn safe_check(
-        &self,
-        _result: &ProgramAnalysisResult,
-        _component: &Symbol,
-    ) -> Option<SafeCheck> {
+    fn safe_check(&self, _ctx: &RuleCtx) -> Option<SafeCheck> {
         None
     }
 }

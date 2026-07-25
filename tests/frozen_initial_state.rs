@@ -8,6 +8,7 @@
 //! Silent: prop provably still, sync effect keyed on the prop, render-time
 //! adjust pattern, no-deps syncing effect, literal initializers.
 
+use reactant::rules::RuleCtx;
 use reactant::{
     engine::{
         ComponentRegistry, Config, HookRegistry, ProgramAnalysisResult, RootStrategy,
@@ -50,7 +51,7 @@ fn diags_for(src: &str, component: &str) -> Vec<reactant::rules::Diagnostic> {
         "component `{component}` not analyzed; got: {:?}",
         result.components.keys().collect::<Vec<_>>()
     );
-    FrozenInitialState.check(&result, &component.to_string())
+    FrozenInitialState.check(&RuleCtx::new(&result, &component.to_string()))
 }
 
 // ── Error: proven versioned prop, no sync ─────────────────────────────────────
@@ -439,7 +440,7 @@ fn safe_check_applicable_only_with_prop_seeded_state() {
     );
     assert!(
         FrozenInitialState
-            .safe_check(&synced, &"Child".to_string())
+            .safe_check(&RuleCtx::new(&synced, &"Child".to_string()))
             .is_some(),
         "prop-seeded state → applicable"
     );
@@ -455,7 +456,7 @@ fn safe_check_applicable_only_with_prop_seeded_state() {
     );
     assert!(
         FrozenInitialState
-            .safe_check(&literal, &"Counter".to_string())
+            .safe_check(&RuleCtx::new(&literal, &"Counter".to_string()))
             .is_none(),
         "literal-only state → not applicable"
     );
