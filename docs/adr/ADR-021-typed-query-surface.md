@@ -4,7 +4,7 @@
 - **Date**: 2026-07-24
 
 > **Implementation status (2026-07-24).** Landed: the typed substrate
-> (`src/rules/query.rs` — `Certified` with a module-private ctor, `MustResult`,
+> (`src/rules/api/query.rs` — `Certified` with a module-private ctor, `MustResult`,
 > `May`, `StabilityVerdict`, `Provenance`, `RuleCtx`, `RuleConfig`); the query
 > primitives (`stability_verdict`/`may_change`, `must_setter_on_all_paths`,
 > `must_on_all_paths`, `ExitDominance`/`must_dominates_all_exits`,
@@ -31,7 +31,7 @@
 >    "private" in `rules/mod.rs` stayed callable from every rule submodule, and
 >    the `pub severity` field allowed forging an Error by mutation or struct
 >    literal from anywhere. `Diagnostic` now lives in the **leaf** module
->    `src/rules/diagnostic.rs` with `severity` private behind a getter; all
+>    `src/rules/api/diagnostic.rs` with `severity` private behind a getter; all
 >    three forgery probes are now compile errors (E0616/E0624).
 > 2. *Two mints were token vending machines.* `must_effect_cycle(bool, bool)`
 >    and `must_frozen_seed(bool, …)` did no analysis — any caller passing

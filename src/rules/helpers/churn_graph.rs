@@ -50,13 +50,13 @@ use super::churn::{
     ChurnSetterCall, Freshness, SlotNode, classify_effect_deps, collect_churn_calls,
     converges_once_written, on_all_paths, reference_part,
 };
-use super::{
+use super::setters::{
     collect_component_setter_vars, collect_fn_bindings, memo_val_labels, resolve_setter_aliases,
     setter_var_labels, state_val_labels,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum EdgeStrength {
+pub(in crate::rules) enum EdgeStrength {
     /// Dep merely versioned by `from`, or the write is conditional/imprecise.
     May,
     /// Exact-slot dep ∧ must-fresh write on all paths.
@@ -64,7 +64,7 @@ pub(super) enum EdgeStrength {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct ChurnEdge {
+pub(in crate::rules) struct ChurnEdge {
     pub from: SlotNode,
     pub to: SlotNode,
     pub strength: EdgeStrength,
@@ -78,7 +78,7 @@ pub(super) struct ChurnEdge {
 
 /// One churn cycle: indices into the edge list, in cycle order
 /// (`edges[i].to == edges[i+1].from`, last wraps to first).
-pub(super) struct ChurnCycle {
+pub(in crate::rules) struct ChurnCycle {
     pub edge_idx: Vec<usize>,
     pub all_must: bool,
     /// The cycle involves more than one component (slot owners or effect
@@ -88,7 +88,7 @@ pub(super) struct ChurnCycle {
 }
 
 /// Build all churn edges of the program.
-pub(super) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
+pub(in crate::rules) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     // Per-effect facts, gathered first so write-site counts are global before
     // any convergence kill is attempted (see module doc).
     struct EffectFacts<'a> {
@@ -294,7 +294,7 @@ pub(super) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec<ChurnEdge
 
 /// Find churn cycles: first in the must-only subgraph (all-must cycles),
 /// then in the full graph, skipping regions already reported.
-pub(super) fn find_churn_cycles(edges: &[ChurnEdge]) -> Vec<ChurnCycle> {
+pub(in crate::rules) fn find_churn_cycles(edges: &[ChurnEdge]) -> Vec<ChurnCycle> {
     let must_idx: Vec<usize> = (0..edges.len())
         .filter(|&i| edges[i].strength == EdgeStrength::Must)
         .collect();

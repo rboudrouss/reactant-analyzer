@@ -1,9 +1,11 @@
-use super::RuleCtx;
+use crate::rules::RuleCtx;
 use std::collections::HashSet;
 
 use crate::ir::{expr::Expr, hooks::HookEntry, types::Var};
 
-use super::{Diagnostic, MustResult, Rule, must_init_calls_setter, setter_var_labels};
+use crate::rules::{
+    Diagnostic, MustResult, Rule, collect_callees, must_init_calls_setter, setter_var_labels,
+};
 
 /// Fires when `useState(...)` is initialised with an expression that contains
 /// any function call (e.g. `useState(expensiveCompute())`, `useState(1 + f())`).
@@ -66,13 +68,15 @@ impl Rule for LazyInit {
         "lazy-init"
     }
 
-    fn safe_check(&self, ctx: &RuleCtx) -> Option<super::SafeCheck> {
+    fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
         let (result, component) = (ctx.program(), ctx.component());
         use crate::engine::HookKind;
-        super::has_hook_kind(result, component, HookKind::State).then_some(super::SafeCheck {
-            rule: self.name(),
-            message: "no useState initializer re-runs work on every render",
-        })
+        crate::rules::has_hook_kind(result, component, HookKind::State).then_some(
+            crate::rules::SafeCheck {
+                rule: self.name(),
+                message: "no useState initializer re-runs work on every render",
+            },
+        )
     }
 
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
@@ -149,7 +153,7 @@ impl Rule for LazyInit {
             // function registry — "`f` resolves to ./util.ts" → "its body
             // calls `fetch`". Refinement only: an unresolved callee just
             // yields a Resolve(Unknown) step, never a weaker severity.
-            d = d.with_notes(super::witness::chase_value(
+            d = d.with_notes(crate::rules::api::witness::chase_value(
                 &result.render_cfg,
                 init,
                 &program.function_registry,
@@ -195,29 +199,6 @@ fn classify_init_effect(init: &Expr, setters: &HashSet<Var>) -> InitEffect {
     }
 }
 
-/// Collect the callee (`fn_`) of every `Call` syntactically present in `e`,
-/// descending into arguments and composites. Shared with
-/// [`super::query::must_init_calls_setter`] so the setter-detection cannot drift.
-pub(crate) fn collect_callees<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
-    match e {
-        Expr::Call { fn_, args } => {
-            out.push(fn_);
-            collect_callees(fn_, out);
-            for a in args {
-                collect_callees(a, out);
-            }
-        }
-        // Rendering a component/element in init is real work with an unknown
-        // cost — register it (classified `Other`) so it is never demoted to a
-        // cheap-and-pure Info, then keep descending for nested calls in props.
-        Expr::CompApp { .. } | Expr::NativeElem { .. } => {
-            out.push(e);
-            e.for_each_child(&mut |c| collect_callees(c, out));
-        }
-        _ => e.for_each_child(&mut |c| collect_callees(c, out)),
-    }
-}
-
 enum Callee {
     Setter,
     Effectful(String),
@@ -227,7 +208,7 @@ enum Callee {
 
 /// Classify a single call target. Setters are proven (the engine tracks them);
 /// the effectful/pure name heuristics are shared witness infrastructure
-/// ([`super::witness::classify_callee_name`], ADR-019).
+/// ([`crate::rules::api::witness::classify_callee_name`], ADR-019).
 fn classify_callee(fn_: &Expr, setters: &HashSet<Var>) -> Callee {
     let fn_ = match fn_ {
         Expr::TSAnnotated(inner) => inner.as_ref(),
@@ -236,12 +217,14 @@ fn classify_callee(fn_: &Expr, setters: &HashSet<Var>) -> Callee {
     match fn_ {
         Expr::StateSetter(_) => Callee::Setter,
         Expr::Var(v) if setters.contains(v) => Callee::Setter,
-        _ => match super::witness::callee_parts(fn_) {
-            Some((method, root)) => match super::witness::classify_callee_name(method, root) {
-                (super::EffectClass::Effectful, n) => Callee::Effectful(n),
-                (super::EffectClass::PureCheap, n) => Callee::PureCheap(n),
-                _ => Callee::Other,
-            },
+        _ => match crate::rules::api::witness::callee_parts(fn_) {
+            Some((method, root)) => {
+                match crate::rules::api::witness::classify_callee_name(method, root) {
+                    (crate::rules::EffectClass::Effectful, n) => Callee::Effectful(n),
+                    (crate::rules::EffectClass::PureCheap, n) => Callee::PureCheap(n),
+                    _ => Callee::Other,
+                }
+            }
             None => Callee::Other,
         },
     }

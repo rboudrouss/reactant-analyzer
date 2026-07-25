@@ -1,7 +1,7 @@
-use super::RuleCtx;
+use crate::rules::RuleCtx;
 use crate::{engine::HookKind, ir::hooks::HookEntry};
 
-use super::{Diagnostic, Rule};
+use crate::rules::{Diagnostic, Rule};
 
 /// Emits `Info` diagnostics when the analyser deliberately truncates analysis
 /// to preserve soundness.  Each site is a potential source of false negatives.

@@ -1,11 +1,11 @@
-use super::RuleCtx;
+use crate::rules::RuleCtx;
 use crate::{
     domains::{AbstractEnv, MemoStore, StateStore, StateValueTransfer, impls::StateValue},
     engine::HookKind,
     ir::{expr::Expr, hooks::HookEntry, types::Symbol},
 };
 
-use super::{Diagnostic, Rule};
+use crate::rules::{Diagnostic, Rule};
 
 /// Fires when **at least one** dep in a `useEffect`/`useMemo`/`useCallback` deps
 /// array is a freshly-allocated **reference** (object/array/function literal).
@@ -33,14 +33,14 @@ impl Rule for AlwaysUnstableDeps {
         "always-unstable-deps"
     }
 
-    fn safe_check(&self, ctx: &RuleCtx) -> Option<super::SafeCheck> {
+    fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
         let (result, component) = (ctx.program(), ctx.component());
         // Applicable when some hook declared a non-empty deps array to defeat.
         result
             .components
             .get(component)
             .is_some_and(|c| c.effect_info.values().any(|e| !e.declared_deps.is_empty()))
-            .then_some(super::SafeCheck {
+            .then_some(crate::rules::SafeCheck {
                 rule: self.name(),
                 message: "no deps array is defeated by an always-fresh reference",
             })
@@ -94,7 +94,7 @@ impl Rule for AlwaysUnstableDeps {
                 continue;
             }
 
-            let word = super::hook_kind_word(kind);
+            let word = crate::rules::hook_kind_word(kind);
             let mut d = Diagnostic::warn(
                 "always-unstable-deps",
                 format!(
@@ -113,7 +113,7 @@ impl Rule for AlwaysUnstableDeps {
             // from — the binding it flows through, and the call/resolution
             // that mints a fresh reference.
             for i in &unstable_idx {
-                d = d.with_notes(super::witness::chase_value(
+                d = d.with_notes(crate::rules::api::witness::chase_value(
                     &result.render_cfg,
                     &deps_ref[*i],
                     &program.function_registry,
@@ -137,7 +137,7 @@ fn eval_dep_is_unstable(
     // own (zero-size) transfer.
     _transfer: &StateValueTransfer,
 ) -> bool {
-    let val = super::eval_in_stores(
+    let val = crate::rules::eval_in_stores(
         dep,
         env,
         component,

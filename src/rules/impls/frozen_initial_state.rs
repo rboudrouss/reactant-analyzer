@@ -1,4 +1,4 @@
-use super::RuleCtx;
+use crate::rules::RuleCtx;
 use std::collections::{HashMap, HashSet};
 
 use crate::{
@@ -13,11 +13,11 @@ use crate::{
     },
 };
 
-use super::{
+use crate::rules::{
     Certified, Diagnostic, Motion, MovingFeeder, MustResult, Rule, Severity, Step, ValueClass,
     all_setter_labels, classify_motion, collect_fn_bindings, collect_setter_calls,
-    collect_setter_calls_with_extra, local_bindings, must_frozen_seed,
-    stale_closure::may_written_slots, state_slot_name, state_val_labels,
+    collect_setter_calls_with_extra, local_bindings, may_written_slots, must_frozen_seed,
+    state_slot_name, state_val_labels,
 };
 
 /// Fires when a `useState` initializer reads a prop and nothing ever syncs
@@ -246,7 +246,7 @@ impl Rule for FrozenInitialState {
         "frozen-initial-state"
     }
 
-    fn safe_check(&self, ctx: &RuleCtx) -> Option<super::SafeCheck> {
+    fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
         let (result, component) = (ctx.program(), ctx.component());
         let comp = result.components.get(component)?;
         let bindings = local_bindings(&comp.render_cfg);
@@ -254,7 +254,7 @@ impl Rule for FrozenInitialState {
             matches!(h, HookEntry::State { init, .. }
                 if !seed_paths(init, &comp.param, &bindings).is_empty())
         });
-        applicable.then_some(super::SafeCheck {
+        applicable.then_some(crate::rules::SafeCheck {
             rule: self.name(),
             message: "no state slot freezes a changing prop's first value",
         })
@@ -482,6 +482,6 @@ fn eval_with_heap(expr: &Expr, comp: &AnalysisResult<StateValue>) -> StateValue 
     // props-param-rooted `FieldAccess` resolves through the props `Obj` rather
     // than degrading to ⊤. The heap choice is exactly what distinguishes this
     // wrapper — it must stay comp-seeded here.
-    use super::ConvergedEval;
+    use crate::rules::ConvergedEval;
     comp.eval_in(&comp.exit_env(), expr, &mut comp.heap.clone())
 }

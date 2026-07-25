@@ -27,15 +27,15 @@ use crate::{
     },
 };
 
-use super::collect_fn_bindings;
+use super::setters::collect_fn_bindings;
 
 /// A state slot qualified by its owning component: `(component, label)`. Lets a
 /// `ComponentSetter` prop (a write into a parent slot) be a first-class churn
 /// node alongside a local setter.
-pub(super) type SlotNode = (Symbol, HookLabel);
+pub(in crate::rules) type SlotNode = (Symbol, HookLabel);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum Freshness {
+pub(in crate::rules) enum Freshness {
     Not,
     /// May store a fresh reference (opaque value, imprecise updater).
     Maybe,
@@ -46,16 +46,16 @@ pub(super) enum Freshness {
 /// A `setX(arg)` call site found in an effect body. The target slot is
 /// qualified `(component, label)` so `ComponentSetter` props (writes into a
 /// parent slot) are first-class alongside local setters.
-pub(super) struct ChurnSetterCall {
-    pub(super) node: SlotNode,
-    pub(super) freshness: Freshness,
+pub(in crate::rules) struct ChurnSetterCall {
+    pub(in crate::rules) node: SlotNode,
+    pub(in crate::rules) freshness: Freshness,
     /// Top-level block of the effect body; `None` when nested in a callback
     /// (then never "must-reached").
-    pub(super) block_id: Option<BlockId>,
-    pub(super) span: Option<SourceRange>,
+    pub(in crate::rules) block_id: Option<BlockId>,
+    pub(in crate::rules) span: Option<SourceRange>,
     /// Abstract value being stored (fresh-reference approximation for
     /// functional updaters). Used for the convergence proof.
-    pub(super) written: crate::domains::StateValue,
+    pub(in crate::rules) written: crate::domains::StateValue,
 }
 
 /// Classify effect deps against the component's own state slots:
@@ -63,7 +63,7 @@ pub(super) struct ChurnSetterCall {
 ///   resolving to one): must-change whenever a fresh value is stored.
 /// - `versioned` — qualified slots `(component, label)` that merely version
 ///   a dep (field reads, memo chains, props): may-change under a fresh set.
-pub(super) fn classify_effect_deps(
+pub(in crate::rules) fn classify_effect_deps(
     dep_exprs: &[Expr],
     comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
     state_vals: &HashMap<Var, HookLabel>,
@@ -105,13 +105,15 @@ pub(super) fn classify_effect_deps(
 /// part (which cannot fail `Object.is` freshly) is dropped, so guard proofs
 /// don't lose to residual ⊤ noise. A ⊥ reference slot yields ⊥: no
 /// reference can ever be stored → the claimed reference churn is vacuous.
-pub(super) fn reference_part(written: &crate::domains::StateValue) -> crate::domains::StateValue {
+pub(in crate::rules) fn reference_part(
+    written: &crate::domains::StateValue,
+) -> crate::domains::StateValue {
     crate::domains::StateValue::reference(written.reference.clone())
 }
 
 /// Evaluate `expr` in the render exit environment (same pattern as
 /// `all_deps_provably_stable`).
-pub(super) fn eval_in_exit_env(
+pub(in crate::rules) fn eval_in_exit_env(
     expr: &Expr,
     comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
 ) -> crate::domains::StateValue {
@@ -194,7 +196,7 @@ fn classify_updater_return(e: &Expr, params: &[Var]) -> Freshness {
 /// Recursively collect `setX(arg)` calls with their argument freshness.
 /// `top_level` — block IDs belong to the effect body CFG (must-reach usable).
 #[allow(clippy::too_many_arguments)]
-pub(super) fn collect_churn_calls(
+pub(in crate::rules) fn collect_churn_calls(
     cfg: &CFG,
     setter_nodes: &HashMap<Var, SlotNode>,
     fn_bindings: &HashMap<Var, Arc<CFG>>,
@@ -359,7 +361,7 @@ fn churn_calls_in_expr(
 /// `(cond, taken)` branch constraints, rebinds every var aliasing the slot to
 /// `written`, and applies the engine's branch narrowing: if the guarded
 /// variable narrows to ⊥, the branch is dead in every later run.
-pub(super) fn converges_once_written(
+pub(in crate::rules) fn converges_once_written(
     cfg: &CFG,
     call_block: BlockId,
     state_vals: &HashMap<Var, HookLabel>,
@@ -532,7 +534,7 @@ fn guard_var(cond: &Expr) -> Option<&str> {
 }
 
 /// True when every entry→exit path of `cfg` passes through one of `blocks`.
-pub(super) fn on_all_paths(cfg: &CFG, blocks: &HashSet<BlockId>) -> bool {
+pub(in crate::rules) fn on_all_paths(cfg: &CFG, blocks: &HashSet<BlockId>) -> bool {
     if blocks.contains(&cfg.entry) {
         return true;
     }

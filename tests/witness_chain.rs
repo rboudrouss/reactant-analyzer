@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use reactant::{
     engine::{Config, RootStrategy},
     resolver::{DefaultImportResolver, analyze_lowered, lower_files},
-    rules::{EffectClass, ResolveTarget, Rule, Step, lazy_init::LazyInit},
+    rules::{EffectClass, LazyInit, ResolveTarget, Rule, Step},
 };
 
 fn fixture(name: &str) -> PathBuf {

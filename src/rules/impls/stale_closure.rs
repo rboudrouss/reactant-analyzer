@@ -1,4 +1,4 @@
-use super::RuleCtx;
+use crate::rules::RuleCtx;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -8,18 +8,19 @@ use crate::{
         SourceRange,
         cfg::{CFG, Terminator},
         expr::Expr,
-        free_vars::{AccessPath, collect_used_vars, compute_free_paths, dep_paths, path_covered},
+        free_vars::{AccessPath, compute_free_paths, dep_paths, path_covered},
         hooks::HookEntry,
         stmt::Stmt,
         types::{BlockId, HookLabel, Symbol, Var},
     },
 };
 
-use super::{
+use crate::rules::helpers::churn::eval_in_exit_env;
+use crate::rules::{
     Certified, Diagnostic, EffectClass, MustResult, OnAllPaths, Rule, Severity, Step, ValueClass,
-    all_setter_labels, churn::eval_in_exit_env, collect_fn_bindings,
-    collect_setter_calls_with_extra, memo_val_labels, missing_deps::fn_lit_binding,
-    must_on_all_paths, resolve_setter_aliases, state_slot_name, state_val_labels,
+    all_setter_labels, collect_fn_bindings, collect_setter_calls_with_extra, fn_lit_binding,
+    may_written_slots, memo_val_labels, must_on_all_paths, resolve_setter_aliases, state_slot_name,
+    state_val_labels,
 };
 
 /// Fires when a callback that **outlives the render** — handed to
@@ -325,70 +326,6 @@ fn resolve_callback<'a>(
     }
 }
 
-/// State slots that *may* ever be written: their setter variable (or an
-/// alias of it) is referenced anywhere in the component — called, passed as
-/// a prop, captured by a closure. A slot whose setter is never referenced
-/// provably never changes (React state only moves through its setter), so a
-/// capture of it can never go stale — sound to skip.
-///
-/// Shared with `frozen-initial-state`, which runs the same proof on the
-/// *parent* component to decide whether a versioned prop can actually change.
-pub(super) fn may_written_slots(
-    render_cfg: &CFG,
-    hooks: &[HookEntry],
-    setter_labels: &HashMap<Var, HookLabel>,
-) -> HashSet<HookLabel> {
-    fn scan_cfg(cfg: &CFG, used: &mut HashSet<Var>) {
-        for block in cfg.blocks.values() {
-            for stmt in &block.stmts {
-                match stmt {
-                    Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => {
-                        collect_used_vars(rhs, used)
-                    }
-                    Stmt::MemberWrite { obj, key, rhs, .. } => {
-                        collect_used_vars(obj, used);
-                        if let crate::ir::stmt::MemberKey::Index(idx) = key {
-                            collect_used_vars(idx, used);
-                        }
-                        collect_used_vars(rhs, used);
-                    }
-                    Stmt::ExprStmt(e, _) => collect_used_vars(e, used),
-                }
-            }
-            match &block.term {
-                Terminator::Return(e) | Terminator::Branch { cond: e, .. } => {
-                    collect_used_vars(e, used)
-                }
-                _ => {}
-            }
-        }
-    }
-    let mut used: HashSet<Var> = HashSet::new();
-    scan_cfg(render_cfg, &mut used);
-    for hook in hooks {
-        if let Some(body_cfg) = hook.body_cfg() {
-            scan_cfg(body_cfg, &mut used);
-            continue;
-        }
-        match hook {
-            HookEntry::State { init, .. } | HookEntry::Ref { init, .. } => {
-                collect_used_vars(init, &mut used)
-            }
-            HookEntry::Custom { args, .. } => {
-                for a in args {
-                    collect_used_vars(a, &mut used);
-                }
-            }
-            _ => {}
-        }
-    }
-    setter_labels
-        .iter()
-        .filter(|(v, _)| used.contains(*v))
-        .map(|(_, l)| *l)
-        .collect()
-}
-
 /// Slots a captured path's root resolves to.
 struct RootSlots {
     /// This component's slots (nameable, self-write provable).
@@ -467,7 +404,7 @@ impl Rule for StaleClosure {
         "stale-closure"
     }
 
-    fn safe_check(&self, ctx: &RuleCtx) -> Option<super::SafeCheck> {
+    fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
         let (result, component) = (ctx.program(), ctx.component());
         // Applicable when some deps-gated effect registers a long-lived
         // callback at all.
@@ -490,7 +427,7 @@ impl Rule for StaleClosure {
             collect_registrations(body_cfg, &fn_bodies, 2, None, &mut regs);
             !regs.is_empty()
         });
-        applicable.then_some(super::SafeCheck {
+        applicable.then_some(crate::rules::SafeCheck {
             rule: self.name(),
             message: "no long-lived callback captures a stale state value",
         })
@@ -712,7 +649,7 @@ impl Rule for StaleClosure {
                     d = d.with_step(
                         Step::Resolve {
                             name: via.clone(),
-                            target: super::ResolveTarget::LocalFn,
+                            target: crate::rules::ResolveTarget::LocalFn,
                         },
                         None,
                         None,

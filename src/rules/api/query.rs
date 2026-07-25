@@ -4,7 +4,7 @@
 //! violating it is a build error — even for a first-party Rust rule.
 //!
 //! - [`Certified`] is the proof token. Its constructor is **private to this
-//!   module**, so only the query primitives here can mint one. [`super::Diagnostic::error`]
+//!   module**, so only the query primitives here can mint one. [`crate::rules::Diagnostic::error`]
 //!   is the sole `Error` constructor and it *requires* a `Certified`, so a
 //!   [`May`] value has no path to an `Error` (type error).
 //! - [`MustResult`] carries the token on its `All` arm; `Some`/`None` are MAY.
@@ -30,10 +30,10 @@ use crate::{
     },
 };
 
-use super::{ConvergedEval, Note, SetterCall, Step, arg_is_call_free, local_bindings};
+use crate::rules::{ConvergedEval, Note, SetterCall, Step, arg_is_call_free, local_bindings};
 
 /// Where a certified fact lives, and the witness chain that proves it (ADR-019).
-/// [`super::Diagnostic::error`] absorbs these into the finding, so the evidence's
+/// [`crate::rules::Diagnostic::error`] absorbs these into the finding, so the evidence's
 /// own span/label/provenance ride the `Error` instead of being threaded by hand.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Provenance {
@@ -429,7 +429,7 @@ pub fn must_setter_on_all_paths(
 /// (promotes `churn::on_all_paths`); `None` otherwise. The shared "on all paths"
 /// must-forward (ADR-021 §3).
 pub fn must_on_all_paths(cfg: &CFG, blocks: &HashSet<BlockId>) -> MustResult<OnAllPaths> {
-    if super::churn::on_all_paths(cfg, blocks) {
+    if crate::rules::helpers::churn::on_all_paths(cfg, blocks) {
         MustResult::All(Certified::mint(
             OnAllPaths {
                 blocks: blocks.iter().copied().collect(),
@@ -499,10 +499,10 @@ pub struct InitSetterCall;
 /// `All` iff `init` syntactically calls a state setter (a `StateSetter` or a
 /// setter-var callee): the write runs on every render — a certain misuse
 /// (ADR-021 §3). `None` otherwise. Mirrors the `Setter` branch of
-/// `lazy_init::classify_init_effect` via the shared [`super::lazy_init::collect_callees`].
+/// `lazy_init::classify_init_effect` via the shared [`crate::rules::collect_callees`].
 pub fn must_init_calls_setter(init: &Expr, setters: &HashSet<Var>) -> MustResult<InitSetterCall> {
     let mut callees = Vec::new();
-    super::lazy_init::collect_callees(init, &mut callees);
+    crate::rules::collect_callees(init, &mut callees);
     let calls_setter = callees.iter().any(|c| {
         let c = match c {
             Expr::TSAnnotated(inner) => inner.as_ref(),
@@ -551,9 +551,8 @@ fn slot_write_evidence(
     owner: &AnalysisResult<StateValue>,
     slot: HookLabel,
 ) -> (bool, Option<SourceRange>) {
-    let setter_labels = super::all_setter_labels(owner);
-    let may =
-        super::stale_closure::may_written_slots(&owner.render_cfg, &owner.hooks, &setter_labels);
+    let setter_labels = crate::rules::all_setter_labels(owner);
+    let may = crate::rules::may_written_slots(&owner.render_cfg, &owner.hooks, &setter_labels);
     if !may.contains(&slot) {
         return (false, None);
     }
@@ -562,10 +561,12 @@ fn slot_write_evidence(
         .filter(|(_, l)| **l == slot)
         .map(|(v, _)| v.clone())
         .collect();
-    let render_fns = super::collect_fn_bindings(&owner.render_cfg);
+    let render_fns = crate::rules::collect_fn_bindings(&owner.render_cfg);
     let mut spans: Vec<SourceRange> = std::iter::once(&owner.render_cfg)
         .chain(owner.hooks.iter().filter_map(|h| h.body_cfg()))
-        .flat_map(|cfg| super::collect_setter_calls_with_extra(cfg, &setters, 2, &render_fns))
+        .flat_map(|cfg| {
+            crate::rules::collect_setter_calls_with_extra(cfg, &setters, 2, &render_fns)
+        })
         .filter_map(|c| c.span)
         .collect();
     spans.sort_by_key(|r| r.pos_key());
@@ -588,10 +589,10 @@ pub fn classify_motion(val: &StateValue, result: &ProgramAnalysisResult) -> Moti
             };
             let (writable, write_span) = slot_write_evidence(owner_result, *slot);
             if writable {
-                let owner_states = super::state_val_labels(&owner_result.render_cfg);
+                let owner_states = crate::rules::state_val_labels(&owner_result.render_cfg);
                 let display = format!(
                     "state {} of `{owner}`",
-                    super::state_slot_name(*slot, &owner_states)
+                    crate::rules::state_slot_name(*slot, &owner_states)
                 );
                 return Motion::Proven(Certified::mint(
                     MovingFeeder {
@@ -652,11 +653,11 @@ pub struct EffectCycleProof;
 /// Both facts are re-derived HERE from the raw edges (strength per edge, slot
 /// owners + effect carriers per component), the point of knowledge — not
 /// trusted from caller-supplied booleans.
-pub(super) fn must_effect_cycle(
-    edges: &[super::churn_graph::ChurnEdge],
-    cycle: &super::churn_graph::ChurnCycle,
+pub(in crate::rules) fn must_effect_cycle(
+    edges: &[crate::rules::helpers::churn_graph::ChurnEdge],
+    cycle: &crate::rules::helpers::churn_graph::ChurnCycle,
 ) -> MustResult<EffectCycleProof> {
-    use super::churn_graph::EdgeStrength;
+    use crate::rules::helpers::churn_graph::EdgeStrength;
     let all_must = cycle
         .edge_idx
         .iter()

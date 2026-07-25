@@ -1,4 +1,4 @@
-use super::RuleCtx;
+use crate::rules::RuleCtx;
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::{
@@ -10,7 +10,7 @@ use crate::ir::{
     types::{HookLabel, Var},
 };
 
-use super::{
+use crate::rules::{
     Diagnostic, MustResult, Rule, Step, ValueClass, all_setter_labels, must_same_ref_mutation,
     state_slot_name, state_val_labels,
 };
@@ -378,13 +378,15 @@ impl Rule for StateMutation {
         "state-mutation"
     }
 
-    fn safe_check(&self, ctx: &RuleCtx) -> Option<super::SafeCheck> {
+    fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
         let (result, component) = (ctx.program(), ctx.component());
         use crate::engine::HookKind;
-        super::has_hook_kind(result, component, HookKind::State).then_some(super::SafeCheck {
-            rule: self.name(),
-            message: "no state or prop object is mutated in place",
-        })
+        crate::rules::has_hook_kind(result, component, HookKind::State).then_some(
+            crate::rules::SafeCheck {
+                rule: self.name(),
+                message: "no state or prop object is mutated in place",
+            },
+        )
     }
 
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {

@@ -1,4 +1,4 @@
-use super::{Diagnostic, Rule, RuleCtx};
+use crate::rules::{Diagnostic, Rule, RuleCtx};
 
 /// Fires when a hook is called inside a conditional branch.
 ///
@@ -12,14 +12,14 @@ impl Rule for ConditionalHook {
         "conditional-hook"
     }
 
-    fn safe_check(&self, ctx: &RuleCtx) -> Option<super::SafeCheck> {
+    fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
         let (result, component) = (ctx.program(), ctx.component());
         // Applicable as soon as the component calls any hook at all.
         result
             .components
             .get(component)
             .is_some_and(|c| !c.hook_calls.is_empty())
-            .then_some(super::SafeCheck {
+            .then_some(crate::rules::SafeCheck {
                 rule: self.name(),
                 message: "all hooks run unconditionally, in a stable order",
             })

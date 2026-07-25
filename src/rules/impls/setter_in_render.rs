@@ -1,4 +1,4 @@
-use super::RuleCtx;
+use crate::rules::RuleCtx;
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::{
@@ -7,8 +7,8 @@ use crate::ir::{
     types::{BlockId, HookLabel, Var},
 };
 
-use super::churn::{converges_once_written, eval_in_exit_env};
-use super::{
+use crate::rules::helpers::churn::{converges_once_written, eval_in_exit_env};
+use crate::rules::{
     Diagnostic, ExitDominance, MustResult, Rule, collect_setter_calls, resolve_setter_aliases,
     state_val_labels,
 };
@@ -38,14 +38,16 @@ impl Rule for SetterInRender {
         "setter-in-render"
     }
 
-    fn safe_check(&self, ctx: &RuleCtx) -> Option<super::SafeCheck> {
+    fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
         let (result, component) = (ctx.program(), ctx.component());
         use crate::engine::HookKind;
         // Local setters exist iff the component has a useState slot.
-        super::has_hook_kind(result, component, HookKind::State).then_some(super::SafeCheck {
-            rule: self.name(),
-            message: "no setter is called during render",
-        })
+        crate::rules::has_hook_kind(result, component, HookKind::State).then_some(
+            crate::rules::SafeCheck {
+                rule: self.name(),
+                message: "no setter is called during render",
+            },
+        )
     }
 
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
@@ -79,7 +81,7 @@ impl Rule for SetterInRender {
 
         // Cross-component setters: ComponentSetter-valued props, excluding self-references.
         let cs_vars: HashMap<Var, (crate::ir::types::Symbol, crate::ir::types::HookLabel)> =
-            super::cross_component_setters(comp_result, component);
+            crate::rules::cross_component_setters(comp_result, component);
 
         let mut all_setter_vars: HashSet<Var> = local_setter_info.keys().cloned().collect();
         all_setter_vars.extend(cs_vars.keys().cloned());
@@ -183,13 +185,13 @@ impl Rule for SetterInRender {
                 }
                 // Witness (ADR-019): the render-time setter call itself.
                 d = d.with_step(
-                    super::Step::Call {
+                    crate::rules::Step::Call {
                         callee: call.var.clone(),
-                        class: super::EffectClass::Setter,
+                        class: crate::rules::EffectClass::Setter,
                     },
                     None,
                     call.span,
-                    &super::witness::fallback_name,
+                    &crate::rules::api::witness::fallback_name,
                 );
                 Some(d)
             })

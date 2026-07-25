@@ -22,7 +22,23 @@ use crate::{
     },
 };
 
-use super::Note;
+/// One step of a diagnostic's witness chain (ADR-019).
+///
+/// `message` is the pre-rendered prose ([`Step::render`] is the single
+/// rendering point — rules never format trace text); `step` is the typed
+/// judgment JSON consumers read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Note {
+    pub message: String,
+    /// The typed witness step this note carries.
+    pub step: Step,
+    /// Hook label this note points to, if any.
+    pub hook_label: Option<HookLabel>,
+    /// Source location this note points to, if available. Carries the
+    /// [`crate::ir::FileId`] of the file it points into (may differ from the
+    /// component's file after cross-file inlining).
+    pub range: Option<SourceRange>,
+}
 
 /// What a resolved name turned out to be ([`Step::Resolve`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +80,7 @@ pub enum ValueClass {
 
 /// One typed step of a finding's witness chain.
 ///
-/// Each step is attached to a [`super::Note`] carrying its `(hook_label,
+/// Each step is attached to a [`Note`] carrying its `(hook_label,
 /// range)` anchor; the step itself holds only the judgment.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Step {
@@ -404,7 +420,7 @@ pub fn chase_value(
 
     // One binding hop: `x` → the RHS assigned to `x` (single-write bindings).
     if let Expr::Var(v) = target {
-        let bindings = super::local_bindings(cfg);
+        let bindings = crate::rules::local_bindings(cfg);
         if let Some(rhss) = bindings.get(v.as_str())
             && let [single] = rhss.as_slice()
         {

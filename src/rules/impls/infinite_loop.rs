@@ -1,4 +1,4 @@
-use super::RuleCtx;
+use crate::rules::RuleCtx;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -12,12 +12,12 @@ use crate::{
     },
 };
 
-use super::churn::{
+use crate::rules::api::query::must_effect_cycle;
+use crate::rules::helpers::churn::{
     ChurnSetterCall, Freshness, classify_effect_deps, collect_churn_calls, converges_once_written,
     reference_part,
 };
-use super::query::must_effect_cycle;
-use super::{
+use crate::rules::{
     Certified, Diagnostic, MustResult, OnAllPaths, Rule, Severity, all_deps_provably_stable,
     all_setter_labels, collect_fn_bindings, collect_setter_calls, collect_setter_calls_with_extra,
     memo_val_labels, must_on_all_paths, resolve_setter_aliases, setter_var_labels, state_slot_name,
@@ -38,13 +38,13 @@ impl Rule for InfiniteLoop {
         "infinite-loop"
     }
 
-    fn safe_check(&self, ctx: &RuleCtx) -> Option<super::SafeCheck> {
+    fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
         let (result, component) = (ctx.program(), ctx.component());
         use crate::engine::HookKind;
         // A render→effect→setState cycle needs both a state slot and an effect.
-        (super::has_hook_kind(result, component, HookKind::State)
-            && super::has_hook_kind(result, component, HookKind::Effect))
-        .then_some(super::SafeCheck {
+        (crate::rules::has_hook_kind(result, component, HookKind::State)
+            && crate::rules::has_hook_kind(result, component, HookKind::Effect))
+        .then_some(crate::rules::SafeCheck {
             rule: self.name(),
             message: "no effect diverges into an infinite render loop",
         })
@@ -63,7 +63,7 @@ impl Rule for InfiniteLoop {
 
         // ComponentSetter props, excluding self-references.
         let cs_vars: HashMap<Var, (Symbol, HookLabel)> =
-            super::cross_component_setters(comp_result, component);
+            crate::rules::cross_component_setters(comp_result, component);
 
         let mut all_setter_vars: HashSet<Var> = local_setter_labels.keys().cloned().collect();
         all_setter_vars.extend(cs_vars.keys().cloned());
@@ -155,7 +155,7 @@ impl Rule for InfiniteLoop {
                         {
                             let h_span = comp_result.handler_info.get(h_label).and_then(|i| i.span);
                             diag = diag.with_step(
-                                super::Step::Handler {
+                                crate::rules::Step::Handler {
                                     event: event.clone(),
                                     slot: state_label,
                                 },
@@ -168,7 +168,7 @@ impl Rule for InfiniteLoop {
 
                     // Fixpoint evidence (ADR-019): which effects were writing
                     // the slot when it widened, and at which iteration.
-                    diag = diag.with_notes(super::witness::slot_history(
+                    diag = diag.with_notes(crate::rules::api::witness::slot_history(
                         comp_result,
                         state_label,
                         &|l| state_slot_name(l, &state_names),
@@ -230,7 +230,7 @@ fn check_multi_effect_cycles(
     component: &Symbol,
     reported_effects: &HashSet<HookLabel>,
 ) -> (Vec<Diagnostic>, HashSet<(HookLabel, HookLabel)>) {
-    use super::churn_graph::{ChurnEdge, build_churn_graph, find_churn_cycles};
+    use crate::rules::helpers::churn_graph::{ChurnEdge, build_churn_graph, find_churn_cycles};
 
     let edges = build_churn_graph(result);
     if edges.is_empty() {
@@ -319,9 +319,9 @@ fn check_multi_effect_cycles(
             }
             if let Some(r) = e.write_span {
                 diag = diag.with_step(
-                    super::Step::Write {
+                    crate::rules::Step::Write {
                         slot: e.to.1,
-                        value: super::ValueClass::Fresh,
+                        value: crate::rules::ValueClass::Fresh,
                     },
                     Some(e.effect_label),
                     Some(r),
@@ -337,13 +337,13 @@ fn check_multi_effect_cycles(
                 let other_from = node_display(&other.from, component, result, &mut names);
                 let other_to = node_display(&other.to, component, result, &mut names);
                 diag = diag.with_step(
-                    super::Step::CycleEdge {
+                    crate::rules::Step::CycleEdge {
                         from: other_from,
                         to: other_to,
                     },
                     Some(other.effect_label),
                     other.write_span,
-                    &super::witness::fallback_name,
+                    &crate::rules::api::witness::fallback_name,
                 );
             }
             diags.push(diag);
@@ -355,7 +355,7 @@ fn check_multi_effect_cycles(
 /// Display name of a qualified slot: `` `count` `` locally,
 /// `` `count` of `Parent` `` for another component's slot.
 fn node_display(
-    node: &super::churn::SlotNode,
+    node: &crate::rules::helpers::churn::SlotNode,
     component: &Symbol,
     result: &ProgramAnalysisResult,
     names: &mut HashMap<Symbol, HashMap<Var, HookLabel>>,
@@ -402,7 +402,7 @@ fn check_object_churn(
         return vec![];
     }
     // This arm is single-effect/single-component: local setters only.
-    let setter_nodes: HashMap<Var, super::churn::SlotNode> = setter_labels
+    let setter_nodes: HashMap<Var, crate::rules::helpers::churn::SlotNode> = setter_labels
         .iter()
         .map(|(v, l)| (v.clone(), (component.clone(), *l)))
         .collect();
@@ -568,9 +568,9 @@ fn check_object_churn(
             }
             if let Some(r) = call_span {
                 diag = diag.with_step(
-                    super::Step::Write {
+                    crate::rules::Step::Write {
                         slot: state_label,
-                        value: super::ValueClass::Fresh,
+                        value: crate::rules::ValueClass::Fresh,
                     },
                     Some(*eff_label),
                     Some(r),

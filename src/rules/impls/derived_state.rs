@@ -1,9 +1,9 @@
-use super::RuleCtx;
+use crate::rules::RuleCtx;
 use std::collections::HashSet;
 
 use crate::ir::{expr::Expr, hooks::HookEntry, types::Var};
 
-use super::{
+use crate::rules::{
     Diagnostic, MustResult, Rule, all_setter_labels, collect_setter_calls,
     must_setter_on_all_paths, state_val_labels,
 };
@@ -24,12 +24,12 @@ impl Rule for DerivedState {
         "derived-state"
     }
 
-    fn safe_check(&self, ctx: &RuleCtx) -> Option<super::SafeCheck> {
+    fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
         let (result, component) = (ctx.program(), ctx.component());
         use crate::engine::HookKind;
-        (super::has_hook_kind(result, component, HookKind::State)
-            && super::has_hook_kind(result, component, HookKind::Effect))
-        .then_some(super::SafeCheck {
+        (crate::rules::has_hook_kind(result, component, HookKind::State)
+            && crate::rules::has_hook_kind(result, component, HookKind::Effect))
+        .then_some(crate::rules::SafeCheck {
             rule: self.name(),
             message: "no effect merely mirrors other state",
         })
@@ -132,9 +132,9 @@ impl Rule for DerivedState {
             // Witness (ADR-019): the mirrored source is read, then its
             // function is written to the derived slot.
             let name_of =
-                |l: crate::ir::types::HookLabel| super::state_slot_name(l, &state_val_label);
+                |l: crate::ir::types::HookLabel| crate::rules::state_slot_name(l, &state_val_label);
             d = d.with_step(
-                super::Step::Read {
+                crate::rules::Step::Read {
                     what: dep_var.clone(),
                 },
                 state_val_label.get(&dep_var).copied(),
@@ -143,9 +143,9 @@ impl Rule for DerivedState {
             );
             if let Some(slot) = setter_label.get(&setter_name) {
                 d = d.with_step(
-                    super::Step::Write {
+                    crate::rules::Step::Write {
                         slot: *slot,
-                        value: super::ValueClass::Unknown,
+                        value: crate::rules::ValueClass::Unknown,
                     },
                     Some(*eff_label),
                     write_span,

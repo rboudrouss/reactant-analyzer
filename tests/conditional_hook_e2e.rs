@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use reactant::{
     engine::{Config, RootStrategy},
     resolver::{DefaultImportResolver, analyze_lowered, lower_files},
-    rules::{Rule, conditional_hook::ConditionalHook},
+    rules::{ConditionalHook, Rule},
 };
 
 fn fixture(name: &str) -> PathBuf {

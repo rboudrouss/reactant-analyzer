@@ -1,4 +1,4 @@
-use super::RuleCtx;
+use crate::rules::RuleCtx;
 use std::collections::HashMap;
 
 use crate::{
@@ -6,7 +6,7 @@ use crate::{
     ir::{expr::Expr, hooks::HookEntry, stmt::Stmt, types::HookLabel},
 };
 
-use super::{
+use crate::rules::{
     Diagnostic, Rule, resolve_setter_aliases, setter_var_labels, state_slot_name, state_val_labels,
 };
 
@@ -24,7 +24,7 @@ impl Rule for UnnecessaryRerender {
         "unnecessary-rerender"
     }
 
-    fn safe_check(&self, ctx: &RuleCtx) -> Option<super::SafeCheck> {
+    fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
         let (result, component) = (ctx.program(), ctx.component());
         use crate::engine::HookKind;
         // Needs a state slot and a mount-only (`deps: []`) effect to overwrite it.
@@ -37,7 +37,7 @@ impl Rule for UnnecessaryRerender {
                         e.kind == HookKind::Effect && e.has_deps_array && e.declared_deps.is_empty()
                     })
             })
-            .then_some(super::SafeCheck {
+            .then_some(crate::rules::SafeCheck {
                 rule: self.name(),
                 message: "no mount effect overwrites its initial state",
             })
@@ -57,7 +57,7 @@ impl Rule for UnnecessaryRerender {
                 if let HookEntry::State { label, init, .. } = h {
                     // Mount-time init eval: empty stores + empty heap, NOT the
                     // converged bundle.
-                    let val = super::eval_in_stores(
+                    let val = crate::rules::eval_in_stores(
                         init,
                         &empty_env,
                         &result.component,
@@ -124,7 +124,7 @@ impl Rule for UnnecessaryRerender {
                     let arg_val = args
                         .first()
                         .map(|a| {
-                            use super::ConvergedEval;
+                            use crate::rules::ConvergedEval;
                             result.eval_in(&empty_env, a, &mut crate::domains::Heap::new())
                         })
                         .unwrap_or(StateValue::top());
@@ -169,9 +169,9 @@ impl Rule for UnnecessaryRerender {
                     // Witness (ADR-019): the mount-effect write that overrides
                     // the initial value.
                     d = d.with_step(
-                        super::Step::Write {
+                        crate::rules::Step::Write {
                             slot: state_label,
-                            value: super::ValueClass::Unknown,
+                            value: crate::rules::ValueClass::Unknown,
                         },
                         Some(*eff_label),
                         eff_span,

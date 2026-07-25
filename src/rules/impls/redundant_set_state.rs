@@ -1,4 +1,4 @@
-use super::RuleCtx;
+use crate::rules::RuleCtx;
 use std::collections::{HashMap, HashSet};
 
 use crate::{
@@ -12,7 +12,7 @@ use crate::{
     },
 };
 
-use super::{Diagnostic, Rule};
+use crate::rules::{Diagnostic, Rule};
 
 /// Fires when `setState` is called with a stable value when the state is already stable.
 /// Checked in both render body and effect bodies.
@@ -24,12 +24,12 @@ impl Rule for RedundantSetState {
         "redundant-set-state"
     }
 
-    fn safe_check(&self, ctx: &RuleCtx) -> Option<super::SafeCheck> {
+    fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
         let (result, component) = (ctx.program(), ctx.component());
         use crate::engine::HookKind;
-        (super::has_hook_kind(result, component, HookKind::State)
-            && super::has_hook_kind(result, component, HookKind::Effect))
-        .then_some(super::SafeCheck {
+        (crate::rules::has_hook_kind(result, component, HookKind::State)
+            && crate::rules::has_hook_kind(result, component, HookKind::Effect))
+        .then_some(crate::rules::SafeCheck {
             rule: self.name(),
             message: "no setState writes the value the state already holds",
         })
@@ -161,7 +161,7 @@ fn collect_setter_vals_in_expr(
                 let arg_val = args
                     .first()
                     .map(|a| {
-                        super::eval_in_stores(
+                        crate::rules::eval_in_stores(
                             a,
                             env,
                             component,
@@ -222,7 +222,7 @@ fn check_setter_calls(
             let arg_val = args
                 .first()
                 .map(|a| {
-                    super::eval_in_stores(
+                    crate::rules::eval_in_stores(
                         a,
                         env,
                         component,
@@ -249,13 +249,13 @@ fn check_setter_calls(
                     // Witness (ADR-019): the write provably stores what the
                     // state already holds.
                     .with_step(
-                        super::Step::Write {
+                        crate::rules::Step::Write {
                             slot: label,
-                            value: super::ValueClass::SameAsCurrent,
+                            value: crate::rules::ValueClass::SameAsCurrent,
                         },
                         Some(label),
                         *call_span,
-                        &super::witness::fallback_name,
+                        &crate::rules::api::witness::fallback_name,
                     ),
                 );
             }

@@ -1,6 +1,6 @@
-use super::RuleCtx;
+use crate::rules::RuleCtx;
 
-use super::{Diagnostic, Rule};
+use crate::rules::{Diagnostic, Rule};
 
 /// Emits an Info diagnostic for each state label that required widening to
 /// force fixpoint convergence.  Widening = over-approximation → abstract
@@ -29,10 +29,10 @@ impl Rule for WideningInfo {
                     ),
                 )
                 // Witness (ADR-019): the engine's own record of the widening.
-                .with_notes(super::witness::slot_history(
+                .with_notes(crate::rules::api::witness::slot_history(
                     result,
                     label,
-                    &super::witness::fallback_name,
+                    &crate::rules::api::witness::fallback_name,
                 ))
             })
             .collect()

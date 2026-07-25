@@ -17,7 +17,7 @@ use crate::ir::{
 };
 
 use super::query::Certified;
-use super::{Note, Step};
+use super::witness::{Note, Step};
 
 /// Confidence level of a diagnostic.
 ///

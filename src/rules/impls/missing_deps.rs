@@ -1,18 +1,16 @@
-use super::RuleCtx;
+use crate::rules::RuleCtx;
 use std::collections::HashSet;
 
 use crate::{
     domains::{impls::StateValue, stores::AbstractEnv},
     ir::{
         cfg::CFG,
-        expr::Expr,
         free_vars::{AccessPath, compute_free_vars, dep_paths, path_covered},
-        stmt::Stmt,
         types::Var,
     },
 };
 
-use super::{Diagnostic, Rule};
+use crate::rules::{Diagnostic, Rule, fn_lit_binding};
 
 /// Fires when a `useEffect`, `useMemo`, or `useCallback` body captures a free
 /// variable that is not listed in the deps array and is not stable (stale-closure
@@ -24,14 +22,14 @@ impl Rule for MissingDeps {
         "missing-deps"
     }
 
-    fn safe_check(&self, ctx: &RuleCtx) -> Option<super::SafeCheck> {
+    fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
         let (result, component) = (ctx.program(), ctx.component());
         // Applicable when some effect/memo/callback declared a deps array.
         result
             .components
             .get(component)
             .is_some_and(|c| c.effect_info.values().any(|e| e.has_deps_array))
-            .then_some(super::SafeCheck {
+            .then_some(crate::rules::SafeCheck {
                 rule: self.name(),
                 message: "every effect declares the variables it reads",
             })
@@ -75,8 +73,8 @@ impl Rule for MissingDeps {
                         format!(
                             "`{}` is used in this {} but not in its deps array, and {}",
                             path,
-                            super::hook_kind_word(info.kind),
-                            super::describe_value(&val)
+                            crate::rules::hook_kind_word(info.kind),
+                            crate::rules::describe_value(&val)
                         ),
                     )
                     .with_label(*label)
@@ -86,12 +84,12 @@ impl Rule for MissingDeps {
                     }
                     // Witness (ADR-019): the undeclared read.
                     d = d.with_step(
-                        super::Step::Read {
+                        crate::rules::Step::Read {
                             what: path.to_string(),
                         },
                         Some(*label),
                         info.span,
-                        &super::witness::fallback_name,
+                        &crate::rules::api::witness::fallback_name,
                     );
                     diags.push(d);
                 }
@@ -143,31 +141,6 @@ fn closure_is_behaviorally_stable(
         }
     }
     true
-}
-
-/// The params and body of the unique `FnLit` bound to `var` in `cfg`, if any.
-/// Conditional or repeated re-binding bails out (`None`): the captured
-/// environment is no longer syntactically certain. Shared with `stale-closure`,
-/// which resolves registered callback variables under the same certainty bar.
-pub(super) fn fn_lit_binding<'c>(var: &str, cfg: &'c CFG) -> Option<(&'c [Var], &'c CFG)> {
-    let mut found: Option<(&[Var], &CFG)> = None;
-    for block in cfg.blocks.values() {
-        for stmt in &block.stmts {
-            let (Stmt::Let { var: v, rhs, .. } | Stmt::Assign { var: v, rhs, .. }) = stmt else {
-                continue;
-            };
-            if v != var {
-                continue;
-            }
-            match rhs.peel_ts() {
-                Expr::FnLit {
-                    params, body_cfg, ..
-                } if found.is_none() => found = Some((params, body_cfg)),
-                _ => return None,
-            }
-        }
-    }
-    found
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
