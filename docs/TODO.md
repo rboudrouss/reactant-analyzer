@@ -220,7 +220,8 @@ expressible, all in weakened form**. The blockers, in decreasing leverage:
 - **Tier A is single-anchor** — a declarative rule binds exactly one anchor entity
   plus typed navigation; cross-component rules (the `cross_component_setters`
   shape only `stale-closure` uses natively) are inexpressible in Tier A v1.
-  Lifted later by a schema extension or by Tier B (Starlark, bounded joins) —
+  Lifted later by a schema extension, or by a restricted-JS evaluator over the
+  oxc AST if analysis-time joins ever become the bottleneck (ADR-023 §5) —
   never by a syntactic bypass. *(ADR-022 §2, §7)* The corpus shape this blocks
   most often is a *slot* written by both an effect and a handler (a resync that
   clobbers user input): each half binds a different anchor, and joining them
@@ -333,6 +334,23 @@ records why vocabulary work comes after attribution and after the engine facts.
    non-context binding from an unresolved one; and the rule must not use the
    `stability` guard, whose `per-render` conflates a fresh allocation with a moving
    primitive — it needs an identity verdict built on `is_unstable_reference_only`.
+
+**Independent of the sequence** — [ADR-023 §5](adr/ADR-023-tier-a-vocabulary-growth.md)
+adopts it and it touches the npm host plus a codegen step, not the core:
+
+- **JS/TS pack authoring compiled to Tier-A JSON.** A pack may be written as a
+  JS/TS module exporting the rule list, on the `eslint.config.js` model, and
+  compiled to the `pack.json` the core already validates. The host side is
+  mostly there: `npm/lib/host.js` runs under Node and resolves packs through
+  `createRequire`. Ship it as codegen — **the generated JSON is the committed
+  artifact** — so the native Rust CLI, which cannot run Node, consumes the same
+  inert file and nothing forks; a `reactant packs build`-style step (or the
+  wrapper doing it when it sees a `.js`/`.ts` pack) is the whole surface. Ship a
+  `.d.ts` for the rule shape generated from the same schemars types as
+  `pack.schema.json`, so the types cannot drift from the validator. This is the
+  JS-community authoring path ADR-021 always intended for Tier A; it buys
+  composition at *authoring* time (generate N rules from a table, share
+  constants, test in vitest) and deliberately not at analysis time.
 
 - **Effect timing is not recoverable by an IR field alone** — adding an `api`
   attribute to distinguish `useLayoutEffect`/`useInsertionEffect` from `useEffect`

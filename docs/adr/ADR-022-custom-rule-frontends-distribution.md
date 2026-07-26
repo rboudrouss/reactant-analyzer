@@ -191,6 +191,14 @@ regime.
 
 ### 7. Tier B (Starlark) — shape decided, shipped later
 
+> **Superseded by [ADR-023 §5](ADR-023-tier-a-vocabulary-growth.md).** Starlark is
+> rejected: the soundness property it was chosen for (no unbounded iteration ⇒
+> hand-rolled dataflow is inexpressible) is not specific to the language, its
+> engineering reserve below was never discharged (`starlark = "0.13"` does not
+> build, on host or `wasm32`), and reactant already ships a JS/TS parser so the
+> cost comparison inverts. The community authoring path is JS/TS compiled to
+> Tier-A JSON. The rest of this section is kept as the historical record.
+
 **Tier B = Tier A's vocabulary + control flow, nothing more.** Same entity
 relations, same navigation edges, same verdict primitives, same emission API
 where `error()` demands an unforgeable `Certified` handle — severity follows

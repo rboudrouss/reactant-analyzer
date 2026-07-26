@@ -1,6 +1,6 @@
-# ADR-023: Tier-A vocabulary growth — expression-position entities, no ∀, Tier B stays deferred
+# ADR-023: Tier-A vocabulary growth — expression-position entities, no ∀, Starlark rejected for JS/TS→JSON
 
-- **Status**: Accepted
+- **Status**: Accepted — supersedes ADR-022 §7 (Tier B)
 - **Date**: 2026-07-26
 
 ## Context
@@ -111,32 +111,75 @@ it is guard-tree composition with no quantifier hazard, and it is the natural
 occasion to collapse `exec.rs`'s two duplicated guard matches into one recursive
 `eval_guard`.
 
-### 5. Tier B (Starlark) stays deferred — and the reason has changed
+### 5. Starlark is rejected; the community authoring path is JS/TS compiled to Tier-A JSON
 
-ADR-022 §7 deferred Tier B pending "vocabulary stabilized by real usage". Real
-usage has now happened, and it inverts the priority rather than confirming it.
-§7 defines Tier B as adding "*composition*, not vocabulary". The measured
-blockers are overwhelmingly vocabulary (class 1) and engine facts (classes 3-5).
-Tier B therefore addresses **at most one of the five classes** — class 2, the
-joins — and cannot touch the rest by its own definition.
+**This supersedes ADR-022 §7.** That section chose Starlark for Tier B and
+deferred it pending "vocabulary stabilized by real usage". Real usage has now
+happened and it changes the answer, not just the schedule.
 
-Against that: Tier A's Error-unforgeability is today a **compiler** property —
-`src/rules/declarative/exec.rs` lives under `src/rules/` and physically cannot
-mint a `Certified`, because `Certified::mint` is private to `api/query.rs`. A
-Starlark binding layer would move that guarantee from the type system to review,
-which is a non-recoverable regression in the ADR-021 posture. And §7's own
-engineering reserve is still **undischarged**: a bare `starlark = "0.13"` fails
-to build at all — on the host as well as on `wasm32-unknown-unknown` — with an
-`Allocative` trait-bound mismatch inside `starlark_map`, so the wasm32 question
-the ADR made a precondition has not actually been answered. (The npm payload is
-788 KB gzipped today; the interpreter's tree must be measured against that, not
-assumed, whenever the question is reopened.)
+**The property Starlark was chosen for is not specific to Starlark.** ADR-021's
+study picked it because banning `while`/recursion makes hand-rolled dataflow
+*inexpressible*, forcing every must/may decision through a vetted primitive —
+"the best soundness ceiling among frontends". That argument is about **the
+absence of unbounded iteration**, not about the language. Any frontend enforcing
+the same ban inherits the same ceiling. Starlark was a means; it was recorded as
+the end.
+
+**Its cost is now measured and its advantage is not free.** A bare
+`starlark = "0.13"` fails to build at all — on the host as well as on
+`wasm32-unknown-unknown` — with an `Allocative` trait-bound mismatch inside
+`starlark_map`, so §7's own engineering reserve was never discharged. It is a
+large new dependency tree against a WASM-only distribution whose payload is
+788 KB gzipped today, and `Cargo.toml` deliberately keeps that tree to *oxc +
+serde*. Meanwhile **reactant already ships a JS/TS parser** (`oxc_parser`,
+`oxc_ast`, `oxc_span`, `oxc_allocator`): parsing JavaScript costs zero new
+dependencies here. That inverts the comparison Starlark was chosen under.
+
+**Decision, in two parts.**
+
+1. **Authoring in JS/TS, compiled to Tier-A JSON — adopted.** A pack may be
+   authored as a JS/TS module that *emits* the pack JSON, on the
+   `eslint.config.js` / `vite.config.ts` model. The npm host already runs Node
+   and already resolves packs through `createRequire`, and ADR-022 §6 already
+   states the host is never a trust boundary — the core re-parses and
+   re-validates whatever it receives, so no invariant moves. The **generated
+   JSON is the committed artifact** (the codegen model), which is what keeps the
+   native Rust CLI — which cannot run Node — from forking: both hosts consume
+   the same inert JSON, and only the authoring front door differs.
+   This buys types, editor support, tests, shared constants and
+   generate-N-rules-from-a-table — i.e. *composition at authoring time*. It does
+   not buy composition at analysis time (joins), which is class 2 and, per the
+   measurement above, not the bottleneck.
+   The tradeoff to state plainly: a JS pack is arbitrary code execution at
+   analysis time, as it is for ESLint. Committing the generated JSON confines
+   that to the authoring machine instead of every CI run.
+
+2. **A restricted-JS evaluator is the option to instruct if joins ever block —
+   not Starlark.** If analysis-time composition becomes the real bottleneck, the
+   candidate is a whitelisted JS subset evaluated by a tree-walking interpreter
+   over the oxc AST we already parse. Two conditions, both normative:
+   - The subset checker must be a **whitelist**, never a blacklist. "Ban
+     `while`" leaks in JavaScript: recursion reaches through any callable
+     (mutual, via object properties, via higher-order functions), getters and
+     setters run code, `Proxy` intercepts, `valueOf`/`toString` are coercion
+     hooks, and `Function` reopens everything. Only `const`, `if`, arrow
+     functions, `for…of` over engine-provided iterables, and calls to
+     whitelisted primitives are admissible. Accept that this is a small language
+     that happens to parse as JavaScript, and say so in its documentation rather
+     than letting authors expect full JS semantics.
+   - The evaluator exposes **only** the primitives. There must be no path from a
+     rule to a raw CFG, and no way to obtain a `Certified` other than from a
+     must-primitive — the ADR-021 invariant that survives every syntax choice:
+     *no Error authority from an untrusted frontend unless every must/may
+     decision routes through a vetted primitive.*
+   Boa is explicitly not the recommendation: it would import full JS semantics
+   only to restrict them again, against the dependency-tree constraint above.
 
 **Sequencing decided here**: the origin-file attribution fix (ADR-024) first
 — it is measured at 44% of custom-rule findings and any new entity multiplies
 the defect — then the frontend vocabulary fixes, then the engine facts, then
-expression-position entities. Tier B is not scheduled. §7's *shape* decision
-stands unchanged should it ever be built.
+expression-position entities. Part 1 above can land at any point; it touches the
+npm host and a codegen step, not the core. Nothing schedules part 2.
 
 ## Soundness arguments
 
@@ -165,7 +208,12 @@ stands unchanged should it ever be built.
 
 - ADR-022 §2's single-anchor restriction is reaffirmed as a *schema* property,
   not a defect to route around.
+- ADR-022 §7 is superseded: Tier B is no longer "Starlark, shipped later". The
+  tier structure of ADR-021 survives — Tier A declarative, Tier C Rust — with
+  the middle tier unfilled and a named candidate should it ever be needed.
 - "Wire the existing guard to a new edge" is now an explicitly refused move
   unless it comes with a program-point argument (§2).
-- A future contributor proposing `every` or Starlark has the measured reason for
-  the refusal, and the conditions under which it would be reconsidered.
+- The `starlark-rust` dependency is not taken, and the "oxc + serde only"
+  dependency constraint in `Cargo.toml` holds.
+- A future contributor proposing `every`, Starlark, or an embedded JS engine has
+  the measured reason for the refusal and the conditions for reconsidering it.
