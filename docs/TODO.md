@@ -6,6 +6,86 @@
 > l'historique git et [ADR-020](adr/ADR-020-tech-debt-cleanup-decisions.md).
 > Ce fichier ne liste que les limites **ouvertes**.
 
+## Open bugs (crash / soundness) — fix before any new vocabulary
+
+Found while authoring `packs/guardrails.json` against the eight corpora. The
+first two are the priority: one denies analysis outright, the other is a
+false-negative channel, and both are reproduced.
+
+- **CRASH — unbounded recursion in the shared setter walker.** `check_expr_for_setters`'
+  "B5" arm ([setters.rs:394-406](../src/rules/helpers/setters.rs#L394)) resolves a
+  variable *argument* to its bound `FnLit` body and recurses with the depth budget
+  **unchanged** (`// no depth cost`), while every other CFG-crossing arm spends a
+  level; there is no cycle guard. A self-referential local closure —
+  `const tick = (t) => { setN(t); id = requestAnimationFrame(tick) }` — recurses
+  forever. `test-repo/memos` aborts with a stack overflow (1 of 8 corpora never
+  analyzed = every finding in it is a false negative). Reduced to a **20-line,
+  2-file repro**: the closure must reach a component's CFG through a *cross-file
+  inlined* custom hook, which is why no single file crashes. 512 MB of stack
+  still overflows, so it is a cycle, not a deep walk — the fix is a walk-stack
+  guard keyed on CFG identity, **not** a depth budget (a budget also fails the
+  pinned `infinite_loop.rs:1467` test). No FN: `found` only grows via
+  `or_insert`, and depth is non-increasing along any path, so the guard explores
+  exactly the CFG-simple paths and discovers the same setter set. One obligation
+  to keep: `SetterCall.block_id` reaches `Certified` at
+  [setter_in_render.rs:111](../src/rules/impls/setter_in_render.rs#L111) and
+  `declarative/exec.rs:194`, and `found` is first-writer-wins, so pruning must
+  not change which insert wins — both consumers walk `render_cfg` as top level,
+  which can never be a `fn_bindings` value; assert it rather than assume it.
+
+- **FN — an unresolved custom hook's return value reads as provably `Stable`.**
+  `Expr::HookMarker(_) => StateValue::undefined()`
+  ([transfer/state_value.rs:123](../src/domains/transfer/state_value.rs#L123)) and
+  `if self.null || self.undef { acc.join(&Stability::Stable) }`
+  ([impls/state_value.rs:316](../src/domains/impls/state_value.rs#L316)) combine so
+  that an opaque hook return is *provably stable* rather than ⊤. Reproduced: a
+  probe pack reports ``dep `legacy` is stable`` for `const legacy = useLegacyStore()`
+  imported from an unresolvable package. Every rule gated on "provably stable"
+  therefore goes quiet on exactly the values the analyzer knows least about —
+  `all_deps_provably_stable` suppressing `infinite-loop` is the worst case. Fix
+  centrally: an opaque marker must read ⊤ (populate the `other` slot), never
+  `undefined`. Measure the FP delta on the eight corpora in isolation, before any
+  other baseline-moving change. This also removes a latent wrong claim from
+  `guardrails/inert-single-dep`, which would otherwise assert "can never re-run
+  after mount" for an effect whose only dep is an opaque hook return.
+
+- **`safe_check` contradicts `analysis-limit` in the same component.** A component
+  that emits `analysis-limit/unknown-hook` ("FN possible") also emits the
+  `verified: …` universals that the very same limit could falsify — observed
+  together in one probe run (`analysis-limit` for `useLegacyStore` alongside
+  `verified missing-deps — every effect declares the variables it reads`). Fix
+  once in `RuleRegistry::check_component` ([registry.rs](../src/rules/registry.rs)):
+  a component carrying an `analysis-limit` Info must not also publish
+  `safe_check` assurances. Central, ~5 lines, and a precondition for any change
+  that moves rows into the opaque `Custom` channel.
+
+- **Array-destructured custom-hook calls lose their provenance.** `import_source`,
+  `resolved_file` and `binding` are populated only inside the `if !is_arr_temp`
+  guard ([hook_extractor.rs:321-332](../src/lowering/hook_extractor.rs#L321)), so
+  `const [a, setA] = useStore(sel)` — the exact zustand-v5 crash shape — keeps no
+  import source and no resolved file, degrading the `(file, name)` HookRegistry
+  lookup to a first-match `get_by_name`. Prerequisite for scoping any pack rule
+  to a package rather than to a bare local name.
+
+- **`break`/`continue` are sealed `Unreachable` with no edge to the loop exit**
+  ([cfg_builder.rs:245-247](../src/lowering/cfg_builder.rs#L245)). Any all-paths
+  reasoning that enumerates exits sees a phantom exit and misses a real one. It
+  is latent today but it is load-bearing for `missing-cleanup` below: with
+  `Unreachable` in the exit set, an effect whose cleanup *is* reachable can read
+  as "no cleanup on any exit" and certify an Error on a non-bug.
+
+- **Silent no-ops in the Tier-A frontend.** Three refutable `let-else` bindings
+  (`declarative/exec.rs` at the `stability`, `in_deps` and
+  `must_setter_on_all_paths` arms) compile unchanged against a new `Bound`
+  variant and `return`, so a future edge would load, validate, report no error
+  and emit nothing. Same class: `entity.rs`'s `render_field` ends in
+  `_ => String::new()` and `validate.rs`'s `field_for` in `_ => None`, so a
+  missing arm becomes an empty string or an always-false guard instead of a
+  compile error. Convert all of them to exhaustive matches **before** adding any
+  entity, and add a test that a new-edge rule actually *emits* — a rule that
+  loads and silently finds nothing is the failure mode the type system currently
+  will not catch.
+
 ## Known false negatives (FN)
 
 - **Aliased React hook imports stay Custom** — `import { useMemo as useM } from "react"`: classification keys on the LOCAL name (`useM` matches no React arm) → Custom with `import_source: "react"` → not analyzed as a memo. Rare pattern; fixing it needs the *imported* name in the import map, not just the local binding.
@@ -125,8 +205,140 @@ rules-of-hooks, index-as-key, naming) are explicitly out of scope.
 
 ## Frontend limits (ADR-022)
 
+Measured by authoring `packs/guardrails.json` against a 21-rule catalogue drawn
+from the eight `test-repo/` corpora: **3 of the 21 real-world rule classes are
+expressible, all in weakened form**. The blockers, in decreasing leverage:
+
+- **Only declared deps carry an expression verdict** — `RuleCtx::stability_verdict`
+  accepts *any* `Expr`, but the `stability` guard is wired to the `deps` edge
+  alone. Every rule about a value in an *argument*, *prop* or *provider-value*
+  position is therefore inexpressible: store-selector snapshots, per-render
+  context values, identity-keyed JSX props, impure state updaters. The fix is
+  new entities/edges (a hook call's `args`, a `jsx_props` anchor, a setter's
+  argument), not a new guard — the guard already exists and is general. This is
+  the single highest-leverage extension.
 - **Tier A is single-anchor** — a declarative rule binds exactly one anchor entity
   plus typed navigation; cross-component rules (the `cross_component_setters`
   shape only `stale-closure` uses natively) are inexpressible in Tier A v1.
   Lifted later by a schema extension or by Tier B (Starlark, bounded joins) —
-  never by a syntactic bypass. *(ADR-022 §2, §7)*
+  never by a syntactic bypass. *(ADR-022 §2, §7)* The corpus shape this blocks
+  most often is a *slot* written by both an effect and a handler (a resync that
+  clobbers user input): each half binds a different anchor, and joining them
+  needs a second binding or a slot-centric anchor.
+- **Guards over a `forEach` binding are existential only** — there is no ∀ over an
+  edge, so "every dep is stable" cannot be stated. The only workaround is to pin
+  the arity (`count equals 1` alongside the per-element guard), which is why
+  `guardrails/inert-single-dep` covers single-dep effects and nothing wider.
+- **Guards are a conjunction** — no disjunction, so "X or Y" costs two rules with
+  duplicated docs.
+- **`source` is renderable but not guardable** — `{anchor.source}` prints a custom
+  hook's import source, yet no guard matches on it: banning a local *name* works,
+  banning everything from a package does not.
+- **`useLayoutEffect`/`useInsertionEffect` are indistinguishable from `useEffect`** —
+  lowering collapses all three into `HookEntry::Effect` (`hook_extractor.rs:592`),
+  so the common "never call `useLayoutEffect` directly, use the SSR-safe wrapper"
+  convention cannot be written at all.
+- **`{anchor.kind}` renders "hook" for 4 of the 7 kinds** — it reuses
+  `hook_kind_word`, which names only effect/memo/callback.
+- **The `ref` anchor kind is inert** — the filter exists, but no guard and no
+  template field applies to `Sort::Hook(Ref)`.
+- **Cross-file inlining makes ~44% of custom findings unactionable** — 12 of the 27
+  corpus findings print a line number belonging to the *inlined hook's* file under
+  the *consumer's* path (verified exactly: `presence-fade.tsx:17` is
+  `use-callback-ref.ts:17`; `providers.tsx:10` is `use-local-storage.ts:10`). This
+  is the already-known cross-file anchor limitation above, but custom rules hit it
+  far harder than native ones, and one shared hook multiplies into a finding per
+  consumer. Fixing the origin-file rendering would recover more custom-rule value
+  than any new guard. Decided in [ADR-024](adr/ADR-024-inlined-hook-finding-attribution.md).
+
+## Planned work (ADR-023 / ADR-024)
+
+In sequence. Each step is gated on the one before it; the ordering is the
+decision, not a preference — [ADR-023 §5](adr/ADR-023-tier-a-vocabulary-growth.md)
+records why vocabulary work comes after attribution and after the engine facts.
+
+1. **Origin-file rendering** *(S)* — ADR-024 §1: when the anchor's file differs
+   from the component's, name it on the primary human line and make the JSON
+   report's `file` the anchor's file so `file`/`line`/`col` denote one location.
+   Driver-level only; extend the report sort key with the anchor file to keep
+   determinism. One test assertion flips (`tests/cli.rs`); nothing asserts on the
+   human `(line N:C)` text. Bump the JSON report version and update
+   [usage.md](usage.md), which documents the old meaning. **Do not** group
+   findings across consumers — ADR-024 §2 refuses it with the counterexample.
+
+2. **The small vocabulary fixes** *(S)* — no engine change, no fixture churn.
+   Collapse `raw_name`/`render_field` into one `Field`-indexed table with **both
+   projections total** (drop the `_` arms, the way `hook_kind_word` must also drop
+   `_ => "hook"`, which today renders "hook" for 4 of the 7 kinds); make `source`
+   guardable, bound to `import_source` only — never `resolved_file`, whose printed
+   shape is cwd-dependent; give `name` to memo/callback/ref/custom; unlock the
+   inert `ref` anchor by extending `must_init_calls_setter` to it **and** native
+   `lazy-init` to `HookEntry::Ref` in the same commit, so the state-only split
+   never exists. Field guards stay positive-only, absent ⇒ fail (ADR-023).
+
+3. **`any_of` disjunction** *(S)* — ADR-023 §4 explicitly clears it: guard-tree
+   composition, no quantifier hazard. Ship it as the one recursive `eval_guard` /
+   `validate_guard` that also collapses `exec.rs`'s two duplicated guard matches.
+   ∀ (`quantifier: all`) is **refused** — see the ADR for the two false negatives.
+
+4. **Effect cleanup as an engine fact → native `missing-cleanup`** *(M)* — pervasive
+   in 6 of 8 corpora and already listed under "Proposed rules" below. Engine first:
+   seal fall-through and give `break`/`continue` their real loop-exit edge (open bug
+   above), because the Error tier is otherwise built on a phantom exit set. Then
+   promote the registrar relation out of `stale_closure.rs` into `api/` as a pure
+   relocate (byte-identical tests), and add a three-valued `CleanupVerdict` whose
+   `Unknown` folds to the **may** side per the standing `api/query.rs` contract.
+   Ship it as a native **Warning** (as this file has always specified); do not add
+   Tier-A cleanup vocabulary in the same step, and do not attempt register/unregister
+   handle pairing — it scored 0 true positives on the corpus.
+
+5. **Hook identity by provenance** *(M/L)* — a fail-closed `Origin` map replacing the
+   `use[A-Z]`-plus-fail-open-guess classification, so a call through a non-`use`
+   binding is still a hook row and a local `useMemo` is not mistaken for React's.
+   Two corrections are mandatory or it becomes a mass FN: `Origin::React` must be
+   decided by the **literal specifier, before the resolver is consulted** (self-aliasing
+   tsconfig `paths` are live in the corpus — `zustand` maps `"zustand"` to
+   `./src/index.ts`, chakra maps `"@chakra-ui/react"` — and a project aliasing
+   `react` would otherwise turn every React hook into an opaque Custom row and
+   silence the analyzer); and the raw specifier must be retained on **every**
+   `Origin` variant, or `SummaryRegistry`'s package-scoped entries are lost.
+   Gated on the `HookMarker` → ⊤ fix, which must land and be measured first.
+
+6. **Expression-position entities** *(M)* — ADR-023 §§1-3. Gated on the
+   array-destructuring provenance fix. Ship `returns_verdict` as a public ⊤-total
+   primitive in `api/query.rs` handling the **inline `FnLit` case only**, then the
+   `args` edge on the `custom` anchor. Not the `init` edge: a mount-only expression
+   has no cross-render stability question. Not `Var`-bound selectors: `locs` wins
+   over `stabs` in `lookup_env_val` with no invalidation on reassignment, so heap
+   resolution would answer `Stable` for a re-bound opaque selector.
+
+7. **Slot-centric `writers` edge** *(M)* — the join blocker (a slot resynced by an
+   effect *and* written by a handler; 43 candidate pairs on the corpus). Reduced
+   scope only: `writer_phases includes`, a pure MAY existential on the same footing
+   as `in_deps`. **No** `only` comparator and **no** `Escaped` row — measured, 254 of
+   442 state slots (57%) would emit `Escaped`, so it is the majority case, not an
+   edge case, and the completeness theorem that would justify `only` is false as
+   constructed. Resolve first whether `phase` names the *lexical region* or the
+   *execution phase*: a `setTimeout` inside an effect currently classifies as
+   `effect`, which is not what any of the target rules mean.
+
+8. **JSX props as a sink** *(L)* — the context-provider and identity-keyed-prop rule
+   classes. The IR already carries what is needed (`Expr::CompApp { name, props }`,
+   with `AppContext.Provider` surviving as a single dotted name), but this is a new
+   *anchor* needing an engine-side relation, not an edge: the walk must cover
+   `comp.hooks[*].body_cfg()` as well as `render_cfg` or providers built inside a
+   `useMemo` are structurally invisible; the element role must be two-valued
+   (`ContextProvider` minted only from proof, everything else ⊤) because
+   `collect_module_consts` drops `CallExpression` initializers and so cannot tell a
+   non-context binding from an unresolved one; and the rule must not use the
+   `stability` guard, whose `per-render` conflates a fresh allocation with a moving
+   primitive — it needs an identity verdict built on `is_unstable_reference_only`.
+
+- **Effect timing is not recoverable by an IR field alone** — adding an `api`
+  attribute to distinguish `useLayoutEffect`/`useInsertionEffect` from `useEffect`
+  (38 exhaustive `HookEntry::Effect` sites) buys nothing until a
+  `label → (origin hook, import source, origin file, direct|inlined)` row survives
+  `expand_custom_hooks`: without it the chakra rule "never call `useLayoutEffect`
+  directly" fires on conformant consumers of a wrapper that calls it for them.
+  That provenance row is the same mechanism step 5 needs and the same one that
+  makes step 1's origin useful — build it once, then the `api` attribute is cheap.

@@ -24,3 +24,5 @@
 | [ADR-020](ADR-020-tech-debt-cleanup-decisions.md) | Technical-debt cleanup — deliberate non-changes (soundness-preserving) | Accepted |
 | [ADR-021](ADR-021-typed-query-surface.md) | Typed query surface — engine-certified severity, must/may/⊤ as types, `RuleCtx` (frontend deferred) | Accepted |
 | [ADR-022](ADR-022-custom-rule-frontends-distribution.md) | Custom rule frontends & distribution — declarative packs over semantic anchors, pin ⊓ polarity, WASM-only npm | Accepted |
+| [ADR-023](ADR-023-tier-a-vocabulary-growth.md) | Tier-A vocabulary growth — expression-position entities, ∀ refused, Tier B stays deferred | Accepted |
+| [ADR-024](ADR-024-inlined-hook-finding-attribution.md) | Finding attribution across inlined hooks — render the origin, never collapse consumers | Accepted |
