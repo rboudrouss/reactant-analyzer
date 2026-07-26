@@ -3,6 +3,14 @@
   "title": "PackFile",
   "type": "object",
   "properties": {
+    "$schema": {
+      "description": "Editor-facing schema URL; not interpreted. Accepted for the same reason\n`reactant.config.json` accepts it — a published schema is only useful if\nthe file is allowed to point at it.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
     "name": {
       "description": "Pack name: the namespace of every rule id (`<name>/<rule>`).",
       "type": "string"

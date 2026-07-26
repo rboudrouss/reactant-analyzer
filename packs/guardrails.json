@@ -1,0 +1,86 @@
+{
+  "$schema": "../docs/schemas/pack.schema.json",
+  "schemaVersion": 1,
+  "name": "guardrails",
+  "rules": [
+    {
+      "id": "effect-without-deps-array",
+      "docs": {
+        "description": "an effect declares no dependency array at all",
+        "why": "Without a deps array the effect re-runs after every single render, including renders caused by unrelated state. It is the one deps-array state no native rule inspects: `always-unstable-deps` and `missing-deps` both need an array to reason about, so this shape is invisible today. Note that the omission is sometimes deliberate — the latest-ref idiom (`useInsertionEffect(() => { ref.current = fn })`, a userland `useEffectEvent`) requires it — so treat this as a review trigger, not a defect claim.",
+        "fix": "Add the array: `[]` if the effect really is mount-only, otherwise what the body reads. If the omission is the latest-ref idiom, turn this rule off for the hook that implements it.",
+        "example": "useEffect(() => { document.title = title; })  // runs after every render"
+      },
+      "severity": "warning",
+      "anchor": { "relation": "hook_calls", "kind": "effect" },
+      "guards": [{ "kind": "deps_declared", "of": "anchor", "eq": false }],
+      "message": "this effect declares no dependency array — it re-runs after every render"
+    },
+    {
+      "id": "inert-single-dep",
+      "docs": {
+        "description": "an effect's only dependency is provably stable, so it can never re-run",
+        "why": "A single dependency that the engine proves stable (a `useRef` container, a state setter, a module constant) can never change identity, so the effect fires once at mount and never again. Writing it as a reactive effect states an intent the code cannot honour — the feature the author expected to re-run silently does not.",
+        "fix": "If mount-only was intended, write `[]` and say so. If the effect should react to something, depend on the value that actually moves, not on the container that holds it.",
+        "example": "useEffect(() => { sync(ref.current) }, [ref])  // ref identity never changes"
+      },
+      "severity": "warning",
+      "anchor": { "relation": "hook_calls", "kind": "effect" },
+      "forEach": { "edge": "deps", "as": "dep" },
+      "guards": [
+        { "kind": "count", "of": "anchor.deps", "equals": 1 },
+        { "kind": "stability", "of": "dep", "is": ["stable"] }
+      ],
+      "message": "the only dependency {dep.path} is {dep.stability} — this effect can never re-run after mount"
+    },
+    {
+      "id": "self-retriggering-effect",
+      "docs": {
+        "description": "an effect unconditionally writes a state slot listed in its own dependency array",
+        "why": "The write changes a dep, which re-runs the effect, which writes again. When the write is proven to happen on every path through the effect body, the cycle has no exit — the component re-renders forever. Certified writes are reported as errors; writes the engine can only prove on some paths stay warnings.",
+        "fix": "Derive the value during render instead of storing it, or remove the slot from the deps array and write with the functional updater.",
+        "example": "useEffect(() => { setCount(count + 1) }, [count])"
+      },
+      "severity": "error",
+      "anchor": { "relation": "hook_calls", "kind": "effect" },
+      "forEach": { "edge": "body_setter_calls", "as": "setter" },
+      "guards": [
+        { "kind": "in_deps", "of": "setter" },
+        { "kind": "must_setter_on_all_paths", "of": "setter" }
+      ],
+      "message": "this effect writes {setter.slot}, which is listed in its own dependency array"
+    },
+    {
+      "id": "oversized-effect",
+      "docs": {
+        "description": "an effect's dependency array exceeds the team's size budget",
+        "why": "A long dependency array almost always means one effect doing several unrelated jobs: every listed value re-runs all of the work, and the effect becomes impossible to review or to change safely. The budget is a review trigger, not a correctness claim.",
+        "fix": "Split the effect so each one owns a single concern and depends only on what that concern reads.",
+        "example": "useEffect(() => { /* fetch, subscribe, and sync the title */ }, [a, b, c, d, e, f])"
+      },
+      "severity": "warning",
+      "params": { "maxDeps": { "type": "number", "default": 5 } },
+      "anchor": { "relation": "hook_calls", "kind": "effect" },
+      "guards": [
+        { "kind": "count", "of": "anchor.deps", "more_than": { "$param": "maxDeps" } }
+      ],
+      "message": "this effect declares more than {param.maxDeps} dependencies — split it by concern"
+    },
+    {
+      "id": "banned-hook",
+      "docs": {
+        "description": "a custom hook the team has withdrawn is still being called",
+        "why": "Deprecating a hook by writing it in a migration document does not stop the next contributor — human or agent — from copying the nearest existing call site. Listing the withdrawn names here turns the convention into a gate.",
+        "fix": "Use the documented replacement. Update the `banned` option when the migration lands.",
+        "example": "const store = useLegacyStore()  // withdrawn: tears under concurrent rendering"
+      },
+      "severity": "warning",
+      "params": { "banned": { "type": "string[]", "default": [] } },
+      "anchor": { "relation": "hook_calls", "kind": "custom" },
+      "guards": [
+        { "kind": "name", "of": "anchor", "one_of": { "$param": "banned" } }
+      ],
+      "message": "{anchor.name} is withdrawn by team policy"
+    }
+  ]
+}

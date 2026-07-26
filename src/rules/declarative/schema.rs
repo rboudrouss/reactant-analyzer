@@ -18,6 +18,11 @@ use schemars::JsonSchema;
 #[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct PackFile {
+    /// Editor-facing schema URL; not interpreted. Accepted for the same reason
+    /// `reactant.config.json` accepts it — a published schema is only useful if
+    /// the file is allowed to point at it.
+    #[serde(rename = "$schema", default)]
+    pub schema: Option<String>,
     /// Format version; only `1` exists.
     #[serde(rename = "schemaVersion")]
     pub schema_version: u32,

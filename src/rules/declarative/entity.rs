@@ -294,11 +294,14 @@ pub(crate) fn verdict_name(v: &StabilityVerdict) -> StabilityName {
     }
 }
 
+/// `PerRender` is kind-agnostic motion ("changes every render", ADR-017), not
+/// a fresh allocation: a `useState` counter converged to a wide interval lands
+/// here too. The word must therefore not claim the value is *recreated*.
 pub(crate) fn verdict_word(n: StabilityName) -> &'static str {
     match n {
         StabilityName::Stable => "stable",
         StabilityName::Versioned => "versioned",
-        StabilityName::PerRender => "recreated every render",
+        StabilityName::PerRender => "changing across renders",
         StabilityName::Unknown => "of unknown stability",
     }
 }

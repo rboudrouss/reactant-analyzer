@@ -132,7 +132,11 @@ pub enum StabilityVerdict {
     Stable,
     /// Changes only at the named setter events (may bound). Empty = widened.
     Versioned(BTreeSet<(Symbol, HookLabel)>),
-    /// A fresh reference every render (must bound).
+    /// Changes on every render (must bound) — **kind-agnostic motion**, not
+    /// necessarily a fresh allocation (ADR-017): a numeric slot converged to a
+    /// non-point interval lands here alongside an object literal. A consumer
+    /// that needs "defeats `Object.is` because the identity is new" wants
+    /// [`crate::domains::StateValue::is_unstable_reference_only`] instead.
     PerRender,
     /// ⊤ — no bound in either direction. Folded to the may side.
     Unknown,
