@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ReactantConfig",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "description": "Editor-facing schema URL; not interpreted.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "allRoots": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "entry": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "failOn": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FailOnConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "format": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FormatConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "info": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "packs": {
+      "description": "Rule packs to load: npm package names or relative paths, in order\n(ADR-022 §8: pack order is output order). Consumed by the pack loader.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "project": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ProjectConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "rules": {
+      "description": "Per-diagnostic overrides: `\"off\" | \"<severity>\" | { severity?, options? }`.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/RuleSetting"
+      }
+    },
+    "showClean": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "trace": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "FailOnConfig": {
+      "type": "string",
+      "enum": [
+        "error",
+        "warning",
+        "never"
+      ]
+    },
+    "FormatConfig": {
+      "type": "string",
+      "enum": [
+        "human",
+        "json"
+      ]
+    },
+    "ProjectConfig": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "vite",
+        "plain"
+      ]
+    },
+    "RuleSetting": {
+      "description": "\"off\", a severity ceiling, or a detailed form with options",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "off",
+            "error",
+            "warning",
+            "info"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "options": {
+              "type": "object"
+            },
+            "severity": {
+              "type": "string",
+              "enum": [
+                "off",
+                "error",
+                "warning",
+                "info"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

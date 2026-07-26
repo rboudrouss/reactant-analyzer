@@ -1,0 +1,4 @@
+{
+  // Discovered at the project root without --config; proves discovery+merge.
+  "failOn": "never"
+}

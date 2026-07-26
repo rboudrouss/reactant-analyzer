@@ -399,9 +399,13 @@ struct PathFinding {
     mount_only: bool,
 }
 
+impl StaleClosure {
+    const NAME: &'static str = "stale-closure";
+}
+
 impl Rule for StaleClosure {
     fn name(&self) -> &'static str {
-        "stale-closure"
+        Self::NAME
     }
 
     fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
@@ -428,7 +432,7 @@ impl Rule for StaleClosure {
             !regs.is_empty()
         });
         applicable.then_some(crate::rules::SafeCheck {
-            rule: self.name(),
+            rule: Self::NAME,
             message: "no long-lived callback captures a stale state value",
         })
     }

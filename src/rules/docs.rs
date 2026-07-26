@@ -6,96 +6,137 @@
 //! `cross-setter-in-render`). Used by the CLI's `rules` / `explain`
 //! subcommands and to validate `--rule` / `--ignore-rule` filters.
 
+use std::borrow::Cow;
+
 /// Documentation entry for one diagnostic name.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuleDoc {
     /// Matches `Diagnostic::rule` exactly.
-    pub name: &'static str,
+    pub name: Cow<'static, str>,
     /// One line, shown by `reactant rules`.
-    pub summary: &'static str,
+    pub summary: Cow<'static, str>,
     /// What the rule detects and why it matters, shown by `reactant explain`.
-    pub explanation: &'static str,
+    pub explanation: Cow<'static, str>,
     /// Minimal buggy snippet.
-    pub example: &'static str,
+    pub example: Cow<'static, str>,
     /// How to fix it.
-    pub fix: &'static str,
+    pub fix: Cow<'static, str>,
+}
+
+impl RuleDoc {
+    /// Runtime constructor for dynamically loaded rules (ADR-022): pack docs
+    /// own their strings. The static table below uses [`doc`].
+    pub fn new(
+        name: impl Into<Cow<'static, str>>,
+        summary: impl Into<Cow<'static, str>>,
+        explanation: impl Into<Cow<'static, str>>,
+        example: impl Into<Cow<'static, str>>,
+        fix: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        RuleDoc {
+            name: name.into(),
+            summary: summary.into(),
+            explanation: explanation.into(),
+            example: example.into(),
+            fix: fix.into(),
+        }
+    }
+}
+
+/// Const constructor for the static table (fields in declaration order:
+/// name, summary, explanation, example, fix).
+const fn doc(
+    name: &'static str,
+    summary: &'static str,
+    explanation: &'static str,
+    example: &'static str,
+    fix: &'static str,
+) -> RuleDoc {
+    RuleDoc {
+        name: Cow::Borrowed(name),
+        summary: Cow::Borrowed(summary),
+        explanation: Cow::Borrowed(explanation),
+        example: Cow::Borrowed(example),
+        fix: Cow::Borrowed(fix),
+    }
 }
 
 /// All diagnostic names, sorted alphabetically.
 pub const RULE_DOCS: &[RuleDoc] = &[
-    RuleDoc {
-        name: "always-unstable-deps",
-        summary: "a dep is a fresh reference every render — the deps array never matches",
-        explanation: "React compares deps with `Object.is`. An object, array, or function \
+    doc(
+        "always-unstable-deps",
+        "a dep is a fresh reference every render — the deps array never matches",
+        "React compares deps with `Object.is`. An object, array, or function \
                       literal allocated during render has a new identity every render, so a \
                       single such dep defeats the whole array: the hook re-runs every render \
                       no matter how stable the other deps are. For `useEffect` this means the \
                       effect always fires; for `useMemo`/`useCallback` the memoization is dead \
                       weight.",
-        example: "useEffect(() => sync(opts), [{ mode }, id]);",
-        fix: "Hoist the literal out of render, memoize it (`useMemo`), or depend on its \
+        "useEffect(() => sync(opts), [{ mode }, id]);",
+        "Hoist the literal out of render, memoize it (`useMemo`), or depend on its \
               primitive parts (`[mode, id]`) instead of a fresh wrapper object.",
-    },
-    RuleDoc {
-        name: "analysis-limit",
-        summary: "the analyzer deliberately truncated analysis here (potential false negatives)",
-        explanation: "Emitted (with --info) wherever soundness required giving up precision: \
+    ),
+    doc(
+        "analysis-limit",
+        "the analyzer deliberately truncated analysis here (potential false negatives)",
+        "Emitted (with --info) wherever soundness required giving up precision: \
                       recursive components (recursion-cutoff), children not found in the \
                       registry (unknown-component), callback inlining past the depth cap \
                       (callback-depth-cap), or custom hooks with no source and no summary \
                       (unknown-hook). Each site is a place where a real bug could hide — a \
                       clean report does NOT cover these regions.",
-        example: "const data = useVendorHook(); // hook body not in the analyzed files",
-        fix: "Not a code bug. Include the hook's source in the analyzed paths, or register a \
+        "const data = useVendorHook(); // hook body not in the analyzed files",
+        "Not a code bug. Include the hook's source in the analyzed paths, or register a \
               HookSummary for it via the plugin API.",
-    },
-    RuleDoc {
-        name: "conditional-hook",
-        summary: "hook called inside a conditional branch",
-        explanation: "Hooks must be called unconditionally, in the same order, on every \
+    ),
+    doc(
+        "conditional-hook",
+        "hook called inside a conditional branch",
+        "Hooks must be called unconditionally, in the same order, on every \
                       render — React matches hook calls to state slots by call order. A hook \
                       whose block does not dominate every render exit can be skipped on some \
                       path, shifting every later hook onto the wrong slot.",
-        example: "if (visible) { const [n, setN] = useState(0); }",
-        fix: "Call the hook unconditionally and branch on its result instead: \
+        "if (visible) { const [n, setN] = useState(0); }",
+        "Call the hook unconditionally and branch on its result instead: \
               `const [n, setN] = useState(0); if (!visible) return null;`",
-    },
-    RuleDoc {
-        name: "cross-component-infinite-loop",
-        summary: "child effect sets parent state — parent re-renders child, effect refires",
-        explanation: "An effect in a child component calls a setter received as a prop, and \
+    ),
+    doc(
+        "cross-component-infinite-loop",
+        "child effect sets parent state — parent re-renders child, effect refires",
+        "An effect in a child component calls a setter received as a prop, and \
                       the abstract value of the parent's state slot keeps growing across \
                       fixpoint iterations. Parent re-renders → child re-renders → effect \
                       fires again: an infinite render loop spanning two components, invisible \
                       to any single-file linter.",
-        example: "function Child({ onCount }) {\n  useEffect(() => onCount(c => c + 1));\n}",
-        fix: "Gate the effect with a deps array that converges, or lift the update to an \
+        "function Child({ onCount }) {\n  useEffect(() => onCount(c => c + 1));\n}",
+        "Gate the effect with a deps array that converges, or lift the update to an \
               event handler instead of an effect.",
-    },
-    RuleDoc {
-        name: "cross-setter-in-render",
-        summary: "parent's setter (received as prop) called during render",
-        explanation: "Calling a setter passed down as a prop during the render body schedules \
+    ),
+    doc(
+        "cross-setter-in-render",
+        "parent's setter (received as prop) called during render",
+        "Calling a setter passed down as a prop during the render body schedules \
                       a parent re-render while the child is rendering. React errors with \
                       \"Cannot update a component while rendering a different component\", or \
                       loops.",
-        example: "function Child({ setTotal }) { setTotal(42); return <div/>; }",
-        fix: "Move the call into a `useEffect` or an event handler.",
-    },
-    RuleDoc {
-        name: "derived-state",
-        summary: "effect only mirrors another state — should be computed during render",
-        explanation: "A `useEffect` that unconditionally sets state B to a call-free function \
+        "function Child({ setTotal }) { setTotal(42); return <div/>; }",
+        "Move the call into a `useEffect` or an event handler.",
+    ),
+    doc(
+        "derived-state",
+        "effect only mirrors another state — should be computed during render",
+        "A `useEffect` that unconditionally sets state B to a call-free function \
                       of state A stores derived data in state. It costs an extra render on \
                       every change of A (render with stale B, effect, render again) and can \
                       go stale.",
-        example: "useEffect(() => setFull(first + ' ' + last), [first, last]);",
-        fix: "Compute it during render — `const full = first + ' ' + last;` — or `useMemo` if \
+        "useEffect(() => setFull(first + ' ' + last), [first, last]);",
+        "Compute it during render — `const full = first + ' ' + last;` — or `useMemo` if \
               it's expensive. Delete the state slot.",
-    },
-    RuleDoc {
-        name: "frozen-initial-state",
-        summary: "useState seeded from a prop that changes — the state freezes at the first value",
-        explanation: "`useState` reads its initializer on the first render only; every later \
+    ),
+    doc(
+        "frozen-initial-state",
+        "useState seeded from a prop that changes — the state freezes at the first value",
+        "`useState` reads its initializer on the first render only; every later \
                       render ignores it. When the initializer reads a prop and no effect keyed \
                       on that prop (and no render-time write) ever syncs the slot, the state \
                       stays frozen at the first prop value while the prop moves on — the \
@@ -108,76 +149,76 @@ pub const RULE_DOCS: &[RuleDoc] = &[
                       deliberate mount-time snapshot). Silent when the feeding state provably \
                       never changes or a sync path exists (that quality is `derived-state`'s \
                       concern).",
-        example: "function Row({ user }) {\n\
+        "function Row({ user }) {\n\
                   \x20 const [name, setName] = useState(user.name); // user changes later\n\
                   }",
-        fix: "Pick an ownership model: use the prop directly and lift updates up (controlled); \
+        "Pick an ownership model: use the prop directly and lift updates up (controlled); \
               remount with `key={...}` at the call site to re-seed; or sync deliberately with \
               `useEffect(() => setName(user.name), [user.name])`. If seed-once is intended, \
               name the prop `initialName`.",
-    },
-    RuleDoc {
-        name: "infinite-loop",
-        summary: "effect sets state that re-triggers the effect — state diverges",
-        explanation: "The render → effect → setState → render cycle never stabilizes: the \
+    ),
+    doc(
+        "infinite-loop",
+        "effect sets state that re-triggers the effect — state diverges",
+        "The render → effect → setState → render cycle never stabilizes: the \
                       abstract value of the state slot required widening and the effect's \
                       write stays unbounded, the structural signature of an infinite render \
                       loop. Detected through the fixpoint (guards that bound the state, e.g. \
                       `if (n < 5) setN(n+1)`, converge and are not flagged), including \
                       through `.then(...)` / `setTimeout(...)` callbacks and inlined \
                       cross-file custom hooks.",
-        example: "useEffect(() => { setCount(count + 1); }, [count]);",
-        fix: "Add a converging condition, use a deps array that doesn't include the state \
+        "useEffect(() => { setCount(count + 1); }, [count]);",
+        "Add a converging condition, use a deps array that doesn't include the state \
               being set, or move the update out of the effect.",
-    },
-    RuleDoc {
-        name: "lazy-init",
-        summary: "useState initializer calls a function on every render",
-        explanation: "`useState(f())` evaluates `f()` on every render but uses the result \
+    ),
+    doc(
+        "lazy-init",
+        "useState initializer calls a function on every render",
+        "`useState(f())` evaluates `f()` on every render but uses the result \
                       only on mount — wasted work on each subsequent render. The lazy form \
                       `useState(() => f())` runs it once. Severity is graded by what the call \
                       does: a state-setter call is an Error (state write every render); a \
                       side-effecting/async call (`fetch`, `subscribe`, `setTimeout`) is a \
                       Warning (the effect re-fires, not just wasted CPU); a proven-cheap pure \
                       builtin (`Math.*`, `Date.now`) is Info (advisory).",
-        example: "const [data, setData] = useState(expensiveParse(blob));",
-        fix: "const [data, setData] = useState(() => expensiveParse(blob));",
-    },
-    RuleDoc {
-        name: "missing-deps",
-        summary: "effect body captures a variable not listed in its deps array",
-        explanation: "A `useEffect`/`useMemo`/`useCallback` body reads a non-stable free \
+        "const [data, setData] = useState(expensiveParse(blob));",
+        "const [data, setData] = useState(() => expensiveParse(blob));",
+    ),
+    doc(
+        "missing-deps",
+        "effect body captures a variable not listed in its deps array",
+        "A `useEffect`/`useMemo`/`useCallback` body reads a non-stable free \
                       variable that is missing from the deps array. The closure keeps seeing \
                       the value from the render when deps last matched — the classic stale \
                       closure: the hook silently works on outdated data.",
-        example: "useEffect(() => { fetch(url); }, []); // url captured, not declared",
-        fix: "Add the captured variable to the deps array, or move it inside the effect if \
+        "useEffect(() => { fetch(url); }, []); // url captured, not declared",
+        "Add the captured variable to the deps array, or move it inside the effect if \
               it shouldn't retrigger it.",
-    },
-    RuleDoc {
-        name: "redundant-set-state",
-        summary: "setState called with the value the state already holds",
-        explanation: "Both the argument and the current abstract state are stable and equal: \
+    ),
+    doc(
+        "redundant-set-state",
+        "setState called with the value the state already holds",
+        "Both the argument and the current abstract state are stable and equal: \
                       the call can never change anything. Usually a leftover or a sign the \
                       update was meant to be conditional. (React bails out on identical \
                       values, but the render to discover it still costs.)",
-        example: "const [n, setN] = useState(0); useEffect(() => { setN(0); }, []);",
-        fix: "Delete the call, or make it set a genuinely different value.",
-    },
-    RuleDoc {
-        name: "setter-in-render",
-        summary: "setState called during the render body",
-        explanation: "Calling a setter while rendering schedules another render before this \
+        "const [n, setN] = useState(0); useEffect(() => { setN(0); }, []);",
+        "Delete the call, or make it set a genuinely different value.",
+    ),
+    doc(
+        "setter-in-render",
+        "setState called during the render body",
+        "Calling a setter while rendering schedules another render before this \
                       one commits. Unconditional call → guaranteed infinite loop (Error); \
                       conditional call → loops whenever the condition holds (Warning).",
-        example: "function C() { const [n, setN] = useState(0); setN(1); return <div/>; }",
-        fix: "Move the call into a `useEffect` or an event handler. To derive a value, \
+        "function C() { const [n, setN] = useState(0); setN(1); return <div/>; }",
+        "Move the call into a `useEffect` or an event handler. To derive a value, \
               compute it during render without state.",
-    },
-    RuleDoc {
-        name: "stale-closure",
-        summary: "long-lived callback keeps a state value frozen at registration time",
-        explanation: "A callback handed to `setInterval`, `addEventListener`, `subscribe`, \
+    ),
+    doc(
+        "stale-closure",
+        "long-lived callback keeps a state value frozen at registration time",
+        "A callback handed to `setInterval`, `addEventListener`, `subscribe`, \
                       `setTimeout` or a promise `.then` inside an effect closes over the \
                       variable values from the render that last ran the effect. When the \
                       effect's deps array does not cover a captured state value, the callback \
@@ -186,47 +227,47 @@ pub const RULE_DOCS: &[RuleDoc] = &[
                       (`setN(n + 1)` in an interval), the state can never advance past its \
                       first update: every firing recomputes from the same frozen capture \
                       (Error).",
-        example: "const [n, setN] = useState(0);\n\
+        "const [n, setN] = useState(0);\n\
                   useEffect(() => { setInterval(() => setN(n + 1), 1000); }, []);",
-        fix: "Use the functional updater (`setN(n => n + 1)`) so the callback never reads \
+        "Use the functional updater (`setN(n => n + 1)`) so the callback never reads \
               the captured value; mirror the latest value into a `useRef` and read \
               `ref.current`; or add the value to the deps array and return a cleanup so \
               the callback is re-registered with a fresh capture.",
-    },
-    RuleDoc {
-        name: "state-mutation",
-        summary: "state or prop object mutated in place — same reference, no re-render",
-        explanation: "Mutating a state object (`arr.push(x)`, `obj.f = v`) keeps its reference \
+    ),
+    doc(
+        "state-mutation",
+        "state or prop object mutated in place — same reference, no re-render",
+        "Mutating a state object (`arr.push(x)`, `obj.f = v`) keeps its reference \
                       identity; calling the setter with that same reference makes React bail \
                       out (`Object.is(old, new)` is true) and skip the re-render — the UI \
                       silently freezes (Error). Mutating an object received via props writes \
                       into data owned by the parent (Warning).",
-        example: "const [items, setItems] = useState([]);\n\
+        "const [items, setItems] = useState([]);\n\
                   const add = (x) => { items.push(x); setItems(items); };",
-        fix: "Create a new reference: `setItems([...items, x])` — or for objects, \
+        "Create a new reference: `setItems([...items, x])` — or for objects, \
               `setUser({ ...user, name })`. Never write through the current state value.",
-    },
-    RuleDoc {
-        name: "unnecessary-rerender",
-        summary: "mount-only effect immediately overwrites the initial state",
-        explanation: "A `deps: []` effect sets a state slot to a stable constant different \
+    ),
+    doc(
+        "unnecessary-rerender",
+        "mount-only effect immediately overwrites the initial state",
+        "A `deps: []` effect sets a state slot to a stable constant different \
                       from its `useState` init. Every mount renders with the init value, then \
                       immediately re-renders with the effect's value — one wasted render and \
                       a visible flash, when the init could be the final value directly.",
-        example: "const [mode, setMode] = useState('none');\nuseEffect(() => setMode('grid'), []);",
-        fix: "Put the final value in the initializer: `useState('grid')` — or compute it \
+        "const [mode, setMode] = useState('none');\nuseEffect(() => setMode('grid'), []);",
+        "Put the final value in the initializer: `useState('grid')` — or compute it \
               lazily: `useState(() => readSetting())`.",
-    },
-    RuleDoc {
-        name: "widening-info",
-        summary: "state slot required widening to converge (precision lost here)",
-        explanation: "Informational (--info): the fixpoint only converged on this state slot \
+    ),
+    doc(
+        "widening-info",
+        "state slot required widening to converge (precision lost here)",
+        "Informational (--info): the fixpoint only converged on this state slot \
                       by widening its abstract value (e.g. an interval jumped to +∞). \
                       Downstream checks on this slot are less precise. Often accompanies a \
                       real divergence (see infinite-loop) but is not itself a bug.",
-        example: "useEffect(() => setN(n + 1), [n]); // n widens to [0, +∞)",
-        fix: "Not a code bug per se — see the companion diagnostic on the same slot if any.",
-    },
+        "useEffect(() => setN(n + 1), [n]); // n widens to [0, +∞)",
+        "Not a code bug per se — see the companion diagnostic on the same slot if any.",
+    ),
 ];
 
 /// Look up the documentation for a diagnostic name.
@@ -261,7 +302,7 @@ mod tests {
 
     #[test]
     fn docs_are_sorted_and_unique() {
-        let names: Vec<&str> = RULE_DOCS.iter().map(|d| d.name).collect();
+        let names: Vec<&str> = RULE_DOCS.iter().map(|d| d.name.as_ref()).collect();
         let mut sorted = names.clone();
         sorted.sort_unstable();
         sorted.dedup();

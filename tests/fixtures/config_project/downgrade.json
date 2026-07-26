@@ -1,0 +1,4 @@
+{
+  // Consumer downgrade of a native Error — always honored (ADR-022 §3).
+  "rules": { "setter-in-render": "warning" }
+}

@@ -1,4 +1,6 @@
+pub mod config;
 pub mod domains;
+pub mod driver;
 pub mod engine;
 pub mod ir;
 pub mod lowering;

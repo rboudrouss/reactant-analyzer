@@ -64,8 +64,8 @@ fn default_discoverer_and_resolver_end_to_end() {
 
     let (result, file_count) = analyze_with_resolvers(
         tmp.path(),
-        &DefaultFileDiscoverer,
-        &DefaultImportResolver,
+        &DefaultFileDiscoverer::default(),
+        &DefaultImportResolver::default(),
         RootStrategy::AllComponents,
         Config::default(),
     );
@@ -110,7 +110,7 @@ fn custom_discoverer_can_filter_to_specific_files() {
     let (result, file_count) = analyze_with_resolvers(
         tmp.path(),
         &OnlyPages,
-        &DefaultImportResolver,
+        &DefaultImportResolver::default(),
         RootStrategy::AllComponents,
         Config::default(),
     );
@@ -141,7 +141,7 @@ fn custom_resolver_is_invoked_for_relative_imports() {
                 .lock()
                 .unwrap()
                 .push((from.to_path_buf(), specifier.to_string()));
-            DefaultImportResolver.resolve(from, specifier)
+            DefaultImportResolver::default().resolve(from, specifier)
         }
     }
 
@@ -163,7 +163,7 @@ fn custom_resolver_is_invoked_for_relative_imports() {
     };
     let (_result, _file_count) = analyze_with_resolvers(
         tmp.path(),
-        &DefaultFileDiscoverer,
+        &DefaultFileDiscoverer::default(),
         &recorder,
         RootStrategy::AllComponents,
         Config::default(),

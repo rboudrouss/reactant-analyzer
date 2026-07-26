@@ -1,20 +1,24 @@
 //! Human-readable renderer: findings grouped per component, colorized, with a
-//! per-component file suffix.
+//! per-component file suffix. Renders into a `String` — the host owns the
+//! streams (native CLI prints, WASM returns).
 
-use reactant::rules::Severity;
+use std::fmt::Write;
+use std::path::Path;
 
-use super::check::{CheckReport, ComponentReport};
-use super::color::Palette;
-use super::display_relative;
+use crate::rules::Severity;
+
+use super::palette::Palette;
+use super::report::{CheckReport, ComponentReport};
 
 /// Under `--info`, list the applicable checks that ran on this component and
 /// found nothing — positive assurance, distinct from an unchecked region.
-fn render_safe_checks(comp: &ComponentReport, info: bool, p: &Palette) {
+fn render_safe_checks(out: &mut String, comp: &ComponentReport, info: bool, p: &Palette) {
     if !info {
         return;
     }
     for s in &comp.safe_checks {
-        println!(
+        let _ = writeln!(
+            out,
             "    {}verified{}  {}{}{}  {}",
             p.green, p.reset, p.dim, s.rule, p.reset, s.message
         );
@@ -24,15 +28,24 @@ fn render_safe_checks(comp: &ComponentReport, info: bool, p: &Palette) {
 /// `show_clean` unhides components with no findings; `info` adds Info
 /// diagnostics plus the per-component "verified safe" list; `trace` reveals
 /// each finding's `→` causal-chain notes (hidden by default).
-pub fn render(report: &CheckReport, no_color: bool, show_clean: bool, info: bool, trace: bool) {
-    let p = Palette::for_stdout(no_color);
+pub fn render(
+    report: &CheckReport,
+    color: bool,
+    show_clean: bool,
+    info: bool,
+    trace: bool,
+    display: &dyn Fn(&Path) -> String,
+) -> String {
+    let p = Palette::pick(color);
+    let mut out = String::new();
 
     if report.components.is_empty() {
-        println!(
+        let _ = writeln!(
+            out,
             "{}✓  {} file(s) no components detected.{}",
             p.green, report.files_analyzed, p.reset
         );
-        return;
+        return out;
     }
 
     let mut hidden_clean = 0usize;
@@ -45,7 +58,7 @@ pub fn render(report: &CheckReport, no_color: bool, show_clean: bool, info: bool
         let file_suffix = comp
             .file
             .as_deref()
-            .map(|f| format!("  {}{}{}", p.dim, display_relative(f), p.reset))
+            .map(|f| format!("  {}{}{}", p.dim, display(f), p.reset))
             .unwrap_or_default();
 
         if comp.diagnostics.is_empty() {
@@ -54,15 +67,17 @@ pub fn render(report: &CheckReport, no_color: bool, show_clean: bool, info: bool
                 hidden_clean += 1;
                 continue;
             }
-            println!(
+            let _ = writeln!(
+                out,
                 "  {}{}{}  ({} hooks){}  {}✓{}",
                 p.bold, comp.name, p.reset, comp.hook_count, file_suffix, p.green, p.reset
             );
-            render_safe_checks(comp, info, &p);
+            render_safe_checks(&mut out, comp, info, &p);
             continue;
         }
 
-        println!(
+        let _ = writeln!(
+            out,
             "  {}{}{}  ({} hooks){}",
             p.bold, comp.name, p.reset, comp.hook_count, file_suffix
         );
@@ -85,7 +100,8 @@ pub fn render(report: &CheckReport, no_color: bool, show_clean: bool, info: bool
                 .range
                 .map(|r| format!("  {}(line {}:{}){}", p.dim, r.line, r.col, p.reset))
                 .unwrap_or_default();
-            println!(
+            let _ = writeln!(
+                out,
                 "    {}{}{}  {}{}{}{}  {}",
                 sev_color, sev_tag, p.reset, d.rule, label_info, var_info, range_info, d.message
             );
@@ -104,15 +120,16 @@ pub fn render(report: &CheckReport, no_color: bool, show_clean: bool, info: bool
                         .range
                         .map(|r| match report.file_table.path(r.file) {
                             Some(f) if comp.file.as_deref() != Some(f) => {
-                                format!(" ({}:{}:{})", display_relative(f), r.line, r.col)
+                                format!(" ({}:{}:{})", display(f), r.line, r.col)
                             }
                             _ => format!(" (line {}:{})", r.line, r.col),
                         })
                         .unwrap_or_default();
-                    println!("       → {}{}{}", note.message, note_hook, note_range);
+                    let _ = writeln!(out, "       → {}{}{}", note.message, note_hook, note_range);
                 }
                 if d.notes.len() > MAX_STEPS {
-                    println!(
+                    let _ = writeln!(
+                        out,
                         "       {}… {} more step(s){}",
                         p.dim,
                         d.notes.len() - MAX_STEPS,
@@ -120,7 +137,8 @@ pub fn render(report: &CheckReport, no_color: bool, show_clean: bool, info: bool
                     );
                 }
             } else if !d.notes.is_empty() {
-                println!(
+                let _ = writeln!(
+                    out,
                     "       {}({} trace step(s) — rerun with --trace){}",
                     p.dim,
                     d.notes.len(),
@@ -128,19 +146,21 @@ pub fn render(report: &CheckReport, no_color: bool, show_clean: bool, info: bool
                 );
             }
         }
-        render_safe_checks(comp, info, &p);
+        render_safe_checks(&mut out, comp, info, &p);
     }
 
     if hidden_clean > 0 && !show_clean {
-        println!(
+        let _ = writeln!(
+            out,
             "{}   {} clean component(s) hidden — rerun with --show-clean{}",
             p.dim, hidden_clean, p.reset
         );
     }
 
-    println!();
+    let _ = writeln!(out);
     if report.errors == 0 && report.warnings == 0 {
-        println!(
+        let _ = writeln!(
+            out,
             "{}✓  {} file(s) no issues found.{}",
             p.green, report.files_analyzed, p.reset
         );
@@ -152,7 +172,8 @@ pub fn render(report: &CheckReport, no_color: bool, show_clean: bool, info: bool
         .into_iter()
         .flatten()
         .collect();
-        println!(
+        let _ = writeln!(
+            out,
             "{}⚠  {} across {} file(s).{}",
             p.yellow,
             parts.join(", "),
@@ -160,4 +181,5 @@ pub fn render(report: &CheckReport, no_color: bool, show_clean: bool, info: bool
             p.reset
         );
     }
+    out
 }

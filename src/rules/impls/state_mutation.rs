@@ -373,9 +373,13 @@ fn display_expr(e: &Expr) -> String {
     }
 }
 
+impl StateMutation {
+    const NAME: &'static str = "state-mutation";
+}
+
 impl Rule for StateMutation {
     fn name(&self) -> &'static str {
-        "state-mutation"
+        Self::NAME
     }
 
     fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
@@ -383,7 +387,7 @@ impl Rule for StateMutation {
         use crate::engine::HookKind;
         crate::rules::has_hook_kind(result, component, HookKind::State).then_some(
             crate::rules::SafeCheck {
-                rule: self.name(),
+                rule: Self::NAME,
                 message: "no state or prop object is mutated in place",
             },
         )

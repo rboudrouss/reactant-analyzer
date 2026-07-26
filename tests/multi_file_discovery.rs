@@ -101,7 +101,7 @@ fn directory_input_discovers_and_analyzes_multiple_files() {
     );
 
     // Phase 1: discovery.
-    let files = DefaultFileDiscoverer.discover(tmp.path());
+    let files = DefaultFileDiscoverer::default().discover(tmp.path());
     assert_eq!(
         files.len(),
         2,
@@ -157,7 +157,7 @@ fn directory_input_ignores_node_modules_and_test_files() {
         "function Other() { return <div/>; }",
     );
 
-    let files = DefaultFileDiscoverer.discover(tmp.path());
+    let files = DefaultFileDiscoverer::default().discover(tmp.path());
     assert_eq!(files.len(), 1, "expected only Page.tsx, got: {:?}", files);
     assert!(files[0].ends_with("Page.tsx"));
 }

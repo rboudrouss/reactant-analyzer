@@ -24,7 +24,7 @@ fn fixture(name: &str) -> PathBuf {
 #[test]
 fn lazy_init_witness_resolves_cross_file_effectful_call() {
     let files = vec![fixture("Settings.tsx"), fixture("prefs.ts")];
-    let lowered = lower_files(&files, &DefaultImportResolver);
+    let lowered = lower_files(&files, &DefaultImportResolver::default());
     assert!(lowered.parse_errors.is_empty(), "fixture must parse");
     let program = analyze_lowered(lowered, RootStrategy::AllComponents, Config::default());
 

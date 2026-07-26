@@ -1,20 +1,18 @@
 //! JSON renderer (schema v1, documented in docs/usage.md).
 //!
-//! DTOs live here, on the binary side — the library's `Diagnostic` stays
-//! serde-free and the wire schema stays stable across IR refactors. The full
-//! document goes to stdout; stderr keeps verbose/warning chatter, so stdout
-//! is always exactly one valid JSON document.
+//! The DTOs moved here from the binary verbatim, field for field — the wire
+//! schema, not the crate boundary, is the stability contract. The whole
+//! document is one `String` (stdout side); stderr keeps verbose/warning
+//! chatter, so stdout is always exactly one valid JSON document.
 
 use std::path::Path;
 
 use serde::Serialize;
 
-use reactant::{
-    ir::FileTable,
-    rules::{Diagnostic, Note, ResolveTarget, Severity, Step},
-};
+use crate::ir::FileTable;
+use crate::rules::{Diagnostic, Note, ResolveTarget, Severity, Step};
 
-use super::check::CheckReport;
+use super::report::CheckReport;
 
 #[derive(Serialize)]
 struct JsonReport<'a> {
@@ -111,15 +109,16 @@ fn severity_str(s: Severity) -> &'static str {
     }
 }
 
-fn to_json_note<'a>(n: &'a Note, files: &FileTable) -> JsonNote<'a> {
+fn to_json_note<'a>(
+    n: &'a Note,
+    files: &FileTable,
+    display: &dyn Fn(&Path) -> String,
+) -> JsonNote<'a> {
     let mut j = JsonNote {
         message: &n.message,
         kind: n.step.kind(),
         hook_label: n.hook_label,
-        file: n
-            .range
-            .and_then(|r| files.path(r.file))
-            .map(super::display_relative),
+        file: n.range.and_then(|r| files.path(r.file)).map(display),
         line: n.range.map(|r| r.line),
         col: n.range.map(|r| r.col),
         var: None,
@@ -150,18 +149,18 @@ fn to_json_note<'a>(n: &'a Note, files: &FileTable) -> JsonNote<'a> {
         Step::Call { callee, class } => {
             j.callee = Some(callee);
             j.effect_class = Some(match class {
-                reactant::rules::EffectClass::Setter => "setter",
-                reactant::rules::EffectClass::Effectful => "effectful",
-                reactant::rules::EffectClass::PureCheap => "pure-cheap",
-                reactant::rules::EffectClass::Unknown => "unknown",
+                crate::rules::EffectClass::Setter => "setter",
+                crate::rules::EffectClass::Effectful => "effectful",
+                crate::rules::EffectClass::PureCheap => "pure-cheap",
+                crate::rules::EffectClass::Unknown => "unknown",
             });
         }
         Step::Write { slot, value } => {
             j.slot = Some(*slot);
             j.value_class = Some(match value {
-                reactant::rules::ValueClass::Fresh => "fresh",
-                reactant::rules::ValueClass::SameAsCurrent => "same-as-current",
-                reactant::rules::ValueClass::Unknown => "unknown",
+                crate::rules::ValueClass::Fresh => "fresh",
+                crate::rules::ValueClass::SameAsCurrent => "same-as-current",
+                crate::rules::ValueClass::Unknown => "unknown",
             });
         }
         Step::Read { what } => j.what = Some(what),
@@ -190,29 +189,34 @@ fn to_json_diag<'a>(
     component: &'a str,
     file: Option<&'a Path>,
     files: &FileTable,
+    display: &dyn Fn(&Path) -> String,
 ) -> JsonDiagnostic<'a> {
     JsonDiagnostic {
-        rule: d.rule,
+        rule: &d.rule,
         severity: severity_str(d.severity()),
         component,
-        file: file.map(super::display_relative),
+        file: file.map(display),
         line: d.range.map(|r| r.line),
         col: d.range.map(|r| r.col),
         hook_label: d.hook_label,
         var: d.var.as_deref(),
         message: &d.message,
-        notes: d.notes.iter().map(|n| to_json_note(n, files)).collect(),
+        notes: d
+            .notes
+            .iter()
+            .map(|n| to_json_note(n, files, display))
+            .collect(),
     }
 }
 
-pub fn render(report: &CheckReport) {
+pub fn render(report: &CheckReport, display: &dyn Fn(&Path) -> String) -> String {
     let diagnostics: Vec<JsonDiagnostic> = report
         .components
         .iter()
         .flat_map(|c| {
             c.diagnostics
                 .iter()
-                .map(|d| to_json_diag(d, &c.name, c.file.as_deref(), &report.file_table))
+                .map(|d| to_json_diag(d, &c.name, c.file.as_deref(), &report.file_table, display))
         })
         .collect();
 
@@ -223,7 +227,7 @@ pub fn render(report: &CheckReport) {
             .parse_errors
             .iter()
             .map(|(f, m)| JsonParseError {
-                file: super::display_relative(f),
+                file: display(f),
                 message: m.clone(),
             })
             .collect(),
@@ -239,5 +243,5 @@ pub fn render(report: &CheckReport) {
 
     // Serialization of these DTOs cannot fail (no maps with non-string keys,
     // no floats); unwrap is safe.
-    println!("{}", serde_json::to_string_pretty(&doc).unwrap());
+    serde_json::to_string_pretty(&doc).unwrap() + "\n"
 }

@@ -6,15 +6,20 @@
 //! - [`impls`] — the rule implementations, one file per rule.
 //! - [`helpers`] — shared analysis machinery (setter/churn/eval/scans).
 //! - [`docs`] — static documentation for every diagnostic name.
+//! - [`declarative`] — the declarative pack frontend (ADR-022 Tier A):
+//!   loader, validator, executor.
 //!
-//! This module keeps only the [`Rule`] trait, [`SafeCheck`], the registry
-//! ([`all_rules`]) and the public façade — every name re-exported here is at
-//! its historical path, so consumers never reach into submodules.
+//! This module keeps only the [`Rule`] trait, [`SafeCheck`], the native rule
+//! set ([`all_rules`]), the dynamic [`registry`] (ADR-022) and the public
+//! façade — every name re-exported here is at its historical path, so
+//! consumers never reach into submodules.
 
 pub mod api;
+pub mod declarative;
 pub mod docs;
 pub mod helpers;
 pub mod impls;
+pub mod registry;
 
 pub use api::diagnostic::{Diagnostic, Severity};
 pub use api::query::{
@@ -26,6 +31,9 @@ pub use api::query::{
 };
 pub use api::witness::{EffectClass, Note, ResolveTarget, Step, ValueClass};
 pub use docs::{RULE_DOCS, RuleDoc, rule_doc};
+pub use registry::{
+    ComponentFindings, OverrideEntry, RegistryError, RuleOverrides, RuleRegistry,
+};
 pub use helpers::setters::{SetterCall, collect_setter_calls, collect_setter_calls_with_extra};
 pub use impls::{
     AlwaysUnstableDeps, AnalysisLimitInfo, ConditionalHook, DerivedState, FrozenInitialState,
@@ -69,7 +77,9 @@ pub struct SafeCheck {
 /// component once (`RuleCtx::new`), and the ctx is the stable anchor the
 /// future external frontends bind to.
 pub trait Rule {
-    fn name(&self) -> &'static str;
+    /// Rule id. Borrowed from `self` so dynamically loaded rules (ADR-022) can
+    /// own their `pack/rule` id; native impls keep returning `&'static str`.
+    fn name(&self) -> &str;
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic>;
 
     /// When this rule is *applicable* to the ctx's component but `check` found

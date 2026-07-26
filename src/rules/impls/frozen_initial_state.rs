@@ -241,9 +241,13 @@ fn seed_paths(init: &Expr, param: &Var, bindings: &HashMap<&str, Vec<&Expr>>) ->
     seeds
 }
 
+impl FrozenInitialState {
+    const NAME: &'static str = "frozen-initial-state";
+}
+
 impl Rule for FrozenInitialState {
     fn name(&self) -> &'static str {
-        "frozen-initial-state"
+        Self::NAME
     }
 
     fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
@@ -255,7 +259,7 @@ impl Rule for FrozenInitialState {
                 if !seed_paths(init, &comp.param, &bindings).is_empty())
         });
         applicable.then_some(crate::rules::SafeCheck {
-            rule: self.name(),
+            rule: Self::NAME,
             message: "no state slot freezes a changing prop's first value",
         })
     }

@@ -7,12 +7,11 @@
 //! through `references[].path` as a fallback.
 
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::resolver::normalize;
+use crate::resolver::{FileSystem, normalize};
 
 /// `compilerOptions.baseUrl` + `paths`, resolved to absolute form.
 #[derive(Debug, Clone)]
@@ -128,15 +127,15 @@ pub fn strip_jsonc(src: &str) -> String {
 
 /// Read and parse one tsconfig file (JSONC-tolerant). `None` on read or
 /// parse failure.
-fn read_config(path: &Path) -> Option<Value> {
-    let src = fs::read_to_string(path).ok()?;
+fn read_config(path: &Path, fs: &dyn FileSystem) -> Option<Value> {
+    let src = fs.read_to_string(path).ok()?;
     serde_json::from_str(&strip_jsonc(&src)).ok()
 }
 
 /// Resolve an `extends` / `references[].path` specifier relative to the
 /// directory of the config that declares it. Appends `.json` when missing.
 /// Package specifiers (e.g. `"@tsconfig/vite-react"`) are not supported.
-fn resolve_config_ref(config_dir: &Path, spec: &str) -> Option<PathBuf> {
+fn resolve_config_ref(config_dir: &Path, spec: &str, fs: &dyn FileSystem) -> Option<PathBuf> {
     if !spec.starts_with('.') && Path::new(spec).is_relative() && !spec.contains('/') {
         // Bare package name — would live in node_modules; out of scope.
         return None;
@@ -146,21 +145,25 @@ fn resolve_config_ref(config_dir: &Path, spec: &str) -> Option<PathBuf> {
         candidate.set_extension("json");
     }
     // A directory reference means <dir>/tsconfig.json.
-    if candidate.is_dir() {
+    if fs.is_dir(&candidate) {
         candidate = candidate.join("tsconfig.json");
     }
-    candidate.is_file().then(|| normalize(&candidate))
+    fs.is_file(&candidate).then(|| normalize(&candidate))
 }
 
 /// Extract `paths` (+ the effective `baseUrl`) from one config file,
 /// following its `extends` chain. Own values win over inherited ones.
 /// `visited` guards against `extends` / `references` cycles.
-fn paths_from_config(path: &Path, visited: &mut HashSet<PathBuf>) -> Option<TsconfigPaths> {
+fn paths_from_config(
+    path: &Path,
+    visited: &mut HashSet<PathBuf>,
+    fs: &dyn FileSystem,
+) -> Option<TsconfigPaths> {
     let path = normalize(path);
     if !visited.insert(path.clone()) {
         return None; // cycle
     }
-    let config = read_config(&path)?;
+    let config = read_config(&path, fs)?;
     let dir = path.parent()?.to_path_buf();
     let opts = config.get("compilerOptions");
 
@@ -202,8 +205,8 @@ fn paths_from_config(path: &Path, visited: &mut HashSet<PathBuf>) -> Option<Tsco
         _ => return None,
     };
     for spec in specs {
-        if let Some(parent) = resolve_config_ref(&dir, spec)
-            && let Some(mut found) = paths_from_config(&parent, visited)
+        if let Some(parent) = resolve_config_ref(&dir, spec, fs)
+            && let Some(mut found) = paths_from_config(&parent, visited, fs)
         {
             // A `baseUrl` declared in THIS config overrides the inherited one.
             if let Some(base) = &own_base {
@@ -223,26 +226,26 @@ fn paths_from_config(path: &Path, visited: &mut HashSet<PathBuf>) -> Option<Tsco
 ///
 /// Returns `None` when no config exists, nothing declares `paths`, or the
 /// JSON is unreadable — callers fall back to plain relative resolution.
-pub fn load_tsconfig_paths(root: &Path) -> Option<TsconfigPaths> {
+pub fn load_tsconfig_paths(root: &Path, fs: &dyn FileSystem) -> Option<TsconfigPaths> {
     let root_config = root.join("tsconfig.json");
-    if !root_config.is_file() {
+    if !fs.is_file(&root_config) {
         return None;
     }
     let mut visited = HashSet::new();
-    if let Some(found) = paths_from_config(&root_config, &mut visited) {
+    if let Some(found) = paths_from_config(&root_config, &mut visited, fs) {
         return Some(found);
     }
 
     // Fall back to project references.
-    let config = read_config(&normalize(&root_config))?;
+    let config = read_config(&normalize(&root_config), fs)?;
     let dir = root_config.parent()?.to_path_buf();
     let references = config.get("references")?.as_array()?;
     for r in references {
         let Some(spec) = r.get("path").and_then(|p| p.as_str()) else {
             continue;
         };
-        if let Some(ref_config) = resolve_config_ref(&dir, spec)
-            && let Some(found) = paths_from_config(&ref_config, &mut visited)
+        if let Some(ref_config) = resolve_config_ref(&dir, spec, fs)
+            && let Some(found) = paths_from_config(&ref_config, &mut visited, fs)
         {
             return Some(found);
         }
@@ -255,6 +258,7 @@ pub fn load_tsconfig_paths(root: &Path) -> Option<TsconfigPaths> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -352,7 +356,7 @@ mod tests {
             "tsconfig.json",
             r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@/*": ["./src/*"] } } }"#,
         );
-        let p = load_tsconfig_paths(tmp.path()).expect("paths found");
+        let p = load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem).expect("paths found");
         assert_eq!(p.base_url, normalize(tmp.path()));
         assert_eq!(
             p.patterns,
@@ -367,7 +371,7 @@ mod tests {
             "tsconfig.json",
             r#"{ "compilerOptions": { "paths": { "@/*": ["./src/*"] } } }"#,
         );
-        let p = load_tsconfig_paths(tmp.path()).expect("paths found");
+        let p = load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem).expect("paths found");
         assert_eq!(p.base_url, normalize(tmp.path()));
     }
 
@@ -379,7 +383,7 @@ mod tests {
             "configs/base.json",
             r#"{ "compilerOptions": { "baseUrl": "..", "paths": { "~/*": ["./app/*"] } } }"#,
         );
-        let p = load_tsconfig_paths(tmp.path()).expect("paths via extends");
+        let p = load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem).expect("paths via extends");
         // baseUrl ".." is relative to configs/ → the project root.
         assert_eq!(p.base_url, normalize(tmp.path()));
         assert_eq!(p.patterns[0].0, "~/*");
@@ -396,7 +400,7 @@ mod tests {
             "base.json",
             r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@/*": ["./*"] } } }"#,
         );
-        let p = load_tsconfig_paths(tmp.path()).expect("paths found");
+        let p = load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem).expect("paths found");
         assert_eq!(p.base_url, normalize(&tmp.path().join("src")));
     }
 
@@ -405,7 +409,7 @@ mod tests {
         let tmp = Tmp::new("cycle");
         tmp.write("tsconfig.json", r#"{ "extends": "./other.json" }"#);
         tmp.write("other.json", r#"{ "extends": "./tsconfig.json" }"#);
-        assert!(load_tsconfig_paths(tmp.path()).is_none());
+        assert!(load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem).is_none());
     }
 
     #[test]
@@ -435,7 +439,7 @@ mod tests {
 }"#,
         );
         tmp.write("tsconfig.node.json", r#"{ "compilerOptions": {} }"#);
-        let p = load_tsconfig_paths(tmp.path()).expect("paths via references");
+        let p = load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem).expect("paths via references");
         assert_eq!(p.base_url, normalize(tmp.path()));
         assert_eq!(p.patterns[0].0, "@/*");
     }
@@ -443,13 +447,13 @@ mod tests {
     #[test]
     fn missing_tsconfig_returns_none() {
         let tmp = Tmp::new("missing");
-        assert!(load_tsconfig_paths(tmp.path()).is_none());
+        assert!(load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem).is_none());
     }
 
     #[test]
     fn unparseable_tsconfig_returns_none() {
         let tmp = Tmp::new("broken");
         tmp.write("tsconfig.json", "{ not json at all");
-        assert!(load_tsconfig_paths(tmp.path()).is_none());
+        assert!(load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem).is_none());
     }
 }

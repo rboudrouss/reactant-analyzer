@@ -19,9 +19,13 @@ use crate::rules::{Diagnostic, Rule};
 /// Only fires when BOTH argument and current state are stable.
 pub struct RedundantSetState;
 
+impl RedundantSetState {
+    const NAME: &'static str = "redundant-set-state";
+}
+
 impl Rule for RedundantSetState {
     fn name(&self) -> &'static str {
-        "redundant-set-state"
+        Self::NAME
     }
 
     fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
@@ -30,7 +34,7 @@ impl Rule for RedundantSetState {
         (crate::rules::has_hook_kind(result, component, HookKind::State)
             && crate::rules::has_hook_kind(result, component, HookKind::Effect))
         .then_some(crate::rules::SafeCheck {
-            rule: self.name(),
+            rule: Self::NAME,
             message: "no setState writes the value the state already holds",
         })
     }

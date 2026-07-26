@@ -1,0 +1,597 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PackFile",
+  "type": "object",
+  "properties": {
+    "name": {
+      "description": "Pack name: the namespace of every rule id (`<name>/<rule>`).",
+      "type": "string"
+    },
+    "rules": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/RuleDef"
+      }
+    },
+    "schemaVersion": {
+      "description": "Format version; only `1` exists.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "name",
+    "rules"
+  ],
+  "$defs": {
+    "Anchor": {
+      "description": "The anchor: a relation the engine has already resolved (ADR-022 §1) —\nnever a syntax pattern.",
+      "oneOf": [
+        {
+          "description": "One row of the `hook_calls` table, optionally kind-filtered.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/HookKindFilter"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "relation": {
+              "type": "string",
+              "const": "hook_calls"
+            }
+          },
+          "required": [
+            "relation"
+          ]
+        },
+        {
+          "description": "Alias-resolved setter calls in the render body.",
+          "type": "object",
+          "properties": {
+            "relation": {
+              "type": "string",
+              "const": "render_setter_calls"
+            }
+          },
+          "required": [
+            "relation"
+          ]
+        }
+      ]
+    },
+    "EdgeName": {
+      "oneOf": [
+        {
+          "description": "Declared deps-array entries of an effect/memo/callback anchor.",
+          "type": "string",
+          "const": "deps"
+        },
+        {
+          "description": "Alias-resolved setter calls in the anchor's body CFG.",
+          "type": "string",
+          "const": "body_setter_calls"
+        }
+      ]
+    },
+    "ElseBehavior": {
+      "description": "What happens to a finding whose must-guard did not certify: `keep` (the\ndefault — it survives as a Warning-ceiling finding, ADR-022 §3's free\nstratification) or `drop` (explicit opt-in for qualification-style rules).",
+      "type": "string",
+      "enum": [
+        "keep",
+        "drop"
+      ]
+    },
+    "ForEach": {
+      "description": "Typed navigation from the anchor (ADR-022 §2): at most one edge, one\nbinding — no joins.",
+      "type": "object",
+      "properties": {
+        "as": {
+          "type": "string"
+        },
+        "edge": {
+          "$ref": "#/$defs/EdgeName"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "edge",
+        "as"
+      ]
+    },
+    "Guard": {
+      "description": "A guard: a predicate over an engine verdict. `must_*` guards certify\n(attach the `Certified` proof on `All`); the others filter. The `must_`\nprefix makes polarity visible in the JSON — the §3 load-time warning is\na prefix scan.",
+      "oneOf": [
+        {
+          "description": "Stability verdict of a deps entry. Exactly one of `is`/`not`; the\nverdict names mirror `StabilityVerdict` totally — ⊤ (`unknown`) can\nbe matched but never silently dropped.",
+          "type": "object",
+          "properties": {
+            "is": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_Array_of_StabilityName"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "stability"
+            },
+            "not": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_Array_of_StabilityName"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        },
+        {
+          "description": "The setter's slot appears in the anchor's declared deps.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "in_deps"
+            },
+            "negate": {
+              "type": "boolean",
+              "default": false
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        },
+        {
+          "description": "Name filter on a resolved entity (ADR-022 §1: names are filters on\nresolved entities, never text patterns over call syntax). Exactly one\nof `one_of`/`prefix`.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "name"
+            },
+            "of": {
+              "type": "string"
+            },
+            "one_of": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_Array_of_string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "prefix": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        },
+        {
+          "description": "Cardinality of `anchor.<edge>` (only `anchor.deps` in v1). Exactly\none comparator.",
+          "type": "object",
+          "properties": {
+            "equals": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_uint64"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "count"
+            },
+            "less_than": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_uint64"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "more_than": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_uint64"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        },
+        {
+          "description": "Whether the anchor declares a deps array at all.",
+          "type": "object",
+          "properties": {
+            "eq": {
+              "$ref": "#/$defs/PVal_boolean"
+            },
+            "kind": {
+              "type": "string",
+              "const": "deps_declared"
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of",
+            "eq"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "else": {
+              "$ref": "#/$defs/ElseBehavior"
+            },
+            "kind": {
+              "type": "string",
+              "const": "must_setter_on_all_paths"
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "else": {
+              "$ref": "#/$defs/ElseBehavior"
+            },
+            "kind": {
+              "type": "string",
+              "const": "must_dominates_all_exits"
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "else": {
+              "$ref": "#/$defs/ElseBehavior"
+            },
+            "kind": {
+              "type": "string",
+              "const": "must_init_calls_setter"
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "else": {
+              "$ref": "#/$defs/ElseBehavior"
+            },
+            "kind": {
+              "type": "string",
+              "const": "must_hook_is_conditional"
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        }
+      ]
+    },
+    "HookKindFilter": {
+      "type": "string",
+      "enum": [
+        "state",
+        "effect",
+        "memo",
+        "callback",
+        "ref",
+        "custom",
+        "handler"
+      ]
+    },
+    "PVal_Array_of_StabilityName": {
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StabilityName"
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "$param": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "$param"
+          ]
+        }
+      ]
+    },
+    "PVal_Array_of_string": {
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "$param": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "$param"
+          ]
+        }
+      ]
+    },
+    "PVal_boolean": {
+      "oneOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "$param": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "$param"
+          ]
+        }
+      ]
+    },
+    "PVal_string": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "$param": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "$param"
+          ]
+        }
+      ]
+    },
+    "PVal_uint64": {
+      "oneOf": [
+        {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        {
+          "type": "object",
+          "properties": {
+            "$param": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "$param"
+          ]
+        }
+      ]
+    },
+    "ParamDecl": {
+      "type": "object",
+      "properties": {
+        "default": true,
+        "type": {
+          "$ref": "#/$defs/ParamType"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "default"
+      ]
+    },
+    "ParamType": {
+      "type": "string",
+      "enum": [
+        "number",
+        "string",
+        "boolean",
+        "string[]"
+      ]
+    },
+    "RuleDef": {
+      "type": "object",
+      "properties": {
+        "anchor": {
+          "$ref": "#/$defs/Anchor"
+        },
+        "docs": {
+          "$ref": "#/$defs/RuleDocs"
+        },
+        "forEach": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ForEach"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "guards": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Guard"
+          }
+        },
+        "id": {
+          "description": "Bare rule id (no `/`); addressed as `<pack>/<id>`.",
+          "type": "string"
+        },
+        "message": {
+          "description": "Message template interpolating navigated entities (`{setter.slot}`)\nand params (`{param.maxDeps}`); `{{`/`}}` escape braces.",
+          "type": "string"
+        },
+        "params": {
+          "description": "Declared parameters, referenced as `{\"$param\": \"<name>\"}` in leaf\nconstant positions (ADR-022 §4).",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ParamDecl"
+          }
+        },
+        "severity": {
+          "description": "Desired severity ceiling (a pin, ADR-022 §3): the effective severity\nof each finding is `pin ⊓ polarity`, evaluated at emission.",
+          "$ref": "#/$defs/SeverityPin"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "docs",
+        "severity",
+        "anchor",
+        "message"
+      ]
+    },
+    "RuleDocs": {
+      "description": "Mandatory docs (ADR-022 §5): a custom rule without an explanation is\nexactly the diagnostic a team learns to ignore.",
+      "type": "object",
+      "properties": {
+        "description": {
+          "description": "One line — what the rule detects (`reactant rules`).",
+          "type": "string"
+        },
+        "example": {
+          "description": "Optional minimal buggy snippet.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "fix": {
+          "description": "How to fix it.",
+          "type": "string"
+        },
+        "why": {
+          "description": "Why it matters (`reactant explain`).",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "description",
+        "why",
+        "fix"
+      ]
+    },
+    "SeverityPin": {
+      "type": "string",
+      "enum": [
+        "error",
+        "warning",
+        "info"
+      ]
+    },
+    "StabilityName": {
+      "description": "Total mirror of `StabilityVerdict`.",
+      "type": "string",
+      "enum": [
+        "stable",
+        "versioned",
+        "per-render",
+        "unknown"
+      ]
+    }
+  }
+}

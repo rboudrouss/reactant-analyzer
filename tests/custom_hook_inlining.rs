@@ -134,7 +134,7 @@ fn unknown_custom_hook_no_crash() {
         .iter()
         .filter(|d| {
             matches!(
-                d.rule,
+                d.rule.as_ref(),
                 "infinite-loop" | "setter-in-render" | "cross-setter-in-render"
             )
         })
@@ -207,7 +207,7 @@ fn setter_in_render_via_custom_hook_detected() {
     assert!(
         setter_diag.is_some(),
         "Expected setter-in-render diagnostic for Comp but got: {:?}",
-        diags.iter().map(|d| d.rule).collect::<Vec<_>>()
+        diags.iter().map(|d| d.rule.as_ref()).collect::<Vec<_>>()
     );
 }
 
@@ -240,7 +240,7 @@ fn probe_multiblock_hook_setter_in_join_block_detected() {
         setter_diag.is_some(),
         "setter called unconditionally in a hook's non-entry block must fire \
          setter-in-render (multi-block FN); got: {:?}",
-        diags.iter().map(|d| d.rule).collect::<Vec<_>>()
+        diags.iter().map(|d| d.rule.as_ref()).collect::<Vec<_>>()
     );
 }
 
@@ -294,7 +294,7 @@ fn destructured_ref_hook_no_false_positive() {
     let result = parse_and_analyze(src);
     let noisy: Vec<_> = diags_for(&result, "Comp")
         .into_iter()
-        .filter(|d| matches!(d.rule, "missing-deps" | "always-unstable-deps"))
+        .filter(|d| matches!(d.rule.as_ref(), "missing-deps" | "always-unstable-deps"))
         .collect();
     assert!(
         noisy.is_empty(),

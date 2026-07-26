@@ -21,7 +21,7 @@ fn fixture(name: &str) -> PathBuf {
 #[test]
 fn void_hooks_after_early_return_are_flagged() {
     let files = vec![fixture("EarlyReturn.tsx")];
-    let lowered = lower_files(&files, &DefaultImportResolver);
+    let lowered = lower_files(&files, &DefaultImportResolver::default());
     assert!(lowered.parse_errors.is_empty(), "fixture must parse");
     let program = analyze_lowered(lowered, RootStrategy::AllComponents, Config::default());
 

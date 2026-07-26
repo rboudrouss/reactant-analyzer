@@ -33,9 +33,13 @@ use crate::rules::{
 /// are treated as no-deps. If parent not in results, cross fires as Warning.
 pub struct InfiniteLoop;
 
+impl InfiniteLoop {
+    const NAME: &'static str = "infinite-loop";
+}
+
 impl Rule for InfiniteLoop {
     fn name(&self) -> &'static str {
-        "infinite-loop"
+        Self::NAME
     }
 
     fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
@@ -45,7 +49,7 @@ impl Rule for InfiniteLoop {
         (crate::rules::has_hook_kind(result, component, HookKind::State)
             && crate::rules::has_hook_kind(result, component, HookKind::Effect))
         .then_some(crate::rules::SafeCheck {
-            rule: self.name(),
+            rule: Self::NAME,
             message: "no effect diverges into an infinite render loop",
         })
     }

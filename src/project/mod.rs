@@ -13,8 +13,9 @@ pub mod paths_resolver;
 pub mod tsconfig;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use crate::resolver::{DefaultImportResolver, ImportResolver};
+use crate::resolver::{DefaultImportResolver, FileSystem, ImportResolver};
 
 pub use paths_resolver::TsconfigPathsResolver;
 pub use tsconfig::{TsconfigPaths, load_tsconfig_paths, strip_jsonc};
@@ -36,8 +37,8 @@ const VITE_CONFIGS: &[&str] = &[
 ];
 
 /// Detect the project kind at `root` from marker files.
-pub fn detect(root: &Path) -> ProjectKind {
-    if VITE_CONFIGS.iter().any(|c| root.join(c).is_file()) {
+pub fn detect(root: &Path, fs: &dyn FileSystem) -> ProjectKind {
+    if VITE_CONFIGS.iter().any(|c| fs.is_file(&root.join(c))) {
         ProjectKind::Vite
     } else {
         ProjectKind::Plain
@@ -64,33 +65,37 @@ pub struct ProjectContext {
 /// Assemble the analysis context for `root`.
 ///
 /// `forced` overrides detection (`--project vite|plain`); `None` = auto.
-pub fn build_context(root: &Path, forced: Option<ProjectKind>) -> ProjectContext {
-    let kind = forced.unwrap_or_else(|| detect(root));
+pub fn build_context(
+    root: &Path,
+    forced: Option<ProjectKind>,
+    fs: Arc<dyn FileSystem>,
+) -> ProjectContext {
+    let kind = forced.unwrap_or_else(|| detect(root, fs.as_ref()));
     match kind {
         ProjectKind::Plain => ProjectContext {
             kind,
             discovery_root: root.to_path_buf(),
-            resolver: Box::new(DefaultImportResolver),
+            resolver: Box::new(DefaultImportResolver::new(fs)),
             alias_warning: None,
         },
         ProjectKind::Vite => {
             let src = root.join("src");
-            let discovery_root = if src.is_dir() {
+            let discovery_root = if fs.is_dir(&src) {
                 src
             } else {
                 root.to_path_buf()
             };
-            match load_tsconfig_paths(root) {
+            match load_tsconfig_paths(root, fs.as_ref()) {
                 Some(paths) => ProjectContext {
                     kind,
                     discovery_root,
-                    resolver: Box::new(TsconfigPathsResolver::new(paths)),
+                    resolver: Box::new(TsconfigPathsResolver::new(paths, fs)),
                     alias_warning: None,
                 },
                 None => ProjectContext {
                     kind,
                     discovery_root,
-                    resolver: Box::new(DefaultImportResolver),
+                    resolver: Box::new(DefaultImportResolver::new(fs)),
                     alias_warning: Some(
                         "no tsconfig `paths` found — aliased imports (e.g. `@/...`) stay \
                          unresolved and their targets are NOT analyzed (possible false \
@@ -153,14 +158,14 @@ mod tests {
     fn detects_vite_by_config_file() {
         let tmp = Tmp::new("detect-vite");
         tmp.write("vite.config.ts", "export default {}");
-        assert_eq!(detect(tmp.path()), ProjectKind::Vite);
+        assert_eq!(detect(tmp.path(), &crate::resolver::OsFileSystem), ProjectKind::Vite);
     }
 
     #[test]
     fn detects_plain_without_marker() {
         let tmp = Tmp::new("detect-plain");
         tmp.write("package.json", "{}");
-        assert_eq!(detect(tmp.path()), ProjectKind::Plain);
+        assert_eq!(detect(tmp.path(), &crate::resolver::OsFileSystem), ProjectKind::Plain);
     }
 
     #[test]
@@ -168,7 +173,7 @@ mod tests {
         let tmp = Tmp::new("ctx-src");
         tmp.write("vite.config.ts", "");
         tmp.write("src/App.tsx", "");
-        let ctx = build_context(tmp.path(), None);
+        let ctx = build_context(tmp.path(), None, std::sync::Arc::new(crate::resolver::OsFileSystem));
         assert_eq!(ctx.kind, ProjectKind::Vite);
         assert_eq!(ctx.discovery_root, tmp.path().join("src"));
     }
@@ -177,7 +182,7 @@ mod tests {
     fn vite_without_src_keeps_root() {
         let tmp = Tmp::new("ctx-nosrc");
         tmp.write("vite.config.ts", "");
-        let ctx = build_context(tmp.path(), None);
+        let ctx = build_context(tmp.path(), None, std::sync::Arc::new(crate::resolver::OsFileSystem));
         assert_eq!(ctx.discovery_root, tmp.path());
     }
 
@@ -185,7 +190,7 @@ mod tests {
     fn vite_without_paths_warns() {
         let tmp = Tmp::new("ctx-warn");
         tmp.write("vite.config.ts", "");
-        let ctx = build_context(tmp.path(), None);
+        let ctx = build_context(tmp.path(), None, std::sync::Arc::new(crate::resolver::OsFileSystem));
         assert!(ctx.alias_warning.is_some());
     }
 
@@ -197,7 +202,7 @@ mod tests {
             "tsconfig.json",
             r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@/*": ["./src/*"] } } }"#,
         );
-        let ctx = build_context(tmp.path(), None);
+        let ctx = build_context(tmp.path(), None, std::sync::Arc::new(crate::resolver::OsFileSystem));
         assert!(ctx.alias_warning.is_none());
     }
 
@@ -205,7 +210,7 @@ mod tests {
     fn forced_plain_skips_detection() {
         let tmp = Tmp::new("forced");
         tmp.write("vite.config.ts", "");
-        let ctx = build_context(tmp.path(), Some(ProjectKind::Plain));
+        let ctx = build_context(tmp.path(), Some(ProjectKind::Plain), std::sync::Arc::new(crate::resolver::OsFileSystem));
         assert_eq!(ctx.kind, ProjectKind::Plain);
         assert_eq!(ctx.discovery_root, tmp.path());
     }

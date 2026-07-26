@@ -1,45 +1,17 @@
-//! The `explain <rule>` subcommand: full documentation for one diagnostic.
+//! The `explain <rule>` subcommand: full documentation for one diagnostic —
+//! built-in or from a loaded pack (ADR-022 §5: docs are mandatory, so every
+//! loaded rule is explainable).
 
-use reactant::rules::{RULE_DOCS, rule_doc};
+use std::path::Path;
 
-use super::color::Palette;
-use super::{EXIT_OK, EXIT_USAGE};
-
-pub fn run(rule: &str) -> i32 {
-    let p = Palette::for_stdout(false);
-    match rule_doc(rule) {
-        Some(doc) => {
-            println!("{}{}{}", p.bold, doc.name, p.reset);
-            println!("  {}", doc.summary);
-            println!();
-            println!("{}", doc.explanation);
-            println!();
-            println!("{}Example:{}", p.bold, p.reset);
-            for line in doc.example.lines() {
-                println!("  {line}");
-            }
-            println!();
-            println!("{}Fix:{}", p.bold, p.reset);
-            println!("  {}", doc.fix);
-            EXIT_OK
-        }
-        None => {
-            eprintln!("[error] unknown rule `{rule}`");
-            let suggestions: Vec<&str> = RULE_DOCS
-                .iter()
-                .map(|d| d.name)
-                .filter(|n| {
-                    n.contains(rule)
-                        || rule.contains(n)
-                        || n.split('-').any(|part| rule.contains(part))
-                })
-                .collect();
-            if !suggestions.is_empty() {
-                eprintln!("did you mean: {}?", suggestions.join(", "));
-            } else {
-                eprintln!("run `reactant rules` for the list of valid names");
-            }
-            EXIT_USAGE
-        }
-    }
+pub fn run(rule: &str, config: Option<&Path>) -> i32 {
+    let (_cfg, registry) =
+        match super::config_load::load_config_and_registry(config, Path::new(".")) {
+            Ok(pair) => pair,
+            Err(code) => return code,
+        };
+    let out = reactant::driver::run_explain(&registry, rule, super::color::enabled(false));
+    eprint!("{}", out.stderr);
+    print!("{}", out.stdout);
+    out.exit_code
 }

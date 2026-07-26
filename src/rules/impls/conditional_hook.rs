@@ -7,9 +7,13 @@ use crate::rules::{Diagnostic, Rule, RuleCtx};
 /// path from entry to every return must pass through H ⟺ unconditional call.
 pub struct ConditionalHook;
 
+impl ConditionalHook {
+    const NAME: &'static str = "conditional-hook";
+}
+
 impl Rule for ConditionalHook {
     fn name(&self) -> &'static str {
-        "conditional-hook"
+        Self::NAME
     }
 
     fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
@@ -20,7 +24,7 @@ impl Rule for ConditionalHook {
             .get(component)
             .is_some_and(|c| !c.hook_calls.is_empty())
             .then_some(crate::rules::SafeCheck {
-                rule: self.name(),
+                rule: Self::NAME,
                 message: "all hooks run unconditionally, in a stable order",
             })
     }

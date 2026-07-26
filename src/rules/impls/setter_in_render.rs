@@ -33,9 +33,13 @@ use crate::rules::{
 /// component's state during render is a runtime error regardless of guards.
 pub struct SetterInRender;
 
+impl SetterInRender {
+    const NAME: &'static str = "setter-in-render";
+}
+
 impl Rule for SetterInRender {
     fn name(&self) -> &'static str {
-        "setter-in-render"
+        Self::NAME
     }
 
     fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
@@ -44,7 +48,7 @@ impl Rule for SetterInRender {
         // Local setters exist iff the component has a useState slot.
         crate::rules::has_hook_kind(result, component, HookKind::State).then_some(
             crate::rules::SafeCheck {
-                rule: self.name(),
+                rule: Self::NAME,
                 message: "no setter is called during render",
             },
         )

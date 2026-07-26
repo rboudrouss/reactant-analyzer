@@ -20,7 +20,7 @@ display names to files).
 >
 > ```rust
 > use reactant::project;
-> let ctx = project::build_context(root, None);   // detects Vite, loads tsconfig paths
+> let ctx = project::build_context(root, None, Arc::new(OsFileSystem));   // detects Vite, loads tsconfig paths
 > // ctx.resolver: Box<dyn ImportResolver>, ctx.discovery_root: PathBuf
 > ```
 >
@@ -69,7 +69,7 @@ fn main() {
     let (result, file_count) = analyze_with_resolvers(
         Path::new("./my-nextjs-app"),
         &NextJsAppDiscoverer,
-        &DefaultImportResolver,         // fall back to default import resolution
+        &DefaultImportResolver::default(), // fall back to default import resolution
         RootStrategy::AllComponents,
         Config::default(),
     );
@@ -106,10 +106,10 @@ impl ImportResolver for AliasResolver {
                         .ok()?
                         .display()
                 );
-                return DefaultImportResolver.resolve(from, &synthetic);
+                return DefaultImportResolver::default().resolve(from, &synthetic);
             }
         }
-        DefaultImportResolver.resolve(from, specifier)
+        DefaultImportResolver::default().resolve(from, specifier)
     }
 }
 ```

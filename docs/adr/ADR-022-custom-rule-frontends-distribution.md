@@ -1,6 +1,7 @@
 # ADR-022: Custom rule frontends & distribution — declarative packs over semantic anchors, pin ⊓ polarity, WASM-only npm
 
-- **Status**: Accepted — not yet implemented
+- **Status**: Accepted — implemented (steps 1–4 of the implementation order,
+  2026-07-26; step 5, Tier B, still pending)
 - **Date**: 2026-07-25
 
 ## Context

@@ -19,9 +19,13 @@ use crate::rules::{
 /// ```
 pub struct DerivedState;
 
+impl DerivedState {
+    const NAME: &'static str = "derived-state";
+}
+
 impl Rule for DerivedState {
     fn name(&self) -> &'static str {
-        "derived-state"
+        Self::NAME
     }
 
     fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
@@ -30,7 +34,7 @@ impl Rule for DerivedState {
         (crate::rules::has_hook_kind(result, component, HookKind::State)
             && crate::rules::has_hook_kind(result, component, HookKind::Effect))
         .then_some(crate::rules::SafeCheck {
-            rule: self.name(),
+            rule: Self::NAME,
             message: "no effect merely mirrors other state",
         })
     }

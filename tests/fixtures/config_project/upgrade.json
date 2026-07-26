@@ -1,0 +1,4 @@
+{
+  // Upgrade attempt on a may-polarity finding — must be a structural no-op.
+  "rules": { "missing-deps": "error" }
+}

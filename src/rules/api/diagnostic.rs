@@ -11,6 +11,8 @@
 //! [`Diagnostic::error`] (requires a [`Certified`] proof), [`Diagnostic::warn`]
 //! and [`Diagnostic::info`]. Severity is read through [`Diagnostic::severity`].
 
+use std::borrow::Cow;
+
 use crate::ir::{
     SourceRange,
     types::{HookLabel, Var},
@@ -32,6 +34,19 @@ pub enum Severity {
     Info,
 }
 
+impl Severity {
+    /// Lattice rank for the `⊓` clamp (ADR-022 §3): Error > Warning > Info.
+    /// Distinct from the enum discriminant, whose order (Error < Warning <
+    /// Info) the deterministic output sort depends on.
+    fn rank(self) -> u8 {
+        match self {
+            Severity::Error => 2,
+            Severity::Warning => 1,
+            Severity::Info => 0,
+        }
+    }
+}
+
 /// Finding produced by a rule against the fixpoint analysis result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diagnostic {
@@ -39,7 +54,9 @@ pub struct Diagnostic {
     /// through [`Diagnostic::severity`]. A `pub` field here would let any code
     /// forge an Error by mutation or struct literal.
     severity: Severity,
-    pub rule: &'static str,
+    /// Diagnostic name. `Cow`: native rules pass string literals (borrowed,
+    /// zero-cost), dynamically loaded rules own their `pack/rule` id.
+    pub rule: Cow<'static, str>,
     pub message: String,
     /// Hook label most directly involved, if any.
     pub hook_label: Option<HookLabel>,
@@ -55,10 +72,10 @@ impl Diagnostic {
     /// Private to this leaf module (ADR-021): the rule-facing constructors are
     /// [`Diagnostic::error`] (needs a `Certified` proof), [`Diagnostic::warn`],
     /// and [`Diagnostic::info`].
-    fn new(rule: &'static str, message: impl Into<String>) -> Self {
+    fn new(rule: impl Into<Cow<'static, str>>, message: impl Into<String>) -> Self {
         Diagnostic {
             severity: Severity::default(),
-            rule,
+            rule: rule.into(),
             message: message.into(),
             hook_label: None,
             var: None,
@@ -78,6 +95,18 @@ impl Diagnostic {
     /// construction (`error`/`warn`/`info`) and cannot be reassigned.
     pub fn severity(&self) -> Severity {
         self.severity
+    }
+
+    /// Consumer override (ADR-022 §3): lower this finding to `ceiling` when its
+    /// constructed severity exceeds it. Downgrade-only, hence sound to expose:
+    /// Error is constructible only through [`Diagnostic::error`], so the
+    /// constructed severity IS the polarity ceiling and `pin ⊓ polarity`
+    /// reduces to a min — an upgrade request is a structural no-op.
+    pub fn clamp(mut self, ceiling: Severity) -> Self {
+        if ceiling.rank() < self.severity.rank() {
+            self.severity = ceiling;
+        }
+        self
     }
 
     pub fn with_label(mut self, label: HookLabel) -> Self {
@@ -127,11 +156,15 @@ impl Diagnostic {
     /// has no `Certified` to pass here — Error-on-may is a type error.
     ///
     /// Further `.with_*` builders may still refine/override the absorbed fields.
-    pub fn error<E>(rule: &'static str, proof: Certified<E>, message: impl Into<String>) -> Self {
+    pub fn error<E>(
+        rule: impl Into<Cow<'static, str>>,
+        proof: Certified<E>,
+        message: impl Into<String>,
+    ) -> Self {
         let prov = proof.provenance();
         Diagnostic {
             severity: Severity::Error,
-            rule,
+            rule: rule.into(),
             message: message.into(),
             hook_label: prov.hook_label,
             var: None,
@@ -142,13 +175,40 @@ impl Diagnostic {
 
     /// A Warning: a safe over-claim (conditional path / over-approximation). Free
     /// to construct — a Warning asserts no MUST fact.
-    pub fn warn(rule: &'static str, message: impl Into<String>) -> Self {
+    pub fn warn(rule: impl Into<Cow<'static, str>>, message: impl Into<String>) -> Self {
         Diagnostic::new(rule, message).with_severity(Severity::Warning)
     }
 
     /// An Info: a known analysis limitation. Makes no must/may claim; hidden
     /// unless `--info`.
-    pub fn info(rule: &'static str, message: impl Into<String>) -> Self {
+    pub fn info(rule: impl Into<Cow<'static, str>>, message: impl Into<String>) -> Self {
         Diagnostic::new(rule, message).with_severity(Severity::Info)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_lowers_above_ceiling() {
+        let d = Diagnostic::warn("r", "m").clamp(Severity::Info);
+        assert_eq!(d.severity(), Severity::Info);
+    }
+
+    #[test]
+    fn clamp_upgrade_is_a_no_op() {
+        // The soundness case: a consumer pin can never raise a finding above
+        // its constructed (polarity-derived) severity.
+        let d = Diagnostic::warn("r", "m").clamp(Severity::Error);
+        assert_eq!(d.severity(), Severity::Warning);
+        let d = Diagnostic::info("r", "m").clamp(Severity::Warning);
+        assert_eq!(d.severity(), Severity::Info);
+    }
+
+    #[test]
+    fn clamp_at_own_level_is_identity() {
+        let d = Diagnostic::warn("r", "m").clamp(Severity::Warning);
+        assert_eq!(d.severity(), Severity::Warning);
     }
 }

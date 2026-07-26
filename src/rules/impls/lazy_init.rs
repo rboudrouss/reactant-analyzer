@@ -63,9 +63,13 @@ enum InitEffect {
     Unknown,
 }
 
+impl LazyInit {
+    const NAME: &'static str = "lazy-init";
+}
+
 impl Rule for LazyInit {
     fn name(&self) -> &'static str {
-        "lazy-init"
+        Self::NAME
     }
 
     fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
@@ -73,7 +77,7 @@ impl Rule for LazyInit {
         use crate::engine::HookKind;
         crate::rules::has_hook_kind(result, component, HookKind::State).then_some(
             crate::rules::SafeCheck {
-                rule: self.name(),
+                rule: Self::NAME,
                 message: "no useState initializer re-runs work on every render",
             },
         )

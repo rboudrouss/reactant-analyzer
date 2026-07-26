@@ -19,9 +19,13 @@ use crate::rules::{
 /// That rerender is unnecessary if B could simply be the init value.
 pub struct UnnecessaryRerender;
 
+impl UnnecessaryRerender {
+    const NAME: &'static str = "unnecessary-rerender";
+}
+
 impl Rule for UnnecessaryRerender {
     fn name(&self) -> &'static str {
-        "unnecessary-rerender"
+        Self::NAME
     }
 
     fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
@@ -38,7 +42,7 @@ impl Rule for UnnecessaryRerender {
                     })
             })
             .then_some(crate::rules::SafeCheck {
-                rule: self.name(),
+                rule: Self::NAME,
                 message: "no mount effect overwrites its initial state",
             })
     }

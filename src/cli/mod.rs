@@ -6,18 +6,16 @@
 
 mod check;
 mod color;
+mod config_load;
 mod explain;
-mod output_human;
-mod output_json;
 mod rules_cmd;
+mod schemas_cmd;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-pub const EXIT_OK: i32 = 0;
-pub const EXIT_FINDINGS: i32 = 1;
-pub const EXIT_USAGE: i32 = 2;
+pub use reactant::driver::{EXIT_OK, EXIT_USAGE};
 
 /// Render `path` relative to the current directory when possible, else as-is.
 pub(crate) fn display_relative(path: &Path) -> String {
@@ -49,12 +47,25 @@ struct Cli {
 enum Command {
     /// Analyze files or directories (the default subcommand)
     Check(check::CheckArgs),
-    /// List every diagnostic the analyzer can emit
-    Rules,
+    /// List every diagnostic the analyzer can emit (built-in and loaded packs)
+    Rules {
+        /// Config file path (default: ./reactant.config.json if present)
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Show the full documentation of one diagnostic
     Explain {
         /// Diagnostic name, e.g. `infinite-loop` (see `reactant rules`)
         rule: String,
+        /// Config file path (default: ./reactant.config.json if present)
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Emit the JSON Schemas for pack.json and reactant.config.json
+    Schemas {
+        /// Write the schema files into this directory (default: stdout)
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -91,8 +102,9 @@ pub fn run() -> i32 {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Check(args)) => check::run(args),
-        Some(Command::Rules) => rules_cmd::run(),
-        Some(Command::Explain { rule }) => explain::run(&rule),
+        Some(Command::Rules { config }) => rules_cmd::run(config.as_deref()),
+        Some(Command::Explain { rule, config }) => explain::run(&rule, config.as_deref()),
+        Some(Command::Schemas { out }) => schemas_cmd::run(out.as_deref()),
         None => {
             if cli.check.paths.is_empty() {
                 // Bare `reactant`: print help, exit as a usage error.

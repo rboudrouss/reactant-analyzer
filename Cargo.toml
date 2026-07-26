@@ -10,9 +10,23 @@ authors       = ["rboudrouss <r.boudrouss@gmail.com>"]
 keywords      = ["react", "static-analysis", "linter", "hooks", "abstract-interpretation"]
 categories    = ["development-tools", "development-tools::debugging"]
 
+[workspace]
+members = [".", "crates/reactant-wasm"]
+
+[features]
+default = ["cli", "schema-gen"]
+# The CLI (clap and friends) is binary-only; the wasm build uses
+# `default-features = false` to keep the dependency tree to oxc + serde.
+cli = ["dep:clap"]
+# JSON Schema generation (ADR-022 §6): only the `reactant schemas` emitter
+# needs schemars — validation is serde + hand checks, so the wasm build
+# drops it.
+schema-gen = ["dep:schemars"]
+
 [[bin]]
 name = "reactant"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [lib]
 name = "reactant"
@@ -23,6 +37,8 @@ oxc_parser    = "0.129.0"
 oxc_ast       = "0.129.0"
 oxc_span      = "0.129.0"
 oxc_allocator = "0.129.0"
-clap          = { version = "4", features = ["derive"] }
+clap          = { version = "4", features = ["derive"], optional = true }
 serde         = { version = "1", features = ["derive"] }
 serde_json    = "1"
+serde_path_to_error = "0.1"
+schemars      = { version = "1", optional = true }

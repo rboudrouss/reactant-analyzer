@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 1,
+  "name": "team",
+  "rules": [
+    {
+      "id": "effect-writes-own-dep",
+      "docs": {
+        "description": "an effect writes a state slot listed in its own deps array",
+        "why": "Writing a dep re-triggers the effect; unconditional writes loop forever.",
+        "fix": "Derive the value during render, or drop the slot from deps and use the functional updater."
+      },
+      "severity": "error",
+      "anchor": { "relation": "hook_calls", "kind": "effect" },
+      "forEach": { "edge": "body_setter_calls", "as": "setter" },
+      "guards": [
+        { "kind": "in_deps", "of": "setter" },
+        { "kind": "must_setter_on_all_paths", "of": "setter" }
+      ],
+      "message": "this effect writes {setter.slot}, which is in its own deps array"
+    },
+    {
+      "id": "no-per-render-memo-dep",
+      "docs": {
+        "description": "a useMemo dep is recreated every render",
+        "why": "Object.is never matches a fresh reference, so the memo recomputes every render.",
+        "fix": "Hoist the literal, memoize it, or depend on its primitive parts."
+      },
+      "severity": "warning",
+      "anchor": { "relation": "hook_calls", "kind": "memo" },
+      "forEach": { "edge": "deps", "as": "dep" },
+      "guards": [{ "kind": "stability", "of": "dep", "is": ["per-render"] }],
+      "message": "dep {dep.path} is {dep.stability}: this memo recomputes every render"
+    },
+    {
+      "id": "max-effect-deps",
+      "docs": {
+        "description": "effect deps arrays are capped by team policy",
+        "why": "A long deps array usually means one effect doing several jobs.",
+        "fix": "Split the effect by concern."
+      },
+      "severity": "warning",
+      "params": { "maxDeps": { "type": "number", "default": 5 } },
+      "anchor": { "relation": "hook_calls", "kind": "effect" },
+      "guards": [
+        { "kind": "count", "of": "anchor.deps", "more_than": { "$param": "maxDeps" } }
+      ],
+      "message": "this effect declares more than {param.maxDeps} deps — split it by concern"
+    },
+    {
+      "id": "no-banned-hooks",
+      "docs": {
+        "description": "team-banned custom hooks",
+        "why": "useLegacyStore tears under concurrent rendering.",
+        "fix": "Use the @team/hooks replacement."
+      },
+      "severity": "warning",
+      "params": { "banned": { "type": "string[]", "default": ["useLegacyStore"] } },
+      "anchor": { "relation": "hook_calls", "kind": "custom" },
+      "guards": [{ "kind": "name", "of": "anchor", "one_of": { "$param": "banned" } }],
+      "message": "{anchor.name} is banned by team policy"
+    }
+  ]
+}

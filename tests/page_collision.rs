@@ -97,7 +97,7 @@ fn two_pages_in_different_files_coexist_and_only_buggy_one_warns() {
     );
 
     // Phase 1: discovery.
-    let files = DefaultFileDiscoverer.discover(tmp.path());
+    let files = DefaultFileDiscoverer::default().discover(tmp.path());
     assert_eq!(
         files.len(),
         2,

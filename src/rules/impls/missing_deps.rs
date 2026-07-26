@@ -17,9 +17,13 @@ use crate::rules::{Diagnostic, Rule, fn_lit_binding};
 /// bug).
 pub struct MissingDeps;
 
+impl MissingDeps {
+    const NAME: &'static str = "missing-deps";
+}
+
 impl Rule for MissingDeps {
     fn name(&self) -> &'static str {
-        "missing-deps"
+        Self::NAME
     }
 
     fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
@@ -30,7 +34,7 @@ impl Rule for MissingDeps {
             .get(component)
             .is_some_and(|c| c.effect_info.values().any(|e| e.has_deps_array))
             .then_some(crate::rules::SafeCheck {
-                rule: self.name(),
+                rule: Self::NAME,
                 message: "every effect declares the variables it reads",
             })
     }

@@ -176,11 +176,24 @@ pub fn may_change_of(val: &StateValue) -> May<bool> {
     May(!stability_verdict_of(val).is_stable())
 }
 
-/// Config carried on the ctx. A stub for now — the schema/format is deferred to
-/// the frontend ADR (ADR-021 §4; config only matters for parameterized/external
-/// rules, which do not exist yet).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RuleConfig;
+/// Per-rule options store (ADR-022 §4). Values are leaf constants, validated
+/// against the rule's declared params by the loader — no native rule declares
+/// params in v1, so the mechanism exists and waits for a client (Tier-A rules
+/// consume their options at load time, baked into the resolved rule).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RuleConfig {
+    options: serde_json::Map<String, serde_json::Value>,
+}
+
+impl RuleConfig {
+    pub fn new(options: serde_json::Map<String, serde_json::Value>) -> Self {
+        RuleConfig { options }
+    }
+
+    pub fn option(&self, key: &str) -> Option<&serde_json::Value> {
+        self.options.get(key)
+    }
+}
 
 /// The single object a rule's `check`/`safe_check` binds to: the program result,
 /// the component under analysis, its resolved [`AnalysisResult`], and the typed
@@ -198,12 +211,21 @@ impl<'a> RuleCtx<'a> {
     /// is absent (the dispatcher only builds a ctx for analysed components, and
     /// every rule indexed `result.components[component]` before).
     pub fn new(program: &'a ProgramAnalysisResult, component: &'a Symbol) -> Self {
+        Self::with_config(program, component, RuleConfig::default())
+    }
+
+    /// Like [`RuleCtx::new`], carrying per-rule options (ADR-022 §4).
+    pub fn with_config(
+        program: &'a ProgramAnalysisResult,
+        component: &'a Symbol,
+        config: RuleConfig,
+    ) -> Self {
         let comp = &program.components[component];
         RuleCtx {
             program,
             component,
             comp,
-            config: RuleConfig,
+            config,
         }
     }
 

@@ -1,20 +1,19 @@
-//! The `rules` subcommand: list every diagnostic name with its summary.
+//! The `rules` subcommand: list every diagnostic name with its summary —
+//! built-in rules and, when a config loads packs, their rules too (ADR-022 §8).
 
-use reactant::rules::RULE_DOCS;
+use std::path::Path;
 
 use super::EXIT_OK;
-use super::color::Palette;
 
-pub fn run() -> i32 {
-    let p = Palette::for_stdout(false);
-    let width = RULE_DOCS.iter().map(|d| d.name.len()).max().unwrap_or(0);
-    for doc in RULE_DOCS {
-        println!(
-            "  {}{:width$}{}  {}",
-            p.bold, doc.name, p.reset, doc.summary
-        );
-    }
-    println!();
-    println!("Run `reactant explain <rule>` for details, example, and fix.");
+pub fn run(config: Option<&Path>) -> i32 {
+    let (_cfg, registry) =
+        match super::config_load::load_config_and_registry(config, Path::new(".")) {
+            Ok(pair) => pair,
+            Err(code) => return code,
+        };
+    print!(
+        "{}",
+        reactant::driver::run_rules_list(&registry, super::color::enabled(false))
+    );
     EXIT_OK
 }

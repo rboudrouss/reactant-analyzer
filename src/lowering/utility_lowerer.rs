@@ -25,7 +25,7 @@ pub fn lower_utilities(
     file: &Path,
     files: &mut FileTable,
 ) -> Vec<FunctionIR> {
-    lower_utilities_with_resolver(program, source, file, files, &DefaultImportResolver)
+    lower_utilities_with_resolver(program, source, file, files, &DefaultImportResolver::default())
 }
 
 /// Plugin-friendly variant of [`lower_utilities`].

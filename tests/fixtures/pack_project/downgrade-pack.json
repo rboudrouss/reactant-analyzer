@@ -1,0 +1,4 @@
+{
+  "packs": ["../packs/team.json"],
+  "rules": { "team/effect-writes-own-dep": "warning" }
+}

@@ -3,9 +3,15 @@
 //! Default implementations cover the common case (recursive `*.ts*` discovery
 //! + relative imports with `.ts`/`.tsx`/index fallbacks).
 //! See `docs/plugins.md` for an end-to-end plugin example.
+//!
+//! All filesystem access goes through the [`FileSystem`] seam (ADR-022 §6):
+//! the defaults are `std::fs`-backed via [`OsFileSystem`]; the WASM build
+//! runs the same code over a [`MemFileSystem`].
 
-use std::fs;
+pub mod filesystem;
+
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::{
     engine::{
@@ -19,6 +25,8 @@ use crate::{
     },
 };
 
+pub use filesystem::{FileSystem, MemFileSystem, OsFileSystem};
+
 pub trait FileDiscoverer: Send + Sync {
     fn discover(&self, root: &Path) -> Vec<PathBuf>;
 }
@@ -30,8 +38,37 @@ pub trait ImportResolver: Send + Sync {
     fn resolve(&self, from: &Path, specifier: &str) -> Option<PathBuf>;
 }
 
-pub struct DefaultFileDiscoverer;
-pub struct DefaultImportResolver;
+pub struct DefaultFileDiscoverer {
+    fs: Arc<dyn FileSystem>,
+}
+
+pub struct DefaultImportResolver {
+    fs: Arc<dyn FileSystem>,
+}
+
+impl DefaultFileDiscoverer {
+    pub fn new(fs: Arc<dyn FileSystem>) -> Self {
+        DefaultFileDiscoverer { fs }
+    }
+}
+
+impl Default for DefaultFileDiscoverer {
+    fn default() -> Self {
+        Self::new(Arc::new(OsFileSystem))
+    }
+}
+
+impl DefaultImportResolver {
+    pub fn new(fs: Arc<dyn FileSystem>) -> Self {
+        DefaultImportResolver { fs }
+    }
+}
+
+impl Default for DefaultImportResolver {
+    fn default() -> Self {
+        Self::new(Arc::new(OsFileSystem))
+    }
+}
 
 // ── Plugin-facing high-level entry points ────────────────────────────────────
 
@@ -57,10 +94,20 @@ pub struct LoweredProgram {
 }
 
 /// Parse and lower an explicit list of files with the given `ImportResolver`.
+/// Reads through `std::fs`; the seam-aware form is [`lower_files_with`].
+pub fn lower_files(files: &[PathBuf], resolver: &dyn ImportResolver) -> LoweredProgram {
+    lower_files_with(&OsFileSystem, files, resolver)
+}
+
+/// Parse and lower an explicit list of files, reading sources through `fs`.
 ///
 /// Read/parse failures don't abort the run: the file is skipped and recorded
 /// in [`LoweredProgram::parse_errors`].
-pub fn lower_files(files: &[PathBuf], resolver: &dyn ImportResolver) -> LoweredProgram {
+pub fn lower_files_with(
+    fs: &dyn FileSystem,
+    files: &[PathBuf],
+    resolver: &dyn ImportResolver,
+) -> LoweredProgram {
     use oxc_allocator::Allocator;
     use oxc_parser::{ParseOptions, Parser as OxcParser};
     use oxc_span::SourceType;
@@ -75,10 +122,10 @@ pub fn lower_files(files: &[PathBuf], resolver: &dyn ImportResolver) -> LoweredP
     };
 
     for path in files {
-        let source = match fs::read_to_string(path) {
+        let source = match fs.read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
-                lowered.parse_errors.push((path.clone(), e.to_string()));
+                lowered.parse_errors.push((path.clone(), e));
                 continue;
             }
         };
@@ -188,8 +235,11 @@ pub fn analyze_with_resolvers(
     analyze_files(&files, resolver, strategy, config)
 }
 
-pub(crate) const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx"];
-const EXCLUDED_DIRS: &[&str] = &["node_modules", "dist", "build", ".next"];
+/// Source extensions and directory exclusions of the default discovery.
+/// `pub`: the WASM host's superset walk reads them at runtime
+/// (`host_constants`), so wrapper and core cannot drift (ADR-022 §6).
+pub const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx"];
+pub const EXCLUDED_DIRS: &[&str] = &["node_modules", "dist", "build", ".next"];
 
 fn is_source_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -215,24 +265,15 @@ fn is_source_file(path: &Path) -> bool {
     }
 }
 
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let file_type = match entry.file_type() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        if file_type.is_dir() {
+fn walk(fs: &dyn FileSystem, dir: &Path, out: &mut Vec<PathBuf>) {
+    for path in fs.read_dir(dir) {
+        if fs.is_dir(&path) {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if EXCLUDED_DIRS.contains(&name) {
                 continue;
             }
-            walk(&path, out);
-        } else if file_type.is_file() && is_source_file(&path) {
+            walk(fs, &path, out);
+        } else if fs.is_file(&path) && is_source_file(&path) {
             out.push(path);
         }
     }
@@ -241,13 +282,13 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 impl FileDiscoverer for DefaultFileDiscoverer {
     fn discover(&self, root: &Path) -> Vec<PathBuf> {
         let mut files = Vec::new();
-        if root.is_file() {
+        if self.fs.is_file(root) {
             if is_source_file(root) {
                 files.push(root.to_path_buf());
             }
             return files;
         }
-        walk(root, &mut files);
+        walk(self.fs.as_ref(), root, &mut files);
         files.sort();
         files
     }
@@ -290,7 +331,7 @@ impl ImportResolver for DefaultImportResolver {
         // Try <base>.<ext> for each source extension.
         for ext in SOURCE_EXTENSIONS {
             let candidate = base.with_extension(ext);
-            if candidate.is_file() {
+            if self.fs.is_file(&candidate) {
                 return Some(normalize(&candidate));
             }
         }
@@ -298,7 +339,7 @@ impl ImportResolver for DefaultImportResolver {
         // Try <base>/index.<ext>.
         for ext in SOURCE_EXTENSIONS {
             let candidate = base.join(format!("index.{ext}"));
-            if candidate.is_file() {
+            if self.fs.is_file(&candidate) {
                 return Some(normalize(&candidate));
             }
         }
@@ -376,7 +417,7 @@ mod tests {
         tmp.write("legacy.js", "");
         tmp.write("README.md", "");
 
-        let files = DefaultFileDiscoverer.discover(tmp.path());
+        let files = DefaultFileDiscoverer::default().discover(tmp.path());
         let names = rel(tmp.path(), &files);
         assert_eq!(
             names,
@@ -391,7 +432,7 @@ mod tests {
         tmp.write("app/components/Button.tsx", "");
         tmp.write("lib/utils/format.ts", "");
 
-        let files = DefaultFileDiscoverer.discover(tmp.path());
+        let files = DefaultFileDiscoverer::default().discover(tmp.path());
         let names = rel(tmp.path(), &files);
         assert_eq!(
             names,
@@ -410,7 +451,7 @@ mod tests {
         tmp.write("node_modules/react/index.tsx", "");
         tmp.write("node_modules/nested/lib/foo.ts", "");
 
-        let files = DefaultFileDiscoverer.discover(tmp.path());
+        let files = DefaultFileDiscoverer::default().discover(tmp.path());
         let names = rel(tmp.path(), &files);
         assert_eq!(names, vec!["Page.tsx"]);
     }
@@ -423,7 +464,7 @@ mod tests {
         tmp.write("build/Page.tsx", "");
         tmp.write(".next/Page.tsx", "");
 
-        let files = DefaultFileDiscoverer.discover(tmp.path());
+        let files = DefaultFileDiscoverer::default().discover(tmp.path());
         let names = rel(tmp.path(), &files);
         assert_eq!(names, vec!["src/Page.tsx"]);
     }
@@ -436,7 +477,7 @@ mod tests {
         tmp.write("Page.spec.ts", "");
         tmp.write("types.d.ts", "");
 
-        let files = DefaultFileDiscoverer.discover(tmp.path());
+        let files = DefaultFileDiscoverer::default().discover(tmp.path());
         let names = rel(tmp.path(), &files);
         assert_eq!(names, vec!["Page.tsx"]);
     }
@@ -446,7 +487,7 @@ mod tests {
         let tmp = Tmp::new("single-file");
         let file = tmp.write("Page.tsx", "");
 
-        let files = DefaultFileDiscoverer.discover(&file);
+        let files = DefaultFileDiscoverer::default().discover(&file);
         assert_eq!(files, vec![file]);
     }
 
@@ -455,7 +496,7 @@ mod tests {
         let tmp = Tmp::new("missing");
         let missing = tmp.path().join("does-not-exist");
 
-        let files = DefaultFileDiscoverer.discover(&missing);
+        let files = DefaultFileDiscoverer::default().discover(&missing);
         assert!(files.is_empty());
     }
 
@@ -465,7 +506,7 @@ mod tests {
         let from = tmp.write("a/b.tsx", "");
         let utils = tmp.write("a/utils.ts", "");
 
-        let resolved = DefaultImportResolver.resolve(&from, "./utils");
+        let resolved = DefaultImportResolver::default().resolve(&from, "./utils");
         assert_eq!(resolved, Some(utils));
     }
 
@@ -476,7 +517,7 @@ mod tests {
         let ts = tmp.write("a/utils.ts", "");
         tmp.write("a/utils.js", "");
 
-        let resolved = DefaultImportResolver.resolve(&from, "./utils");
+        let resolved = DefaultImportResolver::default().resolve(&from, "./utils");
         assert_eq!(resolved, Some(ts));
     }
 
@@ -486,7 +527,7 @@ mod tests {
         let from = tmp.write("a/b.tsx", "");
         let index = tmp.write("a/utils/index.ts", "");
 
-        let resolved = DefaultImportResolver.resolve(&from, "./utils");
+        let resolved = DefaultImportResolver::default().resolve(&from, "./utils");
         assert_eq!(resolved, Some(index));
     }
 
@@ -496,7 +537,7 @@ mod tests {
         let from = tmp.write("a/b/c.tsx", "");
         let sibling = tmp.write("a/sibling.tsx", "");
 
-        let resolved = DefaultImportResolver.resolve(&from, "../sibling");
+        let resolved = DefaultImportResolver::default().resolve(&from, "../sibling");
         assert_eq!(resolved, Some(sibling));
     }
 
@@ -506,11 +547,11 @@ mod tests {
         let from = tmp.write("a/b.tsx", "");
 
         assert!(
-            DefaultImportResolver
+            DefaultImportResolver::default()
                 .resolve(&from, "@tanstack/react-query")
                 .is_none()
         );
-        assert!(DefaultImportResolver.resolve(&from, "react").is_none());
+        assert!(DefaultImportResolver::default().resolve(&from, "react").is_none());
     }
 
     #[test]
@@ -518,6 +559,6 @@ mod tests {
         let tmp = Tmp::new("resolve-missing");
         let from = tmp.write("a/b.tsx", "");
 
-        assert!(DefaultImportResolver.resolve(&from, "./nope").is_none());
+        assert!(DefaultImportResolver::default().resolve(&from, "./nope").is_none());
     }
 }

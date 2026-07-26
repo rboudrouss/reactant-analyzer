@@ -28,9 +28,13 @@ use crate::rules::{Diagnostic, Rule};
 /// reference, or there is no deps array at all.
 pub struct AlwaysUnstableDeps;
 
+impl AlwaysUnstableDeps {
+    const NAME: &'static str = "always-unstable-deps";
+}
+
 impl Rule for AlwaysUnstableDeps {
     fn name(&self) -> &'static str {
-        "always-unstable-deps"
+        Self::NAME
     }
 
     fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
@@ -41,7 +45,7 @@ impl Rule for AlwaysUnstableDeps {
             .get(component)
             .is_some_and(|c| c.effect_info.values().any(|e| !e.declared_deps.is_empty()))
             .then_some(crate::rules::SafeCheck {
-                rule: self.name(),
+                rule: Self::NAME,
                 message: "no deps array is defeated by an always-fresh reference",
             })
     }

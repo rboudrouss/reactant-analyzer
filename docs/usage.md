@@ -6,6 +6,7 @@
 reactant check [PATHS...]      # analyze files/directories (the default subcommand)
 reactant rules                 # list every diagnostic the analyzer can emit
 reactant explain <rule>        # full doc for one diagnostic: what, example, fix
+reactant schemas [--out DIR]   # emit the JSON Schemas (pack.json, reactant.config.json)
 ```
 
 `check` is the default: `reactant src/` ≡ `reactant check src/` (the historical
@@ -43,6 +44,7 @@ reactant check src/ --ignore-rule lazy-init      # all but this one
 | `--all-roots` | Analyze every component as an entry point (`props = ⊤`). |
 | `--verbose` | Debug output on stderr: symbol graph topo order, fixpoint stats, per-component iterations/widened labels. |
 | `--no-color` | Disable ANSI colors. Also honored: a non-empty `NO_COLOR` env var, or stdout not being a terminal. |
+| `--config <path>` | Config file to use (default: `<project root>/reactant.config.json` when present). Also accepted by `rules` and `explain` (their default root is the cwd). |
 
 ### Exit codes
 
@@ -54,6 +56,59 @@ reactant check src/ --ignore-rule lazy-init      # all but this one
 
 A missing or unparseable `tsconfig.json` is **not** an error: the run degrades
 to relative-only import resolution with a warning on stderr.
+
+## `reactant.config.json` (ADR-022)
+
+Discovered at the **project root** (the first directory argument), or passed
+explicitly with `--config`. JSONC-tolerant (comments, trailing commas). A
+present but broken config is always an error (exit 2) — it never silently
+degrades to defaults. CLI flags beat config values.
+
+```jsonc
+{
+  "$schema": "./node_modules/reactant-analyzer/schemas/reactant-config.schema.json",
+  "packs": ["@team/react-rules", "./rules/pack.json"],
+  "rules": {
+    "infinite-loop": "warning",                  // native downgrade: allowed
+    "team/effect-writes-own-dep": { "severity": "error", "options": { "maxDeps": 8 } },
+    "missing-deps": "off"                        // subsumes --ignore-rule
+  },
+  // check-flag equivalents (camelCase): entry, allRoots, failOn, project,
+  // format, info, showClean, trace
+  "failOn": "error"
+}
+```
+
+- **`rules`** entries are keyed by *diagnostic name* and accept `"off"`, a
+  severity, or `{ "severity": …, "options": … }`. Severity is a **ceiling**
+  (`pin ⊓ polarity`, ADR-022 §3): downgrades are always honored, but a
+  Warning-polarity finding can never be promoted to Error — the clamp is
+  structural (an Error is only constructible from an engine-certified proof).
+  An explicit `--rule X` on the CLI resurrects a config-`"off"` X;
+  `--ignore-rule` always denies.
+- **`packs`** lists Tier-A rule packs, loaded in order: npm package names
+  (resolved via `node_modules/<name>/package.json`'s `"reactant"` field,
+  fallback `pack.json`) or paths relative to the config file. Pack rules are
+  addressed `pack/rule`, work with `--rule`/`--ignore-rule`/`rules`/`explain`,
+  and their Errors gate `--fail-on` exactly like native ones.
+- **`options`** are validated against the params the pack rule declares
+  (unknown key or type mismatch → exit 2).
+
+## Rule packs (Tier A)
+
+A pack is one JSON file (`$schema`:
+`./node_modules/reactant-analyzer/schemas/pack.schema.json`) declaring rules
+over **semantic anchors** — relations the engine has already resolved (hook
+calls, alias-resolved setter calls, deps entries) — with guards over
+polarity-typed verdicts. There is no syntax position in the schema: a rule
+that can't be expressed semantically is refused, never emulated. See
+`docs/adr/ADR-022-custom-rule-frontends-distribution.md` for the model and
+`tests/fixtures/packs/team.json` for a complete example.
+
+Severity per finding is `pin ⊓ polarity`: a rule pinned `"error"` emits an
+Error only where a `must_*` guard certified the finding, and a Warning
+elsewhere (free stratification). A pin of `"error"` with no `must_*` guard
+loads with a warning (it can only ever emit warnings).
 
 ## Project kinds
 

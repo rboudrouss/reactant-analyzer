@@ -103,7 +103,7 @@ fn rules_lists_all_diagnostic_names() {
     let text = stdout(&out);
     for doc in reactant::rules::RULE_DOCS {
         assert!(
-            text.contains(doc.name),
+            text.contains(doc.name.as_ref()),
             "missing rule in listing: {}",
             doc.name
         );

@@ -1,8 +1,11 @@
 //! `ImportResolver` backed by tsconfig `compilerOptions.paths` aliases.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use crate::resolver::{DefaultImportResolver, ImportResolver, SOURCE_EXTENSIONS, normalize};
+use crate::resolver::{
+    DefaultImportResolver, FileSystem, ImportResolver, SOURCE_EXTENSIONS, normalize,
+};
 
 use super::tsconfig::TsconfigPaths;
 
@@ -20,10 +23,11 @@ pub struct TsconfigPathsResolver {
     /// Starless patterns matched verbatim.
     exacts: Vec<(String, Vec<String>)>,
     fallback: DefaultImportResolver,
+    fs: Arc<dyn FileSystem>,
 }
 
 impl TsconfigPathsResolver {
-    pub fn new(paths: TsconfigPaths) -> Self {
+    pub fn new(paths: TsconfigPaths, fs: Arc<dyn FileSystem>) -> Self {
         let mut wildcards = Vec::new();
         let mut exacts = Vec::new();
         for (pattern, targets) in paths.patterns {
@@ -40,7 +44,8 @@ impl TsconfigPathsResolver {
             base_url: paths.base_url,
             wildcards,
             exacts,
-            fallback: DefaultImportResolver,
+            fallback: DefaultImportResolver::new(fs.clone()),
+            fs,
         }
     }
 
@@ -48,18 +53,18 @@ impl TsconfigPathsResolver {
     /// `<base>/<target>` as-is, then `.<ext>`, then `/index.<ext>`.
     fn probe(&self, target: &str) -> Option<PathBuf> {
         let base = normalize(&self.base_url.join(target));
-        if base.is_file() {
+        if self.fs.is_file(&base) {
             return Some(base);
         }
         for ext in SOURCE_EXTENSIONS {
             let candidate = base.with_extension(ext);
-            if candidate.is_file() {
+            if self.fs.is_file(&candidate) {
                 return Some(candidate);
             }
         }
         for ext in SOURCE_EXTENSIONS {
             let candidate = base.join(format!("index.{ext}"));
-            if candidate.is_file() {
+            if self.fs.is_file(&candidate) {
                 return Some(candidate);
             }
         }
@@ -110,6 +115,7 @@ impl ImportResolver for TsconfigPathsResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -152,13 +158,16 @@ mod tests {
     }
 
     fn resolver(tmp: &Tmp, patterns: Vec<(&str, Vec<&str>)>) -> TsconfigPathsResolver {
-        TsconfigPathsResolver::new(TsconfigPaths {
-            base_url: tmp.path().to_path_buf(),
-            patterns: patterns
-                .into_iter()
-                .map(|(p, ts)| (p.to_string(), ts.into_iter().map(str::to_string).collect()))
-                .collect(),
-        })
+        TsconfigPathsResolver::new(
+            TsconfigPaths {
+                base_url: tmp.path().to_path_buf(),
+                patterns: patterns
+                    .into_iter()
+                    .map(|(p, ts)| (p.to_string(), ts.into_iter().map(str::to_string).collect()))
+                    .collect(),
+            },
+            Arc::new(crate::resolver::OsFileSystem),
+        )
     }
 
     #[test]

@@ -229,7 +229,7 @@ pub fn lower_custom_hooks(
     file: &Path,
     files: &mut FileTable,
 ) -> Vec<HookIR> {
-    lower_custom_hooks_with_resolver(program, source, file, files, &DefaultImportResolver)
+    lower_custom_hooks_with_resolver(program, source, file, files, &DefaultImportResolver::default())
 }
 
 /// Plugin-friendly variant of [`lower_custom_hooks`] that accepts a custom
@@ -283,7 +283,7 @@ pub fn lower_program(
     file: &Path,
     files: &mut FileTable,
 ) -> Vec<ComponentIR> {
-    lower_program_with_resolver(program, source, file, files, &DefaultImportResolver)
+    lower_program_with_resolver(program, source, file, files, &DefaultImportResolver::default())
 }
 
 /// Plugin-friendly variant of [`lower_program`].
