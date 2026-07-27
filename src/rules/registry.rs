@@ -24,6 +24,7 @@ use crate::ir::types::Symbol;
 use super::api::diagnostic::{Diagnostic, Severity};
 use super::api::query::{RuleConfig, RuleCtx};
 use super::docs::{RULE_DOCS, RuleDoc};
+use super::impls::AnalysisLimitInfo;
 use super::{Rule, SafeCheck, all_rules};
 
 /// Consumer overrides, already precedence-resolved by the frontend (ADR-022
@@ -220,6 +221,17 @@ impl RuleRegistry {
             }
             diags.extend(produced.into_iter().map(|d| self.clamped(d)));
         }
+
+        // A component where the analyzer admits it truncated (`analysis-limit`
+        // says "FN possible") must not also publish `verified: …` universals
+        // that the very same limit could falsify — an opaque hook may hide the
+        // conditional call, the missing dep, the diverging effect. Read off the
+        // *unfiltered* diagnostics on purpose: silencing the Info with
+        // `--ignore-rule` hides the notice, it does not restore the guarantee.
+        if diags.iter().any(|d| d.rule == AnalysisLimitInfo::NAME) {
+            safe_checks.clear();
+        }
+
         diags.retain(|d| self.visible(&d.rule));
         safe_checks.retain(|s| self.visible(s.rule));
 

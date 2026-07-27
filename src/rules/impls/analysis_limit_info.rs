@@ -18,9 +18,13 @@ use crate::rules::{Diagnostic, Rule};
 ///                           and has no `HookSummary`; its internals are opaque (FN possible).
 pub struct AnalysisLimitInfo;
 
+impl AnalysisLimitInfo {
+    pub(crate) const NAME: &'static str = "analysis-limit";
+}
+
 impl Rule for AnalysisLimitInfo {
     fn name(&self) -> &'static str {
-        "analysis-limit"
+        Self::NAME
     }
 
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {

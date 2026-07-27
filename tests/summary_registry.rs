@@ -226,3 +226,63 @@ fn unresolved_custom_hook_return_is_not_provably_stable() {
         "an opaque hook's return must be ⊤, not a provably-stable `undefined`"
     );
 }
+
+/// A component whose analysis was truncated must not publish `verified: …`
+/// assurances alongside the `analysis-limit` Info that says "FN possible" —
+/// the opaque hook could hide the very conditional call, missing dep or
+/// diverging effect the assurance denies. The two outputs contradicted each
+/// other before this interlock.
+#[test]
+fn analysis_limit_suppresses_safe_check_assurances() {
+    use reactant::rules::RuleRegistry;
+
+    let opaque = r#"
+        import { useEffect } from "react";
+        import { useOpaqueThing } from "some-uninstalled-pkg";
+        function C() {
+            const thing = useOpaqueThing();
+            useEffect(() => { subscribe(thing); }, [thing]);
+            return <div>x</div>;
+        }
+    "#;
+    // Same component minus the unresolvable import: the assurances must still
+    // be published, or the interlock would be suppressing everything.
+    let clear = r#"
+        import { useEffect, useState } from "react";
+        function C() {
+            const [n, setN] = useState(0);
+            useEffect(() => { subscribe(n); }, [n]);
+            return <div onClick={() => setN(n + 1)}>{n}</div>;
+        }
+    "#;
+
+    let registry = RuleRegistry::natives();
+    let findings = |src: &str| {
+        let result = parse_and_analyze_with_config(src, Config::default());
+        registry.check_component(&result, &"C".to_string())
+    };
+
+    let truncated = findings(opaque);
+    assert!(
+        truncated
+            .diagnostics
+            .iter()
+            .any(|d| d.rule == "analysis-limit"),
+        "fixture must actually trip the limit"
+    );
+    assert!(
+        truncated.safe_checks.is_empty(),
+        "a truncated component must publish no assurances, got: {:?}",
+        truncated
+            .safe_checks
+            .iter()
+            .map(|s| s.rule)
+            .collect::<Vec<_>>()
+    );
+
+    let complete = findings(clear);
+    assert!(
+        !complete.safe_checks.is_empty(),
+        "a fully-analyzed component must still publish its assurances"
+    );
+}
