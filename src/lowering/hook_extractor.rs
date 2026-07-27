@@ -318,17 +318,25 @@ fn process_stmt(
                 }
 
                 // Record the binding variable, npm import source, and resolved file for Custom hooks.
-                if !is_arr_temp
-                    && let Some(HookEntry::Custom {
-                        binding,
-                        import_source,
-                        resolved_file,
-                        ..
-                    }) = hooks.last_mut()
+                if let Some(HookEntry::Custom {
+                    binding,
+                    import_source,
+                    resolved_file,
+                    ..
+                }) = hooks.last_mut()
                 {
-                    *binding = Some(var.clone());
+                    // Provenance describes the *call*, not the shape of what
+                    // receives it. Gating it on the binding meant
+                    // `const [a, setA] = useStore(sel)` — the ordinary zustand
+                    // shape — kept no import source and no resolved file, so
+                    // the `(file, name)` registry lookup degraded to a
+                    // first-match by bare name.
                     *import_source = imports.import_map.get(&name).cloned();
                     *resolved_file = imports.resolved_import_map.get(&name).cloned();
+                    // `__arr_N` is a lowering temp, never a source name.
+                    if !is_arr_temp {
+                        *binding = Some(var.clone());
+                    }
                 }
 
                 if is_state_like && is_arr_temp {
@@ -1356,5 +1364,62 @@ mod tests {
             find_let_rhs(stmts, "dispatch"),
             Some(Expr::StateSetter(0))
         ));
+    }
+
+    /// A hook's import source and resolved file describe the *call*, so an
+    /// array-destructured one keeps them. Gating them on the binding meant
+    /// `const [a, setA] = useStore(sel)` — the ordinary zustand and
+    /// react-router shape — kept neither, and the `(file, name)` registry
+    /// lookup fell back to a first match on the bare name.
+    #[test]
+    fn array_destructured_custom_hook_keeps_its_provenance() {
+        let src = "function C() { const [p, setP] = useSearchParams(); return <div/>; }";
+        let alloc = Allocator::default();
+        let ret = Parser::new(&alloc, src, SourceType::tsx())
+            .with_options(ParseOptions::default())
+            .parse();
+        let mut cfg = ret
+            .program
+            .body
+            .iter()
+            .find_map(|s| match s {
+                Statement::FunctionDeclaration(f) => f
+                    .body
+                    .as_ref()
+                    .map(|b| build_cfg(b, &crate::ir::SourceMap::empty())),
+                _ => None,
+            })
+            .expect("no function found");
+
+        let imports = HashMap::from([("useSearchParams".to_string(), "react-router".to_string())]);
+        let resolved = HashMap::from([(
+            "useSearchParams".to_string(),
+            PathBuf::from("/pkg/react-router/index.ts"),
+        )]);
+        let names = HashSet::new();
+        let ctx = ImportCtx {
+            import_map: &imports,
+            resolved_import_map: &resolved,
+            react_ns: &names,
+            local_hooks: &names,
+        };
+        let (hooks, _) = extract_hooks(&mut cfg, &ctx);
+
+        let HookEntry::Custom {
+            import_source,
+            resolved_file,
+            binding,
+            ..
+        } = &hooks[0]
+        else {
+            panic!("expected a custom hook, got {:?}", hooks[0]);
+        };
+        assert_eq!(import_source.as_deref(), Some("react-router"));
+        assert_eq!(
+            resolved_file.as_deref(),
+            Some(std::path::Path::new("/pkg/react-router/index.ts"))
+        );
+        // The receiver is a lowering temp (`__arr_N`), never a source name.
+        assert_eq!(*binding, None, "a temp is not a binding");
     }
 }

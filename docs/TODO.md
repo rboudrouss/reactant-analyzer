@@ -59,13 +59,14 @@ false-negative channel, and both are reproduced.
   `safe_check` assurances. Central, ~5 lines, and a precondition for any change
   that moves rows into the opaque `Custom` channel.
 
-- **Array-destructured custom-hook calls lose their provenance.** `import_source`,
-  `resolved_file` and `binding` are populated only inside the `if !is_arr_temp`
-  guard ([hook_extractor.rs:321-332](../src/lowering/hook_extractor.rs#L321)), so
-  `const [a, setA] = useStore(sel)` — the exact zustand-v5 crash shape — keeps no
-  import source and no resolved file, degrading the `(file, name)` HookRegistry
-  lookup to a first-match `get_by_name`. Prerequisite for scoping any pack rule
-  to a package rather than to a bare local name.
+- ~~**Array-destructured custom-hook calls lose their provenance.**~~ —
+  **fixed**: `import_source` and `resolved_file` describe the *call*, so they
+  are recorded whatever the binding's shape; only `binding` still skips the
+  `__arr_N` temp, which is not a source name. Corpus: 8 `analysis-limit`
+  notices disappear, every one a
+  `const [params, setParams] = useSearchParams()` that the package-scoped
+  `SummaryRegistry` entry can now match — the analyzer is no longer blind
+  there, so it stops saying it is. No finding added or removed.
 
 - ~~**`break`/`continue` are sealed `Unreachable` with no edge to the loop
   exit**~~ — **fixed**. The diagnosis in this entry was off: the exit set
@@ -326,8 +327,8 @@ records why vocabulary work comes after attribution and after the engine facts.
    `Origin` variant, or `SummaryRegistry`'s package-scoped entries are lost.
    Gated on the `HookMarker` → ⊤ fix, which must land and be measured first.
 
-6. **Expression-position entities** *(M)* — ADR-023 §§1-3. Gated on the
-   array-destructuring provenance fix. Ship `returns_verdict` as a public ⊤-total
+6. **Expression-position entities** *(M)* — ADR-023 §§1-3. Its gate, the
+   array-destructuring provenance fix, has landed. Ship `returns_verdict` as a public ⊤-total
    primitive in `api/query.rs` handling the **inline `FnLit` case only**, then the
    `args` edge on the `custom` anchor. Not the `init` edge: a mount-only expression
    has no cross-render stability question. Not `Var`-bound selectors: `locs` wins
