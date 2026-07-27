@@ -34,7 +34,7 @@ fn check_vite_project_json() {
 
     let doc: serde_json::Value =
         serde_json::from_str(&stdout(&out)).expect("stdout must be valid JSON");
-    assert_eq!(doc["version"], 1);
+    assert_eq!(doc["version"], 2);
     assert_eq!(doc["files_analyzed"], 2);
     assert_eq!(doc["parse_errors"].as_array().unwrap().len(), 0);
 
@@ -45,10 +45,18 @@ fn check_vite_project_json() {
         .expect("infinite-loop diagnostic in JSON output");
     assert_eq!(inf["severity"], "warning");
     assert_eq!(inf["component"], "App");
+    // This fixture's effect lives in a hook inlined from `useData.ts`, so v2
+    // reports that file next to its line number (v1 asserted `App.tsx` here —
+    // the component's file paired with the hook's line, ADR-024 §1).
     assert!(
-        inf["file"].as_str().unwrap().ends_with("App.tsx"),
+        inf["file"].as_str().unwrap().ends_with("useData.ts"),
         "file field: {:?}",
         inf["file"]
+    );
+    assert!(
+        inf["component_file"].as_str().unwrap().ends_with("App.tsx"),
+        "component_file field: {:?}",
+        inf["component_file"]
     );
     assert!(inf["line"].is_number());
 
@@ -56,6 +64,46 @@ fn check_vite_project_json() {
     assert_eq!(summary["warnings"], 1);
     assert_eq!(summary["errors"], 0);
     assert_eq!(summary["exit_code"], 1);
+}
+
+/// Schema v2 (ADR-024 §1): `file` names the file `line`/`col` point into. The
+/// finding here is anchored in a hook inlined from another file, so `file` must
+/// be the hook's — pairing the component's path with the hook's line number is
+/// the incoherence v1 had — while `component_file` keeps v1's meaning.
+#[test]
+fn json_file_is_the_anchor_file_not_the_component_file() {
+    let out = reactant(&["check", "tests/fixtures/cross_file_hook", "--format", "json"]);
+    let doc: serde_json::Value =
+        serde_json::from_str(&stdout(&out)).expect("stdout must be valid JSON");
+
+    let d = doc["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["rule"] == "infinite-loop")
+        .expect("infinite-loop diagnostic");
+
+    let file = d["file"].as_str().unwrap();
+    let comp_file = d["component_file"].as_str().unwrap();
+    assert!(file.ends_with("hooks/useData.ts"), "file: {file}");
+    assert!(comp_file.ends_with("page.tsx"), "component_file: {comp_file}");
+    assert!(d["line"].is_number());
+}
+
+/// The human primary line must not print a bare line number that belongs to
+/// another file — the 44%-unactionable defect ADR-024 §1 fixes.
+#[test]
+fn human_line_names_the_origin_file_when_it_differs() {
+    let out = reactant(&["check", "tests/fixtures/cross_file_hook", "--no-color"]);
+    let text = stdout(&out);
+    assert!(
+        text.contains("hooks/useData.ts:7:2"),
+        "the finding line must carry the origin file:\n{text}"
+    );
+    assert!(
+        !text.contains("(line 7:2)"),
+        "a bare line number here would point into page.tsx:\n{text}"
+    );
 }
 
 #[test]

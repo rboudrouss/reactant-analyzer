@@ -1,4 +1,4 @@
-//! JSON renderer (schema v1, documented in docs/usage.md).
+//! JSON renderer (schema v2, documented in docs/usage.md).
 //!
 //! The DTOs moved here from the binary verbatim, field for field — the wire
 //! schema, not the crate boundary, is the stability contract. The whole
@@ -35,8 +35,14 @@ struct JsonDiagnostic<'a> {
     severity: &'static str,
     /// Registry display name; collision-disambiguated (`Page@src/a/page.tsx`).
     component: &'a str,
-    /// The component's defining file.
+    /// The file `line`/`col` point into — the anchor's own file, which for a
+    /// finding inside a cross-file inlined hook is *not* `component_file`
+    /// (schema v2; v1 reported the component's file here and so paired it with
+    /// a line number from another file). Falls back to `component_file` when
+    /// the diagnostic carries no range.
     file: Option<String>,
+    /// The component's defining file — what `file` meant in schema v1.
+    component_file: Option<String>,
     /// 1-indexed; null when the diagnostic has no source range.
     line: Option<u32>,
     /// 0-indexed; null when the diagnostic has no source range.
@@ -191,11 +197,13 @@ fn to_json_diag<'a>(
     files: &FileTable,
     display: &dyn Fn(&Path) -> String,
 ) -> JsonDiagnostic<'a> {
+    let anchor_file = d.range.and_then(|r| files.path(r.file)).map(display);
     JsonDiagnostic {
         rule: &d.rule,
         severity: severity_str(d.severity()),
         component,
-        file: file.map(display),
+        file: anchor_file.or_else(|| file.map(display)),
+        component_file: file.map(display),
         line: d.range.map(|r| r.line),
         col: d.range.map(|r| r.col),
         hook_label: d.hook_label,
@@ -221,7 +229,7 @@ pub fn render(report: &CheckReport, display: &dyn Fn(&Path) -> String) -> String
         .collect();
 
     let doc = JsonReport {
-        version: 1,
+        version: 2,
         files_analyzed: report.files_analyzed,
         parse_errors: report
             .parse_errors

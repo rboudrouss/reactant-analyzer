@@ -5,10 +5,33 @@
 use std::fmt::Write;
 use std::path::Path;
 
+use crate::ir::{FileTable, SourceRange};
 use crate::rules::Severity;
 
 use super::palette::Palette;
 use super::report::{CheckReport, ComponentReport};
+
+/// Renders a position as `(line L:C)` when it lies in the file already named
+/// on the component header, and as `(path:L:C)` when it does not.
+///
+/// A component's hooks may be inlined from other files (ADR-013), so a bare
+/// line number under the component's path names a line in the wrong file —
+/// measured at 44% of custom-rule findings (ADR-024). Both the primary finding
+/// line and the `--trace` steps go through here so the two can never disagree
+/// about where a position points.
+fn position(
+    range: SourceRange,
+    comp_file: Option<&Path>,
+    files: &FileTable,
+    display: &dyn Fn(&Path) -> String,
+) -> String {
+    match files.path(range.file) {
+        Some(f) if comp_file != Some(f) => {
+            format!("({}:{}:{})", display(f), range.line, range.col)
+        }
+        _ => format!("(line {}:{})", range.line, range.col),
+    }
+}
 
 /// Under `--info`, list the applicable checks that ran on this component and
 /// found nothing — positive assurance, distinct from an unchecked region.
@@ -98,7 +121,10 @@ pub fn render(
                 .unwrap_or_default();
             let range_info = d
                 .range
-                .map(|r| format!("  {}(line {}:{}){}", p.dim, r.line, r.col, p.reset))
+                .map(|r| {
+                    let at = position(r, comp.file.as_deref(), &report.file_table, display);
+                    format!("  {}{}{}", p.dim, at, p.reset)
+                })
                 .unwrap_or_default();
             let _ = writeln!(
                 out,
@@ -113,16 +139,13 @@ pub fn render(
                         .hook_label
                         .map(|l| format!(" [hook:{l}]"))
                         .unwrap_or_default();
-                    // A witness step may point into another file (cross-file
-                    // inlining): name it whenever it differs from the
-                    // component's own file.
                     let note_range = note
                         .range
-                        .map(|r| match report.file_table.path(r.file) {
-                            Some(f) if comp.file.as_deref() != Some(f) => {
-                                format!(" ({}:{}:{})", display(f), r.line, r.col)
-                            }
-                            _ => format!(" (line {}:{})", r.line, r.col),
+                        .map(|r| {
+                            format!(
+                                " {}",
+                                position(r, comp.file.as_deref(), &report.file_table, display)
+                            )
                         })
                         .unwrap_or_default();
                     let _ = writeln!(out, "       → {}{}{}", note.message, note_hook, note_range);

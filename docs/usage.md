@@ -137,11 +137,11 @@ Recursive walk of the given directories for `.ts/.tsx/.js/.jsx`, excluding
 `node_modules/`, `dist/`, `build/`, `.next/`, `*.test.*`, `*.spec.*`,
 `*.d.ts`. Relative imports only.
 
-## JSON schema (v1)
+## JSON schema (v2)
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "files_analyzed": 12,
   "parse_errors": [ { "file": "src/broken.tsx", "message": "..." } ],
   "diagnostics": [
@@ -149,7 +149,8 @@ Recursive walk of the given directories for `.ts/.tsx/.js/.jsx`, excluding
       "rule": "infinite-loop",
       "severity": "warning",
       "component": "Page@src/users/page.tsx",
-      "file": "src/users/page.tsx",
+      "file": "src/hooks/useData.ts",
+      "component_file": "src/users/page.tsx",
       "line": 10,
       "col": 4,
       "hook_label": 2,
@@ -180,7 +181,13 @@ Semantics:
 
 - `component` — registry display name; the `@<file>` suffix appears only when
   two files define the same component name.
-- `file` — the component's defining file, relative to the CWD when possible.
+- `file` — the file `line`/`col` point into, relative to the CWD when possible.
+  A custom hook is inlined into each component that calls it (ADR-013), so a
+  finding anchored inside one is reported in the **hook's** file, not the
+  consumer's. Falls back to `component_file` when the finding has no range.
+  *(Changed in v2: v1 reported the component's file here and paired it with a
+  line number that could belong to another file — ADR-024 §1.)*
+- `component_file` — the component's defining file; what `file` meant in v1.
 - `notes` — the finding's **witness chain** (ADR-019): typed steps explaining
   why the rule fired. `kind` ∈ `binding | resolve | call | write | read |
   branch | handler | cycle-edge | widen`; each kind adds its structured
@@ -206,7 +213,12 @@ Semantics:
   Page  (2 hooks)  src/users/page.tsx         ← with diagnostics
     warn   infinite-loop  [hook:1]  (line 7:2)  — effect 2 sets state 1 ...
        → handler `onClick` also calls setter ... [hook:3] (line 12:4)
+    warn   missing-deps  [hook:4]  (src/hooks/useData.ts:9:2)  ...
 ```
+
+`(line L:C)` is a position in the file named on the component header;
+`(path:L:C)` is one in another file — a hook or utility inlined into this
+component from there (ADR-013). Trace steps follow the same convention.
 
 On a component-name collision the name is disambiguated automatically
 (`Page@tests/fixtures/page_collision/users/page.tsx`).

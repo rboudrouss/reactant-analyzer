@@ -239,12 +239,27 @@ impl RuleRegistry {
         // (many `analysis-limit` Infos, several notes on one slot) come back
         // in a run-dependent order — tie-break on position, then content, so
         // consecutive runs are byte-identical (CI/bench diffing).
+        //
+        // The position key is `(file, line, col)`, not `(line, col)`: a
+        // component whose hooks are inlined from several files (ADR-013) holds
+        // anchors from all of them, so bare line numbers both interleave the
+        // origins and leave a genuine tie — two findings at the same line:col
+        // of two different hook files — to HashMap order. `is_none()` leads so
+        // range-less findings stay last, as under the old `u32::MAX` sentinel.
+        let loc = |d: &Diagnostic| {
+            let r = d.range;
+            (
+                r.is_none(),
+                r.and_then(|r| program.file_table.path(r.file)),
+                r.map_or(u32::MAX, |r| r.line),
+                r.map_or(u32::MAX, |r| r.col),
+            )
+        };
         diags.sort_by(|a, b| {
-            let pos = |d: &Diagnostic| d.range.map_or((u32::MAX, u32::MAX), |r| (r.line, r.col));
             (
                 &a.rule,
                 a.severity() as u8,
-                pos(a),
+                loc(a),
                 &a.message,
                 &a.var,
                 a.hook_label,
@@ -252,7 +267,7 @@ impl RuleRegistry {
                 .cmp(&(
                     &b.rule,
                     b.severity() as u8,
-                    pos(b),
+                    loc(b),
                     &b.message,
                     &b.var,
                     b.hook_label,

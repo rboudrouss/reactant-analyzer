@@ -133,8 +133,6 @@ false-negative channel, and both are reproduced.
 
 ### Diagnostics UX (side-finding)
 
-- **Cross-file anchors print bare line numbers** — a finding anchored inside an *inlined* hook renders `(line N:C)` under the component header, but N points into the hook's source file, not the component file shown in the header (excalidraw: `EyeDropper … EyeDropper.tsx` + `(line 26:2)` = `useOutsideClick.ts:26`; memos: `App` ×2 → `useUserTheme.ts`/`useUserLocale.ts`; `TextToDiagramContent` → `useTTDChatStorage.ts:78/146`). The `--trace` steps do print the true path; the primary finding line should carry the origin file whenever the `InlineOrigin` (ADR-019) differs from the component's file.
-
 - **Cross-component blame** — `always-unstable-deps` on a prop-rooted dep blames the *child* (memos `MentionResolutionProvider`; zustand `Fireflies` — `colors` dep fed by the literal `['orange']` at the `Scene.jsx:92` call site) when the instability comes from a specific parent call site (`MemoDetail.tsx` passes an unmemoized array). The propagation is semantically correct (verified: the provider analyzed alone is silent); the message should carry the provenance ("unstable because `<Parent>` passes a fresh array at file:line"). An `OnProps` label family in the ADR-017 frame would make this provenance first-class — worth doing for the *message*, no FP to fix.
 
 - **Sequential/streaming diagnostics** *(low priority)* — print each component's findings as its analysis completes instead of buffering the whole report until the end (better perceived latency on large repos). Constraints to solve: (1) the pipeline is currently analyze-all → rules → sort → render, and the deterministic total order (byte-identical CI/bench diffing, cf. the sort in `cli/check.rs`) conflicts with emission order — either stream in analysis order and drop the ordering guarantee for human output, or keep `--format json` and any diff-sensitive path buffered; (2) top-down inter-component analysis (ADR-012) means a component's result isn't final until its subtree is done, and program-level arms (churn graph ADR-018, cross-component rules) only run after *all* components — those findings can't stream and would arrive in a trailing batch; (3) the summary/exit code stays end-of-run. Human-only feature; JSON stays a single buffered document.
@@ -243,14 +241,15 @@ expressible, all in weakened form**. The blockers, in decreasing leverage:
   `hook_kind_word`, which names only effect/memo/callback.
 - **The `ref` anchor kind is inert** — the filter exists, but no guard and no
   template field applies to `Sort::Hook(Ref)`.
-- **Cross-file inlining makes ~44% of custom findings unactionable** — 12 of the 27
-  corpus findings print a line number belonging to the *inlined hook's* file under
-  the *consumer's* path (verified exactly: `presence-fade.tsx:17` is
-  `use-callback-ref.ts:17`; `providers.tsx:10` is `use-local-storage.ts:10`). This
-  is the already-known cross-file anchor limitation above, but custom rules hit it
-  far harder than native ones, and one shared hook multiplies into a finding per
-  consumer. Fixing the origin-file rendering would recover more custom-rule value
-  than any new guard. Decided in [ADR-024](adr/ADR-024-inlined-hook-finding-attribution.md).
+- ~~**Cross-file inlining makes ~44% of custom findings unactionable**~~ — **fixed**
+  (ADR-024 §1): the human primary line and the JSON `file` now name the anchor's
+  own file. Measured on the eight corpora: 757 of 12 139 findings (6.2%, and 41%
+  of excalidraw's) moved to their origin file, the finding multiset is unchanged,
+  and 89% of the relocated anchors land on a literal `useX(` call in the new file
+  against 3.4% in the old one. What remains is the *actionability* half of
+  ADR-024 §3 — a finding correctly attributed to `node_modules`-like vendored
+  code is locatable but not fixable by its reader; a first-party/dependency
+  boundary is still unfiled.
 
 ## Planned work (ADR-023 / ADR-024)
 
@@ -258,14 +257,12 @@ In sequence. Each step is gated on the one before it; the ordering is the
 decision, not a preference — [ADR-023 §5](adr/ADR-023-tier-a-vocabulary-growth.md)
 records why vocabulary work comes after attribution and after the engine facts.
 
-1. **Origin-file rendering** *(S)* — ADR-024 §1: when the anchor's file differs
-   from the component's, name it on the primary human line and make the JSON
-   report's `file` the anchor's file so `file`/`line`/`col` denote one location.
-   Driver-level only; extend the report sort key with the anchor file to keep
-   determinism. One test assertion flips (`tests/cli.rs`); nothing asserts on the
-   human `(line N:C)` text. Bump the JSON report version and update
-   [usage.md](usage.md), which documents the old meaning. **Do not** group
-   findings across consumers — ADR-024 §2 refuses it with the counterexample.
+1. ~~**Origin-file rendering**~~ — **done** (ADR-024 §1). JSON schema v2: `file`
+   is the anchor's file, `component_file` keeps v1's meaning. The sort key gained
+   the anchor path, which also closed a real tie: two findings of one rule at the
+   same `line:col` of two *different* inlined hooks were previously ordered by
+   HashMap iteration. Findings are still never deduplicated across consumers
+   (ADR-024 §2).
 
 2. **The small vocabulary fixes** *(S)* — no engine change, no fixture churn.
    Collapse `raw_name`/`render_field` into one `Field`-indexed table with **both
