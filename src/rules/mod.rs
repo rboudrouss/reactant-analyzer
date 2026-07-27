@@ -23,19 +23,19 @@ pub mod registry;
 
 pub use api::diagnostic::{Diagnostic, Severity};
 pub use api::query::{
-    Certified, ConditionalHookCall, DominatesAllExits, EffectCycleProof, ExitDominance,
-    InitSetterCall, May, Motion, MovingFeeder, MustResult, OnAllPaths, Provenance, RuleConfig,
-    RuleCtx, SameRefMutation, StabilityVerdict, classify_motion, may_change_of,
-    must_dominates_all_exits, must_frozen_seed, must_init_calls_setter, must_on_all_paths,
-    must_same_ref_mutation, must_setter_on_all_paths, stability_verdict_of,
+    Certified, CleanupVerdict, ConditionalHookCall, DominatesAllExits, EffectCycleProof,
+    ExitDominance, InitSetterCall, May, Motion, MovingFeeder, MustResult, OnAllPaths, Provenance,
+    RuleConfig, RuleCtx, SameRefMutation, StabilityVerdict, classify_motion, cleanup_verdict,
+    may_change_of, must_dominates_all_exits, must_frozen_seed, must_init_calls_setter,
+    must_on_all_paths, must_same_ref_mutation, must_setter_on_all_paths, stability_verdict_of,
 };
 pub use api::witness::{EffectClass, Note, ResolveTarget, Step, ValueClass};
 pub use docs::{RULE_DOCS, RuleDoc, rule_doc};
 pub use helpers::setters::{SetterCall, collect_setter_calls, collect_setter_calls_with_extra};
 pub use impls::{
     AlwaysUnstableDeps, AnalysisLimitInfo, ConditionalHook, DerivedState, FrozenInitialState,
-    InfiniteLoop, LazyInit, MissingDeps, RedundantSetState, SetterInRender, StaleClosure,
-    StateMutation, UnnecessaryRerender, WideningInfo,
+    InfiniteLoop, LazyInit, MissingCleanup, MissingDeps, RedundantSetState, SetterInRender,
+    StaleClosure, StateMutation, UnnecessaryRerender, WideningInfo,
 };
 pub use registry::{ComponentFindings, OverrideEntry, RegistryError, RuleOverrides, RuleRegistry};
 
@@ -98,6 +98,7 @@ pub fn all_rules() -> Vec<Box<dyn Rule>> {
     vec![
         Box::new(ConditionalHook),
         Box::new(MissingDeps),
+        Box::new(MissingCleanup),
         Box::new(AlwaysUnstableDeps),
         Box::new(LazyInit),
         Box::new(RedundantSetState),

@@ -24,7 +24,7 @@ use crate::{
     ir::{
         SourceRange,
         cfg::{CFG, Terminator},
-        expr::Expr,
+        expr::{Expr, Prim},
         stmt::Stmt,
         types::{BlockId, HookLabel, Symbol, Var},
     },
@@ -789,4 +789,59 @@ fn guard_site(cfg: &CFG, block: BlockId) -> Option<(BlockId, Option<SourceRange>
                 });
             (d, span)
         })
+}
+
+// ── Effect cleanup ────────────────────────────────────────────────────────────
+
+/// What an effect body returns, from the point of view of teardown.
+///
+/// Three-valued on purpose, and `Unknown` folds to the **may** side: it means
+/// "there may be a cleanup", so it can never be read as an absence. Only
+/// [`CleanupVerdict::Absent`] — every exit returns nothing at all — is a claim,
+/// and it is the only one a rule may act on. The asymmetry is the point: an
+/// effect that returns *something* is one whose author wrote a teardown, or
+/// wrote something we cannot classify, and advice is wrong in both cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupVerdict {
+    /// Some exit returns a function.
+    Present,
+    /// No exit returns anything: every `return` is bare and the body otherwise
+    /// falls off the end.
+    Absent,
+    /// Something is returned that we cannot classify as a function or not —
+    /// a call result, an unresolvable variable.
+    Unknown,
+}
+
+/// Classify an effect body's teardown. `fn_lit_binding`'s certainty bar is
+/// reused for `return unsubscribe`: a variable bound to exactly one function
+/// literal counts as a cleanup, a re-bound or imported one is `Unknown`.
+pub fn cleanup_verdict(body: &CFG) -> CleanupVerdict {
+    let mut verdict = CleanupVerdict::Absent;
+    for block in body.blocks.values() {
+        let Terminator::Return(expr) = &block.term else {
+            continue;
+        };
+        match classify_returned(expr, body) {
+            // One cleanup on one path is a cleanup: the rule is about the
+            // author forgetting teardown entirely, not about a path missing it.
+            CleanupVerdict::Present => return CleanupVerdict::Present,
+            CleanupVerdict::Unknown => verdict = CleanupVerdict::Unknown,
+            CleanupVerdict::Absent => {}
+        }
+    }
+    verdict
+}
+
+fn classify_returned(expr: &Expr, body: &CFG) -> CleanupVerdict {
+    match expr.peel_ts() {
+        Expr::FnLit { .. } => CleanupVerdict::Present,
+        // `return;` and `return undefined;` — the author returned nothing.
+        Expr::Lit(Prim::Unit) => CleanupVerdict::Absent,
+        Expr::Var(v) => match crate::rules::fn_lit_binding(v, body) {
+            Some(_) => CleanupVerdict::Present,
+            None => CleanupVerdict::Unknown,
+        },
+        _ => CleanupVerdict::Unknown,
+    }
 }

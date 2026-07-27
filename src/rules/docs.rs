@@ -185,6 +185,23 @@ pub const RULE_DOCS: &[RuleDoc] = &[
         "const [data, setData] = useState(() => expensiveParse(blob));",
     ),
     doc(
+        "missing-cleanup",
+        "effect starts something long-lived and returns no teardown",
+        "An effect that calls `setInterval`, `addEventListener`, `subscribe`, \
+                      `on` or `addListener` registers again every time it re-runs — on every \
+                      deps change, on every mount, and twice on the first mount under \
+                      StrictMode. With no cleanup nothing ever unregisters, so the handlers \
+                      accumulate and the ones from earlier renders keep firing against state \
+                      the component no longer has. One-shot registrars (`setTimeout`, `.then`) \
+                      are out of scope: they fire late rather than repeatedly, which wants an \
+                      abort flag, not a teardown. Warning only — the teardown may live in a \
+                      helper this rule cannot see through, so it fires solely when the effect \
+                      provably returns nothing at all.",
+        "useEffect(() => { window.addEventListener('resize', onResize); }, []);",
+        "useEffect(() => {\n  window.addEventListener('resize', onResize);\n  \
+                      return () => window.removeEventListener('resize', onResize);\n}, []);",
+    ),
+    doc(
         "missing-deps",
         "effect body captures a variable not listed in its deps array",
         "A `useEffect`/`useMemo`/`useCallback` body reads a non-stable free \

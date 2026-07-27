@@ -23,7 +23,7 @@ use crate::ir::types::{BlockId, HookLabel, Var};
 use crate::rules::api::query::{Certified, ConditionalHookCall, ExitDominance, RuleCtx};
 use crate::rules::{
     SetterCall, StabilityVerdict, all_setter_labels, collect_setter_calls, hook_kind_word,
-    hook_val_labels, resolve_setter_aliases, state_slot_name, state_val_labels,
+    hook_val_labels, resolve_setter_aliases, state_val_labels,
 };
 
 use super::schema::{HookKindFilter, StabilityName};
@@ -189,10 +189,6 @@ impl<'a> EntityCtx<'a> {
     }
 
     // ── Naming & rendering (the single naming point) ──────────────────────────
-
-    pub fn slot_display(&self, label: HookLabel) -> String {
-        state_slot_name(label, &self.state_names)
-    }
 
     /// Verdict of a deps entry, evaluated at render exit.
     pub fn dep_verdict(&self, dep: &DepEntity<'a>) -> StabilityName {

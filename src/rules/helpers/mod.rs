@@ -6,6 +6,7 @@
 
 pub mod churn;
 pub mod churn_graph;
+pub mod registrations;
 pub mod setters;
 
 use std::collections::{HashMap, HashSet};

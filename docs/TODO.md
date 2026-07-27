@@ -194,8 +194,6 @@ rules-of-hooks, index-as-key, naming) are explicitly out of scope.
 
 ### Tier 2 — semantic but higher FP (aim Warning/Info)
 
-- **`missing-cleanup`** — a resource created in an effect (`setInterval`/`addEventListener`/`subscribe`/`new WebSocket`) with no cleanup `return` → leak + double-subscribe under StrictMode/effect re-run. Engine: sees the call and the absence of a `Return` FnLit in the effect block. FP: cleanup done via a helper. **Warning.**
-
 - **`async-setState-race`** — setter after `await`/in `.then` with no guard (no `AbortController`, no `cancelled` flag) → out-of-order responses overwrite. `useEffect(() => { fetch(url).then(r => setData(r)) }, [url])`. **Warning/Info — often benign.**
 
 ## Out-of-scope perimeter (future)
@@ -297,16 +295,24 @@ records why vocabulary work comes after attribution and after the engine facts.
    ∀ (`quantifier: all`) stays **refused** — see the ADR for the two false
    negatives.
 
-4. **Effect cleanup as an engine fact → native `missing-cleanup`** *(M)* — pervasive
-   in 6 of 8 corpora and already listed under "Proposed rules" below. Engine first:
-   seal fall-through and give `break`/`continue` their real loop-exit edge (open bug
-   above), because the Error tier is otherwise built on a phantom exit set. Then
-   promote the registrar relation out of `stale_closure.rs` into `api/` as a pure
-   relocate (byte-identical tests), and add a three-valued `CleanupVerdict` whose
-   `Unknown` folds to the **may** side per the standing `api/query.rs` contract.
-   Ship it as a native **Warning** (as this file has always specified); do not add
-   Tier-A cleanup vocabulary in the same step, and do not attempt register/unregister
-   handle pairing — it scored 0 true positives on the corpus.
+4. ~~**Effect cleanup as an engine fact → native `missing-cleanup`**~~ — **done**,
+   as a Warning. The registrar relation moved to `helpers/registrations.rs` (a
+   CFG scan belongs with the other CFG scans; the polarity-typed
+   `CleanupVerdict` went to `api/query.rs`), and `Unknown` folds to
+   "there may be a cleanup" so only a provable `Absent` fires. Scope is repeating
+   registrars only — a one-shot `setTimeout`/`.then` fires late rather than
+   repeatedly, which wants an abort flag, not a teardown.
+
+   **It finds nothing on the eight corpora**, and that is not a wiring failure:
+   a crude syntactic sweep finds zero effects with a repeating registrar and no
+   `return` in any of them. This file's "pervasive in 6 of 8" described the
+   *pattern*, not the bug — mature OSS has had this reviewed out. A mutation
+   test (delete the `return` from chakra's `useScrollPosition` and analyse it
+   through a cross-file consumer) fires correctly, so what the corpus measures
+   is precision: 0 false positives against ~12 000 diagnostics of real code.
+   The rule is aimed at code being written now, which is the stated audience;
+   its true-positive value stays unproven here. Register/unregister handle
+   pairing is still refused — it scored 0 true positives.
 
 5. **Hook identity by provenance** *(M/L)* — a fail-closed `Origin` map replacing the
    `use[A-Z]`-plus-fail-open-guess classification, so a call through a non-`use`
