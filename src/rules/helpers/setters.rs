@@ -59,7 +59,16 @@ pub fn collect_setter_calls_with_extra(
             .or_insert_with(|| Arc::clone(v));
     }
     let mut found: HashMap<Var, (Option<SourceRange>, Option<BlockId>)> = HashMap::new();
-    collect_setter_calls_inner(cfg, setter_vars, max_depth, &fn_bindings, &mut found, true);
+    let mut walking = HashSet::new();
+    collect_setter_calls_inner(
+        cfg,
+        setter_vars,
+        max_depth,
+        &fn_bindings,
+        &mut found,
+        true,
+        &mut walking,
+    );
     found
         .into_iter()
         .map(|(var, (span, block_id))| SetterCall {
@@ -163,6 +172,14 @@ pub(in crate::rules) fn collect_fn_bindings(cfg: &CFG) -> HashMap<Var, Arc<CFG>>
 
 /// `top_level = true` → block IDs recorded are from the caller's CFG, meaningful for dominance.
 /// `top_level = false` → inside a nested FnLit; block IDs are `None`.
+///
+/// `walking` is the set of CFGs on the current expansion *stack*, keyed by
+/// identity. It must stay a stack (pushed on entry, popped on exit), not a
+/// global visited set: a body first reached with no depth left and later with
+/// budget to spare has to be walked again, so a global set would lose findings.
+/// Skipping only re-entrant walks loses none — a cycle re-enters a body at a
+/// budget no larger than the one it is already being walked at, so the spliced
+/// cycle-free path reaches the same CFGs and `found` only ever grows.
 fn collect_setter_calls_inner(
     cfg: &CFG,
     setter_vars: &HashSet<Var>,
@@ -170,7 +187,12 @@ fn collect_setter_calls_inner(
     fn_bindings: &HashMap<Var, Arc<CFG>>,
     found: &mut HashMap<Var, (Option<SourceRange>, Option<BlockId>)>,
     top_level: bool,
+    walking: &mut HashSet<usize>,
 ) {
+    let key = cfg as *const CFG as usize;
+    if !walking.insert(key) {
+        return;
+    }
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
     queue.push_back(cfg.entry);
@@ -180,7 +202,15 @@ fn collect_setter_calls_inner(
         let block_id = if top_level { Some(bid) } else { None };
         if let Some(block) = cfg.blocks.get(&bid) {
             for stmt in &block.stmts {
-                check_stmt_for_setters(stmt, block_id, setter_vars, depth, fn_bindings, found);
+                check_stmt_for_setters(
+                    stmt,
+                    block_id,
+                    setter_vars,
+                    depth,
+                    fn_bindings,
+                    found,
+                    walking,
+                );
             }
             match &block.term {
                 Terminator::Return(expr) => {
@@ -192,6 +222,7 @@ fn collect_setter_calls_inner(
                         depth,
                         fn_bindings,
                         found,
+                        walking,
                     );
                 }
                 Terminator::Branch { cond, .. } => {
@@ -203,6 +234,7 @@ fn collect_setter_calls_inner(
                         depth,
                         fn_bindings,
                         found,
+                        walking,
                     );
                 }
                 _ => {}
@@ -214,6 +246,7 @@ fn collect_setter_calls_inner(
             }
         }
     }
+    walking.remove(&key);
 }
 
 /// Extend a `setter var → state label` map with alias `let a = b` bindings in
@@ -334,6 +367,7 @@ fn check_stmt_for_setters(
     depth: usize,
     fn_bindings: &HashMap<Var, Arc<CFG>>,
     found: &mut HashMap<Var, (Option<SourceRange>, Option<BlockId>)>,
+    walking: &mut HashSet<usize>,
 ) {
     let (expr, span) = match stmt {
         Stmt::ExprStmt(e, span) => (e, *span),
@@ -342,7 +376,16 @@ fn check_stmt_for_setters(
         Stmt::Assign { rhs, .. } => (rhs, None),
         Stmt::MemberWrite { rhs, .. } => (rhs, None),
     };
-    check_expr_for_setters(expr, span, block_id, setter_vars, depth, fn_bindings, found);
+    check_expr_for_setters(
+        expr,
+        span,
+        block_id,
+        setter_vars,
+        depth,
+        fn_bindings,
+        found,
+        walking,
+    );
 }
 
 fn check_expr_for_setters(
@@ -353,6 +396,7 @@ fn check_expr_for_setters(
     depth: usize,
     fn_bindings: &HashMap<Var, Arc<CFG>>,
     found: &mut HashMap<Var, (Option<SourceRange>, Option<BlockId>)>,
+    walking: &mut HashSet<usize>,
 ) {
     if let Expr::Call { fn_, args } = expr {
         if let Expr::Var(name) = fn_.as_ref() {
@@ -372,6 +416,7 @@ fn check_expr_for_setters(
                     fn_bindings,
                     &mut inner,
                     false,
+                    walking,
                 );
                 for (var, (span, _)) in inner {
                     found.entry(var).or_insert((span, block_id));
@@ -389,9 +434,12 @@ fn check_expr_for_setters(
                         fn_bindings,
                         found,
                         false,
+                        walking,
                     );
                 }
-                // B5: variable arg name resolution, no depth cost.
+                // B5: variable arg name resolution, no depth cost — so this is
+                // the arm that can cycle (`const tick = t => raf(tick)`); the
+                // `walking` stack is what terminates it.
                 Expr::Var(name) => {
                     if let Some(body) = fn_bindings.get(name) {
                         collect_setter_calls_inner(
@@ -401,6 +449,7 @@ fn check_expr_for_setters(
                             fn_bindings,
                             found,
                             false,
+                            walking,
                         );
                     }
                 }
@@ -473,4 +522,101 @@ pub(in crate::rules) fn may_written_slots(
         .filter(|(v, _)| used.contains(*v))
         .map(|(_, l)| *l)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::expr::Prim;
+    use crate::ir::types::ExprId;
+    use crate::test_support::single_block_cfg;
+
+    fn call(callee: &str, args: Vec<Expr>) -> Expr {
+        Expr::Call {
+            fn_: Box::new(Expr::Var(callee.to_string())),
+            args,
+        }
+    }
+
+    /// A self-referential local closure — `const tick = t => { setN(t); raf(tick) }`
+    /// — used to make the "B5" variable-argument arm recurse forever, because it
+    /// resolves the argument to its bound body without spending depth. The walk
+    /// must terminate *and* still report the setter it contains.
+    #[test]
+    fn self_referential_callback_terminates_and_is_still_scanned() {
+        let tick_body = single_block_cfg(vec![
+            Stmt::ExprStmt(call("setN", vec![Expr::Lit(Prim::Int(1))]), None),
+            Stmt::ExprStmt(
+                call("raf", vec![Expr::Var("tick".to_string())]),
+                None,
+            ),
+        ]);
+        let cfg = single_block_cfg(vec![
+            Stmt::Let {
+                var: "tick".to_string(),
+                rhs: Expr::FnLit {
+                    id: ExprId(0),
+                    params: vec!["t".to_string()],
+                    body_cfg: Arc::new(tick_body),
+                },
+                span: None,
+            },
+            Stmt::ExprStmt(
+                call("raf", vec![Expr::Var("tick".to_string())]),
+                None,
+            ),
+        ]);
+
+        let setters: HashSet<Var> = ["setN".to_string()].into_iter().collect();
+        let found = collect_setter_calls(&cfg, &setters, 2);
+
+        assert_eq!(
+            found.iter().map(|c| c.var.as_str()).collect::<Vec<_>>(),
+            vec!["setN"],
+            "the cycle guard must not hide the setter inside the recursive closure"
+        );
+    }
+
+    /// Mutual recursion between two bound closures — the same hazard one hop
+    /// further out, which a self-reference-only guard would miss.
+    #[test]
+    fn mutually_recursive_callbacks_terminate() {
+        let a_body = single_block_cfg(vec![Stmt::ExprStmt(
+            call("raf", vec![Expr::Var("b".to_string())]),
+            None,
+        )]);
+        let b_body = single_block_cfg(vec![
+            Stmt::ExprStmt(call("setN", vec![]), None),
+            Stmt::ExprStmt(call("raf", vec![Expr::Var("a".to_string())]), None),
+        ]);
+        let cfg = single_block_cfg(vec![
+            Stmt::Let {
+                var: "a".to_string(),
+                rhs: Expr::FnLit {
+                    id: ExprId(0),
+                    params: vec![],
+                    body_cfg: Arc::new(a_body),
+                },
+                span: None,
+            },
+            Stmt::Let {
+                var: "b".to_string(),
+                rhs: Expr::FnLit {
+                    id: ExprId(1),
+                    params: vec![],
+                    body_cfg: Arc::new(b_body),
+                },
+                span: None,
+            },
+            Stmt::ExprStmt(call("raf", vec![Expr::Var("a".to_string())]), None),
+        ]);
+
+        let setters: HashSet<Var> = ["setN".to_string()].into_iter().collect();
+        let found = collect_setter_calls(&cfg, &setters, 2);
+
+        assert_eq!(
+            found.iter().map(|c| c.var.as_str()).collect::<Vec<_>>(),
+            vec!["setN"]
+        );
+    }
 }
