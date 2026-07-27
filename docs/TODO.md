@@ -6,90 +6,11 @@
 > l'historique git et [ADR-020](adr/ADR-020-tech-debt-cleanup-decisions.md).
 > Ce fichier ne liste que les limites **ouvertes**.
 
-## Open bugs (crash / soundness) — fix before any new vocabulary
-
-Found while authoring `packs/guardrails.json` against the eight corpora. The
-first two are the priority: one denies analysis outright, the other is a
-false-negative channel, and both are reproduced.
-
-- **CRASH — unbounded recursion in the shared setter walker.** `check_expr_for_setters`'
-  "B5" arm ([setters.rs:394-406](../src/rules/helpers/setters.rs#L394)) resolves a
-  variable *argument* to its bound `FnLit` body and recurses with the depth budget
-  **unchanged** (`// no depth cost`), while every other CFG-crossing arm spends a
-  level; there is no cycle guard. A self-referential local closure —
-  `const tick = (t) => { setN(t); id = requestAnimationFrame(tick) }` — recurses
-  forever. `test-repo/memos` aborts with a stack overflow (1 of 8 corpora never
-  analyzed = every finding in it is a false negative). Reduced to a **20-line,
-  2-file repro**: the closure must reach a component's CFG through a *cross-file
-  inlined* custom hook, which is why no single file crashes. 512 MB of stack
-  still overflows, so it is a cycle, not a deep walk — the fix is a walk-stack
-  guard keyed on CFG identity, **not** a depth budget (a budget also fails the
-  pinned `infinite_loop.rs:1467` test). No FN: `found` only grows via
-  `or_insert`, and depth is non-increasing along any path, so the guard explores
-  exactly the CFG-simple paths and discovers the same setter set. One obligation
-  to keep: `SetterCall.block_id` reaches `Certified` at
-  [setter_in_render.rs:111](../src/rules/impls/setter_in_render.rs#L111) and
-  `declarative/exec.rs:194`, and `found` is first-writer-wins, so pruning must
-  not change which insert wins — both consumers walk `render_cfg` as top level,
-  which can never be a `fn_bindings` value; assert it rather than assume it.
-
-- **FN — an unresolved custom hook's return value reads as provably `Stable`.**
-  `Expr::HookMarker(_) => StateValue::undefined()`
-  ([transfer/state_value.rs:123](../src/domains/transfer/state_value.rs#L123)) and
-  `if self.null || self.undef { acc.join(&Stability::Stable) }`
-  ([impls/state_value.rs:316](../src/domains/impls/state_value.rs#L316)) combine so
-  that an opaque hook return is *provably stable* rather than ⊤. Reproduced: a
-  probe pack reports ``dep `legacy` is stable`` for `const legacy = useLegacyStore()`
-  imported from an unresolvable package. Every rule gated on "provably stable"
-  therefore goes quiet on exactly the values the analyzer knows least about —
-  `all_deps_provably_stable` suppressing `infinite-loop` is the worst case. Fix
-  centrally: an opaque marker must read ⊤ (populate the `other` slot), never
-  `undefined`. Measure the FP delta on the eight corpora in isolation, before any
-  other baseline-moving change. This also removes a latent wrong claim from
-  `guardrails/inert-single-dep`, which would otherwise assert "can never re-run
-  after mount" for an effect whose only dep is an opaque hook return.
-
-- **`safe_check` contradicts `analysis-limit` in the same component.** A component
-  that emits `analysis-limit/unknown-hook` ("FN possible") also emits the
-  `verified: …` universals that the very same limit could falsify — observed
-  together in one probe run (`analysis-limit` for `useLegacyStore` alongside
-  `verified missing-deps — every effect declares the variables it reads`). Fix
-  once in `RuleRegistry::check_component` ([registry.rs](../src/rules/registry.rs)):
-  a component carrying an `analysis-limit` Info must not also publish
-  `safe_check` assurances. Central, ~5 lines, and a precondition for any change
-  that moves rows into the opaque `Custom` channel.
-
-- ~~**Array-destructured custom-hook calls lose their provenance.**~~ —
-  **fixed**: `import_source` and `resolved_file` describe the *call*, so they
-  are recorded whatever the binding's shape; only `binding` still skips the
-  `__arr_N` temp, which is not a source name. Corpus: 8 `analysis-limit`
-  notices disappear, every one a
-  `const [params, setParams] = useSearchParams()` that the package-scoped
-  `SummaryRegistry` entry can now match — the analyzer is no longer blind
-  there, so it stops saying it is. No finding added or removed.
-
-- ~~**`break`/`continue` are sealed `Unreachable` with no edge to the loop
-  exit**~~ — **fixed**. The diagnosis in this entry was off: the exit set
-  (`ExitDominance`) only ever counted `Return` blocks, so no phantom exit was
-  entering it. The real defect was one level down — the abstract env at the jump
-  never reached the loop exit, so a variable written only on the early-leaving
-  path was narrowed to whatever the *other* paths left. Measured on a fixture
-  where that narrowing made a dep provably stable and so suppressed
-  `infinite-loop`: 0 findings before, 1 after. Same class, found while fixing
-  it: a `switch` fell straight into its cases, so one whose every case leaves
-  (`continue`/`return`) made everything after it unreachable — no case has to
-  match, and the fall-out edge now says so. `do…while` gained a real test block
-  (`continue` runs the test). Corpus: no change in any of the eight, as
-  expected for a latent hole.
-
-- ~~**Silent no-ops in the Tier-A frontend.**~~ — **fixed**: `field_for` and
-  `render_field` are one `Field`-indexed table (`Field::token`/`admits` +
-  `EntityCtx::field_raw`, all total), and the `stability`/`in_deps` arms of
-  `exec.rs` are exhaustive matches on `Bound` instead of refutable `let-else`
-  bindings. `every_admitted_field_renders` walks all twelve admitted
-  (anchor kind, field) pairs. Residual, benign and loud: a `Field` variant
-  missing from `Field::ALL` is unreachable from templates and reported as an
-  unknown field, rather than silently rendering empty.
+> **Les six bugs ouverts recensés en juillet 2026 sont tous corrigés** — crash
+> du walker de setters, retour de hook opaque lu comme `Stable`, `safe_check`
+> contredisant `analysis-limit`, provenance perdue sur destructuration en
+> tableau, `break`/`continue` sans arête, no-ops silencieux du frontend Tier A.
+> Voir l'historique git ; les mesures de chacun sont dans son message de commit.
 
 ## Known false negatives (FN)
 
@@ -207,8 +128,11 @@ rules-of-hooks, index-as-key, naming) are explicitly out of scope.
 ## Frontend limits (ADR-022)
 
 Measured by authoring `packs/guardrails.json` against a 21-rule catalogue drawn
-from the eight `test-repo/` corpora: **3 of the 21 real-world rule classes are
-expressible, all in weakened form**. The blockers, in decreasing leverage:
+from the eight `test-repo/` corpora: **3 of the 21 real-world rule classes were
+expressible, all in weakened form**. Five of the blockers below have since been
+removed; that count has *not* been re-measured against the current vocabulary,
+so treat it as the baseline the fixes were judged against, not as today's
+figure. The blockers still standing, in decreasing leverage:
 
 - **Only declared deps carry an expression verdict** — `RuleCtx::stability_verdict`
   accepts *any* `Expr`, but the `stability` guard is wired to the `deps` edge
@@ -231,6 +155,13 @@ expressible, all in weakened form**. The blockers, in decreasing leverage:
   edge, so "every dep is stable" cannot be stated. The only workaround is to pin
   the arity (`count equals 1` alongside the per-element guard), which is why
   `guardrails/inert-single-dep` covers single-dep effects and nothing wider.
+- **`useLayoutEffect`/`useInsertionEffect` are indistinguishable from `useEffect`** —
+  lowering collapses all three into `HookEntry::Effect` (`hook_extractor.rs:592`),
+  so the common "never call `useLayoutEffect` directly, use the SSR-safe wrapper"
+  convention cannot be written at all.
+
+### Closed since that measurement
+
 - ~~**Guards are a conjunction**~~ — **fixed**: `any_of` composes guards into a
   tree (ADR-023 §4 cleared it; ∀ over an edge stays refused). Every branch is
   evaluated rather than short-circuited, or whether a `must_*` branch
@@ -243,10 +174,6 @@ expressible, all in weakened form**. The blockers, in decreasing leverage:
   `import_source` alone — `resolved_file` is absolute, so matching or printing it
   would tie a pack to one checkout. A relatively-imported hook has no specifier
   and therefore does not match (positive-only, ADR-023).
-- **`useLayoutEffect`/`useInsertionEffect` are indistinguishable from `useEffect`** —
-  lowering collapses all three into `HookEntry::Effect` (`hook_extractor.rs:592`),
-  so the common "never call `useLayoutEffect` directly, use the SSR-safe wrapper"
-  convention cannot be written at all.
 - ~~**`{anchor.kind}` renders "hook" for 4 of the 7 kinds**~~ — **fixed**:
   `hook_kind_word` is total (state / effect / memo / callback / ref / custom hook
   / handler). Native messages are unaffected — they only ever ask about
