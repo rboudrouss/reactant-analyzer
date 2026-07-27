@@ -6,12 +6,6 @@
 > l'historique git et [ADR-020](adr/ADR-020-tech-debt-cleanup-decisions.md).
 > Ce fichier ne liste que les limites **ouvertes**.
 
-> **Les six bugs ouverts recensés en juillet 2026 sont tous corrigés** — crash
-> du walker de setters, retour de hook opaque lu comme `Stable`, `safe_check`
-> contredisant `analysis-limit`, provenance perdue sur destructuration en
-> tableau, `break`/`continue` sans arête, no-ops silencieux du frontend Tier A.
-> Voir l'historique git ; les mesures de chacun sont dans son message de commit.
-
 ## Known false negatives (FN)
 
 - **Aliased React hook imports stay Custom** — `import { useMemo as useM } from "react"`: classification keys on the LOCAL name (`useM` matches no React arm) → Custom with `import_source: "react"` → not analyzed as a memo. Rare pattern; fixing it needs the *imported* name in the import map, not just the local binding.
@@ -129,10 +123,10 @@ rules-of-hooks, index-as-key, naming) are explicitly out of scope.
 
 Measured by authoring `packs/guardrails.json` against a 21-rule catalogue drawn
 from the eight `test-repo/` corpora: **3 of the 21 real-world rule classes were
-expressible, all in weakened form**. Five of the blockers below have since been
-removed; that count has *not* been re-measured against the current vocabulary,
-so treat it as the baseline the fixes were judged against, not as today's
-figure. The blockers still standing, in decreasing leverage:
+expressible, all in weakened form**. Five of the blockers that count was taken
+against have since been removed and it has *not* been re-measured, so read it as
+the baseline the fixes were judged against, not as today's figure. What is still
+blocking, in decreasing leverage:
 
 - **Only declared deps carry an expression verdict** — `RuleCtx::stability_verdict`
   accepts *any* `Expr`, but the `stability` guard is wired to the `deps` edge
@@ -160,89 +154,15 @@ figure. The blockers still standing, in decreasing leverage:
   so the common "never call `useLayoutEffect` directly, use the SSR-safe wrapper"
   convention cannot be written at all.
 
-### Closed since that measurement
-
-- ~~**Guards are a conjunction**~~ — **fixed**: `any_of` composes guards into a
-  tree (ADR-023 §4 cleared it; ∀ over an edge stays refused). Every branch is
-  evaluated rather than short-circuited, or whether a `must_*` branch
-  contributes its proof — and so whether the finding can reach Error — would
-  depend on the order the author wrote the branches in. A `must_*` branch left
-  on the default `else: keep` makes the disjunction vacuous and warns at load.
-- ~~**`source` is renderable but not guardable**~~ — **fixed**: a `source` guard
-  matches the import specifier with `one_of`/`prefix`, so a package (or a whole
-  `@scope/` prefix) can be banned, not just a local name. It is bound to
-  `import_source` alone — `resolved_file` is absolute, so matching or printing it
-  would tie a pack to one checkout. A relatively-imported hook has no specifier
-  and therefore does not match (positive-only, ADR-023).
-- ~~**`{anchor.kind}` renders "hook" for 4 of the 7 kinds**~~ — **fixed**:
-  `hook_kind_word` is total (state / effect / memo / callback / ref / custom hook
-  / handler). Native messages are unaffected — they only ever ask about
-  deps-carrying kinds.
-- ~~**The `ref` anchor kind is inert**~~ — **fixed**: `must_init_calls_setter`
-  accepts a `ref` anchor, `{anchor.name}` resolves for memo/callback/ref/custom
-  (the variable the call binds, or the hook's own name for a custom), and native
-  `lazy-init` moved to `HookEntry::Ref` in the same commit so the two cannot
-  disagree about `useRef`. The ref tier is deliberately lower than state's: with
-  no lazy form to recommend, only a state write (Error) or a side-effecting call
-  (Warning) earns the three-line `if (ref.current === null)` advice; an
-  unjudgeable call is Info and a cheap pure one is silent. Corpus: +8 Info,
-  0 Warning, 0 Error — all `useRef(new Map()/new Set()/new Compartment())`.
-- ~~**Cross-file inlining makes ~44% of custom findings unactionable**~~ — **fixed**
-  (ADR-024 §1): the human primary line and the JSON `file` now name the anchor's
-  own file. Measured on the eight corpora: 757 of 12 139 findings (6.2%, and 41%
-  of excalidraw's) moved to their origin file, the finding multiset is unchanged,
-  and 89% of the relocated anchors land on a literal `useX(` call in the new file
-  against 3.4% in the old one. What remains is the *actionability* half of
-  ADR-024 §3 — a finding correctly attributed to `node_modules`-like vendored
-  code is locatable but not fixable by its reader; a first-party/dependency
-  boundary is still unfiled.
-
 ## Planned work (ADR-023 / ADR-024)
 
 In sequence. Each step is gated on the one before it; the ordering is the
 decision, not a preference — [ADR-023 §5](adr/ADR-023-tier-a-vocabulary-growth.md)
 records why vocabulary work comes after attribution and after the engine facts.
+The first four steps of that sequence (origin-file attribution, the vocabulary
+fixes, `any_of`, native `missing-cleanup`) are done — see the git history.
 
-1. ~~**Origin-file rendering**~~ — **done** (ADR-024 §1). JSON schema v2: `file`
-   is the anchor's file, `component_file` keeps v1's meaning. The sort key gained
-   the anchor path, which also closed a real tie: two findings of one rule at the
-   same `line:col` of two *different* inlined hooks were previously ordered by
-   HashMap iteration. Findings are still never deduplicated across consumers
-   (ADR-024 §2).
-
-2. ~~**The small vocabulary fixes**~~ — **done**, all four (one `Field` table,
-   total `hook_kind_word`, guardable `source`, live `ref` anchor); see the
-   struck-through entries above for what each turned into. Field guards stayed
-   positive-only, absent ⇒ fail (ADR-023).
-
-3. ~~**`any_of` disjunction**~~ — **done**, as the one recursive
-   `eval_guard`/`validate_guard`. The executor's two duplicated guard matches
-   collapsed into one over a `Candidate` (hook row + optional edge element, or
-   render setter), which also removed the `_ => unreachable!` catch-all that let
-   a guard be handled on one anchor and silently fall through on the other.
-   ∀ (`quantifier: all`) stays **refused** — see the ADR for the two false
-   negatives.
-
-4. ~~**Effect cleanup as an engine fact → native `missing-cleanup`**~~ — **done**,
-   as a Warning. The registrar relation moved to `helpers/registrations.rs` (a
-   CFG scan belongs with the other CFG scans; the polarity-typed
-   `CleanupVerdict` went to `api/query.rs`), and `Unknown` folds to
-   "there may be a cleanup" so only a provable `Absent` fires. Scope is repeating
-   registrars only — a one-shot `setTimeout`/`.then` fires late rather than
-   repeatedly, which wants an abort flag, not a teardown.
-
-   **It finds nothing on the eight corpora**, and that is not a wiring failure:
-   a crude syntactic sweep finds zero effects with a repeating registrar and no
-   `return` in any of them. This file's "pervasive in 6 of 8" described the
-   *pattern*, not the bug — mature OSS has had this reviewed out. A mutation
-   test (delete the `return` from chakra's `useScrollPosition` and analyse it
-   through a cross-file consumer) fires correctly, so what the corpus measures
-   is precision: 0 false positives against ~12 000 diagnostics of real code.
-   The rule is aimed at code being written now, which is the stated audience;
-   its true-positive value stays unproven here. Register/unregister handle
-   pairing is still refused — it scored 0 true positives.
-
-5. **Hook identity by provenance** *(M/L)* — a fail-closed `Origin` map replacing the
+1. **Hook identity by provenance** *(M/L)* — a fail-closed `Origin` map replacing the
    `use[A-Z]`-plus-fail-open-guess classification, so a call through a non-`use`
    binding is still a hook row and a local `useMemo` is not mistaken for React's.
    Two corrections are mandatory or it becomes a mass FN: `Origin::React` must be
@@ -252,17 +172,31 @@ records why vocabulary work comes after attribution and after the engine facts.
    `react` would otherwise turn every React hook into an opaque Custom row and
    silence the analyzer); and the raw specifier must be retained on **every**
    `Origin` variant, or `SummaryRegistry`'s package-scoped entries are lost.
-   Gated on the `HookMarker` → ⊤ fix, which must land and be measured first.
+   Its gate, the `HookMarker` → ⊤ fix, has landed and been measured.
 
-6. **Expression-position entities** *(M)* — ADR-023 §§1-3. Its gate, the
-   array-destructuring provenance fix, has landed. Ship `returns_verdict` as a public ⊤-total
-   primitive in `api/query.rs` handling the **inline `FnLit` case only**, then the
-   `args` edge on the `custom` anchor. Not the `init` edge: a mount-only expression
-   has no cross-render stability question. Not `Var`-bound selectors: `locs` wins
-   over `stabs` in `lookup_env_val` with no invalidation on reassignment, so heap
+2. **Expression-position entities** *(M/L)* — ADR-023 §§1-3. Its gate, the
+   array-destructuring provenance fix, has landed. The ADR's own cost estimate
+   does not survive checking and is amended in place: `returns_verdict`
+   **cannot be a primitive in `api/query.rs`**. Every part it composes from
+   (`exec_body`, the ⊤-param binding at `interpreter.rs:426-435`, the lazy-init
+   shape at `fixpoint.rs:244`) takes an `&mut AnalysisCtx`, and no context
+   survives the fixpoint — the rules layer holds an `AnalysisResult`. The
+   verdict has to be computed during the fixpoint and stored on the result,
+   the way `effect_block_states` and `handler_block_states` already are, with
+   `api/query.rs` owning only the type and the reader. Scope is otherwise
+   unchanged: the **inline `FnLit` case only**, then the `args` edge on the
+   `custom` anchor. Not the `init` edge: a mount-only expression has no
+   cross-render stability question. Not `Var`-bound selectors: `locs` wins over
+   `stabs` in `lookup_env_val` with no invalidation on reassignment, so heap
    resolution would answer `Stable` for a re-bound opaque selector.
 
-7. **Slot-centric `writers` edge** *(M)* — the join blocker (a slot resynced by an
+   One constraint the vocabulary work now makes cheap to enforce: the `args`
+   edge must admit `returns_verdict` and **not** `stability` — reading the
+   stability guard at render exit for a call-site argument is precisely the
+   program-point error ADR-023 §2 refuses, and `Field::admits` is the table
+   that can say so.
+
+3. **Slot-centric `writers` edge** *(M)* — the join blocker (a slot resynced by an
    effect *and* written by a handler; 43 candidate pairs on the corpus). Reduced
    scope only: `writer_phases includes`, a pure MAY existential on the same footing
    as `in_deps`. **No** `only` comparator and **no** `Escaped` row — measured, 254 of
@@ -272,7 +206,7 @@ records why vocabulary work comes after attribution and after the engine facts.
    *execution phase*: a `setTimeout` inside an effect currently classifies as
    `effect`, which is not what any of the target rules mean.
 
-8. **JSX props as a sink** *(L)* — the context-provider and identity-keyed-prop rule
+4. **JSX props as a sink** *(L)* — the context-provider and identity-keyed-prop rule
    classes. The IR already carries what is needed (`Expr::CompApp { name, props }`,
    with `AppContext.Provider` surviving as a single dotted name), but this is a new
    *anchor* needing an engine-side relation, not an edge: the walk must cover
@@ -307,5 +241,5 @@ adopts it and it touches the npm host plus a codegen step, not the core:
   `label → (origin hook, import source, origin file, direct|inlined)` row survives
   `expand_custom_hooks`: without it the chakra rule "never call `useLayoutEffect`
   directly" fires on conformant consumers of a wrapper that calls it for them.
-  That provenance row is the same mechanism step 5 needs and the same one that
-  makes step 1's origin useful — build it once, then the `api` attribute is cheap.
+  That provenance row is the same mechanism step 1 needs, and the same one that
+  would make the origin attribution actionable — build it once, then the `api` attribute is cheap.

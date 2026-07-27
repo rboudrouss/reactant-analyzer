@@ -82,6 +82,31 @@ miss an opaque re-binding and answer `Stable` — a forbidden false negative. Th
 is an engine-layer defect with reach far beyond this ADR; folding it into a
 schema change would hide it.
 
+#### Amendment (2026-07-27): the primitive cannot live in `api/query.rs`
+
+The three cited parts do all ship, verified: `exec_body` joins a body CFG's
+returns (`interp/interpreter.rs:41`), params are bound to ⊤ before executing a
+callback body (`interpreter.rs:426-435`, and to the current slot for a
+functional updater at `:278-288`), and `fixpoint.rs:244-255` runs exactly this
+shape for `useState(() => …)`.
+
+What does **not** hold is where the composition can happen. Every one of those
+call sites takes an `&mut AnalysisCtx`, which owns the registry, cache, shared
+state, call graph and child-analysis callback — and none of it survives the
+fixpoint. The rules layer holds an `AnalysisResult`, not a context, so
+`api/query.rs` cannot *compute* this verdict at all.
+
+The unit of work is therefore one size larger than §3 states: the verdict must
+be computed **during** the fixpoint, where the context exists, and stored on
+`AnalysisResult` for the rules layer to read. There is a direct precedent —
+`effect_block_states` and `handler_block_states` are exactly this, per-CFG
+results computed at convergence and read afterwards — so the shape is settled
+even though the cost is not what §3 implies. `api/query.rs` still owns the
+verdict *type* and the reader; it just cannot own the evaluation.
+
+Nothing else in §3 changes: the FnLit-only scope, the ⊤-totality, and the
+deferral of `Var`-bound selectors all stand.
+
 ### 4. Universal quantification over an edge is REFUSED
 
 Guards over a `forEach` binding are existential: one finding per element that
