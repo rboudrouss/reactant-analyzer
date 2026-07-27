@@ -23,7 +23,7 @@ use crate::ir::types::{BlockId, HookLabel, Var};
 use crate::rules::api::query::{Certified, ConditionalHookCall, ExitDominance, RuleCtx};
 use crate::rules::{
     SetterCall, StabilityVerdict, all_setter_labels, collect_setter_calls, hook_kind_word,
-    resolve_setter_aliases, state_slot_name, state_val_labels,
+    hook_val_labels, resolve_setter_aliases, state_slot_name, state_val_labels,
 };
 
 use super::schema::{HookKindFilter, StabilityName};
@@ -73,6 +73,11 @@ pub(crate) struct EntityCtx<'a> {
     /// State-value bindings in the render CFG (alias-resolved) — the naming
     /// table for slots.
     pub state_names: HashMap<Var, HookLabel>,
+    /// `var → label` for every bound hook result, whatever the kind — the
+    /// naming table for `{anchor.name}`. Direct bindings only: unlike a slot
+    /// name, a hook's name is the variable the call itself binds, not an alias
+    /// of it.
+    pub hook_names: HashMap<Var, HookLabel>,
     exit_dom: OnceCell<ExitDominance>,
     conditional: OnceCell<HashMap<HookLabel, Certified<ConditionalHookCall>>>,
 }
@@ -90,6 +95,7 @@ impl<'a> EntityCtx<'a> {
             setter_labels,
             setter_vars,
             state_names,
+            hook_names: hook_val_labels(&comp.render_cfg),
             exit_dom: OnceCell::new(),
             conditional: OnceCell::new(),
         }
@@ -188,69 +194,94 @@ impl<'a> EntityCtx<'a> {
         state_slot_name(label, &self.state_names)
     }
 
-    /// The raw (unquoted) name of an entity, for `name` guard matching:
-    /// custom hook name, state slot's source variable, or setter variable.
-    pub fn raw_name(&self, v: &EntityVal<'a, '_>) -> Option<String> {
-        match v {
-            EntityVal::Hook(h) => match h.entry {
-                Some(HookEntry::Custom { name, .. }) => {
-                    Some(crate::ir::source_name(name).to_string())
-                }
-                Some(HookEntry::State { .. }) => self
-                    .state_names
-                    .iter()
-                    .filter(|(var, l)| **l == h.info.label && !var.starts_with("__"))
-                    .map(|(var, _)| var)
-                    .min()
-                    .map(|var| crate::ir::source_name(var).to_string()),
-                _ => None,
-            },
-            EntityVal::Setter(s) => Some(crate::ir::source_name(&s.var).to_string()),
-            EntityVal::Dep(d) => d.path.as_ref().map(|p| p.to_string()),
-        }
-    }
-
     /// Verdict of a deps entry, evaluated at render exit.
     pub fn dep_verdict(&self, dep: &DepEntity<'a>) -> StabilityName {
         verdict_name(&self.ctx.stability_verdict(dep.expr))
     }
 
-    /// Render one template field against a bound entity.
-    pub fn render_field(&self, v: &EntityVal<'a, '_>, field: Field) -> String {
-        match (v, field) {
-            (EntityVal::Hook(h), Field::Kind) => hook_kind_word(h.info.kind).to_string(),
-            (EntityVal::Hook(h), Field::Name) => match h.entry {
-                Some(HookEntry::Custom { name, .. }) => {
-                    format!("`{}`", crate::ir::source_name(name))
-                }
-                _ => self.slot_display(h.info.label),
+    /// The raw value of `field` on `v`: what a text guard matches and what
+    /// [`Self::render_field`] decorates — one table, two projections.
+    ///
+    /// `None` means the entity carries no such value (a slot with no source
+    /// name, a hook with no import specifier). Guards **fail** on `None`
+    /// (ADR-023: field matching is positive-only, absent ⇒ fail) and rendering
+    /// falls back to an anonymous form.
+    ///
+    /// Total on `Field`, and every arm matches `EntityVal` exhaustively, so a
+    /// new field or entity is a compile error here rather than a silently
+    /// empty rendering. Combinations the validator rejects answer `None`.
+    pub fn field_raw(&self, v: &EntityVal<'a, '_>, field: Field) -> Option<String> {
+        match field {
+            Field::Kind => match v {
+                EntityVal::Hook(h) => Some(hook_kind_word(h.info.kind).to_string()),
+                EntityVal::Setter(_) | EntityVal::Dep(_) => None,
             },
-            (EntityVal::Hook(h), Field::Source) => match h.entry {
-                Some(HookEntry::Custom {
-                    import_source: Some(src),
-                    ..
-                }) => src.clone(),
-                Some(HookEntry::Custom {
-                    resolved_file: Some(f),
-                    ..
-                }) => f.display().to_string(),
-                _ => "unknown".to_string(),
+            Field::Name => match v {
+                // A custom hook is called by its own name; every other kind is
+                // called by the variable it binds.
+                EntityVal::Hook(h) => match h.entry {
+                    Some(HookEntry::Custom { name, .. }) => {
+                        Some(crate::ir::source_name(name).to_string())
+                    }
+                    _ => self.binding_name(h.info.label),
+                },
+                EntityVal::Setter(_) | EntityVal::Dep(_) => None,
             },
-            (EntityVal::Setter(s), Field::Slot) => match s.slot {
-                Some(label) => self.slot_display(label),
-                None => format!("`{}`", crate::ir::source_name(&s.var)),
+            // The import specifier, and only that: `resolved_file` is an
+            // absolute path, so printing or matching it would make a pack's
+            // behaviour depend on where the repository sits on disk.
+            Field::Source => match v {
+                EntityVal::Hook(h) => match h.entry {
+                    Some(HookEntry::Custom { import_source, .. }) => import_source.clone(),
+                    _ => None,
+                },
+                EntityVal::Setter(_) | EntityVal::Dep(_) => None,
             },
-            (EntityVal::Setter(s), Field::Setter) => {
-                format!("`{}`", crate::ir::source_name(&s.var))
-            }
-            (EntityVal::Dep(d), Field::Path) => match &d.path {
-                Some(p) => format!("`{p}`"),
-                None => format!("dep #{}", d.index),
+            Field::Slot => match v {
+                EntityVal::Setter(s) => s.slot.and_then(|l| self.slot_source_name(l)),
+                EntityVal::Hook(_) | EntityVal::Dep(_) => None,
             },
-            (EntityVal::Dep(d), Field::Stability) => verdict_word(self.dep_verdict(d)).to_string(),
-            // Unreachable by validation (field_for), but total anyway.
-            _ => String::new(),
+            Field::Setter => match v {
+                EntityVal::Setter(s) => Some(crate::ir::source_name(&s.var).to_string()),
+                EntityVal::Hook(_) | EntityVal::Dep(_) => None,
+            },
+            Field::Path => match v {
+                EntityVal::Dep(d) => d.path.as_ref().map(|p| p.to_string()),
+                EntityVal::Hook(_) | EntityVal::Setter(_) => None,
+            },
+            Field::Stability => match v {
+                EntityVal::Dep(d) => Some(verdict_word(self.dep_verdict(d)).to_string()),
+                EntityVal::Hook(_) | EntityVal::Setter(_) => None,
+            },
         }
+    }
+
+    /// Render one template field: the raw value, decorated, or the entity's
+    /// anonymous form. Never a bare internal label, never an empty string.
+    pub fn render_field(&self, v: &EntityVal<'a, '_>, field: Field) -> String {
+        let raw = self.field_raw(v, field);
+        match field {
+            // A missing specifier is not an anonymous entity — it is a hook
+            // whose origin we do not know.
+            Field::Source => raw.unwrap_or_else(|| "unknown".to_string()),
+            Field::Kind | Field::Stability => raw.unwrap_or_else(|| anonymous(v)),
+            // Source identifiers are quoted, verdict words are not.
+            Field::Name | Field::Slot | Field::Setter | Field::Path => match raw {
+                Some(s) => format!("`{s}`"),
+                None => anonymous(v),
+            },
+        }
+    }
+
+    /// The unquoted source name of the variable a hook's result binds to.
+    fn binding_name(&self, label: HookLabel) -> Option<String> {
+        pick_name(&self.hook_names, label)
+    }
+
+    /// The unquoted source name of a state slot (alias-aware, like every
+    /// native message).
+    fn slot_source_name(&self, label: HookLabel) -> Option<String> {
+        pick_name(&self.state_names, label)
     }
 
     fn sorted_setters(&self, calls: Vec<SetterCall>) -> Vec<SetterEntity> {
@@ -269,6 +300,30 @@ impl<'a> EntityCtx<'a> {
         });
         setters
     }
+}
+
+/// How an entity is named when it has no source name. Mirrors the native
+/// discipline: an identifier the reader can act on, never a bare label.
+fn anonymous(v: &EntityVal<'_, '_>) -> String {
+    match v {
+        EntityVal::Hook(h) => format!("{} #{}", hook_kind_word(h.info.kind), h.info.label),
+        EntityVal::Setter(s) => match s.slot {
+            Some(label) => format!("state #{label}"),
+            None => format!("`{}`", crate::ir::source_name(&s.var)),
+        },
+        EntityVal::Dep(d) => format!("dep #{}", d.index),
+    }
+}
+
+/// The smallest non-temp source name bound to `label`. Smallest, not first:
+/// `HashMap` order is seed-dependent and the name is user-visible.
+fn pick_name(names: &HashMap<Var, HookLabel>, label: HookLabel) -> Option<String> {
+    names
+        .iter()
+        .filter(|(var, l)| **l == label && !var.starts_with("__"))
+        .map(|(var, _)| var)
+        .min()
+        .map(|var| crate::ir::source_name(var).to_string())
 }
 
 fn kind_matches(kind: HookKind, filter: HookKindFilter) -> bool {

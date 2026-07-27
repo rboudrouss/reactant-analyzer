@@ -46,13 +46,20 @@ pub(crate) fn describe_value(val: &StateValue) -> &'static str {
 
 /// User-facing noun for a hook kind in a diagnostic message
 /// (`useEffect` → "effect", `useMemo` → "memo", `useCallback` → "callback").
-/// Falls back to "hook" for kinds without a distinct word.
+///
+/// Total on purpose: the old `_ => "hook"` arm answered "hook" for four of the
+/// seven kinds, which is invisible in native messages (they only ever ask about
+/// deps-carrying kinds) but is what a Tier-A `{anchor.kind}` renders. Each word
+/// has to read in "this {word}".
 pub(crate) fn hook_kind_word(kind: HookKind) -> &'static str {
     match kind {
+        HookKind::State => "state",
         HookKind::Effect => "effect",
         HookKind::Memo => "memo",
         HookKind::Callback => "callback",
-        _ => "hook",
+        HookKind::Ref => "ref",
+        HookKind::Custom => "custom hook",
+        HookKind::Handler => "handler",
     }
 }
 

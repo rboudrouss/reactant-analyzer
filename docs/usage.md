@@ -110,6 +110,15 @@ Error only where a `must_*` guard certified the finding, and a Warning
 elsewhere (free stratification). A pin of `"error"` with no `must_*` guard
 loads with a warning (it can only ever emit warnings).
 
+An entity's fields are both renderable (`{anchor.name}`) and, for the string
+ones, guardable: `name` matches what the source calls the entity (a custom
+hook's own name; the variable a state/memo/callback/ref binds) and `source`
+matches the package a custom hook was imported from, so
+`{"kind": "source", "of": "anchor", "prefix": "@acme/internal"}` bans a whole
+scope. `source` is the import specifier only — a relatively-imported hook has
+none, and an absent value **fails** the guard rather than passing it. The
+validator lists the fields a subject carries when you ask for one it does not.
+
 ## Project kinds
 
 `check` inspects the **first directory argument** (default `.`) for marker

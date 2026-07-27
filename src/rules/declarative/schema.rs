@@ -186,6 +186,19 @@ pub enum Guard {
         #[serde(default)]
         prefix: Option<PVal<String>>,
     },
+    /// Import-specifier filter on a custom hook row — the package it was
+    /// imported from (`@chakra-ui/react`), which is how a team bans a
+    /// dependency rather than a local name. Never the resolved path: that is
+    /// absolute, so matching it would tie a pack to one checkout. A hook with
+    /// no specifier (defined locally, or imported relatively) does not match.
+    /// Exactly one of `one_of`/`prefix`.
+    Source {
+        of: String,
+        #[serde(default)]
+        one_of: Option<PVal<Vec<String>>>,
+        #[serde(default)]
+        prefix: Option<PVal<String>>,
+    },
     /// Cardinality of `anchor.<edge>` (only `anchor.deps` in v1). Exactly
     /// one comparator.
     Count {

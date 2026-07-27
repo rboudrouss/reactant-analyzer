@@ -177,13 +177,30 @@ fn rejects_guards_on_wrong_sorts() {
     ));
     assert!(e.message.contains("body setter call"), "{e}");
 
-    // must_init_calls_setter needs a state anchor.
+    // must_init_calls_setter needs an anchor that takes an initializer.
     let e = load_err(&one_rule(
         r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
             "anchor":{"relation":"hook_calls","kind":"effect"},
             "guards":[{"kind":"must_init_calls_setter","of":"anchor"}],"message":"m"}"#,
     ));
-    assert!(e.message.contains("state-hook anchor"), "{e}");
+    assert!(e.message.contains("state- or ref-hook anchor"), "{e}");
+
+    // `source` is recorded on custom hook rows only.
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls","kind":"effect"},
+            "guards":[{"kind":"source","of":"anchor","one_of":["react"]}],"message":"m"}"#,
+    ));
+    assert_eq!(e.path, "rules[0].guards[0].of");
+    assert!(e.message.contains("does not carry"), "{e}");
+
+    // `name` on an effect: the one hook kind with nothing to call it.
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls","kind":"effect"},
+            "guards":[{"kind":"name","of":"anchor","prefix":"use"}],"message":"m"}"#,
+    ));
+    assert!(e.message.contains("does not carry"), "{e}");
 }
 
 #[test]
@@ -541,4 +558,150 @@ fn runs_are_deterministic() {
             .collect::<Vec<_>>()
     };
     assert_eq!(render(&a), render(&b));
+}
+
+// ── Vocabulary: fields, the `source` guard, names beyond state/custom ─────────
+
+/// Every `{binding.field}` the validator admits must render something. The two
+/// tables used to be independent, each ending in a catch-all, so a field could
+/// validate and then render as the empty string.
+#[test]
+fn every_admitted_field_renders() {
+    // One rule per (anchor kind, field) pair the validator accepts, each
+    // message reduced to the field alone.
+    let cases: &[(&str, &str, &str)] = &[
+        ("state", "kind", "state"),
+        ("state", "name", "`count`"),
+        ("effect", "kind", "effect"),
+        ("memo", "kind", "memo"),
+        ("memo", "name", "`doubled`"),
+        ("callback", "kind", "callback"),
+        ("callback", "name", "`bump`"),
+        ("ref", "kind", "ref"),
+        ("ref", "name", "`node`"),
+        ("custom", "kind", "custom hook"),
+        ("custom", "name", "`useThing`"),
+        ("custom", "source", "some-pkg"),
+    ];
+    let src = r#"
+        import { useState, useEffect, useMemo, useCallback, useRef } from "react";
+        import { useThing } from "some-pkg";
+        function C() {
+            const [count, setCount] = useState(0);
+            const doubled = useMemo(() => count * 2, [count]);
+            const bump = useCallback(() => setCount(count + 1), [count]);
+            const node = useRef(null);
+            const t = useThing();
+            useEffect(() => { console.log(doubled, bump, node, t); });
+            return <div>{count}</div>;
+        }
+    "#;
+    for (kind, field, expected) in cases {
+        let pack = format!(
+            r#"{{"schemaVersion":1,"name":"f","rules":[
+                {{"id":"r","docs":{{"description":"d","why":"w","fix":"f"}},
+                  "severity":"warning","anchor":{{"relation":"hook_calls","kind":"{kind}"}},
+                  "message":"[{{anchor.{field}}}]"}}]}}"#
+        );
+        let diags = run_pack(&pack, src, &Options::new());
+        assert!(
+            diags.iter().any(|d| d.message == format!("[{expected}]")),
+            "anchor kind `{kind}`, field `{field}`: expected [{expected}], got {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// `source` matches the import specifier and nothing else: a locally-defined
+/// hook has none, and an absent value fails the guard (ADR-023, positive-only).
+#[test]
+fn source_guard_matches_the_import_specifier() {
+    let pack = r#"{"schemaVersion":1,"name":"f","rules":[
+        {"id":"banned-pkg","docs":{"description":"d","why":"w","fix":"f"},
+         "severity":"warning","anchor":{"relation":"hook_calls","kind":"custom"},
+         "guards":[{"kind":"source","of":"anchor","one_of":["legacy-pkg"]}],
+         "message":"{anchor.name} comes from {anchor.source}"}]}"#;
+
+    let diags = run_pack(
+        pack,
+        r#"
+        import { useLegacy } from "legacy-pkg";
+        function C() { const v = useLegacy(); return <div>{v}</div>; }
+    "#,
+        &Options::new(),
+    );
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].message, "`useLegacy` comes from legacy-pkg");
+
+    // Same hook name, different package.
+    let other = run_pack(
+        pack,
+        r#"
+        import { useLegacy } from "modern-pkg";
+        function C() { const v = useLegacy(); return <div>{v}</div>; }
+    "#,
+        &Options::new(),
+    );
+    assert!(other.is_empty(), "{other:?}");
+
+    // Relative imports carry no package specifier: absent ⇒ the guard fails.
+    let local = run_pack(
+        pack,
+        r#"
+        import { useLegacy } from "./legacy";
+        function C() { const v = useLegacy(); return <div>{v}</div>; }
+    "#,
+        &Options::new(),
+    );
+    assert!(local.is_empty(), "{local:?}");
+}
+
+/// A prefix ban over a package scope — the rule class the TODO recorded as
+/// inexpressible while `source` was renderable but not guardable.
+#[test]
+fn source_guard_supports_a_package_prefix() {
+    let pack = r#"{"schemaVersion":1,"name":"f","rules":[
+        {"id":"no-internal","docs":{"description":"d","why":"w","fix":"f"},
+         "severity":"warning","anchor":{"relation":"hook_calls","kind":"custom"},
+         "guards":[{"kind":"source","of":"anchor","prefix":"@acme/internal"}],
+         "message":"{anchor.name}"}]}"#;
+    let diags = run_pack(
+        pack,
+        r#"
+        import { useA } from "@acme/internal-auth";
+        import { useB } from "@acme/public";
+        function C() { const a = useA(); const b = useB(); return <div>{a}{b}</div>; }
+    "#,
+        &Options::new(),
+    );
+    assert_eq!(
+        diags.iter().map(|d| d.message.as_str()).collect::<Vec<_>>(),
+        vec!["`useA`"]
+    );
+}
+
+/// `must_init_calls_setter` on a `ref` anchor — the kind was inert before:
+/// the filter existed but no guard and no field applied to it.
+#[test]
+fn ref_anchor_certifies_an_init_setter_call() {
+    let pack = r#"{"schemaVersion":1,"name":"f","rules":[
+        {"id":"ref-init-writes","docs":{"description":"d","why":"w","fix":"f"},
+         "severity":"error","anchor":{"relation":"hook_calls","kind":"ref"},
+         "guards":[{"kind":"must_init_calls_setter","of":"anchor","else":"drop"}],
+         "message":"{anchor.name} writes state while initialising"}]}"#;
+    let diags = run_pack(
+        pack,
+        r#"
+        import { useState, useRef } from "react";
+        function C() {
+            const [n, setN] = useState(0);
+            const r = useRef(setN(1));
+            return <div>{n}{r}</div>;
+        }
+    "#,
+        &Options::new(),
+    );
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].severity(), Severity::Error);
+    assert_eq!(diags[0].message, "`r` writes state while initialising");
 }

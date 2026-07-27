@@ -214,6 +214,43 @@
           ]
         },
         {
+          "description": "Import-specifier filter on a custom hook row — the package it was\nimported from (`@chakra-ui/react`), which is how a team bans a\ndependency rather than a local name. Never the resolved path: that is\nabsolute, so matching it would tie a pack to one checkout. A hook with\nno specifier (defined locally, or imported relatively) does not match.\nExactly one of `one_of`/`prefix`.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "source"
+            },
+            "of": {
+              "type": "string"
+            },
+            "one_of": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_Array_of_string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "prefix": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        },
+        {
           "description": "Cardinality of `anchor.<edge>` (only `anchor.deps` in v1). Exactly\none comparator.",
           "type": "object",
           "properties": {

@@ -74,17 +74,14 @@ false-negative channel, and both are reproduced.
   `Unreachable` in the exit set, an effect whose cleanup *is* reachable can read
   as "no cleanup on any exit" and certify an Error on a non-bug.
 
-- **Silent no-ops in the Tier-A frontend.** Three refutable `let-else` bindings
-  (`declarative/exec.rs` at the `stability`, `in_deps` and
-  `must_setter_on_all_paths` arms) compile unchanged against a new `Bound`
-  variant and `return`, so a future edge would load, validate, report no error
-  and emit nothing. Same class: `entity.rs`'s `render_field` ends in
-  `_ => String::new()` and `validate.rs`'s `field_for` in `_ => None`, so a
-  missing arm becomes an empty string or an always-false guard instead of a
-  compile error. Convert all of them to exhaustive matches **before** adding any
-  entity, and add a test that a new-edge rule actually *emits* — a rule that
-  loads and silently finds nothing is the failure mode the type system currently
-  will not catch.
+- ~~**Silent no-ops in the Tier-A frontend.**~~ — **fixed**: `field_for` and
+  `render_field` are one `Field`-indexed table (`Field::token`/`admits` +
+  `EntityCtx::field_raw`, all total), and the `stability`/`in_deps` arms of
+  `exec.rs` are exhaustive matches on `Bound` instead of refutable `let-else`
+  bindings. `every_admitted_field_renders` walks all twelve admitted
+  (anchor kind, field) pairs. Residual, benign and loud: a `Field` variant
+  missing from `Field::ALL` is unreachable from templates and reported as an
+  unknown field, rather than silently rendering empty.
 
 ## Known false negatives (FN)
 
@@ -230,17 +227,29 @@ expressible, all in weakened form**. The blockers, in decreasing leverage:
   `guardrails/inert-single-dep` covers single-dep effects and nothing wider.
 - **Guards are a conjunction** — no disjunction, so "X or Y" costs two rules with
   duplicated docs.
-- **`source` is renderable but not guardable** — `{anchor.source}` prints a custom
-  hook's import source, yet no guard matches on it: banning a local *name* works,
-  banning everything from a package does not.
+- ~~**`source` is renderable but not guardable**~~ — **fixed**: a `source` guard
+  matches the import specifier with `one_of`/`prefix`, so a package (or a whole
+  `@scope/` prefix) can be banned, not just a local name. It is bound to
+  `import_source` alone — `resolved_file` is absolute, so matching or printing it
+  would tie a pack to one checkout. A relatively-imported hook has no specifier
+  and therefore does not match (positive-only, ADR-023).
 - **`useLayoutEffect`/`useInsertionEffect` are indistinguishable from `useEffect`** —
   lowering collapses all three into `HookEntry::Effect` (`hook_extractor.rs:592`),
   so the common "never call `useLayoutEffect` directly, use the SSR-safe wrapper"
   convention cannot be written at all.
-- **`{anchor.kind}` renders "hook" for 4 of the 7 kinds** — it reuses
-  `hook_kind_word`, which names only effect/memo/callback.
-- **The `ref` anchor kind is inert** — the filter exists, but no guard and no
-  template field applies to `Sort::Hook(Ref)`.
+- ~~**`{anchor.kind}` renders "hook" for 4 of the 7 kinds**~~ — **fixed**:
+  `hook_kind_word` is total (state / effect / memo / callback / ref / custom hook
+  / handler). Native messages are unaffected — they only ever ask about
+  deps-carrying kinds.
+- ~~**The `ref` anchor kind is inert**~~ — **fixed**: `must_init_calls_setter`
+  accepts a `ref` anchor, `{anchor.name}` resolves for memo/callback/ref/custom
+  (the variable the call binds, or the hook's own name for a custom), and native
+  `lazy-init` moved to `HookEntry::Ref` in the same commit so the two cannot
+  disagree about `useRef`. The ref tier is deliberately lower than state's: with
+  no lazy form to recommend, only a state write (Error) or a side-effecting call
+  (Warning) earns the three-line `if (ref.current === null)` advice; an
+  unjudgeable call is Info and a cheap pure one is silent. Corpus: +8 Info,
+  0 Warning, 0 Error — all `useRef(new Map()/new Set()/new Compartment())`.
 - ~~**Cross-file inlining makes ~44% of custom findings unactionable**~~ — **fixed**
   (ADR-024 §1): the human primary line and the JSON `file` now name the anchor's
   own file. Measured on the eight corpora: 757 of 12 139 findings (6.2%, and 41%
@@ -264,15 +273,10 @@ records why vocabulary work comes after attribution and after the engine facts.
    HashMap iteration. Findings are still never deduplicated across consumers
    (ADR-024 §2).
 
-2. **The small vocabulary fixes** *(S)* — no engine change, no fixture churn.
-   Collapse `raw_name`/`render_field` into one `Field`-indexed table with **both
-   projections total** (drop the `_` arms, the way `hook_kind_word` must also drop
-   `_ => "hook"`, which today renders "hook" for 4 of the 7 kinds); make `source`
-   guardable, bound to `import_source` only — never `resolved_file`, whose printed
-   shape is cwd-dependent; give `name` to memo/callback/ref/custom; unlock the
-   inert `ref` anchor by extending `must_init_calls_setter` to it **and** native
-   `lazy-init` to `HookEntry::Ref` in the same commit, so the state-only split
-   never exists. Field guards stay positive-only, absent ⇒ fail (ADR-023).
+2. ~~**The small vocabulary fixes**~~ — **done**, all four (one `Field` table,
+   total `hook_kind_word`, guardable `source`, live `ref` anchor); see the
+   struck-through entries above for what each turned into. Field guards stayed
+   positive-only, absent ⇒ fail (ADR-023).
 
 3. **`any_of` disjunction** *(S)* — ADR-023 §4 explicitly clears it: guard-tree
    composition, no quantifier hazard. Ship it as the one recursive `eval_guard` /

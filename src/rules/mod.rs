@@ -42,7 +42,8 @@ pub use registry::{ComponentFindings, OverrideEntry, RegistryError, RuleOverride
 // Internal vocabulary shared by api/helpers/impls, re-exported at its
 // historical paths so call sites stay `crate::rules::X`.
 pub(crate) use helpers::setters::{
-    all_setter_labels, memo_val_labels, resolve_setter_aliases, setter_var_labels, state_val_labels,
+    all_setter_labels, hook_val_labels, memo_val_labels, resolve_setter_aliases, setter_var_labels,
+    state_val_labels,
 };
 pub(in crate::rules) use helpers::setters::{
     collect_fn_bindings, cross_component_setters, may_written_slots,

@@ -140,8 +140,12 @@ pub(crate) enum ResolvedGuard {
         of: BindRef,
         negate: bool,
     },
-    Name {
+    /// A string match on one of the subject's fields (`name`, `source`). One
+    /// resolved form for every such guard: the schema keeps a distinct `kind`
+    /// per field so the JSON says what it matches, the executor runs one arm.
+    Text {
         of: BindRef,
+        field: Field,
         one_of: Option<Vec<String>>,
         prefix: Option<String>,
     },
@@ -157,7 +161,15 @@ pub(crate) enum ResolvedGuard {
     },
 }
 
-/// A template field on a bound entity.
+/// A field of a bound entity — what `{binding.field}` renders and what a
+/// text guard matches.
+///
+/// This enum is the single table both projections read: [`Field::token`] names
+/// it in the schema, [`Field::admits`] says which sorts carry it, and
+/// `EntityCtx::field_raw` computes it. All three are total matches on `Field`,
+/// so a new field cannot be half-added — the previous split between `field_for`
+/// and `render_field`, each ending in a catch-all, let a field validate and
+/// then render as the empty string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Field {
     Kind,
@@ -167,6 +179,72 @@ pub(crate) enum Field {
     Setter,
     Path,
     Stability,
+}
+
+impl Field {
+    /// Every variant. A variant missing here is unreachable from a template and
+    /// reported as an unknown field — loud and harmless, unlike the silent
+    /// empty rendering the catch-all arms used to produce.
+    pub(crate) const ALL: &'static [Field] = &[
+        Field::Kind,
+        Field::Name,
+        Field::Source,
+        Field::Slot,
+        Field::Setter,
+        Field::Path,
+        Field::Stability,
+    ];
+
+    /// The name authors write: `{anchor.<token>}`.
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            Field::Kind => "kind",
+            Field::Name => "name",
+            Field::Source => "source",
+            Field::Slot => "slot",
+            Field::Setter => "setter",
+            Field::Path => "path",
+            Field::Stability => "stability",
+        }
+    }
+
+    /// Sorts on which this field resolves. Every arm matches `sort`
+    /// exhaustively, so a new sort must state its answer for every field.
+    pub(crate) fn admits(self, sort: Sort) -> bool {
+        match self {
+            Field::Kind => match sort {
+                Sort::Hook(_) => true,
+                Sort::SetterRender | Sort::SetterBody | Sort::Dep => false,
+            },
+            // Effects and handlers are the two kinds with nothing to call them;
+            // an any-kind anchor is admitted and falls back per row.
+            Field::Name => match sort {
+                Sort::Hook(None) => true,
+                Sort::Hook(Some(k)) => match k {
+                    HookKindFilter::State
+                    | HookKindFilter::Memo
+                    | HookKindFilter::Callback
+                    | HookKindFilter::Ref
+                    | HookKindFilter::Custom => true,
+                    HookKindFilter::Effect | HookKindFilter::Handler => false,
+                },
+                Sort::SetterRender | Sort::SetterBody | Sort::Dep => false,
+            },
+            // The import specifier is recorded on custom hook rows only.
+            Field::Source => match sort {
+                Sort::Hook(Some(HookKindFilter::Custom)) => true,
+                Sort::Hook(_) | Sort::SetterRender | Sort::SetterBody | Sort::Dep => false,
+            },
+            Field::Slot | Field::Setter => match sort {
+                Sort::SetterRender | Sort::SetterBody => true,
+                Sort::Hook(_) | Sort::Dep => false,
+            },
+            Field::Path | Field::Stability => match sort {
+                Sort::Dep => true,
+                Sort::Hook(_) | Sort::SetterRender | Sort::SetterBody => false,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -225,6 +303,7 @@ fn guard_allowed_keys(g: &Guard) -> (&'static str, &'static [&'static str]) {
         Guard::Stability { .. } => ("guard `stability`", &["kind", "of", "is", "not"]),
         Guard::InDeps { .. } => ("guard `in_deps`", &["kind", "of", "negate"]),
         Guard::Name { .. } => ("guard `name`", &["kind", "of", "one_of", "prefix"]),
+        Guard::Source { .. } => ("guard `source`", &["kind", "of", "one_of", "prefix"]),
         Guard::Count { .. } => (
             "guard `count`",
             &["kind", "of", "more_than", "less_than", "equals"],
@@ -588,52 +667,21 @@ fn validate_rule(
                     negate: *negate,
                 }
             }
+            // `name` and `source` are one matcher over two fields. The subject
+            // check is `Field::admits` — the same table the templates use, so
+            // a field can never be renderable but unguardable (or the reverse).
             Guard::Name { of, one_of, prefix } => {
-                let (of, sort) = resolve_of(of, &g_path)?;
-                let named = matches!(
-                    sort,
-                    Sort::Hook(Some(HookKindFilter::Custom | HookKindFilter::State))
-                        | Sort::SetterBody
-                        | Sort::SetterRender
-                );
-                if !named {
-                    return Err(PackError::new(
-                        format!("{g_path}.of"),
-                        format!(
-                            "guard `name` applies to a named entity (custom/state hook, setter \
-                             call), but the subject binds {}",
-                            sort.describe()
-                        ),
-                    ));
-                }
-                let resolved = match (one_of, prefix) {
-                    (Some(pv), None) => ResolvedGuard::Name {
-                        of,
-                        one_of: Some(env.resolve(
-                            pv,
-                            Some(ParamType::StringList),
-                            &format!("{g_path}.one_of"),
-                        )?),
-                        prefix: None,
-                    },
-                    (None, Some(pv)) => ResolvedGuard::Name {
-                        of,
-                        one_of: None,
-                        prefix: Some(env.resolve(
-                            pv,
-                            Some(ParamType::String),
-                            &format!("{g_path}.prefix"),
-                        )?),
-                    },
-                    _ => {
-                        return Err(PackError::new(
-                            &g_path,
-                            "guard `name` takes exactly one of `one_of` / `prefix`",
-                        ));
-                    }
-                };
-                resolved
+                text_guard(Field::Name, of, one_of, prefix, &resolve_of, &env, &g_path)?
             }
+            Guard::Source { of, one_of, prefix } => text_guard(
+                Field::Source,
+                of,
+                one_of,
+                prefix,
+                &resolve_of,
+                &env,
+                &g_path,
+            )?,
             Guard::Count {
                 of,
                 more_than,
@@ -734,10 +782,16 @@ fn validate_rule(
             }
             Guard::MustInitCallsSetter { of, r#else } => {
                 let (of_ref, sort) = resolve_of(of, &g_path)?;
-                if of_ref != BindRef::Anchor || sort != Sort::Hook(Some(HookKindFilter::State)) {
+                // The two hooks that take an initializer React evaluates on
+                // every render; native `lazy-init` covers exactly the same pair.
+                let has_init = matches!(
+                    sort,
+                    Sort::Hook(Some(HookKindFilter::State | HookKindFilter::Ref))
+                );
+                if of_ref != BindRef::Anchor || !has_init {
                     return Err(PackError::new(
                         format!("{g_path}.of"),
-                        "guard `must_init_calls_setter` applies to a state-hook anchor",
+                        "guard `must_init_calls_setter` applies to a state- or ref-hook anchor",
                     ));
                 }
                 has_must = true;
@@ -807,19 +861,75 @@ fn validate_rule(
     })
 }
 
-/// Fields available per sort — the template's type check.
+/// Fields available per sort — the template's type check, derived from the one
+/// `Field` table so validation and rendering cannot disagree.
 fn field_for(sort: Sort, name: &str) -> Option<Field> {
-    match (sort, name) {
-        (Sort::Hook(_), "kind") => Some(Field::Kind),
-        (Sort::Hook(Some(HookKindFilter::Custom)), "name") => Some(Field::Name),
-        (Sort::Hook(Some(HookKindFilter::Custom)), "source") => Some(Field::Source),
-        (Sort::Hook(Some(HookKindFilter::State)), "name") => Some(Field::Name),
-        (Sort::SetterBody | Sort::SetterRender, "slot") => Some(Field::Slot),
-        (Sort::SetterBody | Sort::SetterRender, "setter") => Some(Field::Setter),
-        (Sort::Dep, "path") => Some(Field::Path),
-        (Sort::Dep, "stability") => Some(Field::Stability),
-        _ => None,
+    Field::ALL
+        .iter()
+        .copied()
+        .find(|f| f.token() == name && f.admits(sort))
+}
+
+/// Validate a string-matching guard (`name`, `source`) against `field`. The
+/// subject must be a sort that carries the field, and exactly one of
+/// `one_of`/`prefix` must be given.
+#[allow(clippy::too_many_arguments)]
+fn text_guard(
+    field: Field,
+    of: &str,
+    one_of: &Option<PVal<Vec<String>>>,
+    prefix: &Option<PVal<String>>,
+    resolve_of: &dyn Fn(&str, &str) -> Result<(BindRef, Sort), PackError>,
+    env: &ParamEnv,
+    g_path: &str,
+) -> Result<ResolvedGuard, PackError> {
+    let kind = field.token();
+    let (of, sort) = resolve_of(of, g_path)?;
+    if !field.admits(sort) {
+        return Err(PackError::new(
+            format!("{g_path}.of"),
+            format!(
+                "guard `{kind}` matches the `{kind}` field, which {} does not carry — its \
+                 fields: {}",
+                sort.describe(),
+                match fields_of(sort).as_slice() {
+                    [] => "none".to_string(),
+                    fs => fs.join(", "),
+                }
+            ),
+        ));
     }
+    match (one_of, prefix) {
+        (Some(pv), None) => Ok(ResolvedGuard::Text {
+            of,
+            field,
+            one_of: Some(env.resolve(
+                pv,
+                Some(ParamType::StringList),
+                &format!("{g_path}.one_of"),
+            )?),
+            prefix: None,
+        }),
+        (None, Some(pv)) => Ok(ResolvedGuard::Text {
+            of,
+            field,
+            one_of: None,
+            prefix: Some(env.resolve(pv, Some(ParamType::String), &format!("{g_path}.prefix"))?),
+        }),
+        _ => Err(PackError::new(
+            g_path,
+            format!("guard `{kind}` takes exactly one of `one_of` / `prefix`"),
+        )),
+    }
+}
+
+/// The fields this sort carries, for the "unknown field" message.
+fn fields_of(sort: Sort) -> Vec<&'static str> {
+    Field::ALL
+        .iter()
+        .filter(|f| f.admits(sort))
+        .map(|f| f.token())
+        .collect()
 }
 
 fn parse_template(
@@ -893,8 +1003,9 @@ fn parse_template(
                     return Err(PackError::new(
                         path,
                         format!(
-                            "`{binding}` binds {} which has no field `{field}`",
-                            sort.describe()
+                            "`{binding}` binds {} which has no field `{field}` — available: {}",
+                            sort.describe(),
+                            fields_of(sort).join(", ")
                         ),
                     ));
                 };

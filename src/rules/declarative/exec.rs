@@ -109,23 +109,33 @@ impl TierARule {
 
         for guard in &self.def.guards {
             let pass = match guard {
-                ResolvedGuard::Stability { names, negated, .. } => {
-                    let Some(Bound::Dep(dep)) = bound.as_ref() else {
-                        return;
-                    };
-                    names.contains(&e.dep_verdict(dep)) != *negated
-                }
-                ResolvedGuard::InDeps { negate, .. } => {
-                    let Some(Bound::Setter(setter)) = bound.as_ref() else {
-                        return;
-                    };
-                    let in_deps = setter
-                        .slot
-                        .is_some_and(|slot| e.dep_slots(row).contains(&slot));
-                    in_deps != *negate
-                }
-                ResolvedGuard::Name { of, one_of, prefix } => name_matches(
-                    e.raw_name(&entity_at(*of, row, bound.as_ref())),
+                // The `bound` matches below are exhaustive, not refutable
+                // `let`s: a new edge would otherwise validate, load, and
+                // silently emit nothing.
+                ResolvedGuard::Stability { names, negated, .. } => match bound.as_ref() {
+                    Some(Bound::Dep(dep)) => names.contains(&e.dep_verdict(dep)) != *negated,
+                    Some(Bound::Setter(_)) | None => {
+                        unreachable!("validated: `stability` binds a deps entry")
+                    }
+                },
+                ResolvedGuard::InDeps { negate, .. } => match bound.as_ref() {
+                    Some(Bound::Setter(setter)) => {
+                        let in_deps = setter
+                            .slot
+                            .is_some_and(|slot| e.dep_slots(row).contains(&slot));
+                        in_deps != *negate
+                    }
+                    Some(Bound::Dep(_)) | None => {
+                        unreachable!("validated: `in_deps` binds a body setter call")
+                    }
+                },
+                ResolvedGuard::Text {
+                    of,
+                    field,
+                    one_of,
+                    prefix,
+                } => text_matches(
+                    e.field_raw(&entity_at(*of, row, bound.as_ref()), *field),
                     one_of,
                     prefix,
                 ),
@@ -184,9 +194,16 @@ impl TierARule {
 
         for guard in &self.def.guards {
             let pass = match guard {
-                ResolvedGuard::Name { one_of, prefix, .. } => {
-                    name_matches(e.raw_name(&EntityVal::Setter(setter)), one_of, prefix)
-                }
+                ResolvedGuard::Text {
+                    field,
+                    one_of,
+                    prefix,
+                    ..
+                } => text_matches(
+                    e.field_raw(&EntityVal::Setter(setter), *field),
+                    one_of,
+                    prefix,
+                ),
                 ResolvedGuard::Must {
                     kind: MustKind::DominatesAllExits,
                     els,
@@ -234,8 +251,11 @@ impl TierARule {
     ) -> Option<Proof> {
         match kind {
             MustKind::SetterOnAllPaths => {
-                let Some(Bound::Setter(setter)) = bound else {
-                    return None;
+                let setter = match bound {
+                    Some(Bound::Setter(s)) => s,
+                    Some(Bound::Dep(_)) | None => {
+                        unreachable!("validated: `must_setter_on_all_paths` binds a body setter")
+                    }
                 };
                 let body = row.entry.and_then(|en| en.body_cfg())?;
                 // The alias set for the subject's slot — the primitive's own
@@ -255,8 +275,9 @@ impl TierARule {
             }
             MustKind::DominatesAllExits => unreachable!("validated: render anchor only"),
             MustKind::InitCallsSetter => {
-                let Some(HookEntry::State { init, .. }) = row.entry else {
-                    return None;
+                let init = match row.entry {
+                    Some(HookEntry::State { init, .. } | HookEntry::Ref { init, .. }) => init,
+                    _ => return None,
                 };
                 match must_init_calls_setter(init, &e.setter_vars) {
                     MustResult::All(c) => Some(Proof::Init(c)),
@@ -324,12 +345,15 @@ fn entity_at<'a, 'b>(
     }
 }
 
-fn name_matches(
-    name: Option<String>,
+/// Positive-only field matching (ADR-023): an absent value **fails**. A
+/// negative form would let an unknown value pass a guard and, combined with a
+/// must-guard, carry an Error on a candidate whose field we never resolved.
+fn text_matches(
+    value: Option<String>,
     one_of: &Option<Vec<String>>,
     prefix: &Option<String>,
 ) -> bool {
-    match (name, one_of, prefix) {
+    match (value, one_of, prefix) {
         (Some(n), Some(set), None) => set.iter().any(|s| s == &n),
         (Some(n), None, Some(p)) => n.starts_with(p.as_str()),
         (None, ..) => false,

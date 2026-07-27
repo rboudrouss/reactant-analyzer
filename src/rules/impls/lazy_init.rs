@@ -75,12 +75,12 @@ impl Rule for LazyInit {
     fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
         let (result, component) = (ctx.program(), ctx.component());
         use crate::engine::HookKind;
-        crate::rules::has_hook_kind(result, component, HookKind::State).then_some(
-            crate::rules::SafeCheck {
-                rule: Self::NAME,
-                message: "no useState initializer re-runs work on every render",
-            },
-        )
+        let applies = crate::rules::has_hook_kind(result, component, HookKind::State)
+            || crate::rules::has_hook_kind(result, component, HookKind::Ref);
+        applies.then_some(crate::rules::SafeCheck {
+            rule: Self::NAME,
+            message: "no useState/useRef initializer re-runs work on every render",
+        })
     }
 
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
@@ -95,11 +95,14 @@ impl Rule for LazyInit {
         let mut diags = Vec::new();
 
         for hook in &result.hooks {
-            let HookEntry::State {
-                label, init, span, ..
-            } = hook
-            else {
-                continue;
+            let (label, init, span, is_ref) = match hook {
+                HookEntry::State {
+                    label, init, span, ..
+                } => (label, init, span, false),
+                HookEntry::Ref {
+                    label, init, span, ..
+                } => (label, init, span, true),
+                _ => continue,
             };
             // Fire only on a call that is syntactically part of the init. We do
             // NOT chase calls through local bindings: after custom-hook inlining
@@ -111,11 +114,38 @@ impl Rule for LazyInit {
                 continue;
             }
 
-            // #2: grade by what the call actually does. A setter init is the
-            // only Error tier — routed through the must-primitive that mints the
-            // proof; the rest stay Warning/Info (safe over-claims, no proof).
-            let mut d = match classify_init_effect(init, &setters) {
-                InitEffect::Setter => {
+            // `useRef` has no lazy form — `useRef(() => x)` stores the function
+            // — so the fix is the three-line `if (ref.current === null)` idiom,
+            // not one token. Advice that costly is only worth giving where the
+            // repeated call actually harms: a state write, or a side effect.
+            // A cheap or unjudgeable call on a ref grades to Info instead.
+            let mut d = match (classify_init_effect(init, &setters), is_ref) {
+                (InitEffect::PureCheap(_), true) => continue,
+                (InitEffect::Unknown, true) => Diagnostic::info(
+                    "lazy-init",
+                    "this useRef is initialised by a direct function call — the call runs on \
+                     every render but the result is only kept from the first; if it is not \
+                     cheap, initialise lazily with `if (ref.current === null) ref.current = …`",
+                ),
+                (InitEffect::Effectful(name), true) => Diagnostic::warn(
+                    "lazy-init",
+                    format!(
+                        "this useRef init calls `{name}`, which has side effects, on every \
+                         render — only the first render's value is kept, so every later render \
+                         repeats the effect (duplicate subscriptions/requests/timers); \
+                         initialise lazily with `if (ref.current === null) ref.current = …`"
+                    ),
+                ),
+                (InitEffect::Setter, true) => {
+                    let msg = "this useRef init calls a state setter — it runs a state write on \
+                               every render (only the first render's value is kept); move the \
+                               call into an effect or event handler";
+                    match must_init_calls_setter(init, &setters) {
+                        MustResult::All(proof) => Diagnostic::error("lazy-init", proof, msg),
+                        _ => Diagnostic::warn("lazy-init", msg),
+                    }
+                }
+                (InitEffect::Setter, false) => {
                     let msg = "this useState init calls a state setter — it runs a state write on \
                                every render (the result is discarded after mount); move the call \
                                into an effect or event handler";
@@ -126,7 +156,7 @@ impl Rule for LazyInit {
                         _ => Diagnostic::warn("lazy-init", msg),
                     }
                 }
-                InitEffect::Effectful(name) => Diagnostic::warn(
+                (InitEffect::Effectful(name), false) => Diagnostic::warn(
                     "lazy-init",
                     format!(
                         "this useState init calls `{name}`, which has side effects, on every \
@@ -135,14 +165,14 @@ impl Rule for LazyInit {
                          just wasted work); wrap as `useState(() => …)`"
                     ),
                 ),
-                InitEffect::PureCheap(name) => Diagnostic::info(
+                (InitEffect::PureCheap(name), false) => Diagnostic::info(
                     "lazy-init",
                     format!(
                         "this useState init calls `{name}` on every render; the call is cheap \
                          and pure, so wrapping as `useState(() => …)` is optional"
                     ),
                 ),
-                InitEffect::Unknown => Diagnostic::warn(
+                (InitEffect::Unknown, false) => Diagnostic::warn(
                     "lazy-init",
                     "this useState is initialised by a direct function call \
                      the call runs on every render but the result is only used on mount; \
@@ -522,5 +552,92 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    // ── useRef: the same fact, a costlier fix, so a different severity floor ──
+
+    #[test]
+    fn ref_init_with_unknown_call_is_info_only() {
+        // useRef(new Map()) is real waste, but `useRef` has no lazy form: the
+        // fix is a three-line idiom, so a cheap call earns advice, not a warning.
+        let hooks = vec![HookEntry::Ref {
+            label: 0,
+            init: Expr::Call {
+                fn_: Box::new(Expr::Var("Map".to_string())),
+                args: vec![],
+            },
+            span: None,
+        }];
+        let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
+        let diags = LazyInit.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].severity(), crate::rules::Severity::Info);
+        assert!(diags[0].message.contains("useRef"), "{}", diags[0].message);
+    }
+
+    #[test]
+    fn ref_init_with_side_effects_warns() {
+        let hooks = vec![HookEntry::Ref {
+            label: 0,
+            init: Expr::Call {
+                fn_: Box::new(Expr::Var("setInterval".to_string())),
+                args: vec![],
+            },
+            span: None,
+        }];
+        let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
+        let diags = LazyInit.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].severity(), crate::rules::Severity::Warning);
+        assert!(
+            diags[0].message.contains("setInterval"),
+            "{}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn ref_init_calling_a_setter_is_certified() {
+        let hooks = vec![
+            HookEntry::State {
+                label: 0,
+                init: Expr::Lit(Prim::Int(0)),
+                span: None,
+            },
+            HookEntry::Ref {
+                label: 1,
+                init: Expr::Call {
+                    fn_: Box::new(Expr::StateSetter(0)),
+                    args: vec![Expr::Lit(Prim::Int(1))],
+                },
+                span: None,
+            },
+        ];
+        let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
+        let diags = LazyInit.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let d = diags
+            .iter()
+            .find(|d| d.hook_label == Some(1))
+            .expect("the ref init must be reported");
+        assert_eq!(d.severity(), crate::rules::Severity::Error);
+    }
+
+    #[test]
+    fn ref_init_with_a_cheap_pure_call_is_silent() {
+        // No lazy form to recommend and nothing to gain: say nothing.
+        let hooks = vec![HookEntry::Ref {
+            label: 0,
+            init: Expr::Call {
+                fn_: Box::new(Expr::FieldAccess {
+                    obj: Box::new(Expr::Var("Date".to_string())),
+                    field: "now".to_string(),
+                }),
+                args: vec![],
+            },
+            span: None,
+        }];
+        let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
+        let diags = LazyInit.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        assert!(diags.is_empty(), "{diags:?}");
     }
 }

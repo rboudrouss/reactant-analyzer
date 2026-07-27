@@ -279,6 +279,21 @@ pub(crate) fn memo_val_labels(cfg: &CFG) -> HashMap<Var, HookLabel> {
     })
 }
 
+/// `var → hook label` for every `let var = <hook call>` in `cfg`, whatever the
+/// kind: the value slot of a `useState`, a memo, a callback, and — through
+/// `HookMarker`, which every other hook binds — a ref or a custom hook's
+/// return. This is the "what does the source call this hook" table; a label
+/// with no `hook_calls` row can never be looked up in it.
+pub(crate) fn hook_val_labels(cfg: &CFG) -> HashMap<Var, HookLabel> {
+    state_binding_labels(cfg, |rhs| match rhs {
+        Expr::StateVal(label)
+        | Expr::MemoVal(label)
+        | Expr::CallbackVal(label)
+        | Expr::HookMarker(label, _) => Some(*label),
+        _ => None,
+    })
+}
+
 /// Shared kernel: collect `var → label` for `let var = <rhs>` where `pick`
 /// extracts a label from the rhs.
 fn state_binding_labels(
