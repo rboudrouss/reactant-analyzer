@@ -199,8 +199,10 @@ impl<'a> EntityCtx<'a> {
                 Some(HookEntry::State { .. }) => self
                     .state_names
                     .iter()
-                    .find(|(var, l)| **l == h.info.label && !var.starts_with("__"))
-                    .map(|(var, _)| crate::ir::source_name(var).to_string()),
+                    .filter(|(var, l)| **l == h.info.label && !var.starts_with("__"))
+                    .map(|(var, _)| var)
+                    .min()
+                    .map(|var| crate::ir::source_name(var).to_string()),
                 _ => None,
             },
             EntityVal::Setter(s) => Some(crate::ir::source_name(&s.var).to_string()),

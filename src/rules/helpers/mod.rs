@@ -63,14 +63,21 @@ pub(crate) fn hook_kind_word(kind: HookKind) -> &'static str {
 /// Messages must never print a bare internal `HookLabel` ("state 46") or a
 /// lowering temp (`__obj_N` for `const [{ a, b }] = useState(...)`): both are
 /// meaningless next to source.
+///
+/// One slot can have several source names — `const c = count` aliases it, and
+/// alias resolution records both. The smallest name wins: `find` over a
+/// `HashMap` would pick a seed-dependent one, so the same slot could be called
+/// `count` in one run and `c` in the next.
 pub(crate) fn state_slot_name(
     label: HookLabel,
     state_val_labels: &HashMap<Var, HookLabel>,
 ) -> String {
     state_val_labels
         .iter()
-        .find(|(v, l)| **l == label && !v.starts_with("__"))
-        .map(|(v, _)| format!("`{}`", crate::ir::source_name(v)))
+        .filter(|(v, l)| **l == label && !v.starts_with("__"))
+        .map(|(v, _)| v)
+        .min()
+        .map(|v| format!("`{}`", crate::ir::source_name(v)))
         .unwrap_or_else(|| format!("state #{label}"))
 }
 
@@ -282,4 +289,36 @@ pub(in crate::rules) fn all_deps_provably_stable(
         let val = result.eval_in(&exit_env, dep, &mut Heap::new());
         query::stability_verdict_of(&val).is_stable()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A slot with two source names must always print the same one. `HashMap`
+    /// seeds its iteration order per instance, so a `find` here made the name
+    /// depend on which alias came out first.
+    #[test]
+    fn slot_name_is_stable_across_hashmap_seeds() {
+        let names: Vec<String> = (0..64)
+            .map(|_| {
+                let mut m: HashMap<Var, HookLabel> = HashMap::new();
+                m.insert("count".into(), 3);
+                m.insert("c".into(), 3);
+                m.insert("__state_0".into(), 3);
+                state_slot_name(3, &m)
+            })
+            .collect();
+        assert!(
+            names.iter().all(|n| n == "`c`"),
+            "unstable slot name: {names:?}"
+        );
+    }
+
+    #[test]
+    fn slot_name_falls_back_when_only_temps_bind_it() {
+        let mut m: HashMap<Var, HookLabel> = HashMap::new();
+        m.insert("__obj_1".into(), 7);
+        assert_eq!(state_slot_name(7, &m), "state #7");
+    }
 }
