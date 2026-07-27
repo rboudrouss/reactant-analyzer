@@ -816,7 +816,7 @@ fn find_hook_marker(render_cfg: &CFG, label: HookLabel) -> Option<(BlockId, usiz
 }
 
 fn is_marker(expr: &Expr, label: HookLabel) -> bool {
-    matches!(expr.peel_ts(), Expr::HookMarker(l) if *l == label)
+    matches!(expr.peel_ts(), Expr::HookMarker(l, _) if *l == label)
 }
 
 /// Map a `StateValue` returned by `HookSummary::summarize` to the coarse `SummaryValue`
@@ -987,7 +987,7 @@ fn collect_hook_labels_expr(expr: &Expr, out: &mut Vec<HookLabel>) {
         | Expr::StateSetter(l)
         | Expr::MemoVal(l)
         | Expr::CallbackVal(l)
-        | Expr::HookMarker(l) => {
+        | Expr::HookMarker(l, _) => {
             out.push(*l);
         }
         Expr::ObjectLit { fields, .. } => fields

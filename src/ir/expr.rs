@@ -115,17 +115,36 @@ pub enum Expr {
     CallbackVal(HookLabel),
 
     /// Marks the call site of a hook whose result carries no tracked value
-    /// (`useEffect`, `useRef`, custom hooks, …). Evaluates to unit; its only
-    /// role is to keep the hook's label anchored in the CFG so call-site
-    /// blocks survive inlining and renumbering (`collect_hook_calls`,
-    /// conditional-hook). Every extracted hook leaves its label in the CFG —
-    /// value-bearing kinds via `StateVal`/`MemoVal`/…, all others via this.
-    HookMarker(HookLabel),
+    /// (`useEffect`, `useRef`, custom hooks, …). Its primary role is to keep
+    /// the hook's label anchored in the CFG so call-site blocks survive
+    /// inlining and renumbering (`collect_hook_calls`, conditional-hook).
+    /// Every extracted hook leaves its label in the CFG — value-bearing kinds
+    /// via `StateVal`/`MemoVal`/…, all others via this. The [`MarkerVal`] says
+    /// what the *binding* reads as.
+    HookMarker(HookLabel, MarkerVal),
 
     /// Injected by `expand_custom_hooks` for library hooks with a `HookSummary`.
     /// Evaluates directly to the encoded abstract value without going through the
     /// concrete expression language (avoids a circular dep between `ir` and `domains`).
     SummaryVal(SummaryValue),
+}
+
+/// What a [`Expr::HookMarker`] binding reads as.
+///
+/// The distinction is decided at lowering, where "is this React's own hook?"
+/// is still known: a React hook with no tracked result really does return
+/// `undefined`, while an unresolved custom hook returns something the engine
+/// has no information about. Collapsing the two — as a single `undefined`
+/// once did — makes an opaque hook's return *provably stable*
+/// (`to_stability` joins `Stable` for `undef`), which silences every
+/// stability-gated rule on it: a false negative, and the forbidden direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerVal {
+    /// Reads as `undefined` — React's own value-less hooks.
+    Undefined,
+    /// Reads as ⊤ — a custom hook the engine could neither inline nor
+    /// summarize. Paired with the `analysis-limit/unknown-hook` Info.
+    Unknown,
 }
 
 /// Coarse abstract return-value hint for library hooks.
@@ -160,7 +179,7 @@ impl Expr {
             | Expr::StateSetter(_)
             | Expr::MemoVal(_)
             | Expr::CallbackVal(_)
-            | Expr::HookMarker(_)
+            | Expr::HookMarker(..)
             | Expr::SummaryVal(_) => {}
             Expr::ObjectLit { fields, .. } => {
                 for (_, v) in fields {

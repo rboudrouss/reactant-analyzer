@@ -188,3 +188,41 @@ fn unstable_ref_hook_triggers_always_unstable_deps() {
         "Unstable-ref hook as sole dep should trigger always-unstable-deps; diags: {diags:?}"
     );
 }
+
+/// An unresolved custom hook — no `HookRegistry` body, no `SummaryRegistry`
+/// entry — must read as ⊤, never as `undefined`. `undefined` joins
+/// `Stability::Stable` in `to_stability`, so the old behaviour made an opaque
+/// hook's return *provably stable* and silenced every stability-gated rule on
+/// it (a false negative, the forbidden direction). The `analysis-limit` Info
+/// says the analyzer is blind here; the verdict must agree.
+#[test]
+fn unresolved_custom_hook_return_is_not_provably_stable() {
+    use reactant::rules::StabilityVerdict;
+
+    let src = r#"
+        import { useEffect } from "react";
+        import { useOpaqueThing } from "some-uninstalled-pkg";
+        function C() {
+            const thing = useOpaqueThing();
+            useEffect(() => { subscribe(thing); }, [thing]);
+            return <div>x</div>;
+        }
+    "#;
+    let result = parse_and_analyze_with_config(src, Config::default());
+    let comp = &result.components["C"];
+
+    let effect = comp
+        .effect_info
+        .values()
+        .find(|e| !e.declared_deps.is_empty())
+        .expect("the effect declares a dep");
+    let dep = &effect.declared_deps[0];
+    let name = "C".to_string();
+    let ctx = RuleCtx::new(&result, &name);
+
+    assert_eq!(
+        ctx.stability_verdict(dep),
+        StabilityVerdict::Unknown,
+        "an opaque hook's return must be ⊤, not a provably-stable `undefined`"
+    );
+}

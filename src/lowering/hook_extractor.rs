@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use crate::ir::{
     cfg::{BasicBlock, CFG, Terminator},
-    expr::{Expr, Prim},
+    expr::{Expr, MarkerVal, Prim},
     hooks::HookEntry,
     source_range::SourceRange,
     stmt::{MemberKey, Stmt},
@@ -370,7 +370,10 @@ fn process_stmt(
                 }
                 // Void hooks (useEffect, bare custom calls): leave a marker so
                 // the call-site block stays recoverable from the CFG.
-                out.push(Stmt::ExprStmt(Expr::HookMarker(lbl), stmt_span));
+                out.push(Stmt::ExprStmt(
+                    Expr::HookMarker(lbl, marker_val(is_react)),
+                    stmt_span,
+                ));
             }
             Err(expr) => {
                 out.push(Stmt::ExprStmt(rewrite_expr(expr, state_temps), stmt_span));
@@ -619,19 +622,30 @@ fn make_hook_entry(
     }
 }
 
+/// What a hook-call marker reads as. A custom hook that the engine later
+/// inlines or summarizes has its binding replaced, so a `MarkerVal::Unknown`
+/// surviving into the fixpoint means the hook really is opaque.
+fn marker_val(is_react: bool) -> MarkerVal {
+    if is_react {
+        MarkerVal::Undefined
+    } else {
+        MarkerVal::Unknown
+    }
+}
+
 /// IR expression that replaces a hook call at its binding site.
 fn hook_result_expr(name: &str, is_react: bool, label: HookLabel) -> Expr {
     if !is_react {
-        // Custom hooks bind an opaque marker (evaluates to unit); the engine
-        // resolves the real value via HookRegistry inlining or a summary. The
-        // marker keeps the call-site block recoverable (`collect_hook_calls`).
-        return Expr::HookMarker(label);
+        // Custom hooks bind an opaque marker; the engine resolves the real
+        // value via HookRegistry inlining or a summary. The marker keeps the
+        // call-site block recoverable (`collect_hook_calls`).
+        return Expr::HookMarker(label, MarkerVal::Unknown);
     }
     match name {
         "useState" | "useReducer" => Expr::StateVal(label),
         "useMemo" => Expr::MemoVal(label),
         "useCallback" => Expr::CallbackVal(label),
-        _ => Expr::HookMarker(label),
+        _ => Expr::HookMarker(label, MarkerVal::Undefined),
     }
 }
 
@@ -856,7 +870,7 @@ mod tests {
         assert!(
             entry_stmts(&cfg)
                 .iter()
-                .any(|s| matches!(s, Stmt::ExprStmt(Expr::HookMarker(0), _)))
+                .any(|s| matches!(s, Stmt::ExprStmt(Expr::HookMarker(0, _), _)))
         );
     }
 
@@ -923,7 +937,7 @@ mod tests {
         let stmts = entry_stmts(&cfg);
         assert!(matches!(
             find_let_rhs(stmts, "r"),
-            Some(Expr::HookMarker(0))
+            Some(Expr::HookMarker(0, _))
         ));
     }
 
@@ -938,7 +952,7 @@ mod tests {
         let stmts = entry_stmts(&cfg);
         assert!(matches!(
             find_let_rhs(stmts, "data"),
-            Some(Expr::HookMarker(0))
+            Some(Expr::HookMarker(0, _))
         ));
     }
 

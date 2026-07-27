@@ -10,7 +10,7 @@ use crate::{
         stores::{AbstractEnv, EnvVal, Heap, HeapValue},
     },
     ir::{
-        expr::{BinOp, Expr, Prim, UnaryOp},
+        expr::{BinOp, Expr, MarkerVal, Prim, UnaryOp},
         stmt::Stmt,
         types::{ExprId, Symbol},
     },
@@ -119,8 +119,13 @@ fn eval_state_value(
         }
         Expr::StateSetter(label) => StateValue::component_setter(ctx.component.clone(), *label),
         Expr::MemoVal(label) | Expr::CallbackVal(label) => ctx.memo.get(*label),
-        // Call-site marker for value-less hooks; reads as `undefined`.
-        Expr::HookMarker(_) => StateValue::undefined(),
+        // Call-site marker. A React hook with no tracked result really does
+        // return `undefined`; an unresolved custom hook returns ⊤. Reading the
+        // latter as `undefined` made it *provably stable* (`to_stability`
+        // joins `Stable` for `undef`) and silenced every stability-gated rule
+        // on it — a false negative.
+        Expr::HookMarker(_, MarkerVal::Undefined) => StateValue::undefined(),
+        Expr::HookMarker(_, MarkerVal::Unknown) => StateValue::top(),
 
         Expr::ObjectLit { .. } => StateValue::reference(Stability::PerRender),
         Expr::ArrayLit { .. } => StateValue::reference(Stability::PerRender),

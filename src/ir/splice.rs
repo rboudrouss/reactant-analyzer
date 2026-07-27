@@ -400,7 +400,7 @@ fn rename_vars_expr(expr: Expr, ren: &HashMap<Var, Var>) -> Expr {
         | Expr::StateSetter(_)
         | Expr::MemoVal(_)
         | Expr::CallbackVal(_)
-        | Expr::HookMarker(_)
+        | Expr::HookMarker(..)
         | Expr::SummaryVal(_)) => leaf,
     }
 }
@@ -598,7 +598,7 @@ pub fn subst_vars_expr(expr: Expr, subst: &HashMap<Var, Expr>) -> Expr {
         | Expr::StateSetter(_)
         | Expr::MemoVal(_)
         | Expr::CallbackVal(_)
-        | Expr::HookMarker(_)
+        | Expr::HookMarker(..)
         | Expr::SummaryVal(_)) => leaf,
     }
 }
@@ -676,6 +676,7 @@ fn subst_vars_cfg(cfg: CFG, subst: &HashMap<Var, Expr>) -> CFG {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::expr::MarkerVal;
     use crate::ir::expr::Prim;
     use crate::ir::types::ExprId;
     use std::sync::Arc;
@@ -726,7 +727,7 @@ mod tests {
         };
         let rename = callee_rename_map(&callee, &[], 7);
         let x = "x".to_string();
-        let mut caller = caller(vec![let_("x", Expr::HookMarker(0))]);
+        let mut caller = caller(vec![let_("x", Expr::HookMarker(0, MarkerVal::Unknown))]);
         splice_callee_into_cfg(
             &mut caller,
             0,
@@ -803,7 +804,7 @@ mod tests {
             }],
         };
         let rename = callee_rename_map(&callee, &[], 1);
-        let mut caller = caller(vec![Stmt::ExprStmt(Expr::HookMarker(0), None)]);
+        let mut caller = caller(vec![Stmt::ExprStmt(Expr::HookMarker(0, MarkerVal::Unknown), None)]);
         let before_blocks = caller.blocks.len();
         splice_callee_into_cfg(
             &mut caller,
@@ -848,7 +849,7 @@ mod tests {
         let rename = callee_rename_map(&callee, &params, 2);
         let args = vec![Expr::Lit(Prim::Int(5))];
         let out = "out".to_string();
-        let mut caller = caller(vec![let_("out", Expr::HookMarker(0))]);
+        let mut caller = caller(vec![let_("out", Expr::HookMarker(0, MarkerVal::Unknown))]);
         splice_callee_into_cfg(
             &mut caller,
             0,
