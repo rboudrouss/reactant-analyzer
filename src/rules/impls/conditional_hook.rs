@@ -196,6 +196,7 @@ mod tests {
                 kind: HookKind::State,
                 block_id: 1,
                 span: None,
+                opaque: false,
             }],
         );
         let diags = ConditionalHook.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
@@ -326,6 +327,7 @@ mod tests {
                 kind: HookKind::State,
                 block_id: 5,
                 span: None,
+                opaque: false,
             }],
         );
         let diags = ConditionalHook.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
@@ -344,6 +346,7 @@ mod tests {
                 kind: HookKind::State,
                 block_id: 0,
                 span: None,
+                opaque: false,
             }],
         );
         assert!(
@@ -363,6 +366,7 @@ mod tests {
                 kind: HookKind::State,
                 block_id: 1,
                 span: None,
+                opaque: false,
             }],
         );
         assert!(
@@ -382,6 +386,7 @@ mod tests {
                 kind: HookKind::State,
                 block_id: 1,
                 span: None,
+                opaque: false,
             }],
         );
         let diags = ConditionalHook.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
@@ -399,6 +404,7 @@ mod tests {
                 kind: HookKind::State,
                 block_id: 3,
                 span: None,
+                opaque: false,
             }],
         );
         assert!(
@@ -417,12 +423,14 @@ mod tests {
                 kind: HookKind::State,
                 block_id: 0,
                 span: None,
+                opaque: false,
             },
             HookCallInfo {
                 label: 1,
                 kind: HookKind::State,
                 block_id: 1,
                 span: None,
+                opaque: false,
             },
         ];
         let result = make_result(cfg, hook_calls);

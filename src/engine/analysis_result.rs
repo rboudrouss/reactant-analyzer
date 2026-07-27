@@ -70,6 +70,14 @@ pub struct HookCallInfo {
     pub block_id: BlockId,
     /// Source location of the hook call site (e.g. `useState(0)`), if available.
     pub span: Option<SourceRange>,
+    /// The engine has no information about this hook's internals — it could
+    /// neither inline a body nor apply a summary. What
+    /// `analysis-limit/unknown-hook` reports.
+    ///
+    /// Distinct from `kind == Custom`, which is what that Info used to key on:
+    /// a *summarized* library hook is a custom hook whose abstraction is known,
+    /// and it keeps its row so rules-of-hooks checks can see the call site.
+    pub opaque: bool,
 }
 
 /// Captured information about a JSX event handler entry point.

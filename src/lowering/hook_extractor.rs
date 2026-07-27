@@ -313,7 +313,9 @@ fn process_stmt(
                 let is_state_like = is_react && matches!(name.as_str(), "useState" | "useReducer");
                 let is_arr_temp = var.starts_with("__arr_");
 
-                if let Some(entry) = make_hook_entry(&name, is_react, lbl, args, stmt_span) {
+                let entry = make_hook_entry(&name, is_react, lbl, args, stmt_span);
+                let marker = hook_result_expr(&name, is_react, lbl, entry.as_ref());
+                if let Some(entry) = entry {
                     hooks.push(entry);
                 }
 
@@ -346,7 +348,7 @@ fn process_stmt(
                 } else {
                     out.push(Stmt::Let {
                         var,
-                        rhs: hook_result_expr(&name, is_react, lbl),
+                        rhs: marker,
                         span: stmt_span,
                     });
                 }
@@ -363,7 +365,9 @@ fn process_stmt(
             Ok((name, is_react, args)) => {
                 let lbl = *label;
                 *label += 1;
-                if let Some(entry) = make_hook_entry(&name, is_react, lbl, args, stmt_span) {
+                let entry = make_hook_entry(&name, is_react, lbl, args, stmt_span);
+                let marker = marker_val(entry.as_ref());
+                if let Some(entry) = entry {
                     hooks.push(entry);
                 }
                 // For Custom hooks without a binding, populate import_source + resolved_file.
@@ -378,10 +382,7 @@ fn process_stmt(
                 }
                 // Void hooks (useEffect, bare custom calls): leave a marker so
                 // the call-site block stays recoverable from the CFG.
-                out.push(Stmt::ExprStmt(
-                    Expr::HookMarker(lbl, marker_val(is_react)),
-                    stmt_span,
-                ));
+                out.push(Stmt::ExprStmt(Expr::HookMarker(lbl, marker), stmt_span));
             }
             Err(expr) => {
                 out.push(Stmt::ExprStmt(rewrite_expr(expr, state_temps), stmt_span));
@@ -630,19 +631,35 @@ fn make_hook_entry(
     }
 }
 
-/// What a hook-call marker reads as. A custom hook that the engine later
-/// inlines or summarizes has its binding replaced, so a `MarkerVal::Unknown`
-/// surviving into the fixpoint means the hook really is opaque.
-fn marker_val(is_react: bool) -> MarkerVal {
-    if is_react {
-        MarkerVal::Undefined
-    } else {
-        MarkerVal::Unknown
+/// What a hook-call marker reads as, decided by the entry the engine actually
+/// built rather than by "is the name React's".
+///
+/// Being React's own hook is not the question — `useContext`, `useId`,
+/// `useOptimistic` and friends are React's and the engine has no model for any
+/// of them, so `make_hook_entry` files them as `Custom` like any other unknown
+/// hook. Answering `Undefined` for those made their return *provably stable*
+/// (`to_stability` joins `Stable` for `undef`) and silenced every
+/// stability-gated rule on a context value — the same false negative the
+/// `Undefined`/`Unknown` split was introduced to close, left open on React's
+/// side of it.
+///
+/// `Undefined` is therefore reserved for the hooks the engine models as
+/// genuinely value-less: an effect returns nothing, and a ref's identity is
+/// constant across renders, which is what `undefined` reads as anyway.
+fn marker_val(entry: Option<&HookEntry>) -> MarkerVal {
+    match entry {
+        Some(HookEntry::Effect { .. } | HookEntry::Ref { .. }) => MarkerVal::Undefined,
+        _ => MarkerVal::Unknown,
     }
 }
 
 /// IR expression that replaces a hook call at its binding site.
-fn hook_result_expr(name: &str, is_react: bool, label: HookLabel) -> Expr {
+fn hook_result_expr(
+    name: &str,
+    is_react: bool,
+    label: HookLabel,
+    entry: Option<&HookEntry>,
+) -> Expr {
     if !is_react {
         // Custom hooks bind an opaque marker; the engine resolves the real
         // value via HookRegistry inlining or a summary. The marker keeps the
@@ -653,7 +670,7 @@ fn hook_result_expr(name: &str, is_react: bool, label: HookLabel) -> Expr {
         "useState" | "useReducer" => Expr::StateVal(label),
         "useMemo" => Expr::MemoVal(label),
         "useCallback" => Expr::CallbackVal(label),
-        _ => Expr::HookMarker(label, MarkerVal::Undefined),
+        _ => Expr::HookMarker(label, marker_val(entry)),
     }
 }
 

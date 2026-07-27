@@ -286,3 +286,187 @@ fn analysis_limit_suppresses_safe_check_assurances() {
         "a fully-analyzed component must still publish its assurances"
     );
 }
+
+// ── The call site survives summarization ─────────────────────────────────────
+
+/// A hook served by the `SummaryRegistry` keeps its `hook_calls` row, so
+/// rules-of-hooks still sees the call site. Summarization used to remove the
+/// `HookEntry` *and* overwrite the call-site marker with a bare `SummaryVal`,
+/// which erased the label from the CFG — a conditional `useQuery()` produced no
+/// finding at all, and rules-of-hooks violations crash React at runtime.
+#[test]
+fn a_conditional_summarized_hook_is_still_conditional() {
+    let src = r#"
+        import { useState } from "react";
+        import { useQuery } from "@tanstack/react-query";
+        function C({ enabled }) {
+            const [n, setN] = useState(0);
+            if (enabled) {
+                const q = useQuery({ queryKey: ["x"] });
+                return <div>{q}</div>;
+            }
+            return <div>{n}</div>;
+        }
+    "#;
+    let config = Config {
+        summary_registry: SummaryRegistry::new_with_common(),
+        ..Config::default()
+    };
+    let result = parse_and_analyze_with_config(src, config);
+    let diags = diags_for(&result, "C");
+    assert!(
+        diags.iter().any(|d| d.rule == "conditional-hook"),
+        "the conditional useQuery must be flagged; got: {diags:?}"
+    );
+}
+
+/// The same for a call with no binding: retagging is keyed on the label, not on
+/// a binding name searched in the entry block.
+#[test]
+fn a_conditional_summarized_void_call_is_still_conditional() {
+    let src = r#"
+        import { useState } from "react";
+        import { useQuery } from "@tanstack/react-query";
+        function C({ enabled }) {
+            const [n, setN] = useState(0);
+            if (enabled) { useQuery({ queryKey: ["y"] }); }
+            return <div>{n}</div>;
+        }
+    "#;
+    let config = Config {
+        summary_registry: SummaryRegistry::new_with_common(),
+        ..Config::default()
+    };
+    let result = parse_and_analyze_with_config(src, config);
+    assert!(
+        diags_for(&result, "C")
+            .iter()
+            .any(|d| d.rule == "conditional-hook")
+    );
+}
+
+/// Keeping the row must not bring the noise back: a summarized hook is a hook
+/// whose abstraction is known, so it is not an analysis limit. `analysis-limit`
+/// keys on that fact now, not on `kind == Custom`.
+#[test]
+fn a_summarized_hook_keeps_its_row_without_an_analysis_limit() {
+    let src = r#"
+        import { useQuery } from "@tanstack/react-query";
+        function C() {
+            const q = useQuery({ queryKey: ["users"] });
+            return <div>{q}</div>;
+        }
+    "#;
+    let config = Config {
+        summary_registry: SummaryRegistry::new_with_common(),
+        ..Config::default()
+    };
+    let result = parse_and_analyze_with_config(src, config);
+    let comp = &result.components["C"];
+    assert!(
+        comp.hook_calls
+            .iter()
+            .any(|c| c.kind == reactant::engine::HookKind::Custom && !c.opaque),
+        "the summarized hook must keep a non-opaque row: {:?}",
+        comp.hook_calls
+    );
+    let limits: Vec<_> = diags_for(&result, "C")
+        .into_iter()
+        .filter(|d| d.rule == "analysis-limit")
+        .collect();
+    assert!(limits.is_empty(), "{limits:?}");
+}
+
+// ── React's own unmodelled hooks are not "value-less" ────────────────────────
+
+/// `useContext`, `useId`, `useOptimistic`… are React's, and the engine models
+/// none of them — `make_hook_entry` files them as `Custom` like any other
+/// unknown hook. Reading their result as `undefined` made it *provably stable*
+/// (`to_stability` joins `Stable` for `undef`) and silenced every
+/// stability-gated rule on a context value.
+#[test]
+fn an_unmodelled_react_hook_return_is_not_provably_stable() {
+    use reactant::rules::StabilityVerdict;
+
+    let src = r#"
+        import { useEffect, useContext } from "react";
+        function C() {
+            const cfg = useContext(ConfigContext);
+            useEffect(() => { subscribe(cfg); }, [cfg]);
+            return <div>x</div>;
+        }
+    "#;
+    let result = parse_and_analyze_with_config(src, Config::default());
+    let comp = &result.components["C"];
+    let effect = comp
+        .effect_info
+        .values()
+        .find(|e| !e.declared_deps.is_empty())
+        .expect("the effect declares a dep");
+    let name = "C".to_string();
+    let ctx = RuleCtx::new(&result, &name);
+    assert_eq!(
+        ctx.stability_verdict(&effect.declared_deps[0]),
+        StabilityVerdict::Unknown,
+        "a context value is not provably stable — the engine has no model for it"
+    );
+}
+
+/// …and it stays an admitted analysis limit, since the engine really is blind
+/// to it. The soundness fix must not buy quiet by hiding the notice.
+#[test]
+fn an_unmodelled_react_hook_still_reports_the_limit() {
+    let src = r#"
+        import { useContext } from "react";
+        function C() {
+            const cfg = useContext(ConfigContext);
+            return <div>{cfg}</div>;
+        }
+    "#;
+    let result = parse_and_analyze_with_config(src, Config::default());
+    assert!(
+        diags_for(&result, "C")
+            .iter()
+            .any(|d| d.rule == "analysis-limit"),
+        "the engine has no model for useContext and must say so"
+    );
+}
+
+/// An effect returns nothing and a ref's identity is constant, so those two
+/// keep reading as `undefined` — the fix narrows what counts as value-less, it
+/// does not abolish the category.
+#[test]
+fn effects_and_refs_stay_value_less() {
+    use reactant::ir::expr::{Expr, MarkerVal};
+    use reactant::ir::stmt::Stmt;
+
+    let src = r#"
+        import { useEffect, useRef } from "react";
+        function C() {
+            const r = useRef(null);
+            useEffect(() => { touch(r); });
+            return <div/>;
+        }
+    "#;
+    let result = parse_and_analyze_with_config(src, Config::default());
+    let comp = &result.components["C"];
+    let markers: Vec<&MarkerVal> = comp
+        .render_cfg
+        .blocks
+        .values()
+        .flat_map(|b| &b.stmts)
+        .filter_map(|s| match s {
+            Stmt::Let {
+                rhs: Expr::HookMarker(_, m),
+                ..
+            }
+            | Stmt::ExprStmt(Expr::HookMarker(_, m), _) => Some(m),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(markers.len(), 2, "one for the ref, one for the effect");
+    assert!(
+        markers.iter().all(|m| **m == MarkerVal::Undefined),
+        "{markers:?}"
+    );
+}

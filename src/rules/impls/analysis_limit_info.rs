@@ -71,7 +71,11 @@ impl Rule for AnalysisLimitInfo {
         // Unknown custom hooks survived expand_custom_hooks (not in HookRegistry or SummaryRegistry).
         if let Some(comp_result) = result.components.get(component) {
             for call in &comp_result.hook_calls {
-                if call.kind != HookKind::Custom {
+                // Not `kind == Custom`: a summarized library hook is a custom
+                // hook whose abstraction is known, and it keeps its row so
+                // rules-of-hooks checks can see the call site. `opaque` is the
+                // fact this Info is about.
+                if !call.opaque {
                     continue;
                 }
                 let name = comp_result.hooks.iter().find_map(|h| match h {

@@ -126,6 +126,10 @@ fn eval_state_value(
         // on it — a false negative.
         Expr::HookMarker(_, MarkerVal::Undefined) => StateValue::undefined(),
         Expr::HookMarker(_, MarkerVal::Unknown) => StateValue::top(),
+        // A summarized library hook reads exactly as its summary; the marker
+        // is kept (rather than replaced by a bare `SummaryVal`) so the label
+        // stays anchored at the call site.
+        Expr::HookMarker(_, MarkerVal::Summary(sv)) => summary_value(sv),
 
         Expr::ObjectLit { .. } => StateValue::reference(Stability::PerRender),
         Expr::ArrayLit { .. } => StateValue::reference(Stability::PerRender),
@@ -155,13 +159,17 @@ fn eval_state_value(
 
         Expr::TSAnnotated(inner) => eval_state_value(inner, env, ctx),
 
-        Expr::SummaryVal(sv) => match sv {
-            crate::ir::expr::SummaryValue::Top => StateValue::top(),
-            crate::ir::expr::SummaryValue::StableRef => StateValue::reference(Stability::Stable),
-            crate::ir::expr::SummaryValue::UnstableRef => {
-                StateValue::reference(Stability::PerRender)
-            }
-        },
+        Expr::SummaryVal(sv) => summary_value(sv),
+    }
+}
+
+/// The abstract value a [`SummaryValue`] denotes. One table, so the marker and
+/// the standalone `SummaryVal` can never disagree about what a summary means.
+fn summary_value(sv: &crate::ir::expr::SummaryValue) -> StateValue {
+    match sv {
+        crate::ir::expr::SummaryValue::Top => StateValue::top(),
+        crate::ir::expr::SummaryValue::StableRef => StateValue::reference(Stability::Stable),
+        crate::ir::expr::SummaryValue::UnstableRef => StateValue::reference(Stability::PerRender),
     }
 }
 

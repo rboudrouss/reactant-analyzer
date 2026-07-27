@@ -12,8 +12,6 @@
 
 - **Unknown callees without `Loc`** — `myHelper(() => setX())` → FN if `myHelper` is imported from an npm package (not in the analyzed files) or if inlining was cut off by depth. Local utilities are inlined (ADR-013 Phase 3) but only in **statement** position; in expression position they stay opaque. *(ADR-010, ADR-013)*
 
-- **Summarized library hooks invisible to `conditional-hook`** — `expand_custom_hooks` *removes* the `HookEntry::Custom` of a hook served by the `SummaryRegistry` (jotai `useAtom`, TanStack…) and patches its binding to `SummaryVal`, so no label survives into `hook_calls` → a conditional `useAtom()` is not flagged. The `Expr::HookMarker` invariant (every extracted hook leaves its label in the CFG) covers everything else; fixing this one means keeping the entry (or its label→kind row) alive through summarization instead of dropping it.
-
 - **`cross-component-infinite-loop` FN if the parent is only analyzed intra** — if the parent component isn't reached by top-down analysis (Phase 2 fallback, props = ⊤), the `SharedStateStore` isn't populated → the rule doesn't fire. *(ADR-012)*
 
 - **Loop-carried values inside callbacks** — `exec_body` doesn't widen on back-edges → `setX(arr[i])` records a partial value. Minor FN on the *value*, never an FP. *(ADR-009)*
@@ -27,6 +25,15 @@
 - **`frozen-initial-state` residuals** — (1) *primitive props can't reach the Error tier*: version labels live on the `reference` slot only (ADR-017), so a parent **string/number** state passed down arrives as a plain interval/StrConst — proven-changing evidence caps at Warning (reference props, including their fields via versioned field reads, do reach Error). (2) *Memo-chained seeds not rooted*: `const v = useMemo(() => props.a, …); useState(v)` — the binding chase stops at `MemoVal`, the seed is not recognized as prop-rooted → silent. (3) Never-written local slot (mount snapshot, `const [{ snap }] = useState(...)`) and `initial*`/`default*`-named props are graded down to Info by declared intent — a real freeze behind those idioms is only visible with `--info`.
 
 - **Churn-graph residuals (ADR-018)** — auto-run nested callbacks (`.then(() => set(fresh))`) in **no-deps** effects create no self-edge (event-vs-async callback classification lives in the engine, not the syntactic collector). *(The other historical residual — prop deps degrading to `Unknown` on FieldAccess-on-versioned — is addressed since field reads propagate version labels; a field of a versioned object keeps its `Versioned(labels)` reference. The value's kind stays ⊤: kind-dependent reasoning on such fields is still imprecise.)*
+
+- **`useContext` is unmodelled and now dominates the analysis limits** — the
+  engine has no model for it, so a context value reads ⊤ and every
+  `useContext` call emits `analysis-limit` (363 sites across the eight corpora,
+  the single largest source). ⊤ is the correct answer, not a bug, but modelling
+  it would be the biggest precision win available: the value is whatever the
+  nearest matching Provider passes, which is cross-component (ADR-012 territory)
+  and needs the `createContext` binding resolved to its Provider element — the
+  same relation [step 4](#planned-work-adr-023--adr-024) needs for JSX props.
 
 ## Known false positives (FP)
 

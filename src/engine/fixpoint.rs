@@ -664,27 +664,19 @@ fn expand_custom_hooks(
                 .get(&name, import_source.as_deref())
             {
                 let sv = summary.summarize(&[]);
-                let summary_val = state_value_to_summary_value(sv);
-                if let HookEntry::Custom {
-                    binding: Some(ref bind_var),
-                    ..
-                } = hooks[i]
-                {
-                    let bind_var = bind_var.clone();
-                    if let Some(entry) = render_cfg.blocks.get_mut(&render_cfg.entry) {
-                        for stmt in &mut entry.stmts {
-                            if let Stmt::Let { var, rhs, .. } = stmt {
-                                if *var == bind_var {
-                                    *rhs = Expr::SummaryVal(summary_val);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                hooks.remove(i);
-                // Don't increment i it now points to the next entry.
-                continue;
+                // Retag the call-site marker rather than replacing it, and keep
+                // the `HookEntry`. Both used to go: the binding became a bare
+                // `SummaryVal` and the entry was removed, which erased the
+                // label from the CFG and from `label_to_kind` — so no
+                // `HookCallInfo` row survived and a *conditional* `useAtom()`
+                // was invisible to every rules-of-hooks check. The marker is
+                // the anchor those checks read.
+                //
+                // Retagging by label also reaches a void call
+                // (`useTracking()`, no binding) and a call in a non-entry
+                // block, neither of which the binding-name search in the entry
+                // block could find.
+                retag_marker(render_cfg, custom_label, state_value_to_summary_value(sv));
             }
             i += 1;
             continue;
@@ -897,6 +889,36 @@ fn exit_env<D: AbstractDomain>(
 /// the final CFG (positions survive inlining and block renumbering). A label
 /// with no CFG occurrence (Handler entries, markers lost to a transformation)
 /// falls back to `cfg.entry`.
+/// Retag the `HookMarker(label, _)` in `cfg` as reading the given summary.
+///
+/// Walks all blocks: the call site may be a plain binding or a bare statement,
+/// and it may sit in any block — a *conditional* call is in none of the ones a
+/// search of the entry block reaches, which is exactly the case that matters
+/// here. No recursion into sub-expressions is needed: `try_consume_hook_call`
+/// consumes the whole right-hand side, so a marker is always the entire rhs of
+/// a `Let`/`Assign` or the entire `ExprStmt`. If that ever stops holding the
+/// marker is simply not retagged and the hook reads ⊤ — the conservative
+/// answer, with its `analysis-limit` notice, not a silent wrong value.
+fn retag_marker(cfg: &mut CFG, label: HookLabel, sv: crate::ir::expr::SummaryValue) {
+    let retag = |e: &mut Expr| {
+        if let Expr::HookMarker(l, m) = e
+            && *l == label
+        {
+            *m = crate::ir::expr::MarkerVal::Summary(sv.clone());
+        }
+    };
+    for block in cfg.blocks.values_mut() {
+        for stmt in &mut block.stmts {
+            match stmt {
+                Stmt::Let { rhs, .. }
+                | Stmt::Assign { rhs, .. }
+                | Stmt::MemberWrite { rhs, .. } => retag(rhs),
+                Stmt::ExprStmt(e, _) => retag(e),
+            }
+        }
+    }
+}
+
 fn collect_hook_calls(hooks: &[HookEntry], cfg: &CFG) -> Vec<HookCallInfo> {
     // Build label → kind and label → span maps from hook entries.
     let label_to_kind: HashMap<HookLabel, HookKind> = hooks
@@ -925,6 +947,25 @@ fn collect_hook_calls(hooks: &[HookEntry], cfg: &CFG) -> Vec<HookCallInfo> {
         })
         .collect();
 
+    // Labels whose call site is an `Unknown` marker: a custom hook the engine
+    // could neither inline nor summarize. `kind == Custom` no longer answers
+    // this — a summarized library hook keeps its Custom row so rules-of-hooks
+    // checks can see the call site.
+    let mut opaque: HashSet<HookLabel> = HashSet::new();
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            let e = match stmt {
+                Stmt::Let { rhs, .. }
+                | Stmt::Assign { rhs, .. }
+                | Stmt::MemberWrite { rhs, .. } => rhs,
+                Stmt::ExprStmt(e, _) => e,
+            };
+            if let Expr::HookMarker(l, crate::ir::expr::MarkerVal::Unknown) = e {
+                opaque.insert(*l);
+            }
+        }
+    }
+
     // Scan blocks for label-bearing exprs (StateVal / StateSetter / MemoVal /
     // CallbackVal / HookMarker); first occurrence in block order wins.
     let mut call_map: HashMap<HookLabel, HookCallInfo> = HashMap::new();
@@ -941,6 +982,7 @@ fn collect_hook_calls(hooks: &[HookEntry], cfg: &CFG) -> Vec<HookCallInfo> {
                             kind,
                             block_id,
                             span: label_to_span.get(&label).copied().flatten(),
+                            opaque: opaque.contains(&label),
                         });
                     }
                 }
@@ -955,6 +997,9 @@ fn collect_hook_calls(hooks: &[HookEntry], cfg: &CFG) -> Vec<HookCallInfo> {
             kind,
             block_id: cfg.entry,
             span: label_to_span.get(&label).copied().flatten(),
+            // A label with no marker left in the CFG cannot be shown to be
+            // resolved, and `kind == Custom` is what the Info keyed on before.
+            opaque: kind == HookKind::Custom,
         });
     }
 

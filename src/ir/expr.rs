@@ -138,13 +138,19 @@ pub enum Expr {
 /// once did — makes an opaque hook's return *provably stable*
 /// (`to_stability` joins `Stable` for `undef`), which silences every
 /// stability-gated rule on it: a false negative, and the forbidden direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkerVal {
     /// Reads as `undefined` — React's own value-less hooks.
     Undefined,
     /// Reads as ⊤ — a custom hook the engine could neither inline nor
     /// summarize. Paired with the `analysis-limit/unknown-hook` Info.
     Unknown,
+    /// Reads as the library hook's [`HookSummary`](crate::registry::HookSummary).
+    /// Retagged onto the marker by `expand_custom_hooks` rather than replacing
+    /// it: overwriting the marker with a bare `SummaryVal` erased the label,
+    /// and with it the call site every rules-of-hooks check needs — a
+    /// conditional `useAtom()` was invisible to `conditional-hook`.
+    Summary(SummaryValue),
 }
 
 /// Coarse abstract return-value hint for library hooks.
