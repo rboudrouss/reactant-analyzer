@@ -119,6 +119,11 @@ scope. `source` is the import specifier only — a relatively-imported hook has
 none, and an absent value **fails** the guard rather than passing it. The
 validator lists the fields a subject carries when you ask for one it does not.
 
+A rule's `guards` are a conjunction; `{"kind": "any_of", "guards": [...]}`
+nests a disjunction inside it, so "X or Y" costs one rule instead of two with
+duplicated docs. There is no universal quantifier over a `forEach` edge, and
+there deliberately will not be (ADR-023 §4).
+
 ## Project kinds
 
 `check` inspects the **first directory argument** (default `.`) for marker

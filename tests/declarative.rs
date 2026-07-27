@@ -705,3 +705,122 @@ fn ref_anchor_certifies_an_init_setter_call() {
     assert_eq!(diags[0].severity(), Severity::Error);
     assert_eq!(diags[0].message, "`r` writes state while initialising");
 }
+
+// ── any_of (ADR-023 §4: disjunction ships, ∀ does not) ───────────────────────
+
+/// The guard list is a conjunction; `any_of` is the only way to write "X or Y"
+/// without duplicating a rule and its docs.
+#[test]
+fn any_of_passes_when_either_branch_does() {
+    let pack = r#"{"schemaVersion":1,"name":"f","rules":[
+        {"id":"either","docs":{"description":"d","why":"w","fix":"f"},
+         "severity":"warning","anchor":{"relation":"hook_calls","kind":"custom"},
+         "guards":[{"kind":"any_of","guards":[
+             {"kind":"source","of":"anchor","one_of":["legacy-pkg"]},
+             {"kind":"name","of":"anchor","prefix":"useDeprecated"}]}],
+         "message":"{anchor.name}"}]}"#;
+    let names = |src: &str| {
+        let mut v: Vec<String> = run_pack(pack, src, &Options::new())
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
+        v.sort();
+        v
+    };
+
+    // First branch only, second branch only, both, neither.
+    assert_eq!(
+        names(
+            r#"
+        import { useThing } from "legacy-pkg";
+        import { useDeprecatedThing, useFine } from "modern-pkg";
+        function C() {
+            const a = useThing();
+            const b = useDeprecatedThing();
+            const c = useFine();
+            return <div>{a}{b}{c}</div>;
+        }
+    "#
+        ),
+        vec!["`useDeprecatedThing`", "`useThing`"]
+    );
+}
+
+/// Both branches of an `any_of` are evaluated, so whether a `must_*` branch
+/// contributes its proof — and therefore whether the finding reaches Error —
+/// does not depend on the order the author wrote the branches in.
+#[test]
+fn any_of_severity_is_branch_order_independent() {
+    let rule = |branches: &str| {
+        format!(
+            r#"{{"schemaVersion":1,"name":"f","rules":[
+                {{"id":"r","docs":{{"description":"d","why":"w","fix":"f"}},
+                 "severity":"error","anchor":{{"relation":"hook_calls","kind":"state"}},
+                 "guards":[{{"kind":"any_of","guards":[{branches}]}}],
+                 "message":"m"}}]}}"#
+        )
+    };
+    let must = r#"{"kind":"must_init_calls_setter","of":"anchor","else":"drop"}"#;
+    let may = r#"{"kind":"name","of":"anchor","one_of":["r"]}"#;
+    let src = r#"
+        import { useState } from "react";
+        function C() {
+            const [n, setN] = useState(0);
+            const [r, setR] = useState(setN(1));
+            return <div>{n}{r}</div>;
+        }
+    "#;
+
+    let sev = |branches: &str| {
+        let diags = run_pack(&rule(branches), src, &Options::new());
+        let d = diags.iter().find(|d| d.var.is_none()).expect("a finding");
+        d.severity()
+    };
+    assert_eq!(sev(&format!("{must},{may}")), Severity::Error);
+    assert_eq!(sev(&format!("{may},{must}")), Severity::Error);
+}
+
+#[test]
+fn any_of_rejects_a_single_branch_and_validates_children() {
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls","kind":"custom"},
+            "guards":[{"kind":"any_of","guards":[{"kind":"name","of":"anchor","prefix":"x"}]}],
+            "message":"m"}"#,
+    ));
+    assert_eq!(e.path, "rules[0].guards[0].guards");
+    assert!(e.message.contains("at least two"), "{e}");
+
+    // A child is validated in the same sort environment, with its own path.
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls","kind":"effect"},
+            "guards":[{"kind":"any_of","guards":[
+                {"kind":"deps_declared","of":"anchor","eq":true},
+                {"kind":"source","of":"anchor","one_of":["x"]}]}],
+            "message":"m"}"#,
+    ));
+    assert_eq!(e.path, "rules[0].guards[0].guards[1].of");
+}
+
+/// A `must_*` branch on the default `else: keep` always passes, so the
+/// disjunction is vacuous and every other branch is dead code.
+#[test]
+fn any_of_warns_on_a_vacuous_must_branch() {
+    let pack = load(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"error",
+            "anchor":{"relation":"hook_calls","kind":"state"},
+            "guards":[{"kind":"any_of","guards":[
+                {"kind":"must_init_calls_setter","of":"anchor"},
+                {"kind":"name","of":"anchor","one_of":["x"]}]}],
+            "message":"m"}"#,
+    ))
+    .expect("loads");
+    assert!(
+        pack.warnings
+            .iter()
+            .any(|w| w.message.contains("always passes")),
+        "{:?}",
+        pack.warnings
+    );
+}

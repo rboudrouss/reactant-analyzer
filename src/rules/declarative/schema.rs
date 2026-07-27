@@ -232,6 +232,14 @@ pub enum Guard {
         #[serde(rename = "else", default)]
         r#else: ElseBehavior,
     },
+    /// Disjunction: the candidate passes when **any** listed guard passes.
+    /// The guard list of a rule is a conjunction, so this is the only way to
+    /// write "X or Y" without duplicating a rule and its docs.
+    ///
+    /// Universal quantification over a `forEach` edge is a different question
+    /// and stays refused (ADR-023 §4): this composes guards, it does not fold
+    /// over elements.
+    AnyOf { guards: Vec<Guard> },
 }
 
 /// What happens to a finding whose must-guard did not certify: `keep` (the

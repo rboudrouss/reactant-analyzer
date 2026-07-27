@@ -59,6 +59,66 @@ enum Bound<'a, 'b> {
     Dep(&'b DepEntity<'a>),
 }
 
+/// One candidate under evaluation: whatever the anchor bound, plus the
+/// `forEach` element if the rule navigates an edge. The two anchors used to
+/// have a guard match each, so a guard could be handled on one and silently
+/// fall into an `unreachable!` catch-all on the other.
+enum Candidate<'a, 'b> {
+    Hook {
+        row: &'b HookRow<'a>,
+        bound: Option<Bound<'a, 'b>>,
+    },
+    RenderSetter(&'b SetterEntity),
+}
+
+impl<'a, 'b> Candidate<'a, 'b> {
+    fn row(&self) -> Option<&'b HookRow<'a>> {
+        match self {
+            Candidate::Hook { row, .. } => Some(row),
+            Candidate::RenderSetter(_) => None,
+        }
+    }
+
+    fn bound(&self) -> Option<&Bound<'a, 'b>> {
+        match self {
+            Candidate::Hook { bound, .. } => bound.as_ref(),
+            Candidate::RenderSetter(_) => None,
+        }
+    }
+
+    /// Resolve a guard/template subject to its entity value.
+    fn entity_at(&self, r: BindRef) -> EntityVal<'a, '_> {
+        match (r, self) {
+            (BindRef::Anchor, Candidate::Hook { row, .. }) => EntityVal::Hook(row),
+            (BindRef::Anchor, Candidate::RenderSetter(s)) => EntityVal::Setter(s),
+            (BindRef::Bound, _) => match self.bound().expect("validated: binding exists") {
+                Bound::Setter(s) => EntityVal::Setter(s),
+                Bound::Dep(d) => EntityVal::Dep(d),
+            },
+        }
+    }
+
+    /// The hook label a finding on this candidate carries.
+    fn label(&self) -> Option<HookLabel> {
+        match self {
+            Candidate::Hook { row, .. } => Some(row.info.label),
+            Candidate::RenderSetter(s) => s.slot,
+        }
+    }
+
+    /// Where the finding is anchored: the bound setter's call site when the
+    /// rule navigated to one, the hook call otherwise.
+    fn range(&self) -> Option<SourceRange> {
+        match self {
+            Candidate::Hook { row, bound } => match bound {
+                Some(Bound::Setter(s)) => s.span,
+                Some(Bound::Dep(_)) | None => row.info.span,
+            },
+            Candidate::RenderSetter(s) => s.span,
+        }
+    }
+}
+
 impl Rule for TierARule {
     fn name(&self) -> &str {
         &self.def.id
@@ -73,21 +133,42 @@ impl Rule for TierARule {
                     match self.def.for_each {
                         Some(EdgeName::Deps) => {
                             for dep in e.deps(&row) {
-                                self.eval(&e, &row, Some(Bound::Dep(&dep)), &mut out);
+                                self.eval(
+                                    &e,
+                                    &Candidate::Hook {
+                                        row: &row,
+                                        bound: Some(Bound::Dep(&dep)),
+                                    },
+                                    &mut out,
+                                );
                             }
                         }
                         Some(EdgeName::BodySetterCalls) => {
                             for setter in e.body_setters(&row) {
-                                self.eval(&e, &row, Some(Bound::Setter(&setter)), &mut out);
+                                self.eval(
+                                    &e,
+                                    &Candidate::Hook {
+                                        row: &row,
+                                        bound: Some(Bound::Setter(&setter)),
+                                    },
+                                    &mut out,
+                                );
                             }
                         }
-                        None => self.eval(&e, &row, None, &mut out),
+                        None => self.eval(
+                            &e,
+                            &Candidate::Hook {
+                                row: &row,
+                                bound: None,
+                            },
+                            &mut out,
+                        ),
                     }
                 }
             }
             ResolvedAnchor::RenderSetterCalls => {
                 for setter in e.render_setters() {
-                    self.eval_render_setter(&e, &setter, &mut out);
+                    self.eval(&e, &Candidate::RenderSetter(&setter), &mut out);
                 }
             }
         }
@@ -96,72 +177,12 @@ impl Rule for TierARule {
 }
 
 impl TierARule {
-    /// Evaluate guards for one (hook anchor, bound entity) candidate; emit on
-    /// full pass. Guards run in author order and short-circuit.
-    fn eval(
-        &self,
-        e: &EntityCtx<'_>,
-        row: &HookRow<'_>,
-        bound: Option<Bound<'_, '_>>,
-        out: &mut Vec<Diagnostic>,
-    ) {
+    /// Evaluate every guard against one candidate; emit on a full pass. Guards
+    /// run in author order and short-circuit on the first failure.
+    fn eval(&self, e: &EntityCtx<'_>, cand: &Candidate<'_, '_>, out: &mut Vec<Diagnostic>) {
         let mut proofs: Vec<Proof> = Vec::new();
-
         for guard in &self.def.guards {
-            let pass = match guard {
-                // The `bound` matches below are exhaustive, not refutable
-                // `let`s: a new edge would otherwise validate, load, and
-                // silently emit nothing.
-                ResolvedGuard::Stability { names, negated, .. } => match bound.as_ref() {
-                    Some(Bound::Dep(dep)) => names.contains(&e.dep_verdict(dep)) != *negated,
-                    Some(Bound::Setter(_)) | None => {
-                        unreachable!("validated: `stability` binds a deps entry")
-                    }
-                },
-                ResolvedGuard::InDeps { negate, .. } => match bound.as_ref() {
-                    Some(Bound::Setter(setter)) => {
-                        let in_deps = setter
-                            .slot
-                            .is_some_and(|slot| e.dep_slots(row).contains(&slot));
-                        in_deps != *negate
-                    }
-                    Some(Bound::Dep(_)) | None => {
-                        unreachable!("validated: `in_deps` binds a body setter call")
-                    }
-                },
-                ResolvedGuard::Text {
-                    of,
-                    field,
-                    one_of,
-                    prefix,
-                } => text_matches(
-                    e.field_raw(&entity_at(*of, row, bound.as_ref()), *field),
-                    one_of,
-                    prefix,
-                ),
-                ResolvedGuard::Count(cmp) => {
-                    let len = row.effect.map_or(0, |i| i.declared_deps.len()) as u64;
-                    match cmp {
-                        CountCmp::MoreThan(n) => len > *n,
-                        CountCmp::LessThan(n) => len < *n,
-                        CountCmp::Equals(n) => len == *n,
-                    }
-                }
-                ResolvedGuard::DepsDeclared { eq } => {
-                    row.effect.is_some_and(|i| i.has_deps_array) == *eq
-                }
-                ResolvedGuard::Must { kind, els, .. } => {
-                    match (self.certify(e, row, bound.as_ref(), *kind), els) {
-                        (Some(p), _) => {
-                            proofs.push(p);
-                            true
-                        }
-                        (None, ElseBehavior::Keep) => true,
-                        (None, ElseBehavior::Drop) => false,
-                    }
-                }
-            };
-            if !pass {
+            if !self.eval_guard(e, cand, guard, &mut proofs) {
                 return;
             }
         }
@@ -172,90 +193,99 @@ impl TierARule {
             .iter()
             .map(|seg| match seg {
                 Segment::Lit(s) => s.clone(),
-                Segment::Field(r, f) => e.render_field(&entity_at(*r, row, bound.as_ref()), *f),
+                Segment::Field(r, f) => e.render_field(&cand.entity_at(*r), *f),
             })
             .collect();
-        let range = match bound.as_ref() {
-            Some(Bound::Setter(s)) => s.span,
-            Some(Bound::Dep(_)) | None => row.info.span,
-        };
-        out.push(self.emit(message, proofs, Some(row.info.label), range));
+        out.push(self.emit(message, proofs, cand.label(), cand.range()));
     }
 
-    /// Same loop for the `render_setter_calls` anchor (no edges in v1; only
-    /// `name` and `must_dominates_all_exits` guards survive validation).
-    fn eval_render_setter(
+    /// One guard against one candidate. Recursive for `any_of`; proofs
+    /// collected along the way are pushed onto `proofs` whether or not the
+    /// guard ends up passing, because a certified sub-claim is evidence for
+    /// the finding either way.
+    fn eval_guard(
         &self,
         e: &EntityCtx<'_>,
-        setter: &SetterEntity,
-        out: &mut Vec<Diagnostic>,
-    ) {
-        let mut proofs: Vec<Proof> = Vec::new();
-
-        for guard in &self.def.guards {
-            let pass = match guard {
-                ResolvedGuard::Text {
-                    field,
-                    one_of,
-                    prefix,
-                    ..
-                } => text_matches(
-                    e.field_raw(&EntityVal::Setter(setter), *field),
-                    one_of,
-                    prefix,
-                ),
-                ResolvedGuard::Must {
-                    kind: MustKind::DominatesAllExits,
-                    els,
-                    ..
-                } => {
-                    let proof = setter.block_id.and_then(|b| match e.exit_dom().certify(b) {
-                        MustResult::All(c) => Some(Proof::Dominates(c)),
-                        _ => None,
-                    });
-                    match (proof, els) {
-                        (Some(p), _) => {
-                            proofs.push(p);
-                            true
-                        }
-                        (None, ElseBehavior::Keep) => true,
-                        (None, ElseBehavior::Drop) => false,
-                    }
+        cand: &Candidate<'_, '_>,
+        guard: &ResolvedGuard,
+        proofs: &mut Vec<Proof>,
+    ) -> bool {
+        // Every `bound` match below is exhaustive, not a refutable `let`: a
+        // new edge would otherwise validate, load, and silently emit nothing.
+        match guard {
+            ResolvedGuard::Stability { names, negated, .. } => match cand.bound() {
+                Some(Bound::Dep(dep)) => names.contains(&e.dep_verdict(dep)) != *negated,
+                Some(Bound::Setter(_)) | None => {
+                    unreachable!("validated: `stability` binds a deps entry")
                 }
-                _ => unreachable!("validated: guard not applicable to render_setter_calls"),
-            };
-            if !pass {
-                return;
+            },
+            ResolvedGuard::InDeps { negate, .. } => match (cand.row(), cand.bound()) {
+                (Some(row), Some(Bound::Setter(setter))) => {
+                    let in_deps = setter
+                        .slot
+                        .is_some_and(|slot| e.dep_slots(row).contains(&slot));
+                    in_deps != *negate
+                }
+                _ => unreachable!("validated: `in_deps` binds a body setter call"),
+            },
+            ResolvedGuard::Text {
+                of,
+                field,
+                one_of,
+                prefix,
+            } => text_matches(e.field_raw(&cand.entity_at(*of), *field), one_of, prefix),
+            ResolvedGuard::Count(cmp) => {
+                let len = cand
+                    .row()
+                    .and_then(|r| r.effect)
+                    .map_or(0, |i| i.declared_deps.len()) as u64;
+                match cmp {
+                    CountCmp::MoreThan(n) => len > *n,
+                    CountCmp::LessThan(n) => len < *n,
+                    CountCmp::Equals(n) => len == *n,
+                }
+            }
+            ResolvedGuard::DepsDeclared { eq } => {
+                cand.row()
+                    .and_then(|r| r.effect)
+                    .is_some_and(|i| i.has_deps_array)
+                    == *eq
+            }
+            ResolvedGuard::Must { kind, els, .. } => match (self.certify(e, cand, *kind), els) {
+                (Some(p), _) => {
+                    proofs.push(p);
+                    true
+                }
+                (None, ElseBehavior::Keep) => true,
+                (None, ElseBehavior::Drop) => false,
+            },
+            // Every branch is evaluated: short-circuiting would make whether a
+            // `must_*` branch contributes its proof — and therefore whether the
+            // finding can reach Error — depend on the order the author wrote
+            // the branches in.
+            ResolvedGuard::AnyOf(children) => {
+                // Not `.any()`: it short-circuits, and each call pushes proofs.
+                let mut passed = false;
+                for child in children {
+                    passed |= self.eval_guard(e, cand, child, proofs);
+                }
+                passed
             }
         }
-
-        let message: String = self
-            .def
-            .message
-            .iter()
-            .map(|seg| match seg {
-                Segment::Lit(s) => s.clone(),
-                Segment::Field(_, f) => e.render_field(&EntityVal::Setter(setter), *f),
-            })
-            .collect();
-        out.push(self.emit(message, proofs, setter.slot, setter.span));
     }
 
     /// Run the must-primitive backing `kind` for this finding's subject.
     fn certify(
         &self,
         e: &EntityCtx<'_>,
-        row: &HookRow<'_>,
-        bound: Option<&Bound<'_, '_>>,
+        cand: &Candidate<'_, '_>,
         kind: MustKind,
     ) -> Option<Proof> {
         match kind {
             MustKind::SetterOnAllPaths => {
-                let setter = match bound {
-                    Some(Bound::Setter(s)) => s,
-                    Some(Bound::Dep(_)) | None => {
-                        unreachable!("validated: `must_setter_on_all_paths` binds a body setter")
-                    }
+                let (row, setter) = match (cand.row(), cand.bound()) {
+                    (Some(row), Some(Bound::Setter(s))) => (row, s),
+                    _ => unreachable!("validated: `must_setter_on_all_paths` binds a body setter"),
                 };
                 let body = row.entry.and_then(|en| en.body_cfg())?;
                 // The alias set for the subject's slot — the primitive's own
@@ -273,8 +303,20 @@ impl TierARule {
                     _ => None,
                 }
             }
-            MustKind::DominatesAllExits => unreachable!("validated: render anchor only"),
+            MustKind::DominatesAllExits => {
+                let setter = match cand {
+                    Candidate::RenderSetter(s) => s,
+                    Candidate::Hook { .. } => {
+                        unreachable!("validated: `must_dominates_all_exits` binds a render setter")
+                    }
+                };
+                setter.block_id.and_then(|b| match e.exit_dom().certify(b) {
+                    MustResult::All(c) => Some(Proof::Dominates(c)),
+                    _ => None,
+                })
+            }
             MustKind::InitCallsSetter => {
+                let row = cand.row().expect("validated: hook anchor");
                 let init = match row.entry {
                     Some(HookEntry::State { init, .. } | HookEntry::Ref { init, .. }) => init,
                     _ => return None,
@@ -284,11 +326,13 @@ impl TierARule {
                     _ => None,
                 }
             }
-            MustKind::HookIsConditional => e
-                .conditional()
-                .get(&row.info.label)
-                .cloned()
-                .map(Proof::Conditional),
+            MustKind::HookIsConditional => {
+                let row = cand.row().expect("validated: hook anchor");
+                e.conditional()
+                    .get(&row.info.label)
+                    .cloned()
+                    .map(Proof::Conditional)
+            }
         }
     }
 
@@ -330,24 +374,6 @@ impl TierARule {
     }
 }
 
-/// Resolve a guard/template subject to its entity value.
-fn entity_at<'a, 'b>(
-    r: BindRef,
-    row: &'b HookRow<'a>,
-    bound: Option<&'b Bound<'a, 'b>>,
-) -> EntityVal<'a, 'b> {
-    match r {
-        BindRef::Anchor => EntityVal::Hook(row),
-        BindRef::Bound => match bound.expect("validated: binding exists") {
-            Bound::Setter(s) => EntityVal::Setter(s),
-            Bound::Dep(d) => EntityVal::Dep(d),
-        },
-    }
-}
-
-/// Positive-only field matching (ADR-023): an absent value **fails**. A
-/// negative form would let an unknown value pass a guard and, combined with a
-/// must-guard, carry an Error on a candidate whose field we never resolved.
 fn text_matches(
     value: Option<String>,
     one_of: &Option<Vec<String>>,

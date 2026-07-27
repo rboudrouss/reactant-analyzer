@@ -393,6 +393,26 @@
             "kind",
             "of"
           ]
+        },
+        {
+          "description": "Disjunction: the candidate passes when **any** listed guard passes.\nThe guard list of a rule is a conjunction, so this is the only way to\nwrite \"X or Y\" without duplicating a rule and its docs.\n\nUniversal quantification over a `forEach` edge is a different question\nand stays refused (ADR-023 §4): this composes guards, it does not fold\nover elements.",
+          "type": "object",
+          "properties": {
+            "guards": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Guard"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "any_of"
+            }
+          },
+          "required": [
+            "kind",
+            "guards"
+          ]
         }
       ]
     },

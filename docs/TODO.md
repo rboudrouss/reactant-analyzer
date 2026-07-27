@@ -225,8 +225,12 @@ expressible, all in weakened form**. The blockers, in decreasing leverage:
   edge, so "every dep is stable" cannot be stated. The only workaround is to pin
   the arity (`count equals 1` alongside the per-element guard), which is why
   `guardrails/inert-single-dep` covers single-dep effects and nothing wider.
-- **Guards are a conjunction** — no disjunction, so "X or Y" costs two rules with
-  duplicated docs.
+- ~~**Guards are a conjunction**~~ — **fixed**: `any_of` composes guards into a
+  tree (ADR-023 §4 cleared it; ∀ over an edge stays refused). Every branch is
+  evaluated rather than short-circuited, or whether a `must_*` branch
+  contributes its proof — and so whether the finding can reach Error — would
+  depend on the order the author wrote the branches in. A `must_*` branch left
+  on the default `else: keep` makes the disjunction vacuous and warns at load.
 - ~~**`source` is renderable but not guardable**~~ — **fixed**: a `source` guard
   matches the import specifier with `one_of`/`prefix`, so a package (or a whole
   `@scope/` prefix) can be banned, not just a local name. It is bound to
@@ -278,10 +282,13 @@ records why vocabulary work comes after attribution and after the engine facts.
    struck-through entries above for what each turned into. Field guards stayed
    positive-only, absent ⇒ fail (ADR-023).
 
-3. **`any_of` disjunction** *(S)* — ADR-023 §4 explicitly clears it: guard-tree
-   composition, no quantifier hazard. Ship it as the one recursive `eval_guard` /
-   `validate_guard` that also collapses `exec.rs`'s two duplicated guard matches.
-   ∀ (`quantifier: all`) is **refused** — see the ADR for the two false negatives.
+3. ~~**`any_of` disjunction**~~ — **done**, as the one recursive
+   `eval_guard`/`validate_guard`. The executor's two duplicated guard matches
+   collapsed into one over a `Candidate` (hook row + optional edge element, or
+   render setter), which also removed the `_ => unreachable!` catch-all that let
+   a guard be handled on one anchor and silently fall through on the other.
+   ∀ (`quantifier: all`) stays **refused** — see the ADR for the two false
+   negatives.
 
 4. **Effect cleanup as an engine fact → native `missing-cleanup`** *(M)* — pervasive
    in 6 of 8 corpora and already listed under "Proposed rules" below. Engine first:

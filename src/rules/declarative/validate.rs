@@ -159,6 +159,11 @@ pub(crate) enum ResolvedGuard {
         of: BindRef,
         els: ElseBehavior,
     },
+    /// Passes when any child passes. Every child is evaluated, not
+    /// short-circuited: a `must_*` child that certifies contributes its proof,
+    /// and stopping at the first pass would make the finding's severity depend
+    /// on the order the author happened to write the branches in.
+    AnyOf(Vec<ResolvedGuard>),
 }
 
 /// A field of a bound entity — what `{binding.field}` renders and what a
@@ -321,6 +326,7 @@ fn guard_allowed_keys(g: &Guard) -> (&'static str, &'static [&'static str]) {
         Guard::MustHookIsConditional { .. } => {
             ("guard `must_hook_is_conditional`", &["kind", "of", "else"])
         }
+        Guard::AnyOf { .. } => ("guard `any_of`", &["kind", "guards"]),
     }
 }
 
@@ -583,241 +589,28 @@ fn validate_rule(
         bound_name = Some(fe.bind.as_str());
     }
 
-    // A guard's subject: "anchor" or the forEach binding.
-    let resolve_of = |of: &str, g_path: &str| -> Result<(BindRef, Sort), PackError> {
-        if of == "anchor" {
-            Ok((BindRef::Anchor, anchor_sort))
-        } else if Some(of) == bound_name {
-            Ok((BindRef::Bound, bound_sort.unwrap()))
-        } else {
-            Err(PackError::new(
-                format!("{g_path}.of"),
-                match bound_name {
-                    Some(b) => format!("unknown binding `{of}` — available: anchor, {b}"),
-                    None => format!("unknown binding `{of}` — available: anchor"),
-                },
-            ))
-        }
-    };
-
     let env = ParamEnv::build(&def.params, options, &path)?;
+    let cx = GuardCx {
+        anchor_sort,
+        bound_name,
+        bound_sort,
+        env: &env,
+    };
 
     // Guards.
     let mut guards = Vec::with_capacity(def.guards.len());
     let mut has_must = false;
+    let mut guard_warnings: Vec<String> = Vec::new();
     for (gi, guard) in def.guards.iter().enumerate() {
         let g_path = format!("{path}.guards[{gi}]");
-        let (what, allowed) = guard_allowed_keys(guard);
-        check_keys(&raw_rule["guards"][gi], allowed, what, &g_path)?;
-
-        let resolved = match guard {
-            Guard::Stability { of, is, not } => {
-                let (of, sort) = resolve_of(of, &g_path)?;
-                if sort != Sort::Dep {
-                    return Err(PackError::new(
-                        format!("{g_path}.of"),
-                        format!(
-                            "guard `stability` applies to a deps entry, but the subject binds {}",
-                            sort.describe()
-                        ),
-                    ));
-                }
-                let (names, negated) = match (is, not) {
-                    (Some(pv), None) => (env.resolve(pv, None, &format!("{g_path}.is"))?, false),
-                    (None, Some(pv)) => (env.resolve(pv, None, &format!("{g_path}.not"))?, true),
-                    _ => {
-                        return Err(PackError::new(
-                            &g_path,
-                            "guard `stability` takes exactly one of `is` / `not`",
-                        ));
-                    }
-                };
-                if names.is_empty() {
-                    return Err(PackError::new(
-                        &g_path,
-                        "the verdict list must not be empty",
-                    ));
-                }
-                ResolvedGuard::Stability { of, names, negated }
-            }
-            Guard::InDeps { of, negate } => {
-                let (of, sort) = resolve_of(of, &g_path)?;
-                if sort != Sort::SetterBody {
-                    return Err(PackError::new(
-                        format!("{g_path}.of"),
-                        format!(
-                            "guard `in_deps` applies to a body setter call, but the subject \
-                             binds {}",
-                            sort.describe()
-                        ),
-                    ));
-                }
-                if !admits_deps(anchor_sort) {
-                    return Err(PackError::new(
-                        &g_path,
-                        format!(
-                            "guard `in_deps` needs an anchor with a deps array \
-                             (effect/memo/callback), but the anchor binds {}",
-                            anchor_sort.describe()
-                        ),
-                    ));
-                }
-                ResolvedGuard::InDeps {
-                    of,
-                    negate: *negate,
-                }
-            }
-            // `name` and `source` are one matcher over two fields. The subject
-            // check is `Field::admits` — the same table the templates use, so
-            // a field can never be renderable but unguardable (or the reverse).
-            Guard::Name { of, one_of, prefix } => {
-                text_guard(Field::Name, of, one_of, prefix, &resolve_of, &env, &g_path)?
-            }
-            Guard::Source { of, one_of, prefix } => text_guard(
-                Field::Source,
-                of,
-                one_of,
-                prefix,
-                &resolve_of,
-                &env,
-                &g_path,
-            )?,
-            Guard::Count {
-                of,
-                more_than,
-                less_than,
-                equals,
-            } => {
-                if of != "anchor.deps" {
-                    return Err(PackError::new(
-                        format!("{g_path}.of"),
-                        format!("guard `count` counts `anchor.deps` (got `{of}`)"),
-                    ));
-                }
-                if !admits_deps(anchor_sort) {
-                    return Err(PackError::new(
-                        &g_path,
-                        format!(
-                            "guard `count` needs an anchor with a deps array \
-                             (effect/memo/callback), but the anchor binds {}",
-                            anchor_sort.describe()
-                        ),
-                    ));
-                }
-                let cmp = match (more_than, less_than, equals) {
-                    (Some(pv), None, None) => CountCmp::MoreThan(env.resolve(
-                        pv,
-                        Some(ParamType::Number),
-                        &format!("{g_path}.more_than"),
-                    )?),
-                    (None, Some(pv), None) => CountCmp::LessThan(env.resolve(
-                        pv,
-                        Some(ParamType::Number),
-                        &format!("{g_path}.less_than"),
-                    )?),
-                    (None, None, Some(pv)) => CountCmp::Equals(env.resolve(
-                        pv,
-                        Some(ParamType::Number),
-                        &format!("{g_path}.equals"),
-                    )?),
-                    _ => {
-                        return Err(PackError::new(
-                            &g_path,
-                            "guard `count` takes exactly one of `more_than` / `less_than` / \
-                             `equals`",
-                        ));
-                    }
-                };
-                ResolvedGuard::Count(cmp)
-            }
-            Guard::DepsDeclared { of, eq } => {
-                let (of_ref, sort) = resolve_of(of, &g_path)?;
-                if of_ref != BindRef::Anchor || !admits_deps(sort) {
-                    return Err(PackError::new(
-                        format!("{g_path}.of"),
-                        "guard `deps_declared` applies to an effect/memo/callback anchor",
-                    ));
-                }
-                ResolvedGuard::DepsDeclared {
-                    eq: env.resolve(eq, Some(ParamType::Boolean), &format!("{g_path}.eq"))?,
-                }
-            }
-            Guard::MustSetterOnAllPaths { of, r#else } => {
-                let (of, sort) = resolve_of(of, &g_path)?;
-                if sort != Sort::SetterBody {
-                    return Err(PackError::new(
-                        format!("{g_path}.of"),
-                        format!(
-                            "guard `must_setter_on_all_paths` applies to a body setter call, \
-                             but the subject binds {}",
-                            sort.describe()
-                        ),
-                    ));
-                }
-                has_must = true;
-                ResolvedGuard::Must {
-                    kind: MustKind::SetterOnAllPaths,
-                    of,
-                    els: *r#else,
-                }
-            }
-            Guard::MustDominatesAllExits { of, r#else } => {
-                let (of, sort) = resolve_of(of, &g_path)?;
-                if sort != Sort::SetterRender {
-                    return Err(PackError::new(
-                        format!("{g_path}.of"),
-                        format!(
-                            "guard `must_dominates_all_exits` applies to a render setter call, \
-                             but the subject binds {}",
-                            sort.describe()
-                        ),
-                    ));
-                }
-                has_must = true;
-                ResolvedGuard::Must {
-                    kind: MustKind::DominatesAllExits,
-                    of,
-                    els: *r#else,
-                }
-            }
-            Guard::MustInitCallsSetter { of, r#else } => {
-                let (of_ref, sort) = resolve_of(of, &g_path)?;
-                // The two hooks that take an initializer React evaluates on
-                // every render; native `lazy-init` covers exactly the same pair.
-                let has_init = matches!(
-                    sort,
-                    Sort::Hook(Some(HookKindFilter::State | HookKindFilter::Ref))
-                );
-                if of_ref != BindRef::Anchor || !has_init {
-                    return Err(PackError::new(
-                        format!("{g_path}.of"),
-                        "guard `must_init_calls_setter` applies to a state- or ref-hook anchor",
-                    ));
-                }
-                has_must = true;
-                ResolvedGuard::Must {
-                    kind: MustKind::InitCallsSetter,
-                    of: of_ref,
-                    els: *r#else,
-                }
-            }
-            Guard::MustHookIsConditional { of, r#else } => {
-                let (of_ref, sort) = resolve_of(of, &g_path)?;
-                if of_ref != BindRef::Anchor || !matches!(sort, Sort::Hook(_)) {
-                    return Err(PackError::new(
-                        format!("{g_path}.of"),
-                        "guard `must_hook_is_conditional` applies to the hook-call anchor",
-                    ));
-                }
-                has_must = true;
-                ResolvedGuard::Must {
-                    kind: MustKind::HookIsConditional,
-                    of: of_ref,
-                    els: *r#else,
-                }
-            }
-        };
-        guards.push(resolved);
+        guards.push(validate_guard(
+            guard,
+            &raw_rule["guards"][gi],
+            &g_path,
+            &cx,
+            &mut has_must,
+            &mut guard_warnings,
+        )?);
     }
 
     // Message template.
@@ -830,6 +623,12 @@ fn validate_rule(
         &format!("{path}.message"),
     )?;
 
+    for message in guard_warnings {
+        warnings.push(LoadWarning {
+            rule: full_id.clone(),
+            message,
+        });
+    }
     // §3: the only static severity check is a WARNING, never a rejection —
     // a pin of "error" with no must-guard can never be reached.
     if def.severity == SeverityPin::Error && !has_must {
@@ -861,6 +660,289 @@ fn validate_rule(
     })
 }
 
+/// Everything a guard is validated against: the anchor's sort, the `forEach`
+/// binding if there is one, and the resolved params.
+struct GuardCx<'a> {
+    anchor_sort: Sort,
+    bound_name: Option<&'a str>,
+    bound_sort: Option<Sort>,
+    env: &'a ParamEnv<'a>,
+}
+
+impl GuardCx<'_> {
+    /// A guard's subject: "anchor" or the forEach binding.
+    fn resolve_of(&self, of: &str, g_path: &str) -> Result<(BindRef, Sort), PackError> {
+        if of == "anchor" {
+            Ok((BindRef::Anchor, self.anchor_sort))
+        } else if Some(of) == self.bound_name {
+            Ok((BindRef::Bound, self.bound_sort.unwrap()))
+        } else {
+            Err(PackError::new(
+                format!("{g_path}.of"),
+                match self.bound_name {
+                    Some(b) => format!("unknown binding `{of}` — available: anchor, {b}"),
+                    None => format!("unknown binding `{of}` — available: anchor"),
+                },
+            ))
+        }
+    }
+}
+
+/// Validate one guard, recursively for `any_of`. `has_must` accumulates over
+/// the whole tree: a certifying guard anywhere in it can mint an Error, so the
+/// §3 "pinned error with no must_*" warning must see through disjunctions.
+fn validate_guard(
+    guard: &Guard,
+    raw: &serde_json::Value,
+    g_path: &str,
+    cx: &GuardCx<'_>,
+    has_must: &mut bool,
+    warnings: &mut Vec<String>,
+) -> Result<ResolvedGuard, PackError> {
+    let (what, allowed) = guard_allowed_keys(guard);
+    check_keys(raw, allowed, what, g_path)?;
+    Ok(match guard {
+        Guard::Stability { of, is, not } => {
+            let (of, sort) = cx.resolve_of(of, g_path)?;
+            if sort != Sort::Dep {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    format!(
+                        "guard `stability` applies to a deps entry, but the subject binds {}",
+                        sort.describe()
+                    ),
+                ));
+            }
+            let (names, negated) = match (is, not) {
+                (Some(pv), None) => (cx.env.resolve(pv, None, &format!("{g_path}.is"))?, false),
+                (None, Some(pv)) => (cx.env.resolve(pv, None, &format!("{g_path}.not"))?, true),
+                _ => {
+                    return Err(PackError::new(
+                        g_path,
+                        "guard `stability` takes exactly one of `is` / `not`",
+                    ));
+                }
+            };
+            if names.is_empty() {
+                return Err(PackError::new(g_path, "the verdict list must not be empty"));
+            }
+            ResolvedGuard::Stability { of, names, negated }
+        }
+        Guard::InDeps { of, negate } => {
+            let (of, sort) = cx.resolve_of(of, g_path)?;
+            if sort != Sort::SetterBody {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    format!(
+                        "guard `in_deps` applies to a body setter call, but the subject \
+                         binds {}",
+                        sort.describe()
+                    ),
+                ));
+            }
+            if !admits_deps(cx.anchor_sort) {
+                return Err(PackError::new(
+                    g_path,
+                    format!(
+                        "guard `in_deps` needs an anchor with a deps array \
+                         (effect/memo/callback), but the anchor binds {}",
+                        cx.anchor_sort.describe()
+                    ),
+                ));
+            }
+            ResolvedGuard::InDeps {
+                of,
+                negate: *negate,
+            }
+        }
+        // `name` and `source` are one matcher over two fields. The subject
+        // check is `Field::admits` — the same table the templates use, so
+        // a field can never be renderable but unguardable (or the reverse).
+        Guard::Name { of, one_of, prefix } => {
+            text_guard(Field::Name, of, one_of, prefix, cx, g_path)?
+        }
+        Guard::Source { of, one_of, prefix } => {
+            text_guard(Field::Source, of, one_of, prefix, cx, g_path)?
+        }
+        Guard::Count {
+            of,
+            more_than,
+            less_than,
+            equals,
+        } => {
+            if of != "anchor.deps" {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    format!("guard `count` counts `anchor.deps` (got `{of}`)"),
+                ));
+            }
+            if !admits_deps(cx.anchor_sort) {
+                return Err(PackError::new(
+                    g_path,
+                    format!(
+                        "guard `count` needs an anchor with a deps array \
+                         (effect/memo/callback), but the anchor binds {}",
+                        cx.anchor_sort.describe()
+                    ),
+                ));
+            }
+            let cmp = match (more_than, less_than, equals) {
+                (Some(pv), None, None) => CountCmp::MoreThan(cx.env.resolve(
+                    pv,
+                    Some(ParamType::Number),
+                    &format!("{g_path}.more_than"),
+                )?),
+                (None, Some(pv), None) => CountCmp::LessThan(cx.env.resolve(
+                    pv,
+                    Some(ParamType::Number),
+                    &format!("{g_path}.less_than"),
+                )?),
+                (None, None, Some(pv)) => CountCmp::Equals(cx.env.resolve(
+                    pv,
+                    Some(ParamType::Number),
+                    &format!("{g_path}.equals"),
+                )?),
+                _ => {
+                    return Err(PackError::new(
+                        g_path,
+                        "guard `count` takes exactly one of `more_than` / `less_than` / \
+                         `equals`",
+                    ));
+                }
+            };
+            ResolvedGuard::Count(cmp)
+        }
+        Guard::DepsDeclared { of, eq } => {
+            let (of_ref, sort) = cx.resolve_of(of, g_path)?;
+            if of_ref != BindRef::Anchor || !admits_deps(sort) {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    "guard `deps_declared` applies to an effect/memo/callback anchor",
+                ));
+            }
+            ResolvedGuard::DepsDeclared {
+                eq: cx
+                    .env
+                    .resolve(eq, Some(ParamType::Boolean), &format!("{g_path}.eq"))?,
+            }
+        }
+        Guard::MustSetterOnAllPaths { of, r#else } => {
+            let (of, sort) = cx.resolve_of(of, g_path)?;
+            if sort != Sort::SetterBody {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    format!(
+                        "guard `must_setter_on_all_paths` applies to a body setter call, \
+                         but the subject binds {}",
+                        sort.describe()
+                    ),
+                ));
+            }
+            *has_must = true;
+            ResolvedGuard::Must {
+                kind: MustKind::SetterOnAllPaths,
+                of,
+                els: *r#else,
+            }
+        }
+        Guard::MustDominatesAllExits { of, r#else } => {
+            let (of, sort) = cx.resolve_of(of, g_path)?;
+            if sort != Sort::SetterRender {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    format!(
+                        "guard `must_dominates_all_exits` applies to a render setter call, \
+                         but the subject binds {}",
+                        sort.describe()
+                    ),
+                ));
+            }
+            *has_must = true;
+            ResolvedGuard::Must {
+                kind: MustKind::DominatesAllExits,
+                of,
+                els: *r#else,
+            }
+        }
+        Guard::MustInitCallsSetter { of, r#else } => {
+            let (of_ref, sort) = cx.resolve_of(of, g_path)?;
+            // The two hooks that take an initializer React evaluates on
+            // every render; native `lazy-init` covers exactly the same pair.
+            let has_init = matches!(
+                sort,
+                Sort::Hook(Some(HookKindFilter::State | HookKindFilter::Ref))
+            );
+            if of_ref != BindRef::Anchor || !has_init {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    "guard `must_init_calls_setter` applies to a state- or ref-hook anchor",
+                ));
+            }
+            *has_must = true;
+            ResolvedGuard::Must {
+                kind: MustKind::InitCallsSetter,
+                of: of_ref,
+                els: *r#else,
+            }
+        }
+        Guard::MustHookIsConditional { of, r#else } => {
+            let (of_ref, sort) = cx.resolve_of(of, g_path)?;
+            if of_ref != BindRef::Anchor || !matches!(sort, Sort::Hook(_)) {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    "guard `must_hook_is_conditional` applies to the hook-call anchor",
+                ));
+            }
+            *has_must = true;
+            ResolvedGuard::Must {
+                kind: MustKind::HookIsConditional,
+                of: of_ref,
+                els: *r#else,
+            }
+        }
+        Guard::AnyOf { guards } => {
+            if guards.len() < 2 {
+                return Err(PackError::new(
+                    format!("{g_path}.guards"),
+                    format!(
+                        "guard `any_of` needs at least two alternatives (got {})",
+                        guards.len()
+                    ),
+                ));
+            }
+            let mut children = Vec::with_capacity(guards.len());
+            for (i, child) in guards.iter().enumerate() {
+                let c_path = format!("{g_path}.guards[{i}]");
+                // A `must_*` branch left on the default `else: keep` passes
+                // whether or not it certifies, so the disjunction is always
+                // true and every other branch is dead. Loud, but a warning:
+                // over-reporting is the tolerated direction.
+                if let Guard::MustSetterOnAllPaths { r#else, .. }
+                | Guard::MustDominatesAllExits { r#else, .. }
+                | Guard::MustInitCallsSetter { r#else, .. }
+                | Guard::MustHookIsConditional { r#else, .. } = child
+                    && *r#else == ElseBehavior::Keep
+                {
+                    warnings.push(format!(
+                        "at `{c_path}`: a `must_*` branch of `any_of` with the default \
+                         `\"else\": \"keep\"` always passes, so the disjunction is always true \
+                         — add `\"else\": \"drop\"` if the branch is meant to be a condition"
+                    ));
+                }
+                children.push(validate_guard(
+                    child,
+                    &raw["guards"][i],
+                    &c_path,
+                    cx,
+                    has_must,
+                    warnings,
+                )?);
+            }
+            ResolvedGuard::AnyOf(children)
+        }
+    })
+}
+
 /// Fields available per sort — the template's type check, derived from the one
 /// `Field` table so validation and rendering cannot disagree.
 fn field_for(sort: Sort, name: &str) -> Option<Field> {
@@ -873,18 +955,16 @@ fn field_for(sort: Sort, name: &str) -> Option<Field> {
 /// Validate a string-matching guard (`name`, `source`) against `field`. The
 /// subject must be a sort that carries the field, and exactly one of
 /// `one_of`/`prefix` must be given.
-#[allow(clippy::too_many_arguments)]
 fn text_guard(
     field: Field,
     of: &str,
     one_of: &Option<PVal<Vec<String>>>,
     prefix: &Option<PVal<String>>,
-    resolve_of: &dyn Fn(&str, &str) -> Result<(BindRef, Sort), PackError>,
-    env: &ParamEnv,
+    cx: &GuardCx<'_>,
     g_path: &str,
 ) -> Result<ResolvedGuard, PackError> {
     let kind = field.token();
-    let (of, sort) = resolve_of(of, g_path)?;
+    let (of, sort) = cx.resolve_of(of, g_path)?;
     if !field.admits(sort) {
         return Err(PackError::new(
             format!("{g_path}.of"),
@@ -903,7 +983,7 @@ fn text_guard(
         (Some(pv), None) => Ok(ResolvedGuard::Text {
             of,
             field,
-            one_of: Some(env.resolve(
+            one_of: Some(cx.env.resolve(
                 pv,
                 Some(ParamType::StringList),
                 &format!("{g_path}.one_of"),
@@ -914,7 +994,11 @@ fn text_guard(
             of,
             field,
             one_of: None,
-            prefix: Some(env.resolve(pv, Some(ParamType::String), &format!("{g_path}.prefix"))?),
+            prefix: Some(cx.env.resolve(
+                pv,
+                Some(ParamType::String),
+                &format!("{g_path}.prefix"),
+            )?),
         }),
         _ => Err(PackError::new(
             g_path,
