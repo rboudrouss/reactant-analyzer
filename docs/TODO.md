@@ -67,12 +67,19 @@ false-negative channel, and both are reproduced.
   lookup to a first-match `get_by_name`. Prerequisite for scoping any pack rule
   to a package rather than to a bare local name.
 
-- **`break`/`continue` are sealed `Unreachable` with no edge to the loop exit**
-  ([cfg_builder.rs:245-247](../src/lowering/cfg_builder.rs#L245)). Any all-paths
-  reasoning that enumerates exits sees a phantom exit and misses a real one. It
-  is latent today but it is load-bearing for `missing-cleanup` below: with
-  `Unreachable` in the exit set, an effect whose cleanup *is* reachable can read
-  as "no cleanup on any exit" and certify an Error on a non-bug.
+- ~~**`break`/`continue` are sealed `Unreachable` with no edge to the loop
+  exit**~~ — **fixed**. The diagnosis in this entry was off: the exit set
+  (`ExitDominance`) only ever counted `Return` blocks, so no phantom exit was
+  entering it. The real defect was one level down — the abstract env at the jump
+  never reached the loop exit, so a variable written only on the early-leaving
+  path was narrowed to whatever the *other* paths left. Measured on a fixture
+  where that narrowing made a dep provably stable and so suppressed
+  `infinite-loop`: 0 findings before, 1 after. Same class, found while fixing
+  it: a `switch` fell straight into its cases, so one whose every case leaves
+  (`continue`/`return`) made everything after it unreachable — no case has to
+  match, and the fall-out edge now says so. `do…while` gained a real test block
+  (`continue` runs the test). Corpus: no change in any of the eight, as
+  expected for a latent hole.
 
 - ~~**Silent no-ops in the Tier-A frontend.**~~ — **fixed**: `field_for` and
   `render_field` are one `Field`-indexed table (`Field::token`/`admits` +

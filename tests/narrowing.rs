@@ -483,3 +483,79 @@ fn aliased_setter_in_effect_assign_is_tracked() {
         "a setter aliased through an `Assign` reassignment must still loop"
     );
 }
+
+// ── break/continue carry their state out of the loop ─────────────────────────
+
+/// `break` used to seal `Unreachable` with no edge to the loop exit, so an
+/// assignment on the path that leaves early never reached the exit env: the
+/// analysis narrowed the variable to whatever the *other* paths left, an
+/// under-approximation, and the forbidden direction.
+///
+/// Here `key` is `"a"` on every path but the break, where it becomes ⊤. Losing
+/// that path made the dep *provably stable*, which suppresses `infinite-loop`
+/// (the effect "can never re-run"), and the divergence went unreported.
+/// Measured: 0 findings before the fix, 1 after.
+#[test]
+fn a_value_written_before_break_reaches_the_loop_exit() {
+    let src = r#"
+        function C({ items }) {
+            const [n, setN] = useState(0);
+            let key = "a";
+            for (const it of items) { if (it.x) { key = it.k; break; } }
+            useEffect(() => { setN(n + 1); }, [key]);
+            return <div>{n}</div>;
+        }
+    "#;
+    assert_eq!(
+        infinite_loop_hits(src),
+        1,
+        "the break path makes `key` unknown, so the effect can re-run"
+    );
+
+    // Control: with no loop at all, `key` really is the constant and the
+    // suppression is correct — the assertion above is about the edge, not
+    // about the rule being trigger-happy.
+    let no_loop = r#"
+        function C() {
+            const [n, setN] = useState(0);
+            let key = "a";
+            useEffect(() => { setN(n + 1); }, [key]);
+            return <div>{n}</div>;
+        }
+    "#;
+    assert_eq!(infinite_loop_hits(no_loop), 0);
+}
+
+/// Same for `continue`, whose target is the loop header.
+#[test]
+fn a_value_written_before_continue_reaches_the_loop_header() {
+    let src = r#"
+        function C({ items }) {
+            const [n, setN] = useState(0);
+            let key = "a";
+            for (const it of items) { if (it.x) { key = it.k; continue; } use(it); }
+            useEffect(() => { setN(n + 1); }, [key]);
+            return <div>{n}</div>;
+        }
+    "#;
+    assert_eq!(infinite_loop_hits(src), 1);
+}
+
+/// A `switch` whose every case leaves used to make everything after it
+/// unreachable: no case has to match, so the fall-out path exists.
+#[test]
+fn a_value_written_after_an_all_leaving_switch_is_seen() {
+    let src = r#"
+        function C({ mode, items }) {
+            const [n, setN] = useState(0);
+            let key = "a";
+            for (const it of items) {
+                switch (mode) { case 1: continue; }
+                key = it.k;
+            }
+            useEffect(() => { setN(n + 1); }, [key]);
+            return <div>{n}</div>;
+        }
+    "#;
+    assert_eq!(infinite_loop_hits(src), 1);
+}

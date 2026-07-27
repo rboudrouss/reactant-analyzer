@@ -25,7 +25,20 @@ pub(super) struct BlockBuilder {
     terminated: bool,
     temp_counter: usize,
     expr_counter: usize,
+    /// Enclosing breakables, innermost last. A `switch` is breakable but not
+    /// continuable, so `continue_to` is `None` there.
+    loop_stack: Vec<LoopFrame>,
+    /// Label of the statement being lowered, when it labels a loop directly.
+    pending_label: Option<String>,
     pub(super) smap: SourceMap,
+}
+
+/// One enclosing `break`/`continue` target.
+struct LoopFrame {
+    label: Option<String>,
+    break_to: BlockId,
+    /// `None` for a `switch`: `continue` skips past it to the enclosing loop.
+    continue_to: Option<BlockId>,
 }
 
 impl BlockBuilder {
@@ -39,8 +52,48 @@ impl BlockBuilder {
             terminated: false,
             temp_counter: 0,
             expr_counter: 0,
+            loop_stack: Vec::new(),
+            pending_label: None,
             smap: smap.clone(),
         }
+    }
+
+    /// Enter a breakable construct, consuming a pending label.
+    pub(super) fn push_loop(&mut self, break_to: BlockId, continue_to: Option<BlockId>) {
+        let label = self.pending_label.take();
+        self.loop_stack.push(LoopFrame {
+            label,
+            break_to,
+            continue_to,
+        });
+    }
+
+    pub(super) fn pop_loop(&mut self) {
+        self.loop_stack.pop();
+    }
+
+    /// Where a `break [label]` goes. `None` only for a `break` with no
+    /// enclosing breakable, or an unknown label — neither is valid JavaScript.
+    pub(super) fn break_target(&self, label: Option<&str>) -> Option<BlockId> {
+        self.frame(label, false).map(|f| f.break_to)
+    }
+
+    /// Where a `continue [label]` goes: the innermost enclosing *loop*,
+    /// skipping any `switch` in between.
+    pub(super) fn continue_target(&self, label: Option<&str>) -> Option<BlockId> {
+        self.frame(label, true).and_then(|f| f.continue_to)
+    }
+
+    fn frame(&self, label: Option<&str>, continuable: bool) -> Option<&LoopFrame> {
+        self.loop_stack.iter().rev().find(|f| match label {
+            Some(l) => f.label.as_deref() == Some(l),
+            None => !continuable || f.continue_to.is_some(),
+        })
+    }
+
+    /// Record that the next loop lowered is the body of a labeled statement.
+    pub(super) fn set_pending_label(&mut self, label: &str) {
+        self.pending_label = Some(label.to_string());
     }
 
     pub(super) fn new_block(&mut self) -> BlockId {
@@ -83,10 +136,6 @@ impl BlockBuilder {
 
     pub(super) fn is_terminated(&self) -> bool {
         self.terminated
-    }
-
-    pub(super) fn current_id(&self) -> BlockId {
-        self.current
     }
 
     pub(super) fn into_cfg(mut self, entry: BlockId) -> CFG {
@@ -184,24 +233,36 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
             lower_iter_loop(&f.left, &f.right, &f.body, builder);
         }
         Statement::DoWhileStatement(dw) => {
+            // The test gets its own block: `continue` in a `do…while` runs it,
+            // so it needs to be a jump target, and the exit then has a real
+            // predecessor even when the body always leaves early.
             let body_block = builder.new_block();
+            let test_block = builder.new_block();
             let exit_block = builder.new_block();
             let pre = builder.seal_with(Terminator::Jump(body_block));
             builder.add_edge(pre, body_block, EdgeKind::Unconditional);
+
             builder.start_block(body_block);
+            builder.push_loop(exit_block, Some(test_block));
             lower_stmt(&dw.body, builder);
+            builder.pop_loop();
             if !builder.is_terminated() {
-                let cond = lower_expr(&dw.test, builder);
-                let span = builder.span_at(dw.test.span().start);
-                let b = builder.seal_with(Terminator::Branch {
-                    cond,
-                    then_: body_block,
-                    else_: exit_block,
-                    span,
-                });
-                builder.add_edge(b, body_block, EdgeKind::Back);
-                builder.add_edge(b, exit_block, EdgeKind::IfFalse);
+                let b = builder.seal_with(Terminator::Jump(test_block));
+                builder.add_edge(b, test_block, EdgeKind::Unconditional);
             }
+
+            builder.start_block(test_block);
+            let cond = lower_expr(&dw.test, builder);
+            let span = builder.span_at(dw.test.span().start);
+            let t = builder.seal_with(Terminator::Branch {
+                cond,
+                then_: body_block,
+                else_: exit_block,
+                span,
+            });
+            builder.add_edge(t, body_block, EdgeKind::Back);
+            builder.add_edge(t, exit_block, EdgeKind::IfFalse);
+
             builder.start_block(exit_block);
         }
         Statement::ThrowStatement(th) => {
@@ -240,10 +301,34 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
             lower_switch(sw, builder);
         }
         Statement::LabeledStatement(l) => {
+            // Only a label on a loop is honoured. A labeled *block* is legal
+            // JS but vanishingly rare in components, and attaching its label
+            // to a loop nested inside would send `break outer` to the wrong
+            // place — leave those to the unlabeled fallback.
+            if matches!(
+                l.body,
+                Statement::WhileStatement(_)
+                    | Statement::DoWhileStatement(_)
+                    | Statement::ForStatement(_)
+                    | Statement::ForInStatement(_)
+                    | Statement::ForOfStatement(_)
+            ) {
+                builder.set_pending_label(l.label.name.as_str());
+            }
             lower_stmt(&l.body, builder);
         }
-        Statement::BreakStatement(_) | Statement::ContinueStatement(_) => {
-            builder.seal_with(Terminator::Unreachable);
+        // A `break`/`continue` is a real edge to the loop's exit or header.
+        // Sealing `Unreachable` instead dropped the state the jump carries out
+        // of the loop, and left an exit the CFG says is unreachable while the
+        // real one has no edge — all-paths reasoning then reads a phantom exit
+        // set (`ExitDominance`, `must_setter_on_all_paths`).
+        Statement::BreakStatement(b) => {
+            let target = builder.break_target(b.label.as_ref().map(|l| l.name.as_str()));
+            jump_out(builder, target);
+        }
+        Statement::ContinueStatement(c) => {
+            let target = builder.continue_target(c.label.as_ref().map(|l| l.name.as_str()));
+            jump_out(builder, target);
         }
         // Hoisted declarations: bind name but emit no CFG node
         Statement::FunctionDeclaration(func) => {
@@ -316,6 +401,22 @@ fn lower_if(
     builder.start_block(join_block);
 }
 
+/// Seal the current block with a jump to a `break`/`continue` target. With no
+/// target the statement is not valid JavaScript (a stray `break`, or a label
+/// that names no enclosing loop); keep the old `Unreachable` rather than invent
+/// an edge.
+fn jump_out(builder: &mut BlockBuilder, target: Option<BlockId>) {
+    match target {
+        Some(to) => {
+            let from = builder.seal_with(Terminator::Jump(to));
+            builder.add_edge(from, to, EdgeKind::Unconditional);
+        }
+        None => {
+            builder.seal_with(Terminator::Unreachable);
+        }
+    }
+}
+
 fn lower_while(test: &Expression, body: &Statement, builder: &mut BlockBuilder) {
     let header = builder.new_block();
     let body_block = builder.new_block();
@@ -337,7 +438,9 @@ fn lower_while(test: &Expression, body: &Statement, builder: &mut BlockBuilder) 
     builder.add_edge(h, exit_block, EdgeKind::IfFalse);
 
     builder.start_block(body_block);
+    builder.push_loop(exit_block, Some(header));
     lower_stmt(body, builder);
+    builder.pop_loop();
     if !builder.is_terminated() {
         let b = builder.seal_with(Terminator::Jump(header));
         builder.add_edge(b, header, EdgeKind::Back);
@@ -395,7 +498,10 @@ fn lower_for(
     builder.add_edge(h, exit_block, EdgeKind::IfFalse);
 
     builder.start_block(body_block);
+    // `continue` in a `for` runs the update before the next test.
+    builder.push_loop(exit_block, Some(update_block));
     lower_stmt(body, builder);
+    builder.pop_loop();
     if !builder.is_terminated() {
         let b = builder.seal_with(Terminator::Jump(update_block));
         builder.add_edge(b, update_block, EdgeKind::Unconditional);
@@ -471,7 +577,9 @@ fn lower_iter_loop(
             }
         }
     }
+    builder.push_loop(exit_block, Some(header));
     lower_stmt(body, builder);
+    builder.pop_loop();
     if !builder.is_terminated() {
         let b = builder.seal_with(Terminator::Jump(header));
         builder.add_edge(b, header, EdgeKind::Back);
@@ -481,24 +589,40 @@ fn lower_iter_loop(
 }
 
 fn lower_switch(sw: &SwitchStatement, builder: &mut BlockBuilder) {
+    let cases_block = builder.new_block();
     let exit_block = builder.new_block();
     let disc = lower_expr(&sw.discriminant, builder);
     builder.push_stmt(Stmt::ExprStmt(disc, None));
 
-    // Lower each case's body sequentially; break → jump to exit
+    // No case has to match, so the exit is reachable without entering any of
+    // them. Falling straight into the cases made everything after a switch
+    // whose every case leaves (`continue`, `return`) unreachable — a missing
+    // path, the forbidden direction. The condition is opaque on purpose: which
+    // case runs is not a truthiness test on the discriminant.
+    let head = builder.seal_with(Terminator::Branch {
+        cond: Expr::Lit(Prim::Bool(true)),
+        then_: cases_block,
+        else_: exit_block,
+        span: None,
+    });
+    builder.add_edge(head, cases_block, EdgeKind::IfTrue);
+    builder.add_edge(head, exit_block, EdgeKind::IfFalse);
+    builder.start_block(cases_block);
+
+    // Lower each case's body sequentially. `break` is the generic statement
+    // arm now that the switch pushes a frame, so a guarded `if (x) break;`
+    // reaches the exit too — the old special case only saw a bare `break` at
+    // the top of a consequent.
+    builder.push_loop(exit_block, None);
     for case in &sw.cases {
         for stmt in &case.consequent {
             if builder.is_terminated() {
                 break;
             }
-            if matches!(stmt, Statement::BreakStatement(_)) {
-                builder.seal_with(Terminator::Jump(exit_block));
-                builder.add_edge(builder.current_id(), exit_block, EdgeKind::Unconditional);
-                break;
-            }
             lower_stmt(stmt, builder);
         }
     }
+    builder.pop_loop();
 
     if !builder.is_terminated() {
         let b = builder.seal_with(Terminator::Jump(exit_block));
@@ -636,4 +760,201 @@ pub fn build_expr_fn_body_cfg(
         }
     }
     (param_names, builder.into_cfg(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::SourceMap;
+    use oxc_allocator::Allocator;
+    use oxc_parser::{ParseOptions, Parser};
+    use oxc_span::SourceType;
+
+    fn cfg_of(body: &str) -> CFG {
+        let src = format!("function f() {{ {body} }}");
+        let alloc = Allocator::default();
+        let ret = Parser::new(&alloc, &src, SourceType::tsx())
+            .with_options(ParseOptions::default())
+            .parse();
+        assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
+        ret.program
+            .body
+            .iter()
+            .find_map(|s| match s {
+                Statement::FunctionDeclaration(f) => {
+                    f.body.as_ref().map(|b| build_cfg(b, &SourceMap::empty()))
+                }
+                _ => None,
+            })
+            .expect("function body")
+    }
+
+    /// The block whose statements call `name`.
+    fn block_calling(cfg: &CFG, name: &str) -> BlockId {
+        cfg.blocks
+            .values()
+            .find(|b| {
+                b.stmts.iter().any(|s| {
+                    matches!(s, Stmt::ExprStmt(Expr::Call { fn_, .. }, _)
+                        if matches!(&**fn_, Expr::Var(v) if v == name))
+                })
+            })
+            .unwrap_or_else(|| panic!("no block calls {name}(): {:?}", cfg.blocks))
+            .id
+    }
+
+    fn preds(cfg: &CFG, to: BlockId) -> usize {
+        cfg.edges.iter().filter(|e| e.to == to).count()
+    }
+
+    /// Blocks a jump can reach from `from`, following edges.
+    fn reaches(cfg: &CFG, from: BlockId, to: BlockId) -> bool {
+        let mut seen = vec![from];
+        let mut i = 0;
+        while i < seen.len() {
+            let b = seen[i];
+            i += 1;
+            if b == to {
+                return true;
+            }
+            for e in cfg.edges.iter().filter(|e| e.from == b) {
+                if !seen.contains(&e.to) {
+                    seen.push(e.to);
+                }
+            }
+        }
+        false
+    }
+
+    /// A `break` used to seal `Unreachable` with no outgoing edge, so the loop
+    /// exit was reached only by the failing test. The path through the break
+    /// has to be there or the exit env misses everything the loop wrote before
+    /// leaving early — an under-approximation, the forbidden direction.
+    #[test]
+    fn break_reaches_the_loop_exit() {
+        let cfg = cfg_of("while (c) { if (x) { break; } g(); } h();");
+        let after = block_calling(&cfg, "h");
+        assert_eq!(
+            preds(&cfg, after),
+            2,
+            "the loop exit needs the false-test edge and the break edge: {:?}",
+            cfg.edges
+        );
+        // The break block jumps out rather than terminating the analysis.
+        assert!(
+            cfg.blocks
+                .values()
+                .filter(|b| matches!(b.term, Terminator::Jump(t) if t == after))
+                .count()
+                >= 1
+        );
+    }
+
+    #[test]
+    fn continue_reaches_the_loop_header() {
+        // (source, the block `continue` must be able to reach again)
+        for body in [
+            "while (c) { if (x) { continue; } g(); }",
+            "for (let i = 0; i < n; i++) { if (x) { continue; } g(); }",
+            "for (const v of xs) { if (x) { continue; } g(); }",
+            "do { if (x) { continue; } g(); } while (c);",
+        ] {
+            let cfg = cfg_of(body);
+            let body_block = block_calling(&cfg, "g");
+            // Every `continue` target loops back around to the body, so the
+            // continue block must still reach the body it skipped the rest of.
+            let jumpers: Vec<BlockId> = cfg
+                .blocks
+                .values()
+                .filter(|b| b.stmts.is_empty() && matches!(b.term, Terminator::Jump(_)))
+                .map(|b| b.id)
+                .collect();
+            assert!(
+                jumpers.iter().any(|&j| reaches(&cfg, j, body_block)),
+                "`{body}`: no continue edge back into the loop: {:?}",
+                cfg.edges
+            );
+        }
+    }
+
+    /// `break` inside a `switch` leaves the switch, not the enclosing loop —
+    /// and a *guarded* one now does too. The old special case only recognised
+    /// a bare `break` at the top of a consequent.
+    #[test]
+    fn guarded_break_in_a_switch_reaches_the_switch_exit() {
+        let cfg = cfg_of("while (c) { switch (k) { case 1: if (x) { break; } g(); } h(); }");
+        let after_switch = block_calling(&cfg, "h");
+        assert_eq!(
+            preds(&cfg, after_switch),
+            3,
+            "the switch exit needs the no-case-matched edge, the guarded break \
+             and the fall-through past `g()`: {:?}",
+            cfg.edges
+        );
+    }
+
+    /// A switch none of whose cases falls out still reaches what follows it:
+    /// no case has to match.
+    #[test]
+    fn switch_exit_is_reachable_when_every_case_leaves() {
+        let cfg = cfg_of("while (c) { switch (k) { case 1: continue; } g(); }");
+        let after_switch = block_calling(&cfg, "g");
+        assert_eq!(
+            preds(&cfg, after_switch),
+            1,
+            "the no-case-matched edge is the only way here, and it must exist: {:?}",
+            cfg.edges
+        );
+    }
+
+    /// `continue` skips a `switch` and reaches the loop.
+    #[test]
+    fn continue_inside_a_switch_targets_the_loop() {
+        let cfg = cfg_of("while (c) { switch (k) { case 1: continue; } g(); }");
+        let header = cfg
+            .edges
+            .iter()
+            .find(|e| matches!(e.kind, EdgeKind::Back))
+            .map(|e| e.to)
+            .expect("the loop has a back edge");
+        // The `continue` jumps to the loop header, not to the switch's exit.
+        assert!(
+            cfg.edges.iter().any(|e| e.to == header
+                && matches!(e.kind, EdgeKind::Unconditional)
+                && e.from != 0),
+            "no continue edge to the loop header: {:?}",
+            cfg.edges
+        );
+    }
+
+    /// A labeled `break` leaves the loop it names, not the innermost one: it
+    /// jumps past `g()`, which the inner loop's own exit falls into.
+    #[test]
+    fn labeled_break_targets_the_named_loop() {
+        let cfg = cfg_of("outer: while (a) { while (b) { break outer; } g(); } h();");
+        let outer_exit = block_calling(&cfg, "h");
+        assert_eq!(
+            preds(&cfg, outer_exit),
+            2,
+            "the outer exit needs its own false-test edge and the labeled break: {:?}",
+            cfg.edges
+        );
+        let inner_exit = block_calling(&cfg, "g");
+        assert_eq!(
+            preds(&cfg, inner_exit),
+            1,
+            "the labeled break must not land in the inner loop's exit"
+        );
+    }
+
+    /// A stray `break` is not valid JavaScript; keep sealing it rather than
+    /// invent an edge.
+    #[test]
+    fn break_with_no_enclosing_loop_stays_unreachable() {
+        let cfg = cfg_of("break;");
+        assert!(matches!(
+            cfg.blocks.get(&cfg.entry).map(|b| &b.term),
+            Some(Terminator::Unreachable)
+        ));
+    }
 }
