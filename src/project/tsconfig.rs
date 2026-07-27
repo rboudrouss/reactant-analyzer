@@ -356,7 +356,8 @@ mod tests {
             "tsconfig.json",
             r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@/*": ["./src/*"] } } }"#,
         );
-        let p = load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem).expect("paths found");
+        let p =
+            load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem).expect("paths found");
         assert_eq!(p.base_url, normalize(tmp.path()));
         assert_eq!(
             p.patterns,
@@ -371,7 +372,8 @@ mod tests {
             "tsconfig.json",
             r#"{ "compilerOptions": { "paths": { "@/*": ["./src/*"] } } }"#,
         );
-        let p = load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem).expect("paths found");
+        let p =
+            load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem).expect("paths found");
         assert_eq!(p.base_url, normalize(tmp.path()));
     }
 
@@ -383,7 +385,8 @@ mod tests {
             "configs/base.json",
             r#"{ "compilerOptions": { "baseUrl": "..", "paths": { "~/*": ["./app/*"] } } }"#,
         );
-        let p = load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem).expect("paths via extends");
+        let p = load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem)
+            .expect("paths via extends");
         // baseUrl ".." is relative to configs/ → the project root.
         assert_eq!(p.base_url, normalize(tmp.path()));
         assert_eq!(p.patterns[0].0, "~/*");
@@ -400,7 +403,8 @@ mod tests {
             "base.json",
             r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@/*": ["./*"] } } }"#,
         );
-        let p = load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem).expect("paths found");
+        let p =
+            load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem).expect("paths found");
         assert_eq!(p.base_url, normalize(&tmp.path().join("src")));
     }
 
@@ -439,7 +443,8 @@ mod tests {
 }"#,
         );
         tmp.write("tsconfig.node.json", r#"{ "compilerOptions": {} }"#);
-        let p = load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem).expect("paths via references");
+        let p = load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem)
+            .expect("paths via references");
         assert_eq!(p.base_url, normalize(tmp.path()));
         assert_eq!(p.patterns[0].0, "@/*");
     }

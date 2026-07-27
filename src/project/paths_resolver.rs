@@ -115,8 +115,8 @@ impl ImportResolver for TsconfigPathsResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::fs;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);

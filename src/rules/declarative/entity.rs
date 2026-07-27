@@ -245,9 +245,7 @@ impl<'a> EntityCtx<'a> {
                 Some(p) => format!("`{p}`"),
                 None => format!("dep #{}", d.index),
             },
-            (EntityVal::Dep(d), Field::Stability) => {
-                verdict_word(self.dep_verdict(d)).to_string()
-            }
+            (EntityVal::Dep(d), Field::Stability) => verdict_word(self.dep_verdict(d)).to_string(),
             // Unreachable by validation (field_for), but total anyway.
             _ => String::new(),
         }

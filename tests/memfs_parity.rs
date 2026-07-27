@@ -39,7 +39,10 @@ fn load_dir(root: &Path, files: &mut Vec<(PathBuf, String)>) {
     }
 }
 
-fn run_both(fixture: &str, format: driver::ReportFormat) -> (driver::CheckOutput, driver::CheckOutput) {
+fn run_both(
+    fixture: &str,
+    format: driver::ReportFormat,
+) -> (driver::CheckOutput, driver::CheckOutput) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture);
     // Same relative paths as a CLI invocation from the manifest dir.
     let rel = root
@@ -68,7 +71,9 @@ fn run_both(fixture: &str, format: driver::ReportFormat) -> (driver::CheckOutput
         .into_iter()
         .map(|(p, s)| {
             (
-                p.strip_prefix(env!("CARGO_MANIFEST_DIR")).unwrap().to_path_buf(),
+                p.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                    .unwrap()
+                    .to_path_buf(),
                 s,
             )
         })

@@ -158,14 +158,20 @@ mod tests {
     fn detects_vite_by_config_file() {
         let tmp = Tmp::new("detect-vite");
         tmp.write("vite.config.ts", "export default {}");
-        assert_eq!(detect(tmp.path(), &crate::resolver::OsFileSystem), ProjectKind::Vite);
+        assert_eq!(
+            detect(tmp.path(), &crate::resolver::OsFileSystem),
+            ProjectKind::Vite
+        );
     }
 
     #[test]
     fn detects_plain_without_marker() {
         let tmp = Tmp::new("detect-plain");
         tmp.write("package.json", "{}");
-        assert_eq!(detect(tmp.path(), &crate::resolver::OsFileSystem), ProjectKind::Plain);
+        assert_eq!(
+            detect(tmp.path(), &crate::resolver::OsFileSystem),
+            ProjectKind::Plain
+        );
     }
 
     #[test]
@@ -173,7 +179,11 @@ mod tests {
         let tmp = Tmp::new("ctx-src");
         tmp.write("vite.config.ts", "");
         tmp.write("src/App.tsx", "");
-        let ctx = build_context(tmp.path(), None, std::sync::Arc::new(crate::resolver::OsFileSystem));
+        let ctx = build_context(
+            tmp.path(),
+            None,
+            std::sync::Arc::new(crate::resolver::OsFileSystem),
+        );
         assert_eq!(ctx.kind, ProjectKind::Vite);
         assert_eq!(ctx.discovery_root, tmp.path().join("src"));
     }
@@ -182,7 +192,11 @@ mod tests {
     fn vite_without_src_keeps_root() {
         let tmp = Tmp::new("ctx-nosrc");
         tmp.write("vite.config.ts", "");
-        let ctx = build_context(tmp.path(), None, std::sync::Arc::new(crate::resolver::OsFileSystem));
+        let ctx = build_context(
+            tmp.path(),
+            None,
+            std::sync::Arc::new(crate::resolver::OsFileSystem),
+        );
         assert_eq!(ctx.discovery_root, tmp.path());
     }
 
@@ -190,7 +204,11 @@ mod tests {
     fn vite_without_paths_warns() {
         let tmp = Tmp::new("ctx-warn");
         tmp.write("vite.config.ts", "");
-        let ctx = build_context(tmp.path(), None, std::sync::Arc::new(crate::resolver::OsFileSystem));
+        let ctx = build_context(
+            tmp.path(),
+            None,
+            std::sync::Arc::new(crate::resolver::OsFileSystem),
+        );
         assert!(ctx.alias_warning.is_some());
     }
 
@@ -202,7 +220,11 @@ mod tests {
             "tsconfig.json",
             r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@/*": ["./src/*"] } } }"#,
         );
-        let ctx = build_context(tmp.path(), None, std::sync::Arc::new(crate::resolver::OsFileSystem));
+        let ctx = build_context(
+            tmp.path(),
+            None,
+            std::sync::Arc::new(crate::resolver::OsFileSystem),
+        );
         assert!(ctx.alias_warning.is_none());
     }
 
@@ -210,7 +232,11 @@ mod tests {
     fn forced_plain_skips_detection() {
         let tmp = Tmp::new("forced");
         tmp.write("vite.config.ts", "");
-        let ctx = build_context(tmp.path(), Some(ProjectKind::Plain), std::sync::Arc::new(crate::resolver::OsFileSystem));
+        let ctx = build_context(
+            tmp.path(),
+            Some(ProjectKind::Plain),
+            std::sync::Arc::new(crate::resolver::OsFileSystem),
+        );
         assert_eq!(ctx.kind, ProjectKind::Plain);
         assert_eq!(ctx.discovery_root, tmp.path());
     }

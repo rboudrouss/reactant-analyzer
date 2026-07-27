@@ -546,10 +546,7 @@ mod tests {
     fn self_referential_callback_terminates_and_is_still_scanned() {
         let tick_body = single_block_cfg(vec![
             Stmt::ExprStmt(call("setN", vec![Expr::Lit(Prim::Int(1))]), None),
-            Stmt::ExprStmt(
-                call("raf", vec![Expr::Var("tick".to_string())]),
-                None,
-            ),
+            Stmt::ExprStmt(call("raf", vec![Expr::Var("tick".to_string())]), None),
         ]);
         let cfg = single_block_cfg(vec![
             Stmt::Let {
@@ -561,10 +558,7 @@ mod tests {
                 },
                 span: None,
             },
-            Stmt::ExprStmt(
-                call("raf", vec![Expr::Var("tick".to_string())]),
-                None,
-            ),
+            Stmt::ExprStmt(call("raf", vec![Expr::Var("tick".to_string())]), None),
         ]);
 
         let setters: HashSet<Var> = ["setN".to_string()].into_iter().collect();

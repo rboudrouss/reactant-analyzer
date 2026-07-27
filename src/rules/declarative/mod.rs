@@ -22,8 +22,8 @@ mod validate;
 
 use std::collections::BTreeMap;
 
-use crate::rules::docs::RuleDoc;
 use crate::rules::Rule;
+use crate::rules::docs::RuleDoc;
 
 pub use validate::{LoadWarning, PackError};
 
@@ -53,11 +53,10 @@ pub fn load_pack(
         message: format!("not valid JSON: {e}"),
     })?;
     // Typed deserialization with exact paths (`rules[1].guards[0].kind`).
-    let pack: schema::PackFile =
-        serde_path_to_error::deserialize(&raw).map_err(|e| PackError {
-            path: e.path().to_string(),
-            message: e.inner().to_string(),
-        })?;
+    let pack: schema::PackFile = serde_path_to_error::deserialize(&raw).map_err(|e| PackError {
+        path: e.path().to_string(),
+        message: e.inner().to_string(),
+    })?;
 
     let (resolved, warnings) = validate::validate_pack(&raw, &pack, options_by_full_id)?;
 

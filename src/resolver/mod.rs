@@ -551,7 +551,11 @@ mod tests {
                 .resolve(&from, "@tanstack/react-query")
                 .is_none()
         );
-        assert!(DefaultImportResolver::default().resolve(&from, "react").is_none());
+        assert!(
+            DefaultImportResolver::default()
+                .resolve(&from, "react")
+                .is_none()
+        );
     }
 
     #[test]
@@ -559,6 +563,10 @@ mod tests {
         let tmp = Tmp::new("resolve-missing");
         let from = tmp.write("a/b.tsx", "");
 
-        assert!(DefaultImportResolver::default().resolve(&from, "./nope").is_none());
+        assert!(
+            DefaultImportResolver::default()
+                .resolve(&from, "./nope")
+                .is_none()
+        );
     }
 }

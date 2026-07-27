@@ -72,7 +72,12 @@ fn check_vite_project_json() {
 /// the incoherence v1 had — while `component_file` keeps v1's meaning.
 #[test]
 fn json_file_is_the_anchor_file_not_the_component_file() {
-    let out = reactant(&["check", "tests/fixtures/cross_file_hook", "--format", "json"]);
+    let out = reactant(&[
+        "check",
+        "tests/fixtures/cross_file_hook",
+        "--format",
+        "json",
+    ]);
     let doc: serde_json::Value =
         serde_json::from_str(&stdout(&out)).expect("stdout must be valid JSON");
 
@@ -86,7 +91,10 @@ fn json_file_is_the_anchor_file_not_the_component_file() {
     let file = d["file"].as_str().unwrap();
     let comp_file = d["component_file"].as_str().unwrap();
     assert!(file.ends_with("hooks/useData.ts"), "file: {file}");
-    assert!(comp_file.ends_with("page.tsx"), "component_file: {comp_file}");
+    assert!(
+        comp_file.ends_with("page.tsx"),
+        "component_file: {comp_file}"
+    );
     assert!(d["line"].is_number());
 }
 

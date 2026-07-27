@@ -353,7 +353,8 @@ mod tests {
     fn overrides_reject_unknown_keys() {
         let mut reg = RuleRegistry::natives();
         let mut o = RuleOverrides::default();
-        o.entries.insert("no-such-rule".into(), OverrideEntry::default());
+        o.entries
+            .insert("no-such-rule".into(), OverrideEntry::default());
         assert_eq!(
             reg.set_overrides(o).unwrap_err(),
             RegistryError::UnknownRule("no-such-rule".into())
@@ -547,7 +548,8 @@ mod tests {
         }
         let (prog, name) = one_component();
         let mut reg = RuleRegistry::natives();
-        reg.register(Box::new(TwoNames), stub_doc("test/two")).unwrap();
+        reg.register(Box::new(TwoNames), stub_doc("test/two"))
+            .unwrap();
         // The secondary diagnostic name needs a doc for override validation;
         // registry docs are keyed by diagnostic name.
         reg.docs.push(stub_doc("test/two-cross"));

@@ -230,14 +230,12 @@ fn guard_allowed_keys(g: &Guard) -> (&'static str, &'static [&'static str]) {
             &["kind", "of", "more_than", "less_than", "equals"],
         ),
         Guard::DepsDeclared { .. } => ("guard `deps_declared`", &["kind", "of", "eq"]),
-        Guard::MustSetterOnAllPaths { .. } => (
-            "guard `must_setter_on_all_paths`",
-            &["kind", "of", "else"],
-        ),
-        Guard::MustDominatesAllExits { .. } => (
-            "guard `must_dominates_all_exits`",
-            &["kind", "of", "else"],
-        ),
+        Guard::MustSetterOnAllPaths { .. } => {
+            ("guard `must_setter_on_all_paths`", &["kind", "of", "else"])
+        }
+        Guard::MustDominatesAllExits { .. } => {
+            ("guard `must_dominates_all_exits`", &["kind", "of", "else"])
+        }
         Guard::MustInitCallsSetter { .. } => {
             ("guard `must_init_calls_setter`", &["kind", "of", "else"])
         }
@@ -736,9 +734,7 @@ fn validate_rule(
             }
             Guard::MustInitCallsSetter { of, r#else } => {
                 let (of_ref, sort) = resolve_of(of, &g_path)?;
-                if of_ref != BindRef::Anchor
-                    || sort != Sort::Hook(Some(HookKindFilter::State))
-                {
+                if of_ref != BindRef::Anchor || sort != Sort::Hook(Some(HookKindFilter::State)) {
                     return Err(PackError::new(
                         format!("{g_path}.of"),
                         "guard `must_init_calls_setter` applies to a state-hook anchor",
@@ -930,7 +926,10 @@ pub(crate) fn validate_pack(
     if pack.schema_version != 1 {
         return Err(PackError::new(
             "schemaVersion",
-            format!("unsupported schemaVersion {} — only 1 exists", pack.schema_version),
+            format!(
+                "unsupported schemaVersion {} — only 1 exists",
+                pack.schema_version
+            ),
         ));
     }
     if pack.name.trim().is_empty() {

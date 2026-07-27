@@ -124,9 +124,11 @@ impl TierARule {
                         .is_some_and(|slot| e.dep_slots(row).contains(&slot));
                     in_deps != *negate
                 }
-                ResolvedGuard::Name { of, one_of, prefix } => {
-                    name_matches(e.raw_name(&entity_at(*of, row, bound.as_ref())), one_of, prefix)
-                }
+                ResolvedGuard::Name { of, one_of, prefix } => name_matches(
+                    e.raw_name(&entity_at(*of, row, bound.as_ref())),
+                    one_of,
+                    prefix,
+                ),
                 ResolvedGuard::Count(cmp) => {
                     let len = row.effect.map_or(0, |i| i.declared_deps.len()) as u64;
                     match cmp {
@@ -190,12 +192,10 @@ impl TierARule {
                     els,
                     ..
                 } => {
-                    let proof = setter
-                        .block_id
-                        .and_then(|b| match e.exit_dom().certify(b) {
-                            MustResult::All(c) => Some(Proof::Dominates(c)),
-                            _ => None,
-                        });
+                    let proof = setter.block_id.and_then(|b| match e.exit_dom().certify(b) {
+                        MustResult::All(c) => Some(Proof::Dominates(c)),
+                        _ => None,
+                    });
                     match (proof, els) {
                         (Some(p), _) => {
                             proofs.push(p);

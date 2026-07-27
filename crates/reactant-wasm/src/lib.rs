@@ -164,7 +164,8 @@ fn run_inner(input_json: &str) -> Output {
             }
         }
     }
-    let overrides = config::resolve_overrides(&cfg, &input.options.rule, &input.options.ignore_rule);
+    let overrides =
+        config::resolve_overrides(&cfg, &input.options.rule, &input.options.ignore_rule);
     if let Err(e) = registry.set_overrides(overrides) {
         return usage(format!("[error] {e}\n"));
     }

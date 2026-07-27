@@ -804,7 +804,10 @@ mod tests {
             }],
         };
         let rename = callee_rename_map(&callee, &[], 1);
-        let mut caller = caller(vec![Stmt::ExprStmt(Expr::HookMarker(0, MarkerVal::Unknown), None)]);
+        let mut caller = caller(vec![Stmt::ExprStmt(
+            Expr::HookMarker(0, MarkerVal::Unknown),
+            None,
+        )]);
         let before_blocks = caller.blocks.len();
         splice_callee_into_cfg(
             &mut caller,

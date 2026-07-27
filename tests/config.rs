@@ -112,7 +112,10 @@ fn ignore_rule_flag_beats_a_config_severity() {
         &["--ignore-rule", "setter-in-render"],
     );
     let diags = json_diags(&out);
-    assert!(!diags.iter().any(|(r, _)| r == "setter-in-render"), "{diags:?}");
+    assert!(
+        !diags.iter().any(|(r, _)| r == "setter-in-render"),
+        "{diags:?}"
+    );
 }
 
 // ── Flag precedence (CLI beats config) ────────────────────────────────────────
@@ -271,12 +274,7 @@ fn rules_and_explain_see_pack_rules_through_their_docs() {
 
 #[test]
 fn consecutive_runs_with_config_are_byte_identical() {
-    let run = || {
-        check_json(
-            "tests/fixtures/config_project/downgrade.json",
-            &["--info"],
-        )
-    };
+    let run = || check_json("tests/fixtures/config_project/downgrade.json", &["--info"]);
     let (a, b) = (run(), run());
     assert_eq!(a.stdout, b.stdout);
     assert_eq!(a.stderr, b.stderr);

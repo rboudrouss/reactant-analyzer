@@ -93,8 +93,7 @@ pub fn run(mut args: CheckArgs) -> i32 {
         .unwrap_or_else(|| PathBuf::from("."));
 
     let (cfg, mut registry) =
-        match super::config_load::load_config_and_registry(args.config.as_deref(), &project_root)
-        {
+        match super::config_load::load_config_and_registry(args.config.as_deref(), &project_root) {
             Ok(pair) => pair,
             Err(code) => return code,
         };

@@ -214,8 +214,7 @@ pub fn parse(src: &str, origin: &Path) -> Result<ReactantConfig, ConfigError> {
 
 /// Read, strip JSONC, parse, validate the shape. Every failure is `Err`.
 pub fn load(path: &Path) -> Result<ReactantConfig, ConfigError> {
-    let src = std::fs::read_to_string(path)
-        .map_err(|e| ConfigError::Io(path.to_path_buf(), e))?;
+    let src = std::fs::read_to_string(path).map_err(|e| ConfigError::Io(path.to_path_buf(), e))?;
     parse(&src, path)
 }
 
@@ -311,7 +310,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             cfg.packs,
-            vec!["@team/react-rules".to_string(), "./rules/pack.json".to_string()]
+            vec![
+                "@team/react-rules".to_string(),
+                "./rules/pack.json".to_string()
+            ]
         );
         assert_eq!(
             cfg.rules["infinite-loop"],
@@ -371,10 +373,8 @@ mod tests {
 
     #[test]
     fn discover_finds_only_at_root() {
-        let dir = std::env::temp_dir().join(format!(
-            "reactant-config-discover-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("reactant-config-discover-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(discover(&dir), None);
         let path = dir.join(CONFIG_FILE_NAME);
@@ -385,10 +385,8 @@ mod tests {
 
     #[test]
     fn broken_json_is_an_error_never_defaults() {
-        let dir = std::env::temp_dir().join(format!(
-            "reactant-config-broken-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("reactant-config-broken-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(CONFIG_FILE_NAME);
         std::fs::write(&path, "{ not json").unwrap();

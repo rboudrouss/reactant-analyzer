@@ -65,9 +65,7 @@ fn run_pack(pack_json: &str, src: &str, options: &Options) -> Vec<Diagnostic> {
 const TEAM_PACK: &str = include_str!("fixtures/packs/team.json");
 
 fn one_rule(body: &str) -> String {
-    format!(
-        r#"{{"schemaVersion":1,"name":"t","rules":[{body}]}}"#
-    )
+    format!(r#"{{"schemaVersion":1,"name":"t","rules":[{body}]}}"#)
 }
 
 const MINIMAL: &str = r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},
@@ -214,7 +212,10 @@ fn rejects_bad_field_arity() {
             "guards":[{"kind":"stability","of":"dep","is":["stable"],"not":["unknown"]}],
             "message":"m"}"#,
     ));
-    assert!(both.message.contains("exactly one of `is` / `not`"), "{both}");
+    assert!(
+        both.message.contains("exactly one of `is` / `not`"),
+        "{both}"
+    );
 
     let neither = load_err(&one_rule(
         r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",

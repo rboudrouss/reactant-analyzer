@@ -148,7 +148,10 @@ mod tests {
         let children = fs.read_dir(Path::new("proj"));
         assert_eq!(
             children,
-            vec![PathBuf::from("proj/src"), PathBuf::from("proj/tsconfig.json")]
+            vec![
+                PathBuf::from("proj/src"),
+                PathBuf::from("proj/tsconfig.json")
+            ]
         );
         let children = fs.read_dir(Path::new("proj/src"));
         assert_eq!(

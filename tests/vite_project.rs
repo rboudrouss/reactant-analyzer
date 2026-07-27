@@ -17,12 +17,19 @@ fn fixture_root() -> PathBuf {
 
 #[test]
 fn vite_fixture_is_detected() {
-    assert_eq!(project::detect(&fixture_root(), &reactant::resolver::OsFileSystem), ProjectKind::Vite);
+    assert_eq!(
+        project::detect(&fixture_root(), &reactant::resolver::OsFileSystem),
+        ProjectKind::Vite
+    );
 }
 
 #[test]
 fn context_narrows_discovery_to_src_and_loads_aliases() {
-    let ctx = project::build_context(&fixture_root(), None, std::sync::Arc::new(reactant::resolver::OsFileSystem));
+    let ctx = project::build_context(
+        &fixture_root(),
+        None,
+        std::sync::Arc::new(reactant::resolver::OsFileSystem),
+    );
     assert_eq!(ctx.kind, ProjectKind::Vite);
     assert_eq!(ctx.discovery_root, fixture_root().join("src"));
     assert!(
@@ -34,7 +41,11 @@ fn context_narrows_discovery_to_src_and_loads_aliases() {
 
 #[test]
 fn alias_resolves_through_references_chain() {
-    let ctx = project::build_context(&fixture_root(), None, std::sync::Arc::new(reactant::resolver::OsFileSystem));
+    let ctx = project::build_context(
+        &fixture_root(),
+        None,
+        std::sync::Arc::new(reactant::resolver::OsFileSystem),
+    );
     let from = fixture_root().join("src/App.tsx");
     let resolved = ctx.resolver.resolve(&from, "@/hooks/useData");
     assert_eq!(
@@ -48,7 +59,11 @@ fn alias_resolves_through_references_chain() {
 fn infinite_loop_surfaces_on_app_through_alias() {
     // The full pipeline: vite context → src/ discovery → alias-resolved
     // lowering → useData inlined into App's fixpoint → bug on the call site.
-    let ctx = project::build_context(&fixture_root(), None, std::sync::Arc::new(reactant::resolver::OsFileSystem));
+    let ctx = project::build_context(
+        &fixture_root(),
+        None,
+        std::sync::Arc::new(reactant::resolver::OsFileSystem),
+    );
     let files = DefaultFileDiscoverer::default().discover(&ctx.discovery_root);
     assert_eq!(files.len(), 2, "App.tsx + hooks/useData.ts");
 

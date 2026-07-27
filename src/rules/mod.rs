@@ -31,15 +31,13 @@ pub use api::query::{
 };
 pub use api::witness::{EffectClass, Note, ResolveTarget, Step, ValueClass};
 pub use docs::{RULE_DOCS, RuleDoc, rule_doc};
-pub use registry::{
-    ComponentFindings, OverrideEntry, RegistryError, RuleOverrides, RuleRegistry,
-};
 pub use helpers::setters::{SetterCall, collect_setter_calls, collect_setter_calls_with_extra};
 pub use impls::{
     AlwaysUnstableDeps, AnalysisLimitInfo, ConditionalHook, DerivedState, FrozenInitialState,
     InfiniteLoop, LazyInit, MissingDeps, RedundantSetState, SetterInRender, StaleClosure,
     StateMutation, UnnecessaryRerender, WideningInfo,
 };
+pub use registry::{ComponentFindings, OverrideEntry, RegistryError, RuleOverrides, RuleRegistry};
 
 // Internal vocabulary shared by api/helpers/impls, re-exported at its
 // historical paths so call sites stay `crate::rules::X`.
