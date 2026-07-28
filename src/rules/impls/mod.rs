@@ -17,6 +17,7 @@ pub mod setter_in_render;
 pub mod stale_closure;
 pub mod state_mutation;
 pub mod unnecessary_rerender;
+pub mod unstable_context_value;
 pub mod widening_info;
 
 pub use always_unstable_deps::AlwaysUnstableDeps;
@@ -33,4 +34,5 @@ pub use setter_in_render::SetterInRender;
 pub use stale_closure::StaleClosure;
 pub use state_mutation::StateMutation;
 pub use unnecessary_rerender::UnnecessaryRerender;
+pub use unstable_context_value::UnstableContextValue;
 pub use widening_info::WideningInfo;

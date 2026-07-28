@@ -576,6 +576,7 @@ fn lower_jsx_element(jsx: &JSXElement, builder: &mut BlockBuilder) -> Expr {
         Expr::CompApp {
             name,
             props: Box::new(props),
+            span: builder.span_at(jsx.opening_element.span.start),
         }
     } else {
         Expr::NativeElem {

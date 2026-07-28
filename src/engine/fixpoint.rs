@@ -151,7 +151,11 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 ModuleConstInit::Prim(p) => {
                     transfer.eval_expr(&Expr::Lit(p.clone()), &empty_env, &mut ac)
                 }
-                ModuleConstInit::Ref => StateValue::reference(Stability::Stable),
+                // A context object is a module-scoped reference like any
+                // literal — the role it also records is read by the rules layer.
+                ModuleConstInit::Ref | ModuleConstInit::Context => {
+                    StateValue::reference(Stability::Stable)
+                }
             };
             initial_env.extend(name.clone(), val);
         }
@@ -478,6 +482,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         file: comp_file,
         param: comp_param,
         dom_props: comp_dom_props,
+        module_consts,
         state_store: final_state,
         memo_store,
         block_states,

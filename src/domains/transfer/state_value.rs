@@ -136,7 +136,7 @@ fn eval_state_value(
         Expr::FnLit { .. } => StateValue::reference(Stability::PerRender),
         Expr::NativeElem { .. } => StateValue::reference(Stability::Stable),
 
-        Expr::CompApp { name, props } => eval_comp_app(name, props, env, ctx),
+        Expr::CompApp { name, props, .. } => eval_comp_app(name, props, env, ctx),
 
         Expr::BinOp { op, lhs, rhs } => {
             let l = eval_state_value(lhs, env, ctx);

@@ -276,6 +276,22 @@ pub const RULE_DOCS: &[RuleDoc] = &[
               lazily: `useState(() => readSetting())`.",
     ),
     doc(
+        "unstable-context-value",
+        "context provider hands consumers a new object every render",
+        "A `<Ctx.Provider value={…}>` whose value is allocated in the \
+                      provider's own render body is a different object on every render. \
+                      `useContext` compares with `Object.is`, so every consumer re-renders \
+                      whenever the providing component does — however deep the tree, and \
+                      however little actually changed. Fires only on a *proven* context \
+                      (a module-level `createContext` reached through a React import) with \
+                      a *proven* fresh value, and stays a Warning: the fresh reference is \
+                      certain, what it costs is not.",
+        "return <Ctx.Provider value={{ user, logout }}>{children}</Ctx.Provider>;",
+        "Memoize the value: \
+              `const v = useMemo(() => ({ user, logout }), [user, logout]);` then \
+              `<Ctx.Provider value={v}>`.",
+    ),
+    doc(
         "widening-info",
         "state slot required widening to converge (precision lost here)",
         "Informational (--info): the fixpoint only converged on this state slot \

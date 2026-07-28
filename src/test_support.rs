@@ -66,6 +66,7 @@ pub(crate) fn analysis_result(render_cfg: CFG) -> AnalysisResult<StateValue> {
         file: Default::default(),
         param: "props".to_string(),
         dom_props: Default::default(),
+        module_consts: Default::default(),
         state_store: StateStore::bottom(),
         memo_store: MemoStore::new(),
         block_states: HashMap::new(),

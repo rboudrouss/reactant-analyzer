@@ -126,6 +126,7 @@ mod tests {
                 term: Terminator::Return(Expr::CompApp {
                     name: child.to_string(),
                     props: Box::new(Expr::Lit(Prim::Null)),
+                    span: None,
                 }),
             },
         );

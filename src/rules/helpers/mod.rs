@@ -6,6 +6,7 @@
 
 pub mod churn;
 pub mod churn_graph;
+pub mod providers;
 pub mod registrations;
 pub mod setters;
 

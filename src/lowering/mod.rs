@@ -132,6 +132,32 @@ fn build_react_ns(program: &Program) -> HashSet<String> {
     ns
 }
 
+/// Local names bound to React's `createContext`, including an aliased import
+/// (`import { createContext as ctx } from "react"`). Namespace forms
+/// (`React.createContext`) go through [`build_react_ns`] instead.
+fn react_create_context_names(program: &Program) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for stmt in &program.body {
+        let Statement::ImportDeclaration(decl) = stmt else {
+            continue;
+        };
+        if decl.source.value.as_str() != "react" {
+            continue;
+        }
+        let Some(specifiers) = &decl.specifiers else {
+            continue;
+        };
+        for spec in specifiers {
+            if let ImportDeclarationSpecifier::ImportSpecifier(s) = spec
+                && s.imported.name() == "createContext"
+            {
+                names.insert(s.local.name.to_string());
+            }
+        }
+    }
+    names
+}
+
 /// Collect module-level `const` bindings whose initializer kind is
 /// syntactically certain (see [`ModuleConstInit`]).
 ///
@@ -143,7 +169,10 @@ fn build_react_ns(program: &Program) -> HashSet<String> {
 /// Opaque initializers (calls, imported values, conditionals) are skipped
 /// too: their kind is unknown and the value domain has no sound encoding
 /// for "unknown kind, constant across renders" — they stay ⊤.
-fn collect_module_consts(program: &Program) -> HashMap<Var, ModuleConstInit> {
+fn collect_module_consts(
+    program: &Program,
+    react_ns: &HashSet<String>,
+) -> HashMap<Var, ModuleConstInit> {
     fn peel_ts<'e, 'a>(mut expr: &'e Expression<'a>) -> &'e Expression<'a> {
         loop {
             expr = match expr {
@@ -172,6 +201,24 @@ fn collect_module_consts(program: &Program) -> HashMap<Var, ModuleConstInit> {
             _ => None,
         }
     }
+
+    // `createContext(…)` reached through a React binding: a bare name imported
+    // from "react", or `<ns>.createContext` where `ns` is the react module
+    // (`React` is accepted unimported, matching `ImportCtx::callee_is_react`).
+    let create_context = react_create_context_names(program);
+    let is_create_context = |call: &oxc_ast::ast::CallExpression| match &call.callee {
+        Expression::Identifier(id) => create_context.contains(id.name.as_str()),
+        Expression::StaticMemberExpression(m) => {
+            m.property.name == "createContext"
+                && match &m.object {
+                    Expression::Identifier(ns) => {
+                        react_ns.contains(ns.name.as_str()) || ns.name == "React"
+                    }
+                    _ => false,
+                }
+        }
+        _ => false,
+    };
 
     let mut map = HashMap::new();
     for stmt in &program.body {
@@ -204,6 +251,10 @@ fn collect_module_consts(program: &Program) -> HashMap<Var, ModuleConstInit> {
                     | Expression::JSXFragment(_)
             ) {
                 map.insert(id.name.to_string(), ModuleConstInit::Ref);
+            } else if let Expression::CallExpression(call) = init
+                && is_create_context(call)
+            {
+                map.insert(id.name.to_string(), ModuleConstInit::Context);
             }
         }
     }
@@ -310,8 +361,8 @@ pub fn lower_program_with_resolver(
     let import_map = build_import_map(program);
     let resolved_import_map: HashMap<String, PathBuf> =
         build_resolved_import_map(program, file, resolver);
-    let module_consts = Arc::new(collect_module_consts(program));
     let react_ns = build_react_ns(program);
+    let module_consts = Arc::new(collect_module_consts(program, &react_ns));
     let local_hooks: HashSet<String> = detect_custom_hooks(program)
         .iter()
         .map(|c| c.name.clone())
@@ -349,4 +400,74 @@ pub fn lower_program_with_resolver(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxc_allocator::Allocator;
+    use oxc_parser::{ParseOptions, Parser};
+    use oxc_span::SourceType;
+
+    fn consts(src: &str) -> HashMap<Var, ModuleConstInit> {
+        let alloc = Allocator::default();
+        let ret = Parser::new(&alloc, src, SourceType::tsx())
+            .with_options(ParseOptions::default())
+            .parse();
+        assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
+        let react_ns = build_react_ns(&ret.program);
+        collect_module_consts(&ret.program, &react_ns)
+    }
+
+    fn is_context(map: &HashMap<Var, ModuleConstInit>, name: &str) -> bool {
+        matches!(map.get(name), Some(ModuleConstInit::Context))
+    }
+
+    #[test]
+    fn react_create_context_is_a_context_const() {
+        let m =
+            consts("import { createContext } from \"react\";\nconst Ctx = createContext(null);");
+        assert!(is_context(&m, "Ctx"));
+    }
+
+    #[test]
+    fn namespace_and_aliased_forms_are_contexts() {
+        let m = consts(
+            "import * as R from \"react\";\nimport { createContext as mk } from \"react\";\n\
+             const A = R.createContext(0);\nconst B = React.createContext(0);\nconst C = mk(0);",
+        );
+        for name in ["A", "B", "C"] {
+            assert!(is_context(&m, name), "{name} should be a context");
+        }
+    }
+
+    /// The exception the `Context` arm carves out is narrow on purpose: an
+    /// opaque call still has an unknown kind and stays out of the map, or a
+    /// wide primitive slot would read as per-render motion.
+    #[test]
+    fn other_calls_are_still_skipped() {
+        let m = consts(
+            "import { createContext } from \"other\";\n\
+             const A = makeThing();\nconst B = createContext(null);\nconst C = obj.createContext(0);",
+        );
+        assert!(!m.contains_key("A"), "opaque call must stay out");
+        assert!(!m.contains_key("B"), "createContext from another package");
+        assert!(
+            !m.contains_key("C"),
+            "createContext on a non-react receiver"
+        );
+    }
+
+    /// A context const seeds as a Stable reference, so it is also a precision
+    /// win independent of the provider relation.
+    #[test]
+    fn context_and_literal_consts_coexist() {
+        let m = consts(
+            "import { createContext } from \"react\";\n\
+             const Ctx = createContext(null);\nconst N = 3;\nconst O = { a: 1 };",
+        );
+        assert!(is_context(&m, "Ctx"));
+        assert!(matches!(m.get("N"), Some(ModuleConstInit::Prim(_))));
+        assert!(matches!(m.get("O"), Some(ModuleConstInit::Ref)));
+    }
 }

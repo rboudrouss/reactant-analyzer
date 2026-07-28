@@ -130,6 +130,11 @@ pub struct AnalysisResult<D: AbstractDomain> {
     /// Props whose declared TypeScript type is a DOM interface — mutating
     /// them is imperative DOM manipulation, exempt from state-mutation.
     pub dom_props: std::sync::Arc<HashSet<Var>>,
+    /// The file's module-level `const` bindings — the same table the engine
+    /// seeded the initial env from, carried through so the rules layer reads
+    /// one source of truth. Its `Context` rows are the only proof available
+    /// that `<X.Provider>` is a React context provider. Empty for hand-built IR.
+    pub module_consts: std::sync::Arc<HashMap<Var, crate::ir::ModuleConstInit>>,
     pub state_store: StateStore<D>,
     pub memo_store: MemoStore<D>,
     /// Abstract environment at the *exit* of each render-CFG block.

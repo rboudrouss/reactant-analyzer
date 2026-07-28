@@ -23,6 +23,15 @@ pub enum ModuleConstInit {
     /// Object/array/new/JSX literal: a reference, allocated once per module
     /// lifetime → identity Stable across renders.
     Ref,
+    /// `createContext(…)`, proven to be React's by its import specifier. A
+    /// reference like [`Ref`](ModuleConstInit::Ref) — the exception to "opaque
+    /// calls stay ⊤" is earned by knowing the callee, hence the kind.
+    ///
+    /// The variant exists because the *role* is what a provider rule needs:
+    /// `<X.Provider>` is a context provider only if `X` is a context, and
+    /// nothing else in the IR can say so. Two-valued on purpose — absence
+    /// means "not proven", never "not a context".
+    Context,
 }
 
 #[derive(Debug, Clone)]

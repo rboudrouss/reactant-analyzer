@@ -76,6 +76,7 @@ fn heuristic_detects_parent_not_child_as_root() {
                 term: Terminator::Return(Expr::CompApp {
                     name: "Child".to_string(),
                     props: Box::new(Expr::Lit(Prim::Null)),
+                    span: None,
                 }),
             },
         );
@@ -129,6 +130,7 @@ fn analyze_program_populates_call_graph_for_parent_child() {
                 term: Terminator::Return(Expr::CompApp {
                     name: "Child".to_string(),
                     props: Box::new(Expr::Lit(Prim::Null)),
+                    span: None,
                 }),
             },
         );
@@ -266,6 +268,7 @@ fn setter_prop_propagates_to_shared_state() {
                                 Expr::Var("setCount".to_string()),
                             )],
                         }),
+                        span: None,
                     }),
                 },
             );
@@ -322,6 +325,7 @@ fn recursive_component_does_not_crash() {
                 term: Terminator::Return(Expr::CompApp {
                     name: "TreeNode".to_string(),
                     props: Box::new(Expr::Lit(Prim::Null)),
+                    span: None,
                 }),
             },
         );
@@ -599,6 +603,7 @@ fn prop_drilling_direct_ir() {
                             },
                         )],
                     }),
+                    span: None,
                 }),
             },
         );
@@ -641,6 +646,7 @@ fn prop_drilling_direct_ir() {
                         id: ExprId(201),
                         fields: vec![("action".to_string(), Expr::Var("setV".to_string()))],
                     }),
+                    span: None,
                 }),
             },
         );

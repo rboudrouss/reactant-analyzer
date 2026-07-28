@@ -376,9 +376,10 @@ fn rename_vars_expr(expr: Expr, ren: &HashMap<Var, Var>) -> Expr {
             fn_: Box::new(rename_vars_expr(*fn_, ren)),
             args: args.into_iter().map(|a| rename_vars_expr(a, ren)).collect(),
         },
-        Expr::CompApp { name, props } => Expr::CompApp {
+        Expr::CompApp { name, props, span } => Expr::CompApp {
             name,
             props: Box::new(rename_vars_expr(*props, ren)),
+            span,
         },
         Expr::NativeElem {
             tag,
@@ -574,9 +575,10 @@ pub fn subst_vars_expr(expr: Expr, subst: &HashMap<Var, Expr>) -> Expr {
                 .map(|a| subst_vars_expr(a, subst))
                 .collect(),
         },
-        Expr::CompApp { name, props } => Expr::CompApp {
+        Expr::CompApp { name, props, span } => Expr::CompApp {
             name,
             props: Box::new(subst_vars_expr(*props, subst)),
+            span,
         },
         Expr::NativeElem {
             tag,

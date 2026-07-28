@@ -35,7 +35,7 @@ pub use helpers::setters::{SetterCall, collect_setter_calls, collect_setter_call
 pub use impls::{
     AlwaysUnstableDeps, AnalysisLimitInfo, ConditionalHook, DerivedState, FrozenInitialState,
     InfiniteLoop, LazyInit, MissingCleanup, MissingDeps, RedundantSetState, SetterInRender,
-    StaleClosure, StateMutation, UnnecessaryRerender, WideningInfo,
+    StaleClosure, StateMutation, UnnecessaryRerender, UnstableContextValue, WideningInfo,
 };
 pub use registry::{ComponentFindings, OverrideEntry, RegistryError, RuleOverrides, RuleRegistry};
 
@@ -109,6 +109,7 @@ pub fn all_rules() -> Vec<Box<dyn Rule>> {
         Box::new(InfiniteLoop),
         Box::new(DerivedState),
         Box::new(FrozenInitialState),
+        Box::new(UnstableContextValue),
         Box::new(WideningInfo),
         Box::new(AnalysisLimitInfo),
     ]

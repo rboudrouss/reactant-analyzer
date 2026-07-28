@@ -91,6 +91,11 @@ pub enum Expr {
     CompApp {
         name: Symbol,
         props: Box<Expr>,
+        /// Span of the element's opening tag. A diagnostic about a JSX element
+        /// (a context provider's `value`, an identity-keyed prop) has nowhere
+        /// else to point: unlike `NativeElem`, whose handler props are reached
+        /// through `HookEntry::Handler`, a component element owns no hook.
+        span: Option<SourceRange>,
     },
     NativeElem {
         tag: Symbol,

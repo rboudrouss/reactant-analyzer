@@ -31,9 +31,24 @@
   `useContext` call emits `analysis-limit` (363 sites across the eight corpora,
   the single largest source). ⊤ is the correct answer, not a bug, but modelling
   it would be the biggest precision win available: the value is whatever the
-  nearest matching Provider passes, which is cross-component (ADR-012 territory)
-  and needs the `createContext` binding resolved to its Provider element — the
-  same relation [step 4](#planned-work-adr-023--adr-024) needs for JSX props.
+  nearest matching Provider passes, which is cross-component (ADR-012 territory).
+  Half the groundwork now exists — `ModuleConstInit::Context` proves a binding
+  is a React context and `helpers::providers` resolves `<Ctx.Provider>` to the
+  value expression it receives — but only *within one file*, and the relation
+  answers "what identity does this provider pass", not "which provider does
+  this consumer see". The remaining work is the provider→consumer direction.
+
+- **A context provider the relation cannot prove** — `unstable-context-value`
+  fires only on a `createContext` binding visible in the component's own file
+  (`ModuleConstInit::Context`). An **imported** context
+  (`import { Ctx } from "./common"` — excalidraw `DropdownMenuContent.tsx:86`
+  on the corpus) is not proven and is skipped. Fixing it needs a program-level
+  `(file, name) → is-context` table: the map is per-file today and lowering
+  never crosses the import. Same class, one level up: a provider inside an
+  inline arrow (`items.map(() => <Ctx.Provider …>)`) or in a `useCallback`
+  invoked during render is missed, because the walk stops at `FnLit` — see
+  [step 4](#planned-work-adr-023--adr-024) for why crossing it naively would
+  instead produce a false positive on the memoized shape.
 
 ## Known false positives (FP)
 
@@ -142,7 +157,9 @@ blocking, in decreasing leverage:
   context values, identity-keyed JSX props, impure state updaters. The fix is
   new entities/edges (a hook call's `args`, a `jsx_props` anchor, a setter's
   argument), not a new guard — the guard already exists and is general. This is
-  the single highest-leverage extension.
+  the single highest-leverage extension. *(The provider-value case has since
+  been answered natively by `unstable-context-value`; what is still missing on
+  the Tier-A side is the anchor exposing that relation to a pack.)*
 - **Tier A is single-anchor** — a declarative rule binds exactly one anchor entity
   plus typed navigation; cross-component rules (the `cross_component_setters`
   shape only `stale-closure` uses natively) are inexpressible in Tier A v1.
@@ -213,17 +230,27 @@ fixes, `any_of`, native `missing-cleanup`) are done — see the git history.
    *execution phase*: a `setTimeout` inside an effect currently classifies as
    `effect`, which is not what any of the target rules mean.
 
-4. **JSX props as a sink** *(L)* — the context-provider and identity-keyed-prop rule
-   classes. The IR already carries what is needed (`Expr::CompApp { name, props }`,
-   with `AppContext.Provider` surviving as a single dotted name), but this is a new
-   *anchor* needing an engine-side relation, not an edge: the walk must cover
-   `comp.hooks[*].body_cfg()` as well as `render_cfg` or providers built inside a
-   `useMemo` are structurally invisible; the element role must be two-valued
-   (`ContextProvider` minted only from proof, everything else ⊤) because
-   `collect_module_consts` drops `CallExpression` initializers and so cannot tell a
-   non-context binding from an unresolved one; and the rule must not use the
-   `stability` guard, whose `per-render` conflates a fresh allocation with a moving
-   primitive — it needs an identity verdict built on `is_unstable_reference_only`.
+4. **JSX props as a sink** *(M, reduced)* — the engine half is built and shipped as
+   the native `unstable-context-value` (10 true positives, 0 regressions on the
+   corpus): `Expr::CompApp` carries a span, `ModuleConstInit::Context` mints the
+   two-valued element role from a proof, and `helpers::providers` answers the
+   identity question on `is_unstable_reference_only` — not the `stability` guard,
+   whose `per-render` conflates a fresh allocation with a moving primitive.
+
+   **One prescription of this step was wrong and is corrected here**: the walk must
+   *not* cover `comp.hooks[*].body_cfg()`. A provider element built inside a
+   `useMemo` is reconstructed only when the memo recomputes — its value keeps its
+   identity between recomputations, which is the *fixed* shape, so firing there
+   would be a false positive, and effect/handler bodies never hand elements to the
+   renderer at all. Render-only is the semantic answer, not a shortcut. The cost is
+   the `FnLit`-crossing FN recorded above; separating it from the memoized shape
+   needs a notion of *how often an element is constructed*, which the domain does
+   not model.
+
+   What remains: expose it as a Tier-A `context_providers` anchor with an `identity`
+   field (the vocabulary half), and the identity-keyed-prop class — a fresh
+   object or callback handed to a memoized child, which needs the same relation
+   generalised from the `value` prop to any prop.
 
 **Independent of the sequence** — [ADR-023 §5](adr/ADR-023-tier-a-vocabulary-growth.md)
 adopts it and it touches the npm host plus a codegen step, not the core:

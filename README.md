@@ -18,6 +18,7 @@ A static analyzer for React hook bugs, built on **abstract interpretation** over
 | `redundant-set-state` | `setN(0)` when `n` is already `0` |
 | `unnecessary-rerender` | mount-only effect that re-sets the initial value |
 | `lazy-init` | `useState(expensiveCall())` instead of `useState(() => expensiveCall())` |
+| `unstable-context-value` | `const v = { user, logout }` handed to `<Ctx.Provider value={v}>` — a new object every render, so every consumer re-renders |
 
 Rules live in `src/rules/`, one file per rule, all post-pass on a single `AnalysisResult`.
 

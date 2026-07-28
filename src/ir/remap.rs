@@ -67,9 +67,10 @@ pub fn remap_expr(expr: Expr, offset: HookLabel) -> Expr {
             fn_: Box::new(remap_expr(*fn_, offset)),
             args: args.into_iter().map(|a| remap_expr(a, offset)).collect(),
         },
-        Expr::CompApp { name, props } => Expr::CompApp {
+        Expr::CompApp { name, props, span } => Expr::CompApp {
             name,
             props: Box::new(remap_expr(*props, offset)),
+            span,
         },
         Expr::NativeElem {
             tag,
