@@ -1,5 +1,5 @@
+use crate::ir::hooks::HookEntry;
 use crate::rules::RuleCtx;
-use crate::{engine::HookKind, ir::hooks::HookEntry};
 
 use crate::rules::{Diagnostic, Rule};
 
