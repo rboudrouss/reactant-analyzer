@@ -26,3 +26,4 @@
 | [ADR-022](ADR-022-custom-rule-frontends-distribution.md) | Custom rule frontends & distribution — declarative packs over semantic anchors, pin ⊓ polarity, WASM-only npm | Accepted |
 | [ADR-023](ADR-023-tier-a-vocabulary-growth.md) | Tier-A vocabulary growth — expression-position entities, ∀ refused, Starlark rejected for JS/TS→JSON (supersedes ADR-022 §7) | Accepted |
 | [ADR-024](ADR-024-inlined-hook-finding-attribution.md) | Finding attribution across inlined hooks — render the origin, never collapse consumers | Accepted |
+| [ADR-025](ADR-025-fall-through-is-a-return.md) | A body that falls off the end returns `undefined` — `Unreachable` means only "control stops" | Accepted |

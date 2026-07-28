@@ -147,7 +147,16 @@ impl BlockBuilder {
                 BasicBlock {
                     id,
                     stmts,
-                    term: Terminator::Unreachable,
+                    // A body that falls off the end returns `undefined` — that
+                    // is a `Return`, not `Unreachable`. Sealing it `Unreachable`
+                    // told the splice that control never came back, so the join
+                    // block carrying the post-call statements *and the caller's
+                    // own terminator* was left with no predecessor: 198 corpus
+                    // components were severed from their own `Return`, and every
+                    // `stability_verdict` on them read an exit env missing a
+                    // real path (a false negative). `Unreachable` now means only
+                    // what it says — a `throw`, a stray `break`.
+                    term: Terminator::Return(Expr::Lit(Prim::Unit)),
                 },
             );
         }
@@ -945,6 +954,60 @@ mod tests {
             1,
             "the labeled break must not land in the inner loop's exit"
         );
+    }
+
+    /// A body that falls off the end returns `undefined`. Sealing it
+    /// `Unreachable` made the splice believe control never came back, which
+    /// severed the caller from its own exit (see `tests/cfg_exit_integrity.rs`).
+    #[test]
+    fn fall_through_tail_returns_undefined() {
+        let cfg = cfg_of("doSomething();");
+        assert!(
+            matches!(
+                cfg.blocks.get(&cfg.entry).map(|b| &b.term),
+                Some(Terminator::Return(Expr::Lit(Prim::Unit)))
+            ),
+            "got {:?}",
+            cfg.blocks.get(&cfg.entry).map(|b| &b.term)
+        );
+    }
+
+    /// `Unreachable` is reserved for control that does not continue. A `throw`
+    /// is the case that must keep it: wiring it into a caller's join block
+    /// invents a path reaching the exit without the callee's hooks.
+    #[test]
+    fn throw_stays_unreachable() {
+        let cfg = cfg_of("throw new Error(\"x\");");
+        assert!(matches!(
+            cfg.blocks.get(&cfg.entry).map(|b| &b.term),
+            Some(Terminator::Unreachable)
+        ));
+    }
+
+    /// An `if`/`else` whose branches both return leaves the join block with no
+    /// predecessor — it exists in `blocks` but cannot execute, so anything
+    /// quantifying over exits must exclude it.
+    #[test]
+    fn reachable_blocks_excludes_an_orphaned_join() {
+        let cfg = cfg_of("if (c) { return 1; } else { return 2; }");
+        let reachable = cfg.reachable_blocks();
+        let orphans: Vec<_> = cfg
+            .blocks
+            .keys()
+            .filter(|b| !reachable.contains(b))
+            .collect();
+        assert!(
+            !orphans.is_empty(),
+            "expected an orphaned join block, blocks={:?}",
+            cfg.blocks.keys().collect::<Vec<_>>()
+        );
+        for id in orphans {
+            assert!(
+                cfg.predecessors(*id).is_empty(),
+                "blk {id} should be orphaned"
+            );
+        }
+        assert!(reachable.contains(&cfg.entry));
     }
 
     /// A stray `break` is not valid JavaScript; keep sealing it rather than

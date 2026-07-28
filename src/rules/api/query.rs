@@ -300,20 +300,13 @@ impl<'a> RuleCtx<'a> {
     /// check so a rule cannot under-quantify (ADR-021 §3).
     pub fn hook_is_conditional(&self) -> Vec<Certified<ConditionalHookCall>> {
         let cfg = &self.comp.render_cfg;
-        let exits: Vec<BlockId> = cfg
-            .blocks
-            .values()
-            .filter(|b| matches!(b.term, Terminator::Return(_)))
-            .map(|b| b.id)
-            .collect();
-        let domtree = DominatorTree::new(cfg);
+        // One owner for "what the exits are": this used to keep its own copy of
+        // the enumeration and its own `DominatorTree`, which could disagree with
+        // `ExitDominance` about reachability.
+        let dominance = ExitDominance::of(cfg);
         cfg_hook_calls(self.comp)
             .filter(|call| !matches!(call.kind, HookKind::Handler))
-            .filter(|call| {
-                exits
-                    .iter()
-                    .any(|&exit| !domtree.dominates(call.block_id, exit))
-            })
+            .filter(|call| dominance.may_be_skipped(call.block_id))
             .map(|call| {
                 let mut notes = Vec::new();
                 if let Some((_, guard_span)) = guard_site(cfg, call.block_id) {
@@ -479,16 +472,35 @@ pub struct ExitDominance {
 
 impl ExitDominance {
     pub fn of(cfg: &CFG) -> Self {
+        // Reachable exits only. A `Return` no path can arrive at is not an exit:
+        // lowering seals a fall-through tail as `Return(undefined)`, and an
+        // `if`/`else` whose both branches returned leaves that tail orphaned —
+        // counting it would make every hook before the branch fail to dominate
+        // "all exits" and report as conditional at the **Error** tier.
+        let reachable = cfg.reachable_blocks();
         let exits = cfg
             .blocks
             .values()
             .filter(|b| matches!(b.term, Terminator::Return(_)))
             .map(|b| b.id)
+            .filter(|id| reachable.contains(id))
             .collect();
         ExitDominance {
             domtree: DominatorTree::new(cfg),
             exits,
         }
+    }
+
+    /// `true` when `block` may be skipped on some render path — the *rule-facing*
+    /// negation of [`Self::certify`], and deliberately not its `MustResult::None`
+    /// case: a CFG with no reachable exit proves nothing in either direction, so
+    /// nothing is skippable there.
+    pub fn may_be_skipped(&self, block: BlockId) -> bool {
+        !self.exits.is_empty()
+            && self
+                .exits
+                .iter()
+                .any(|&exit| !self.domtree.dominates(block, exit))
     }
 
     /// `All` iff `block` dominates every render exit (executes unconditionally);

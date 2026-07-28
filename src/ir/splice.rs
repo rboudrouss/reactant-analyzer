@@ -138,6 +138,15 @@ pub fn splice_callee_into_cfg(
                 return_blocks.push(*new_id);
                 Terminator::Jump(join_block_id)
             }
+            // Stays severed on purpose: `Unreachable` now means only what its
+            // name says — control does not continue (a `throw`, a stray
+            // `break`). A callee that merely falls off the end carries an
+            // explicit `Return(undefined)` from lowering and is handled by the
+            // arm above. Wiring `throw` to the join instead would invent a path
+            // that reaches the caller's exit without passing through the
+            // callee's hooks, which promoted a guard-throw custom hook
+            // (`if (!ctx) throw …; useOptimistic(…)`) to an **Error**-tier
+            // `conditional-hook` — a false positive at the certain tier.
             Terminator::Unreachable => Terminator::Unreachable,
         };
     }

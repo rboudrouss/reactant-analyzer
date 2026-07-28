@@ -74,6 +74,25 @@ impl CFG {
         }
     }
 
+    /// Blocks reachable from [`Self::entry`] by following edges.
+    ///
+    /// Splicing and `if`/`else` lowering both leave orphan blocks behind (a
+    /// join whose every predecessor returned, an inlined body after a `throw`),
+    /// so "every block of the CFG" and "every block that can execute" are not
+    /// the same set. Anything quantifying over program points — exits above
+    /// all — must use this one.
+    pub fn reachable_blocks(&self) -> std::collections::HashSet<BlockId> {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![self.entry];
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            stack.extend(self.successors(id));
+        }
+        seen
+    }
+
     pub fn successors(&self, block_id: BlockId) -> Vec<BlockId> {
         self.edges
             .iter()
