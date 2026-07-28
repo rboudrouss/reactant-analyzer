@@ -15,6 +15,69 @@ use oxc_ast::ast::{ImportDeclarationSpecifier, Program, Statement};
 
 use crate::resolver::ImportResolver;
 
+/// A relative import resolved to its defining file, keeping the name the
+/// *origin* exports under.
+///
+/// The distinction matters whenever a fact is looked up in the origin file's
+/// tables: `import { Ctx as C } from "./ctx"` binds `C` here but `./ctx`
+/// knows it as `Ctx`, so a local-name-only map cannot find it. (The same
+/// missing field is what makes `import { useMemo as useM }` classify as a
+/// custom hook — see `docs/TODO.md`.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedImport {
+    /// Absolute path the specifier resolved to.
+    pub file: PathBuf,
+    /// Name the origin file exports it under — the local name for a default
+    /// import, which has no exported name of its own.
+    pub imported: String,
+}
+
+/// Build a map from locally-bound import name → resolved origin, for every
+/// **relative** import in `program`. [`build_resolved_import_map`] is the
+/// file-only projection of this.
+pub fn build_resolved_imports(
+    program: &Program,
+    current_file: &Path,
+    resolver: &dyn ImportResolver,
+) -> HashMap<String, ResolvedImport> {
+    let mut map = HashMap::new();
+    for stmt in &program.body {
+        let Statement::ImportDeclaration(decl) = stmt else {
+            continue;
+        };
+        let source = decl.source.value.as_str();
+        // Only relative imports — npm packages are tracked by build_import_map.
+        if !source.starts_with('.') {
+            continue;
+        }
+        let Some(resolved) = resolver.resolve(current_file, source) else {
+            continue;
+        };
+        let Some(specifiers) = &decl.specifiers else {
+            continue;
+        };
+        for spec in specifiers {
+            let (local, imported) = match spec {
+                ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                    (s.local.name.as_str(), s.imported.name().to_string())
+                }
+                ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                    (s.local.name.as_str(), s.local.name.to_string())
+                }
+                ImportDeclarationSpecifier::ImportNamespaceSpecifier(_) => continue,
+            };
+            map.insert(
+                local.to_string(),
+                ResolvedImport {
+                    file: resolved.clone(),
+                    imported,
+                },
+            );
+        }
+    }
+    map
+}
+
 /// Build a map from locally-bound import name → resolved absolute file path,
 /// for every **relative** import in `program`.
 ///
@@ -35,30 +98,8 @@ pub fn build_resolved_import_map(
     current_file: &Path,
     resolver: &dyn ImportResolver,
 ) -> HashMap<String, PathBuf> {
-    let mut map = HashMap::new();
-    for stmt in &program.body {
-        let Statement::ImportDeclaration(decl) = stmt else {
-            continue;
-        };
-        let source = decl.source.value.as_str();
-        // Only relative imports npm packages are tracked by build_import_map.
-        if !source.starts_with('.') {
-            continue;
-        }
-        let Some(resolved) = resolver.resolve(current_file, source) else {
-            continue;
-        };
-        let Some(specifiers) = &decl.specifiers else {
-            continue;
-        };
-        for spec in specifiers {
-            let local_name = match spec {
-                ImportDeclarationSpecifier::ImportSpecifier(s) => s.local.name.as_str(),
-                ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => s.local.name.as_str(),
-                ImportDeclarationSpecifier::ImportNamespaceSpecifier(_) => continue,
-            };
-            map.insert(local_name.to_string(), resolved.clone());
-        }
-    }
-    map
+    build_resolved_imports(program, current_file, resolver)
+        .into_iter()
+        .map(|(local, r)| (local, r.file))
+        .collect()
 }

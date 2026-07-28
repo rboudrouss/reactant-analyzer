@@ -8,7 +8,7 @@
 
 ## Known false negatives (FN)
 
-- **Aliased React hook imports stay Custom** — `import { useMemo as useM } from "react"`: classification keys on the LOCAL name (`useM` matches no React arm) → Custom with `import_source: "react"` → not analyzed as a memo. Rare pattern; fixing it needs the *imported* name in the import map, not just the local binding.
+- **Aliased React hook imports stay Custom** — `import { useMemo as useM } from "react"`: classification keys on the LOCAL name (`useM` matches no React arm) → Custom with `import_source: "react"` → not analyzed as a memo. Rare pattern (measured: 13 alias sites across the eight corpora, 12 of them re-exports, so the payload is ≈0). The missing piece it needed — the *imported* name alongside the resolved file — now exists as `lowering::ResolvedImport`; `build_resolved_import_map` is its file-only projection, and switching the hook classifier onto the richer relation is what remains. Note the same field is needed for **relative** imports only: a React alias arrives through a bare `"react"` specifier, which `build_resolved_imports` skips by design, so `build_import_map` needs the same treatment.
 
 - **Unknown callees without `Loc`** — `myHelper(() => setX())` → FN if `myHelper` is imported from an npm package (not in the analyzed files) or if inlining was cut off by depth. Local utilities are inlined (ADR-013 Phase 3) but only in **statement** position; in expression position they stay opaque. *(ADR-010, ADR-013)*
 
@@ -32,23 +32,28 @@
   the single largest source). ⊤ is the correct answer, not a bug, but modelling
   it would be the biggest precision win available: the value is whatever the
   nearest matching Provider passes, which is cross-component (ADR-012 territory).
-  Half the groundwork now exists — `ModuleConstInit::Context` proves a binding
-  is a React context and `helpers::providers` resolves `<Ctx.Provider>` to the
-  value expression it receives — but only *within one file*, and the relation
-  answers "what identity does this provider pass", not "which provider does
-  this consumer see". The remaining work is the provider→consumer direction.
+  The producer side now exists and crosses files: `ModuleConstInit::Context`
+  proves a binding is a React context (including an imported and aliased one,
+  resolved by `resolver::resolve_imported_contexts` on the name the *origin*
+  exports), and `helpers::providers` resolves `<Ctx.Provider>` to the identity
+  of the value it passes. What is missing is the other direction — "which
+  provider does this consumer see" — and its blocker is now known rather than
+  guessed: a `ContextStore` on the `SharedStateStore` model cannot be populated
+  during the fixpoint, because `analyze_program`'s **phase 2** analyses
+  unreached components *intra only*, with no `InterCtx`, so a provider living
+  there would never register its value and consumers would read a store entry
+  that is silently `bottom`. Either the store is built as a post-pass over the
+  results (and then the consumer cannot read it during its own analysis), or
+  the two phases are unified. Decide that first.
 
-- **A context provider the relation cannot prove** — `unstable-context-value`
-  fires only on a `createContext` binding visible in the component's own file
-  (`ModuleConstInit::Context`). An **imported** context
-  (`import { Ctx } from "./common"` — excalidraw `DropdownMenuContent.tsx:86`
-  on the corpus) is not proven and is skipped. Fixing it needs a program-level
-  `(file, name) → is-context` table: the map is per-file today and lowering
-  never crosses the import. Same class, one level up: a provider inside an
-  inline arrow (`items.map(() => <Ctx.Provider …>)`) or in a `useCallback`
-  invoked during render is missed, because the walk stops at `FnLit` — see
+- **A context provider the relation cannot prove** — a provider inside an inline
+  arrow (`items.map(() => <Ctx.Provider …>)`) or in a `useCallback` invoked
+  during render is missed, because the walk stops at `FnLit` — see
   [step 4](#planned-work-adr-023--adr-024) for why crossing it naively would
-  instead produce a false positive on the memoized shape.
+  instead produce a false positive on the memoized shape. A context reached
+  through a **re-export chain** (`export { Ctx } from "./a"`) is also unproven:
+  the cross-file pass follows one level, the same bound as the rest of the
+  import resolution.
 
 ## Known false positives (FP)
 
@@ -231,11 +236,15 @@ fixes, `any_of`, native `missing-cleanup`) are done — see the git history.
    `effect`, which is not what any of the target rules mean.
 
 4. **JSX props as a sink** *(M, reduced)* — the engine half is built and shipped as
-   the native `unstable-context-value` (10 true positives, 0 regressions on the
+   the native `unstable-context-value` (11 true positives, 0 regressions on the
    corpus): `Expr::CompApp` carries a span, `ModuleConstInit::Context` mints the
-   two-valued element role from a proof, and `helpers::providers` answers the
-   identity question on `is_unstable_reference_only` — not the `stability` guard,
-   whose `per-render` conflates a fresh allocation with a moving primitive.
+   two-valued element role from a proof — same-file or imported, resolved by the
+   name the origin exports — and `helpers::providers` answers the identity
+   question on `is_unstable_reference_only`, not the `stability` guard, whose
+   `per-render` conflates a fresh allocation with a moving primitive. The
+   two-valued role is load-bearing, not defensive: 2 of the 14 cross-file
+   `.Provider` elements on the corpus are namespace-imported components
+   (Radix's `TooltipPrimitive.Provider`) and are not contexts at all.
 
    **One prescription of this step was wrong and is corrected here**: the walk must
    *not* cover `comp.hooks[*].body_cfg()`. A provider element built inside a

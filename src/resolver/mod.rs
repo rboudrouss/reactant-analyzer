@@ -10,6 +10,7 @@
 
 pub mod filesystem;
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -18,10 +19,13 @@ use crate::{
         ComponentRegistry, Config, FunctionRegistry, HookRegistry, ProgramAnalysisResult,
         RootStrategy, analyze_program,
     },
-    ir::{FileTable, component::ComponentIR, function_ir::FunctionIR, hook_ir::HookIR},
+    ir::{
+        FileTable, ModuleConstInit, component::ComponentIR, function_ir::FunctionIR,
+        hook_ir::HookIR,
+    },
     lowering::{
-        lower_custom_hooks_with_resolver, lower_program_with_resolver,
-        utility_lowerer::lower_utilities_with_resolver,
+        ResolvedImport, lower_custom_hooks_with_resolver, lower_program_with_resolver,
+        scan_context_names, utility_lowerer::lower_utilities_with_resolver,
     },
 };
 
@@ -120,6 +124,10 @@ pub fn lower_files_with(
         parse_errors: Vec::new(),
         file_table: FileTable::default(),
     };
+    // Per-file context bindings and resolved imports, for the cross-file pass
+    // below: a context is only provable once every file has been scanned.
+    let mut contexts: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    let mut file_imports: Vec<(PathBuf, HashMap<String, ResolvedImport>)> = Vec::new();
 
     for path in files {
         let source = match fs.read_to_string(path) {
@@ -166,10 +174,62 @@ pub fn lower_files_with(
             &mut lowered.file_table,
             resolver,
         ));
+        contexts.insert(path.clone(), scan_context_names(&ret.program));
+        file_imports.push((
+            path.clone(),
+            crate::lowering::build_resolved_imports(&ret.program, path, resolver),
+        ));
         lowered.file_count += 1;
     }
 
+    resolve_imported_contexts(&mut lowered, &contexts, &file_imports);
     lowered
+}
+
+/// Mark a context imported from another analyzed file as a context *here*.
+///
+/// `collect_module_consts` sees one file, so `import { Ctx } from "./ctx"` left
+/// `Ctx` unproven and every `<Ctx.Provider>` unreachable to the provider
+/// relation. Resolution has to happen once all files are lowered, which is
+/// here; the enriched map replaces the per-file `Arc` on every component of
+/// that file, so the role stays in the single table its consumers already read.
+///
+/// One level only: if the origin file re-exports the context from a third file,
+/// the chain is not followed (the re-export limit recorded in `docs/TODO.md`).
+fn resolve_imported_contexts(
+    lowered: &mut LoweredProgram,
+    contexts: &HashMap<PathBuf, HashSet<String>>,
+    file_imports: &[(PathBuf, HashMap<String, ResolvedImport>)],
+) {
+    let mut extra: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    for (file, imports) in file_imports {
+        for (local, origin) in imports {
+            if contexts
+                .get(&origin.file)
+                .is_some_and(|names| names.contains(&origin.imported))
+            {
+                extra.entry(file.clone()).or_default().push(local.clone());
+            }
+        }
+    }
+    if extra.is_empty() {
+        return;
+    }
+    // One rebuilt map per file, shared by that file's components as before.
+    let mut rebuilt: HashMap<PathBuf, Arc<HashMap<String, ModuleConstInit>>> = HashMap::new();
+    for comp in &mut lowered.components {
+        let Some(names) = extra.get(&comp.file) else {
+            continue;
+        };
+        let map = rebuilt.entry(comp.file.clone()).or_insert_with(|| {
+            let mut m = (*comp.module_consts).clone();
+            for name in names {
+                m.insert(name.clone(), ModuleConstInit::Context);
+            }
+            Arc::new(m)
+        });
+        comp.module_consts = Arc::clone(map);
+    }
 }
 
 /// Run the inter-component analysis on an already-lowered program.

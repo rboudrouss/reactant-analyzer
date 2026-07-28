@@ -14,7 +14,7 @@ pub use cfg_builder::{build_cfg, build_fn_body_cfg};
 pub use component_detector::{ComponentCandidate, detect_components};
 pub use hook_detector::{HookCandidate, detect_custom_hooks};
 pub use hook_extractor::{extract_handlers, extract_hooks, extract_subscriptions};
-pub use import_resolution::build_resolved_import_map;
+pub use import_resolution::{ResolvedImport, build_resolved_import_map, build_resolved_imports};
 pub use utility_detector::{UtilityCandidate, detect_utilities};
 pub use utility_lowerer::{lower_utilities, lower_utilities_with_resolver};
 
@@ -130,6 +130,20 @@ fn build_react_ns(program: &Program) -> HashSet<String> {
         }
     }
     ns
+}
+
+/// Module-level bindings of `program` that are proven React contexts.
+///
+/// The cross-file pass in [`crate::resolver::lower_files_with`] needs this for
+/// *every* file, including files with no component of their own — a
+/// `contexts/ctx.ts` that only exports the context is the common shape.
+pub(crate) fn scan_context_names(program: &Program) -> HashSet<String> {
+    let react_ns = build_react_ns(program);
+    collect_module_consts(program, &react_ns)
+        .into_iter()
+        .filter(|(_, init)| matches!(init, ModuleConstInit::Context))
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// Local names bound to React's `createContext`, including an aliased import
