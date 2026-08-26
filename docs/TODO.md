@@ -47,7 +47,7 @@
 - **A context provider the relation cannot prove** — a provider inside an inline
   arrow (`items.map(() => <Ctx.Provider …>)`) or in a `useCallback` invoked
   during render is missed, because the walk stops at `FnLit` — see
-  [step 3](#planned-work-adr-023--adr-024) for why crossing it naively would
+  [step 2](#planned-work-adr-023--adr-024) for why crossing it naively would
   instead produce a false positive on the memoized shape. A context reached
   through a **re-export chain** (`export { Ctx } from "./a"`) is also unproven:
   the cross-file pass follows one level, the same bound as the rest of the
@@ -146,23 +146,25 @@ rules-of-hooks, index-as-key, naming) are explicitly out of scope.
 
 ## Frontend limits (ADR-022)
 
-Measured by authoring `packs/guardrails.json` against a 21-rule catalogue drawn
-from the eight `test-repo/` corpora: **3 of the 21 real-world rule classes were
-expressible, all in weakened form**. Five of the blockers that count was taken
-against have since been removed and it has *not* been re-measured, so read it as
-the baseline the fixes were judged against, not as today's figure. What is still
-blocking, in decreasing leverage:
+The measure is now **automated**: `tests/catalogue.rs` materializes the 21-rule
+catalogue (reconstructed from ADR-023's blocker classes and the corpus notes)
+and *proves* every expressible entry — the pack rule must load, fire on the
+buggy fixture, and stay silent on the conformant one. The curve:
+**3/21 (ADR-022 baseline) → 5/21** after ADR-023 steps 1-2 — new:
+`store-selector-fresh-reference` (the `args` edge + `returns` guard) and
+`no-direct-use-layout-effect` (the `origin` guard over provenance rows,
+wrapper-aware). Run `cargo test --test catalogue -- --nocapture` for the full
+blocked-entry report. What is still blocking, in decreasing leverage:
 
-- **Only declared deps carry an expression verdict** — `RuleCtx::stability_verdict`
-  accepts *any* `Expr`, but the `stability` guard is wired to the `deps` edge
-  alone. Every rule about a value in an *argument*, *prop* or *provider-value*
-  position is therefore inexpressible: store-selector snapshots, per-render
-  context values, identity-keyed JSX props, impure state updaters. The fix is
-  new entities/edges (a hook call's `args`, a `jsx_props` anchor, a setter's
-  argument), not a new guard — the guard already exists and is general. This is
-  the single highest-leverage extension. *(The provider-value case has since
-  been answered natively by `unstable-context-value`; what is still missing on
-  the Tier-A side is the anchor exposing that relation to a pack.)*
+- **Only deps and custom-hook args carry an expression verdict** — the `args`
+  edge (ADR-023 step 2) answers the store-selector class with `returns` (the
+  identity question, computed during the fixpoint); *prop*, *provider-value*
+  and *setter-argument* positions remain inexpressible: per-render context
+  values, identity-keyed JSX props, impure state updaters. The fix stays new
+  entities/edges (a `jsx_props` anchor, a setter's argument), not a new guard.
+  *(The provider-value case has since been answered natively by
+  `unstable-context-value`; what is still missing on the Tier-A side is the
+  anchor exposing that relation to a pack.)*
 - **Tier A is single-anchor** — a declarative rule binds exactly one anchor entity
   plus typed navigation; cross-component rules (the `cross_component_setters`
   shape only `stale-closure` uses natively) are inexpressible in Tier A v1.
@@ -176,14 +178,6 @@ blocking, in decreasing leverage:
   edge, so "every dep is stable" cannot be stated. The only workaround is to pin
   the arity (`count equals 1` alongside the per-element guard), which is why
   `guardrails/inert-single-dep` covers single-dep effects and nothing wider.
-- **`useLayoutEffect`/`useInsertionEffect` are indistinguishable from `useEffect`
-  in Tier A** — lowering still collapses all three into `HookEntry::Effect`, but
-  the engine half is no longer the blocker: `AnalysisResult::hook_provenance`
-  (ADR-023 step 1) keeps `label → (origin hook, source, direct|inlined)`, so the
-  "never call `useLayoutEffect` directly, use the SSR-safe wrapper" rule is
-  decidable — including staying silent on conformant consumers of a wrapper
-  (`inlined: true`). What remains is the Tier-A exposure: a field/guard on the
-  effect anchor reading the provenance row.
 
 ## Planned work (ADR-023 / ADR-024)
 
@@ -191,37 +185,29 @@ In sequence. Each step is gated on the one before it; the ordering is the
 decision, not a preference — [ADR-023 §5](adr/ADR-023-tier-a-vocabulary-growth.md)
 records why vocabulary work comes after attribution and after the engine facts.
 The first four steps of that sequence (origin-file attribution, the vocabulary
-fixes, `any_of`, native `missing-cleanup`) are done, and so is **step 1, hook
-identity by provenance** (`lowering::HookOrigin` fail-closed on imports, literal
-`"react"` specifier decided before the resolver, raw specifier retained on every
-variant, `hook_provenance` rows surviving `expand_custom_hooks` onto
-`AnalysisResult`; the aliased-import FN and the `(file, name)` lookup for
-self-aliased packages fell out of it) — see the git history. Corpus re-measure:
-6/8 byte-identical, +4 TPs (barrel re-export fallback), 0 lost.
+fixes, `any_of`, native `missing-cleanup`) are done, and so are **steps 1 and 2**
+— see the git history:
 
-1. **Expression-position entities** *(M/L)* — ADR-023 §§1-3. Its gate, the
-   array-destructuring provenance fix, has landed. The ADR's own cost estimate
-   does not survive checking and is amended in place: `returns_verdict`
-   **cannot be a primitive in `api/query.rs`**. Every part it composes from
-   (`exec_body`, the ⊤-param binding at `interpreter.rs:426-435`, the lazy-init
-   shape at `fixpoint.rs:244`) takes an `&mut AnalysisCtx`, and no context
-   survives the fixpoint — the rules layer holds an `AnalysisResult`. The
-   verdict has to be computed during the fixpoint and stored on the result,
-   the way `effect_block_states` and `handler_block_states` already are, with
-   `api/query.rs` owning only the type and the reader. Scope is otherwise
-   unchanged: the **inline `FnLit` case only**, then the `args` edge on the
-   `custom` anchor. Not the `init` edge: a mount-only expression has no
-   cross-render stability question. Not `Var`-bound selectors: `locs` wins over
-   `stabs` in `lookup_env_val` with no invalidation on reassignment, so heap
-   resolution would answer `Stable` for a re-bound opaque selector.
+- **Step 1, hook identity by provenance**: `lowering::HookOrigin` fail-closed
+  on imports, literal `"react"` specifier decided before the resolver, raw
+  specifier retained on every variant, `hook_provenance` rows surviving
+  `expand_custom_hooks` onto `AnalysisResult`, plus the Tier-A `origin` guard
+  reading them (wrapper-aware `no-direct-use-layout-effect`). The
+  aliased-import FN and the `(file, name)` lookup for self-aliased packages
+  fell out of it. Corpus re-measure: 6/8 byte-identical, +4 TPs (barrel
+  re-export fallback), 0 lost.
+- **Step 2, expression-position entities**: per the ADR-023 §3 amendment,
+  the joined return value of each inline `FnLit` argument of an unexpanded
+  custom hook is computed during analysis (params ⊤, module consts only in
+  scope — the written over-approximation argument ADR-023 §2 demands) and
+  stored as `AnalysisResult::custom_arg_returns`; `api/query.rs` owns the
+  `ReturnsVerdict` type (the *identity* question — `fresh-reference`, not
+  `per-render`) and the ⊤-total reader. Tier A gained the `args` edge on the
+  custom anchor and the `returns` guard; `Field::admits` refuses `stability`
+  on an argument (the program-point error). `Var`-bound selectors stay
+  `Unknown` (the recorded deferral). Corpus: byte-identical.
 
-   One constraint the vocabulary work now makes cheap to enforce: the `args`
-   edge must admit `returns_verdict` and **not** `stability` — reading the
-   stability guard at render exit for a call-site argument is precisely the
-   program-point error ADR-023 §2 refuses, and `Field::admits` is the table
-   that can say so.
-
-2. **Slot-centric `writers` edge** *(M)* — the join blocker (a slot resynced by an
+1. **Slot-centric `writers` edge** *(M)* — the join blocker (a slot resynced by an
    effect *and* written by a handler; 43 candidate pairs on the corpus). Reduced
    scope only: `writer_phases includes`, a pure MAY existential on the same footing
    as `in_deps`. **No** `only` comparator and **no** `Escaped` row — measured, 254 of
@@ -231,7 +217,7 @@ self-aliased packages fell out of it) — see the git history. Corpus re-measure
    *execution phase*: a `setTimeout` inside an effect currently classifies as
    `effect`, which is not what any of the target rules mean.
 
-3. **JSX props as a sink** *(M, reduced)* — the engine half is built and shipped as
+2. **JSX props as a sink** *(M, reduced)* — the engine half is built and shipped as
    the native `unstable-context-value` (11 true positives, 0 regressions on the
    corpus): `Expr::CompApp` carries a span, `ModuleConstInit::Context` mints the
    two-valued element role from a proof — same-file or imported, resolved by the
@@ -257,28 +243,20 @@ self-aliased packages fell out of it) — see the git history. Corpus re-measure
    object or callback handed to a memoized child, which needs the same relation
    generalised from the `value` prop to any prop.
 
-**Independent of the sequence** — [ADR-023 §5](adr/ADR-023-tier-a-vocabulary-growth.md)
-adopts it and it touches the npm host plus a codegen step, not the core:
+**Independent of the sequence** — both done, see the git history:
 
-- **JS/TS pack authoring compiled to Tier-A JSON.** A pack may be written as a
-  JS/TS module exporting the rule list, on the `eslint.config.js` model, and
-  compiled to the `pack.json` the core already validates. The host side is
-  mostly there: `npm/lib/host.js` runs under Node and resolves packs through
-  `createRequire`. Ship it as codegen — **the generated JSON is the committed
-  artifact** — so the native Rust CLI, which cannot run Node, consumes the same
-  inert file and nothing forks; a `reactant packs build`-style step (or the
-  wrapper doing it when it sees a `.js`/`.ts` pack) is the whole surface. Ship a
-  `.d.ts` for the rule shape generated from the same schemars types as
-  `pack.schema.json`, so the types cannot drift from the validator. This is the
-  JS-community authoring path ADR-021 always intended for Tier A; it buys
-  composition at *authoring* time (generate N rules from a table, share
-  constants, test in vitest) and deliberately not at analysis time.
+- **JS/TS pack authoring compiled to Tier-A JSON** — shipped as
+  `reactant packs build <pack.js>` in the npm wrapper (ADR-023 §5): the module
+  is evaluated at authoring time, validated through the core's own `load_pack`
+  (the `validatePack` wasm export), and **the generated JSON is the committed
+  artifact** — the native CLI consumes the same inert file. `npm/lib/pack.d.ts`
+  is generated from `pack.schema.json` (same schemars types as the validator,
+  `npm/scripts/gen-pack-dts.js`, drift-checked by `npm/test/packs.sh`); the
+  byte-identity of the build and the core-validity of the output are both
+  regression-tested (`npm/test/packs.sh`, `tests/declarative.rs`).
 
-- **Effect timing is not recoverable by an IR field alone** — adding an `api`
-  attribute to distinguish `useLayoutEffect`/`useInsertionEffect` from `useEffect`
-  (38 exhaustive `HookEntry::Effect` sites) buys nothing until a
-  `label → (origin hook, import source, origin file, direct|inlined)` row survives
-  `expand_custom_hooks`: without it the chakra rule "never call `useLayoutEffect`
-  directly" fires on conformant consumers of a wrapper that calls it for them.
-  That provenance row is the same mechanism step 1 needs, and the same one that
-  would make the origin attribution actionable — build it once, then the `api` attribute is cheap.
+- **Effect timing (`api` attribute on `HookEntry::Effect`)** — the provenance
+  row it was gated on now exists, and the Tier-A `origin` guard already covers
+  the chakra rule ("never call `useLayoutEffect` directly", wrapper-aware), so
+  the IR attribute is only worth adding if the *engine* ever needs timing
+  semantics (layout vs passive effects) — not for any rule currently in view.

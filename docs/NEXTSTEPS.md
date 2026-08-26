@@ -1,0 +1,97 @@
+# Next steps — feuille de route recommandée
+
+> Complément stratégique de [TODO.md](TODO.md) : TODO.md liste les limites
+> d'analyse ouvertes ; ce fichier ordonne le travail par levier d'adoption.
+> Principe directeur : **sortir l'outil et le vocabulaire devant des
+> utilisateurs avant de creuser la précision.**
+>
+> Positionnement (double, les deux volets se renforcent) :
+> 1. **Vérificateur sound pour le code que l'IA écrit** — les LLMs produisent
+>    précisément les bugs que le niveau 3 attrape (boucles d'effets, deps
+>    manquantes, état dérivé, closures périmées) ; sortie JSON déterministe +
+>    chaînes de témoins = oracle exploitable dans une boucle d'agent.
+> 2. **Langage de contraintes sémantiques pour lui dire quoi écrire** — les
+>    packs Tier A transforment les conventions d'équipe (prose CLAUDE.md,
+>    page Notion) en spec exécutable, gardée sur des faits prouvés du domaine,
+>    donc robuste au refactoring et aux indirections — contrairement à une
+>    règle eslint custom (pattern AST contournable). Le React Compiler
+>    n'attaquera jamais ce volet.
+
+## Phase 1 — Rendre l'outil installable (1-2 semaines)
+
+1. **Publier le paquet npm** (`reactant-analyzer`) — le build wasm et le
+   wrapper existent (`npm/`, smoke test 9/9 byte-identical vs natif). Reste
+   de la finition : nom définitif, README npm, `npx reactant check src/` qui
+   marche du premier coup.
+2. **GitHub Action** — un `action.yml` autour du CLI (`--format json`,
+   `--fail-on error`, exit codes déjà propres). Point d'entrée CI, donc point
+   d'entrée « gate pour code généré par IA ».
+3. **README orienté adoption** — section « reactant vs React Compiler vs
+   eslint-plugin-react-hooks » : ce que chacun corrige, masque, ou prouve.
+   Le compiler auto-mémoïse (il érode l'urgence de la classe stabilité
+   référentielle) mais ne corrige ni `infinite-loop`, ni `derived-state`,
+   ni `stale-closure`, ni les cycles cross-composants — c'est la ligne de
+   différenciation à écrire noir sur blanc.
+
+## Phase 2 — Le chemin critique du vocabulaire (le gros du trimestre)
+
+**✅ FAIT (2026-08-26)** — les quatre items sont livrés, voir l'historique git
+et [TODO.md § Planned work](TODO.md#planned-work-adr-023--adr-024) :
+
+4. ~~**Étape 1 ADR-023 : provenance des hooks**~~ — `HookOrigin` fail-closed,
+   littéral `"react"` avant le resolver, spécificateur brut retenu ;
+   `hook_provenance` (`label → origin hook, source, direct|inlined`) survit à
+   `expand_custom_hooks` jusqu'à `AnalysisResult`, et le guard Tier-A
+   `origin` exprime « jamais `useLayoutEffect` direct » wrapper-aware.
+   Bonus mesurés : FN d'alias fermé, +4 TPs corpus (re-exports barrel).
+5. ~~**Étape 2 ADR-023 : entités en position d'expression**~~ —
+   `custom_arg_returns` calculé pendant le fixpoint (params ⊤, module consts
+   seuls en scope), `ReturnsVerdict` (question d'*identité*, pas de
+   stabilité) + reader ⊤-total dans `api/query.rs`, edge `args` + guard
+   `returns` en Tier A ; `stability` refusé sur un argument (erreur de point
+   de programme, ADR-023 §2). La règle zustand-selector est exprimable.
+6. ~~**Re-mesure automatisée**~~ — `tests/catalogue.rs` matérialise le
+   catalogue 21 règles ; chaque entrée exprimable est *prouvée* (le pack
+   charge, fire sur le fixture buggé, silencieux sur le conforme).
+   **Courbe : 3/21 → 5/21.** `cargo test --test catalogue -- --nocapture`
+   imprime le rapport des bloqueurs.
+7. ~~**Authoring JS/TS des packs**~~ — `reactant packs build <pack.js>` dans
+   le wrapper npm : module évalué à l'authoring, validé par le `load_pack`
+   du core (export wasm `validatePack`), **JSON généré = artefact committé** ;
+   `npm/lib/pack.d.ts` généré de `pack.schema.json` (mêmes types schemars),
+   anti-drift testé (`npm/test/packs.sh`).
+
+## Phase 3 — Se faire connaître (en parallèle de la phase 2)
+
+8. **L'article de comparaison** — les 8 corpus, le différentiel vs
+   eslint-plugin-react-hooks, les cas où les auteurs eux-mêmes ont posé des
+   `eslint-disable` que reactant tranche sémantiquement. L'envoyer aux
+   auteurs de React-tRace (Lee, Ahn, Yi — OOPSLA 2025) : cette implémentation
+   est probablement la seule industrielle de leur sémantique.
+9. **Contacter l'équipe Oxc** — reactant est déjà sur leur parser ; oxlint
+   cherche de l'analyse React profonde et se greffer sur un linter que les
+   gens ont déjà bat toute installation standalone. Même une issue « voilà ce
+   que je fais avec oxc » peut ouvrir le canal.
+10. **Un mode agent** — serveur MCP, ou simplement `--format json` documenté
+    comme interface agent, avec les chaînes de témoins (ADR-019) exposées
+    comme explication causale exploitable pour l'autofix. Petit effort, gros
+    effet de positionnement.
+
+## Phase 4 — Précision (après avoir des utilisateurs)
+
+11. **Trancher la question `useContext`** — post-pass sur les résultats vs
+    unification des deux phases (cf. TODO.md : « decide that first »). Plus
+    gros gain de précision disponible (363 sites ⊤ sur les corpus), mais il
+    sert les règles natives, pas le marché — il attend du feedback réel.
+12. **Étapes 3-4 ADR-023** (`writers` edge, anchor `context_providers`
+    Tier A) au fil de l'eau, guidées par ce que les premiers packs
+    utilisateurs n'arrivent pas à exprimer.
+
+## Anti-priorités
+
+- Entamer la phase 4 avant la phase 1.
+- Ajouter de nouvelles règles natives (Tier 1/2 de TODO.md) avant que le
+  vocabulaire ne les rende exprimables en pack.
+- Vendre « écrivez vos règles sémantiques » tant que l'expressivité mesurée
+  reste à 3/21 — les étapes 4-6 d'abord.
+- Toute re-mesure corpus non automatisée.
