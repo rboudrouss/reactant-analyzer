@@ -1,3 +1,5 @@
 dist/
 schemas/
 node_modules/
+LICENSE
+*.tgz
