@@ -247,9 +247,9 @@ impl TierARule {
                 };
                 match e.provenance(row.info.label) {
                     Some(p) => {
-                        hook.as_ref().is_none_or(|names| {
-                            names.iter().any(|n| n == p.origin_hook.as_str())
-                        }) && direct.is_none_or(|d| !p.inlined == d)
+                        hook.as_ref()
+                            .is_none_or(|names| names.iter().any(|n| n == p.origin_hook.as_str()))
+                            && direct.is_none_or(|d| p.inlined != d)
                     }
                     None => false,
                 }

@@ -119,9 +119,8 @@ fn var_bound_selector_is_unknown() {
 
 #[test]
 fn out_of_range_argument_is_unknown() {
-    let (prog, name) = ctx_for(
-        "function C() {\n  const x = useStore((s) => s.a);\n  return <div>{x}</div>;\n}",
-    );
+    let (prog, name) =
+        ctx_for("function C() {\n  const x = useStore((s) => s.a);\n  return <div>{x}</div>;\n}");
     let ctx = RuleCtx::new(&prog, &name);
     assert_eq!(ctx.returns_verdict(999, 0), ReturnsVerdict::Unknown);
 }

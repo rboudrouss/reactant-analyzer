@@ -153,7 +153,7 @@ mod tests {
             render_cfg: crate::test_support::single_block_cfg(vec![]),
             hooks: vec![],
             hook_provenance: vec![],
-        custom_arg_returns: HashMap::new(),
+            custom_arg_returns: HashMap::new(),
             iterations: 1,
             heap: crate::domains::stores::Heap::new(),
         }
