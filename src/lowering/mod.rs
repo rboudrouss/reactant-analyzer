@@ -14,12 +14,15 @@ pub use cfg_builder::{build_cfg, build_fn_body_cfg};
 pub use component_detector::{ComponentCandidate, detect_components};
 pub use hook_detector::{HookCandidate, detect_custom_hooks};
 pub use hook_extractor::{extract_handlers, extract_hooks, extract_subscriptions};
-pub use import_resolution::{ResolvedImport, build_resolved_import_map, build_resolved_imports};
+pub use import_resolution::{
+    HookOrigin, ResolvedImport, build_hook_origins, build_resolved_import_map,
+    build_resolved_imports,
+};
 pub use utility_detector::{UtilityCandidate, detect_utilities};
 pub use utility_lowerer::{lower_utilities, lower_utilities_with_resolver};
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use oxc_ast::ast::{
@@ -63,43 +66,6 @@ pub struct Candidate<'a> {
     pub name: String,
     pub params: &'a FormalParameters<'a>,
     pub body: &'a FunctionBody<'a>,
-}
-
-/// Build a map from locally-bound hook name → NPM package source for every
-/// named import in `program`.
-///
-/// Example: `import { useQuery } from '@tanstack/react-query'`
-///          → `{"useQuery": "@tanstack/react-query"}`
-///
-/// Only named and default imports are tracked; namespace imports (`* as foo`)
-/// are skipped.  Relative imports (starting with `.`) are excluded they
-/// are local files, not packages, and would not match SummaryRegistry entries.
-fn build_import_map(program: &Program) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for stmt in &program.body {
-        let Statement::ImportDeclaration(decl) = stmt else {
-            continue;
-        };
-        let source = decl.source.value.as_str();
-        // Skip relative imports local files, not packages.
-        if source.starts_with('.') {
-            continue;
-        }
-        let Some(specifiers) = &decl.specifiers else {
-            continue;
-        };
-        for spec in specifiers {
-            let local_name = match spec {
-                ImportDeclarationSpecifier::ImportSpecifier(s) => s.local.name.as_str(),
-                ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => s.local.name.as_str(),
-                ImportDeclarationSpecifier::ImportNamespaceSpecifier(_) => continue,
-            };
-            if local_name.starts_with("use") {
-                map.insert(local_name.to_string(), source.to_string());
-            }
-        }
-    }
-    map
 }
 
 /// Local names bound to the `react` module itself: `import React from
@@ -313,23 +279,22 @@ pub fn lower_custom_hooks_with_resolver(
     resolver: &dyn ImportResolver,
 ) -> Vec<HookIR> {
     let smap = SourceMap::new(source, files.intern(file));
-    let import_map = build_import_map(program);
-    let resolved_import_map: HashMap<String, PathBuf> =
-        build_resolved_import_map(program, file, resolver);
+    let origins = build_hook_origins(program, file, resolver);
     let react_ns = build_react_ns(program);
     let candidates = detect_custom_hooks(program);
     let local_hooks: HashSet<String> = candidates.iter().map(|c| c.name.clone()).collect();
     let imports = hook_extractor::ImportCtx {
-        import_map: &import_map,
-        resolved_import_map: &resolved_import_map,
+        origins: &origins,
         react_ns: &react_ns,
         local_hooks: &local_hooks,
+        current_file: Some(file),
     };
     candidates
         .into_iter()
         .map(|candidate| {
             let (params, mut body_cfg) = build_fn_body_cfg(candidate.params, candidate.body, &smap);
-            let (mut hooks, mut next_label) = extract_hooks(&mut body_cfg, &imports);
+            let (mut hooks, hook_provenance, mut next_label) =
+                extract_hooks(&mut body_cfg, &imports);
             extract_handlers(&body_cfg, &mut hooks, &mut next_label);
             extract_subscriptions(&mut hooks, &mut next_label);
             HookIR {
@@ -338,6 +303,7 @@ pub fn lower_custom_hooks_with_resolver(
                 params,
                 body_cfg,
                 hooks,
+                hook_provenance,
             }
         })
         .collect()
@@ -372,9 +338,7 @@ pub fn lower_program_with_resolver(
     resolver: &dyn ImportResolver,
 ) -> Vec<ComponentIR> {
     let smap = SourceMap::new(source, files.intern(file));
-    let import_map = build_import_map(program);
-    let resolved_import_map: HashMap<String, PathBuf> =
-        build_resolved_import_map(program, file, resolver);
+    let origins = build_hook_origins(program, file, resolver);
     let react_ns = build_react_ns(program);
     let module_consts = Arc::new(collect_module_consts(program, &react_ns));
     let local_hooks: HashSet<String> = detect_custom_hooks(program)
@@ -382,17 +346,18 @@ pub fn lower_program_with_resolver(
         .map(|c| c.name.clone())
         .collect();
     let imports = hook_extractor::ImportCtx {
-        import_map: &import_map,
-        resolved_import_map: &resolved_import_map,
+        origins: &origins,
         react_ns: &react_ns,
         local_hooks: &local_hooks,
+        current_file: Some(file),
     };
     detect_components(program)
         .into_iter()
         .map(|candidate| {
             let (param_names, mut render_cfg) =
                 build_fn_body_cfg(candidate.params, candidate.body, &smap);
-            let (mut hooks, mut next_label) = extract_hooks(&mut render_cfg, &imports);
+            let (mut hooks, hook_provenance, mut next_label) =
+                extract_hooks(&mut render_cfg, &imports);
             extract_handlers(&render_cfg, &mut hooks, &mut next_label);
             extract_subscriptions(&mut hooks, &mut next_label);
             let param = param_names
@@ -410,6 +375,7 @@ pub fn lower_program_with_resolver(
                 dom_props,
                 render_cfg,
                 hooks,
+                hook_provenance,
                 module_consts: module_consts.clone(),
             }
         })

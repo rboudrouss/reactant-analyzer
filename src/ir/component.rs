@@ -49,6 +49,10 @@ pub struct ComponentIR {
     pub dom_props: Arc<HashSet<Var>>,
     pub render_cfg: CFG,
     pub hooks: Vec<HookEntry>,
+    /// Provenance row per hook call in `hooks` (ADR-023 step 1):
+    /// `label → (origin hook, source, direct|inlined)`. Grows during
+    /// analysis as custom hooks are expanded.
+    pub hook_provenance: Vec<crate::ir::hooks::HookProvenance>,
     /// Module-level `const` bindings of the source file with syntactically
     /// known kinds, keyed by name. Function-valued consts (arrow/function
     /// expressions) are excluded: those are components/utilities/handlers

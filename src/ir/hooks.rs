@@ -7,6 +7,33 @@ use crate::ir::{
     types::{HookLabel, Symbol, Var},
 };
 
+/// Provenance of one hook call: `label → (origin hook, source, direct|inlined)`.
+///
+/// `HookEntry` records what the engine *models* (`useLayoutEffect` collapses
+/// into `Effect`, an aliased import into its origin's entry kind); this row
+/// records where the call's identity was *proven*, and survives
+/// `expand_custom_hooks` so a component that reaches `useLayoutEffect` only
+/// through an inlined wrapper is distinguishable from one calling it directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookProvenance {
+    pub label: HookLabel,
+    /// Name the origin defines the hook under (`useLayoutEffect`, `useData`) —
+    /// the *imported* name for an aliased import, never the local alias.
+    pub origin_hook: Symbol,
+    /// `true` iff the call was classified as React's own hook.
+    pub react: bool,
+    /// Raw import specifier at the call's import site (`"zustand"` even when a
+    /// self-aliasing tsconfig path resolves it to a local file). `None` for a
+    /// local definition or an unimported name.
+    pub specifier: Option<String>,
+    /// File the hook's definition resolved to; the current file for a local
+    /// definition.
+    pub file: Option<PathBuf>,
+    /// `false` = written in the component itself; `true` = reached through an
+    /// inlined custom hook.
+    pub inlined: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum HookEntry {
     State {
@@ -50,13 +77,15 @@ pub enum HookEntry {
         deps: Option<Vec<Expr>>,
         /// Variable in the caller's render CFG that receives the hook's return value.
         binding: Option<Var>,
-        /// NPM package the hook was imported from, if determinable at parse time.
-        /// E.g. `"@tanstack/react-query"` for `import { useQuery } from '@tanstack/react-query'`.
-        /// `None` when the hook is defined locally or the import source is unknown.
+        /// NPM package the hook was imported from, if determinable at parse
+        /// time (`"@tanstack/react-query"`). Retained even when a self-aliasing
+        /// tsconfig path also resolves the package to a local file, so
+        /// `SummaryRegistry` package scoping survives. `None` when the hook is
+        /// defined locally or came through a relative specifier.
         import_source: Option<String>,
-        /// Relative-import source file resolved via `ImportResolver`.
-        /// E.g. `Some("/abs/path/to/hooks/useData.ts")` for `import { useData } from './hooks/useData'`.
-        /// `None` for npm imports (see `import_source`) or unresolvable specifiers.
+        /// File the hook's definition resolved to via `ImportResolver` —
+        /// relative or aliased specifier — or the current file for a local
+        /// definition. `None` for unresolved (plain npm) imports.
         resolved_file: Option<PathBuf>,
         span: Option<SourceRange>,
     },

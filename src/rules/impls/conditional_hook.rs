@@ -470,6 +470,7 @@ mod tests {
                 edges: vec![],
             },
             hooks,
+            hook_provenance: vec![],
             module_consts: Default::default(),
         };
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
@@ -568,6 +569,7 @@ mod tests {
                 ],
             },
             hooks,
+            hook_provenance: vec![],
             module_consts: Default::default(),
         };
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());

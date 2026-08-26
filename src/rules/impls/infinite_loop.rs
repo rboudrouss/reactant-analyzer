@@ -812,6 +812,7 @@ mod tests {
             dom_props: Default::default(),
             render_cfg: crate::test_support::single_block_cfg(render_stmts),
             hooks,
+            hook_provenance: vec![],
             module_consts: Default::default(),
         };
         let config = Config {
@@ -877,6 +878,7 @@ mod tests {
             dom_props: Default::default(),
             render_cfg: crate::test_support::single_block_cfg(render_stmts),
             hooks,
+            hook_provenance: vec![],
             module_consts: Default::default(),
         };
         let config = Config {
@@ -1001,6 +1003,7 @@ mod tests {
             dom_props: Default::default(),
             render_cfg: crate::test_support::single_block_cfg(render_stmts),
             hooks,
+            hook_provenance: vec![],
             module_consts: Default::default(),
         }
     }
@@ -1341,6 +1344,7 @@ mod tests {
             dom_props: Default::default(),
             render_cfg: crate::test_support::single_block_cfg(render_stmts),
             hooks,
+            hook_provenance: vec![],
             module_consts: Default::default(),
         }
     }

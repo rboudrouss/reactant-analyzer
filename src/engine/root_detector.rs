@@ -112,6 +112,7 @@ mod tests {
             dom_props: Default::default(),
             render_cfg: trivial_cfg(),
             hooks: vec![],
+            hook_provenance: vec![],
             module_consts: Default::default(),
         }
     }
@@ -141,6 +142,7 @@ mod tests {
                 edges: vec![],
             },
             hooks: vec![],
+            hook_provenance: vec![],
             module_consts: Default::default(),
         }
     }

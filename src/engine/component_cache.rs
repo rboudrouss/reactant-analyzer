@@ -152,6 +152,7 @@ mod tests {
             effect_setter_writes: StateStore::bottom(),
             render_cfg: crate::test_support::single_block_cfg(vec![]),
             hooks: vec![],
+            hook_provenance: vec![],
             iterations: 1,
             heap: crate::domains::stores::Heap::new(),
         }

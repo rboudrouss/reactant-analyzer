@@ -296,6 +296,7 @@ mod tests {
             dom_props: Default::default(),
             render_cfg: cfg_calling(callees),
             hooks: vec![],
+            hook_provenance: vec![],
             module_consts: Default::default(),
         }
     }
@@ -307,6 +308,7 @@ mod tests {
             params: vec![],
             body_cfg: cfg_calling(callees),
             hooks: vec![],
+            hook_provenance: vec![],
         }
     }
 

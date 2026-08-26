@@ -1,12 +1,9 @@
-//! Map each locally-bound import name to the file it resolves to.
+//! Map each locally-bound import name to what its import declaration proves.
 //!
-//! Mirror of [`crate::lowering::build_import_map`] for **relative** imports
-//! only. Where `build_import_map` records the npm package source for a name
-//! (`"useQuery" → "@tanstack/react-query"`), this module records the absolute
-//! file path that a relative specifier resolves to via [`ImportResolver`].
-//!
-//! Populated values flow into [`crate::ir::hooks::HookEntry::Custom::resolved_file`]
-//! at extraction time.
+//! Two relations live here: [`build_hook_origins`] classifies hook-relevant
+//! bindings by provenance (ADR-023 step 1) and feeds hook extraction;
+//! [`build_resolved_imports`] resolves **relative** imports for the cross-file
+//! context pass, keeping the name the origin exports under.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,6 +27,103 @@ pub struct ResolvedImport {
     /// Name the origin file exports it under — the local name for a default
     /// import, which has no exported name of its own.
     pub imported: String,
+}
+
+/// Provenance of one hook-relevant imported binding, decided fail-closed:
+/// each variant records what was *proven* about the origin, and the raw
+/// specifier is retained on every non-React variant so a package-scoped
+/// lookup ([`crate::registry::SummaryRegistry`]) still matches when a
+/// self-aliasing tsconfig path resolves the package to a local file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookOrigin {
+    /// The literal specifier was `"react"` — decided *before* the resolver is
+    /// consulted, so a project aliasing `react` to a file keeps React's hooks
+    /// classified as React's (ADR-023 step 1: the mass-FN hazard).
+    React { imported: String },
+    /// The specifier resolved to a local file. `specifier` is the raw import
+    /// text (`"zustand"` under a self-alias, `"./hooks/useData"`).
+    File {
+        file: PathBuf,
+        specifier: String,
+        imported: String,
+    },
+    /// The specifier did not resolve — an npm package, or a missing file.
+    Package { specifier: String, imported: String },
+}
+
+impl HookOrigin {
+    /// Name the origin exports the binding under (alias-resolved).
+    pub fn imported(&self) -> &str {
+        match self {
+            HookOrigin::React { imported }
+            | HookOrigin::File { imported, .. }
+            | HookOrigin::Package { imported, .. } => imported,
+        }
+    }
+}
+
+/// Build a map from locally-bound import name → [`HookOrigin`], for every
+/// import specifier whose local *or* imported name follows the hook naming
+/// rule. Keying on either side is what makes a call through a non-`use`
+/// binding (`import { useThing as thing }`) still classify as a hook row,
+/// and an aliased React hook (`import { useMemo as useM } from "react"`)
+/// classify as React's.
+pub fn build_hook_origins(
+    program: &Program,
+    current_file: &Path,
+    resolver: &dyn ImportResolver,
+) -> HashMap<String, HookOrigin> {
+    let mut map = HashMap::new();
+    for stmt in &program.body {
+        let Statement::ImportDeclaration(decl) = stmt else {
+            continue;
+        };
+        let Some(specifiers) = &decl.specifiers else {
+            continue;
+        };
+        let source = decl.source.value.as_str();
+        // The literal specifier decides React-ness BEFORE the resolver runs:
+        // a self-aliasing tsconfig `paths` entry mapping "react" to a file
+        // must not demote React's hooks to opaque Custom rows.
+        let is_react = source == "react";
+        // Resolved lazily: only consulted when a hook-relevant specifier
+        // exists on a non-react declaration.
+        let mut resolved: Option<Option<PathBuf>> = None;
+        for spec in specifiers {
+            let (local, imported) = match spec {
+                ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                    (s.local.name.as_str(), s.imported.name().to_string())
+                }
+                ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                    (s.local.name.as_str(), s.local.name.to_string())
+                }
+                ImportDeclarationSpecifier::ImportNamespaceSpecifier(_) => continue,
+            };
+            if !(super::is_hook_name(local) || super::is_hook_name(&imported)) {
+                continue;
+            }
+            let origin = if is_react {
+                HookOrigin::React { imported }
+            } else {
+                let file = resolved
+                    .get_or_insert_with(|| resolver.resolve(current_file, source))
+                    .clone();
+                match file {
+                    Some(file) => HookOrigin::File {
+                        file,
+                        specifier: source.to_string(),
+                        imported,
+                    },
+                    None => HookOrigin::Package {
+                        specifier: source.to_string(),
+                        imported,
+                    },
+                }
+            };
+            map.insert(local.to_string(), origin);
+        }
+    }
+    map
 }
 
 /// Build a map from locally-bound import name → resolved origin, for every

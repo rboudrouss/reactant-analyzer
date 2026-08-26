@@ -64,6 +64,7 @@ mod tests {
             params: vec![],
             body_cfg: trivial_cfg(),
             hooks: vec![],
+            hook_provenance: vec![],
         }
     }
 

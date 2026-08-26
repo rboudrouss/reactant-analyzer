@@ -164,6 +164,12 @@ pub struct AnalysisResult<D: AbstractDomain> {
     pub render_cfg: CFG,
     /// Original hook entries needed by rules that inspect effect body CFGs.
     pub hooks: Vec<HookEntry>,
+    /// Provenance row per hook call in `hooks` (ADR-023 step 1):
+    /// `label → (origin hook, source, direct|inlined)`. Inlined custom hooks'
+    /// rows are merged in by `expand_custom_hooks` with `inlined: true`, so a
+    /// rule can tell a direct `useLayoutEffect` call from one reached through
+    /// a wrapper. Empty for hand-built IR.
+    pub hook_provenance: Vec<crate::ir::hooks::HookProvenance>,
     /// Number of outer fixpoint iterations before convergence.  Useful for
     /// --verbose output and for Info diagnostics about analysis depth.
     pub iterations: usize,

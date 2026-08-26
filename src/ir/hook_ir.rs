@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::ir::{
     cfg::CFG,
-    hooks::HookEntry,
+    hooks::{HookEntry, HookProvenance},
     types::{Symbol, Var},
 };
 
@@ -17,4 +17,8 @@ pub struct HookIR {
     pub body_cfg: CFG,
     /// Hook calls declared inside this hook's body (useState, useEffect, etc.).
     pub hooks: Vec<HookEntry>,
+    /// Provenance row per hook call in `hooks` (ADR-023 step 1). Merged —
+    /// labels remapped, marked `inlined` — into each consumer that expands
+    /// this hook.
+    pub hook_provenance: Vec<HookProvenance>,
 }

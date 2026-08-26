@@ -8,8 +8,6 @@
 
 ## Known false negatives (FN)
 
-- **Aliased React hook imports stay Custom** — `import { useMemo as useM } from "react"`: classification keys on the LOCAL name (`useM` matches no React arm) → Custom with `import_source: "react"` → not analyzed as a memo. Rare pattern (measured: 13 alias sites across the eight corpora, 12 of them re-exports, so the payload is ≈0). The missing piece it needed — the *imported* name alongside the resolved file — now exists as `lowering::ResolvedImport`; `build_resolved_import_map` is its file-only projection, and switching the hook classifier onto the richer relation is what remains. Note the same field is needed for **relative** imports only: a React alias arrives through a bare `"react"` specifier, which `build_resolved_imports` skips by design, so `build_import_map` needs the same treatment.
-
 - **Unknown callees without `Loc`** — `myHelper(() => setX())` → FN if `myHelper` is imported from an npm package (not in the analyzed files) or if inlining was cut off by depth. Local utilities are inlined (ADR-013 Phase 3) but only in **statement** position; in expression position they stay opaque. *(ADR-010, ADR-013)*
 
 - **`cross-component-infinite-loop` FN if the parent is only analyzed intra** — if the parent component isn't reached by top-down analysis (Phase 2 fallback, props = ⊤), the `SharedStateStore` isn't populated → the rule doesn't fire. *(ADR-012)*
@@ -49,7 +47,7 @@
 - **A context provider the relation cannot prove** — a provider inside an inline
   arrow (`items.map(() => <Ctx.Provider …>)`) or in a `useCallback` invoked
   during render is missed, because the walk stops at `FnLit` — see
-  [step 4](#planned-work-adr-023--adr-024) for why crossing it naively would
+  [step 3](#planned-work-adr-023--adr-024) for why crossing it naively would
   instead produce a false positive on the memoized shape. A context reached
   through a **re-export chain** (`export { Ctx } from "./a"`) is also unproven:
   the cross-file pass follows one level, the same bound as the rest of the
@@ -97,7 +95,7 @@
 
 - **Aliases outside tsconfig `paths`** — tsconfig `paths` are built-in (ADR-016); still unresolved: aliases declared *only* in `vite.config.*` (`resolve.alias`, requires evaluating JS) and `jsconfig.json` — the CLI warns when a Vite project has no tsconfig `paths`.
 - **Monorepo `@workspace/*` not resolved** — workspace-package specifiers are not aliases; need package.json/workspace resolution. Workaround: custom `ImportResolver`.
-- **Deep re-export chains** — `export { X } from './a'` → `'./a'` re-exports from `'./b'` → deep re-exports can be missed if the chain goes beyond one level (the lowering doesn't follow transitive chains).
+- **Deep re-export chains** — `export { X } from './a'` → `'./a'` re-exports from `'./b'` → deep re-exports can be missed if the chain goes beyond one level (the lowering doesn't follow transitive chains). For *hooks*, a barrel re-export is mitigated: when the resolved file doesn't define the hook under its name, `expand_custom_hooks` falls back to the name-only lookup (which found 4 new corpus TPs — memos `useLinkMemo`/`useAudioRecorder`, chakra `use-media-query`), with the same first-match caveat as the rest of `get_by_name`.
 - **Re-export of a third-party hook not traced** — `export let useMyQuery = useQuery` (from `@tanstack/react-query`): no function body → absent from `HookRegistry`; import source = local file → doesn't match the `SummaryRegistry` of the origin package → `analysis-limit/unknown-hook` Info emitted, binding = `⊤`. Fixing this requires tracking re-export aliases.
 - **`node_modules` utilities/hooks/components** — never lowered (not in the files discovered by `DefaultFileDiscoverer`) → opaque → fallback to `SummaryRegistry` (hooks) or `⊤`.
 
@@ -178,10 +176,14 @@ blocking, in decreasing leverage:
   edge, so "every dep is stable" cannot be stated. The only workaround is to pin
   the arity (`count equals 1` alongside the per-element guard), which is why
   `guardrails/inert-single-dep` covers single-dep effects and nothing wider.
-- **`useLayoutEffect`/`useInsertionEffect` are indistinguishable from `useEffect`** —
-  lowering collapses all three into `HookEntry::Effect` (`hook_extractor.rs:592`),
-  so the common "never call `useLayoutEffect` directly, use the SSR-safe wrapper"
-  convention cannot be written at all.
+- **`useLayoutEffect`/`useInsertionEffect` are indistinguishable from `useEffect`
+  in Tier A** — lowering still collapses all three into `HookEntry::Effect`, but
+  the engine half is no longer the blocker: `AnalysisResult::hook_provenance`
+  (ADR-023 step 1) keeps `label → (origin hook, source, direct|inlined)`, so the
+  "never call `useLayoutEffect` directly, use the SSR-safe wrapper" rule is
+  decidable — including staying silent on conformant consumers of a wrapper
+  (`inlined: true`). What remains is the Tier-A exposure: a field/guard on the
+  effect anchor reading the provenance row.
 
 ## Planned work (ADR-023 / ADR-024)
 
@@ -189,21 +191,15 @@ In sequence. Each step is gated on the one before it; the ordering is the
 decision, not a preference — [ADR-023 §5](adr/ADR-023-tier-a-vocabulary-growth.md)
 records why vocabulary work comes after attribution and after the engine facts.
 The first four steps of that sequence (origin-file attribution, the vocabulary
-fixes, `any_of`, native `missing-cleanup`) are done — see the git history.
+fixes, `any_of`, native `missing-cleanup`) are done, and so is **step 1, hook
+identity by provenance** (`lowering::HookOrigin` fail-closed on imports, literal
+`"react"` specifier decided before the resolver, raw specifier retained on every
+variant, `hook_provenance` rows surviving `expand_custom_hooks` onto
+`AnalysisResult`; the aliased-import FN and the `(file, name)` lookup for
+self-aliased packages fell out of it) — see the git history. Corpus re-measure:
+6/8 byte-identical, +4 TPs (barrel re-export fallback), 0 lost.
 
-1. **Hook identity by provenance** *(M/L)* — a fail-closed `Origin` map replacing the
-   `use[A-Z]`-plus-fail-open-guess classification, so a call through a non-`use`
-   binding is still a hook row and a local `useMemo` is not mistaken for React's.
-   Two corrections are mandatory or it becomes a mass FN: `Origin::React` must be
-   decided by the **literal specifier, before the resolver is consulted** (self-aliasing
-   tsconfig `paths` are live in the corpus — `zustand` maps `"zustand"` to
-   `./src/index.ts`, chakra maps `"@chakra-ui/react"` — and a project aliasing
-   `react` would otherwise turn every React hook into an opaque Custom row and
-   silence the analyzer); and the raw specifier must be retained on **every**
-   `Origin` variant, or `SummaryRegistry`'s package-scoped entries are lost.
-   Its gate, the `HookMarker` → ⊤ fix, has landed and been measured.
-
-2. **Expression-position entities** *(M/L)* — ADR-023 §§1-3. Its gate, the
+1. **Expression-position entities** *(M/L)* — ADR-023 §§1-3. Its gate, the
    array-destructuring provenance fix, has landed. The ADR's own cost estimate
    does not survive checking and is amended in place: `returns_verdict`
    **cannot be a primitive in `api/query.rs`**. Every part it composes from
@@ -225,7 +221,7 @@ fixes, `any_of`, native `missing-cleanup`) are done — see the git history.
    program-point error ADR-023 §2 refuses, and `Field::admits` is the table
    that can say so.
 
-3. **Slot-centric `writers` edge** *(M)* — the join blocker (a slot resynced by an
+2. **Slot-centric `writers` edge** *(M)* — the join blocker (a slot resynced by an
    effect *and* written by a handler; 43 candidate pairs on the corpus). Reduced
    scope only: `writer_phases includes`, a pure MAY existential on the same footing
    as `in_deps`. **No** `only` comparator and **no** `Escaped` row — measured, 254 of
@@ -235,7 +231,7 @@ fixes, `any_of`, native `missing-cleanup`) are done — see the git history.
    *execution phase*: a `setTimeout` inside an effect currently classifies as
    `effect`, which is not what any of the target rules mean.
 
-4. **JSX props as a sink** *(M, reduced)* — the engine half is built and shipped as
+3. **JSX props as a sink** *(M, reduced)* — the engine half is built and shipped as
    the native `unstable-context-value` (11 true positives, 0 regressions on the
    corpus): `Expr::CompApp` carries a span, `ModuleConstInit::Context` mints the
    two-valued element role from a proof — same-file or imported, resolved by the

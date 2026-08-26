@@ -118,6 +118,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         dom_props: comp_dom_props,
         mut render_cfg,
         hooks,
+        mut hook_provenance,
         module_consts,
         ..
     } = comp;
@@ -182,6 +183,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // Expand Custom entries before seeding so inlined State entries are seeded.
     expand_custom_hooks(
         &mut hooks,
+        &mut hook_provenance,
         &mut render_cfg,
         inter,
         &mut inline_origins,
@@ -496,6 +498,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         effect_setter_writes,
         render_cfg,
         hooks: hooks_clone,
+        hook_provenance,
         iterations: iteration,
         heap,
     }
@@ -611,6 +614,7 @@ pub fn analyze_program(
 /// the same component (second call stays opaque FN, not FP).
 fn expand_custom_hooks(
     hooks: &mut Vec<HookEntry>,
+    hook_provenance: &mut Vec<crate::ir::hooks::HookProvenance>,
     render_cfg: &mut CFG,
     inter: Option<&InterCtx<'_>>,
     origins: &mut Vec<crate::engine::InlineOrigin>,
@@ -651,10 +655,14 @@ fn expand_custom_hooks(
             continue;
         }
 
-        // Prefer resolved-file key when available; fall back to name-only for
-        // hooks whose import wasn't resolved (legacy / test inputs without a file).
+        // Prefer the resolved-file key; fall back to name-only when the import
+        // wasn't resolved OR the resolved file doesn't define the hook under
+        // that name (a one-level re-export: `./a` resolves but `useX` lives in
+        // `./b`). Same first-match caveat as the rest of `get_by_name`.
         let hook_ir_opt = match &resolved_file {
-            Some(file) => reg.get(&(file.clone(), name.clone())),
+            Some(file) => reg
+                .get(&(file.clone(), name.clone()))
+                .or_else(|| reg.get_by_name(&name)),
             None => reg.get_by_name(&name),
         };
         let Some(hook_ir) = hook_ir_opt else {
@@ -775,6 +783,19 @@ fn expand_custom_hooks(
             from: hook_ir.file.clone(),
             kind: crate::engine::InlineKind::Hook,
         });
+
+        // Provenance rows (ADR-023 step 1): the hook's own rows join the
+        // component's table under the same label offset as its entries,
+        // marked `inlined` — a `useLayoutEffect` reached through a wrapper
+        // stays distinguishable from one written in the component. The
+        // wrapper call's own (direct) row is kept.
+        hook_provenance.extend(hook_ir.hook_provenance.iter().map(|p| {
+            crate::ir::hooks::HookProvenance {
+                label: p.label + offset,
+                inlined: true,
+                ..p.clone()
+            }
+        }));
 
         // Mark before inserting so re-encountered Custom entries for this hook are guarded.
         expanding.insert(name.clone());
@@ -1412,6 +1433,7 @@ mod tests {
             dom_props: Default::default(),
             render_cfg: crate::test_support::single_block_cfg(render_stmts),
             hooks,
+            hook_provenance: vec![],
             module_consts: Default::default(),
         }
     }
@@ -1727,6 +1749,7 @@ mod tests {
                 }],
             },
             hooks: vec![],
+            hook_provenance: vec![],
             module_consts: Default::default(),
         };
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());

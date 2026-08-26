@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use super::import_resolution::HookOrigin;
 use crate::ir::{
     cfg::{BasicBlock, CFG, Terminator},
     expr::{Expr, MarkerVal, Prim},
-    hooks::HookEntry,
+    hooks::{HookEntry, HookProvenance},
     source_range::SourceRange,
     stmt::{MemberKey, Stmt},
     types::{BlockId, HookLabel},
@@ -261,11 +262,16 @@ fn prop_to_event(name: &str) -> String {
 }
 
 /// Walk `cfg` in block-id order, extract top-level hook calls, and rewrite
-/// affected statements in-place. Returns `(hooks, next_label)`.
+/// affected statements in-place. Returns `(hooks, provenance, next_label)`;
+/// `provenance` holds one row per extracted hook call (never for handlers).
 /// Destructuring is resolved: `__arr_N[0]` → `StateVal(L)`, `__arr_N[1]` → `StateSetter(L)`.
-pub fn extract_hooks(cfg: &mut CFG, imports: &ImportCtx<'_>) -> (Vec<HookEntry>, HookLabel) {
+pub fn extract_hooks(
+    cfg: &mut CFG,
+    imports: &ImportCtx<'_>,
+) -> (Vec<HookEntry>, Vec<HookProvenance>, HookLabel) {
     let mut label: HookLabel = 0;
     let mut hooks: Vec<HookEntry> = Vec::new();
+    let mut provenance: Vec<HookProvenance> = Vec::new();
     // Maps array-destructuring temps (e.g. "__arr_42") → hook label, for useState/useReducer.
     let mut state_temps: HashMap<String, HookLabel> = HashMap::new();
 
@@ -281,6 +287,7 @@ pub fn extract_hooks(cfg: &mut CFG, imports: &ImportCtx<'_>) -> (Vec<HookEntry>,
                 stmt,
                 &mut new,
                 &mut hooks,
+                &mut provenance,
                 &mut label,
                 &mut state_temps,
                 imports,
@@ -290,13 +297,14 @@ pub fn extract_hooks(cfg: &mut CFG, imports: &ImportCtx<'_>) -> (Vec<HookEntry>,
         cfg.blocks.get_mut(&id).unwrap().stmts = new;
     }
 
-    (hooks, label)
+    (hooks, provenance, label)
 }
 
 fn process_stmt(
     stmt: Stmt,
     out: &mut Vec<Stmt>,
     hooks: &mut Vec<HookEntry>,
+    provenance: &mut Vec<HookProvenance>,
     label: &mut HookLabel,
     state_temps: &mut HashMap<String, HookLabel>,
     imports: &ImportCtx<'_>,
@@ -307,34 +315,23 @@ fn process_stmt(
             rhs,
             span: stmt_span,
         } => match try_consume_hook_call(rhs, imports) {
-            Ok((name, is_react, args)) => {
+            Ok((call, args)) => {
                 let lbl = *label;
                 *label += 1;
-                let is_state_like = is_react && matches!(name.as_str(), "useState" | "useReducer");
+                let is_state_like =
+                    call.is_react && matches!(call.origin_name.as_str(), "useState" | "useReducer");
                 let is_arr_temp = var.starts_with("__arr_");
 
-                let entry = make_hook_entry(&name, is_react, lbl, args, stmt_span);
-                let marker = hook_result_expr(&name, is_react, lbl, entry.as_ref());
+                let entry = make_hook_entry(&call, lbl, args, stmt_span);
+                let marker = hook_result_expr(&call, lbl, entry.as_ref());
+                provenance.push(call.provenance(lbl));
                 if let Some(entry) = entry {
                     hooks.push(entry);
                 }
 
-                // Record the binding variable, npm import source, and resolved file for Custom hooks.
-                if let Some(HookEntry::Custom {
-                    binding,
-                    import_source,
-                    resolved_file,
-                    ..
-                }) = hooks.last_mut()
-                {
-                    // Provenance describes the *call*, not the shape of what
-                    // receives it. Gating it on the binding meant
-                    // `const [a, setA] = useStore(sel)` — the ordinary zustand
-                    // shape — kept no import source and no resolved file, so
-                    // the `(file, name)` registry lookup degraded to a
-                    // first-match by bare name.
-                    *import_source = imports.import_map.get(&name).cloned();
-                    *resolved_file = imports.resolved_import_map.get(&name).cloned();
+                // Record the binding variable on Custom hooks (their import
+                // source and resolved file come from the classification).
+                if let Some(HookEntry::Custom { binding, .. }) = hooks.last_mut() {
                     // `__arr_N` is a lowering temp, never a source name.
                     if !is_arr_temp {
                         *binding = Some(var.clone());
@@ -362,23 +359,14 @@ fn process_stmt(
             }
         },
         Stmt::ExprStmt(expr, stmt_span) => match try_consume_hook_call(expr, imports) {
-            Ok((name, is_react, args)) => {
+            Ok((call, args)) => {
                 let lbl = *label;
                 *label += 1;
-                let entry = make_hook_entry(&name, is_react, lbl, args, stmt_span);
+                let entry = make_hook_entry(&call, lbl, args, stmt_span);
                 let marker = marker_val(entry.as_ref());
+                provenance.push(call.provenance(lbl));
                 if let Some(entry) = entry {
                     hooks.push(entry);
-                }
-                // For Custom hooks without a binding, populate import_source + resolved_file.
-                if let Some(HookEntry::Custom {
-                    import_source,
-                    resolved_file,
-                    ..
-                }) = hooks.last_mut()
-                {
-                    *import_source = imports.import_map.get(&name).cloned();
-                    *resolved_file = imports.resolved_import_map.get(&name).cloned();
                 }
                 // Void hooks (useEffect, bare custom calls): leave a marker so
                 // the call-site block stays recoverable from the CFG.
@@ -416,66 +404,84 @@ fn process_stmt(
 
 // ── Hook call detection ───────────────────────────────────────────────────────
 
-/// Returns `Ok((hook_name, is_react, args))` if `expr` is a `use*` call; else
-/// `Err(expr)`. A `TSAnnotated` wrapper (`useState<T>(..)`) is looked through —
-/// the product value domain (ADR-015) no longer needs the generic-argument
-/// type hint.
+/// Identity of one hook call, resolved through the file's imports
+/// (ADR-023 step 1). What `make_hook_entry` and the provenance row consume.
+#[derive(Debug, Clone)]
+pub struct ResolvedHookCall {
+    /// Name the origin defines the hook under — the *imported* name for an
+    /// aliased import (`useMemo` for `import { useMemo as useM }`), never
+    /// the local alias.
+    pub origin_name: String,
+    /// `true` iff the call is React's own hook (modeled semantics apply).
+    pub is_react: bool,
+    /// Raw import specifier, retained even when it also resolved to a file
+    /// (a self-aliased package keeps its `SummaryRegistry` scope).
+    pub specifier: Option<String>,
+    /// File the definition resolved to; the current file for a local decl.
+    pub resolved_file: Option<PathBuf>,
+}
+
+impl ResolvedHookCall {
+    fn provenance(&self, label: HookLabel) -> HookProvenance {
+        HookProvenance {
+            label,
+            origin_hook: self.origin_name.clone(),
+            react: self.is_react,
+            specifier: self.specifier.clone(),
+            file: self.resolved_file.clone(),
+            inlined: false,
+        }
+    }
+
+    /// `import_source` as `HookEntry::Custom` defines it: an npm package
+    /// specifier. A relative specifier is a file, not a package.
+    fn import_source(&self) -> Option<String> {
+        self.specifier.clone().filter(|s| !s.starts_with('.'))
+    }
+}
+
+/// Returns `Ok((call, args))` if `expr` is a hook call; else `Err(expr)`.
+/// A `TSAnnotated` wrapper (`useState<T>(..)`) is looked through — the product
+/// value domain (ADR-015) no longer needs the generic-argument type hint.
 fn try_consume_hook_call(
     expr: Expr,
     imports: &ImportCtx<'_>,
-) -> Result<(String, bool, Vec<Expr>), Expr> {
+) -> Result<(ResolvedHookCall, Vec<Expr>), Expr> {
     match expr {
         Expr::TSAnnotated(inner) => {
             if let Expr::Call { fn_, args } = *inner {
-                match hook_name_from_callee(&fn_) {
-                    Some(name) => {
-                        let is_react = imports.callee_is_react(&fn_, &name);
-                        Ok((name, is_react, args))
-                    }
+                match imports.classify_callee(&fn_) {
+                    Some(call) => Ok((call, args)),
                     None => Err(Expr::TSAnnotated(Box::new(Expr::Call { fn_, args }))),
                 }
             } else {
                 Err(Expr::TSAnnotated(inner))
             }
         }
-        Expr::Call { fn_, args } => match hook_name_from_callee(&fn_) {
-            Some(name) => {
-                let is_react = imports.callee_is_react(&fn_, &name);
-                Ok((name, is_react, args))
-            }
+        Expr::Call { fn_, args } => match imports.classify_callee(&fn_) {
+            Some(call) => Ok((call, args)),
             None => Err(Expr::Call { fn_, args }),
         },
         other => Err(other),
     }
 }
 
-fn hook_name_from_callee(fn_: &Expr) -> Option<String> {
-    // Shared predicate (`super::is_hook_name`): `use` + uppercase/digit. Keying
-    // on the looser `starts_with("use")` misclassified plain calls whose name
-    // merely begins with the letters "use" (`userKeys.userStats()`, `userId()`)
-    // as custom hooks → HookMarker in a ternary arm → spurious conditional-hook.
-    match fn_ {
-        Expr::Var(name) if super::is_hook_name(name) => Some(name.clone()),
-        // React.useState / React.useEffect / etc.
-        Expr::FieldAccess { field, .. } if super::is_hook_name(field) => Some(field.clone()),
-        _ => None,
-    }
-}
-
-/// Import context deciding whether a `use*` call is REACT's hook or a
-/// same-named custom hook (name-only classification misread memos' local
-/// `useMemo(name, options)` as React's `useMemo`, force-fitting its args).
+/// Import context deciding a hook call's identity by provenance
+/// (ADR-023 step 1). Fail-closed: an imported binding classifies only from
+/// what its import declaration proves ([`HookOrigin`]); name-shape guessing
+/// survives solely for unimported bare names (test sources, globals).
 pub struct ImportCtx<'a> {
-    /// Imported `use*` names → npm package / unresolved alias specifier.
-    pub import_map: &'a HashMap<String, String>,
-    /// Imported `use*` names → resolved local source file.
-    pub resolved_import_map: &'a HashMap<String, PathBuf>,
+    /// Hook-relevant imported bindings → proven origin.
+    pub origins: &'a HashMap<String, HookOrigin>,
     /// Local names bound to the `react` module itself
     /// (`import React from "react"`, `import * as R from "react"`).
     pub react_ns: &'a HashSet<String>,
     /// `use*` functions defined in this file (JS scoping: a local
     /// definition shadows any same-named import or global).
     pub local_hooks: &'a HashSet<String>,
+    /// File being lowered — provenance of locally-defined hooks, so the
+    /// `(file, name)` registry lookup stays precise. `None` for hand-built IR.
+    pub current_file: Option<&'a Path>,
 }
 
 impl ImportCtx<'static> {
@@ -483,41 +489,92 @@ impl ImportCtx<'static> {
     /// React's. For tests and IR built without a source program.
     pub fn empty() -> Self {
         use std::sync::LazyLock;
-        static MAP: LazyLock<HashMap<String, String>> = LazyLock::new(HashMap::new);
-        static PATHS: LazyLock<HashMap<String, PathBuf>> = LazyLock::new(HashMap::new);
+        static ORIGINS: LazyLock<HashMap<String, HookOrigin>> = LazyLock::new(HashMap::new);
         static NAMES: LazyLock<HashSet<String>> = LazyLock::new(HashSet::new);
         ImportCtx {
-            import_map: &MAP,
-            resolved_import_map: &PATHS,
+            origins: &ORIGINS,
             react_ns: &NAMES,
             local_hooks: &NAMES,
+            current_file: None,
         }
     }
 }
 
 impl ImportCtx<'_> {
-    /// - bare `useX(...)`: React's unless the name is defined in this file
-    ///   or imported from somewhere other than `react` (npm package or
-    ///   local file). Unimported names are React's (test sources, globals).
-    /// - `ns.useX(...)`: React's iff `ns` is bound to the `react` module,
-    ///   or is the conventional unimported global `React`.
-    /// - deeper receivers (`a.b.useX`): never React's.
-    fn callee_is_react(&self, fn_: &Expr, name: &str) -> bool {
+    /// Resolve a callee to a hook identity, or `None` for a plain call.
+    ///
+    /// - bare `name(...)`: a local `use*` definition shadows everything
+    ///   (JS scoping); then the [`HookOrigin`] map decides by provenance —
+    ///   including a non-`use` alias of a hook import and an aliased React
+    ///   hook; an unimported hook-shaped name stays React's by convention
+    ///   (test sources, globals).
+    /// - `ns.useX(...)`: React's iff `ns` is bound to the `react` module or
+    ///   is the conventional unimported global `React`; any other receiver
+    ///   is a custom hook with unknown provenance.
+    fn classify_callee(&self, fn_: &Expr) -> Option<ResolvedHookCall> {
         match fn_ {
-            Expr::Var(_) => {
-                if self.local_hooks.contains(name) || self.resolved_import_map.contains_key(name) {
-                    return false;
+            Expr::Var(name) => {
+                if self.local_hooks.contains(name) {
+                    return Some(ResolvedHookCall {
+                        origin_name: name.clone(),
+                        is_react: false,
+                        specifier: None,
+                        resolved_file: self.current_file.map(Path::to_path_buf),
+                    });
                 }
-                match self.import_map.get(name) {
-                    Some(source) => source == "react",
-                    None => true,
+                if let Some(origin) = self.origins.get(name) {
+                    return Some(match origin {
+                        HookOrigin::React { imported } => ResolvedHookCall {
+                            origin_name: imported.clone(),
+                            is_react: true,
+                            specifier: Some("react".to_string()),
+                            resolved_file: None,
+                        },
+                        HookOrigin::File {
+                            file,
+                            specifier,
+                            imported,
+                        } => ResolvedHookCall {
+                            origin_name: imported.clone(),
+                            is_react: false,
+                            specifier: Some(specifier.clone()),
+                            resolved_file: Some(file.clone()),
+                        },
+                        HookOrigin::Package {
+                            specifier,
+                            imported,
+                        } => ResolvedHookCall {
+                            origin_name: imported.clone(),
+                            is_react: false,
+                            specifier: Some(specifier.clone()),
+                            resolved_file: None,
+                        },
+                    });
                 }
+                // Unimported bare name: hook-shaped is presumed React's.
+                // (Shared predicate `super::is_hook_name` — the looser
+                // `starts_with("use")` misclassified `userId()` as a hook.)
+                super::is_hook_name(name).then(|| ResolvedHookCall {
+                    origin_name: name.clone(),
+                    is_react: true,
+                    specifier: None,
+                    resolved_file: None,
+                })
             }
-            Expr::FieldAccess { obj, .. } => match obj.as_ref() {
-                Expr::Var(ns) => self.react_ns.contains(ns) || ns == "React",
-                _ => false,
-            },
-            _ => false,
+            // React.useState / R.useMemo / store.useThing.
+            Expr::FieldAccess { obj, field } if super::is_hook_name(field) => {
+                let is_react = match obj.as_ref() {
+                    Expr::Var(ns) => self.react_ns.contains(ns) || ns == "React",
+                    _ => false,
+                };
+                Some(ResolvedHookCall {
+                    origin_name: field.clone(),
+                    is_react,
+                    specifier: None,
+                    resolved_file: None,
+                })
+            }
+            _ => None,
         }
     }
 }
@@ -525,25 +582,27 @@ impl ImportCtx<'_> {
 // ── HookEntry construction ────────────────────────────────────────────────────
 
 fn make_hook_entry(
-    name: &str,
-    is_react: bool,
+    call: &ResolvedHookCall,
     label: HookLabel,
     args: Vec<Expr>,
     span: Option<SourceRange>,
 ) -> Option<HookEntry> {
+    let name = call.origin_name.as_str();
     let mut it = args.into_iter();
-    if !is_react {
-        // `use*`-named but not React's (the name is imported from a package
-        // or a local file that shadows it): a Custom hook like any other,
-        // resolved through the HookRegistry / SummaryRegistry.
+    if !call.is_react {
+        // A hook, but not React's (defined locally, or imported from a
+        // package or a local file): a Custom hook like any other, resolved
+        // through the HookRegistry / SummaryRegistry. `name` is the origin's
+        // own name, so the `(file, name)` registry lookup matches even when
+        // the call site binds it under an alias.
         return Some(HookEntry::Custom {
             label,
             name: name.to_string(),
             args: it.collect(),
             deps: None,
             binding: None,
-            import_source: None,
-            resolved_file: None,
+            import_source: call.import_source(),
+            resolved_file: call.resolved_file.clone(),
             span,
         });
     }
@@ -615,6 +674,8 @@ fn make_hook_entry(
             })
         }
         _ if name.starts_with("use") => {
+            // React's own but unmodeled (useContext, useId, useTransition…):
+            // a Custom row whose provenance keeps the `react` specifier.
             let args: Vec<Expr> = it.collect();
             Some(HookEntry::Custom {
                 label,
@@ -622,7 +683,7 @@ fn make_hook_entry(
                 args,
                 deps: None,
                 binding: None,
-                import_source: None,
+                import_source: call.import_source(),
                 resolved_file: None,
                 span,
             })
@@ -654,19 +715,14 @@ fn marker_val(entry: Option<&HookEntry>) -> MarkerVal {
 }
 
 /// IR expression that replaces a hook call at its binding site.
-fn hook_result_expr(
-    name: &str,
-    is_react: bool,
-    label: HookLabel,
-    entry: Option<&HookEntry>,
-) -> Expr {
-    if !is_react {
+fn hook_result_expr(call: &ResolvedHookCall, label: HookLabel, entry: Option<&HookEntry>) -> Expr {
+    if !call.is_react {
         // Custom hooks bind an opaque marker; the engine resolves the real
         // value via HookRegistry inlining or a summary. The marker keeps the
         // call-site block recoverable (`collect_hook_calls`).
         return Expr::HookMarker(label, MarkerVal::Unknown);
     }
-    match name {
+    match call.origin_name.as_str() {
         "useState" | "useReducer" => Expr::StateVal(label),
         "useMemo" => Expr::MemoVal(label),
         "useCallback" => Expr::CallbackVal(label),
@@ -814,7 +870,7 @@ mod tests {
                 _ => None,
             })
             .expect("no function found");
-        let (hooks, _) = extract_hooks(&mut cfg, &ImportCtx::empty());
+        let (hooks, _, _) = extract_hooks(&mut cfg, &ImportCtx::empty());
         (cfg, hooks)
     }
 
@@ -1060,7 +1116,7 @@ mod tests {
                 _ => None,
             })
             .expect("no function found");
-        let (mut hooks, mut next_label) = extract_hooks(&mut cfg, &ImportCtx::empty());
+        let (mut hooks, _, mut next_label) = extract_hooks(&mut cfg, &ImportCtx::empty());
         extract_handlers(&cfg, &mut hooks, &mut next_label);
         (cfg, hooks)
     }
@@ -1205,7 +1261,7 @@ mod tests {
                 _ => None,
             })
             .expect("no function found");
-        let (mut hooks, mut next_label) = extract_hooks(&mut cfg, &ImportCtx::empty());
+        let (mut hooks, _, mut next_label) = extract_hooks(&mut cfg, &ImportCtx::empty());
         extract_handlers(&cfg, &mut hooks, &mut next_label);
         let handler = hooks
             .iter()
@@ -1237,7 +1293,7 @@ mod tests {
                 _ => None,
             })
             .expect("no function found");
-        let (mut hooks, mut next_label) = extract_hooks(&mut cfg, &ImportCtx::empty());
+        let (mut hooks, _, mut next_label) = extract_hooks(&mut cfg, &ImportCtx::empty());
         extract_handlers(&cfg, &mut hooks, &mut next_label);
         extract_subscriptions(&mut hooks, &mut next_label);
         (cfg, hooks)
@@ -1408,19 +1464,22 @@ mod tests {
             })
             .expect("no function found");
 
-        let imports = HashMap::from([("useSearchParams".to_string(), "react-router".to_string())]);
-        let resolved = HashMap::from([(
+        let origins = HashMap::from([(
             "useSearchParams".to_string(),
-            PathBuf::from("/pkg/react-router/index.ts"),
+            HookOrigin::File {
+                file: PathBuf::from("/pkg/react-router/index.ts"),
+                specifier: "react-router".to_string(),
+                imported: "useSearchParams".to_string(),
+            },
         )]);
         let names = HashSet::new();
         let ctx = ImportCtx {
-            import_map: &imports,
-            resolved_import_map: &resolved,
+            origins: &origins,
             react_ns: &names,
             local_hooks: &names,
+            current_file: None,
         };
-        let (hooks, _) = extract_hooks(&mut cfg, &ctx);
+        let (hooks, _, _) = extract_hooks(&mut cfg, &ctx);
 
         let HookEntry::Custom {
             import_source,

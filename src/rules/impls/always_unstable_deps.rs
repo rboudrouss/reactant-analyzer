@@ -215,6 +215,7 @@ mod tests {
                 edges: vec![],
             },
             hooks,
+            hook_provenance: vec![],
             module_consts: Default::default(),
         }
     }

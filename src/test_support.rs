@@ -79,6 +79,7 @@ pub(crate) fn analysis_result(render_cfg: CFG) -> AnalysisResult<StateValue> {
         inline_origins: Vec::new(),
         render_cfg,
         hooks: vec![],
+        hook_provenance: vec![],
         iterations: 0,
         effect_setter_writes: StateStore::bottom(),
         heap: Heap::new(),

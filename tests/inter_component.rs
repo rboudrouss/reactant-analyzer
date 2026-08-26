@@ -57,6 +57,7 @@ fn leaf_component(name: &str) -> ComponentIR {
         dom_props: Default::default(),
         render_cfg: empty_cfg(),
         hooks: vec![],
+        hook_provenance: vec![],
         module_consts: Default::default(),
     }
 }
@@ -91,6 +92,7 @@ fn heuristic_detects_parent_not_child_as_root() {
                 edges: vec![],
             },
             hooks: vec![],
+            hook_provenance: vec![],
             module_consts: Default::default(),
         }
     };
@@ -145,6 +147,7 @@ fn analyze_program_populates_call_graph_for_parent_child() {
                 edges: vec![],
             },
             hooks: vec![],
+            hook_provenance: vec![],
             module_consts: Default::default(),
         }
     };
@@ -229,6 +232,7 @@ fn setter_prop_propagates_to_shared_state() {
             param: "props".to_string(),
             dom_props: Default::default(),
             render_cfg: render,
+            hook_provenance: vec![],
             hooks: vec![HookEntry::Effect {
                 label: 0,
                 body_cfg: eff_body,
@@ -284,6 +288,7 @@ fn setter_prop_propagates_to_shared_state() {
             param: "props".to_string(),
             dom_props: Default::default(),
             render_cfg: render,
+            hook_provenance: vec![],
             hooks: vec![HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
@@ -340,6 +345,7 @@ fn recursive_component_does_not_crash() {
                 edges: vec![],
             },
             hooks: vec![],
+            hook_provenance: vec![],
             module_consts: Default::default(),
         }
     };
@@ -574,6 +580,7 @@ fn prop_drilling_direct_ir() {
             param: "props".to_string(),
             dom_props: Default::default(),
             render_cfg: empty_cfg(),
+            hook_provenance: vec![],
             hooks: vec![HookEntry::Effect {
                 label: 0,
                 body_cfg: eff_body,
@@ -618,6 +625,7 @@ fn prop_drilling_direct_ir() {
                 edges: vec![],
             },
             hooks: vec![],
+            hook_provenance: vec![],
             module_consts: Default::default(),
         }
     };
@@ -660,6 +668,7 @@ fn prop_drilling_direct_ir() {
                 blocks,
                 edges: vec![],
             },
+            hook_provenance: vec![],
             hooks: vec![HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
