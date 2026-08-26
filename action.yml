@@ -1,0 +1,67 @@
+name: reactant-analyzer
+description: >-
+  Sound static analysis for React hooks — catches infinite render loops,
+  derived state, stale closures and cross-component cycles that syntactic
+  linters cannot see. Annotates the PR with each finding.
+author: rboudrouss
+branding:
+  icon: search
+  color: purple
+
+inputs:
+  path:
+    description: >-
+      Files or directories to analyze, space-separated. The first directory
+      is the project root (Vite detection, reactant.config.json discovery).
+    required: false
+    default: "."
+  fail-on:
+    description: "Findings that fail the job: error | warning | never."
+    required: false
+    default: warning
+  config:
+    description: >-
+      Path to a reactant.config.json. Default: auto-discovered at the
+      project root when present.
+    required: false
+    default: ""
+  version:
+    description: npm version of reactant-analyzer to run (via npx).
+    required: false
+    default: latest
+  args:
+    description: >-
+      Extra flags passed through to `reactant check`, space-separated
+      (e.g. "--info --rule infinite-loop"). Values must not contain spaces.
+    required: false
+    default: ""
+
+outputs:
+  errors:
+    description: Number of error-level findings.
+    value: ${{ steps.check.outputs.errors }}
+  warnings:
+    description: Number of warning-level findings.
+    value: ${{ steps.check.outputs.warnings }}
+  infos:
+    description: Number of info-level findings (only populated with --info).
+    value: ${{ steps.check.outputs.infos }}
+  exit-code:
+    description: "CLI exit code: 0 clean, 1 findings at/above fail-on, 2 usage error."
+    value: ${{ steps.check.outputs.exit-code }}
+  json:
+    description: Path to the full JSON report (schema v2, docs/usage.md).
+    value: ${{ steps.check.outputs.json }}
+
+runs:
+  using: composite
+  steps:
+    - id: check
+      shell: bash
+      env:
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_CONFIG: ${{ inputs.config }}
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_ARGS: ${{ inputs.args }}
+      run: node "${{ github.action_path }}/scripts/gh-action.mjs"
