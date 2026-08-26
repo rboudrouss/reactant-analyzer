@@ -1,0 +1,484 @@
+//! The 21-rule catalogue, as an automated measure (NEXTSTEPS phase 2, item 6).
+//!
+//! ADR-022/ADR-023 measured Tier-A expressibility against a catalogue of 21
+//! semantic rule classes drawn from the eight `test-repo/` corpora, but the
+//! catalogue itself was a session artifact. This file MATERIALIZES it —
+//! reconstructed from the blocker classes ADR-023 records (expression-position
+//! entities, joins, engine facts, whole-program, hook identity) and the rule
+//! classes named across `docs/TODO.md` — and turns the measure into a test:
+//!
+//! - an `Expressible` entry is *proven*: its pack rule must load, fire on the
+//!   buggy fixture, and stay silent on the conformant one;
+//! - a `Blocked` entry names the missing vocabulary, so flipping it means
+//!   writing the pack rule and fixtures, never editing a number.
+//!
+//! The curve so far: 3/21 (ADR-022 baseline) → **5/21** (ADR-023 steps 1-2:
+//! hook provenance + the `origin` guard, the `args` edge + the `returns`
+//! guard). The count assertion at the bottom is the measure; update it only
+//! by flipping entries.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use oxc_allocator::Allocator;
+use oxc_parser::{ParseOptions, Parser};
+use oxc_span::SourceType;
+
+use reactant::domains::StateValueTransfer;
+use reactant::engine::{Config, RootStrategy, analyze_component};
+use reactant::lowering::lower_program;
+use reactant::resolver::{DefaultImportResolver, analyze_lowered, lower_files};
+use reactant::rules::declarative::load_pack;
+use reactant::rules::{Diagnostic, RuleCtx};
+
+// ── Harness ───────────────────────────────────────────────────────────────────
+
+enum Fixture {
+    /// One source file, analyzed intra-component.
+    Single(&'static str),
+    /// `(relative path, source)` files analyzed together (inlining active).
+    Multi(&'static [(&'static str, &'static str)]),
+}
+
+enum Status {
+    /// Proven by a pack: `rule` (full `pack/rule` id) from `pack_json` must
+    /// fire ≥1 finding on `fires_on` and none on `silent_on`.
+    Expressible {
+        pack_json: &'static str,
+        rule: &'static str,
+        fires_on: Fixture,
+        silent_on: Fixture,
+        /// Recorded weakening, if the pack rule under-covers the class.
+        weakened: Option<&'static str>,
+    },
+    /// Not expressible in a Tier-A pack today; `missing` names the vocabulary.
+    Blocked {
+        class: &'static str,
+        missing: &'static str,
+    },
+}
+
+struct Entry {
+    id: &'static str,
+    status: Status,
+}
+
+static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn run_rule_on(pack_json: &str, rule_id: &str, fixture: &Fixture) -> Vec<Diagnostic> {
+    let pack = load_pack(pack_json, &BTreeMap::new()).expect("catalogue pack must load");
+    let rule = pack
+        .rules
+        .iter()
+        .find(|r| r.rule.name() == rule_id)
+        .unwrap_or_else(|| panic!("rule `{rule_id}` not in pack"));
+
+    let prog_and_names: (reactant::engine::ProgramAnalysisResult, Vec<String>) = match fixture {
+        Fixture::Single(src) => {
+            let alloc = Allocator::default();
+            let ret = Parser::new(&alloc, src, SourceType::tsx())
+                .with_options(ParseOptions::default())
+                .parse();
+            assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
+            let components = lower_program(
+                &ret.program,
+                src,
+                std::path::Path::new("test.tsx"),
+                &mut Default::default(),
+            );
+            assert!(!components.is_empty(), "no component in fixture");
+            let mut map = std::collections::HashMap::new();
+            let mut names = Vec::new();
+            for comp in components {
+                let name = comp.name.clone();
+                let result = analyze_component(comp, &StateValueTransfer, &Config::default());
+                map.insert(name.clone(), result);
+                names.push(name);
+            }
+            (
+                reactant::engine::ProgramAnalysisResult {
+                    components: map,
+                    shared_state: reactant::domains::stores::SharedStateStore::new(),
+                    call_graph: reactant::engine::ComponentCallGraph::new(),
+                    recursive_components: std::collections::HashSet::new(),
+                    stats: reactant::engine::AnalysisStats::default(),
+                    file_table: Default::default(),
+                    function_registry: Default::default(),
+                },
+                names,
+            )
+        }
+        Fixture::Multi(files) => {
+            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("reactant-catalogue-{}-{id}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("tmp dir");
+            let mut paths: Vec<PathBuf> = Vec::new();
+            for (rel, src) in *files {
+                let p = dir.join(rel);
+                if let Some(parent) = p.parent() {
+                    fs::create_dir_all(parent).unwrap();
+                }
+                fs::write(&p, src).unwrap();
+                paths.push(p);
+            }
+            let lowered = lower_files(&paths, &DefaultImportResolver::default());
+            assert!(
+                lowered.parse_errors.is_empty(),
+                "{:?}",
+                lowered.parse_errors
+            );
+            let result = analyze_lowered(lowered, RootStrategy::AllComponents, Config::default());
+            let names: Vec<String> = result.components.keys().cloned().collect();
+            let out = (result, names);
+            let _ = fs::remove_dir_all(&dir);
+            out
+        }
+    };
+
+    let (prog, mut names) = prog_and_names;
+    names.sort();
+    names
+        .iter()
+        .flat_map(|name| rule.rule.check(&RuleCtx::new(&prog, name)))
+        .collect()
+}
+
+// ── Shared pack sources ───────────────────────────────────────────────────────
+
+/// The committed guardrails pack proves the three ADR-022 baseline entries.
+const GUARDRAILS: &str = include_str!("../packs/guardrails.json");
+
+const SELECTOR_PACK: &str = r#"{
+  "schemaVersion": 1, "name": "cat-selector",
+  "rules": [{
+    "id": "fresh-selector",
+    "docs": {
+      "description": "store selector returns a fresh reference",
+      "why": "a fresh reference defeats Object.is — infinite re-render under zustand v5",
+      "fix": "select primitives or memoize with useShallow"
+    },
+    "severity": "warning",
+    "anchor": { "relation": "hook_calls", "kind": "custom" },
+    "forEach": { "edge": "args", "as": "sel" },
+    "guards": [
+      { "kind": "name", "of": "anchor", "one_of": ["useStore", "useSelector"] },
+      { "kind": "returns", "of": "sel", "is": ["fresh-reference"] }
+    ],
+    "message": "the selector passed to {anchor.name} returns {sel.returns}"
+  }]
+}"#;
+
+const LAYOUT_EFFECT_PACK: &str = r#"{
+  "schemaVersion": 1, "name": "cat-ssr",
+  "rules": [{
+    "id": "no-direct-use-layout-effect",
+    "docs": {
+      "description": "useLayoutEffect called directly instead of the SSR-safe wrapper",
+      "why": "useLayoutEffect warns on the server; the wrapper swaps it for useEffect there",
+      "fix": "import useSafeLayoutEffect and call it instead"
+    },
+    "severity": "warning",
+    "anchor": { "relation": "hook_calls", "kind": "effect" },
+    "guards": [
+      { "kind": "origin", "of": "anchor", "hook": ["useLayoutEffect"], "direct": true }
+    ],
+    "message": "useLayoutEffect is called directly — use the SSR-safe wrapper"
+  }]
+}"#;
+
+// ── Fixtures ──────────────────────────────────────────────────────────────────
+
+const WRAPPER_FILES: &[(&str, &str)] = &[
+    (
+        "use-safe-layout-effect.ts",
+        "import { useLayoutEffect } from \"react\";\nexport function useSafeLayoutEffect(fn, deps) { useLayoutEffect(fn, deps); }\n",
+    ),
+    (
+        "comp.tsx",
+        "import { useSafeLayoutEffect } from \"./use-safe-layout-effect\";\nexport function C() {\n  useSafeLayoutEffect(() => {}, []);\n  return <div/>;\n}\n",
+    ),
+];
+
+// ── The catalogue ─────────────────────────────────────────────────────────────
+
+fn catalogue() -> Vec<Entry> {
+    vec![
+        // ── Expression-position entities ─────────────────────────────────────
+        Entry {
+            id: "store-selector-fresh-reference",
+            status: Status::Expressible {
+                pack_json: SELECTOR_PACK,
+                rule: "cat-selector/fresh-selector",
+                fires_on: Fixture::Single(
+                    "function C() {\n  const x = useStore((s) => ({ a: s.items }));\n  return <div>{x}</div>;\n}",
+                ),
+                silent_on: Fixture::Single(
+                    "function C() {\n  const x = useStore((s) => s.items);\n  return <div>{x}</div>;\n}",
+                ),
+                weakened: Some("inline FnLit selectors only; Var-bound selectors read Unknown"),
+            },
+        },
+        Entry {
+            id: "unstable-context-provider-value",
+            status: Status::Blocked {
+                class: "expression-position",
+                missing: "Tier-A `context_providers` anchor with an `identity` field \
+                          (covered natively by unstable-context-value)",
+            },
+        },
+        Entry {
+            id: "identity-keyed-jsx-prop",
+            status: Status::Blocked {
+                class: "expression-position",
+                missing: "jsx_props sink generalized from the `value` prop to any prop \
+                          (planned step: JSX props as a sink)",
+            },
+        },
+        Entry {
+            id: "impure-state-updater",
+            status: Status::Blocked {
+                class: "expression-position",
+                missing: "setter-argument edge plus a purity fact on the updater body",
+            },
+        },
+        Entry {
+            id: "unstable-hook-options-object",
+            status: Status::Blocked {
+                class: "expression-position",
+                missing: "a call-point identity fact for non-function arguments — reading \
+                          the render-exit stability there is the ADR-023 §2 program-point error",
+            },
+        },
+        Entry {
+            id: "subscribe-with-fresh-listener",
+            status: Status::Blocked {
+                class: "expression-position",
+                missing: "call-site entities for non-hook calls (only hook rows carry args)",
+            },
+        },
+        Entry {
+            id: "var-bound-selector",
+            status: Status::Blocked {
+                class: "expression-position",
+                missing: "heap resolution of a Var-bound selector — unsound while `locs` \
+                          never invalidates on reassignment (ADR-023 §3 recorded deferral)",
+            },
+        },
+        Entry {
+            id: "all-deps-stable",
+            status: Status::Blocked {
+                class: "expression-position",
+                missing: "∀ over an edge — refused (ADR-023 §4) until truncation is \
+                          representable in the IR; `inert-effect-single-dep` is the pinned-arity \
+                          weakening",
+            },
+        },
+        // ── Single anchor, no joins ──────────────────────────────────────────
+        Entry {
+            id: "effect-and-handler-write-same-slot",
+            status: Status::Blocked {
+                class: "joins",
+                missing: "slot-centric `writers` edge (`writer_phases includes`, planned step)",
+            },
+        },
+        Entry {
+            id: "state-mirrors-prop-without-sync",
+            status: Status::Blocked {
+                class: "joins",
+                missing: "a prop+slot join (covered natively by frozen-initial-state)",
+            },
+        },
+        Entry {
+            id: "setter-called-in-child-render",
+            status: Status::Blocked {
+                class: "joins",
+                missing: "cross-component anchor (covered natively by cross-component rules)",
+            },
+        },
+        // ── Facts the engine does not compute (for Tier A) ───────────────────
+        Entry {
+            id: "missing-effect-cleanup",
+            status: Status::Blocked {
+                class: "engine-facts",
+                missing: "a cleanup verdict guard (the fact shipped as the NATIVE \
+                          missing-cleanup rule; Tier-A exposure not planned)",
+            },
+        },
+        Entry {
+            id: "async-set-state-race",
+            status: Status::Blocked {
+                class: "engine-facts",
+                missing: "async continuation phase (a `.then`/post-await write is not \
+                          distinguishable from a sync one)",
+            },
+        },
+        Entry {
+            id: "stale-update-without-functional-updater",
+            status: Status::Blocked {
+                class: "engine-facts",
+                missing: "a same-tick multi-write fact on one slot (TODO.md Tier 1 stale-update)",
+            },
+        },
+        Entry {
+            id: "nullable-return-unguarded",
+            status: Status::Blocked {
+                class: "engine-facts",
+                missing: "guard dominance over nullable returns",
+            },
+        },
+        // ── Whole-program / cross-file ───────────────────────────────────────
+        Entry {
+            id: "cross-component-effect-cycle",
+            status: Status::Blocked {
+                class: "whole-program",
+                missing: "cross-component anchors (covered natively by the churn graph)",
+            },
+        },
+        Entry {
+            id: "consumer-without-provider",
+            status: Status::Blocked {
+                class: "whole-program",
+                missing: "the useContext consumer→provider relation (TODO.md: decide \
+                          post-pass vs unified phases first)",
+            },
+        },
+        // ── Hook identity ────────────────────────────────────────────────────
+        Entry {
+            id: "no-direct-use-layout-effect",
+            status: Status::Expressible {
+                pack_json: LAYOUT_EFFECT_PACK,
+                rule: "cat-ssr/no-direct-use-layout-effect",
+                fires_on: Fixture::Single(
+                    "import { useLayoutEffect } from \"react\";\nfunction C() {\n  useLayoutEffect(() => {}, []);\n  return <div/>;\n}",
+                ),
+                // The conformant consumer of the wrapper: the inlined
+                // useLayoutEffect row is marked `inlined`, so `direct: true`
+                // keeps the rule silent — the whole point of the provenance row.
+                silent_on: Fixture::Multi(WRAPPER_FILES),
+                weakened: None,
+            },
+        },
+        // ── ADR-022 baseline (proven by the committed guardrails pack) ──────
+        Entry {
+            id: "effect-must-declare-deps",
+            status: Status::Expressible {
+                pack_json: GUARDRAILS,
+                rule: "guardrails/effect-without-deps-array",
+                fires_on: Fixture::Single(
+                    "function C() {\n  useEffect(() => { console.log(1); });\n  return <div/>;\n}",
+                ),
+                silent_on: Fixture::Single(
+                    "function C() {\n  useEffect(() => { console.log(1); }, []);\n  return <div/>;\n}",
+                ),
+                weakened: None,
+            },
+        },
+        Entry {
+            id: "inert-effect-all-deps-stable",
+            status: Status::Expressible {
+                pack_json: GUARDRAILS,
+                rule: "guardrails/inert-single-dep",
+                fires_on: Fixture::Single(
+                    "const K = 1;\nfunction C() {\n  useEffect(() => { console.log(K); }, [K]);\n  return <div/>;\n}",
+                ),
+                silent_on: Fixture::Single(
+                    "function C({ a }) {\n  useEffect(() => { console.log(a); }, [a]);\n  return <div/>;\n}",
+                ),
+                weakened: Some("arity pinned to 1 — ∀ over deps is refused (ADR-023 §4)"),
+            },
+        },
+        Entry {
+            id: "self-retriggering-effect",
+            status: Status::Expressible {
+                pack_json: GUARDRAILS,
+                rule: "guardrails/self-retriggering-effect",
+                fires_on: Fixture::Single(
+                    "function C({ xs }) {\n  const [n, setN] = useState(0);\n  useEffect(() => { setN(n + 1); }, [n]);\n  return <div>{n}</div>;\n}",
+                ),
+                silent_on: Fixture::Single(
+                    "function C({ xs }) {\n  const [n, setN] = useState(0);\n  useEffect(() => { setN(xs.length); }, [xs]);\n  return <div>{n}</div>;\n}",
+                ),
+                weakened: Some("existential per setter — no join with narrowing facts"),
+            },
+        },
+    ]
+}
+
+// ── The measure ───────────────────────────────────────────────────────────────
+
+/// The curve: 3/21 at the ADR-022 baseline → 5/21 after ADR-023 steps 1-2.
+/// Flip an entry (rule + fixtures), then update this constant.
+const EXPRESSIBLE_NOW: usize = 5;
+
+#[test]
+fn catalogue_has_21_entries() {
+    assert_eq!(catalogue().len(), 21);
+}
+
+#[test]
+fn every_expressible_entry_is_proven() {
+    for entry in catalogue() {
+        let Status::Expressible {
+            pack_json,
+            rule,
+            fires_on,
+            silent_on,
+            ..
+        } = entry.status
+        else {
+            continue;
+        };
+        let fired = run_rule_on(pack_json, rule, &fires_on);
+        assert!(
+            !fired.is_empty(),
+            "catalogue entry `{}`: rule `{rule}` must fire on the buggy fixture",
+            entry.id
+        );
+        let silent = run_rule_on(pack_json, rule, &silent_on);
+        assert!(
+            silent.is_empty(),
+            "catalogue entry `{}`: rule `{rule}` must stay silent on the conformant fixture, got {:?}",
+            entry.id,
+            silent.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn the_measure() {
+    let entries = catalogue();
+    let expressible: Vec<&str> = entries
+        .iter()
+        .filter(|e| matches!(e.status, Status::Expressible { .. }))
+        .map(|e| e.id)
+        .collect();
+    // The printed lines are the curve datapoint for release notes / NEXTSTEPS
+    // (run with `-- --nocapture` to see them).
+    println!(
+        "Tier-A expressibility: {}/{} — {:?}",
+        expressible.len(),
+        entries.len(),
+        expressible
+    );
+    for e in &entries {
+        match &e.status {
+            Status::Blocked { class, missing } => {
+                println!("  blocked [{class}] {}: {missing}", e.id);
+            }
+            Status::Expressible {
+                weakened: Some(w), ..
+            } => println!("  weakened {}: {w}", e.id),
+            Status::Expressible { weakened: None, .. } => {}
+        }
+    }
+    assert_eq!(
+        expressible.len(),
+        EXPRESSIBLE_NOW,
+        "the measured count moved — update EXPRESSIBLE_NOW and record the new \
+         datapoint in docs/TODO.md"
+    );
+}
