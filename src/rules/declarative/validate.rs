@@ -16,7 +16,7 @@ use crate::rules::docs::rule_doc;
 
 use super::schema::{
     Anchor, EdgeName, ElseBehavior, Guard, HookKindFilter, PVal, PackFile, ParamDecl, ParamType,
-    RuleDef, SeverityPin, StabilityName,
+    ReturnsName, RuleDef, SeverityPin, StabilityName,
 };
 
 /// A pack rejection: `path` is the JSON location (`rules[1].guards[0].of`),
@@ -68,6 +68,8 @@ pub(crate) enum Sort {
     SetterBody,
     /// One declared deps-array entry.
     Dep,
+    /// One call-site argument of a custom-hook anchor.
+    Arg,
 }
 
 impl Sort {
@@ -78,6 +80,7 @@ impl Sort {
             Sort::SetterRender => "a render-body setter call".into(),
             Sort::SetterBody => "a body setter call".into(),
             Sort::Dep => "a deps entry".into(),
+            Sort::Arg => "a call-site argument".into(),
         }
     }
 }
@@ -136,6 +139,17 @@ pub(crate) enum ResolvedGuard {
         /// `true` when the author wrote `not` (pass ⟺ verdict ∉ names).
         negated: bool,
     },
+    Returns {
+        of: BindRef,
+        names: Vec<ReturnsName>,
+        /// `true` when the author wrote `not` (pass ⟺ verdict ∉ names).
+        negated: bool,
+    },
+    Origin {
+        of: BindRef,
+        hook: Option<Vec<String>>,
+        direct: Option<bool>,
+    },
     InDeps {
         of: BindRef,
         negate: bool,
@@ -184,6 +198,7 @@ pub(crate) enum Field {
     Setter,
     Path,
     Stability,
+    Returns,
 }
 
 impl Field {
@@ -198,6 +213,7 @@ impl Field {
         Field::Setter,
         Field::Path,
         Field::Stability,
+        Field::Returns,
     ];
 
     /// The name authors write: `{anchor.<token>}`.
@@ -210,6 +226,7 @@ impl Field {
             Field::Setter => "setter",
             Field::Path => "path",
             Field::Stability => "stability",
+            Field::Returns => "returns",
         }
     }
 
@@ -219,7 +236,7 @@ impl Field {
         match self {
             Field::Kind => match sort {
                 Sort::Hook(_) => true,
-                Sort::SetterRender | Sort::SetterBody | Sort::Dep => false,
+                Sort::SetterRender | Sort::SetterBody | Sort::Dep | Sort::Arg => false,
             },
             // Effects and handlers are the two kinds with nothing to call them;
             // an any-kind anchor is admitted and falls back per row.
@@ -233,20 +250,29 @@ impl Field {
                     | HookKindFilter::Custom => true,
                     HookKindFilter::Effect | HookKindFilter::Handler => false,
                 },
-                Sort::SetterRender | Sort::SetterBody | Sort::Dep => false,
+                Sort::SetterRender | Sort::SetterBody | Sort::Dep | Sort::Arg => false,
             },
             // The import specifier is recorded on custom hook rows only.
             Field::Source => match sort {
                 Sort::Hook(Some(HookKindFilter::Custom)) => true,
-                Sort::Hook(_) | Sort::SetterRender | Sort::SetterBody | Sort::Dep => false,
+                Sort::Hook(_) | Sort::SetterRender | Sort::SetterBody | Sort::Dep | Sort::Arg => {
+                    false
+                }
             },
             Field::Slot | Field::Setter => match sort {
                 Sort::SetterRender | Sort::SetterBody => true,
-                Sort::Hook(_) | Sort::Dep => false,
+                Sort::Hook(_) | Sort::Dep | Sort::Arg => false,
             },
+            // `stability` stays a deps-entry fact: reading it for a call-site
+            // argument is the program-point error ADR-023 §2 refuses — this
+            // table is where the refusal is enforced.
             Field::Path | Field::Stability => match sort {
                 Sort::Dep => true,
-                Sort::Hook(_) | Sort::SetterRender | Sort::SetterBody => false,
+                Sort::Hook(_) | Sort::SetterRender | Sort::SetterBody | Sort::Arg => false,
+            },
+            Field::Returns => match sort {
+                Sort::Arg => true,
+                Sort::Hook(_) | Sort::SetterRender | Sort::SetterBody | Sort::Dep => false,
             },
         }
     }
@@ -306,6 +332,8 @@ fn check_keys(
 fn guard_allowed_keys(g: &Guard) -> (&'static str, &'static [&'static str]) {
     match g {
         Guard::Stability { .. } => ("guard `stability`", &["kind", "of", "is", "not"]),
+        Guard::Returns { .. } => ("guard `returns`", &["kind", "of", "is", "not"]),
+        Guard::Origin { .. } => ("guard `origin`", &["kind", "of", "hook", "direct"]),
         Guard::InDeps { .. } => ("guard `in_deps`", &["kind", "of", "negate"]),
         Guard::Name { .. } => ("guard `name`", &["kind", "of", "one_of", "prefix"]),
         Guard::Source { .. } => ("guard `source`", &["kind", "of", "one_of", "prefix"]),
@@ -584,6 +612,18 @@ fn validate_rule(
                 }
                 Sort::SetterBody
             }
+            EdgeName::Args => {
+                if !matches!(anchor_sort, Sort::Hook(Some(HookKindFilter::Custom))) {
+                    return Err(PackError::new(
+                        format!("{fe_path}.edge"),
+                        format!(
+                            "edge `args` needs a custom-hook anchor, but the anchor binds {}",
+                            anchor_sort.describe()
+                        ),
+                    ));
+                }
+                Sort::Arg
+            }
         };
         bound_sort = Some(element);
         bound_name = Some(fe.bind.as_str());
@@ -727,6 +767,71 @@ fn validate_guard(
                 return Err(PackError::new(g_path, "the verdict list must not be empty"));
             }
             ResolvedGuard::Stability { of, names, negated }
+        }
+        Guard::Returns { of, is, not } => {
+            let (of, sort) = cx.resolve_of(of, g_path)?;
+            if sort != Sort::Arg {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    format!(
+                        "guard `returns` applies to a call-site argument (the `args` edge), \
+                         but the subject binds {}",
+                        sort.describe()
+                    ),
+                ));
+            }
+            let (names, negated) = match (is, not) {
+                (Some(pv), None) => (cx.env.resolve(pv, None, &format!("{g_path}.is"))?, false),
+                (None, Some(pv)) => (cx.env.resolve(pv, None, &format!("{g_path}.not"))?, true),
+                _ => {
+                    return Err(PackError::new(
+                        g_path,
+                        "guard `returns` takes exactly one of `is` / `not`",
+                    ));
+                }
+            };
+            if names.is_empty() {
+                return Err(PackError::new(g_path, "the verdict list must not be empty"));
+            }
+            ResolvedGuard::Returns { of, names, negated }
+        }
+        Guard::Origin { of, hook, direct } => {
+            let (of, sort) = cx.resolve_of(of, g_path)?;
+            if !matches!(sort, Sort::Hook(_)) {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    format!(
+                        "guard `origin` applies to a hook-call row, but the subject binds {}",
+                        sort.describe()
+                    ),
+                ));
+            }
+            let hook = match hook {
+                Some(pv) => Some(cx.env.resolve(
+                    pv,
+                    Some(ParamType::StringList),
+                    &format!("{g_path}.hook"),
+                )?),
+                None => None,
+            };
+            let direct = match direct {
+                Some(pv) => Some(cx.env.resolve(
+                    pv,
+                    Some(ParamType::Boolean),
+                    &format!("{g_path}.direct"),
+                )?),
+                None => None,
+            };
+            if hook.is_none() && direct.is_none() {
+                return Err(PackError::new(
+                    g_path,
+                    "guard `origin` needs at least one of `hook` / `direct`",
+                ));
+            }
+            if hook.as_ref().is_some_and(|h| h.is_empty()) {
+                return Err(PackError::new(g_path, "the hook list must not be empty"));
+            }
+            ResolvedGuard::Origin { of, hook, direct }
         }
         Guard::InDeps { of, negate } => {
             let (of, sort) = cx.resolve_of(of, g_path)?;

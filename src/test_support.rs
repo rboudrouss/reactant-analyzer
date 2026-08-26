@@ -80,6 +80,7 @@ pub(crate) fn analysis_result(render_cfg: CFG) -> AnalysisResult<StateValue> {
         render_cfg,
         hooks: vec![],
         hook_provenance: vec![],
+        custom_arg_returns: HashMap::new(),
         iterations: 0,
         effect_setter_writes: StateStore::bottom(),
         heap: Heap::new(),

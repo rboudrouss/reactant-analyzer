@@ -161,6 +161,17 @@ pub struct AnalysisResult<D: AbstractDomain> {
     /// (branch narrowing held the growth) from one that truly diverges.
     /// `Bottom` for a label = effect never called that setter in the semantic analysis.
     pub effect_setter_writes: StateStore<D>,
+    /// Joined abstract return value of each inline `FnLit` argument of an
+    /// unexpanded custom hook, keyed by `(hook label, argument index)`
+    /// (ADR-023 §3 amendment: computed during analysis, where the context
+    /// exists; `api/query.rs` owns only the verdict type and the reader).
+    ///
+    /// Program-point argument: the body runs with its params bound to ⊤ and
+    /// only module consts in scope — every other capture reads the env-miss
+    /// default (⊤), which over-approximates the value at *any* program point,
+    /// so no invocation timing can make the stored value an under-approximation.
+    /// Absent key = not an inline `FnLit` (Var-bound, imported) → `Unknown`.
+    pub custom_arg_returns: HashMap<(HookLabel, usize), D>,
     pub render_cfg: CFG,
     /// Original hook entries needed by rules that inspect effect body CFGs.
     pub hooks: Vec<HookEntry>,

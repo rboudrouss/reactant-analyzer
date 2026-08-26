@@ -172,6 +172,38 @@ pub fn stability_verdict_of(val: &StateValue) -> StabilityVerdict {
     StabilityVerdict::of(val.to_stability())
 }
 
+/// ⊤-total classifier of what a function-valued call-site argument *returns*
+/// (ADR-023 §3). Asks the identity question, not the stability one: a store
+/// selector crashes zustand v5 when its return defeats `Object.is` — a fresh
+/// reference per call — while a moving *primitive* is value-compared and safe,
+/// which is why `stability`'s `per-render` (kind-agnostic motion) is the wrong
+/// vocabulary here and the `args` edge does not admit it.
+///
+/// A classifier, not a must-primitive (ADR-023 Limitations): it mints nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnsVerdict {
+    /// Provably the same reference on every call.
+    Stable,
+    /// A reference whose identity is fresh on every call — defeats `Object.is`.
+    FreshReference,
+    /// Everything else — primitives, mixed kinds, ⊤, or an argument the
+    /// engine could not resolve (Var-bound, imported). The may side.
+    Unknown,
+}
+
+/// Project an abstract return value onto [`ReturnsVerdict`] — the same
+/// three-way coarsening `SummaryValue` established for library-hook returns.
+pub fn returns_verdict_of(val: &StateValue) -> ReturnsVerdict {
+    use crate::domains::impls::Stability;
+    if *val == StateValue::reference(Stability::Stable) {
+        ReturnsVerdict::Stable
+    } else if val.is_unstable_reference_only() {
+        ReturnsVerdict::FreshReference
+    } else {
+        ReturnsVerdict::Unknown
+    }
+}
+
 /// The sole ⊤-safe stability-reachability probe (ADR-021 §3): `true` unless the
 /// value is provably `Stable` (`⊤`/`Versioned`/`PerRender` → `true`). Replaces
 /// the withdrawn `StateValue::is_unstable`, whose `PerRender`-only test let a
@@ -293,6 +325,18 @@ impl<'a> RuleCtx<'a> {
     /// provably `Stable`. Withdraws the FN-prone `is_unstable` from the surface.
     pub fn may_change(&self, expr: &Expr) -> May<bool> {
         may_change_of(&self.eval_exit(expr))
+    }
+
+    /// Returns-verdict of argument `arg` of the custom hook labelled `label`
+    /// (ADR-023 §3). ⊤-total: an argument the engine did not resolve — not an
+    /// inline `FnLit`, or no such row — answers `Unknown`. The evaluation
+    /// happened during the fixpoint (`AnalysisResult::custom_arg_returns`);
+    /// this reader only projects it.
+    pub fn returns_verdict(&self, label: HookLabel, arg: usize) -> ReturnsVerdict {
+        self.comp
+            .custom_arg_returns
+            .get(&(label, arg))
+            .map_or(ReturnsVerdict::Unknown, returns_verdict_of)
     }
 
     /// Every conditionally-called hook in the component: a hook whose block does

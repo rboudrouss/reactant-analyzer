@@ -22,7 +22,7 @@ use crate::rules::api::query::{
 };
 use crate::rules::{Rule, SetterCall};
 
-use super::entity::{DepEntity, EntityCtx, EntityVal, HookRow, SetterEntity};
+use super::entity::{ArgEntity, DepEntity, EntityCtx, EntityVal, HookRow, SetterEntity};
 use super::schema::{EdgeName, ElseBehavior, SeverityPin};
 use super::validate::{
     BindRef, CountCmp, MustKind, ResolvedAnchor, ResolvedGuard, ResolvedRule, Segment,
@@ -57,6 +57,7 @@ impl Proof {
 enum Bound<'a, 'b> {
     Setter(&'b SetterEntity),
     Dep(&'b DepEntity<'a>),
+    Arg(&'b ArgEntity),
 }
 
 /// One candidate under evaluation: whatever the anchor bound, plus the
@@ -94,6 +95,7 @@ impl<'a, 'b> Candidate<'a, 'b> {
             (BindRef::Bound, _) => match self.bound().expect("validated: binding exists") {
                 Bound::Setter(s) => EntityVal::Setter(s),
                 Bound::Dep(d) => EntityVal::Dep(d),
+                Bound::Arg(a) => EntityVal::Arg(a),
             },
         }
     }
@@ -112,7 +114,7 @@ impl<'a, 'b> Candidate<'a, 'b> {
         match self {
             Candidate::Hook { row, bound } => match bound {
                 Some(Bound::Setter(s)) => s.span,
-                Some(Bound::Dep(_)) | None => row.info.span,
+                Some(Bound::Dep(_) | Bound::Arg(_)) | None => row.info.span,
             },
             Candidate::RenderSetter(s) => s.span,
         }
@@ -150,6 +152,18 @@ impl Rule for TierARule {
                                     &Candidate::Hook {
                                         row: &row,
                                         bound: Some(Bound::Setter(&setter)),
+                                    },
+                                    &mut out,
+                                );
+                            }
+                        }
+                        Some(EdgeName::Args) => {
+                            for arg in e.args(&row) {
+                                self.eval(
+                                    &e,
+                                    &Candidate::Hook {
+                                        row: &row,
+                                        bound: Some(Bound::Arg(&arg)),
                                     },
                                     &mut out,
                                 );
@@ -215,10 +229,31 @@ impl TierARule {
         match guard {
             ResolvedGuard::Stability { names, negated, .. } => match cand.bound() {
                 Some(Bound::Dep(dep)) => names.contains(&e.dep_verdict(dep)) != *negated,
-                Some(Bound::Setter(_)) | None => {
+                Some(Bound::Setter(_) | Bound::Arg(_)) | None => {
                     unreachable!("validated: `stability` binds a deps entry")
                 }
             },
+            ResolvedGuard::Returns { names, negated, .. } => match cand.bound() {
+                Some(Bound::Arg(arg)) => names.contains(&e.arg_verdict(arg)) != *negated,
+                Some(Bound::Setter(_) | Bound::Dep(_)) | None => {
+                    unreachable!("validated: `returns` binds a call-site argument")
+                }
+            },
+            ResolvedGuard::Origin { hook, direct, .. } => {
+                // Validated: the subject is a hook-call row, which only the
+                // anchor can bind in v1. Positive-only: no provenance row ⇒ fail.
+                let Some(row) = cand.row() else {
+                    unreachable!("validated: `origin` binds a hook-call row")
+                };
+                match e.provenance(row.info.label) {
+                    Some(p) => {
+                        hook.as_ref().is_none_or(|names| {
+                            names.iter().any(|n| n == p.origin_hook.as_str())
+                        }) && direct.is_none_or(|d| !p.inlined == d)
+                    }
+                    None => false,
+                }
+            }
             ResolvedGuard::InDeps { negate, .. } => match (cand.row(), cand.bound()) {
                 (Some(row), Some(Bound::Setter(setter))) => {
                     let in_deps = setter

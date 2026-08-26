@@ -150,6 +150,11 @@ pub enum EdgeName {
     Deps,
     /// Alias-resolved setter calls in the anchor's body CFG.
     BodySetterCalls,
+    /// Call-site arguments of a custom-hook anchor (ADR-023 §3). Admits the
+    /// `returns` guard and NOT `stability`: an argument is evaluated at the
+    /// call, so reading the render-exit stability there is the program-point
+    /// error ADR-023 §2 refuses.
+    Args,
 }
 
 /// A guard: a predicate over an engine verdict. `must_*` guards certify
@@ -169,6 +174,33 @@ pub enum Guard {
         is: Option<PVal<Vec<StabilityName>>>,
         #[serde(default)]
         not: Option<PVal<Vec<StabilityName>>>,
+    },
+    /// Returns-verdict of a call-site argument (ADR-023 §3): what the
+    /// function-valued argument *returns* — the identity question, so a store
+    /// selector returning a fresh reference is distinguishable from one
+    /// returning a value-compared primitive. Exactly one of `is`/`not`; the
+    /// names mirror `ReturnsVerdict` totally — ⊤ (`unknown`) is matchable,
+    /// never dropped.
+    Returns {
+        of: String,
+        #[serde(default)]
+        is: Option<PVal<Vec<ReturnsName>>>,
+        #[serde(default)]
+        not: Option<PVal<Vec<ReturnsName>>>,
+    },
+    /// Provenance filter on a hook-call row (ADR-023 step 1): the hook the
+    /// call's identity resolved to (`useLayoutEffect` even when reached
+    /// through an alias) and whether the call is written in the component
+    /// (`direct: true`) or reached through an inlined wrapper hook. This is
+    /// what lets "never call `useLayoutEffect` directly, use the SSR-safe
+    /// wrapper" stay silent on conformant consumers of the wrapper. At least
+    /// one of `hook`/`direct`; a row with no provenance fails (positive-only).
+    Origin {
+        of: String,
+        #[serde(default)]
+        hook: Option<PVal<Vec<String>>>,
+        #[serde(default)]
+        direct: Option<PVal<bool>>,
     },
     /// The setter's slot appears in the anchor's declared deps.
     InDeps {
@@ -262,6 +294,16 @@ pub enum StabilityName {
     Stable,
     Versioned,
     PerRender,
+    Unknown,
+}
+
+/// Total mirror of `ReturnsVerdict`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum ReturnsName {
+    Stable,
+    FreshReference,
     Unknown,
 }
 

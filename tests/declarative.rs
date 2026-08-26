@@ -824,3 +824,126 @@ fn any_of_warns_on_a_vacuous_must_branch() {
         pack.warnings
     );
 }
+
+// ── The `args` edge and the `returns` guard (ADR-023 step 2) ─────────────────
+
+/// The motivating rule: a store selector returning a fresh reference per call
+/// (an outright crash under zustand v5's `Object.is` compare).
+const SELECTOR_PACK: &str = r#"{
+  "schemaVersion": 1,
+  "name": "store",
+  "rules": [{
+    "id": "fresh-selector",
+    "docs": {
+      "description": "store selector returns a fresh reference",
+      "why": "a selector allocating per call defeats Object.is and re-renders forever",
+      "fix": "select primitives, or memoize with useShallow"
+    },
+    "severity": "warning",
+    "anchor": { "relation": "hook_calls", "kind": "custom" },
+    "forEach": { "edge": "args", "as": "sel" },
+    "guards": [
+      { "kind": "name", "of": "anchor", "one_of": ["useStore"] },
+      { "kind": "returns", "of": "sel", "is": ["fresh-reference"] }
+    ],
+    "message": "the selector passed to {anchor.name} returns {sel.returns}"
+  }]
+}"#;
+
+#[test]
+fn fresh_reference_selector_fires_as_warning() {
+    let diags = run_pack(
+        SELECTOR_PACK,
+        "function C() {\n  const x = useStore((s) => ({ a: s.items }));\n  return <div>{x}</div>;\n}",
+        &Options::new(),
+    );
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].severity(), Severity::Warning);
+    assert!(
+        diags[0]
+            .message
+            .contains("returns a fresh reference per call"),
+        "{}",
+        diags[0].message
+    );
+}
+
+#[test]
+fn passthrough_selector_is_silent() {
+    // `s => s.items` keeps the store's identity — Unknown, not fresh.
+    let diags = run_pack(
+        SELECTOR_PACK,
+        "function C() {\n  const x = useStore((s) => s.items);\n  return <div>{x}</div>;\n}",
+        &Options::new(),
+    );
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn other_custom_hooks_are_silent() {
+    // The name guard scopes the rule to the store hook.
+    let diags = run_pack(
+        SELECTOR_PACK,
+        "function C() {\n  const x = useQuery((s) => ({ a: s.items }));\n  return <div>{x}</div>;\n}",
+        &Options::new(),
+    );
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn args_edge_needs_a_custom_anchor() {
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+        "anchor":{"relation":"hook_calls","kind":"effect"},
+        "forEach":{"edge":"args","as":"a"},"message":"m"}"#,
+    ));
+    assert!(
+        e.message.contains("edge `args` needs a custom-hook anchor"),
+        "{e}"
+    );
+}
+
+#[test]
+fn returns_guard_rejects_a_deps_binding() {
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+        "anchor":{"relation":"hook_calls","kind":"effect"},
+        "forEach":{"edge":"deps","as":"d"},
+        "guards":[{"kind":"returns","of":"d","is":["fresh-reference"]}],"message":"m"}"#,
+    ));
+    assert!(
+        e.message.contains("guard `returns` applies to a call-site argument"),
+        "{e}"
+    );
+}
+
+#[test]
+fn stability_guard_rejects_an_args_binding() {
+    // The program-point refusal (ADR-023 §2): an argument is evaluated at the
+    // call, so the render-exit stability guard must not be readable there.
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+        "anchor":{"relation":"hook_calls","kind":"custom"},
+        "forEach":{"edge":"args","as":"a"},
+        "guards":[{"kind":"stability","of":"a","is":["per-render"]}],"message":"m"}"#,
+    ));
+    assert!(
+        e.message.contains("guard `stability` applies to a deps entry"),
+        "{e}"
+    );
+}
+
+#[test]
+fn stability_template_field_rejects_an_args_binding() {
+    // Same refusal through the other projection of the same table
+    // (`Field::admits`): `{a.stability}` must not render either.
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+        "anchor":{"relation":"hook_calls","kind":"custom"},
+        "forEach":{"edge":"args","as":"a"},"message":"{a.stability}"}"#,
+    ));
+    assert!(
+        e.message.contains("stability") || e.message.contains("field"),
+        "{e}"
+    );
+}

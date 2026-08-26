@@ -87,6 +87,11 @@
           "description": "Alias-resolved setter calls in the anchor's body CFG.",
           "type": "string",
           "const": "body_setter_calls"
+        },
+        {
+          "description": "Call-site arguments of a custom-hook anchor (ADR-023 §3). Admits the\n`returns` guard and NOT `stability`: an argument is evaluated at the\ncall, so reading the render-exit stability there is the program-point\nerror ADR-023 §2 refuses.",
+          "type": "string",
+          "const": "args"
         }
       ]
     },
@@ -145,6 +150,80 @@
                   "type": "null"
                 }
               ]
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        },
+        {
+          "description": "Returns-verdict of a call-site argument (ADR-023 §3): what the\nfunction-valued argument *returns* — the identity question, so a store\nselector returning a fresh reference is distinguishable from one\nreturning a value-compared primitive. Exactly one of `is`/`not`; the\nnames mirror `ReturnsVerdict` totally — ⊤ (`unknown`) is matchable,\nnever dropped.",
+          "type": "object",
+          "properties": {
+            "is": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_Array_of_ReturnsName"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "returns"
+            },
+            "not": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_Array_of_ReturnsName"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        },
+        {
+          "description": "Provenance filter on a hook-call row (ADR-023 step 1): the hook the\ncall's identity resolved to (`useLayoutEffect` even when reached\nthrough an alias) and whether the call is written in the component\n(`direct: true`) or reached through an inlined wrapper hook. This is\nwhat lets \"never call `useLayoutEffect` directly, use the SSR-safe\nwrapper\" stay silent on conformant consumers of the wrapper. At least\none of `hook`/`direct`; a row with no provenance fails (positive-only).",
+          "type": "object",
+          "properties": {
+            "direct": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "hook": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_Array_of_string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "origin"
             },
             "of": {
               "type": "string"
@@ -428,6 +507,28 @@
         "handler"
       ]
     },
+    "PVal_Array_of_ReturnsName": {
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ReturnsName"
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "$param": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "$param"
+          ]
+        }
+      ]
+    },
     "PVal_Array_of_StabilityName": {
       "oneOf": [
         {
@@ -552,6 +653,15 @@
         "string",
         "boolean",
         "string[]"
+      ]
+    },
+    "ReturnsName": {
+      "description": "Total mirror of `ReturnsVerdict`.",
+      "type": "string",
+      "enum": [
+        "stable",
+        "fresh-reference",
+        "unknown"
       ]
     },
     "RuleDef": {

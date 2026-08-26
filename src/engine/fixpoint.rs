@@ -133,7 +133,10 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // see "may be fresh each render". Bindings already present in
     // `initial_env` (props from a parent analysis) win.
     let mut initial_env = initial_env;
-    {
+    // Module consts alone, in their own env: reused below as the entry env of
+    // custom-hook argument bodies — a module const has the same value at every
+    // program point, so it is the only binding that may be seeded there.
+    let module_env = {
         let mut seed_state = StateStore::bottom();
         let mut seed_memo: MemoStore<StateValue> = MemoStore::new();
         let mut seed_heap = crate::domains::Heap::new();
@@ -144,10 +147,8 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             &mut seed_heap,
         );
         let empty_env = AbstractEnv::bottom();
+        let mut env = AbstractEnv::bottom();
         for (name, init) in module_consts.iter() {
-            if initial_env.contains(name) {
-                continue;
-            }
             let val = match init {
                 ModuleConstInit::Prim(p) => {
                     transfer.eval_expr(&Expr::Lit(p.clone()), &empty_env, &mut ac)
@@ -158,9 +159,15 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     StateValue::reference(Stability::Stable)
                 }
             };
-            initial_env.extend(name.clone(), val);
+            // Bindings already present in `initial_env` (props from a parent
+            // analysis) win there; `module_env` keeps every const.
+            if !initial_env.contains(name) {
+                initial_env.extend(name.clone(), val.clone());
+            }
+            env.extend(name.clone(), val);
         }
-    }
+        env
+    };
 
     // Provenance of every splice below (ADR-019) — ends up on the result.
     let mut inline_origins: Vec<crate::engine::InlineOrigin> = Vec::new();
@@ -189,6 +196,46 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         &mut inline_origins,
         &mut splice_salt,
     );
+
+    // Returns-verdict of inline `FnLit` args of the custom hooks that survived
+    // expansion — the opaque/summarized library calls (`useStore(s => …)`),
+    // exactly the rows the Tier-A `args` edge navigates (ADR-023 §3). Params
+    // are bound to ⊤ over the module-const env: every non-const capture reads
+    // ⊤, which over-approximates the value at any program point, so the stored
+    // join is sound for whenever the store chooses to invoke the selector.
+    let custom_arg_returns: HashMap<(HookLabel, usize), StateValue> = {
+        let mut out = HashMap::new();
+        let mut seed_state = StateStore::bottom();
+        let mut seed_memo: MemoStore<StateValue> = MemoStore::new();
+        let mut seed_heap = crate::domains::Heap::new();
+        let mut ac = AnalysisCtx::null(
+            comp_name.clone(),
+            &mut seed_state,
+            &mut seed_memo,
+            &mut seed_heap,
+        );
+        for hook in &hooks {
+            let HookEntry::Custom { label, args, .. } = hook else {
+                continue;
+            };
+            for (i, arg) in args.iter().enumerate() {
+                let Expr::FnLit {
+                    params, body_cfg, ..
+                } = arg.peel_ts()
+                else {
+                    continue;
+                };
+                let mut env = module_env.clone();
+                for p in params {
+                    // Explicit, not by env-miss: a param may shadow a const.
+                    env.extend(p.clone(), StateValue::top());
+                }
+                let ret = crate::domains::interp::exec_body(transfer, body_cfg, &env, &mut ac);
+                out.insert((*label, i), ret);
+            }
+        }
+        out
+    };
 
     // Threshold set for widening up-to (ADR-014); harvested once, post-expansion.
     let thresholds = collect_thresholds(&render_cfg, &hooks);
@@ -496,6 +543,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         widen_trace,
         inline_origins,
         effect_setter_writes,
+        custom_arg_returns,
         render_cfg,
         hooks: hooks_clone,
         hook_provenance,

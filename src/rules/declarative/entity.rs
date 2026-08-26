@@ -22,11 +22,11 @@ use crate::ir::hooks::HookEntry;
 use crate::ir::types::{BlockId, HookLabel, Var};
 use crate::rules::api::query::{Certified, ConditionalHookCall, ExitDominance, RuleCtx};
 use crate::rules::{
-    SetterCall, StabilityVerdict, all_setter_labels, collect_setter_calls, hook_kind_word,
-    hook_val_labels, resolve_setter_aliases, state_val_labels,
+    ReturnsVerdict, SetterCall, StabilityVerdict, all_setter_labels, collect_setter_calls,
+    hook_kind_word, hook_val_labels, resolve_setter_aliases, state_val_labels,
 };
 
-use super::schema::{HookKindFilter, StabilityName};
+use super::schema::{HookKindFilter, ReturnsName, StabilityName};
 use super::validate::Field;
 
 // ── Entities ──────────────────────────────────────────────────────────────────
@@ -55,11 +55,19 @@ pub(crate) struct DepEntity<'a> {
     pub path: Option<AccessPath>,
 }
 
+/// One call-site argument of a custom-hook anchor (ADR-023 §3). Carries the
+/// hook label so the `returns` guard can read the fixpoint-computed verdict.
+pub(crate) struct ArgEntity {
+    pub label: HookLabel,
+    pub index: usize,
+}
+
 /// A bound entity value, for guards and template rendering.
 pub(crate) enum EntityVal<'a, 'b> {
     Hook(&'b HookRow<'a>),
     Setter(&'b SetterEntity),
     Dep(&'b DepEntity<'a>),
+    Arg(&'b ArgEntity),
 }
 
 // ── Per-component index ───────────────────────────────────────────────────────
@@ -80,6 +88,9 @@ pub(crate) struct EntityCtx<'a> {
     pub hook_names: HashMap<Var, HookLabel>,
     exit_dom: OnceCell<ExitDominance>,
     conditional: OnceCell<HashMap<HookLabel, Certified<ConditionalHookCall>>>,
+    /// Index into `comp.hook_provenance` by label (indices, not references:
+    /// `OnceCell` is invariant, so a borrowed map would freeze `'a`).
+    provenance: OnceCell<HashMap<HookLabel, usize>>,
 }
 
 impl<'a> EntityCtx<'a> {
@@ -98,6 +109,7 @@ impl<'a> EntityCtx<'a> {
             hook_names: hook_val_labels(&comp.render_cfg),
             exit_dom: OnceCell::new(),
             conditional: OnceCell::new(),
+            provenance: OnceCell::new(),
         }
     }
 
@@ -171,11 +183,40 @@ impl<'a> EntityCtx<'a> {
             .collect()
     }
 
+    /// `args`: call-site arguments of a custom-hook anchor, in call order.
+    /// Only the anchor's row identity travels — the verdict of what a
+    /// function-valued argument returns was computed during the fixpoint
+    /// (`AnalysisResult::custom_arg_returns`) and is read per (label, index).
+    pub fn args(&self, row: &HookRow<'a>) -> Vec<ArgEntity> {
+        let Some(HookEntry::Custom { args, .. }) = row.entry else {
+            return vec![];
+        };
+        (0..args.len())
+            .map(|index| ArgEntity {
+                label: row.info.label,
+                index,
+            })
+            .collect()
+    }
+
     // ── Component-wide relation objects (lazy) ────────────────────────────────
 
     pub fn exit_dom(&self) -> &ExitDominance {
         self.exit_dom
             .get_or_init(|| ExitDominance::of(&self.comp.render_cfg))
+    }
+
+    /// Provenance row of a hook call (ADR-023 step 1), by label.
+    pub fn provenance(&self, label: HookLabel) -> Option<&'a crate::ir::hooks::HookProvenance> {
+        let idx = self.provenance.get_or_init(|| {
+            self.comp
+                .hook_provenance
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (p.label, i))
+                .collect()
+        });
+        idx.get(&label).map(|&i| &self.comp.hook_provenance[i])
     }
 
     pub fn conditional(&self) -> &HashMap<HookLabel, Certified<ConditionalHookCall>> {
@@ -195,6 +236,11 @@ impl<'a> EntityCtx<'a> {
         verdict_name(&self.ctx.stability_verdict(dep.expr))
     }
 
+    /// Returns-verdict of a call-site argument (⊤-total, ADR-023 §3).
+    pub fn arg_verdict(&self, arg: &ArgEntity) -> ReturnsName {
+        returns_name(self.ctx.returns_verdict(arg.label, arg.index))
+    }
+
     /// The raw value of `field` on `v`: what a text guard matches and what
     /// [`Self::render_field`] decorates — one table, two projections.
     ///
@@ -210,7 +256,7 @@ impl<'a> EntityCtx<'a> {
         match field {
             Field::Kind => match v {
                 EntityVal::Hook(h) => Some(hook_kind_word(h.info.kind).to_string()),
-                EntityVal::Setter(_) | EntityVal::Dep(_) => None,
+                EntityVal::Setter(_) | EntityVal::Dep(_) | EntityVal::Arg(_) => None,
             },
             Field::Name => match v {
                 // A custom hook is called by its own name; every other kind is
@@ -221,7 +267,7 @@ impl<'a> EntityCtx<'a> {
                     }
                     _ => self.binding_name(h.info.label),
                 },
-                EntityVal::Setter(_) | EntityVal::Dep(_) => None,
+                EntityVal::Setter(_) | EntityVal::Dep(_) | EntityVal::Arg(_) => None,
             },
             // The import specifier, and only that: `resolved_file` is an
             // absolute path, so printing or matching it would make a pack's
@@ -231,23 +277,27 @@ impl<'a> EntityCtx<'a> {
                     Some(HookEntry::Custom { import_source, .. }) => import_source.clone(),
                     _ => None,
                 },
-                EntityVal::Setter(_) | EntityVal::Dep(_) => None,
+                EntityVal::Setter(_) | EntityVal::Dep(_) | EntityVal::Arg(_) => None,
             },
             Field::Slot => match v {
                 EntityVal::Setter(s) => s.slot.and_then(|l| self.slot_source_name(l)),
-                EntityVal::Hook(_) | EntityVal::Dep(_) => None,
+                EntityVal::Hook(_) | EntityVal::Dep(_) | EntityVal::Arg(_) => None,
             },
             Field::Setter => match v {
                 EntityVal::Setter(s) => Some(crate::ir::source_name(&s.var).to_string()),
-                EntityVal::Hook(_) | EntityVal::Dep(_) => None,
+                EntityVal::Hook(_) | EntityVal::Dep(_) | EntityVal::Arg(_) => None,
             },
             Field::Path => match v {
                 EntityVal::Dep(d) => d.path.as_ref().map(|p| p.to_string()),
-                EntityVal::Hook(_) | EntityVal::Setter(_) => None,
+                EntityVal::Hook(_) | EntityVal::Setter(_) | EntityVal::Arg(_) => None,
             },
             Field::Stability => match v {
                 EntityVal::Dep(d) => Some(verdict_word(self.dep_verdict(d)).to_string()),
-                EntityVal::Hook(_) | EntityVal::Setter(_) => None,
+                EntityVal::Hook(_) | EntityVal::Setter(_) | EntityVal::Arg(_) => None,
+            },
+            Field::Returns => match v {
+                EntityVal::Arg(a) => Some(returns_word(self.arg_verdict(a)).to_string()),
+                EntityVal::Hook(_) | EntityVal::Setter(_) | EntityVal::Dep(_) => None,
             },
         }
     }
@@ -260,7 +310,7 @@ impl<'a> EntityCtx<'a> {
             // A missing specifier is not an anonymous entity — it is a hook
             // whose origin we do not know.
             Field::Source => raw.unwrap_or_else(|| "unknown".to_string()),
-            Field::Kind | Field::Stability => raw.unwrap_or_else(|| anonymous(v)),
+            Field::Kind | Field::Stability | Field::Returns => raw.unwrap_or_else(|| anonymous(v)),
             // Source identifiers are quoted, verdict words are not.
             Field::Name | Field::Slot | Field::Setter | Field::Path => match raw {
                 Some(s) => format!("`{s}`"),
@@ -308,6 +358,7 @@ fn anonymous(v: &EntityVal<'_, '_>) -> String {
             None => format!("`{}`", crate::ir::source_name(&s.var)),
         },
         EntityVal::Dep(d) => format!("dep #{}", d.index),
+        EntityVal::Arg(a) => format!("argument #{}", a.index),
     }
 }
 
@@ -342,6 +393,25 @@ pub(crate) fn verdict_name(v: &StabilityVerdict) -> StabilityName {
         StabilityVerdict::Versioned(_) => StabilityName::Versioned,
         StabilityVerdict::PerRender => StabilityName::PerRender,
         StabilityVerdict::Unknown => StabilityName::Unknown,
+    }
+}
+
+/// Total projection `ReturnsVerdict` → verdict name (⊤ stays visible).
+pub(crate) fn returns_name(v: ReturnsVerdict) -> ReturnsName {
+    match v {
+        ReturnsVerdict::Stable => ReturnsName::Stable,
+        ReturnsVerdict::FreshReference => ReturnsName::FreshReference,
+        ReturnsVerdict::Unknown => ReturnsName::Unknown,
+    }
+}
+
+/// Unlike `stability`'s `per-render`, `fresh-reference` IS an allocation
+/// claim: the identity defeats `Object.is` on every call.
+pub(crate) fn returns_word(n: ReturnsName) -> &'static str {
+    match n {
+        ReturnsName::Stable => "a stable reference",
+        ReturnsName::FreshReference => "a fresh reference per call",
+        ReturnsName::Unknown => "a value of unknown identity",
     }
 }
 
