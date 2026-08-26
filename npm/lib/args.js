@@ -25,6 +25,8 @@ function parse(argv) {
     paths: [],
     configPath: null,
     schemasOut: null,
+    packsInput: null,
+    packsOut: null,
     options: {
       info: false,
       showClean: false,
@@ -42,8 +44,18 @@ function parse(argv) {
   };
 
   let args = [...argv];
-  if (["check", "rules", "explain", "schemas"].includes(args[0])) {
+  if (["check", "rules", "explain", "schemas", "packs"].includes(args[0])) {
     out.command = args.shift();
+  }
+  if (out.command === "packs") {
+    // `packs build <input> [--out <path>]` — the JS→JSON authoring step.
+    if (args.shift() !== "build") {
+      throw new UsageError("packs: unknown subcommand (expected `packs build <file>`)");
+    }
+    if (!args.length || args[0].startsWith("--")) {
+      throw new UsageError("packs build: missing input file");
+    }
+    out.packsInput = args.shift();
   }
   if (out.command === "explain") {
     if (!args.length || args[0].startsWith("--")) {
@@ -77,6 +89,9 @@ function parse(argv) {
     } else if (a === "--out" && out.command === "schemas") {
       out.schemasOut = args.shift();
       if (out.schemasOut == null) throw new UsageError("--out: missing value");
+    } else if (a === "--out" && out.command === "packs") {
+      out.packsOut = args.shift();
+      if (out.packsOut == null) throw new UsageError("--out: missing value");
     } else if (a === "--help" || a === "-h") {
       out.command = "help";
     } else if (a.startsWith("--")) {

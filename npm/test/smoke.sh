@@ -35,4 +35,7 @@ compare "rules"         rules
 compare "explain"       explain infinite-loop
 compare "explain pack"  explain team/effect-writes-own-dep --config tests/fixtures/pack_project/reactant.config.json
 
+# The JS→JSON authoring path (byte-identity + d.ts currency).
+if ! npm/test/packs.sh; then fail=1; fi
+
 exit $fail

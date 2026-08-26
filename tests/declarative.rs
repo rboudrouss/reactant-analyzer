@@ -912,7 +912,8 @@ fn returns_guard_rejects_a_deps_binding() {
         "guards":[{"kind":"returns","of":"d","is":["fresh-reference"]}],"message":"m"}"#,
     ));
     assert!(
-        e.message.contains("guard `returns` applies to a call-site argument"),
+        e.message
+            .contains("guard `returns` applies to a call-site argument"),
         "{e}"
     );
 }
@@ -928,7 +929,8 @@ fn stability_guard_rejects_an_args_binding() {
         "guards":[{"kind":"stability","of":"a","is":["per-render"]}],"message":"m"}"#,
     ));
     assert!(
-        e.message.contains("guard `stability` applies to a deps entry"),
+        e.message
+            .contains("guard `stability` applies to a deps entry"),
         "{e}"
     );
 }
@@ -946,4 +948,26 @@ fn stability_template_field_rejects_an_args_binding() {
         e.message.contains("stability") || e.message.contains("field"),
         "{e}"
     );
+}
+
+// ── JS/TS pack authoring (ADR-023 §5) ─────────────────────────────────────────
+
+/// The committed output of `reactant packs build` on the JS-authored fixture
+/// (`npm/test/fixtures/team.pack.js`) must load through the same `load_pack`
+/// every check run uses — the codegen cannot bless a pack the core rejects.
+/// The byte-identity of the build itself is `npm/test/packs.sh`.
+#[test]
+fn js_authored_pack_output_loads_in_the_core() {
+    let json = include_str!("../npm/test/fixtures/team.pack.expected.json");
+    let load = load(json).expect("the built pack must be core-valid");
+    let ids: Vec<&str> = load.rules.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "team/no-direct-layout-effect",
+            "team/no-direct-insertion-effect",
+            "team/fresh-store-selector",
+        ]
+    );
+    assert!(load.warnings.is_empty(), "{:?}", load.warnings);
 }

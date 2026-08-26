@@ -55,9 +55,46 @@ deterministic oracle for CI gates and AI-agent loops.
 ## Custom rules
 
 Team conventions ship as **rule packs**: JSON rules over semantic facts the
-engine has proven (hook provenance, setter aliases, deps entries) — robust to
-refactoring and indirection, unlike AST-pattern lint rules. Configure via
-`reactant.config.json`; JSON Schemas for both are in `schemas/`.
+engine has proven (hook provenance, setter aliases, deps entries, what a
+store selector returns) — robust to refactoring and indirection, unlike
+AST-pattern lint rules. Configure via `reactant.config.json`; JSON Schemas
+for both are in `schemas/`.
+
+Packs can be **authored in JavaScript** (the `eslint.config.js` model — typed
+via `lib/pack.d.ts`, testable, rules generated from a table) and compiled to
+the JSON the analyzer consumes:
+
+```bash
+npx reactant packs build team.pack.js        # writes team.pack.json
+```
+
+```js
+// team.pack.js
+/** @type {import("reactant-analyzer/lib/pack").Pack} */
+module.exports = {
+  schemaVersion: 1,
+  name: "team",
+  rules: [
+    {
+      id: "no-direct-use-layout-effect",
+      docs: {
+        description: "useLayoutEffect called directly instead of the SSR-safe wrapper",
+        why: "useLayoutEffect warns during SSR",
+        fix: "call useSafeLayoutEffect instead",
+      },
+      severity: "warning",
+      anchor: { relation: "hook_calls", kind: "effect" },
+      guards: [{ kind: "origin", of: "anchor", hook: ["useLayoutEffect"], direct: true }],
+      message: "useLayoutEffect is called directly — use the SSR-safe wrapper",
+    },
+  ],
+};
+```
+
+The **generated JSON is the committed artifact**: your module runs only on
+the authoring machine at build time, never during analysis or CI, and the
+native and WASM analyzers consume the same inert file. `packs build`
+validates the output through the exact loader a check run uses.
 
 ## Docs & source
 

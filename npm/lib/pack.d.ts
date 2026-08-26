@@ -1,0 +1,222 @@
+// GENERATED from schemas/pack.schema.json by scripts/gen-pack-dts.js — do not edit.
+// The schema and the validator compile from the same Rust types, so these
+// TypeScript types cannot drift from what the core accepts.
+//
+// Author a pack as a JS module and compile it with `reactant packs build`:
+//
+//   /** @type {import("reactant-analyzer/lib/pack").Pack} *​/
+//   module.exports = { schemaVersion: 1, name: "team", rules: [ /* … */ ] };
+//
+// The generated JSON is the committed artifact; the analyzer only ever
+// consumes the inert JSON.
+
+
+export interface PackFile {
+  /**
+   * Editor-facing schema URL; not interpreted. Accepted for the same reason
+   * `reactant.config.json` accepts it — a published schema is only useful if
+   * the file is allowed to point at it.
+   */
+  "$schema"?: string | null;
+  /**
+   * Pack name: the namespace of every rule id (`<name>/<rule>`).
+   */
+  "name": string;
+  "rules": RuleDef[];
+  /**
+   * Format version; only `1` exists.
+   */
+  "schemaVersion": number;
+}
+
+/**
+ * The anchor: a relation the engine has already resolved (ADR-022 §1) —
+ * never a syntax pattern.
+ */
+export type Anchor = {
+  "kind"?: HookKindFilter | null;
+  "relation": "hook_calls";
+} | {
+  "relation": "render_setter_calls";
+};
+
+export type EdgeName = "deps" | "body_setter_calls" | "args";
+
+/**
+ * What happens to a finding whose must-guard did not certify: `keep` (the
+ * default — it survives as a Warning-ceiling finding, ADR-022 §3's free
+ * stratification) or `drop` (explicit opt-in for qualification-style rules).
+ */
+export type ElseBehavior = "keep" | "drop";
+
+/**
+ * Typed navigation from the anchor (ADR-022 §2): at most one edge, one
+ * binding — no joins.
+ */
+export interface ForEach {
+  "as": string;
+  "edge": EdgeName;
+}
+
+/**
+ * A guard: a predicate over an engine verdict. `must_*` guards certify
+ * (attach the `Certified` proof on `All`); the others filter. The `must_`
+ * prefix makes polarity visible in the JSON — the §3 load-time warning is
+ * a prefix scan.
+ */
+export type Guard = {
+  "is"?: PVal_Array_of_StabilityName | null;
+  "kind": "stability";
+  "not"?: PVal_Array_of_StabilityName | null;
+  "of": string;
+} | {
+  "is"?: PVal_Array_of_ReturnsName | null;
+  "kind": "returns";
+  "not"?: PVal_Array_of_ReturnsName | null;
+  "of": string;
+} | {
+  "direct"?: PVal_boolean | null;
+  "hook"?: PVal_Array_of_string | null;
+  "kind": "origin";
+  "of": string;
+} | {
+  "kind": "in_deps";
+  "negate"?: boolean;
+  "of": string;
+} | {
+  "kind": "name";
+  "of": string;
+  "one_of"?: PVal_Array_of_string | null;
+  "prefix"?: PVal_string | null;
+} | {
+  "kind": "source";
+  "of": string;
+  "one_of"?: PVal_Array_of_string | null;
+  "prefix"?: PVal_string | null;
+} | {
+  "equals"?: PVal_uint64 | null;
+  "kind": "count";
+  "less_than"?: PVal_uint64 | null;
+  "more_than"?: PVal_uint64 | null;
+  "of": string;
+} | {
+  "eq": PVal_boolean;
+  "kind": "deps_declared";
+  "of": string;
+} | {
+  "else"?: ElseBehavior;
+  "kind": "must_setter_on_all_paths";
+  "of": string;
+} | {
+  "else"?: ElseBehavior;
+  "kind": "must_dominates_all_exits";
+  "of": string;
+} | {
+  "else"?: ElseBehavior;
+  "kind": "must_init_calls_setter";
+  "of": string;
+} | {
+  "else"?: ElseBehavior;
+  "kind": "must_hook_is_conditional";
+  "of": string;
+} | {
+  "guards": Guard[];
+  "kind": "any_of";
+};
+
+export type HookKindFilter = "state" | "effect" | "memo" | "callback" | "ref" | "custom" | "handler";
+
+export type PVal_Array_of_ReturnsName = ReturnsName[] | {
+  "$param": string;
+};
+
+export type PVal_Array_of_StabilityName = StabilityName[] | {
+  "$param": string;
+};
+
+export type PVal_Array_of_string = string[] | {
+  "$param": string;
+};
+
+export type PVal_boolean = boolean | {
+  "$param": string;
+};
+
+export type PVal_string = string | {
+  "$param": string;
+};
+
+export type PVal_uint64 = number | {
+  "$param": string;
+};
+
+export interface ParamDecl {
+  "default": unknown;
+  "type": ParamType;
+}
+
+export type ParamType = "number" | "string" | "boolean" | "string[]";
+
+/**
+ * Total mirror of `ReturnsVerdict`.
+ */
+export type ReturnsName = "stable" | "fresh-reference" | "unknown";
+
+export interface RuleDef {
+  "anchor": Anchor;
+  "docs": RuleDocs;
+  "forEach"?: ForEach | null;
+  "guards"?: Guard[];
+  /**
+   * Bare rule id (no `/`); addressed as `<pack>/<id>`.
+   */
+  "id": string;
+  /**
+   * Message template interpolating navigated entities (`{setter.slot}`)
+   * and params (`{param.maxDeps}`); `{{`/`}}` escape braces.
+   */
+  "message": string;
+  /**
+   * Declared parameters, referenced as `{"$param": "<name>"}` in leaf
+   * constant positions (ADR-022 §4).
+   */
+  "params"?: { [key: string]: ParamDecl };
+  /**
+   * Desired severity ceiling (a pin, ADR-022 §3): the effective severity
+   * of each finding is `pin ⊓ polarity`, evaluated at emission.
+   */
+  "severity": SeverityPin;
+}
+
+/**
+ * Mandatory docs (ADR-022 §5): a custom rule without an explanation is
+ * exactly the diagnostic a team learns to ignore.
+ */
+export interface RuleDocs {
+  /**
+   * One line — what the rule detects (`reactant rules`).
+   */
+  "description": string;
+  /**
+   * Optional minimal buggy snippet.
+   */
+  "example"?: string | null;
+  /**
+   * How to fix it.
+   */
+  "fix": string;
+  /**
+   * Why it matters (`reactant explain`).
+   */
+  "why": string;
+}
+
+export type SeverityPin = "error" | "warning" | "info";
+
+/**
+ * Total mirror of `StabilityVerdict`.
+ */
+export type StabilityName = "stable" | "versioned" | "per-render" | "unknown";
+
+/** The type an authored pack module exports (or returns from a function). */
+export type Pack = PackFile;

@@ -45,6 +45,29 @@ pub fn pack_specs(config_text: &str) -> String {
     }
 }
 
+/// Validate one pack's JSON without running an analysis — the authoring-time
+/// half of `packs build` (ADR-023 §5): the JS→JSON codegen is host-side, but
+/// what counts as a valid pack is decided by the same `load_pack` the check
+/// run uses, so the codegen cannot bless a pack the core would reject.
+/// Returns `{"ok": {"name": …, "rules": [ids…], "warnings": [msgs…]}}` or
+/// `{"error": "…"}`.
+#[wasm_bindgen(js_name = validatePack)]
+pub fn validate_pack(pack_json: &str) -> String {
+    match reactant::rules::declarative::load_pack(pack_json, &Default::default()) {
+        Ok(load) => serde_json::json!({
+            "ok": {
+                "name": load.pack_name,
+                "rules": load.rules.iter().map(|r| r.rule.name().to_string()).collect::<Vec<_>>(),
+                "warnings": load.warnings.iter()
+                    .map(|w| format!("{}: {}", w.rule, w.message))
+                    .collect::<Vec<_>>(),
+            }
+        })
+        .to_string(),
+        Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Input {

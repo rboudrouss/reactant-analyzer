@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "name": "team",
+  "rules": [
+    {
+      "id": "no-direct-layout-effect",
+      "docs": {
+        "description": "useLayoutEffect called directly instead of useSafeLayoutEffect",
+        "why": "useLayoutEffect warns during SSR; useSafeLayoutEffect swaps it for useEffect on the server",
+        "fix": "import useSafeLayoutEffect and call it instead"
+      },
+      "severity": "warning",
+      "anchor": {
+        "relation": "hook_calls",
+        "kind": "effect"
+      },
+      "guards": [
+        {
+          "kind": "origin",
+          "of": "anchor",
+          "hook": [
+            "useLayoutEffect"
+          ],
+          "direct": true
+        }
+      ],
+      "message": "useLayoutEffect is called directly — use useSafeLayoutEffect"
+    },
+    {
+      "id": "no-direct-insertion-effect",
+      "docs": {
+        "description": "useInsertionEffect called directly instead of useStyleEffect",
+        "why": "useInsertionEffect warns during SSR; useStyleEffect swaps it for useEffect on the server",
+        "fix": "import useStyleEffect and call it instead"
+      },
+      "severity": "warning",
+      "anchor": {
+        "relation": "hook_calls",
+        "kind": "effect"
+      },
+      "guards": [
+        {
+          "kind": "origin",
+          "of": "anchor",
+          "hook": [
+            "useInsertionEffect"
+          ],
+          "direct": true
+        }
+      ],
+      "message": "useInsertionEffect is called directly — use useStyleEffect"
+    },
+    {
+      "id": "fresh-store-selector",
+      "docs": {
+        "description": "store selector returns a fresh reference",
+        "why": "a fresh reference defeats Object.is — infinite re-render under zustand v5",
+        "fix": "select primitives, or memoize the selector with useShallow"
+      },
+      "severity": "warning",
+      "anchor": {
+        "relation": "hook_calls",
+        "kind": "custom"
+      },
+      "forEach": {
+        "edge": "args",
+        "as": "sel"
+      },
+      "guards": [
+        {
+          "kind": "name",
+          "of": "anchor",
+          "one_of": [
+            "useStore"
+          ]
+        },
+        {
+          "kind": "returns",
+          "of": "sel",
+          "is": [
+            "fresh-reference"
+          ]
+        }
+      ],
+      "message": "the selector passed to {anchor.name} returns {sel.returns}"
+    }
+  ]
+}

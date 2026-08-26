@@ -18,6 +18,7 @@ Usage:
   reactant rules [--config <path>]
   reactant explain <rule> [--config <path>]
   reactant schemas [--out <dir>]
+  reactant packs build <pack.js> [--out <pack.json>]
 `;
 
 function main(argv) {
@@ -37,6 +38,19 @@ function main(argv) {
   }
   if (parsed.command === "schemas") {
     return schemas(parsed.schemasOut);
+  }
+  if (parsed.command === "packs") {
+    // Authoring-time codegen (ADR-023 §5): evaluate the JS pack, validate
+    // through the core, write the JSON that gets committed. Async (dynamic
+    // import); the bin resolves the returned promise. A missing/old wasm
+    // bundle degrades to write-without-validate (packs.js says so loudly).
+    let wasm = null;
+    try {
+      wasm = require("../dist/reactant_wasm.js");
+    } catch {
+      // dev tree without a built dist — packs.js handles null.
+    }
+    return require("./packs.js").build(parsed.packsInput, parsed.packsOut, wasm);
   }
 
   const wasm = require("../dist/reactant_wasm.js");

@@ -24,6 +24,10 @@ wasm-bindgen target/wasm32-unknown-unknown/release/reactant_wasm.wasm \
 # the published schemas, so they validate the same types by construction.
 cargo run --quiet --release -- schemas --out npm/schemas
 
+# lib/pack.d.ts from the freshly-written pack.schema.json (ADR-023 §5): the
+# authoring types compile from the same schemars output as the validator.
+node npm/scripts/gen-pack-dts.js
+
 # npm auto-includes README.md/LICENSE only from the package dir; LICENSE is
 # copied from the repo root so there is a single source.
 cp LICENSE npm/LICENSE
