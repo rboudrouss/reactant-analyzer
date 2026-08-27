@@ -35,9 +35,25 @@ fn position(
 
 /// Under `--info`, list the applicable checks that ran on this component and
 /// found nothing — positive assurance, distinct from an unchecked region.
+///
+/// When an `analysis-limit` fired, that list is empty by construction (the
+/// registry withholds every assurance a truncation could falsify) and the
+/// count of what was withheld is printed instead. Without that line, a
+/// truncated component and a component with nothing to check render the same
+/// way, and `--ignore-rule analysis-limit` hides the notice too — so the
+/// suspension line is deliberately NOT subject to the rule filters: it
+/// reports the state of the assurance channel, not a diagnostic.
 fn render_safe_checks(out: &mut String, comp: &ComponentReport, info: bool, p: &Palette) {
     if !info {
         return;
+    }
+    if comp.suspended_safe_checks > 0 {
+        let _ = writeln!(
+            out,
+            "    {}suspended{}  {}analysis-limit{}  {} passing check(s) withheld: the analysis \
+             was truncated in this component, so they are not guaranteed",
+            p.yellow, p.reset, p.dim, p.reset, comp.suspended_safe_checks
+        );
     }
     for s in &comp.safe_checks {
         let _ = writeln!(

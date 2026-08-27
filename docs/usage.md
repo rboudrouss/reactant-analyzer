@@ -38,7 +38,7 @@ reactant check src/ --ignore-rule lazy-init      # all but this one
 | `--project auto\|vite\|next\|plain` | Project-kind handling. `auto` (default) detects from marker files; `vite`/`next` force those conventions; `plain` disables detection. |
 | `--rule <name>` | Only report this diagnostic (repeatable). An unknown name exits with code 2. |
 | `--ignore-rule <name>` | Suppress this diagnostic (repeatable). |
-| `--info` | Also display `Info` diagnostics (known analysis limits: widening, recursion cutoff, unknown hooks), plus, per shown component, the applicable checks that ran and found nothing (`verified: …`). A check is listed only when it was applicable; `infinite-loop`, for example, appears only when the component has both a state slot and an effect. |
+| `--info` | Also display `Info` diagnostics (known analysis limits: widening, recursion cutoff, unknown hooks), plus, per shown component, the applicable checks that ran and found nothing (`verified: …`) or, where the analysis was truncated, the count withheld (`suspended: …`). See [The assurance channel](#the-assurance-channel---info). |
 | `--show-clean` | Show components with no findings (hidden by default). Without it, a trailing note reports how many clean components were hidden. |
 | `--trace` | Show each finding's witness chain (ADR-019): typed `→` steps explaining why the rule fired (e.g. `` `loadPrefs` resolves to an import from ./prefs.ts `` → `` `fetch` has side effects ``). Steps pointing into another file (cross-file inlining) show `file:line:col`. Capped at 8 steps (`… n more step(s)`). Hidden by default; a finding with steps shows a `(N trace step(s) — rerun with --trace)` hint instead. `json` output always includes the chain. |
 | `--entry <names>` | Explicit root components. Repeatable or comma-separated (`--entry Foo,Bar`). On a name collision across files, use `Foo@/abs/path.tsx` (shown in the output). |
@@ -282,6 +282,58 @@ component from there (ADR-013). Trace steps follow the same convention.
 
 On a component-name collision the name is disambiguated automatically
 (`Page@tests/fixtures/page_collision/users/page.tsx`).
+
+### The assurance channel (`--info`)
+
+Under `--info`, a component also reports the checks that were *applicable* and
+found nothing. This is a separate channel from diagnostics, and it makes a
+distinction the absence of a diagnostic cannot:
+
+```
+  Counter  (3 hooks)  src/Counter.tsx  ✓
+    verified  conditional-hook  all hooks run unconditionally, in a stable order
+    verified  infinite-loop     no effect diverges into an infinite render loop
+```
+
+"No `infinite-loop` finding" could mean the check ran and the component is
+sound, or that there was no effect for it to look at. Only `verified: …` says
+the first. A check is listed only when applicable, so the list length varies by
+component and that is expected.
+
+**When the analysis was truncated, the assurances are withheld instead:**
+
+```
+  Widget  (4 hooks)  src/Widget.tsx
+    info       analysis-limit  hook `useThing` not found in registry … (FN possible)
+    suspended  analysis-limit  10 passing check(s) withheld: the analysis was
+                               truncated in this component, so they are not guaranteed
+```
+
+The reason is soundness. An opaque hook body can contain a conditional
+`useState`, an undeclared capture, a diverging effect. Publishing "all hooks run
+unconditionally" next to "I could not look inside this hook" would be a claim
+the analysis cannot support, so the whole list goes. This is all-or-nothing per
+component today; refining it per (limit kind, check) pair is a recorded open
+item in [TODO.md](TODO.md#known-false-positives-fp).
+
+Three properties of that line are deliberate:
+
+- **It is not a diagnostic.** It carries no severity, is not counted in the
+  summary, and never affects the exit code. Nothing about the assurance channel
+  changes what reactant reports as a problem.
+- **`--ignore-rule analysis-limit` does not hide it.** Silencing the notice
+  hides the *advice*, it does not restore the *guarantee*. Suppressing both
+  would render a truncated component as a bare `✓` with no explanation, which
+  is the state this line exists to remove.
+- **It is on the same switch as the assurances it replaces.** Without `--info`
+  neither shows, so the default output is unchanged.
+
+Note that ⊤ still does its normal work on the diagnostic side: an opaque hook's
+return value is unknown, so a rule reading it reports what it must. In the
+example above, an undeclared read of `useThing()`'s result still raises
+`missing-deps` with "its value may change between renders". Withholding an
+assurance is not the same as withholding an alert, and reactant does only the
+former.
 
 ## Fixtures
 

@@ -17,6 +17,11 @@ pub struct ComponentReport {
     /// Applicable checks that ran on this component and found nothing.
     /// Surfaced only under `--info`.
     pub safe_checks: Vec<SafeCheck>,
+    /// Assurances withheld because the analysis was truncated here
+    /// (`analysis-limit`); 0 when nothing was withheld. Rendered in the same
+    /// place, and on the same `--info` switch, as `safe_checks`: it is the
+    /// negative half of the very same channel.
+    pub suspended_safe_checks: usize,
 }
 
 /// Everything the renderers need.

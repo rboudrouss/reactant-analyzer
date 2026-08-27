@@ -31,6 +31,30 @@ Two info-level diagnostics (`analysis-limit` and `widening-info`, behind
 `--info`) report where the analyzer deliberately lost precision. They tell you
 where a clean report is a proof and where it is only best-effort.
 
+`--info` also turns on the other half of that story. Rather than leaving you to
+infer soundness from silence, each component lists the checks that were
+applicable and found nothing:
+
+```
+  Counter  (3 hooks)  src/Counter.tsx  ✓
+    verified   conditional-hook  all hooks run unconditionally, in a stable order
+    verified   infinite-loop     no effect diverges into an infinite render loop
+```
+
+Where the analysis was truncated, those assurances are withheld and the count is
+reported instead, because an opaque hook body can hide the very thing each one
+claims:
+
+```
+  Widget  (4 hooks)  src/Widget.tsx
+    info       analysis-limit  hook `useThing` not found in registry … (FN possible)
+    suspended  analysis-limit  10 passing check(s) withheld
+```
+
+Withholding an *assurance* is not withholding an *alert*: unknown values stay ⊤
+and the rules that read them still fire, false positives included. Details in
+[docs/usage.md](docs/usage.md#the-assurance-channel---info).
+
 Rules live in `src/rules/`, one file per rule, all post-pass on a single `AnalysisResult`. Custom rule packs (semantic, not AST patterns) are described in [docs/custom-rules.md](docs/custom-rules.md).
 
 ## Quick start

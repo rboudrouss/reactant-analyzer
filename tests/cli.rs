@@ -213,6 +213,56 @@ fn json_stdout_is_pure_even_with_verbose() {
 // ── output determinism ────────────────────────────────────────────────────────
 
 #[test]
+fn a_truncated_component_says_its_assurances_were_withheld() {
+    // Without this line, a component the analyzer truncated and a component
+    // with nothing to check render identically (see the `verified:` channel in
+    // docs/usage.md). The line lives on the `--info` switch, like the
+    // assurances it replaces.
+    let args = &[
+        "check",
+        "tests/fixtures/callbacks.tsx",
+        "--info",
+        "--show-clean",
+        "--fail-on",
+        "never",
+    ];
+    let out = stdout(&reactant(args));
+    assert!(
+        out.contains("suspended") && out.contains("passing check(s) withheld"),
+        "expected a suspension line, got:\n{out}"
+    );
+
+    // `--ignore-rule analysis-limit` silences the notice. It must NOT silence
+    // the suspension: that combination used to render a bare green check with
+    // no explanation at all.
+    let mut ignored = args.to_vec();
+    ignored.extend_from_slice(&["--ignore-rule", "analysis-limit"]);
+    let out = stdout(&reactant(&ignored));
+    assert!(
+        !out.contains("info   analysis-limit"),
+        "the Info must be filtered out, got:\n{out}"
+    );
+    assert!(
+        out.contains("passing check(s) withheld"),
+        "the suspension must survive the filter, got:\n{out}"
+    );
+}
+
+#[test]
+fn assurances_and_suspensions_are_both_info_gated() {
+    // No `--info`: neither the `verified:` lines nor the suspension line show.
+    let out = stdout(&reactant(&[
+        "check",
+        "tests/fixtures/callbacks.tsx",
+        "--show-clean",
+        "--fail-on",
+        "never",
+    ]));
+    assert!(!out.contains("verified"), "got:\n{out}");
+    assert!(!out.contains("suspended"), "got:\n{out}");
+}
+
+#[test]
 fn consecutive_runs_are_byte_identical() {
     // Rules iterate HashMaps internally; the output layer's total ordering
     // must absorb that — consecutive runs over a fixture set with many

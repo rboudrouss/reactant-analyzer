@@ -293,6 +293,7 @@ pub fn run_check(
         let findings = registry.check_component(&program_result, name);
         let mut diags: Vec<Diagnostic> = findings.diagnostics;
         let safe_checks: Vec<SafeCheck> = findings.safe_checks;
+        let suspended_safe_checks = findings.suspended_safe_checks;
         diags.retain(|d| d.severity() != Severity::Info || opts.info);
 
         errors += diags
@@ -319,6 +320,7 @@ pub fn run_check(
             hook_count,
             diagnostics: diags,
             safe_checks,
+            suspended_safe_checks,
         });
     }
 

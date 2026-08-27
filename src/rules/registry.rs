@@ -55,6 +55,12 @@ pub struct OverrideEntry {
 pub struct ComponentFindings {
     pub diagnostics: Vec<Diagnostic>,
     pub safe_checks: Vec<SafeCheck>,
+    /// How many assurances were withheld because an `analysis-limit` fired
+    /// (0 when none was). Counted *before* the clear, so renderers can say
+    /// what was lost instead of leaving an unexplained silence: a truncated
+    /// component and a component with nothing to check otherwise render
+    /// identically, and only this number tells them apart.
+    pub suspended_safe_checks: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,7 +234,14 @@ impl RuleRegistry {
         // conditional call, the missing dep, the diverging effect. Read off the
         // *unfiltered* diagnostics on purpose: silencing the Info with
         // `--ignore-rule` hides the notice, it does not restore the guarantee.
+        //
+        // The count survives the clear and is reported as
+        // `suspended_safe_checks`: withholding the assurances is right, but
+        // withholding them *silently* is what made a truncated component
+        // indistinguishable from one that simply had nothing to check.
+        let mut suspended_safe_checks = 0;
         if diags.iter().any(|d| d.rule == AnalysisLimitInfo::NAME) {
+            suspended_safe_checks = safe_checks.len();
             safe_checks.clear();
         }
 
@@ -278,6 +291,7 @@ impl RuleRegistry {
         ComponentFindings {
             diagnostics: diags,
             safe_checks,
+            suspended_safe_checks,
         }
     }
 
@@ -569,6 +583,101 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|d| d.rule == "test/two-cross")
+        );
+    }
+
+    // ── The assurance channel under a truncated analysis ─────────────────────
+
+    /// A component holding one `useState` row, plus an opaque custom-hook row
+    /// when `truncated` — the only difference being the fact
+    /// `analysis-limit/unknown-hook` is about, so the two runs are comparable.
+    fn one_component_with_hooks(truncated: bool) -> (ProgramAnalysisResult, Symbol) {
+        use crate::engine::{HookCallInfo, HookKind};
+        let cfg = crate::test_support::single_block_cfg(vec![]);
+        let mut result = crate::test_support::analysis_result(cfg);
+        result.hook_calls.push(HookCallInfo {
+            label: 0,
+            kind: HookKind::State,
+            block_id: 0,
+            span: None,
+            opaque: false,
+        });
+        if truncated {
+            result.hook_calls.push(HookCallInfo {
+                label: 1,
+                kind: HookKind::Custom,
+                block_id: 0,
+                span: None,
+                opaque: true,
+            });
+        }
+        (crate::test_support::prog("C", result), "C".to_string())
+    }
+
+    #[test]
+    fn a_truncated_component_withholds_its_assurances_and_counts_them() {
+        let reg = RuleRegistry::natives();
+
+        let (clean, name) = one_component_with_hooks(false);
+        let baseline = reg.check_component(&clean, &name);
+        assert!(
+            !baseline.safe_checks.is_empty(),
+            "the baseline must publish at least one assurance, else this test proves nothing"
+        );
+        assert_eq!(baseline.suspended_safe_checks, 0);
+
+        let (truncated, name) = one_component_with_hooks(true);
+        let findings = reg.check_component(&truncated, &name);
+        assert!(
+            findings
+                .diagnostics
+                .iter()
+                .any(|d| d.rule == AnalysisLimitInfo::NAME),
+            "an opaque hook must emit analysis-limit"
+        );
+        assert!(
+            findings.safe_checks.is_empty(),
+            "a component the analyzer truncated publishes no `verified` universal"
+        );
+        assert_eq!(
+            findings.suspended_safe_checks,
+            baseline.safe_checks.len(),
+            "the count is what tells a truncated component from one with nothing to check"
+        );
+    }
+
+    #[test]
+    fn ignoring_the_limit_hides_the_notice_but_not_the_suspension() {
+        // `--ignore-rule analysis-limit` silences the Info. It must not make
+        // the component look verified, and it must not make the suspension
+        // invisible either — that combination was the fully opaque state.
+        let (truncated, name) = one_component_with_hooks(true);
+        let mut reg = RuleRegistry::natives();
+        let mut o = RuleOverrides::default();
+        o.entries.insert(
+            AnalysisLimitInfo::NAME.into(),
+            OverrideEntry {
+                off: true,
+                ..Default::default()
+            },
+        );
+        reg.set_overrides(o).unwrap();
+
+        let findings = reg.check_component(&truncated, &name);
+        assert!(
+            !findings
+                .diagnostics
+                .iter()
+                .any(|d| d.rule == AnalysisLimitInfo::NAME),
+            "the Info is filtered out"
+        );
+        assert!(
+            findings.safe_checks.is_empty(),
+            "filtering the notice does not restore the guarantee"
+        );
+        assert!(
+            findings.suspended_safe_checks > 0,
+            "and the suspension stays reportable"
         );
     }
 }
