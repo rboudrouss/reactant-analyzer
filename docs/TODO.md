@@ -24,6 +24,16 @@
 
 - **Churn-graph residuals (ADR-018)** — auto-run nested callbacks (`.then(() => set(fresh))`) in **no-deps** effects create no self-edge (event-vs-async callback classification lives in the engine, not the syntactic collector). *(The other historical residual — prop deps degrading to `Unknown` on FieldAccess-on-versioned — is addressed since field reads propagate version labels; a field of a versioned object keeps its `Versioned(labels)` reference. The value's kind stays ⊤: kind-dependent reasoning on such fields is still imprecise.)*
 
+- **React's own unmodelled hooks stay ⊤ and Info** — `useActionState`,
+  `useOptimistic`, `useTransition`, `useDeferredValue`, `useId`,
+  `useSyncExternalStore`, `useFormStatus` reach the IR as `Custom` rows and
+  emit `analysis-limit/unknown-hook`. Deliberately **not** silenced with a ⊤
+  summary (ADR-026 §5): unlike a third-party hook, the Info marks an *engine*
+  gap that closing means modelling them — `useId` returns a string,
+  `useTransition`/`useActionState`/`useOptimistic` return tuples whose setter
+  slot is stable, which is the same per-slot summary shape the jotai
+  `useAtom` FP below needs. Fix the two together.
+
 - **`useContext` is unmodelled and now dominates the analysis limits** — the
   engine has no model for it, so a context value reads ⊤ and every
   `useContext` call emits `analysis-limit` (363 sites across the eight corpora,
@@ -43,6 +53,20 @@
   that is silently `bottom`. Either the store is built as a post-pass over the
   results (and then the consumer cannot read it during its own analysis), or
   the two phases are unified. Decide that first.
+
+- **`server-component-hook` under-reports by construction (ADR-026)** — the
+  server graph is a walk from App Router entries over *resolved* import edges,
+  so an unresolved specifier anywhere on the path leaves that whole subtree
+  unclassified and its hooks unreported (the ADR-013 blind spot, one level
+  removed). Two narrower residuals on top: (1) a custom hook whose body is only
+  `return useMemo(...)` contributes **no** `HookEntry` once inlined — the memo
+  is folded into the binding — so a memo-only hook reaching a server module is
+  silent, while an inlined `useState`/`useEffect` is caught; (2) only hooks
+  *proven* client-only count (React's modelled kinds plus the documented
+  React / `next/navigation` / `next/router` names), so a client-only hook from
+  another package — `useSession` from `next-auth/react`, `useTheme` from
+  `next-themes` — is not evidence. Widening (2) to every `useX` would flag the
+  many `use`-named helpers that call no hook at all.
 
 - **A context provider the relation cannot prove** — a provider inside an inline
   arrow (`items.map(() => <Ctx.Provider …>)`) or in a `useCallback` invoked
@@ -93,7 +117,7 @@
 
 ### Import resolution
 
-- **Aliases outside tsconfig `paths`** — tsconfig `paths` are built-in (ADR-016); still unresolved: aliases declared *only* in `vite.config.*` (`resolve.alias`, requires evaluating JS) and `jsconfig.json` — the CLI warns when a Vite project has no tsconfig `paths`.
+- **Aliases outside tsconfig `paths`** — tsconfig `paths` are built-in (ADR-016) and a bare `baseUrl` is probed as TypeScript's last resort (ADR-026); still unresolved: aliases declared *only* in `vite.config.*` / `next.config.*` (`resolve.alias`, webpack overrides — both require evaluating JS) and `jsconfig.json`. The CLI warns when a Vite or Next project has no tsconfig `paths`.
 - **Monorepo `@workspace/*` not resolved** — workspace-package specifiers are not aliases; need package.json/workspace resolution. Workaround: custom `ImportResolver`.
 - **Deep re-export chains** — `export { X } from './a'` → `'./a'` re-exports from `'./b'` → deep re-exports can be missed if the chain goes beyond one level (the lowering doesn't follow transitive chains). For *hooks*, a barrel re-export is mitigated: when the resolved file doesn't define the hook under its name, `expand_custom_hooks` falls back to the name-only lookup (which found 4 new corpus TPs — memos `useLinkMemo`/`useAudioRecorder`, chakra `use-media-query`), with the same first-match caveat as the rest of `get_by_name`.
 - **Re-export of a third-party hook not traced** — `export let useMyQuery = useQuery` (from `@tanstack/react-query`): no function body → absent from `HookRegistry`; import source = local file → doesn't match the `SummaryRegistry` of the origin package → `analysis-limit/unknown-hook` Info emitted, binding = `⊤`. Fixing this requires tracking re-export aliases.

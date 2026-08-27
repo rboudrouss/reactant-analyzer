@@ -25,6 +25,7 @@ A static analyzer for React hook bugs, built on abstract interpretation over a d
 | `missing-cleanup` | an effect starts something long-lived and returns no teardown |
 | `lazy-init` | a useState initializer calls a function on every render |
 | `unstable-context-value` | a context provider hands consumers a new object every render |
+| `server-component-hook` | a hook is called in a Next.js Server Component, where hooks do not exist |
 
 Two info-level diagnostics (`analysis-limit` and `widening-info`, behind
 `--info`) report where the analyzer deliberately lost precision. They tell you
@@ -52,6 +53,7 @@ cargo run -- check path/to/your-project
 ```sh
 reactant check src/                            # analyze a tree (skips node_modules, build dirs, tests)
 reactant check my-vite-app/                    # auto-detects Vite: src/ discovery + @/* aliases
+reactant check my-next-app/                    # auto-detects Next.js: router discovery + @/* and baseUrl
 reactant check src/ --format json              # machine-readable output for CI
 reactant check src/ --fail-on error            # warnings don't fail the build
 reactant check src/ --ignore-rule lazy-init    # filter diagnostics
@@ -60,6 +62,28 @@ reactant explain infinite-loop                 # what it is, example, how to fix
 ```
 
 Exit codes: `0` clean, `1` findings, `2` usage error. See [docs/usage.md](docs/usage.md) for all flags, the JSON schema, and project-kind detection.
+
+### Next.js projects
+
+A directory containing `next.config.*` is analyzed with Next conventions.
+Discovery narrows to `src/` only when `src/app` or `src/pages` lives there, so
+both the root-router and `src/` layouts work. Aliases come from tsconfig
+`paths`; a non-relative specifier no pattern claims is then probed against
+`baseUrl`, which is what a scaffold with `"baseUrl": "."` and no `paths` needs
+to address its own tree (`import { getCart } from "lib/shopify"`). Hooks from
+`next/navigation` and `next/router` are known to the analyzer rather than
+reported as unknown.
+
+**Server Components are analyzed, not skipped.** A Server Component has no
+state, so the abstract interpretation over-approximates it exactly as it does
+any component whose props are ⊤ — and skipping modules based on an import
+graph that may be missing edges would turn every misclassification into a
+missed bug. What the analyzer adds instead is `server-component-hook`: it
+tracks `"use client"` boundaries through the resolved import graph, and warns
+when a hook is called in a module Next compiles into the server graph. The
+rule stays silent in projects that never write the directive, and it never
+suppresses other rules' findings in the same module — the missing directive is
+named beside them.
 
 ### Vite projects
 
@@ -179,7 +203,7 @@ finding divergence.
 
 ## Plugin API
 
-When the CLI isn't enough (Next.js `app/` conventions, monorepos), drop down to the Rust API:
+When the CLI isn't enough (monorepos, workspace specifiers), drop down to the Rust API:
 
 ```rust
 use reactant::engine::{Config, RootStrategy};
@@ -194,7 +218,7 @@ let (result, file_count) = analyze_with_resolvers(
 );
 ```
 
-Vite detection and tsconfig-paths alias resolution are built in (`reactant::project::build_context`); `resolver::{lower_files, analyze_lowered, analyze_files}` expose the pipeline at finer grain. See [docs/plugins.md](docs/plugins.md) for full examples (Next.js App Router discoverer, custom resolvers).
+Vite and Next.js detection, tsconfig-paths/`baseUrl` alias resolution and the `"use client"` module graph are built in (`reactant::project::build_context`); `resolver::{lower_files, analyze_lowered, analyze_files}` expose the pipeline at finer grain. See [docs/plugins.md](docs/plugins.md) for full examples (custom discoverers and resolvers, reading module facts).
 
 ## Known limitations
 

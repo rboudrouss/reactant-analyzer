@@ -12,12 +12,23 @@ DEST="$ROOT/test-repo"
 REPOS=(
   "alan2207/bulletproof-react   bulletproof-react"
   "chakra-ui/chakra-ui          chakra-ui"
-  "vercel/commerce              commerce"
   "excalidraw/excalidraw        excalidraw"
   "usememos/memos               memos"
   "steven-tey/novel             novel"
   "satnaing/shadcn-admin        shadcn-admin"
   "pmndrs/zustand               zustand"
+
+  # Next.js (ADR-026). Chosen to cover the four layouts that change how the
+  # analyzer resolves a project, not just to add volume :
+  #   commerce                       app/ à la racine, tsconfig `baseUrl` SANS `paths`
+  #                                  (specifiers nus : `import "lib/shopify"`)
+  #   ai-chatbot                     app/ à la racine, `@/*` -> `./*`
+  #   next-shadcn-dashboard-starter  src/app/, `@/*` -> `./src/*` (le plus gros)
+  #   precedent                      alias multiples (`@/components/*`, `@/lib/*`…)
+  "vercel/commerce                       commerce"
+  "vercel/ai-chatbot                     ai-chatbot"
+  "Kiranism/next-shadcn-dashboard-starter next-shadcn-dashboard-starter"
+  "steven-tey/precedent                  precedent"
 )
 
 FORCE=0

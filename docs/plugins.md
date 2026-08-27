@@ -6,7 +6,7 @@ crate.
 
 | Trait | Default | What to override for |
 |-------|---------|----------------------|
-| `FileDiscoverer` | `DefaultFileDiscoverer` (recursive `*.ts?(x)` walk, excludes `node_modules`/build dirs/`*.test.*`) | Framework conventions (Next.js `app/`, monorepos, glob patterns) |
+| `FileDiscoverer` | `DefaultFileDiscoverer` (recursive `*.ts?(x)` walk, excludes `node_modules`/build dirs/`*.test.*`) | Framework conventions not already built in, monorepos, glob patterns |
 | `ImportResolver` | `DefaultImportResolver` (relative imports → `.ts`/`.tsx`/`index.*`) | Monorepo `@workspace/*`, exotic resolution schemes |
 
 Both traits live in `reactant::resolver`. Plug them in through
@@ -15,14 +15,18 @@ Both traits live in `reactant::resolver`. Plug them in through
 inspect the lowered IR between phases (the CLI does this to map component
 display names to files).
 
-> tsconfig `paths` aliases are built in since ADR-016, so you no longer
-> need a custom resolver for the common Vite/`@/*` case:
+> Vite and Next.js are built in — tsconfig `paths` since ADR-016, Next.js
+> detection, router-aware discovery and `baseUrl` probing since ADR-026 — so
+> you no longer need a custom discoverer or resolver for either:
 >
 > ```rust
 > use reactant::project;
-> let ctx = project::build_context(root, None, Arc::new(OsFileSystem));   // detects Vite, loads tsconfig paths
+> let ctx = project::build_context(root, None, Arc::new(OsFileSystem));   // detects Vite/Next, loads tsconfig paths
 > // ctx.resolver: Box<dyn ImportResolver>, ctx.discovery_root: PathBuf
 > ```
+>
+> The skeleton below is kept as an illustration of the trait; a real Next.js
+> project needs none of it.
 >
 > `project::TsconfigPathsResolver::new(paths)` is also directly constructible
 > from a `project::TsconfigPaths` if you load aliases yourself.
@@ -131,6 +135,23 @@ opaque-call behaviour.
 `FileDiscoverer` is about *which files to read*. `ImportResolver` is about
 *which file an import points to*. They're orthogonal: a monorepo plugin
 may want default discovery but tsconfig-aware imports, or vice versa.
+
+## Module facts (ADR-026)
+
+`LoweredProgram` and `ProgramAnalysisResult` carry a `ModuleTable`: per file,
+the directive prologue (`"use client"`, `"use server"`, …) and the import
+edges the resolver mapped to a real file. A custom `ImportResolver` therefore
+feeds the module graph as well as the hook registry — an alias your resolver
+declines to resolve is an edge the graph never sees.
+
+```rust
+let table = &result.module_table;
+table.any_declares("use client");                     // is this an RSC codebase at all?
+table.facts(path).is_some_and(|f| f.has_directive("use client"));
+table.reachable_from([entry], Some("use client"));    // walk, stopping at boundaries
+```
+
+`reactant::project::server_modules` is the Next.js reading of that walk.
 
 ## Limitations
 

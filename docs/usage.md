@@ -22,6 +22,7 @@ flat form keeps working). Two consequences of the clap setup:
 reactant check                                   # current directory
 reactant check src/ lib/utils.ts                 # mix directories and files
 reactant check my-vite-app/                      # auto-detects Vite (see below)
+reactant check my-next-app/                      # auto-detects Next.js (see below)
 reactant check src/ --format json                # machine-readable output
 reactant check src/ --fail-on error              # warnings don't fail CI
 reactant check src/ --rule infinite-loop         # only this diagnostic
@@ -34,7 +35,7 @@ reactant check src/ --ignore-rule lazy-init      # all but this one
 |------|--------|
 | `--format human\|json` | Output format. `json` prints exactly one JSON document on stdout (schema below); all warnings/verbose go to stderr. Default `human`. |
 | `--fail-on error\|warning\|never` | Which findings make the exit code `1`. Default `warning` (errors *or* warnings fail). `Info` diagnostics never affect the exit code. |
-| `--project auto\|vite\|plain` | Project-kind handling. `auto` (default) detects from marker files; `vite` forces Vite conventions; `plain` disables detection. |
+| `--project auto\|vite\|next\|plain` | Project-kind handling. `auto` (default) detects from marker files; `vite`/`next` force those conventions; `plain` disables detection. |
 | `--rule <name>` | Only report this diagnostic (repeatable). An unknown name exits with code 2. |
 | `--ignore-rule <name>` | Suppress this diagnostic (repeatable). |
 | `--info` | Also display `Info` diagnostics (known analysis limits: widening, recursion cutoff, unknown hooks), plus, per shown component, the applicable checks that ran and found nothing (`verified: …`). A check is listed only when it was applicable; `infinite-loop`, for example, appears only when the component has both a state slot and an effect. |
@@ -131,6 +132,25 @@ there deliberately will not be (ADR-023 §4).
 
 `check` inspects the first directory argument (default `.`) for marker
 files. Other path arguments are discovered as-is with the same resolver.
+Next.js is tested before Vite: a Next app may keep a `vite.config.*` for its
+test runner, and the router conventions are the ones that govern the sources.
+
+### Next.js (`next.config.{ts,js,mjs,cjs,mts}` present)
+
+- Discovery narrows to `<root>/src` only when `src/app` or `src/pages` exists.
+  Next supports both layouts and populates exactly one, so narrowing
+  unconditionally would hide a root-router app.
+- Aliases come from tsconfig `paths`, parsed exactly as for Vite below. A
+  non-relative specifier no pattern claims is then probed against `baseUrl`,
+  which is TypeScript's own last resort and what a scaffold with
+  `"baseUrl": "."` and no `paths` needs to address its own tree
+  (`import { getCart } from "lib/shopify"`). A `baseUrl`-only tsconfig still
+  warns: bare specifiers resolve, but `@/...` aliases do not exist.
+- `next/navigation`, `next/router` and `next/compat/router` hooks are known to
+  the analyzer, so a real `useRouter`/`useSearchParams` is not reported as an
+  unknown hook. `usePathname` is modelled as a string — a primitive is
+  compared by value, so it never reads as an unstable dep.
+- Server Components are analysed, not skipped — see below.
 
 ### Vite (`vite.config.{ts,js,mjs,mts}` present)
 
@@ -154,6 +174,28 @@ files. Other path arguments are discovered as-is with the same resolver.
 Recursive walk of the given directories for `.ts/.tsx/.js/.jsx`, excluding
 `node_modules/`, `dist/`, `build/`, `.next/`, `*.test.*`, `*.spec.*`,
 `*.d.ts`. Relative imports only.
+
+### Server Components
+
+Under the App Router, a module is a Server Component unless a `"use client"`
+directive opens a client boundary above it. reactant **analyses those modules
+like any other** — a Server Component has no state, so the abstract
+interpretation over-approximates it exactly as it does a component whose props
+are ⊤, and skipping them on an import graph that may be missing edges would
+turn every misclassification into a missed bug.
+
+What it adds instead is `server-component-hook`: a module is *server-compiled*
+when it is reachable from an App Router entry (`page`, `layout`, `template`,
+`default`, `not-found`, `loading` under an `app/` directory) without crossing a
+`"use client"` directive, and a hook called there cannot run. The rule stays
+silent in projects that never write the directive, reports once per component
+rather than once per hook, and never suppresses other rules' findings in the
+same module — the missing directive is named beside them, not instead of them.
+
+Its two supporting facts — a filename convention and the resolved import graph
+— live outside the abstract domain, which is why the finding is a `Warning`
+and why it under-reports rather than over-reports: an unresolved specifier on
+the path from an entry leaves that subtree unclassified.
 
 ## JSON schema (v2)
 
@@ -251,6 +293,7 @@ On a component-name collision the name is disambiguated automatically
 | `cross_file_hook/` | Custom hook resolved via relative import and inlined (ADR-013 §2). |
 | `utility_inlining*/` | Statement-level utility inlining (ADR-013 Phase 3). |
 | `vite_project/` | ADR-016: Vite detection, tsconfig `references` hop, `@/*` alias feeding cross-file hook inlining. |
+| `next_project/` | ADR-026: Next detection, `src/app` discovery, `@/*` alias feeding the `"use client"` module graph, `server-component-hook` in both its direct and transitive forms. |
 
 ```sh
 cargo run -- check tests/fixtures/vite_project
@@ -259,13 +302,14 @@ cargo run -- check tests/fixtures/cross_file_hook
 
 ## Plugin API
 
-When the CLI conventions aren't enough (Next.js `app/` discovery, monorepos):
+When the CLI conventions aren't enough (monorepos, workspace specifiers,
+exotic resolution schemes — Vite and Next.js are built in):
 
 ```rust
 use std::path::Path;
 use reactant::{
     engine::{Config, RootStrategy},
-    project,                        // built-in Vite/tsconfig-paths support
+    project,                        // built-in Vite/Next/tsconfig-paths support
     resolver::{analyze_files, analyze_with_resolvers, DefaultFileDiscoverer},
 };
 
@@ -296,7 +340,8 @@ Detailed list: [docs/TODO.md](TODO.md). Most impactful:
 
 ```sh
 cargo test                       # full suite
-cargo test --test vite_project   # Vite e2e (detection → alias → inlining)
+cargo test --test vite_project     # Vite e2e (detection → alias → inlining)
+cargo test --test nextjs_project   # Next.js e2e (detection → alias → server graph → rule)
 cargo test --test cli            # CLI e2e (binary, exit codes, JSON schema)
 cargo test project::             # tsconfig/JSONC/alias unit tests
 ```
