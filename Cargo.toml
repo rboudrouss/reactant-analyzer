@@ -1,6 +1,6 @@
 [package]
 name          = "reactant"
-version       = "0.2.0"
+version       = "0.3.0"
 edition       = "2024"
 description   = "Static analyzer for React hook bugs (infinite loops, missing deps, derived state, ...) based on abstract interpretation over a dedicated CFG-based IR."
 license       = "MIT"
