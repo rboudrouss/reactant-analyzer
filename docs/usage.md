@@ -96,6 +96,9 @@ degrades to defaults. CLI flags beat config values.
 
 ## Rule packs (Tier A)
 
+Full authoring guide — syntax reference, guard table, JS/TS authoring:
+[docs/custom-rules.md](custom-rules.md).
+
 A pack is one JSON file (`$schema`:
 `./node_modules/reactant-analyzer/schemas/pack.schema.json`) declaring rules
 over **semantic anchors** — relations the engine has already resolved (hook
