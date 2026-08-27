@@ -10,12 +10,12 @@ crate.
 | `ImportResolver` | `DefaultImportResolver` (relative imports → `.ts`/`.tsx`/`index.*`) | Monorepo `@workspace/*`, exotic resolution schemes |
 
 Both traits live in `reactant::resolver`. Plug them in through
-`analyze_with_resolvers`, or use the finer-grained pipeline —
-`resolver::{lower_files, analyze_lowered, analyze_files}` — when you need to
+`analyze_with_resolvers`, or use the finer-grained pipeline
+(`resolver::{lower_files, analyze_lowered, analyze_files}`) when you need to
 inspect the lowered IR between phases (the CLI does this to map component
 display names to files).
 
-> **tsconfig `paths` aliases are built in since ADR-016** — you no longer
+> tsconfig `paths` aliases are built in since ADR-016, so you no longer
 > need a custom resolver for the common Vite/`@/*` case:
 >
 > ```rust
@@ -80,7 +80,7 @@ fn main() {
 ## Wrapping `DefaultImportResolver` for custom aliases
 
 For alias schemes *not* declared in tsconfig `paths` (which are built in, see
-above) — e.g. aliases hardcoded in a bundler config — wrap the default
+above), such as aliases hardcoded in a bundler config, wrap the default
 resolver:
 
 ```rust
