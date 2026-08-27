@@ -639,9 +639,10 @@ pub fn analyze_program(
         call_graph: call_graph.into_inner(),
         recursive_components,
         stats: final_stats,
-        // Filled by `analyze_lowered` — the registry-based entry point has no
-        // file table of its own (hand-built IR).
+        // Both filled by `analyze_lowered` — the registry-based entry point
+        // has no file table and no module facts of its own (hand-built IR).
         file_table: Default::default(),
+        module_table: Default::default(),
         // Exposed for witness producers (ADR-019): rules resolve callee
         // names against the same registry the inliner used.
         function_registry: config.function_registry.clone(),

@@ -42,6 +42,7 @@ fn findings(src: &str) -> Vec<Diagnostic> {
             recursive_components: std::collections::HashSet::new(),
             stats: reactant::engine::AnalysisStats::default(),
             file_table: Default::default(),
+            module_table: Default::default(),
             function_registry: Default::default(),
         };
         out.extend(MissingCleanup.check(&RuleCtx::new(&prog, &name)));

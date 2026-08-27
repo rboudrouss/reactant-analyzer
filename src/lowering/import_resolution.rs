@@ -2,8 +2,8 @@
 //!
 //! Two relations live here: [`build_hook_origins`] classifies hook-relevant
 //! bindings by provenance (ADR-023 step 1) and feeds hook extraction;
-//! [`build_resolved_imports`] resolves **relative** imports for the cross-file
-//! context pass, keeping the name the origin exports under.
+//! [`build_resolved_imports`] resolves every import the project's resolver
+//! maps to a real file, keeping the name the origin exports under.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -12,8 +12,8 @@ use oxc_ast::ast::{ImportDeclarationSpecifier, Program, Statement};
 
 use crate::resolver::ImportResolver;
 
-/// A relative import resolved to its defining file, keeping the name the
-/// *origin* exports under.
+/// An import resolved to its defining file, keeping the name the *origin*
+/// exports under.
 ///
 /// The distinction matters whenever a fact is looked up in the origin file's
 /// tables: `import { Ctx as C } from "./ctx"` binds `C` here but `./ctx`
@@ -127,8 +127,13 @@ pub fn build_hook_origins(
 }
 
 /// Build a map from locally-bound import name → resolved origin, for every
-/// **relative** import in `program`. [`build_resolved_import_map`] is the
-/// file-only projection of this.
+/// import in `program` the resolver maps to a real file — relative or aliased.
+/// [`build_resolved_import_map`] is the file-only projection of this.
+///
+/// No relative-only pre-filter: the resolver answers `None` for anything it
+/// cannot map to an existing source file, so admitting non-relative
+/// specifiers can only add edges an alias made resolvable (`@/lib/ctx` in a
+/// Vite or Next project), never redirect one that already resolved.
 pub fn build_resolved_imports(
     program: &Program,
     current_file: &Path,
@@ -140,10 +145,6 @@ pub fn build_resolved_imports(
             continue;
         };
         let source = decl.source.value.as_str();
-        // Only relative imports — npm packages are tracked by build_import_map.
-        if !source.starts_with('.') {
-            continue;
-        }
         let Some(resolved) = resolver.resolve(current_file, source) else {
             continue;
         };
@@ -173,15 +174,17 @@ pub fn build_resolved_imports(
 }
 
 /// Build a map from locally-bound import name → resolved absolute file path,
-/// for every **relative** import in `program`.
+/// for every import in `program` that resolves to an analyzed file.
 ///
 /// Examples:
 ///   - `import { ChildPage } from './child'` with `./child.tsx` present
 ///     → `{"ChildPage": "/abs/.../child.tsx"}`
 ///   - `import { useData } from './hooks/useData'` with `./hooks/useData.ts`
 ///     → `{"useData": "/abs/.../hooks/useData.ts"}`
-///   - `import { useQuery } from '@tanstack/react-query'` (non-relative)
-///     → not included (handled by [`crate::lowering::build_import_map`])
+///   - `import { useData } from '@/hooks/useData'` with a tsconfig `paths`
+///     alias → included, resolved through the project's resolver
+///   - `import { useQuery } from '@tanstack/react-query'` → not included:
+///     the resolver maps no npm package to a file
 ///   - Unresolvable specifiers → silently omitted; the engine then sees
 ///     `resolved_file: None` and falls back to legacy name-only lookup.
 ///

@@ -52,6 +52,7 @@ pub(crate) fn prog(name: &str, result: AnalysisResult<StateValue>) -> ProgramAna
         recursive_components: HashSet::new(),
         stats: AnalysisStats::default(),
         file_table: Default::default(),
+        module_table: Default::default(),
         function_registry: Default::default(),
     }
 }

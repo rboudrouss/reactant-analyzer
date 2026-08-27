@@ -20,7 +20,7 @@ use crate::{
         RootStrategy, analyze_program,
     },
     ir::{
-        FileTable, ModuleConstInit, component::ComponentIR, function_ir::FunctionIR,
+        FileTable, ModuleConstInit, ModuleTable, component::ComponentIR, function_ir::FunctionIR,
         hook_ir::HookIR,
     },
     lowering::{
@@ -95,6 +95,9 @@ pub struct LoweredProgram {
     /// this lowering (ADR-019). Moved into the analysis result by
     /// [`analyze_lowered`].
     pub file_table: FileTable,
+    /// Per-file directive prologue and resolved import edges (ADR-026 §1).
+    /// Moved into the analysis result by [`analyze_lowered`].
+    pub module_table: ModuleTable,
 }
 
 /// Parse and lower an explicit list of files with the given `ImportResolver`.
@@ -123,6 +126,7 @@ pub fn lower_files_with(
         file_count: 0,
         parse_errors: Vec::new(),
         file_table: FileTable::default(),
+        module_table: ModuleTable::default(),
     };
     // Per-file context bindings and resolved imports, for the cross-file pass
     // below: a context is only provable once every file has been scanned.
@@ -174,6 +178,10 @@ pub fn lower_files_with(
             &mut lowered.file_table,
             resolver,
         ));
+        lowered.module_table.insert(
+            path.clone(),
+            crate::lowering::collect_module_facts(&ret.program, path, resolver),
+        );
         contexts.insert(path.clone(), scan_context_names(&ret.program));
         file_imports.push((
             path.clone(),
@@ -248,6 +256,7 @@ pub fn analyze_lowered(
     let hook_registry = HookRegistry::from_hooks(lowered.hooks);
     let mut result = analyze_program(registry, hook_registry, strategy, &config);
     result.file_table = lowered.file_table;
+    result.module_table = lowered.module_table;
     result
 }
 

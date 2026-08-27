@@ -6,6 +6,7 @@ pub mod hook_detector;
 pub mod hook_extractor;
 pub mod import_resolution;
 pub mod jsx_detect;
+pub mod module_facts;
 pub mod utility_detector;
 pub mod utility_lowerer;
 
@@ -18,6 +19,7 @@ pub use import_resolution::{
     HookOrigin, ResolvedImport, build_hook_origins, build_resolved_import_map,
     build_resolved_imports,
 };
+pub use module_facts::collect_module_facts;
 pub use utility_detector::{UtilityCandidate, detect_utilities};
 pub use utility_lowerer::{lower_utilities, lower_utilities_with_resolver};
 

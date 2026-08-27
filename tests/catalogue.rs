@@ -105,6 +105,7 @@ fn run_rule_on(pack_json: &str, rule_id: &str, fixture: &Fixture) -> Vec<Diagnos
                     recursive_components: std::collections::HashSet::new(),
                     stats: reactant::engine::AnalysisStats::default(),
                     file_table: Default::default(),
+                    module_table: Default::default(),
                     function_registry: Default::default(),
                 },
                 names,

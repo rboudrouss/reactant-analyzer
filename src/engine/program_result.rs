@@ -4,6 +4,7 @@ use crate::{
     domains::{impls::StateValue, stores::SharedStateStore},
     engine::analysis_result::AnalysisResult,
     ir::{
+        ModuleTable,
         source_range::{FileTable, SourceRange},
         types::Symbol,
     },
@@ -28,6 +29,10 @@ pub struct ProgramAnalysisResult {
     /// resolve a callee name to its body (`witness::resolve_and_classify`,
     /// ADR-019). Empty for hand-built IR.
     pub function_registry: crate::engine::FunctionRegistry,
+    /// Per-file directive prologue and import edges (ADR-026 §1). Empty when
+    /// the IR was built by hand — a rule reading it must treat "absent" as
+    /// *unproven*, never as a proven negative.
+    pub module_table: ModuleTable,
 }
 
 /// Directed call graph: caller → list of call sites.

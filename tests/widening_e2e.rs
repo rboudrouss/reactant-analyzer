@@ -67,6 +67,7 @@ fn rule_hits<R: Rule>(
         recursive_components: std::collections::HashSet::new(),
         stats: reactant::engine::AnalysisStats::default(),
         file_table: Default::default(),
+        module_table: Default::default(),
         function_registry: Default::default(),
     };
     rule.check(&RuleCtx::new(&prog, &name.to_string())).len()

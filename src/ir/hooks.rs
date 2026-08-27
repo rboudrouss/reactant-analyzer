@@ -111,6 +111,19 @@ impl HookEntry {
         }
     }
 
+    /// Source range of the hook call site, when lowering recorded one.
+    pub fn span(&self) -> Option<SourceRange> {
+        match self {
+            HookEntry::State { span, .. }
+            | HookEntry::Effect { span, .. }
+            | HookEntry::Memo { span, .. }
+            | HookEntry::Callback { span, .. }
+            | HookEntry::Ref { span, .. }
+            | HookEntry::Custom { span, .. }
+            | HookEntry::Handler { span, .. } => *span,
+        }
+    }
+
     /// The body CFG of hook kinds that have one (`Effect`, `Memo`, `Callback`,
     /// `Handler`); `None` for `State`/`Ref`/`Custom`.
     pub fn body_cfg(&self) -> Option<&CFG> {

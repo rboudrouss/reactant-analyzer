@@ -52,6 +52,7 @@ fn run_pack(pack_json: &str, src: &str, options: &Options) -> Vec<Diagnostic> {
             recursive_components: std::collections::HashSet::new(),
             stats: reactant::engine::AnalysisStats::default(),
             file_table: Default::default(),
+            module_table: Default::default(),
             function_registry: Default::default(),
         };
         let ctx = RuleCtx::new(&prog, &name);

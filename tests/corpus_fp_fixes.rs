@@ -43,6 +43,7 @@ fn diagnostics(src: &str) -> Vec<(String, String)> {
         recursive_components: std::collections::HashSet::new(),
         stats: reactant::engine::AnalysisStats::default(),
         file_table: Default::default(),
+        module_table: Default::default(),
         function_registry: Default::default(),
     };
 
@@ -91,6 +92,7 @@ fn diagnostics_sev(src: &str) -> Vec<(String, reactant::rules::Severity, String)
         recursive_components: std::collections::HashSet::new(),
         stats: reactant::engine::AnalysisStats::default(),
         file_table: Default::default(),
+        module_table: Default::default(),
         function_registry: Default::default(),
     };
     let mut out = Vec::new();
