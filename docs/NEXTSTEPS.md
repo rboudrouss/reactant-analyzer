@@ -1,7 +1,8 @@
 # Next steps — feuille de route recommandée
 
-> Complément stratégique de [TODO.md](TODO.md) : TODO.md liste les limites
-> d'analyse ouvertes ; ce fichier ordonne le travail par levier d'adoption.
+> Complément stratégique du tracker : les issues listent les limites
+> d'analyse ouvertes une par une ([docs/limitations.md](limitations.md) en
+> donne le résumé) ; ce fichier ordonne le travail par levier d'adoption.
 > Principe directeur : **sortir l'outil et le vocabulaire devant des
 > utilisateurs avant de creuser la précision.**
 >
@@ -36,7 +37,7 @@
 ## Phase 2 — Le chemin critique du vocabulaire (le gros du trimestre)
 
 **✅ FAIT (2026-08-26)** — les quatre items sont livrés, voir l'historique git
-et [TODO.md § Planned work](TODO.md#planned-work-adr-023--adr-024) :
+et les issues `enhancement` + `area/tier-a` du tracker :
 
 4. ~~**Étape 1 ADR-023 : provenance des hooks**~~ — `HookOrigin` fail-closed,
    littéral `"react"` avant le resolver, spécificateur brut retenu ;
@@ -80,7 +81,7 @@ et [TODO.md § Planned work](TODO.md#planned-work-adr-023--adr-024) :
 ## Phase 4 — Précision (après avoir des utilisateurs)
 
 11. **Trancher la question `useContext`** — post-pass sur les résultats vs
-    unification des deux phases (cf. TODO.md : « decide that first »). Plus
+    unification des deux phases (« decide that first »). Plus
     gros gain de précision disponible (363 sites ⊤ sur les corpus), mais il
     sert les règles natives, pas le marché — il attend du feedback réel.
 12. **Étapes 3-4 ADR-023** (`writers` edge, anchor `context_providers`
@@ -90,7 +91,7 @@ et [TODO.md § Planned work](TODO.md#planned-work-adr-023--adr-024) :
 ## Anti-priorités
 
 - Entamer la phase 4 avant la phase 1.
-- Ajouter de nouvelles règles natives (Tier 1/2 de TODO.md) avant que le
+- Ajouter de nouvelles règles natives (issues `rule-proposal`) avant que le
   vocabulaire ne les rende exprimables en pack.
 - Vendre « écrivez vos règles sémantiques » tant que l'expressivité mesurée
   reste à 3/21 — les étapes 4-6 d'abord.

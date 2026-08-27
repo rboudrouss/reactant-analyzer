@@ -5,7 +5,7 @@
 //! catalogue itself was a session artifact. This file MATERIALIZES it —
 //! reconstructed from the blocker classes ADR-023 records (expression-position
 //! entities, joins, engine facts, whole-program, hook identity) and the rule
-//! classes named across `docs/TODO.md` — and turns the measure into a test:
+//! classes named across `docs/limitations.md` — and turns the measure into a test:
 //!
 //! - an `Expressible` entry is *proven*: its pack rule must load, fire on the
 //!   buggy fixture, and stay silent on the conformant one;
@@ -321,7 +321,8 @@ fn catalogue() -> Vec<Entry> {
             id: "stale-update-without-functional-updater",
             status: Status::Blocked {
                 class: "engine-facts",
-                missing: "a same-tick multi-write fact on one slot (TODO.md Tier 1 stale-update)",
+                missing: "a same-tick multi-write fact on one slot (the Tier 1 \
+                          `stale-update` proposal, #61)",
             },
         },
         Entry {
@@ -343,7 +344,7 @@ fn catalogue() -> Vec<Entry> {
             id: "consumer-without-provider",
             status: Status::Blocked {
                 class: "whole-program",
-                missing: "the useContext consumer→provider relation (TODO.md: decide \
+                missing: "the useContext consumer→provider relation (#28: decide \
                           post-pass vs unified phases first)",
             },
         },
@@ -480,6 +481,6 @@ fn the_measure() {
         expressible.len(),
         EXPRESSIBLE_NOW,
         "the measured count moved — update EXPRESSIBLE_NOW and record the new \
-         datapoint in docs/TODO.md"
+         datapoint in docs/limitations.md"
     );
 }

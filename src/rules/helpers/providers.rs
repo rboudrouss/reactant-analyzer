@@ -155,9 +155,9 @@ fn top_level_exprs(cfg: &CFG) -> Vec<(BlockId, Vec<&Expr>)> {
 /// Call `f` for every `<Ctx.Provider …>` in the expression tree, `Ctx` proven.
 /// Descends through children so a provider nested in JSX children is reached;
 /// `FnLit` bodies are not crossed, so a provider built inside an inline arrow
-/// (`items.map(() => <C.Provider …>)`) is missed — the known FN recorded in
-/// `docs/TODO.md`, kept because the alternative confuses it with the memoized
-/// shape, which is not a bug.
+/// (`items.map(() => <C.Provider …>)`) is missed — the known FN (#30), kept
+/// because the alternative confuses it with the memoized shape, which is not
+/// a bug.
 fn each_provider<'a>(
     expr: &'a Expr,
     contexts: &HashSet<&'a Var>,

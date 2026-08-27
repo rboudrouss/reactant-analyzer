@@ -203,7 +203,7 @@ pub fn lower_files_with(
 /// that file, so the role stays in the single table its consumers already read.
 ///
 /// One level only: if the origin file re-exports the context from a third file,
-/// the chain is not followed (the re-export limit recorded in `docs/TODO.md`).
+/// the chain is not followed (the re-export limit, #49).
 fn resolve_imported_contexts(
     lowered: &mut LoweredProgram,
     contexts: &HashMap<PathBuf, HashSet<String>>,

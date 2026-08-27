@@ -2,7 +2,7 @@
 //!
 //! - An aliased React import (`import { useMemo as useM } from "react"`)
 //!   classifies by its *imported* name — a real Memo entry, not an opaque
-//!   Custom row (the aliased-import FN in TODO.md).
+//!   Custom row (the aliased-import FN this step closed).
 //! - A call through a non-`use` binding of a hook import is still a hook row.
 //! - `Origin::React` is decided by the literal `"react"` specifier BEFORE the
 //!   resolver is consulted: a project aliasing `react` to a file keeps React's

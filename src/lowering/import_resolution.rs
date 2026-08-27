@@ -18,8 +18,8 @@ use crate::resolver::ImportResolver;
 /// The distinction matters whenever a fact is looked up in the origin file's
 /// tables: `import { Ctx as C } from "./ctx"` binds `C` here but `./ctx`
 /// knows it as `Ctx`, so a local-name-only map cannot find it. (The same
-/// missing field is what makes `import { useMemo as useM }` classify as a
-/// custom hook — see `docs/TODO.md`.)
+/// missing field is what made `import { useMemo as useM }` classify as a
+/// custom hook, before ADR-023 step 1 closed it.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedImport {
     /// Absolute path the specifier resolved to.

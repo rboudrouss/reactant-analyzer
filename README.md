@@ -246,7 +246,9 @@ Vite and Next.js detection, tsconfig-paths/`baseUrl` alias resolution and the `"
 
 ## Known limitations
 
-Full list in [docs/TODO.md](docs/TODO.md).
+Summary in [docs/limitations.md](docs/limitations.md); open work on the
+[issue tracker](https://github.com/rboudrouss/reactant-analyzer/issues)
+(`soundness-bug` for defects, `precision-fn` / `precision-fp` for trade-offs).
 
 ## Building from source
 

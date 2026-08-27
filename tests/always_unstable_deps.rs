@@ -211,7 +211,7 @@ fn all_primitive_deps_no_fire() {
     assert_eq!(h, 0, "all-primitive deps must not fire");
 }
 
-// ── Fresh-array method returns (TODO.md — `.map` & co read PerRender, not ⊤) ──
+// ── Fresh-array method returns (`.map` & co read PerRender, not ⊤; see #22) ──
 
 #[test]
 fn map_result_var_dep_fires() {

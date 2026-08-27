@@ -1,6 +1,7 @@
 //! React-hook classification vs same-named custom hooks.
 //!
-//! Classification is import-aware (TODO.md "React-hook name collision"):
+//! Classification is import-aware — a React hook and a same-named custom
+//! hook must not be conflated:
 //! a bare `useMemo(...)` is React's only if unimported or imported from
 //! `react`; `ns.useMemo(...)` only through a `react` module binding (or the
 //! conventional global `React`). memos' local `useMemo(name, options)` was

@@ -314,7 +314,7 @@ The reason is soundness. An opaque hook body can contain a conditional
 unconditionally" next to "I could not look inside this hook" would be a claim
 the analysis cannot support, so the whole list goes. This is all-or-nothing per
 component today; refining it per (limit kind, check) pair is a recorded open
-item in [TODO.md](TODO.md#known-false-positives-fp).
+item ([#31](https://github.com/rboudrouss/reactant-analyzer/issues/31)).
 
 Three properties of that line are deliberate:
 
@@ -377,16 +377,21 @@ Full trait-level examples (custom `FileDiscoverer` / `ImportResolver`) in
 
 ## Limits to know before use
 
-Detailed list: [docs/TODO.md](TODO.md). Most impactful:
+Summary: [docs/limitations.md](limitations.md). Open work, one entry per
+limit: the [issue tracker](https://github.com/rboudrouss/reactant-analyzer/issues).
+Most impactful:
 
 - Aliases outside tsconfig `paths` stay opaque (monorepo `@workspace/*`
   without tsconfig entries, vite-config-only aliases). The imported symbol
   is treated as external and its body is not analyzed, a possible false
   negative. Write a custom `ImportResolver` for those.
+- An alias resolving *outside* the discovery root is never read at all, and
+  the notice is `--info`-only: pass the target directory too.
 - Utility inlining is statement-level only; `if (util(x))` and `setX(util(y))`
   stay opaque.
-- `--entry Foo`, when ambiguous across files, analyzes both; disambiguate
-  with `Foo@/path`.
+- `--entry Foo`, when ambiguous across files, analyzes **both**, and there is
+  currently **no way to disambiguate**: the qualified `Foo@/path` form matches
+  nothing and is accepted silently.
 
 ## Tests
 

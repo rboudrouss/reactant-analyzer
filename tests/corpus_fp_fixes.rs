@@ -1,4 +1,4 @@
-//! Regression tests for the corpus-bench FP fixes (TODO.md F1/F2/F3),
+//! Regression tests for the corpus-bench FP fixes (F1/F2/F3),
 //! written source-level so the whole pipeline is exercised. Each case is the
 //! minimal repro extracted from a real repo (shadcn-admin / memos).
 

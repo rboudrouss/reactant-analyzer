@@ -28,6 +28,11 @@ Analyseur statique React (niveau 3, interprétation abstraite) en Rust.
 ## Références
 
 - Décisions d'architecture : `docs/adr/`
-- TODO courant (limites FN/FP connues) : `docs/TODO.md`
+- Limites connues (page utilisateur, résumé) : `docs/limitations.md`
+- Backlog actionnable : le tracker GitHub — `gh issue list`, labels
+  `soundness-bug` / `precision-fn` / `precision-fp` / `infra` /
+  `rule-proposal`, taille `size/S|M|L`. Les limites tranchées « on ne
+  corrige pas » sont des issues **fermées** `wontfix` : les lire avant de
+  reproposer le fix (`gh issue list --state closed --label wontfix`).
 - Campagne dette technique close : `docs/adr/ADR-020-tech-debt-cleanup-decisions.md`
   (décisions de non-changement soundness — ne pas re-tenter les fixes qui y sont refusés)

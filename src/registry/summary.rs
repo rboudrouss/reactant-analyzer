@@ -338,7 +338,7 @@ mod tests {
     fn use_context_stays_unknown_on_purpose() {
         // The engine has no model for it, and the `analysis-limit` Info that
         // says so is the largest signal in the corpora — registering a ⊤
-        // summary would silence it (docs/TODO.md).
+        // summary would silence it (#28).
         let r = SummaryRegistry::new_with_common();
         assert!(!r.contains("useContext", Some("react")));
     }
