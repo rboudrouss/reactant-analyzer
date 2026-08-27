@@ -30,8 +30,10 @@ reactant rules                         # list every diagnostic
 reactant explain infinite-loop         # what it is, example, how to fix
 ```
 
-Exit codes: `0` clean, `1` findings, `2` usage error. Vite projects are
-auto-detected (`src/` discovery, tsconfig-`paths` aliases followed cross-file).
+Exit codes: `0` clean, `1` findings, `2` usage error. Vite and Next.js
+projects are auto-detected: router-aware discovery, tsconfig-`paths` and
+`baseUrl` aliases followed cross-file, and — under the Next App Router —
+`"use client"` boundaries tracked through the import graph.
 
 ## What it catches
 
@@ -39,8 +41,8 @@ auto-detected (`src/` discovery, tsconfig-`paths` aliases followed cross-file).
 `missing-deps`, `always-unstable-deps`, `stale-closure`, `setter-in-render`,
 `cross-setter-in-render`, `conditional-hook`, `frozen-initial-state`,
 `state-mutation`, `redundant-set-state`, `unnecessary-rerender`,
-`missing-cleanup`, `lazy-init`, `unstable-context-value`. Run
-`reactant explain <rule>` for any of them.
+`missing-cleanup`, `lazy-init`, `unstable-context-value`,
+`server-component-hook`. Run `reactant explain <rule>` for any of them.
 
 The soundness contract is that the analysis computes a superset of the
 component's behaviors. False positives are possible; false negatives are
