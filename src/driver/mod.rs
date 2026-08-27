@@ -50,6 +50,7 @@ pub enum FailOn {
 pub enum ProjectOverride {
     Auto,
     Vite,
+    NextJs,
     Plain,
 }
 
@@ -113,14 +114,21 @@ pub fn run_check(
     let forced = match opts.project {
         ProjectOverride::Auto => None,
         ProjectOverride::Vite => Some(ProjectKind::Vite),
+        ProjectOverride::NextJs => Some(ProjectKind::NextJs),
         ProjectOverride::Plain => Some(ProjectKind::Plain),
     };
-    if forced == Some(ProjectKind::Vite)
-        && project::detect(&project_root, fs.as_ref()) != ProjectKind::Vite
+    // Forcing a build-tool kind whose marker file is absent is honored (the
+    // tsconfig aliases are usually still right) but said out loud.
+    if let Some(kind @ (ProjectKind::Vite | ProjectKind::NextJs)) = forced
+        && project::detect(&project_root, fs.as_ref()) != kind
     {
+        let (flag, marker) = match kind {
+            ProjectKind::NextJs => ("next", "next.config.*"),
+            _ => ("vite", "vite.config.*"),
+        };
         let _ = writeln!(
             err,
-            "[warn] --project vite: no vite.config.* found in {} — still trying tsconfig paths",
+            "[warn] --project {flag}: no {marker} found in {} — still trying tsconfig paths",
             project_root.display()
         );
     }
@@ -128,10 +136,14 @@ pub fn run_check(
     if let Some(warning) = &ctx.alias_warning {
         let _ = writeln!(err, "[warn] {warning}");
     }
-    if opts.verbose && ctx.kind == ProjectKind::Vite {
+    if opts.verbose && ctx.kind != ProjectKind::Plain {
         let _ = writeln!(
             err,
-            "[verbose] vite project: discovery root {}, tsconfig aliases {}",
+            "[verbose] {} project: discovery root {}, tsconfig aliases {}",
+            match ctx.kind {
+                ProjectKind::NextJs => "next.js",
+                _ => "vite",
+            },
             ctx.discovery_root.display(),
             if ctx.alias_warning.is_none() {
                 "loaded"
@@ -147,7 +159,7 @@ pub fn run_check(
     for input in paths {
         let p = Path::new(input);
         if fs.is_dir(p) {
-            // The project-root dir may be narrowed (vite → <root>/src).
+            // The project-root dir may be narrowed (vite/next → <root>/src).
             let walk_root = if *p == *project_root {
                 &ctx.discovery_root
             } else {

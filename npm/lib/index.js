@@ -12,7 +12,7 @@ const HELP = `reactant — static analyzer for React hook bugs (WASM build)
 Usage:
   reactant [check] [paths…] [--info] [--show-clean] [--trace] [--verbose]
            [--all-roots] [--entry <names>] [--format human|json]
-           [--fail-on error|warning|never] [--project auto|vite|plain]
+           [--fail-on error|warning|never] [--project auto|vite|next|plain]
            [--rule <name>]… [--ignore-rule <name>]… [--no-color]
            [--config <path>]
   reactant rules [--config <path>]

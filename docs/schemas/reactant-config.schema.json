@@ -114,6 +114,7 @@
       "enum": [
         "auto",
         "vite",
+        "next",
         "plain"
       ]
     },

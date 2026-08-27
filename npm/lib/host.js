@@ -59,16 +59,18 @@ function resolvePacks(specs, configDir) {
   });
 }
 
-// Superset walk: every source-extension file plus tsconfig*.json and
-// vite.config.* encountered (the engine's own discovery re-filters over the
-// map — d.ts/test/spec exclusions included). Dir-level exclusions only,
+// Superset walk: every source-extension file plus tsconfig*.json and the
+// build-tool configs (vite.config.*, next.config.*) encountered — the engine's
+// own discovery re-filters over the map (d.ts/test/spec exclusions included)
+// and detects the project kind from those markers. Dir-level exclusions only,
 // taken from hostConstants so wrapper and core cannot drift.
 function buildFileMap(paths, constants) {
   const files = {};
   const wanted = (name) =>
     constants.sourceExtensions.some((ext) => name.endsWith(`.${ext}`)) ||
     /^tsconfig[^/\\]*\.json$/.test(name) ||
-    /^vite\.config\.(ts|js|mjs|mts)$/.test(name);
+    /^vite\.config\.(ts|js|mjs|mts)$/.test(name) ||
+    /^next\.config\.(ts|js|mjs|cjs|mts)$/.test(name);
 
   const addFile = (p) => {
     try {

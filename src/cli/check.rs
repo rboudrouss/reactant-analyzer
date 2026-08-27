@@ -56,7 +56,7 @@ pub struct CheckArgs {
     #[arg(long, value_enum)]
     pub fail_on: Option<FailOn>,
 
-    /// Project kind: auto-detect (default), force vite conventions, or plain walk
+    /// Project kind: auto-detect (default), force vite/next conventions, or plain walk
     #[arg(long, value_enum)]
     pub project: Option<ProjectMode>,
 
@@ -119,6 +119,7 @@ pub fn run(mut args: CheckArgs) -> i32 {
         project: args.project.map(|v| match v {
             ProjectMode::Auto => ProjectConfig::Auto,
             ProjectMode::Vite => ProjectConfig::Vite,
+            ProjectMode::Next => ProjectConfig::Next,
             ProjectMode::Plain => ProjectConfig::Plain,
         }),
     };
@@ -148,6 +149,7 @@ pub fn run(mut args: CheckArgs) -> i32 {
         project: match partial.project.unwrap_or(ProjectConfig::Auto) {
             ProjectConfig::Auto => driver::ProjectOverride::Auto,
             ProjectConfig::Vite => driver::ProjectOverride::Vite,
+            ProjectConfig::Next => driver::ProjectOverride::NextJs,
             ProjectConfig::Plain => driver::ProjectOverride::Plain,
         },
         color: super::color::enabled(args.no_color),

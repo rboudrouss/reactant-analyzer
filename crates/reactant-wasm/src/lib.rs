@@ -268,6 +268,7 @@ fn check_options(o: &Options, cfg: &config::ReactantConfig) -> Result<CheckOptio
             None => None,
             Some("auto") => Some(ProjectConfig::Auto),
             Some("vite") => Some(ProjectConfig::Vite),
+            Some("next") => Some(ProjectConfig::Next),
             Some("plain") => Some(ProjectConfig::Plain),
             Some(x) => return Err(format!("[error] unknown project `{x}`\n")),
         },
@@ -292,6 +293,7 @@ fn check_options(o: &Options, cfg: &config::ReactantConfig) -> Result<CheckOptio
         project: match partial.project.unwrap_or(ProjectConfig::Auto) {
             ProjectConfig::Auto => driver::ProjectOverride::Auto,
             ProjectConfig::Vite => driver::ProjectOverride::Vite,
+            ProjectConfig::Next => driver::ProjectOverride::NextJs,
             ProjectConfig::Plain => driver::ProjectOverride::Plain,
         },
         color: o.color,

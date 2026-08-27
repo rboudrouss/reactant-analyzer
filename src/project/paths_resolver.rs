@@ -15,7 +15,10 @@ use super::tsconfig::TsconfigPaths;
 ///
 /// Matching follows TypeScript semantics: exact (starless) patterns first,
 /// then wildcard patterns by longest matching prefix; substituted targets are
-/// tried in declaration order, first existing file wins.
+/// tried in declaration order, first existing file wins. A specifier no
+/// pattern claims is probed against `baseUrl` itself (`import "lib/api"` in a
+/// `"baseUrl": "."` project) — that probe only answers when a real source
+/// file sits there, so it can add a resolution but never redirect one.
 pub struct TsconfigPathsResolver {
     base_url: PathBuf,
     /// `(prefix, suffix, targets)` for wildcard patterns (`@/*` → `("@/", "")`).
@@ -102,11 +105,13 @@ impl ImportResolver for TsconfigPathsResolver {
                 }
             }
             // Longest matching prefix consumed the specifier: per TS
-            // semantics, do not fall through to shorter patterns.
+            // semantics, do not fall through to shorter patterns — nor to the
+            // baseUrl probe, which TypeScript also skips once `paths` matched.
             return None;
         }
 
-        None
+        // TypeScript's last resort for a non-relative specifier: `baseUrl`.
+        self.probe(specifier)
     }
 }
 

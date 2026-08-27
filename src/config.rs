@@ -72,6 +72,7 @@ pub enum FailOnConfig {
 pub enum ProjectConfig {
     Auto,
     Vite,
+    Next,
     Plain,
 }
 

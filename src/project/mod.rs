@@ -1,14 +1,16 @@
 //! Project-kind detection and per-project analysis context (ADR-016).
 //!
 //! A "project kind" bundles the conventions of a build tool: where sources
-//! live and how import specifiers map to files. Currently detected: **Vite**
-//! (presence of `vite.config.*`), whose `@/*`-style aliases are loaded from
-//! tsconfig `paths` (see [`tsconfig`]). Everything else is [`ProjectKind::Plain`].
+//! live and how import specifiers map to files. Detected: **Vite** (presence
+//! of `vite.config.*`) and **Next.js** (presence of `next.config.*`), both of
+//! which load `@/*`-style aliases from tsconfig `paths` (see [`tsconfig`]).
+//! Everything else is [`ProjectKind::Plain`].
 //!
-//! Out of scope (deliberately): evaluating `vite.config.*` for
-//! `resolve.alias` (requires running JS), `jsconfig.json`, package.json
-//! `exports` maps.
+//! Out of scope (deliberately): evaluating `vite.config.*` / `next.config.*`
+//! for `resolve.alias` / `webpack` overrides (requires running JS),
+//! `jsconfig.json`, package.json `exports` maps.
 
+pub mod nextjs;
 pub mod paths_resolver;
 pub mod tsconfig;
 
@@ -17,6 +19,7 @@ use std::sync::Arc;
 
 use crate::resolver::{DefaultImportResolver, FileSystem, ImportResolver};
 
+pub use nextjs::{USE_CLIENT, server_entry_kind, server_modules};
 pub use paths_resolver::TsconfigPathsResolver;
 pub use tsconfig::{TsconfigPaths, load_tsconfig_paths, strip_jsonc};
 
@@ -27,6 +30,10 @@ pub enum ProjectKind {
     Plain,
     /// Vite project: sources under `src/`, tsconfig `paths` aliases.
     Vite,
+    /// Next.js project: sources under `src/` when the router lives there,
+    /// tsconfig `paths` aliases plus bare `baseUrl` resolution, and RSC
+    /// `"use client"` boundaries (ADR-026).
+    NextJs,
 }
 
 const VITE_CONFIGS: &[&str] = &[
@@ -36,12 +43,42 @@ const VITE_CONFIGS: &[&str] = &[
     "vite.config.mts",
 ];
 
+pub const NEXT_CONFIGS: &[&str] = &[
+    "next.config.ts",
+    "next.config.js",
+    "next.config.mjs",
+    "next.config.cjs",
+    "next.config.mts",
+];
+
 /// Detect the project kind at `root` from marker files.
+///
+/// Next.js is tested first: a Next app may carry a `vite.config.*` for its
+/// test runner (vitest), and the router conventions are the ones that
+/// actually govern the sources.
 pub fn detect(root: &Path, fs: &dyn FileSystem) -> ProjectKind {
-    if VITE_CONFIGS.iter().any(|c| fs.is_file(&root.join(c))) {
+    if NEXT_CONFIGS.iter().any(|c| fs.is_file(&root.join(c))) {
+        ProjectKind::NextJs
+    } else if VITE_CONFIGS.iter().any(|c| fs.is_file(&root.join(c))) {
         ProjectKind::Vite
     } else {
         ProjectKind::Plain
+    }
+}
+
+/// Narrow discovery to `<root>/src` when the Next.js router lives there.
+///
+/// Next supports both layouts, and only one of them is ever populated: with
+/// `src/app` (or `src/pages`) present, everything the app ships is under
+/// `src/`, and walking the root instead would drag in `scripts/`,
+/// `e2e/` and the config files. Without it, the router is at the root and
+/// narrowing would hide the whole app.
+fn next_discovery_root(root: &Path, fs: &dyn FileSystem) -> PathBuf {
+    let src = root.join("src");
+    if fs.is_dir(&src.join("app")) || fs.is_dir(&src.join("pages")) {
+        src
+    } else {
+        root.to_path_buf()
     }
 }
 
@@ -71,40 +108,63 @@ pub fn build_context(
     fs: Arc<dyn FileSystem>,
 ) -> ProjectContext {
     let kind = forced.unwrap_or_else(|| detect(root, fs.as_ref()));
-    match kind {
-        ProjectKind::Plain => ProjectContext {
-            kind,
-            discovery_root: root.to_path_buf(),
-            resolver: Box::new(DefaultImportResolver::new(fs)),
-            alias_warning: None,
-        },
+    let discovery_root = match kind {
+        ProjectKind::Plain => root.to_path_buf(),
         ProjectKind::Vite => {
             let src = root.join("src");
-            let discovery_root = if fs.is_dir(&src) {
+            if fs.is_dir(&src) {
                 src
             } else {
                 root.to_path_buf()
-            };
-            match load_tsconfig_paths(root, fs.as_ref()) {
-                Some(paths) => ProjectContext {
-                    kind,
-                    discovery_root,
-                    resolver: Box::new(TsconfigPathsResolver::new(paths, fs)),
-                    alias_warning: None,
-                },
-                None => ProjectContext {
-                    kind,
-                    discovery_root,
-                    resolver: Box::new(DefaultImportResolver::new(fs)),
-                    alias_warning: Some(
-                        "no tsconfig `paths` found — aliased imports (e.g. `@/...`) stay \
-                         unresolved and their targets are NOT analyzed (possible false \
-                         negatives). Aliases declared only in vite.config are not read."
-                            .to_string(),
-                    ),
-                },
             }
         }
+        ProjectKind::NextJs => next_discovery_root(root, fs.as_ref()),
+    };
+    if kind == ProjectKind::Plain {
+        return ProjectContext {
+            kind,
+            discovery_root,
+            resolver: Box::new(DefaultImportResolver::new(fs)),
+            alias_warning: None,
+        };
+    }
+
+    let config_name = match kind {
+        ProjectKind::NextJs => "next.config",
+        _ => "vite.config",
+    };
+    match load_tsconfig_paths(root, fs.as_ref()) {
+        // A patternless entry means the config declared only `baseUrl`. That
+        // resolves bare specifiers (`import "lib/api"`, the Next scaffold
+        // without `paths`), so it is a real resolver — but no `@/*` alias
+        // exists, and a project written against one would still be blind.
+        Some(paths) if paths.patterns.is_empty() => ProjectContext {
+            kind,
+            discovery_root,
+            resolver: Box::new(TsconfigPathsResolver::new(paths, fs)),
+            alias_warning: Some(format!(
+                "tsconfig declares `baseUrl` but no `paths` — bare specifiers resolve \
+                 against it, but `@/...`-style aliases stay unresolved and their targets \
+                 are NOT analyzed (possible false negatives). Aliases declared only in \
+                 {config_name} are not read."
+            )),
+        },
+        Some(paths) => ProjectContext {
+            kind,
+            discovery_root,
+            resolver: Box::new(TsconfigPathsResolver::new(paths, fs)),
+            alias_warning: None,
+        },
+        None => ProjectContext {
+            kind,
+            discovery_root,
+            resolver: Box::new(DefaultImportResolver::new(fs)),
+            alias_warning: Some(format!(
+                "no tsconfig `paths` found — aliased imports (e.g. `@/...`) stay \
+                 unresolved and their targets are NOT analyzed (possible false \
+                 negatives). Aliases declared only in {config_name} are not read."
+            )),
+        },
     }
 }
 

@@ -15,7 +15,7 @@ const BOOL_FLAGS = {
 const VALUE_FLAGS = {
   "--format": ["format", ["human", "json"]],
   "--fail-on": ["failOn", ["error", "warning", "never"]],
-  "--project": ["project", ["auto", "vite", "plain"]],
+  "--project": ["project", ["auto", "vite", "next", "plain"]],
 };
 
 function parse(argv) {

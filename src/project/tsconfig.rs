@@ -20,7 +20,9 @@ pub struct TsconfigPaths {
     /// a `baseUrl`, this is the directory of the declaring config (TS 4.1+).
     pub base_url: PathBuf,
     /// `(pattern, targets)` pairs in declaration order, e.g.
-    /// `("@/*", ["./src/*"])`. Patterns contain at most one `*`.
+    /// `("@/*", ["./src/*"])`. Patterns contain at most one `*`. Empty when
+    /// the config declares a `baseUrl` and no `paths` — `base_url` alone
+    /// still resolves non-relative specifiers.
     pub patterns: Vec<(String, Vec<String>)>,
 }
 
@@ -175,8 +177,8 @@ fn paths_from_config(
         .and_then(|b| b.as_str())
         .map(|b| normalize(&dir.join(b)));
 
-    if let Some(paths) = own_paths {
-        let patterns: Vec<(String, Vec<String>)> = paths
+    let own_patterns = own_paths.map(|paths| -> Vec<(String, Vec<String>)> {
+        paths
             .iter()
             .filter_map(|(pat, targets)| {
                 let targets: Vec<String> = targets
@@ -186,24 +188,40 @@ fn paths_from_config(
                     .collect();
                 (!targets.is_empty()).then(|| (pat.clone(), targets))
             })
-            .collect();
-        if !patterns.is_empty() {
-            return Some(TsconfigPaths {
-                // paths without baseUrl → relative to the declaring config
-                // (TS 4.1+ semantics).
-                base_url: own_base.unwrap_or(dir),
-                patterns,
-            });
-        }
+            .collect()
+    });
+
+    if let Some(patterns) = own_patterns
+        && !patterns.is_empty()
+    {
+        return Some(TsconfigPaths {
+            // paths without baseUrl → relative to the declaring config
+            // (TS 4.1+ semantics).
+            base_url: own_base.unwrap_or(dir),
+            patterns,
+        });
     }
 
     // No own paths: inherit through `extends` (string or array).
-    let extends = config.get("extends")?;
+    let Some(extends) = config.get("extends") else {
+        // Nothing inherited either. A bare `baseUrl` still resolves
+        // non-relative specifiers against it (`import "lib/api"`), which is
+        // how the Next.js scaffold without `paths` addresses its own tree —
+        // so report it with an empty pattern list rather than nothing.
+        return own_base.map(|base_url| TsconfigPaths {
+            base_url,
+            patterns: Vec::new(),
+        });
+    };
     let specs: Vec<&str> = match extends {
         Value::String(s) => vec![s.as_str()],
         Value::Array(a) => a.iter().filter_map(|v| v.as_str()).collect(),
-        _ => return None,
+        _ => vec![],
     };
+    // A patternless parent (bare `baseUrl`) does not end the search — a
+    // later entry in an `extends` array may still declare the aliases — but
+    // it is kept, so an inherited base is not thrown away.
+    let mut inherited_base: Option<TsconfigPaths> = None;
     for spec in specs {
         if let Some(parent) = resolve_config_ref(&dir, spec, fs)
             && let Some(mut found) = paths_from_config(&parent, visited, fs)
@@ -212,10 +230,18 @@ fn paths_from_config(
             if let Some(base) = &own_base {
                 found.base_url = base.clone();
             }
-            return Some(found);
+            if !found.patterns.is_empty() {
+                return Some(found);
+            }
+            inherited_base.get_or_insert(found);
         }
     }
-    None
+    own_base
+        .map(|base_url| TsconfigPaths {
+            base_url,
+            patterns: Vec::new(),
+        })
+        .or(inherited_base)
 }
 
 /// Load path aliases for a project rooted at `root`.
@@ -224,33 +250,48 @@ fn paths_from_config(
 /// declares `paths`, its `references[].path` entries are scanned in order
 /// (Vite scaffolds keep `paths` in the referenced `tsconfig.app.json`).
 ///
-/// Returns `None` when no config exists, nothing declares `paths`, or the
-/// JSON is unreadable — callers fall back to plain relative resolution.
+/// Returns `None` when no config exists, or when nothing anywhere in the
+/// chain declares `paths` *or* `baseUrl` — callers then fall back to plain
+/// relative resolution. A config declaring only `baseUrl` comes back with an
+/// empty `patterns`: no aliases, but non-relative specifiers still resolve
+/// against the base (`import "lib/api"`).
 pub fn load_tsconfig_paths(root: &Path, fs: &dyn FileSystem) -> Option<TsconfigPaths> {
     let root_config = root.join("tsconfig.json");
     if !fs.is_file(&root_config) {
         return None;
     }
     let mut visited = HashSet::new();
-    if let Some(found) = paths_from_config(&root_config, &mut visited, fs) {
-        return Some(found);
-    }
+    // A patternless result (bare `baseUrl`) is held back, not returned: the
+    // `references` hop below is what finds a Vite scaffold's real aliases,
+    // and returning early would skip it.
+    let base_only = match paths_from_config(&root_config, &mut visited, fs) {
+        Some(found) if !found.patterns.is_empty() => return Some(found),
+        other => other,
+    };
 
     // Fall back to project references.
-    let config = read_config(&normalize(&root_config), fs)?;
-    let dir = root_config.parent()?.to_path_buf();
-    let references = config.get("references")?.as_array()?;
-    for r in references {
+    let refs = read_config(&normalize(&root_config), fs)
+        .as_ref()
+        .and_then(|c| c.get("references"))
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let dir = match root_config.parent() {
+        Some(d) => d.to_path_buf(),
+        None => return base_only,
+    };
+    for r in &refs {
         let Some(spec) = r.get("path").and_then(|p| p.as_str()) else {
             continue;
         };
         if let Some(ref_config) = resolve_config_ref(&dir, spec, fs)
             && let Some(found) = paths_from_config(&ref_config, &mut visited, fs)
+            && !found.patterns.is_empty()
         {
             return Some(found);
         }
     }
-    None
+    base_only
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -447,6 +488,64 @@ mod tests {
             .expect("paths via references");
         assert_eq!(p.base_url, normalize(tmp.path()));
         assert_eq!(p.patterns[0].0, "@/*");
+    }
+
+    #[test]
+    fn bare_base_url_is_reported_with_no_patterns() {
+        // The Next scaffold that addresses its own tree through `baseUrl`
+        // alone: not an alias set, but a real resolution base.
+        let tmp = Tmp::new("base-only");
+        tmp.write(
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "baseUrl": "." } }"#,
+        );
+        let p = load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem)
+            .expect("a bare baseUrl is still a resolution base");
+        assert_eq!(p.base_url, normalize(tmp.path()));
+        assert!(p.patterns.is_empty());
+    }
+
+    #[test]
+    fn a_bare_base_url_does_not_shortcut_the_references_hop() {
+        // Root declares only `baseUrl`; the aliases live in the referenced
+        // config. Returning the patternless root would lose them.
+        let tmp = Tmp::new("base-then-refs");
+        tmp.write(
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "baseUrl": "." },
+                 "references": [{ "path": "./tsconfig.app.json" }] }"#,
+        );
+        tmp.write(
+            "tsconfig.app.json",
+            r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@/*": ["./src/*"] } } }"#,
+        );
+        let p = load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem)
+            .expect("paths via references");
+        assert_eq!(p.patterns[0].0, "@/*");
+    }
+
+    #[test]
+    fn a_base_url_inherited_through_extends_survives() {
+        let tmp = Tmp::new("base-inherited");
+        tmp.write(
+            "tsconfig.base.json",
+            r#"{ "compilerOptions": { "baseUrl": "./src" } }"#,
+        );
+        tmp.write("tsconfig.json", r#"{ "extends": "./tsconfig.base.json" }"#);
+        let p = load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem)
+            .expect("inherited baseUrl is not thrown away");
+        assert_eq!(p.base_url, normalize(&tmp.path().join("src")));
+        assert!(p.patterns.is_empty());
+    }
+
+    #[test]
+    fn no_paths_and_no_base_url_is_still_none() {
+        let tmp = Tmp::new("nothing");
+        tmp.write(
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "strict": true } }"#,
+        );
+        assert!(load_tsconfig_paths(tmp.path(), &crate::resolver::OsFileSystem).is_none());
     }
 
     #[test]

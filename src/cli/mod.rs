@@ -89,10 +89,14 @@ pub enum FailOn {
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ProjectMode {
-    /// Detect the project kind from marker files (vite.config.* → vite)
+    /// Detect the project kind from marker files (next.config.* → next,
+    /// vite.config.* → vite)
     Auto,
     /// Force Vite conventions (src/ discovery, tsconfig paths aliases)
     Vite,
+    /// Force Next.js conventions (router-aware discovery, tsconfig paths +
+    /// baseUrl aliases, "use client" boundaries)
+    Next,
     /// Disable detection: walk paths as-is, relative imports only
     Plain,
 }
