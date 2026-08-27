@@ -35,14 +35,26 @@ impl SummaryRegistry {
         }
     }
 
-    /// Pre-populate with common TanStack Query and React Router hooks,
-    /// scoped to their respective NPM packages so they only match hooks
-    /// that were actually imported from those packages.
+    /// Pre-populate with common TanStack Query, React Router and Next.js
+    /// hooks, scoped to their respective NPM packages so they only match
+    /// hooks that were actually imported from those packages.
+    ///
+    /// Registering a hook as ⊤ is not modelling it — it is recording that the
+    /// hook is *known*, which is what separates a deliberate imprecision from
+    /// the `analysis-limit/unknown-hook` Info that means "we could not even
+    /// find this definition".
     pub fn new_with_common() -> Self {
         let mut r = Self::new();
         r.register_many_for_package("@tanstack/react-query", TANSTACK_HOOKS);
         r.register_many_for_package("react-router-dom", REACT_ROUTER_HOOKS);
         r.register_many_for_package("react-router", REACT_ROUTER_HOOKS);
+        r.register_many_for_package("next/navigation", NEXT_NAVIGATION_HOOKS);
+        r.register_many_for_package("next/router", &["useRouter"]);
+        r.register_many_for_package("next/compat/router", &["useRouter"]);
+        // The one Next hook whose *kind* is certain: App Router
+        // `usePathname()` is typed `string`, and a primitive is compared by
+        // value — so a `pathname` dep is never a per-render fresh reference.
+        r.register_for_package("next/navigation", Box::new(StrTopSummary("usePathname")));
         r
     }
 
@@ -105,6 +117,20 @@ impl HookSummary for TopSummary {
     // summarize returns Top via default
 }
 
+/// A hook whose return is an unknown **string**. Narrower than ⊤ in the one
+/// way that matters downstream: a primitive is value-compared, so it can
+/// never read as a fresh reference in a deps array.
+struct StrTopSummary(&'static str);
+
+impl HookSummary for StrTopSummary {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn summarize(&self, _args: &[StateValue]) -> StateValue {
+        StateValue::str_top()
+    }
+}
+
 // ── Known library hook lists ──────────────────────────────────────────────────
 
 const TANSTACK_HOOKS: &[&str] = &[
@@ -148,6 +174,19 @@ const REACT_ROUTER_HOOKS: &[&str] = &[
     "useMatches",
     "useNavigationType",
     "useBeforeUnload",
+];
+
+/// Next.js App Router hooks (`next/navigation`). All client-only; all opaque
+/// to the engine except `usePathname`, refined above.
+const NEXT_NAVIGATION_HOOKS: &[&str] = &[
+    "useRouter",
+    "usePathname",
+    "useSearchParams",
+    "useParams",
+    "useSelectedLayoutSegment",
+    "useSelectedLayoutSegments",
+    "useServerInsertedHTML",
+    "useLinkStatus",
 ];
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -270,6 +309,38 @@ mod tests {
                 "missing React Router hook: {name}"
             );
         }
+    }
+
+    #[test]
+    fn common_next_hooks_registered() {
+        let r = SummaryRegistry::new_with_common();
+        for name in ["useRouter", "useSearchParams", "useParams", "usePathname"] {
+            assert!(
+                r.contains(name, Some("next/navigation")),
+                "missing Next hook: {name}"
+            );
+        }
+        assert!(r.contains("useRouter", Some("next/router")));
+        // Package-scoped: a same-named hook from elsewhere must not match.
+        assert!(!r.contains("useSearchParams", Some("my-own-lib")));
+    }
+
+    #[test]
+    fn use_pathname_is_a_string_not_top() {
+        let r = SummaryRegistry::new_with_common();
+        let s = r.get("usePathname", Some("next/navigation")).unwrap();
+        let v = s.summarize(&[]);
+        assert_eq!(v, StateValue::str_top());
+        assert!(!v.is_top_value(), "a string is narrower than ⊤");
+    }
+
+    #[test]
+    fn use_context_stays_unknown_on_purpose() {
+        // The engine has no model for it, and the `analysis-limit` Info that
+        // says so is the largest signal in the corpora — registering a ⊤
+        // summary would silence it (docs/TODO.md).
+        let r = SummaryRegistry::new_with_common();
+        assert!(!r.contains("useContext", Some("react")));
     }
 
     #[test]

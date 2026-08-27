@@ -95,6 +95,18 @@ fn vite_project_is_byte_identical_across_filesystems() {
 }
 
 #[test]
+fn next_project_is_byte_identical_across_filesystems() {
+    // ADR-026 adds three fs-dependent steps: next.config detection, the
+    // src/app discovery probe, and the `"use client"` module graph.
+    for format in [driver::ReportFormat::Human, driver::ReportFormat::Json] {
+        let (native, mem) = run_both("tests/fixtures/next_project", format);
+        assert_eq!(native.stdout, mem.stdout, "stdout diverged ({format:?})");
+        assert_eq!(native.stderr, mem.stderr, "stderr diverged ({format:?})");
+        assert_eq!(native.exit_code, mem.exit_code);
+    }
+}
+
+#[test]
 fn cross_file_hook_is_byte_identical_across_filesystems() {
     let (native, mem) = run_both("tests/fixtures/cross_file_hook", driver::ReportFormat::Json);
     assert_eq!(native.stdout, mem.stdout);

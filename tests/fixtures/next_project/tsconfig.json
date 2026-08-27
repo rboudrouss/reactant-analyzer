@@ -1,0 +1,9 @@
+{
+  // Next scaffold shape: aliases under `paths`, sources under src/.
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": { "@/*": ["./src/*"] },
+    "jsx": "preserve"
+  },
+  "include": ["**/*.ts", "**/*.tsx"]
+}

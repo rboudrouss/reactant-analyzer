@@ -35,8 +35,9 @@ pub use docs::{RULE_DOCS, RuleDoc, rule_doc};
 pub use helpers::setters::{SetterCall, collect_setter_calls, collect_setter_calls_with_extra};
 pub use impls::{
     AlwaysUnstableDeps, AnalysisLimitInfo, ConditionalHook, DerivedState, FrozenInitialState,
-    InfiniteLoop, LazyInit, MissingCleanup, MissingDeps, RedundantSetState, SetterInRender,
-    StaleClosure, StateMutation, UnnecessaryRerender, UnstableContextValue, WideningInfo,
+    InfiniteLoop, LazyInit, MissingCleanup, MissingDeps, RedundantSetState, ServerComponentHook,
+    SetterInRender, StaleClosure, StateMutation, UnnecessaryRerender, UnstableContextValue,
+    WideningInfo,
 };
 pub use registry::{ComponentFindings, OverrideEntry, RegistryError, RuleOverrides, RuleRegistry};
 
@@ -105,6 +106,7 @@ pub fn all_rules() -> Vec<Box<dyn Rule>> {
         Box::new(RedundantSetState),
         Box::new(UnnecessaryRerender),
         Box::new(SetterInRender),
+        Box::new(ServerComponentHook),
         Box::new(StaleClosure),
         Box::new(StateMutation),
         Box::new(InfiniteLoop),

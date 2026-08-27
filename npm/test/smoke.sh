@@ -29,6 +29,8 @@ compare "check human"   check tests/fixtures/vite_project --fail-on never
 compare "check json"    check tests/fixtures/vite_project --format json --fail-on never
 compare "check trace"   check tests/fixtures/vite_project --trace --info --show-clean --fail-on never
 compare "exit code"     check tests/fixtures/vite_project --fail-on warning
+compare "next human"    check tests/fixtures/next_project --fail-on never
+compare "next json"     check tests/fixtures/next_project --format json --info --fail-on never
 compare "pack project"  check tests/fixtures/pack_project --format json --fail-on never
 compare "config off"    check tests/fixtures/config_project --config tests/fixtures/config_project/off.json --format json --fail-on never
 compare "rules"         rules

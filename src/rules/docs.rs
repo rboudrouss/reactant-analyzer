@@ -223,6 +223,23 @@ pub const RULE_DOCS: &[RuleDoc] = &[
         "Delete the call, or make it set a genuinely different value.",
     ),
     doc(
+        "server-component-hook",
+        "a hook is called in a Next.js Server Component",
+        "Under the Next.js App Router a module is a Server Component unless \
+                      `\"use client\"` opens a client boundary above it. Server Components \
+                      render once, on the server: there is no state, no commit phase and no \
+                      hook for React to give them, so the render throws. The rule fires on a \
+                      module reachable from an App Router entry (`page`, `layout`, \
+                      `template`, `default`, `not-found`, `loading`) without crossing a \
+                      `\"use client\"` directive. It stays silent in projects that never use \
+                      the directive, where the whole notion does not apply.",
+        "// app/page.tsx  (no \"use client\")\n\
+                  export default function Page() { const [n, setN] = useState(0); }",
+        "Add `\"use client\"` as the first line of the file, or keep the page a \
+              Server Component and move the stateful part into a child component that \
+              declares the directive.",
+    ),
+    doc(
         "setter-in-render",
         "setState called during the render body",
         "Calling a setter while rendering schedules another render before this \
