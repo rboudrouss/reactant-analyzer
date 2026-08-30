@@ -31,7 +31,11 @@ fn analyze(src: &str) -> ProgramAnalysisResult {
     let ret = Parser::new(&alloc, src, SourceType::tsx())
         .with_options(ParseOptions::default())
         .parse();
-    assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
+    assert!(
+        ret.diagnostics.is_empty(),
+        "parse errors: {:?}",
+        ret.diagnostics
+    );
     let path = std::path::Path::new("test.tsx");
     let components = lower_program(&ret.program, src, path, &mut Default::default());
     let hooks = lower_custom_hooks(&ret.program, src, path, &mut Default::default());

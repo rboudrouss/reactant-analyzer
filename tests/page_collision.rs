@@ -68,7 +68,11 @@ fn parse_file(path: &Path) -> (Vec<reactant::ir::ComponentIR>, Vec<reactant::ir:
     let ret = OxcParser::new(&alloc, &source, source_type)
         .with_options(ParseOptions::default())
         .parse();
-    assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
+    assert!(
+        ret.diagnostics.is_empty(),
+        "parse errors: {:?}",
+        ret.diagnostics
+    );
     let components = lower_program(&ret.program, &source, path, &mut Default::default());
     let hooks = lower_custom_hooks(&ret.program, &source, path, &mut Default::default());
     (components, hooks)

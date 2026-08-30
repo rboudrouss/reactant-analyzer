@@ -81,7 +81,11 @@ fn run_rule_on(pack_json: &str, rule_id: &str, fixture: &Fixture) -> Vec<Diagnos
             let ret = Parser::new(&alloc, src, SourceType::tsx())
                 .with_options(ParseOptions::default())
                 .parse();
-            assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
+            assert!(
+                ret.diagnostics.is_empty(),
+                "parse errors: {:?}",
+                ret.diagnostics
+            );
             let components = lower_program(
                 &ret.program,
                 src,

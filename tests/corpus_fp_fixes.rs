@@ -19,7 +19,11 @@ fn diagnostics(src: &str) -> Vec<(String, String)> {
     let ret = Parser::new(&alloc, src, SourceType::tsx())
         .with_options(ParseOptions::default())
         .parse();
-    assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
+    assert!(
+        ret.diagnostics.is_empty(),
+        "parse errors: {:?}",
+        ret.diagnostics
+    );
     let components = lower_program(
         &ret.program,
         src,
@@ -68,7 +72,11 @@ fn diagnostics_sev(src: &str) -> Vec<(String, reactant::rules::Severity, String)
     let ret = Parser::new(&alloc, src, SourceType::tsx())
         .with_options(ParseOptions::default())
         .parse();
-    assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
+    assert!(
+        ret.diagnostics.is_empty(),
+        "parse errors: {:?}",
+        ret.diagnostics
+    );
     let components = lower_program(
         &ret.program,
         src,
@@ -344,7 +352,7 @@ function A({ a, ...rest }) {
     let ret = Parser::new(&alloc, src, SourceType::tsx())
         .with_options(ParseOptions::default())
         .parse();
-    assert!(ret.errors.is_empty());
+    assert!(ret.diagnostics.is_empty());
     let components = lower_program(
         &ret.program,
         src,
@@ -370,7 +378,7 @@ fn program_rules_fired(src: &str) -> Vec<String> {
     let ret = Parser::new(&alloc, src, SourceType::tsx())
         .with_options(ParseOptions::default())
         .parse();
-    assert!(ret.errors.is_empty());
+    assert!(ret.diagnostics.is_empty());
     let components = lower_program(
         &ret.program,
         src,

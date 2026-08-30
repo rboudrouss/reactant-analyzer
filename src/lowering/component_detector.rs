@@ -214,7 +214,11 @@ mod tests {
         let ret = Parser::new(&alloc, src, SourceType::tsx())
             .with_options(ParseOptions::default())
             .parse();
-        assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
+        assert!(
+            ret.diagnostics.is_empty(),
+            "parse errors: {:?}",
+            ret.diagnostics
+        );
         detect_components(&ret.program)
             .into_iter()
             .map(|c| c.name)

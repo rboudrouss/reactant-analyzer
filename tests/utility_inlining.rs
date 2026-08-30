@@ -66,7 +66,11 @@ fn lower_file(
     let ret = OxcParser::new(&alloc, &source, SourceType::tsx())
         .with_options(ParseOptions::default())
         .parse();
-    assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
+    assert!(
+        ret.diagnostics.is_empty(),
+        "parse errors: {:?}",
+        ret.diagnostics
+    );
     (
         lower_program(&ret.program, &source, path, &mut Default::default()),
         lower_custom_hooks(&ret.program, &source, path, &mut Default::default()),

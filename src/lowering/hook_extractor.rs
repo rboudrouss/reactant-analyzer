@@ -856,7 +856,11 @@ mod tests {
         let ret = Parser::new(&alloc, src, SourceType::tsx())
             .with_options(ParseOptions::default())
             .parse();
-        assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
+        assert!(
+            ret.diagnostics.is_empty(),
+            "parse errors: {:?}",
+            ret.diagnostics
+        );
         let mut cfg = ret
             .program
             .body
@@ -1135,7 +1139,11 @@ mod tests {
         let ret = Parser::new(&alloc, src, SourceType::tsx())
             .with_options(ParseOptions::default())
             .parse();
-        assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
+        assert!(
+            ret.diagnostics.is_empty(),
+            "parse errors: {:?}",
+            ret.diagnostics
+        );
         let mut cfg = ret
             .program
             .body
@@ -1281,7 +1289,7 @@ mod tests {
         let ret = Parser::new(&alloc, src, SourceType::tsx())
             .with_options(ParseOptions::default())
             .parse();
-        assert!(ret.errors.is_empty());
+        assert!(ret.diagnostics.is_empty());
         let mut files = crate::ir::FileTable::default();
         let smap = crate::ir::SourceMap::new(src, files.intern(std::path::Path::new("test.tsx")));
         let mut cfg = ret
@@ -1312,7 +1320,11 @@ mod tests {
         let ret = Parser::new(&alloc, src, SourceType::tsx())
             .with_options(ParseOptions::default())
             .parse();
-        assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
+        assert!(
+            ret.diagnostics.is_empty(),
+            "parse errors: {:?}",
+            ret.diagnostics
+        );
         let mut cfg = ret
             .program
             .body

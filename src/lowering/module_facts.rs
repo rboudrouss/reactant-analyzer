@@ -88,7 +88,11 @@ mod tests {
         use oxc_span::SourceType;
         let alloc = Allocator::default();
         let ret = OxcParser::new(&alloc, source, SourceType::tsx()).parse();
-        assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
+        assert!(
+            ret.diagnostics.is_empty(),
+            "parse errors: {:?}",
+            ret.diagnostics
+        );
         collect_module_facts(&ret.program, Path::new("/root/a.tsx"), &FakeResolver)
     }
 

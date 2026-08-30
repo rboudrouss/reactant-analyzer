@@ -67,7 +67,11 @@ fn lower_src(src: &str) -> Vec<reactant::ir::ComponentIR> {
     let ret = OxcParser::new(&alloc, src, SourceType::tsx())
         .with_options(ParseOptions::default())
         .parse();
-    assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
+    assert!(
+        ret.diagnostics.is_empty(),
+        "parse errors: {:?}",
+        ret.diagnostics
+    );
     lower_program(
         &ret.program,
         src,
@@ -81,7 +85,11 @@ fn lower_src_with(src: &str, resolver: &dyn ImportResolver) -> Vec<reactant::ir:
     let ret = OxcParser::new(&alloc, src, SourceType::tsx())
         .with_options(ParseOptions::default())
         .parse();
-    assert!(ret.errors.is_empty(), "parse errors: {:?}", ret.errors);
+    assert!(
+        ret.diagnostics.is_empty(),
+        "parse errors: {:?}",
+        ret.diagnostics
+    );
     lower_program_with_resolver(
         &ret.program,
         src,
