@@ -225,6 +225,31 @@ call writes that slot, this value widened. The GitHub Action above is the
 corresponding gate: generated code doesn't merge until the analyzer stops
 finding divergence.
 
+## Using it from Claude Code
+
+The analyzer ships as a Claude Code plugin, so an agent can run it and act on
+the report without you explaining the output format first.
+
+```
+/plugin marketplace add rboudrouss/reactant-analyzer
+/plugin install reactant@reactant-analyzer
+```
+
+It installs two skills. `reactant-triage` runs the analyzer, sorts every
+finding into true positive, false positive or not worth fixing, and ends on a
+ranked fix plan. It knows which warnings are known limits of the analysis
+rather than bugs in your code, and it refuses to call a component clean when
+the analysis was truncated there. `reactant-rules` writes custom rule packs,
+starting with a feasibility check, because a rule that cannot be expressed
+over the semantics is refused rather than approximated.
+
+A triage runs one `check` plus one `explain` per rule it found. To stop
+approving each call, allow the binary once in `.claude/settings.json`:
+
+```json
+{ "permissions": { "allow": ["Bash(npx reactant-analyzer:*)"] } }
+```
+
 ## Plugin API
 
 When the CLI isn't enough (monorepos, workspace specifiers), drop down to the Rust API:

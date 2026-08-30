@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "reactant-analyzer",
+  "description": "The reactant static analyzer for React hook bugs, packaged for Claude Code",
+  "owner": {
+    "name": "rboudrouss"
+  },
+  "plugins": [
+    {
+      "name": "reactant",
+      "description": "Run the reactant static analyzer on a React or Next.js codebase, triage its findings into true positives, false positives and non-issues, then write custom semantic rule packs for the team's own invariants.",
+      "author": { "name": "rboudrouss" },
+      "category": "code-review",
+      "source": "./",
+      "homepage": "https://github.com/rboudrouss/reactant-analyzer"
+    }
+  ]
+}
