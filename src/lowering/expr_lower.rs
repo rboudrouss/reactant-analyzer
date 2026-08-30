@@ -776,7 +776,7 @@ fn lower_binop(op: BinaryOperator) -> IrBinOp {
         BinaryOperator::GreaterThan => IrBinOp::Gt,
         BinaryOperator::LessEqualThan => IrBinOp::Leq,
         BinaryOperator::GreaterEqualThan => IrBinOp::Geq,
-        _ => IrBinOp::Add, // fallback for bitwise, instanceof, in, etc.
+        _ => IrBinOp::Unknown, // keep unsupported operators soundly opaque.
     }
 }
 
@@ -1048,6 +1048,27 @@ mod tests {
             matches!(rhs, Expr::SummaryVal(SummaryValue::Top)),
             "exotic compound must havoc, got {rhs:?}"
         );
+    }
+
+    #[test]
+    fn unsupported_binary_operators_remain_opaque() {
+        for source in [
+            "function f(n) { return n % 2; }",
+            "function f(n) { return n >> 3; }",
+        ] {
+            let cfg = build(source);
+            let body = cfg.blocks.get(&0).expect("expected entry block");
+            assert!(
+                matches!(
+                    body.term,
+                    Terminator::Return(Expr::BinOp {
+                        op: IrBinOp::Unknown,
+                        ..
+                    })
+                ),
+                "unsupported operators must not be modeled as addition: {source}"
+            );
+        }
     }
 
     #[test]
