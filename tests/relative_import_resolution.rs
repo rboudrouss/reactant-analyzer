@@ -107,11 +107,9 @@ fn relative_hook_import_populates_resolved_file() {
     let resolved = custom_use_data.expect("resolved_file must be Some for ./hooks/useData");
     assert_eq!(
         resolved,
-        std::path::PathBuf::from(
-            hooks_path
-                .canonicalize()
-                .unwrap_or_else(|_| hooks_path.clone()),
-        ),
+        hooks_path
+            .canonicalize()
+            .unwrap_or_else(|_| hooks_path.clone()),
         "resolved_file should point at the actual useData source"
     );
 }

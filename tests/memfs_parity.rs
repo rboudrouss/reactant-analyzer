@@ -58,7 +58,7 @@ fn run_both(
 
     let native = driver::run_check(
         Arc::new(OsFileSystem),
-        &[rel.clone()],
+        std::slice::from_ref(&rel),
         &registry,
         &o,
         &display,

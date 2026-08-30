@@ -1,5 +1,5 @@
 /// Flat lattice for the boolean slot of `StateValue`: `⊥ < {True, False} < ⊤`,
-/// with `True`/`False` incomparable. Lattice ops via [`flat_lattice!`].
+/// with `True`/`False` incomparable. Lattice ops via the `flat_lattice!` macro.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoolVal {
     /// ⊥ unreachable.

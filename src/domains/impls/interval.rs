@@ -254,7 +254,7 @@ impl Interval {
     }
 }
 
-/// [a,b] ≤ [c,d] iff [a,b] ⊆ [c,d] (i.e. c ≤ a && b ≤ d). Bounds only — `is_int`
+/// `[a,b] ≤ [c,d]` iff `[a,b] ⊆ [c,d]` (i.e. c ≤ a && b ≤ d). Bounds only — `is_int`
 /// is a precision annotation and does not participate (see the struct docs).
 impl PartialOrd for Interval {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -442,8 +442,7 @@ mod tests {
     fn interval_partial_ord() {
         let narrow = Interval::point(1.0).hull(&Interval::point(2.0));
         let wide = Interval::point(0.0).hull(&Interval::point(5.0));
-        assert!(narrow < wide);
-        assert!(!(wide < narrow));
+        assert_eq!(narrow.partial_cmp(&wide), Some(Ordering::Less));
     }
 
     // ── Integrality (ADR-014 precision vs. float soundness) ─────────────────

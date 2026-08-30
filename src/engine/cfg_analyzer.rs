@@ -12,6 +12,9 @@ use crate::{
     },
 };
 
+/// Per-block entry environments produced by [`analyze_cfg`].
+pub type BlockEnvs<D> = HashMap<BlockId, AbstractEnv<D>>;
+
 /// Worklist-based abstract interpretation of a single CFG.
 ///
 /// Returns `(exit_envs, state_out)`:
@@ -39,10 +42,7 @@ pub fn analyze_cfg<'inter, T: Transfer>(
     heap: &mut Heap,
     ctx: &dyn QueryContext,
     inter: Option<&'inter InterCtx<'inter>>,
-) -> (
-    HashMap<BlockId, AbstractEnv<T::Domain>>,
-    StateStore<T::Domain>,
-) {
+) -> (BlockEnvs<T::Domain>, StateStore<T::Domain>) {
     let mut entry_envs: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
     let mut exit_envs: HashMap<BlockId, AbstractEnv<T::Domain>> = HashMap::new();
     let mut state_out = state.clone();

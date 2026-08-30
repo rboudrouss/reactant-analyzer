@@ -72,33 +72,6 @@ pub struct InterCtx<'a> {
 }
 
 impl<'a> InterCtx<'a> {
-    pub fn new(
-        registry: &'a ComponentRegistry,
-        cache: &'a RefCell<ComponentCache>,
-        shared_state: &'a RefCell<SharedStateStore>,
-        call_graph: &'a RefCell<ComponentCallGraph>,
-        stats: &'a RefCell<AnalysisStats>,
-        results: &'a RefCell<std::collections::HashMap<Symbol, AnalysisResult<StateValue>>>,
-        component_name: Symbol,
-        config: &'a Config,
-        analyze_child: AnalyzeChildFn,
-        hook_registry: Option<&'a HookRegistry>,
-    ) -> Self {
-        InterCtx {
-            registry,
-            cache,
-            shared_state,
-            call_graph,
-            stats,
-            results,
-            call_stack: RefCell::new(vec![]),
-            component_name,
-            config,
-            analyze_child,
-            hook_registry,
-        }
-    }
-
     /// Create a child context for inlining a nested component.
     /// Shares all RefCell state; new call_stack with parent pushed.
     pub fn child(&self, child_name: Symbol) -> InterCtx<'a> {

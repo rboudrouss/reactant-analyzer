@@ -519,7 +519,7 @@ pub fn rename_hook_entry(entry: HookEntry, ren: &HashMap<Var, Var>) -> HookEntry
 // ── Variable → expression substitution ────────────────────────────────────────
 
 /// Substitute variable *reads* with expressions, capture-aware. Unlike
-/// [`rename_vars_expr`] this never touches binding sites — it is the honest,
+/// `rename_vars_expr` this never touches binding sites — it is the honest,
 /// exhaustive replacement for the old hand-rolled `subst_vars` that dropped
 /// every composite expression through an `other => other` arm (so a param
 /// nested in `useState({x: param})` or `useState(() => param)` never resolved).

@@ -323,20 +323,20 @@ impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for PVal<T> {
     {
         use serde::de::Error;
         let v = serde_json::Value::deserialize(deserializer)?;
-        if let serde_json::Value::Object(m) = &v {
-            if let Some(p) = m.get("$param") {
-                if m.len() != 1 {
-                    return Err(D::Error::custom(
-                        "a {\"$param\": …} reference takes no other key",
-                    ));
-                }
-                return match p {
-                    serde_json::Value::String(s) => Ok(PVal::Param(s.clone())),
-                    other => Err(D::Error::custom(format!(
-                        "\"$param\" expects a parameter name string, got {other}"
-                    ))),
-                };
+        if let serde_json::Value::Object(m) = &v
+            && let Some(p) = m.get("$param")
+        {
+            if m.len() != 1 {
+                return Err(D::Error::custom(
+                    "a {\"$param\": …} reference takes no other key",
+                ));
             }
+            return match p {
+                serde_json::Value::String(s) => Ok(PVal::Param(s.clone())),
+                other => Err(D::Error::custom(format!(
+                    "\"$param\" expects a parameter name string, got {other}"
+                ))),
+            };
         }
         T::deserialize(v).map(PVal::Value).map_err(|e| {
             D::Error::custom(format!(

@@ -16,13 +16,13 @@ use crate::rules::{
 /// This goes beyond a syntactic linter on two axes the abstract-interpretation
 /// pipeline uniquely enables:
 ///
-/// 1. **Data-flow to the call.** [`arg_is_call_free`] chases the call through
+/// 1. **Data-flow to the call.** `arg_is_call_free` chases the call through
 ///    local bindings, so a call hidden behind a `const`/temp is still seen:
 ///    ```js
 ///    const initial = buildTree(props.data);
 ///    const [t] = useState(initial);   // ❌  linter sees `useState(initial)` — opaque
 ///    ```
-/// 2. **Effect classification of the call** (see [`InitEffect`]), which grades
+/// 2. **Effect classification of the call** (see `InitEffect`), which grades
 ///    severity instead of firing one flat warning:
 ///    - a state-setter call in init runs a state write every render → `Error`;
 ///    - a side-effecting/async call (`fetch`, `subscribe`, `setTimeout`, …)

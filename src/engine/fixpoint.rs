@@ -580,18 +580,19 @@ pub fn analyze_program(
     for root_key in &roots {
         if let Some(root_ir) = registry.get(root_key).cloned() {
             let display = registry.display_name(root_key);
-            let inter = InterCtx::new(
-                &registry,
-                &cache,
-                &shared_state,
-                &call_graph,
-                &stats,
-                &results,
-                display.clone(),
+            let inter = InterCtx {
+                registry: &registry,
+                cache: &cache,
+                shared_state: &shared_state,
+                call_graph: &call_graph,
+                stats: &stats,
+                results: &results,
+                call_stack: RefCell::new(vec![]),
+                component_name: display.clone(),
                 config,
-                analyze_component_inter as AnalyzeChildFn,
-                Some(&hook_registry),
-            );
+                analyze_child: analyze_component_inter as AnalyzeChildFn,
+                hook_registry: Some(&hook_registry),
+            };
             let result = analyze_component_impl(
                 root_ir,
                 &StateValueTransfer,

@@ -7,15 +7,15 @@ use crate::rules::{Diagnostic, Rule};
 /// to preserve soundness.  Each site is a potential source of false negatives.
 ///
 /// Four cases:
-/// - `recursion-cutoff`    component references itself (directly or transitively);
-///                           the recursive call is resolved to ⊤.
-/// - `unknown-component`   component instantiates a child not found in the
-///                           analysis registry (imported from an unanalyzed file);
-///                           props and effects of that child are treated as ⊤.
-/// - `callback-depth-cap`  callback inlining reached MAX_INLINE_DEPTH; deeper
-///                           HOF chains (`.then(() => .then(…))`) not descended.
-/// - `unknown-hook`        custom hook call whose source is not in the registry
-///                           and has no `HookSummary`; its internals are opaque (FN possible).
+/// - `recursion-cutoff` — component references itself (directly or transitively);
+///   the recursive call is resolved to ⊤.
+/// - `unknown-component` — component instantiates a child not found in the
+///   analysis registry (imported from an unanalyzed file); props and effects of
+///   that child are treated as ⊤.
+/// - `callback-depth-cap` — callback inlining reached MAX_INLINE_DEPTH; deeper
+///   HOF chains (`.then(() => .then(…))`) not descended.
+/// - `unknown-hook` — custom hook call whose source is not in the registry and
+///   has no `HookSummary`; its internals are opaque (FN possible).
 pub struct AnalysisLimitInfo;
 
 impl AnalysisLimitInfo {

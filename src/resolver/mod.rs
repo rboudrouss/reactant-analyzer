@@ -1,7 +1,7 @@
 //! File discovery and import resolution extension points.
 //!
-//! Default implementations cover the common case (recursive `*.ts*` discovery
-//! + relative imports with `.ts`/`.tsx`/index fallbacks).
+//! Default implementations cover the common case: recursive `*.ts*` discovery
+//! plus relative imports with `.ts`/`.tsx`/index fallbacks.
 //! See `docs/plugins.md` for an end-to-end plugin example.
 //!
 //! All filesystem access goes through the [`FileSystem`] seam (ADR-022 §6):
@@ -463,7 +463,7 @@ mod tests {
         }
     }
 
-    fn rel<'a>(root: &Path, files: &'a [PathBuf]) -> Vec<String> {
+    fn rel(root: &Path, files: &[PathBuf]) -> Vec<String> {
         let mut names: Vec<String> = files
             .iter()
             .map(|p| {

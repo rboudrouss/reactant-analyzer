@@ -1,5 +1,5 @@
-//! Registry of utility [`FunctionIR`]s, mirroring [`ComponentRegistry`] /
-//! [`HookRegistry`].
+//! Registry of utility [`FunctionIR`]s, mirroring [`crate::engine::ComponentRegistry`] /
+//! [`crate::engine::HookRegistry`].
 
 use std::path::PathBuf;
 

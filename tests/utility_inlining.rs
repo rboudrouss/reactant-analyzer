@@ -79,8 +79,10 @@ fn analyze(
     hooks: Vec<reactant::ir::HookIR>,
     utilities: Vec<FunctionIR>,
 ) -> reactant::engine::ProgramAnalysisResult {
-    let mut config = Config::default();
-    config.function_registry = FunctionRegistry::from_functions(utilities);
+    let config = Config {
+        function_registry: FunctionRegistry::from_functions(utilities),
+        ..Default::default()
+    };
     let reg = ComponentRegistry::from_components(components);
     let hook_reg = HookRegistry::from_hooks(hooks);
     analyze_program(reg, hook_reg, RootStrategy::AllComponents, &config)

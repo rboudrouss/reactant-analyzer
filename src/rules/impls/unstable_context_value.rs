@@ -22,7 +22,7 @@ use crate::rules::{Diagnostic, Rule, RuleCtx};
 ///   kind only when `X` is a module-level `createContext(…)` reached through a
 ///   React import. An imported context is not proven here and is skipped —
 ///   precision lost, never soundness.
-/// - **A proven-fresh value only.** [`ValueIdentity::FreshEveryRender`] is a
+/// - **A proven-fresh value only.** `ValueIdentity::FreshEveryRender` is a
 ///   must-fact (`is_unstable_reference_only`, not the `stability` verdict whose
 ///   `per-render` also covers a moving primitive — a number that changes is not
 ///   an identity problem).

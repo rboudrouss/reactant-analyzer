@@ -43,7 +43,7 @@ impl FileSystem for OsFileSystem {
 }
 
 /// In-memory filesystem over a path → content map. Keys are lexically
-/// normalized on insert (`.`/`..` collapsed — same [`super::normalize`]
+/// normalized on insert (`.`/`..` collapsed — same `normalize`
 /// contract as the resolvers, which build candidate paths lexically).
 pub struct MemFileSystem {
     files: BTreeMap<PathBuf, String>,

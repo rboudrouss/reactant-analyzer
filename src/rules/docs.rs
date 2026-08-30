@@ -25,7 +25,7 @@ pub struct RuleDoc {
 
 impl RuleDoc {
     /// Runtime constructor for dynamically loaded rules (ADR-022): pack docs
-    /// own their strings. The static table below uses [`doc`].
+    /// own their strings. The static table below uses `doc`.
     pub fn new(
         name: impl Into<Cow<'static, str>>,
         summary: impl Into<Cow<'static, str>>,

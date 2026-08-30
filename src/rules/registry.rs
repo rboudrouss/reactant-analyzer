@@ -470,8 +470,10 @@ mod tests {
     fn allow_restricts_visibility() {
         let (prog, name) = one_component();
         let mut reg = registry_with_stub();
-        let mut o = RuleOverrides::default();
-        o.allow = Some(BTreeSet::from(["missing-deps".to_string()]));
+        let o = RuleOverrides {
+            allow: Some(BTreeSet::from(["missing-deps".to_string()])),
+            ..Default::default()
+        };
         reg.set_overrides(o).unwrap();
         let findings = reg.check_component(&prog, &name);
         assert!(!findings.diagnostics.iter().any(|d| d.rule == "test/stub"));

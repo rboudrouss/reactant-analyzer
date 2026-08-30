@@ -85,7 +85,7 @@ pub(crate) fn collect_provider_sites(comp: &AnalysisResult<StateValue>) -> Vec<P
             });
         }
     }
-    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found.sort_by_key(|a| a.0);
     found.into_iter().map(|(_, site)| site).collect()
 }
 

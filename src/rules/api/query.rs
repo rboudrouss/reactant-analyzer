@@ -59,7 +59,7 @@ impl Provenance {
 
 /// A certified MUST fact: the evidence plus its provenance.
 ///
-/// The constructor ([`Certified::mint`]) is private to this module. Rule code in
+/// The constructor (`Certified::mint`) is private to this module. Rule code in
 /// sibling modules can only [`Certified::evidence`]/[`Certified::provenance`] —
 /// it can never forge a token. This is the enforcement: an `Error` is reachable
 /// only from a `Certified`, and a `Certified` only from a must-primitive here.
@@ -581,7 +581,7 @@ pub struct InitSetterCall;
 /// `All` iff `init` syntactically calls a state setter (a `StateSetter` or a
 /// setter-var callee): the write runs on every render — a certain misuse
 /// (ADR-021 §3). `None` otherwise. Mirrors the `Setter` branch of
-/// `lazy_init::classify_init_effect` via the shared [`crate::rules::collect_callees`].
+/// `lazy_init::classify_init_effect` via the shared `collect_callees`.
 pub fn must_init_calls_setter(init: &Expr, setters: &HashSet<Var>) -> MustResult<InitSetterCall> {
     let mut callees = Vec::new();
     crate::rules::collect_callees(init, &mut callees);
@@ -614,7 +614,7 @@ pub struct MovingFeeder {
 /// What the domain proves about a seeding prop's motion across renders.
 ///
 /// `Proven` carries its [`Certified`] token, minted HERE at the point of
-/// knowledge ([`slot_write_evidence`] — the owner's setter is really
+/// knowledge (`slot_write_evidence` — the owner's setter is really
 /// referenced), not vouched for by a caller-supplied boolean.
 pub enum Motion {
     /// Provably never changes — kill.

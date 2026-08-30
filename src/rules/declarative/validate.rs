@@ -446,15 +446,12 @@ impl<'a> ParamEnv<'a> {
 
     /// Resolve a `PVal` in a position that admits params of type `expected`
     /// (`None` = the position takes no param at all).
-    fn resolve<T: serde::de::DeserializeOwned>(
+    fn resolve<T: serde::de::DeserializeOwned + Clone>(
         &self,
         pv: &PVal<T>,
         expected: Option<ParamType>,
         path: &str,
-    ) -> Result<T, PackError>
-    where
-        T: Clone,
-    {
+    ) -> Result<T, PackError> {
         match pv {
             PVal::Value(v) => Ok(v.clone()),
             PVal::Param(name) => {
@@ -1262,11 +1259,7 @@ pub(crate) fn validate_pack(
             ));
         }
         let full_id = format!("{}/{}", pack.name, def.id);
-        let options = options_by_full_id.get(&full_id).map(|m| {
-            // Only pass through when non-empty: an empty options object is
-            // indistinguishable from no options.
-            m
-        });
+        let options = options_by_full_id.get(&full_id);
         resolved.push(validate_rule(
             &pack.name,
             i,

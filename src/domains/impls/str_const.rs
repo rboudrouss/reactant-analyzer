@@ -146,8 +146,7 @@ mod tests {
     fn partial_ord_subset() {
         let single = StrConst::singleton("a".to_string());
         let pair = set(&["a", "b"]);
-        assert!(single < pair);
-        assert!(!(pair < single));
+        assert_eq!(single.partial_cmp(&pair), Some(Ordering::Less));
         assert!(single <= StrConst::Top);
         assert!(StrConst::Bottom <= single);
     }

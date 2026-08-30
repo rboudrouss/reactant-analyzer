@@ -59,16 +59,12 @@ pub fn collect_setter_calls_with_extra(
             .or_insert_with(|| Arc::clone(v));
     }
     let mut found: HashMap<Var, (Option<SourceRange>, Option<BlockId>)> = HashMap::new();
-    let mut walking = HashSet::new();
-    collect_setter_calls_inner(
-        cfg,
+    let mut walk = SetterWalk {
         setter_vars,
-        max_depth,
-        &fn_bindings,
-        &mut found,
-        true,
-        &mut walking,
-    );
+        fn_bindings: &fn_bindings,
+        walking: HashSet::new(),
+    };
+    walk.cfg(cfg, max_depth, &mut found, true);
     found
         .into_iter()
         .map(|(var, (span, block_id))| SetterCall {
@@ -168,85 +164,6 @@ pub(in crate::rules) fn collect_fn_bindings(cfg: &CFG) -> HashMap<Var, Arc<CFG>>
         }
     }
     map
-}
-
-/// `top_level = true` → block IDs recorded are from the caller's CFG, meaningful for dominance.
-/// `top_level = false` → inside a nested FnLit; block IDs are `None`.
-///
-/// `walking` is the set of CFGs on the current expansion *stack*, keyed by
-/// identity. It must stay a stack (pushed on entry, popped on exit), not a
-/// global visited set: a body first reached with no depth left and later with
-/// budget to spare has to be walked again, so a global set would lose findings.
-/// Skipping only re-entrant walks loses none — a cycle re-enters a body at a
-/// budget no larger than the one it is already being walked at, so the spliced
-/// cycle-free path reaches the same CFGs and `found` only ever grows.
-fn collect_setter_calls_inner(
-    cfg: &CFG,
-    setter_vars: &HashSet<Var>,
-    depth: usize,
-    fn_bindings: &HashMap<Var, Arc<CFG>>,
-    found: &mut HashMap<Var, (Option<SourceRange>, Option<BlockId>)>,
-    top_level: bool,
-    walking: &mut HashSet<usize>,
-) {
-    let key = cfg as *const CFG as usize;
-    if !walking.insert(key) {
-        return;
-    }
-    let mut visited = HashSet::new();
-    let mut queue = VecDeque::new();
-    queue.push_back(cfg.entry);
-    visited.insert(cfg.entry);
-
-    while let Some(bid) = queue.pop_front() {
-        let block_id = if top_level { Some(bid) } else { None };
-        if let Some(block) = cfg.blocks.get(&bid) {
-            for stmt in &block.stmts {
-                check_stmt_for_setters(
-                    stmt,
-                    block_id,
-                    setter_vars,
-                    depth,
-                    fn_bindings,
-                    found,
-                    walking,
-                );
-            }
-            match &block.term {
-                Terminator::Return(expr) => {
-                    check_expr_for_setters(
-                        expr,
-                        None,
-                        block_id,
-                        setter_vars,
-                        depth,
-                        fn_bindings,
-                        found,
-                        walking,
-                    );
-                }
-                Terminator::Branch { cond, .. } => {
-                    check_expr_for_setters(
-                        cond,
-                        None,
-                        block_id,
-                        setter_vars,
-                        depth,
-                        fn_bindings,
-                        found,
-                        walking,
-                    );
-                }
-                _ => {}
-            }
-            for succ in cfg.successors(bid) {
-                if visited.insert(succ) {
-                    queue.push_back(succ);
-                }
-            }
-        }
-    }
-    walking.remove(&key);
 }
 
 /// Extend a `setter var → state label` map with alias `let a = b` bindings in
@@ -375,100 +292,114 @@ pub(crate) fn all_setter_labels(comp: &AnalysisResult<StateValue>) -> HashMap<Va
     labels
 }
 
-fn check_stmt_for_setters(
-    stmt: &Stmt,
-    block_id: Option<BlockId>,
-    setter_vars: &HashSet<Var>,
-    depth: usize,
-    fn_bindings: &HashMap<Var, Arc<CFG>>,
-    found: &mut HashMap<Var, (Option<SourceRange>, Option<BlockId>)>,
-    walking: &mut HashSet<usize>,
-) {
-    let (expr, span) = match stmt {
-        Stmt::ExprStmt(e, span) => (e, *span),
-        // Also descend Let rhs FnLits.
-        Stmt::Let { rhs, .. } => (rhs, None),
-        Stmt::Assign { rhs, .. } => (rhs, None),
-        Stmt::MemberWrite { rhs, .. } => (rhs, None),
-    };
-    check_expr_for_setters(
-        expr,
-        span,
-        block_id,
-        setter_vars,
-        depth,
-        fn_bindings,
-        found,
-        walking,
-    );
+/// Threads the walk's fixed context (`setter_vars`, `fn_bindings`) and its
+/// expansion stack through the mutually recursive CFG/stmt/expr descent, so
+/// each step only takes what actually varies per call.
+///
+/// `walking` is the set of CFGs on the current expansion *stack*, keyed by
+/// identity. It must stay a stack (pushed on entry, popped on exit), not a
+/// global visited set: a body first reached with no depth left and later with
+/// budget to spare has to be walked again, so a global set would lose findings.
+/// Skipping only re-entrant walks loses none — a cycle re-enters a body at a
+/// budget no larger than the one it is already being walked at, so the spliced
+/// cycle-free path reaches the same CFGs and `found` only ever grows.
+struct SetterWalk<'a> {
+    setter_vars: &'a HashSet<Var>,
+    fn_bindings: &'a HashMap<Var, Arc<CFG>>,
+    walking: HashSet<usize>,
 }
 
-fn check_expr_for_setters(
-    expr: &Expr,
-    stmt_span: Option<SourceRange>,
-    block_id: Option<BlockId>,
-    setter_vars: &HashSet<Var>,
-    depth: usize,
-    fn_bindings: &HashMap<Var, Arc<CFG>>,
-    found: &mut HashMap<Var, (Option<SourceRange>, Option<BlockId>)>,
-    walking: &mut HashSet<usize>,
-) {
-    if let Expr::Call { fn_, args } = expr {
-        if let Expr::Var(name) = fn_.as_ref() {
-            if setter_vars.contains(name) {
-                found.entry(name.clone()).or_insert((stmt_span, block_id));
-            }
-            // B6: direct call to a locally-bound function descend its body, propagate outer block_id.
-            if depth > 0
-                && let Some(body) = fn_bindings.get(name)
-            {
-                let mut inner: HashMap<Var, (Option<SourceRange>, Option<BlockId>)> =
-                    HashMap::new();
-                collect_setter_calls_inner(
-                    body,
-                    setter_vars,
-                    depth - 1,
-                    fn_bindings,
-                    &mut inner,
-                    false,
-                    walking,
-                );
-                for (var, (span, _)) in inner {
-                    found.entry(var).or_insert((span, block_id));
+type Found = HashMap<Var, (Option<SourceRange>, Option<BlockId>)>;
+
+impl<'a> SetterWalk<'a> {
+    /// `top_level = true` → block IDs recorded are from the caller's CFG, meaningful for dominance.
+    /// `top_level = false` → inside a nested FnLit; block IDs are `None`.
+    fn cfg(&mut self, cfg: &'a CFG, depth: usize, found: &mut Found, top_level: bool) {
+        let key = cfg as *const CFG as usize;
+        if !self.walking.insert(key) {
+            return;
+        }
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(cfg.entry);
+        visited.insert(cfg.entry);
+
+        while let Some(bid) = queue.pop_front() {
+            let block_id = if top_level { Some(bid) } else { None };
+            if let Some(block) = cfg.blocks.get(&bid) {
+                for stmt in &block.stmts {
+                    self.stmt(stmt, block_id, depth, found);
+                }
+                match &block.term {
+                    Terminator::Return(expr) => {
+                        self.expr(expr, None, block_id, depth, found);
+                    }
+                    Terminator::Branch { cond, .. } => {
+                        self.expr(cond, None, block_id, depth, found);
+                    }
+                    _ => {}
+                }
+                for succ in cfg.successors(bid) {
+                    if visited.insert(succ) {
+                        queue.push_back(succ);
+                    }
                 }
             }
         }
-        for arg in args {
-            match arg {
-                // Inline FnLit arg descend body, costs one depth level.
-                Expr::FnLit { body_cfg, .. } if depth > 0 => {
-                    collect_setter_calls_inner(
-                        body_cfg,
-                        setter_vars,
-                        depth - 1,
-                        fn_bindings,
-                        found,
-                        false,
-                        walking,
-                    );
+        self.walking.remove(&key);
+    }
+
+    fn stmt(&mut self, stmt: &'a Stmt, block_id: Option<BlockId>, depth: usize, found: &mut Found) {
+        let (expr, span) = match stmt {
+            Stmt::ExprStmt(e, span) => (e, *span),
+            // Also descend Let rhs FnLits.
+            Stmt::Let { rhs, .. } => (rhs, None),
+            Stmt::Assign { rhs, .. } => (rhs, None),
+            Stmt::MemberWrite { rhs, .. } => (rhs, None),
+        };
+        self.expr(expr, span, block_id, depth, found);
+    }
+
+    fn expr(
+        &mut self,
+        expr: &'a Expr,
+        stmt_span: Option<SourceRange>,
+        block_id: Option<BlockId>,
+        depth: usize,
+        found: &mut Found,
+    ) {
+        if let Expr::Call { fn_, args } = expr {
+            if let Expr::Var(name) = fn_.as_ref() {
+                if self.setter_vars.contains(name) {
+                    found.entry(name.clone()).or_insert((stmt_span, block_id));
                 }
-                // B5: variable arg name resolution, no depth cost — so this is
-                // the arm that can cycle (`const tick = t => raf(tick)`); the
-                // `walking` stack is what terminates it.
-                Expr::Var(name) => {
-                    if let Some(body) = fn_bindings.get(name) {
-                        collect_setter_calls_inner(
-                            body,
-                            setter_vars,
-                            depth,
-                            fn_bindings,
-                            found,
-                            false,
-                            walking,
-                        );
+                // B6: direct call to a locally-bound function descend its body, propagate outer block_id.
+                if depth > 0
+                    && let Some(body) = self.fn_bindings.get(name)
+                {
+                    let mut inner = Found::new();
+                    self.cfg(body, depth - 1, &mut inner, false);
+                    for (var, (span, _)) in inner {
+                        found.entry(var).or_insert((span, block_id));
                     }
                 }
-                _ => {}
+            }
+            for arg in args {
+                match arg {
+                    // Inline FnLit arg descend body, costs one depth level.
+                    Expr::FnLit { body_cfg, .. } if depth > 0 => {
+                        self.cfg(body_cfg, depth - 1, found, false);
+                    }
+                    // B5: variable arg name resolution, no depth cost — so this is
+                    // the arm that can cycle (`const tick = t => raf(tick)`); the
+                    // `walking` stack is what terminates it.
+                    Expr::Var(name) => {
+                        if let Some(body) = self.fn_bindings.get(name) {
+                            self.cfg(body, depth, found, false);
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
     }

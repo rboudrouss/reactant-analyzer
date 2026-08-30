@@ -10,7 +10,7 @@
 //!
 //! The table is deliberately uninterpreted. It records the directive strings
 //! verbatim and the edges as resolved paths; assigning meaning to
-//! `"use client"` is the caller's job ([`ModuleTable::directive_closure`] is
+//! `"use client"` is the caller's job ([`ModuleTable::reachable_from`] is
 //! the one shared mechanism, because "the directive marks a boundary and
 //! everything imported below it inherits it" is how *every* RSC directive
 //! works, not something specific to one of them).

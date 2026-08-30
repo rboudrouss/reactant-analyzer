@@ -521,12 +521,12 @@ impl AbstractDomain for StateValue {
             BoolVal::Top => BoolVal::True,
             b => b,
         };
-        if let StrConst::Set(set) = &self.str {
-            if set.contains("") {
-                let filtered: BTreeSet<String> =
-                    set.iter().filter(|s| !s.is_empty()).cloned().collect();
-                self.str = StrConst::from_set(filtered); // empty set → ⊥
-            }
+        if let StrConst::Set(set) = &self.str
+            && set.contains("")
+        {
+            let filtered: BTreeSet<String> =
+                set.iter().filter(|s| !s.is_empty()).cloned().collect();
+            self.str = StrConst::from_set(filtered); // empty set → ⊥
         }
         self
     }
@@ -1032,8 +1032,7 @@ mod tests {
     fn str_partial_ord_subset() {
         let single = str_singleton("a");
         let pair = str_pair("a", "b");
-        assert!(single < pair);
-        assert!(!(pair < single));
+        assert_eq!(single.partial_cmp(&pair), Some(Ordering::Less));
         assert!(single <= StateValue::str_top());
     }
 

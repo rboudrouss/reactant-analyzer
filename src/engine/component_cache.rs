@@ -118,6 +118,23 @@ fn props_equal(a: &HashMap<Symbol, StateValue>, b: &HashMap<Symbol, StateValue>)
     true
 }
 
+/// Pointwise join of props maps.  Keys absent in some entry are treated as `Top`.
+fn join_all_props(all: &[&HashMap<Symbol, StateValue>]) -> HashMap<Symbol, StateValue> {
+    let mut result: HashMap<Symbol, StateValue> = HashMap::new();
+    for props in all {
+        for k in props.keys() {
+            result.entry(k.clone()).or_insert(StateValue::bottom());
+        }
+    }
+    for (k, v) in &mut result {
+        for props in all {
+            let val = props.get(k).cloned().unwrap_or(StateValue::top());
+            *v = v.clone().join(&val);
+        }
+    }
+    result
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -259,21 +276,4 @@ mod tests {
         // Lookup with Stable ≠ Top (strict equality fails)
         assert!(cache.lookup(&"C".to_string(), &stable_props()).is_none());
     }
-}
-
-/// Pointwise join of props maps.  Keys absent in some entry are treated as `Top`.
-fn join_all_props(all: &[&HashMap<Symbol, StateValue>]) -> HashMap<Symbol, StateValue> {
-    let mut result: HashMap<Symbol, StateValue> = HashMap::new();
-    for props in all {
-        for k in props.keys() {
-            result.entry(k.clone()).or_insert(StateValue::bottom());
-        }
-    }
-    for (k, v) in &mut result {
-        for props in all {
-            let val = props.get(k).cloned().unwrap_or(StateValue::top());
-            *v = v.clone().join(&val);
-        }
-    }
-    result
 }

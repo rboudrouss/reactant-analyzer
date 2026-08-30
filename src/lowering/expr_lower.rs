@@ -665,7 +665,7 @@ fn lower_jsx_props(
     let mut prop_spans: HashMap<String, Option<SourceRange>> = HashMap::new();
     let fields: Vec<(String, Expr)> = attrs
         .iter()
-        .filter_map(|attr| match attr {
+        .map(|attr| match attr {
             JSXAttributeItem::Attribute(a) => {
                 let key = match &a.name {
                     JSXAttributeName::Identifier(ident) => ident.name.to_string(),
@@ -691,7 +691,7 @@ fn lower_jsx_props(
                     Some(JSXAttributeValue::Fragment(f)) => lower_jsx_fragment(f, builder),
                     None => Expr::Lit(Prim::Bool(true)), // boolean attribute: <Comp disabled />
                 };
-                Some((key, val))
+                (key, val)
             }
             // Keep spreads under a synthetic `...N` key: `<X {...props}/>`
             // forwards every prop — dropping it makes forwarded setters
@@ -699,10 +699,10 @@ fn lower_jsx_props(
             // The key can't collide with a real JSX attribute name.
             JSXAttributeItem::SpreadAttribute(s) => {
                 let spread_id = builder.next_expr_id();
-                Some((
+                (
                     format!("...{}", spread_id.0),
                     lower_expr(&s.argument, builder),
-                ))
+                )
             }
         })
         .collect();

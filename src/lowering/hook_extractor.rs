@@ -16,10 +16,9 @@ use crate::ir::{
 /// Scan every effect body for `addEventListener(str, FnLit)` and append a
 /// `HookEntry::Handler` for each. Variable callbacks / dynamic names skipped.
 pub fn extract_subscriptions(hooks: &mut Vec<HookEntry>, next_label: &mut HookLabel) {
-    let n = hooks.len();
     let mut new_handlers: Vec<HookEntry> = Vec::new();
-    for i in 0..n {
-        if let HookEntry::Effect { body_cfg, .. } = &hooks[i] {
+    for hook in hooks.iter() {
+        if let HookEntry::Effect { body_cfg, .. } = hook {
             collect_subscriptions_in_cfg(body_cfg, &mut new_handlers, next_label);
         }
     }
