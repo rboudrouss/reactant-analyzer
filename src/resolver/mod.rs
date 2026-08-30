@@ -88,7 +88,10 @@ pub struct LoweredProgram {
     pub utilities: Vec<FunctionIR>,
     /// Number of files successfully parsed and lowered.
     pub file_count: usize,
-    /// Files skipped due to read or parse errors, with the error message.
+    /// Files that hit a read or parse error, with the first message. A read
+    /// error or a parser panic means the file was skipped; a *recovered*
+    /// syntax error means the file was still lowered from a partial AST, so
+    /// this list is a report channel, not a skip list.
     /// Not printed here — the caller decides how to report them.
     pub parse_errors: Vec<(PathBuf, String)>,
     /// `FileId ↔ path` interning table shared by every span produced during
@@ -108,8 +111,10 @@ pub fn lower_files(files: &[PathBuf], resolver: &dyn ImportResolver) -> LoweredP
 
 /// Parse and lower an explicit list of files, reading sources through `fs`.
 ///
-/// Read/parse failures don't abort the run: the file is skipped and recorded
-/// in [`LoweredProgram::parse_errors`].
+/// Read/parse failures don't abort the run: they are recorded in
+/// [`LoweredProgram::parse_errors`]. The file is only skipped when nothing can
+/// be lowered from it (read error, or a parser panic that leaves the program
+/// empty); a syntax error the parser recovered from is reported and analysed.
 pub fn lower_files_with(
     fs: &dyn FileSystem,
     files: &[PathBuf],
@@ -151,10 +156,18 @@ pub fn lower_files_with(
         let ret = OxcParser::new(&alloc, &source, source_type)
             .with_options(ParseOptions::default())
             .parse();
-        if !ret.errors.is_empty() {
+        if let Some(first) = ret.diagnostics.first() {
             lowered
                 .parse_errors
-                .push((path.clone(), ret.errors[0].message.to_string()));
+                .push((path.clone(), first.message.to_string()));
+        }
+        // `panicked` is oxc's only "this AST is unusable" signal (the program
+        // is empty). The parser recovers from every other syntax error and
+        // still returns a lowerable program, so skipping on a non-empty
+        // diagnostic list would drop whole files from the analysis — a
+        // forbidden false negative, and a growing one: oxc keeps moving TS
+        // semantic checks into the parser.
+        if ret.panicked {
             continue;
         }
         lowered.components.extend(lower_program_with_resolver(
@@ -262,9 +275,9 @@ pub fn analyze_lowered(
 
 /// Parse, lower, and analyze an explicit list of files.
 ///
-/// Parse errors are reported on stderr and the file is skipped (same contract
-/// as [`analyze_with_resolvers`]). Returns the analysis result and the number
-/// of files actually analysed.
+/// Parse errors are reported on stderr; the file is skipped only when the
+/// parser could not recover (same contract as [`analyze_with_resolvers`]).
+/// Returns the analysis result and the number of files actually analysed.
 pub fn analyze_files(
     files: &[PathBuf],
     resolver: &dyn ImportResolver,
@@ -625,6 +638,67 @@ mod tests {
                 .resolve(&from, "react")
                 .is_none()
         );
+    }
+
+    /// A syntax error the parser recovered from must not cost us the file.
+    /// oxc keeps moving TS semantic checks into the parser, so keying the
+    /// skip on "any diagnostic" silently drops more and more real files —
+    /// a forbidden false negative. Only `panicked` means "nothing to lower".
+    #[test]
+    fn recovered_syntax_error_still_lowers_the_file() {
+        let tmp = Tmp::new("recovered-parse");
+        let file = tmp.write(
+            "App.tsx",
+            r#"
+import { useState, useEffect } from "react";
+
+const z = a ?? b || c;
+
+export function App() {
+  const [n, setN] = useState(0);
+  useEffect(() => { setN(n + 1); });
+  return <div>{n}</div>;
+}
+"#,
+        );
+
+        let lowered = lower_files(
+            std::slice::from_ref(&file),
+            &DefaultImportResolver::default(),
+        );
+
+        assert_eq!(lowered.file_count, 1, "the file must still be analysed");
+        assert!(
+            lowered.components.iter().any(|c| c.name == "App"),
+            "the component must be lowered from the recovered AST"
+        );
+        assert_eq!(
+            lowered.parse_errors.len(),
+            1,
+            "the diagnostic is still reported, it just no longer skips"
+        );
+        assert_eq!(lowered.parse_errors[0].0, file);
+    }
+
+    /// The other side of the contract: when the parser panics the program is
+    /// empty, so the file is skipped and recorded.
+    #[test]
+    fn unrecoverable_parse_error_skips_the_file() {
+        let tmp = Tmp::new("panicked-parse");
+        let file = tmp.write(
+            "Broken.tsx",
+            "const = ;\nexport function App() { return <div />; }\n",
+        );
+
+        let lowered = lower_files(
+            std::slice::from_ref(&file),
+            &DefaultImportResolver::default(),
+        );
+
+        assert_eq!(lowered.file_count, 0);
+        assert!(lowered.components.is_empty());
+        assert_eq!(lowered.parse_errors.len(), 1);
+        assert_eq!(lowered.parse_errors[0].0, file);
     }
 
     #[test]
