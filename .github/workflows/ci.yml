@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Formatting is the cheapest gate — fail fast, no toolchain caching needed.
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-features --locked
+
+  # `cli` and `schema-gen` are opt-out features so the wasm build can drop clap
+  # and schemars (Cargo.toml). Nothing else exercises that configuration, and a
+  # stray `use clap::…` in the library only fails there.
+  no-default-features:
+    name: lib without default features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --lib --no-default-features --locked -- -D warnings
+
+  # The module docs lean on intra-doc links ([`FileSystem`], [`analyze_cfg`]…);
+  # a rename silently breaks them unless rustdoc is run with warnings denied.
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps --all-features --locked
+
+  # The published artifact is the wasm core, not the native binary: build the
+  # npm package the way npm/build.sh does and run the byte-for-byte parity
+  # smoke test against a release native build.
+  wasm-parity:
+    name: wasm ↔ native parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      # rust-cache also caches ~/.cargo/bin, so wasm-bindgen-cli is compiled
+      # once per lockfile rather than on every run.
+      - uses: Swatinem/rust-cache@v2
+      # Must match the wasm-bindgen version in Cargo.lock, or the generated
+      # glue and the .wasm disagree at load time.
+      - name: Install wasm-bindgen-cli
+        run: |
+          version=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock \
+            | grep '^version' | head -1 | cut -d'"' -f2)
+          echo "pinning wasm-bindgen-cli $version"
+          cargo install wasm-bindgen-cli --version "$version" --locked
+      - run: cargo build --release --locked
+      - run: npm/build.sh
+      # Byte-for-byte wasm↔native comparison, plus `packs build` byte-identity
+      # and `gen-pack-dts.js --check` (npm/test/packs.sh).
+      - run: npm/test/smoke.sh
+
+  # action.yml is a composite action consumed by other repos: nothing else in
+  # the test suite parses it or its runner script.
+  action:
+    name: action.yml wiring
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node --check scripts/gh-action.mjs
+      - name: Workflows and action.yml are valid
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
+            | bash -s -- latest .
+          ./actionlint -color

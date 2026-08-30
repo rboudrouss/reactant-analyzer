@@ -1,0 +1,13 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    # oxc moves fast and its AST is a hard dependency of the lowering layer;
+    # a minor bump is a real review, not an auto-merge.
+    open-pull-requests-limit: 5
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
