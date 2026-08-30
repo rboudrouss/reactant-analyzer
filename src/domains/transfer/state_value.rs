@@ -689,6 +689,7 @@ fn eval_binop(op: &BinOp, lhs: StateValue, rhs: StateValue) -> StateValue {
         BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Leq | BinOp::Geq => {
             StateValue::boolean(BoolVal::Top)
         }
+        BinOp::Unknown => StateValue::top(),
     }
 }
 
@@ -837,6 +838,17 @@ mod tests {
             ),
             StateValue::number(Interval::point(3.0))
         );
+    }
+
+    #[test]
+    fn eval_binop_unknown_is_top() {
+        let value = eval_binop(
+            &BinOp::Unknown,
+            StateValue::number(Interval::point(0.0)),
+            StateValue::number(Interval::point(2.0)),
+        );
+
+        assert_eq!(value, StateValue::top());
     }
 
     #[test]

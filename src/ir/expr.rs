@@ -31,6 +31,8 @@ pub enum BinOp {
     Gt,
     Leq,
     Geq,
+    /// An operator whose concrete semantics are not modeled by the abstract domain.
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
