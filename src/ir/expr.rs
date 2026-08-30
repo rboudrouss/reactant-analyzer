@@ -39,6 +39,10 @@ pub enum BinOp {
 pub enum UnaryOp {
     Neg,
     Not,
+    /// An operator whose concrete semantics are not modeled by the abstract
+    /// domain (`~`, `typeof`, unary `+`). Evaluated as ⊤ — never as the
+    /// identity, which would falsify the operand's value.
+    Unknown,
 }
 
 #[derive(Debug, Clone)]

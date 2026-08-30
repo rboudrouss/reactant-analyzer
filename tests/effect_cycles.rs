@@ -51,6 +51,29 @@ fn infinite_loop_diags(src: &str, component: &str) -> Vec<(String, Severity, Str
         .collect()
 }
 
+// ── indirect callbacks ───────────────────────────────────────────────────────
+
+#[test]
+fn effect_with_a_variable_callback_is_still_analysed() {
+    // The inline form has always been reported. Passing the identical body by
+    // name used to hand the engine an `Unreachable` CFG, so the component came
+    // out clean *and* certified `verified infinite-loop`.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [c, setC] = useState(0);
+  const handler = () => { setC(c + 1); };
+  useEffect(handler);
+  return <div>{c}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        !diags.is_empty(),
+        "an effect whose callback is passed by name must still be analysed"
+    );
+}
+
 // ── all-must cycles → Error ──────────────────────────────────────────────────
 
 #[test]

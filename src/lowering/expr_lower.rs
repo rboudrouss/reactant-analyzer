@@ -24,6 +24,24 @@ fn opaque() -> Expr {
     Expr::SummaryVal(SummaryValue::Top)
 }
 
+/// Lower an expression the enclosing composite cannot represent, keeping it as
+/// a statement so its reads and side effects stay visible. Dropping a
+/// sub-expression outright is not an over-approximation: the deps rules consume
+/// a missing read as "this variable is not used" — a claim, not ignorance.
+fn lower_for_effect(expr: &Expression, builder: &mut BlockBuilder) {
+    let span = builder.span_at(expr.span().start);
+    let lowered = lower_expr(expr, builder);
+    builder.push_stmt(Stmt::ExprStmt(lowered, span));
+}
+
+/// A field name no source property can produce, so a value kept for its reads
+/// is never reachable through a real `FieldAccess`. `collect_escaping_setters`
+/// and the free-variable walk visit `ObjectLit` fields by value, not by name,
+/// so the value stays fully visible to them. Same device as the JSX spread key.
+fn synthetic_key(builder: &mut BlockBuilder, prefix: &str) -> String {
+    format!("{prefix}{}", builder.next_expr_id().0)
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Lower an Oxc expression to IR.
@@ -114,7 +132,20 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                     op: IrUnaryOp::Not,
                     arg: Box::new(arg),
                 },
-                _ => arg,
+                // `void e` is *always* `undefined`, whatever `e` is. Keep `e`
+                // as a statement so its reads and side effects survive.
+                UnaryOperator::Void => {
+                    builder.push_stmt(Stmt::ExprStmt(arg, builder.span_at(un.span.start)));
+                    Expr::Lit(Prim::Unit)
+                }
+                // `~e`, `typeof e`, `+e`: coercions the domain does not model.
+                // Returning `arg` unchanged aliased them onto the *identity*,
+                // which falsifies the value (`~5` is `-6`, not `5`) — the same
+                // defect `BinOp::Unknown` fixed on the binary side.
+                _ => Expr::UnaryOp {
+                    op: IrUnaryOp::Unknown,
+                    arg: Box::new(arg),
+                },
             }
         }
         // `i++` / `--i`: emit the write (`i = i ± 1`), then yield the variable.
@@ -173,11 +204,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         Expression::CallExpression(call) => lower_call(call, builder),
         Expression::NewExpression(new_) => {
             let fn_ = lower_expr(&new_.callee, builder);
-            let args = new_
-                .arguments
-                .iter()
-                .filter_map(|a| a.as_expression().map(|e| lower_expr(e, builder)))
-                .collect();
+            let args = lower_arguments(&new_.arguments, builder);
             Expr::Call {
                 fn_: Box::new(fn_),
                 args,
@@ -214,30 +241,59 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         // ── Composites ────────────────────────────────────────────────────────
         Expression::ObjectExpression(obj) => {
             let id = builder.next_expr_id();
-            let fields = obj
-                .properties
-                .iter()
-                .filter_map(|prop| match prop {
+            let mut fields: Vec<(String, Expr)> = vec![];
+            for prop in &obj.properties {
+                match prop {
                     ObjectPropertyKind::ObjectProperty(p) => {
                         let key = match &p.key {
                             PropertyKey::StaticIdentifier(ident) => ident.name.to_string(),
                             PropertyKey::StringLiteral(s) => s.value.to_string(),
-                            _ => return None,
+                            // Computed key (`{ [k]: v }`): the key expression
+                            // runs, and `v` is still in the object — under a
+                            // synthetic name, since the real one is unknown.
+                            other => {
+                                if let Some(e) = other.as_expression() {
+                                    lower_for_effect(e, builder);
+                                }
+                                synthetic_key(builder, "[computed]")
+                            }
                         };
-                        Some((key, lower_expr(&p.value, builder)))
+                        let value = lower_expr(&p.value, builder);
+                        fields.push((key, value));
                     }
-                    _ => None,
-                })
-                .collect();
+                    // `{ ...opts }` forwards every one of `opts`' fields. Keep
+                    // it under a synthetic key exactly as JSX spread does —
+                    // dropping it lost the read of `opts` and any setter it
+                    // carries.
+                    ObjectPropertyKind::SpreadProperty(sp) => {
+                        let key = synthetic_key(builder, "...");
+                        let value = lower_expr(&sp.argument, builder);
+                        fields.push((key, value));
+                    }
+                }
+            }
             Expr::ObjectLit { id, fields }
         }
         Expression::ArrayExpression(arr) => {
             let id = builder.next_expr_id();
-            let elems = arr
-                .elements
-                .iter()
-                .filter_map(|el| el.as_expression().map(|e| lower_expr(e, builder)))
-                .collect();
+            let mut elems: Vec<Expr> = vec![];
+            for el in &arr.elements {
+                match el {
+                    // `[...items]` holds at least what `items` holds. Index
+                    // positions shift, but `IndexAccess` is ⊤ regardless, so
+                    // keeping the source as an element claims nothing false
+                    // and keeps its reads and setters visible.
+                    ArrayExpressionElement::SpreadElement(sp) => {
+                        elems.push(lower_expr(&sp.argument, builder));
+                    }
+                    ArrayExpressionElement::Elision(_) => {}
+                    other => {
+                        if let Some(e) = other.as_expression() {
+                            elems.push(lower_expr(e, builder));
+                        }
+                    }
+                }
+            }
             Expr::ArrayLit { id, elems }
         }
 
@@ -275,20 +331,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
 
         // ── JSX ───────────────────────────────────────────────────────────────
         Expression::JSXElement(jsx) => lower_jsx_element(jsx, builder),
-        Expression::JSXFragment(frag) => {
-            let id = builder.next_expr_id();
-            let children = frag
-                .children
-                .iter()
-                .filter_map(|c| lower_jsx_child(c, builder))
-                .collect();
-            Expr::NativeElem {
-                tag: "Fragment".to_string(),
-                props: Box::new(Expr::ObjectLit { id, fields: vec![] }),
-                children,
-                prop_spans: HashMap::new(),
-            }
-        }
+        Expression::JSXFragment(frag) => lower_jsx_fragment(frag, builder),
 
         // ── TypeScript wrappers ───────────────────────────────────────────────
         Expression::ParenthesizedExpression(p) => lower_expr(&p.expression, builder),
@@ -350,7 +393,16 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                         });
                         value
                     }
-                    None => rhs_val,
+                    // Destructuring target (`[a, b] = …`, `({ a } = …)`).
+                    // Dropping it left every `a`/`b` bound to its *previous*
+                    // value — a stale binding is an assertion, not ignorance,
+                    // so the write has to be emitted even when the exact value
+                    // cannot be tracked.
+                    None => {
+                        let span = builder.span_at(assign.span.start);
+                        lower_assignment_target(&assign.left, rhs_val.clone(), span, builder);
+                        rhs_val
+                    }
                 },
             }
         }
@@ -382,13 +434,28 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
     }
 }
 
+/// Lower a call/`new` argument list. A `...spread` argument cannot keep a
+/// position — parameters bind positionally when a callee is inlined — so it is
+/// emitted as a statement instead of guessed into a slot, which preserves its
+/// reads without claiming which parameter receives it.
+fn lower_arguments(arguments: &[Argument], builder: &mut BlockBuilder) -> Vec<Expr> {
+    let mut args = vec![];
+    for a in arguments {
+        match a {
+            Argument::SpreadElement(sp) => lower_for_effect(&sp.argument, builder),
+            other => {
+                if let Some(e) = other.as_expression() {
+                    args.push(lower_expr(e, builder));
+                }
+            }
+        }
+    }
+    args
+}
+
 fn lower_call(call: &CallExpression, builder: &mut BlockBuilder) -> Expr {
     let fn_ = lower_expr(&call.callee, builder);
-    let args = call
-        .arguments
-        .iter()
-        .filter_map(|a| a.as_expression().map(|e| lower_expr(e, builder)))
-        .collect();
+    let args = lower_arguments(&call.arguments, builder);
     let call_expr = Expr::Call {
         fn_: Box::new(fn_),
         args,
@@ -621,7 +688,7 @@ fn lower_jsx_props(
                         .map(|e| lower_expr(e, builder))
                         .unwrap_or(Expr::Lit(Prim::Unit)),
                     Some(JSXAttributeValue::Element(el)) => lower_jsx_element(el, builder),
-                    Some(JSXAttributeValue::Fragment(_)) => Expr::Lit(Prim::Unit),
+                    Some(JSXAttributeValue::Fragment(f)) => lower_jsx_fragment(f, builder),
                     None => Expr::Lit(Prim::Bool(true)), // boolean attribute: <Comp disabled />
                 };
                 Some((key, val))
@@ -674,25 +741,30 @@ fn jsx_member_obj_name(obj: &JSXMemberExpressionObject) -> String {
 fn lower_jsx_child(child: &JSXChild, builder: &mut BlockBuilder) -> Option<Expr> {
     match child {
         JSXChild::Element(el) => Some(lower_jsx_element(el, builder)),
-        JSXChild::Fragment(frag) => {
-            let id = builder.next_expr_id();
-            let children = frag
-                .children
-                .iter()
-                .filter_map(|c| lower_jsx_child(c, builder))
-                .collect();
-            Some(Expr::NativeElem {
-                tag: "Fragment".to_string(),
-                props: Box::new(Expr::ObjectLit { id, fields: vec![] }),
-                children,
-                prop_spans: HashMap::new(),
-            })
-        }
+        JSXChild::Fragment(frag) => Some(lower_jsx_fragment(frag, builder)),
         JSXChild::ExpressionContainer(ec) => ec
             .expression
             .as_expression()
             .map(|e| lower_expr(e, builder)),
-        JSXChild::Text(_) | JSXChild::Spread(_) => None,
+        // `<div>{...items}</div>`: the children are whatever `items` holds.
+        // Keeping the source as a child mirrors the array-literal spread.
+        JSXChild::Spread(sp) => Some(lower_expr(&sp.expression, builder)),
+        JSXChild::Text(_) => None,
+    }
+}
+
+fn lower_jsx_fragment(frag: &JSXFragment, builder: &mut BlockBuilder) -> Expr {
+    let id = builder.next_expr_id();
+    let children = frag
+        .children
+        .iter()
+        .filter_map(|c| lower_jsx_child(c, builder))
+        .collect();
+    Expr::NativeElem {
+        tag: "Fragment".to_string(),
+        props: Box::new(Expr::ObjectLit { id, fields: vec![] }),
+        children,
+        prop_spans: HashMap::new(),
     }
 }
 
@@ -751,6 +823,140 @@ fn lower_member_target_expr(
     }
 }
 
+/// Lower an assignment *target* to the writes it performs, recursing through
+/// destructuring patterns. The mirror of `lower_binding_pattern`, but emitting
+/// `Stmt::Assign` (rebinding an existing cell) instead of `Stmt::Let`.
+///
+/// Every leaf identifier is written on every path: a shape the walker cannot
+/// track precisely passes `opaque()` down rather than emitting nothing, because
+/// leaving a variable at its previous abstract value falsifies it.
+fn lower_assignment_target(
+    target: &AssignmentTarget,
+    rhs: Expr,
+    span: Option<SourceRange>,
+    builder: &mut BlockBuilder,
+) {
+    match target {
+        AssignmentTarget::AssignmentTargetIdentifier(id) => {
+            builder.push_stmt(Stmt::Assign {
+                var: id.name.to_string(),
+                rhs,
+                span,
+            });
+        }
+        AssignmentTarget::ArrayAssignmentTarget(arr) => {
+            let temp = format!("__dstr_{}", arr.span.start);
+            builder.push_stmt(Stmt::Let {
+                var: temp.clone(),
+                rhs,
+                span,
+            });
+            for (i, elem) in arr.elements.iter().enumerate() {
+                let Some(elem) = elem else { continue };
+                let elem_rhs = Expr::IndexAccess {
+                    arr: Box::new(Expr::Var(temp.clone())),
+                    idx: Box::new(Expr::Lit(Prim::Int(i as i32))),
+                };
+                lower_assignment_maybe_default(elem, elem_rhs, builder);
+            }
+            // `[a, ...rest] = xs`: bind `rest` to the source itself — a sound
+            // over-approximation (its elements are a subset of the source's),
+            // matching what `lower_binding_pattern` does for object rest.
+            if let Some(rest) = &arr.rest {
+                lower_assignment_target(&rest.target, Expr::Var(temp.clone()), None, builder);
+            }
+        }
+        AssignmentTarget::ObjectAssignmentTarget(obj) => {
+            let temp = format!("__dstr_{}", obj.span.start);
+            builder.push_stmt(Stmt::Let {
+                var: temp.clone(),
+                rhs,
+                span,
+            });
+            for prop in &obj.properties {
+                match prop {
+                    AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
+                        // `({ a = fallback } = o)`: the default is not modeled,
+                        // but it is still evaluated — keep its reads visible.
+                        if let Some(init) = &p.init {
+                            let d = lower_expr(init, builder);
+                            builder.push_stmt(Stmt::ExprStmt(d, None));
+                        }
+                        builder.push_stmt(Stmt::Assign {
+                            var: p.binding.name.to_string(),
+                            rhs: Expr::FieldAccess {
+                                obj: Box::new(Expr::Var(temp.clone())),
+                                field: p.binding.name.to_string(),
+                            },
+                            span: None,
+                        });
+                    }
+                    AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
+                        let field = match &p.name {
+                            PropertyKey::StaticIdentifier(k) => Some(k.name.to_string()),
+                            PropertyKey::StringLiteral(k) => Some(k.value.to_string()),
+                            // Computed key: the key expression still runs, and
+                            // the target still gets written — with an unknown
+                            // value, never with its stale one.
+                            other => {
+                                if let Some(e) = other.as_expression() {
+                                    let k = lower_expr(e, builder);
+                                    builder.push_stmt(Stmt::ExprStmt(k, None));
+                                }
+                                None
+                            }
+                        };
+                        let prop_rhs = match field {
+                            Some(field) => Expr::FieldAccess {
+                                obj: Box::new(Expr::Var(temp.clone())),
+                                field,
+                            },
+                            None => opaque(),
+                        };
+                        lower_assignment_maybe_default(&p.binding, prop_rhs, builder);
+                    }
+                }
+            }
+            if let Some(rest) = &obj.rest {
+                lower_assignment_target(&rest.target, Expr::Var(temp.clone()), None, builder);
+            }
+        }
+        // Member targets nested in a pattern (`[obj.f] = xs`).
+        _ => match assign_target_member(target, builder) {
+            Some((obj, key)) => builder.push_stmt(Stmt::MemberWrite {
+                obj,
+                key,
+                rhs,
+                span,
+            }),
+            // A TS-wrapped or otherwise unrecognised target. Emitting the RHS
+            // keeps its reads; the cell it writes is untracked either way.
+            None => builder.push_stmt(Stmt::ExprStmt(rhs, span)),
+        },
+    }
+}
+
+/// An array element or object property target, which may carry a default
+/// (`[a = 1] = xs`). The default expression is not modeled but is still
+/// evaluated, so it is emitted for its reads and side effects.
+fn lower_assignment_maybe_default(
+    target: &AssignmentTargetMaybeDefault,
+    rhs: Expr,
+    builder: &mut BlockBuilder,
+) {
+    match target {
+        AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
+            let default = lower_expr(&d.init, builder);
+            builder.push_stmt(Stmt::ExprStmt(default, None));
+            lower_assignment_target(&d.binding, rhs, None, builder);
+        }
+        other => match other.as_assignment_target() {
+            Some(t) => lower_assignment_target(t, rhs, None, builder),
+            None => builder.push_stmt(Stmt::ExprStmt(rhs, None)),
+        },
+    }
+}
+
 /// `IrBinOp` for a compound-assignment operator, restricted to those
 /// [`lower_binop`] maps faithfully. Returns `None` for `=` and for operators
 /// that would silently fall back to `Add` (%=, **=, bitwise, logical).
@@ -805,6 +1011,7 @@ pub(super) fn empty_cfg() -> CFG {
 mod tests {
     use super::*;
     use crate::ir::cfg::EdgeKind;
+    use crate::ir::free_vars::compute_free_vars;
     use crate::lowering::cfg_builder::build_cfg;
     use oxc_allocator::Allocator;
     use oxc_ast::ast::Statement;
@@ -1067,6 +1274,94 @@ mod tests {
                     })
                 ),
                 "unsupported operators must not be modeled as addition: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn unary_coercions_are_not_the_identity() {
+        // `~n`, `typeof n`, `+n` are coercions the domain does not model.
+        // Returning the operand aliased them onto the identity, so `~5`
+        // evaluated to `5` instead of `-6` — the `BinOp::Add` defect, unary.
+        for source in [
+            "function f(n) { return ~n; }",
+            "function f(n) { return typeof n; }",
+            "function f(n) { return +n; }",
+        ] {
+            let cfg = build(source);
+            let body = cfg.blocks.get(&0).expect("expected entry block");
+            assert!(
+                matches!(
+                    body.term,
+                    Terminator::Return(Expr::UnaryOp {
+                        op: IrUnaryOp::Unknown,
+                        ..
+                    })
+                ),
+                "unmodeled unary operator must stay opaque: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn void_is_undefined_and_keeps_its_operand() {
+        // `void e` is always `undefined`, but `e` still runs.
+        let cfg = build("function f(n) { return void g(n); }");
+        let body = cfg.blocks.get(&0).expect("expected entry block");
+        assert!(
+            matches!(body.term, Terminator::Return(Expr::Lit(Prim::Unit))),
+            "void must evaluate to undefined, got {:?}",
+            body.term
+        );
+        assert!(
+            compute_free_vars(&cfg).contains("n"),
+            "void must not swallow its operand's reads"
+        );
+    }
+
+    #[test]
+    fn destructuring_assignment_writes_every_target() {
+        // Dropping the write left `a` and `b` at their previous abstract
+        // values — a stale binding is an assertion, not ignorance.
+        let cfg = build("function f(xs) { let a = 1, b = 2; [a, b] = xs; }");
+        let written: Vec<String> = entry_assigns(&cfg).into_iter().map(|(v, _)| v).collect();
+        for var in ["a", "b"] {
+            assert!(
+                written.iter().any(|v| v == var),
+                "`{var}` must be reassigned by the destructuring, got {written:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_destructuring_assignment_writes_every_target() {
+        let cfg = build("function f(o) { let a = 1, rest = 2; ({ a, ...rest } = o); }");
+        let written: Vec<String> = entry_assigns(&cfg).into_iter().map(|(v, _)| v).collect();
+        for var in ["a", "rest"] {
+            assert!(
+                written.iter().any(|v| v == var),
+                "`{var}` must be reassigned by the destructuring, got {written:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn spreads_and_computed_keys_keep_their_reads() {
+        // Every one of these dropped the read of `opts`, which the deps rules
+        // consume as "`opts` is not used" — a claim, not an over-approximation.
+        for source in [
+            "function f(opts) { g({ ...opts }); }",
+            "function f(opts) { g([...opts]); }",
+            "function f(opts) { g(...opts); }",
+            "function f(opts) { g({ [opts]: 1 }); }",
+            "function f(opts) { new C(...opts); }",
+            "function f(opts, o) { const { a = opts } = o; }",
+            "function f(opts) { g(<div title={<>{opts}</>} />); }",
+            "function f(opts) { g(<div>{...opts}</div>); }",
+        ] {
+            assert!(
+                compute_free_vars(&build(source)).contains("opts"),
+                "read of `opts` must survive lowering: {source}"
             );
         }
     }

@@ -718,6 +718,7 @@ fn eval_unary(op: &UnaryOp, val: StateValue) -> StateValue {
                 StateValue::top()
             }
         }
+        UnaryOp::Unknown => StateValue::top(),
     }
 }
 
@@ -847,6 +848,15 @@ mod tests {
             StateValue::number(Interval::point(0.0)),
             StateValue::number(Interval::point(2.0)),
         );
+
+        assert_eq!(value, StateValue::top());
+    }
+
+    #[test]
+    fn eval_unary_unknown_is_top() {
+        // `~`, `typeof` and `+` used to lower to their own operand, so `~5`
+        // evaluated to `5`. Unmodeled coercions must be ⊤, never the identity.
+        let value = eval_unary(&UnaryOp::Unknown, StateValue::number(Interval::point(5.0)));
 
         assert_eq!(value, StateValue::top());
     }

@@ -23,7 +23,7 @@ Everything under *Confirmed defects* is the first kind. Everything else is the s
 
 ## Confirmed defects (audit 2026-08-27)
 
-These drop or falsify information the analysis then relies on. Three of them additionally publish a
+These drop or falsify information the analysis then relies on. Several of them additionally publish a
 `verified: …` assurance over the gap, which is worse than silence. **If your code has one of these
 shapes, do not trust a clean result for it.**
 
@@ -31,7 +31,6 @@ shapes, do not trust a clean result for it.**
 |---|---|---|
 | A `switch` with more than one case | Every case after the first `break` is invisible | [#1](https://github.com/rboudrouss/reactant-analyzer/issues/1) |
 | `try` whose body returns unconditionally | The whole `catch`/`finally` vanishes | [#2](https://github.com/rboudrouss/reactant-analyzer/issues/2) |
-| `%`, `**`, `<<`, `>>`, `>>>`, `&`, <code>&#124;</code>, `^`, `in`, `instanceof` | The computed value is wrong, and a narrowing can lose a path | [#3](https://github.com/rboudrouss/reactant-analyzer/issues/3) |
 | A hook called in `return` or in a branch condition | The component reports zero hooks | [#4](https://github.com/rboudrouss/reactant-analyzer/issues/4) |
 | A concise arrow component/hook (`const C = () => <div/>`) | The component or hook disappears | [#5](https://github.com/rboudrouss/reactant-analyzer/issues/5) |
 | A pack rule anchored on `kind: "custom"` | Sees only hooks the engine could *not* resolve | [#6](https://github.com/rboudrouss/reactant-analyzer/issues/6) |
@@ -66,6 +65,15 @@ shapes, do not trust a clean result for it.**
 - By decision: `arr.slice()` / `arr.concat()` in a deps array is not proven fresh, because the same
   method on a string returns a primitive and the proof would be false
   [#22](https://github.com/rboudrouss/reactant-analyzer/issues/22).
+- Operators the abstract domain does not model evaluate to ⊤, so a guard over them narrows nothing:
+  `%`, `**`, `in`, `instanceof` [#73](https://github.com/rboudrouss/reactant-analyzer/issues/73),
+  the bitwise and shift operators [#74](https://github.com/rboudrouss/reactant-analyzer/issues/74),
+  and `~`, `typeof`, unary `+` [#75](https://github.com/rboudrouss/reactant-analyzer/issues/75).
+- A spread or computed key is kept for its reads but not modeled, so `{ ...opts }.foo` does not
+  resolve and a setter forwarded through `f(...handlers)` is not seen
+  [#76](https://github.com/rboudrouss/reactant-analyzer/issues/76).
+- Class bodies declared inside a component are not lowered, so a setter called from a method is
+  invisible [#77](https://github.com/rboudrouss/reactant-analyzer/issues/77).
 
 ## Why reactant may warn wrongly (false positives)
 

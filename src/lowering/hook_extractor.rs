@@ -612,10 +612,7 @@ fn make_hook_entry(
             Some(HookEntry::State { label, init, span })
         }
         "useEffect" => {
-            let body_cfg = it
-                .next()
-                .and_then(expr_into_cfg)
-                .unwrap_or_else(fallback_cfg);
+            let body_cfg = hook_body_cfg(it.next());
             let deps = it.next().and_then(expr_into_deps);
             Some(HookEntry::Effect {
                 label,
@@ -625,10 +622,7 @@ fn make_hook_entry(
             })
         }
         "useMemo" => {
-            let body_cfg = it
-                .next()
-                .and_then(expr_into_cfg)
-                .unwrap_or_else(fallback_cfg);
+            let body_cfg = hook_body_cfg(it.next());
             let deps = it.next().and_then(expr_into_deps).unwrap_or_default();
             Some(HookEntry::Memo {
                 label,
@@ -638,10 +632,15 @@ fn make_hook_entry(
             })
         }
         "useCallback" => {
-            let (params, body_cfg) = it
-                .next()
-                .and_then(expr_into_fn)
-                .unwrap_or_else(|| (vec![], fallback_cfg()));
+            // No `FnLit` means no parameter list either: an empty one
+            // subtracts nothing from the body's free variables, so captures are
+            // over-approximated rather than missed.
+            let (params, body_cfg) = match it.next() {
+                Some(Expr::FnLit {
+                    params, body_cfg, ..
+                }) => (params, unwrap_body(body_cfg)),
+                other => (vec![], hook_body_cfg(other)),
+            };
             let deps = it.next().and_then(expr_into_deps).unwrap_or_default();
             Some(HookEntry::Callback {
                 label,
@@ -661,10 +660,7 @@ fn make_hook_entry(
             Some(HookEntry::State { label, init, span })
         }
         "useLayoutEffect" | "useInsertionEffect" => {
-            let body_cfg = it
-                .next()
-                .and_then(expr_into_cfg)
-                .unwrap_or_else(fallback_cfg);
+            let body_cfg = hook_body_cfg(it.next());
             let deps = it.next().and_then(expr_into_deps);
             Some(HookEntry::Effect {
                 label,
@@ -732,28 +728,49 @@ fn hook_result_expr(call: &ResolvedHookCall, label: HookLabel, entry: Option<&Ho
 
 // ── Argument extraction ───────────────────────────────────────────────────────
 
-fn expr_into_cfg(expr: Expr) -> Option<CFG> {
-    match expr {
-        Expr::FnLit { body_cfg, .. } => {
-            // Arc::try_unwrap succeeds if this is the sole owner (always true here since
-            // the Expr was just produced by lowering). Fall back to clone for safety.
-            Some(std::sync::Arc::try_unwrap(body_cfg).unwrap_or_else(|arc| (*arc).clone()))
-        }
-        _ => None,
-    }
+/// Arc::try_unwrap succeeds if this is the sole owner (always true since the
+/// Expr was just produced by lowering). Fall back to clone for safety.
+fn unwrap_body(body_cfg: std::sync::Arc<CFG>) -> CFG {
+    std::sync::Arc::try_unwrap(body_cfg).unwrap_or_else(|arc| (*arc).clone())
 }
 
-/// Like `expr_into_cfg` but keeps the `FnLit` params (useCallback fns take
-/// arguments; see `HookEntry::Callback::params`).
-fn expr_into_fn(expr: Expr) -> Option<(Vec<crate::ir::types::Var>, CFG)> {
-    match expr {
-        Expr::FnLit {
-            params, body_cfg, ..
-        } => Some((
-            params,
-            std::sync::Arc::try_unwrap(body_cfg).unwrap_or_else(|arc| (*arc).clone()),
-        )),
-        _ => None,
+/// The body a hook's callback argument runs.
+///
+/// A literal `() => {…}` contributes its own CFG. Anything else — a variable, a
+/// member access, a call returning a function — is *not* unanalysable: the hook
+/// invokes it, so the body is exactly that invocation, and the engine resolves
+/// the callee from the env like any other call.
+///
+/// The previous fallback handed back an `Unreachable` CFG, which claimed the
+/// callback did nothing at all: ⊥ where ⊤ was required. `useEffect(handler)`
+/// came out clean *and certified* `verified infinite-loop`, while the same body
+/// written inline was reported.
+fn hook_body_cfg(arg: Option<Expr>) -> CFG {
+    let stmts = match arg {
+        Some(Expr::FnLit { body_cfg, .. }) => return unwrap_body(body_cfg),
+        Some(callee) => vec![Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(callee),
+                args: vec![],
+            },
+            None,
+        )],
+        // No callback argument at all — not valid React; nothing runs.
+        None => vec![],
+    };
+    let mut blocks = std::collections::HashMap::new();
+    blocks.insert(
+        0,
+        BasicBlock {
+            id: 0,
+            stmts,
+            term: Terminator::Return(Expr::Lit(Prim::Unit)),
+        },
+    );
+    CFG {
+        entry: 0,
+        blocks,
+        edges: vec![],
     }
 }
 
@@ -761,23 +778,6 @@ fn expr_into_deps(expr: Expr) -> Option<Vec<Expr>> {
     match expr {
         Expr::ArrayLit { elems, .. } => Some(elems),
         _ => None,
-    }
-}
-
-fn fallback_cfg() -> CFG {
-    let mut blocks = std::collections::HashMap::new();
-    blocks.insert(
-        0,
-        BasicBlock {
-            id: 0,
-            stmts: vec![],
-            term: Terminator::Unreachable,
-        },
-    );
-    CFG {
-        entry: 0,
-        blocks,
-        edges: vec![],
     }
 }
 
@@ -883,6 +883,39 @@ mod tests {
             Stmt::Let { var, rhs, .. } if var == name => Some(rhs),
             _ => None,
         })
+    }
+
+    // ── callback bodies ───────────────────────────────────────────────────────
+
+    #[test]
+    fn indirect_callback_body_is_the_call_not_unreachable() {
+        // `useEffect(handler)` is not an unanalysable hook: the hook *calls*
+        // `handler`, so that call is the body. The old fallback handed back an
+        // `Unreachable` CFG, claiming the effect did nothing — ⊥ where ⊤ was
+        // required, which certified components that loop forever.
+        let (_, hooks) = parse_and_extract(
+            "function C() { const handler = () => setN(1); useEffect(handler); return <div/>; }",
+        );
+        let body = hooks
+            .iter()
+            .find_map(|h| match h {
+                HookEntry::Effect { body_cfg, .. } => Some(body_cfg),
+                _ => None,
+            })
+            .expect("expected an Effect entry");
+        assert!(
+            !matches!(body.blocks[&body.entry].term, Terminator::Unreachable),
+            "an indirect callback body must not be unreachable"
+        );
+        assert!(
+            body.blocks[&body.entry].stmts.iter().any(|s| matches!(
+                s,
+                Stmt::ExprStmt(Expr::Call { fn_, .. }, _)
+                    if matches!(fn_.as_ref(), Expr::Var(v) if v == "handler")
+            )),
+            "the body must call the callback it was handed: {:?}",
+            body.blocks[&body.entry].stmts
+        );
     }
 
     // ── useState ──────────────────────────────────────────────────────────────

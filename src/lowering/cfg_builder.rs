@@ -682,6 +682,12 @@ fn lower_binding_pattern(
                 };
                 lower_binding_pattern(elem, elem_rhs, None, builder);
             }
+            // `const [a, ...rest] = xs`: bind `rest` to the source — the same
+            // sound over-approximation the object pattern uses for its rest.
+            // Leaving it unbound loses forwarded setters.
+            if let Some(rest) = &arr.rest {
+                lower_binding_pattern(&rest.argument, Expr::Var(temp.clone()), None, builder);
+            }
         }
         BindingPattern::ObjectPattern(obj) => {
             let temp = format!("__obj_{}", obj.span.start);
@@ -692,13 +698,25 @@ fn lower_binding_pattern(
             });
             for prop in &obj.properties {
                 let field = match &prop.key {
-                    PropertyKey::StaticIdentifier(k) => k.name.to_string(),
-                    PropertyKey::StringLiteral(s) => s.value.to_string(),
-                    _ => continue,
+                    PropertyKey::StaticIdentifier(k) => Some(k.name.to_string()),
+                    PropertyKey::StringLiteral(s) => Some(s.value.to_string()),
+                    // `const { [k]: v } = o`: the key expression runs and `v`
+                    // is bound — to an unknown value, not to nothing. Skipping
+                    // the property took the read of `k` with it.
+                    other => {
+                        if let Some(e) = other.as_expression() {
+                            let key = lower_expr(e, builder);
+                            builder.push_stmt(Stmt::ExprStmt(key, None));
+                        }
+                        None
+                    }
                 };
-                let field_rhs = Expr::FieldAccess {
-                    obj: Box::new(Expr::Var(temp.clone())),
-                    field,
+                let field_rhs = match field {
+                    Some(field) => Expr::FieldAccess {
+                        obj: Box::new(Expr::Var(temp.clone())),
+                        field,
+                    },
+                    None => Expr::SummaryVal(crate::ir::expr::SummaryValue::Top),
                 };
                 lower_binding_pattern(&prop.value, field_rhs, None, builder);
             }
@@ -712,7 +730,11 @@ fn lower_binding_pattern(
             }
         }
         BindingPattern::AssignmentPattern(ap) => {
-            // Ignore the default expression conservative (use rhs as-is)
+            // The default value is not modeled (the binding keeps `rhs`), but
+            // it *is* evaluated when the source is undefined — emit it so its
+            // reads and side effects survive (`{ cb = () => setX(1) }`).
+            let default = lower_expr(&ap.right, builder);
+            builder.push_stmt(Stmt::ExprStmt(default, None));
             lower_binding_pattern(&ap.left, rhs, span, builder);
         }
     }
@@ -796,6 +818,56 @@ mod tests {
                 _ => None,
             })
             .expect("function body")
+    }
+
+    fn entry_lets(cfg: &CFG) -> Vec<String> {
+        cfg.blocks
+            .get(&cfg.entry)
+            .unwrap()
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Let { var, .. } => Some(var.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn array_pattern_binds_its_rest() {
+        // Symmetric with the object pattern: leaving `rest` unbound loses the
+        // setters a wrapper forwards through it.
+        let cfg = cfg_of("const [a, ...rest] = xs;");
+        let bound = entry_lets(&cfg);
+        assert!(
+            bound.iter().any(|v| v == "rest"),
+            "`rest` must be bound, got {bound:?}"
+        );
+    }
+
+    #[test]
+    fn computed_key_pattern_binds_and_keeps_the_key_read() {
+        // `const { [k]: v } = o` skipped the property entirely, unbinding `v`
+        // and taking the read of `k` with it.
+        let cfg = cfg_of("const { [k]: v } = o;");
+        let bound = entry_lets(&cfg);
+        assert!(
+            bound.iter().any(|b| b == "v"),
+            "`v` must be bound, got {bound:?}"
+        );
+        assert!(
+            crate::ir::free_vars::compute_free_vars(&cfg).contains("k"),
+            "the computed key's read must survive"
+        );
+    }
+
+    #[test]
+    fn pattern_default_keeps_its_reads() {
+        let cfg = cfg_of("const { a = fallback } = o;");
+        assert!(
+            crate::ir::free_vars::compute_free_vars(&cfg).contains("fallback"),
+            "a default expression still runs — its reads must survive"
+        );
     }
 
     /// The block whose statements call `name`.
