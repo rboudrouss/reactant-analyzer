@@ -35,7 +35,7 @@ path = "src/lib.rs"
 [dependencies]
 oxc_parser    = "0.129.0"
 oxc_ast       = "0.129.0"
-oxc_span      = "0.129.0"
+oxc_span      = "0.138.0"
 oxc_allocator = "0.129.0"
 clap          = { version = "4", features = ["derive"], optional = true }
 serde         = { version = "1", features = ["derive"] }
