@@ -237,9 +237,10 @@ if evaluation is too imprecise the case degrades to Warning, never silence.
   setter call could read `Stable` (more precise; dep omittable). Needs a
   post-fixpoint "slot ever written" bit; marginal gain (eslint requires the
   dep anyway). Future extension.
-- **`FieldAccess` on versioned objects**: propagating `Versioned` through
-  field reads is done only where trivial; otherwise fields evaluate to
-  `Unknown` (FP-flavor, silent-safe).
+- **`FieldAccess` on versioned objects**: a member of an object the heap
+  records (an object literal, a child's props) evaluates to the member's own
+  value; anything else keeps the receiver's version labels where trivial and
+  otherwise evaluates to `Unknown` (FP-flavor, silent-safe).
 
 ## Consequences
 

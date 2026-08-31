@@ -326,3 +326,140 @@ fn recursive_custom_hook_terminates() {
     let result = parse_and_analyze(src);
     assert!(result.components.contains_key("Comp"));
 }
+
+// ── Test 7: members of a hook-returned object keep their own stability ────────
+
+#[test]
+fn stable_member_of_a_hook_returned_object_is_silent() {
+    // Issue #88: `useFormErrors()` hands back a FRESH object every render, but
+    // `clearFieldError` inside it is the same `useCallback` — reading it
+    // without declaring it stales nothing. Before the per-member map the
+    // container's `PerRender` swallowed the member's own stability.
+    let src = r#"
+        function useFormErrors() {
+            const [errors, setErrors] = useState({});
+            const clearFieldError = useCallback((f) => { setErrors({}); }, []);
+            return { clearFieldError, errors };
+        }
+        function Comp() {
+            const $errors = useFormErrors();
+            const [n, setN] = useState(0);
+            const setFieldError = useCallback((f) => {
+                $errors.clearFieldError(f);
+                setN(n + 1);
+            }, [n]);
+            return <div onClick={setFieldError} />;
+        }
+    "#;
+    let result = parse_and_analyze(src);
+    let noisy: Vec<_> = diags_for(&result, "Comp")
+        .into_iter()
+        .filter(|d| d.rule.as_ref() == "missing-deps")
+        .collect();
+    assert!(
+        noisy.is_empty(),
+        "a stable member of a hook-returned object must not fire: {noisy:?}"
+    );
+}
+
+#[test]
+fn unstable_member_of_a_hook_returned_object_still_fires() {
+    // Same shape, but the member is a plain arrow rebuilt on every render.
+    let src = r#"
+        function useFormErrors() {
+            const [errors, setErrors] = useState({});
+            const clearFieldError = (f) => { setErrors({}); };
+            return { clearFieldError, errors };
+        }
+        function Comp() {
+            const $errors = useFormErrors();
+            const [n, setN] = useState(0);
+            const setFieldError = useCallback((f) => {
+                $errors.clearFieldError(f);
+                setN(n + 1);
+            }, [n]);
+            return <div onClick={setFieldError} />;
+        }
+    "#;
+    let result = parse_and_analyze(src);
+    let hits: Vec<_> = diags_for(&result, "Comp")
+        .into_iter()
+        .filter(|d| d.rule.as_ref() == "missing-deps")
+        .collect();
+    assert!(
+        !hits.is_empty(),
+        "a per-render member of a hook-returned object must still fire"
+    );
+}
+
+// ── Test 8: converged memo values reach the rules ─────────────────────────────
+
+#[test]
+fn a_stable_callback_from_a_hook_is_stable_when_state_converges_at_once() {
+    // The memo store is recomputed AFTER each render pass, so a component whose
+    // state converges on the first iteration used to leave every `useCallback`
+    // at ⊤ in the render-exit env — `setErrors` (deps `[]`) then read as "may
+    // change between renders" and every capture of it was reported. Nothing
+    // here involves an object: it is the post-convergence render refresh.
+    let src = r#"
+        function useErrors() {
+            const [errors, setErrors0] = useState({});
+            const setErrors = useCallback((e) => { setErrors0(e); }, []);
+            return setErrors;
+        }
+        function useList(setErrors) {
+            const [n, setN] = useState(0);
+            const removeItem = useCallback(() => { setErrors({}); setN(n + 1); }, [n]);
+            return removeItem;
+        }
+        function Comp() {
+            const setErrors = useErrors();
+            const removeItem = useList(setErrors);
+            return <div onClick={removeItem} />;
+        }
+    "#;
+    let result = parse_and_analyze(src);
+    let noisy: Vec<_> = diags_for(&result, "Comp")
+        .into_iter()
+        .filter(|d| d.rule.as_ref() == "missing-deps")
+        .collect();
+    assert!(
+        noisy.is_empty(),
+        "a `useCallback([])` captured across hooks must read as stable: {noisy:?}"
+    );
+}
+
+#[test]
+fn a_member_two_levels_deep_resolves() {
+    // `deps.$errors.setErrors`: the receiver is itself a member read, so the
+    // heap walk has to follow the whole chain, not just the root variable.
+    let src = r#"
+        function useErrors() {
+            const [errors, setErrors0] = useState({});
+            const setErrors = useCallback((e) => { setErrors0(e); }, []);
+            return { setErrors };
+        }
+        function useList(deps) {
+            const [n, setN] = useState(0);
+            const removeItem = useCallback(() => {
+                deps.$errors.setErrors({});
+                setN(n + 1);
+            }, [n]);
+            return { removeItem };
+        }
+        function Comp() {
+            const $errors = useErrors();
+            const $list = useList({ $errors });
+            return <div onClick={$list.removeItem} />;
+        }
+    "#;
+    let result = parse_and_analyze(src);
+    let noisy: Vec<_> = diags_for(&result, "Comp")
+        .into_iter()
+        .filter(|d| d.rule.as_ref() == "missing-deps")
+        .collect();
+    assert!(
+        noisy.is_empty(),
+        "a two-level member chain must resolve to the member's own value: {noisy:?}"
+    );
+}

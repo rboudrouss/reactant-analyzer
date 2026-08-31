@@ -7,7 +7,7 @@ use crate::{
         AbstractDomain, AnalysisCtx, Transfer,
         impls::{BoolVal, Interval, SetterVal, Stability, StateValue, StrConst},
         interp::{exec_expr_effects, exec_stmt_with_callbacks},
-        stores::{AbstractEnv, EnvVal, Heap, HeapValue},
+        stores::{AbstractEnv, EnvVal, Heap, HeapValue, resolve_locs},
     },
     ir::{
         expr::{BinOp, Expr, MarkerVal, Prim, UnaryOp},
@@ -281,7 +281,7 @@ fn collect_escaping_setters(
             setter_calls_in_cfg(body_cfg, env, None, heap, own, out, walked);
         }
         Expr::Var(name) => {
-            let Some(EnvVal::Loc(ids)) = env.lookup_env_val(name) else {
+            let Some(EnvVal::Loc { ids, .. }) = env.lookup_env_val(name) else {
                 return;
             };
             for id in ids.iter().copied().collect::<Vec<_>>() {
@@ -404,7 +404,7 @@ fn callee_setter(
             let Expr::Var(o) = obj.as_ref() else {
                 return None;
             };
-            let Some(EnvVal::Loc(ids)) = env.lookup_env_val(o) else {
+            let Some(EnvVal::Loc { ids, .. }) = env.lookup_env_val(o) else {
                 return None;
             };
             for id in ids.iter().copied() {
@@ -488,7 +488,7 @@ fn eval_comp_app(
     let props_id = ExprId::fresh();
     let mut initial_heap = crate::domains::stores::Heap::new();
     for ev in abstract_props_full.values() {
-        if let EnvVal::Loc(ids) = ev {
+        if let EnvVal::Loc { ids, .. } = ev {
             for &id in ids {
                 if let Some(hv) = ctx.heap.get(id) {
                     initial_heap.insert(id, hv.clone());
@@ -518,24 +518,20 @@ fn eval_comp_app(
     StateValue::reference(Stability::Stable)
 }
 
-/// Evaluate field access: look up heap if obj is a variable with known locations.
+/// Evaluate field access: read the member off every heap object the receiver
+/// may denote (a whole member chain, not just a bare variable).
 fn eval_field_access(
     obj: &Expr,
     field: &Symbol,
     env: &AbstractEnv<StateValue>,
     ctx: &mut AnalysisCtx<StateValue>,
 ) -> StateValue {
-    if let Expr::Var(v) = obj
-        && let Some(EnvVal::Loc(ids)) = env.lookup_env_val(v)
-    {
-        let ids: Vec<ExprId> = ids.iter().copied().collect();
+    if let Some(ids) = resolve_locs(obj, env, ctx.heap) {
         let vals: Vec<StateValue> = ids
             .iter()
             .filter_map(|id| ctx.heap.get(*id))
             .filter_map(|hv| match hv {
-                HeapValue::Obj(fields) => {
-                    fields.get(field).map(|ev| env_val_to_state_value(ev, ctx))
-                }
+                HeapValue::Obj(fields) => fields.get(field).map(EnvVal::as_val),
                 _ => None,
             })
             .collect();
@@ -556,24 +552,11 @@ fn eval_field_access(
     }
 }
 
-/// Convert an `EnvVal` stored in a heap `Obj` field to a `StateValue`.
+/// Extract per-prop abstract values from a props expression.
 ///
-/// For `Val(sv)` → `sv` directly.
-/// For `Loc(ids)` → `Top` (the Loc represents a FnLit; its stability is unknown
-/// without further analysis; callers that need to resolve the Loc should use
-/// `env.lookup_env_val` and the Loc propagation in `exec_stmt_core`).
-fn env_val_to_state_value(ev: &EnvVal<StateValue>, _ctx: &AnalysisCtx<StateValue>) -> StateValue {
-    ev.as_val()
-}
-
-/// Extract per-field abstract values from a props expression.
-/// Returns `EnvVal`s so that heap locations (FnLit props) can be propagated into the child.
-///
-/// Three cases for each field value:
-/// 1. `Var(x)` → forward the Loc (and setter binding) from the parent's env if available.
-/// 2. `FnLit { id, .. }` → allocate a heap entry and return `EnvVal::Loc(id)` so the child
-///    can inline the callback body (important for `CrossSetterInRender` and similar rules).
-/// 3. Everything else → plain `EnvVal::Val`.
+/// Every prop carries its evaluated value; a prop that is (or aliases) a
+/// literal also carries the allocation sites, so the child can inline a
+/// callback prop's body or resolve a member of an object prop.
 fn eval_props_map(
     props_expr: &Expr,
     env: &AbstractEnv<StateValue>,
@@ -583,20 +566,22 @@ fn eval_props_map(
         Expr::ObjectLit { fields, .. } => fields
             .iter()
             .map(|(k, v)| {
-                let env_val = if let Expr::Var(var_name) = v {
-                    env.lookup_env_val(var_name)
-                        .unwrap_or_else(|| EnvVal::Val(eval_state_value(v, env, ctx)))
-                } else if let Expr::FnLit {
-                    id,
-                    params,
-                    body_cfg,
-                } = v
-                {
+                let ids = match v {
                     // Inline FnLit prop: allocate a heap entry so the child can inline it.
-                    ctx.heap.alloc_fn(*id, params, body_cfg, env);
-                    EnvVal::Loc(std::iter::once(*id).collect())
-                } else {
-                    EnvVal::Val(eval_state_value(v, env, ctx))
+                    Expr::FnLit {
+                        id,
+                        params,
+                        body_cfg,
+                    } => {
+                        ctx.heap.alloc_fn(*id, params, body_cfg, env);
+                        Some(std::iter::once(*id).collect())
+                    }
+                    _ => resolve_locs(v, env, ctx.heap),
+                };
+                let val = eval_state_value(v, env, ctx);
+                let env_val = match ids {
+                    Some(ids) => EnvVal::Loc { ids, val },
+                    None => EnvVal::Val(val),
                 };
                 (k.clone(), env_val)
             })

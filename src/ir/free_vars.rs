@@ -22,6 +22,21 @@ pub struct AccessPath {
     pub segments: Vec<String>,
 }
 
+impl AccessPath {
+    /// The `Expr` this path reads: `Var(root)` wrapped in one `FieldAccess`
+    /// per segment. Lets a rule evaluate the *member actually read* through
+    /// the normal expression evaluator instead of settling for the root's
+    /// value.
+    pub fn to_expr(&self) -> Expr {
+        self.segments
+            .iter()
+            .fold(Expr::Var(self.root.clone()), |obj, seg| Expr::FieldAccess {
+                obj: Box::new(obj),
+                field: seg.clone(),
+            })
+    }
+}
+
 impl fmt::Display for AccessPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Show the source-level name: a spliced-hook capture root may carry the

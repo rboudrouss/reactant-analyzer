@@ -242,3 +242,81 @@ fn template_literal_interpolation_is_a_tracked_read() {
         "a capture read only inside a template literal must still fire missing-deps"
     );
 }
+
+// ── Per-member stability of an object literal (issue #88) ─────────────────────
+
+#[test]
+fn stable_member_of_a_fresh_object_literal_is_silent() {
+    // The container is a new object every render, but `handlers.clear` is the
+    // very same `useCallback` — omitting it from the deps array stales nothing.
+    let hits = missing_deps_hits(
+        r#"
+        import { useState, useCallback } from "react";
+        function C() {
+            const [n, setN] = useState(0);
+            const clear = useCallback(() => {}, []);
+            const handlers = { clear };
+            const cb = useCallback(() => { handlers.clear(); setN(n + 1); }, [n]);
+            return <button onClick={cb}>x</button>;
+        }
+        "#,
+    );
+    assert_eq!(hits, 0, "a stable member of a fresh object must be silent");
+}
+
+#[test]
+fn unstable_member_of_an_object_literal_still_fires() {
+    let hits = missing_deps_hits(
+        r#"
+        import { useState, useCallback } from "react";
+        function C() {
+            const [n, setN] = useState(0);
+            const handlers = { bump: () => n + 1 };
+            const cb = useCallback(() => { handlers.bump(); setN(n + 1); }, [n]);
+            return <button onClick={cb}>x</button>;
+        }
+        "#,
+    );
+    assert!(hits >= 1, "a per-render member must still fire");
+}
+
+#[test]
+fn member_shadowed_by_a_later_spread_still_fires() {
+    // `{ clear, ...rest }`: the spread may overwrite `clear` with anything, so
+    // the per-member map must not claim the `useCallback`'s stability.
+    let hits = missing_deps_hits(
+        r#"
+        import { useState, useCallback } from "react";
+        function C({ rest }) {
+            const [n, setN] = useState(0);
+            const clear = useCallback(() => {}, []);
+            const handlers = { clear, ...rest };
+            const cb = useCallback(() => { handlers.clear(); setN(n + 1); }, [n]);
+            return <button onClick={cb}>x</button>;
+        }
+        "#,
+    );
+    assert!(hits >= 1, "a member a later spread may overwrite must fire");
+}
+
+#[test]
+fn getter_member_still_fires() {
+    // `get value()` runs code on every read: the property holds a function
+    // literal, but `handlers.value` is whatever the body returns.
+    let hits = missing_deps_hits(
+        r#"
+        import { useState, useCallback } from "react";
+        function C() {
+            const [n, setN] = useState(0);
+            const stable = useCallback(() => {}, []);
+            const handlers = { get value() { return stable; } };
+            const cb = useCallback(() => { handlers.value(); setN(n + 1); }, [n]);
+            return <button onClick={cb}>x</button>;
+        }
+        "#,
+    );
+    assert!(
+        hits >= 1,
+        "a getter member must not inherit its body's value"
+    );
+}

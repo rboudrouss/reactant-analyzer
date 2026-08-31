@@ -497,6 +497,39 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         }
     }
 
+    // ── Post-convergence: refresh the render pass ─────────────────────────────
+    // Each iteration recomputes the memo store *after* its render pass, so the
+    // last pass — and everything the rules read from it: `env_exit`,
+    // `block_states`, and every object literal allocated into the heap — froze
+    // the memo values of the *previous* iteration. In a component whose state
+    // converges on the first pass that means ⊤ for every `useCallback`, and a
+    // provably-stable callback then reads as "may change between renders". One
+    // more pass over the converged stores is what the rules actually want.
+    // `inter` is `None`: this re-evaluates and re-allocates, it does not
+    // re-analyze children (same choice as the effect re-run below).
+    {
+        let refresh_ctx = FixpointCtx {
+            state: &state,
+            memo: &memo_store,
+            callbacks: &callback_bodies,
+        };
+        let (bs, _) = analyze_cfg::<T>(
+            &comp_name,
+            &render_cfg,
+            initial_env.clone(),
+            &state,
+            &memo_store,
+            transfer,
+            config.widen_threshold,
+            &thresholds,
+            &mut heap,
+            &refresh_ctx,
+            None,
+        );
+        block_states = bs;
+        env_exit = exit_env(&render_cfg, &block_states);
+    }
+
     // ── Post-convergence: pure setter writes ──────────────────────────────────
     // Re-run effects from ⊥ so `effect_setter_writes` contains only what setters
     // actually wrote. InfiniteLoop uses this to distinguish bounded growth (narrowing

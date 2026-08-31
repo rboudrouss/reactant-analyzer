@@ -4,13 +4,14 @@ use std::sync::Arc;
 use crate::{
     domains::{
         AbstractDomain, AnalysisCtx, Transfer,
-        stores::{AbstractEnv, EnvVal, HeapValue},
+        impls::StateValue,
+        stores::{AbstractEnv, EnvVal, HeapValue, resolve_locs},
     },
     ir::{
         cfg::{CFG, EdgeKind, Terminator},
-        expr::Expr,
+        expr::{Expr, SPREAD_KEY_PREFIX},
         stmt::{MemberKey, Stmt},
-        types::BlockId,
+        types::{BlockId, Symbol},
     },
 };
 
@@ -162,27 +163,35 @@ fn exec_stmt_core<T: Transfer>(
             }
             let val = transfer.eval_expr(rhs, env, ctx);
             if let (Expr::Var(v), MemberKey::Field(field)) = (obj, key)
-                && let Some(EnvVal::Loc(ids)) = env.lookup_env_val(v)
+                && let Some(EnvVal::Loc { ids, .. }) = env.lookup_env_val(v)
             {
+                let Some(sv) = val.as_state_value() else {
+                    return;
+                };
                 let new_val = match rhs {
-                    Expr::FnLit { id, .. } => EnvVal::Loc(std::collections::HashSet::from([*id])),
-                    _ => match val.as_state_value() {
-                        Some(sv) => EnvVal::Val(sv),
-                        None => return,
+                    Expr::FnLit { id, .. } => EnvVal::Loc {
+                        ids: std::collections::HashSet::from([*id]),
+                        val: sv,
                     },
+                    _ => EnvVal::Val(sv),
                 };
                 for id in ids.iter().copied().collect::<Vec<_>>() {
                     if let Some(HeapValue::Obj(fields)) = ctx.heap.get_mut(id) {
+                        // Values always join; the allocation sites survive only
+                        // when both sides have them (a plain value overwriting
+                        // a literal leaves nothing to chase).
                         let joined = match (fields.get(field), &new_val) {
-                            (Some(EnvVal::Val(old)), EnvVal::Val(new)) => {
-                                EnvVal::Val(old.join(new))
-                            }
-                            (Some(EnvVal::Loc(old)), EnvVal::Loc(new)) => {
-                                EnvVal::Loc(old.union(new).copied().collect())
-                            }
-                            // Mixed Loc/Val: no common representation — ⊤.
-                            (Some(_), _) => EnvVal::Val(crate::domains::impls::StateValue::top()),
                             (None, new) => new.clone(),
+                            (Some(old), new) => {
+                                let val = old.as_val().join(&new.as_val());
+                                match (old.locs(), new.locs()) {
+                                    (Some(a), Some(b)) => EnvVal::Loc {
+                                        ids: a.union(b).copied().collect(),
+                                        val,
+                                    },
+                                    _ => EnvVal::Val(val),
+                                }
+                            }
                         };
                         fields.insert(field.clone(), joined);
                     }
@@ -224,10 +233,20 @@ fn bind_rhs<T: Transfer>(
         env.extend_loc(var.to_string(), *id);
         ctx.heap.alloc_fn(*id, params, body_cfg, env);
     }
+    // An object literal is a fresh container, but its members keep their own
+    // identities: `{ onClear }` where `onClear` is a `useCallback` is a new
+    // object every render holding the SAME function. Recording the per-member
+    // map on the heap is what lets `o.onClear` resolve to the member's own
+    // value instead of inheriting the container's `PerRender` (issue #88).
+    if let Expr::ObjectLit { id, fields } = rhs {
+        let members = obj_members(transfer, fields, env, ctx);
+        ctx.heap.insert(*id, HeapValue::Obj(members));
+        env.extend_loc(var.to_string(), *id);
+    }
     // Propagate heap locs for variable aliases (e.g. destructuring preamble:
     // `let __obj = __p0` where __p0 carries the props heap location).
     if let Expr::Var(src) = rhs {
-        if let Some(EnvVal::Loc(ids)) = env.lookup_env_val(src) {
+        if let Some(EnvVal::Loc { ids, .. }) = env.lookup_env_val(src) {
             for &id in ids.iter().collect::<Vec<_>>() {
                 env.extend_loc(var.to_string(), id);
             }
@@ -239,24 +258,62 @@ fn bind_rhs<T: Transfer>(
             env.bind_callback(var.to_string(), label);
         }
     }
-    // Propagate heap locs from field access (e.g. `let f = props.onClick`
+    // Propagate heap locs from a member chain (e.g. `let f = props.onClick`
     // where onClick is a FnLit stored in the parent's heap under the Obj).
-    if let Expr::FieldAccess { obj, field } = rhs
-        && let Expr::Var(v) = obj.as_ref()
-        && let Some(EnvVal::Loc(obj_ids)) = env.lookup_env_val(v)
+    if let Expr::FieldAccess { .. } = rhs
+        && let Some(ids) = resolve_locs(rhs, env, ctx.heap)
     {
-        for obj_id in obj_ids.iter().copied().collect::<Vec<_>>() {
-            if let Some(HeapValue::Obj(fields)) = ctx.heap.get(obj_id)
-                && let Some(EnvVal::Loc(field_ids)) = fields.get(field)
-            {
-                for &fid in field_ids {
-                    env.extend_loc(var.to_string(), fid);
-                }
-            }
+        for id in ids {
+            env.extend_loc(var.to_string(), id);
         }
     }
     let val = transfer.eval_expr(rhs, env, ctx);
     env.extend(var.to_string(), val);
+}
+
+/// Per-member `EnvVal`s of an object literal, for the heap `Obj` entry.
+///
+/// A member that is (or aliases) a function literal keeps its heap location so
+/// `o.f` stays callable; everything else is the member expression's abstract
+/// value. Members written before a spread are dropped: `{ a, ...rest }` may
+/// overwrite `a` with something this map cannot see, and an absent member falls
+/// back to the container's own value — sound, just imprecise.
+fn obj_members<T: Transfer>(
+    transfer: &T,
+    fields: &[(Symbol, Expr)],
+    env: &AbstractEnv<T::Domain>,
+    ctx: &mut AnalysisCtx<T::Domain>,
+) -> HashMap<Symbol, EnvVal<StateValue>> {
+    let after_last_spread = fields
+        .iter()
+        .rposition(|(k, _)| k.starts_with(SPREAD_KEY_PREFIX))
+        .map_or(0, |i| i + 1);
+    let mut out = HashMap::new();
+    for (key, value) in &fields[after_last_spread..] {
+        let ids = match value {
+            Expr::FnLit {
+                id,
+                params,
+                body_cfg,
+            } => {
+                ctx.heap.alloc_fn(*id, params, body_cfg, env);
+                Some(std::iter::once(*id).collect())
+            }
+            _ => resolve_locs(value, env, ctx.heap),
+        };
+        let val = transfer
+            .eval_expr(value, env, ctx)
+            .as_state_value()
+            .unwrap_or_else(StateValue::top);
+        out.insert(
+            key.clone(),
+            match ids {
+                Some(ids) => EnvVal::Loc { ids, val },
+                None => EnvVal::Val(val),
+            },
+        );
+    }
+    out
 }
 
 /// If `expr` is a setter call `setX(arg)`, weak-update the corresponding state
@@ -475,7 +532,7 @@ fn exec_var_callback<T: Transfer>(
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) {
-    if let Some(EnvVal::Loc(ids)) = env.lookup_env_val(name) {
+    if let Some(EnvVal::Loc { ids, .. }) = env.lookup_env_val(name) {
         let ids: Vec<_> = ids.iter().copied().collect();
         for id in ids {
             if let Some(HeapValue::Fn {

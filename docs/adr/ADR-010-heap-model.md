@@ -47,8 +47,8 @@ ArrayLit { id: ExprId, elems: Vec<Expr> },
 // domains/stores/heap.rs
 pub enum HeapValue {
     Fn { params: Vec<Var>, body_cfg: Arc<CFG> },
-    Obj(HashMap<Symbol, StateValue>),  // reserved — future object domain
-    Arr(Vec<StateValue>),              // reserved — future array domain
+    Obj(HashMap<Symbol, EnvVal<StateValue>>),  // per-member map: value + locs
+    Arr(Vec<StateValue>),                      // reserved — future array domain
 }
 
 pub struct Heap(HashMap<ExprId, HeapValue>);
@@ -120,7 +120,12 @@ if class == TriggerClass::Unknown {
 ## Known limits
 
 - **Back-edge in a callback body** → FN (documented ADR-009, unchanged).
-- **Object/array domains** (`HeapValue::Obj`/`Arr`) reserved — unused until a field domain is implemented.
+- **`HeapValue::Obj`** holds the per-member map of an object literal and of a
+  child's props: a member read (`o.f`, and chains through
+  `stores::resolve_locs`) resolves to the member's own value instead of the
+  container's. Members before a spread and getter/setter properties are absent
+  from the map on purpose (they lower under synthetic keys) and fall back to the
+  container. `HeapValue::Arr` stays reserved — `IndexAccess` is still ⊤.
 - **Multi-site join**: `locs` can contain several ExprIds for a same variable (ternary branches). All bodies are executed and their effects joined — correct by over-approximation.
 - **Unknown callee without `Loc`** (external helper) → immediate bail → FN. When `depth >= MAX_INLINE_DEPTH`, the `analysis-limit` rule emits an `Info` (visible with `--info`) signaling that callback chains weren't descended.
 

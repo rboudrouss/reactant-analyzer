@@ -4,10 +4,13 @@ use crate::{
     domains::{AbstractDomain, impls::StateValue},
     ir::{
         cfg::CFG,
+        expr::Expr,
         free_vars::compute_free_vars,
         types::{ExprId, Symbol, Var},
     },
 };
+
+use std::collections::HashSet;
 
 use super::{AbstractEnv, EnvVal, map_get_or};
 
@@ -125,5 +128,38 @@ impl Heap {
         // self ⊑ other: every key in self must exist in other.
         // (Heap grows monotonically; no key removal is needed for soundness.)
         self.0.keys().all(|k| other.0.contains_key(k))
+    }
+}
+
+/// The allocation sites `expr` may denote, chasing member chains through the
+/// heap: `o.a.f` resolves as far as the objects on the way record their
+/// members. `None` for anything the heap cannot place (a call, a primitive, an
+/// unbound variable) — the caller then falls back to the expression's value.
+///
+/// One walker so every consumer — the field evaluator, the `let` binder, the
+/// object-literal member map — agrees on what a chain points to; the old
+/// `Expr::Var` special cases each stopped at the first segment.
+pub fn resolve_locs<D: AbstractDomain>(
+    expr: &Expr,
+    env: &AbstractEnv<D>,
+    heap: &Heap,
+) -> Option<HashSet<ExprId>> {
+    match expr {
+        Expr::Var(v) => env.lookup_env_val(v).and_then(|ev| ev.locs().cloned()),
+        Expr::TSAnnotated(inner) => resolve_locs(inner, env, heap),
+        Expr::FieldAccess { obj, field } => {
+            let ids: HashSet<ExprId> = resolve_locs(obj, env, heap)?
+                .iter()
+                .filter_map(|id| match heap.get(*id) {
+                    Some(HeapValue::Obj(fields)) => fields.get(field),
+                    _ => None,
+                })
+                .filter_map(|ev| ev.locs())
+                .flatten()
+                .copied()
+                .collect();
+            (!ids.is_empty()).then_some(ids)
+        }
+        _ => None,
     }
 }

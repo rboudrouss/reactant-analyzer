@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::ir::{
     cfg::{BasicBlock, CFG, EdgeKind, Terminator},
-    expr::{BinOp as IrBinOp, Expr, Prim, SummaryValue, UnaryOp as IrUnaryOp},
+    expr::{BinOp as IrBinOp, Expr, Prim, SPREAD_KEY_PREFIX, SummaryValue, UnaryOp as IrUnaryOp},
     stmt::{MemberKey, Stmt},
 };
 
@@ -352,6 +352,14 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 match prop {
                     ObjectPropertyKind::ObjectProperty(p) => {
                         let key = match &p.key {
+                            // A getter/setter runs code on every read: `o.x`
+                            // is whatever the body returns, not the function
+                            // literal sitting in the property. Kept under a
+                            // synthetic key, like a spread — the body stays
+                            // visible, the name resolves to nothing.
+                            _ if p.kind != PropertyKind::Init => {
+                                synthetic_key(builder, "[accessor]")
+                            }
                             PropertyKey::StaticIdentifier(ident) => ident.name.to_string(),
                             PropertyKey::StringLiteral(s) => s.value.to_string(),
                             // Computed key (`{ [k]: v }`): the key expression
@@ -372,7 +380,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                     // dropping it lost the read of `opts` and any setter it
                     // carries.
                     ObjectPropertyKind::SpreadProperty(sp) => {
-                        let key = synthetic_key(builder, "...");
+                        let key = synthetic_key(builder, SPREAD_KEY_PREFIX);
                         let value = lower_expr(&sp.argument, builder);
                         fields.push((key, value));
                     }

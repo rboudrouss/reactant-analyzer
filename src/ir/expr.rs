@@ -70,6 +70,13 @@ pub enum UnaryOp {
     Unknown,
 }
 
+/// Key prefix lowering gives the synthetic `ObjectLit` member that holds an
+/// object spread (`{ ...opts }`). A spread's own members are invisible to the
+/// per-member map, and it overwrites every member written before it, so a
+/// reader that resolves members by name must stop at one. Source keys can
+/// never collide — `...` is not a valid property name.
+pub const SPREAD_KEY_PREFIX: &str = "...";
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     // Primitive literals

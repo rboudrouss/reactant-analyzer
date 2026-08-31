@@ -15,15 +15,30 @@ use super::{leq_pointwise, map_get_or};
 #[derive(Debug, Clone, PartialEq)]
 pub enum EnvVal<D> {
     Val(D),
-    Loc(HashSet<ExprId>),
+    /// A reference the analysis can chase: the allocation sites it may point
+    /// to *and* the value the domain computed for it. A location and a value
+    /// are not alternatives — answering ⊤ for the value of a `Loc` is what
+    /// made a function or object prop read as "unknown" in the child instead
+    /// of the per-render reference the parent had already proved it to be.
+    Loc {
+        ids: HashSet<ExprId>,
+        val: D,
+    },
 }
 
 impl<D: AbstractDomain> EnvVal<D> {
-    /// Unwrap to domain value: `Val(v)` → `v`, `Loc(_)` → `D::top()`.
+    /// The domain value, whichever variant carries it.
     pub fn as_val(&self) -> D {
         match self {
-            EnvVal::Val(v) => v.clone(),
-            EnvVal::Loc(_) => D::top(),
+            EnvVal::Val(v) | EnvVal::Loc { val: v, .. } => v.clone(),
+        }
+    }
+
+    /// A `Loc`'s allocation sites, or `None` for a plain value.
+    pub fn locs(&self) -> Option<&HashSet<ExprId>> {
+        match self {
+            EnvVal::Loc { ids, .. } => Some(ids),
+            EnvVal::Val(_) => None,
         }
     }
 }
@@ -69,7 +84,10 @@ impl<D: AbstractDomain> AbstractEnv<D> {
     /// Returns `None` when the variable has no Loc (external/imported function).
     pub fn lookup_env_val(&self, var: &str) -> Option<EnvVal<D>> {
         if let Some(ids) = self.locs.get(var) {
-            return Some(EnvVal::Loc(ids.clone()));
+            return Some(EnvVal::Loc {
+                ids: ids.clone(),
+                val: self.lookup(var),
+            });
         }
         self.stabs.get(var).map(|v| EnvVal::Val(v.clone()))
     }
@@ -304,7 +322,7 @@ mod tests {
         let mut env = Env::new();
         env.extend_loc("cb".to_string(), ExprId(1));
         match env.lookup_env_val("cb") {
-            Some(EnvVal::Loc(ids)) => assert!(ids.contains(&ExprId(1))),
+            Some(EnvVal::Loc { ids, .. }) => assert!(ids.contains(&ExprId(1))),
             _ => panic!("expected Loc"),
         }
     }
@@ -315,7 +333,7 @@ mod tests {
         env.extend_loc("cb".to_string(), ExprId(1));
         env.extend_loc("cb".to_string(), ExprId(2));
         match env.lookup_env_val("cb") {
-            Some(EnvVal::Loc(ids)) => {
+            Some(EnvVal::Loc { ids, .. }) => {
                 assert!(ids.contains(&ExprId(1)));
                 assert!(ids.contains(&ExprId(2)));
             }
@@ -331,7 +349,7 @@ mod tests {
         b.extend_loc("cb".to_string(), ExprId(2));
         let joined = a.join(&b);
         match joined.lookup_env_val("cb") {
-            Some(EnvVal::Loc(ids)) => {
+            Some(EnvVal::Loc { ids, .. }) => {
                 assert!(ids.contains(&ExprId(1)));
                 assert!(ids.contains(&ExprId(2)));
             }

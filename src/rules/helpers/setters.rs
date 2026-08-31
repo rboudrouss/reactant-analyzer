@@ -112,7 +112,7 @@ pub(in crate::rules) fn collect_component_setter_vars(
             }
             // Loc pointing to a FnLit that captures a ComponentSetter
             // (e.g. the parent passed `() => setCount(0)` as a prop).
-            if let Some(EnvVal::Loc(ids)) = env.lookup_env_val(var) {
+            if let Some(EnvVal::Loc { ids, .. }) = env.lookup_env_val(var) {
                 for id in ids {
                     if let Some(HeapValue::Fn { captured, .. }) = heap.get(id) {
                         for val in captured.values() {

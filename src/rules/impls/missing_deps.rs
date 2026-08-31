@@ -10,6 +10,7 @@ use crate::{
     },
 };
 
+use crate::rules::helpers::ConvergedEval;
 use crate::rules::{Diagnostic, Rule, fn_lit_binding};
 
 /// Fires when a `useEffect`, `useMemo`, or `useCallback` body captures a free
@@ -61,10 +62,15 @@ impl Rule for MissingDeps {
                 if !env_exit.contains(&path.root) {
                     continue;
                 }
-                // Stability is a property of the whole slot: if the root
-                // reference never changes, no field of it can go stale.
+                // What can go stale is the *member actually read*: a fresh
+                // container built from stable members (`useFormErrors()`
+                // returning `{ clearFieldError }`) holds nothing that changes.
+                // The root's value is the fallback for a path the heap cannot
+                // resolve — `eval_field_access` degrades such a read to ⊤, so
+                // this only ever removes findings (issue #88).
                 let val = env_exit.lookup(&path.root);
                 if !val.is_stable()
+                    && !member_is_stable(path, &env_exit, result)
                     && !closure_is_behaviorally_stable(
                         &path.root,
                         &result.render_cfg,
@@ -102,6 +108,21 @@ impl Rule for MissingDeps {
 
         diags
     }
+}
+
+/// True when the member the path names is provably stable on its own — the
+/// per-member map an `ObjectLit` records on the heap (issue #88). Bare roots
+/// (no segments) are left to the caller's `env_exit.lookup`: re-evaluating
+/// them here would answer the same thing.
+fn member_is_stable(
+    path: &AccessPath,
+    env_exit: &AbstractEnv<StateValue>,
+    result: &crate::engine::AnalysisResult<StateValue>,
+) -> bool {
+    !path.segments.is_empty()
+        && result
+            .eval_in(env_exit, &path.to_expr(), &mut result.heap.clone())
+            .is_stable()
 }
 
 /// Identity vs behavior (ADR-017 framing): this rule guards against *stale
