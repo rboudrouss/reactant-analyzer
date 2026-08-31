@@ -31,7 +31,7 @@ pub(crate) fn single_block_cfg(stmts: Vec<Stmt>) -> CFG {
 
 /// One-block CFG with a caller-chosen terminator (entry 0, block id 0, no edges).
 pub(crate) fn single_block_cfg_term(stmts: Vec<Stmt>, term: Terminator) -> CFG {
-    let mut blocks = HashMap::new();
+    let mut blocks = std::collections::BTreeMap::new();
     blocks.insert(0, BasicBlock { id: 0, stmts, term });
     CFG {
         entry: 0,

@@ -1,0 +1,43 @@
+//! Whole-program derived data, computed once per program (ADR-021 §4).
+//!
+//! A rule's `check` runs per component, but some rules need structure that is
+//! a property of the *program* — the churn graph of `infinite-loop` walks
+//! every component to find the multi-effect cycles a single component only
+//! participates in. Recomputing that inside each `check` makes the rules phase
+//! quadratic in component count (the dub/twenty hang, issue #86).
+//!
+//! [`ProgramCache`] is where such data lives: the frontend builds one per
+//! program, every [`super::query::RuleCtx`] of that program borrows it, and
+//! each entry is computed on first use. Adding a new program-level structure
+//! means one more lazily-initialized field here — never a rebuild in `check`.
+
+use std::sync::OnceLock;
+
+use crate::engine::ProgramAnalysisResult;
+use crate::rules::helpers::churn_graph::ChurnGraph;
+
+/// Program-scoped, lazily-computed derived data shared by every component's
+/// rule pass. Bound to the program it was built from, so a cache can never be
+/// read against a different analysis result.
+pub struct ProgramCache<'a> {
+    program: &'a ProgramAnalysisResult,
+    churn: OnceLock<ChurnGraph>,
+}
+
+impl<'a> ProgramCache<'a> {
+    pub fn new(program: &'a ProgramAnalysisResult) -> Self {
+        ProgramCache {
+            program,
+            churn: OnceLock::new(),
+        }
+    }
+
+    pub fn program(&self) -> &'a ProgramAnalysisResult {
+        self.program
+    }
+
+    /// The program's churn graph and its cycles, built on first request.
+    pub(in crate::rules) fn churn(&self) -> &ChurnGraph {
+        self.churn.get_or_init(|| ChurnGraph::build(self.program))
+    }
+}

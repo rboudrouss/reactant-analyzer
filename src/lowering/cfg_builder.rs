@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use oxc_ast::ast::*;
 use oxc_span::GetSpan;
@@ -17,7 +17,7 @@ use crate::{
 // ── BlockBuilder ──────────────────────────────────────────────────────────────
 
 pub(super) struct BlockBuilder {
-    blocks: HashMap<BlockId, BasicBlock>,
+    blocks: BTreeMap<BlockId, BasicBlock>,
     edges: Vec<Edge>,
     current: BlockId,
     counter: usize,
@@ -44,7 +44,7 @@ struct LoopFrame {
 impl BlockBuilder {
     pub(super) fn new_with_smap(smap: &SourceMap) -> Self {
         Self {
-            blocks: HashMap::new(),
+            blocks: BTreeMap::new(),
             edges: Vec::new(),
             current: 0,
             counter: 1, // block 0 is entry

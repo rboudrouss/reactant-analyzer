@@ -731,7 +731,7 @@ mod tests {
     /// Caller CFG: single block `[stmts]` returning unit (the splice replaces
     /// the call at index 0).
     fn caller(stmts: Vec<Stmt>) -> CFG {
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         let (id, b) = one_block(0, stmts, Terminator::Return(Expr::Lit(Prim::Unit)));
         blocks.insert(id, b);
         CFG {
@@ -753,7 +753,7 @@ mod tests {
     fn a_headless_callee_leaves_the_caller_untouched() {
         let callee = CFG {
             entry: 3, // no such block
-            blocks: HashMap::new(),
+            blocks: std::collections::BTreeMap::new(),
             edges: vec![],
         };
         let x = "x".to_string();
@@ -788,7 +788,7 @@ mod tests {
     /// block the caller does not have.
     #[test]
     fn a_missing_call_site_block_leaves_the_caller_untouched() {
-        let mut cblocks = HashMap::new();
+        let mut cblocks = std::collections::BTreeMap::new();
         let (id, b) = one_block(0, vec![], Terminator::Return(Expr::Lit(Prim::Unit)));
         cblocks.insert(id, b);
         let callee = CFG {
@@ -818,7 +818,7 @@ mod tests {
     #[test]
     fn alpha_renames_locals_and_binds_return() {
         // callee: `let a = 1; return a`  spliced as `let x = callee()`.
-        let mut cblocks = HashMap::new();
+        let mut cblocks = std::collections::BTreeMap::new();
         let (id, b) = one_block(
             0,
             vec![let_("a", Expr::Lit(Prim::Int(1)))],
@@ -866,7 +866,7 @@ mod tests {
     #[test]
     fn caller_local_of_same_name_is_not_clobbered() {
         // callee local `x` must not collide with the caller's own `x`.
-        let mut cblocks = HashMap::new();
+        let mut cblocks = std::collections::BTreeMap::new();
         let (id, b) = one_block(
             0,
             vec![let_("x", Expr::Lit(Prim::Int(9)))],
@@ -886,7 +886,7 @@ mod tests {
     fn every_callee_block_and_edge_is_spliced() {
         // Two-block callee (entry jumps to block 1); both must survive, unlike
         // the old entry-only graft.
-        let mut cblocks = HashMap::new();
+        let mut cblocks = std::collections::BTreeMap::new();
         let (i0, b0) = one_block(
             0,
             vec![let_("a", Expr::Lit(Prim::Int(1)))],
@@ -945,7 +945,7 @@ mod tests {
     #[test]
     fn params_bind_args_under_fresh_names() {
         // callee(p): return p; spliced with arg `Lit(5)` → `let p#2 = 5`.
-        let mut cblocks = HashMap::new();
+        let mut cblocks = std::collections::BTreeMap::new();
         let (id, b) = one_block(0, vec![], Terminator::Return(Expr::Var("p".into())));
         cblocks.insert(id, b);
         let callee = CFG {
@@ -1016,7 +1016,7 @@ mod tests {
         // is the closure's own param and must stay untouched.
         let mut ren = HashMap::new();
         ren.insert("p".to_string(), "p#0".to_string());
-        let mut inner_blocks = HashMap::new();
+        let mut inner_blocks = std::collections::BTreeMap::new();
         let (id, b) = one_block(0, vec![], Terminator::Return(Expr::Var("p".into())));
         inner_blocks.insert(id, b);
         let lambda = Expr::FnLit {

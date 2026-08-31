@@ -1120,7 +1120,7 @@ fn lower_binop(op: BinaryOperator) -> IrBinOp {
 // ── Shared helpers (used by cfg_builder.rs too) ───────────────────────────────
 
 pub(super) fn empty_cfg() -> CFG {
-    let mut blocks = HashMap::new();
+    let mut blocks = std::collections::BTreeMap::new();
     blocks.insert(
         0,
         BasicBlock {

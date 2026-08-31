@@ -65,7 +65,6 @@ mod tests {
         },
         rules::Rule,
     };
-    use std::collections::HashMap;
 
     fn prog(r: &AnalysisResult<StateValue>) -> ProgramAnalysisResult {
         crate::test_support::prog("C", r.clone())
@@ -79,7 +78,7 @@ mod tests {
     }
 
     fn linear_cfg() -> CFG {
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -108,7 +107,7 @@ mod tests {
     }
 
     fn diamond_cfg() -> CFG {
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -224,7 +223,7 @@ mod tests {
             line: 69,
             col: 9,
         };
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -446,7 +445,7 @@ mod tests {
             init: Expr::Lit(Prim::Int(0)),
             span: None,
         }];
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -488,7 +487,7 @@ mod tests {
             init: Expr::Lit(Prim::Int(0)),
             span: None,
         }];
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {

@@ -11,7 +11,7 @@ use reactant::{
     },
     lowering::{lower_custom_hooks, lower_program},
     registry::{HookSummary, SummaryRegistry},
-    rules::{Diagnostic, RuleCtx, all_rules},
+    rules::{Diagnostic, ProgramCache, RuleCtx, all_rules},
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -263,7 +263,7 @@ fn analysis_limit_suppresses_safe_check_assurances() {
     let registry = RuleRegistry::natives();
     let findings = |src: &str| {
         let result = parse_and_analyze_with_config(src, Config::default());
-        registry.check_component(&result, &"C".to_string())
+        registry.check_component(&ProgramCache::new(&result), &"C".to_string())
     };
 
     let truncated = findings(opaque);

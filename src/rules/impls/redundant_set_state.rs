@@ -297,7 +297,7 @@ mod tests {
         env_bindings: Vec<(&str, StateValue, Option<HookLabel>)>,
         state_values: Vec<(HookLabel, StateValue)>,
     ) -> AnalysisResult<StateValue> {
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         for (id, stmts) in render_blocks {
             let id = id as usize;
             blocks.insert(

@@ -32,7 +32,7 @@ use reactant::{
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn empty_cfg() -> CFG {
-    let mut blocks = HashMap::new();
+    let mut blocks = std::collections::BTreeMap::new();
     blocks.insert(
         0,
         BasicBlock {
@@ -68,7 +68,7 @@ fn leaf_component(name: &str) -> ComponentIR {
 fn heuristic_detects_parent_not_child_as_root() {
     // Parent renders Child → only Parent is a root.
     let parent = {
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -123,7 +123,7 @@ fn analyze_program_two_isolated_components() {
 fn analyze_program_populates_call_graph_for_parent_child() {
     // Parent has CompApp for Child in its render return.
     let parent = {
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -181,7 +181,7 @@ fn setter_prop_propagates_to_shared_state() {
     let child = {
         // Effect body: call onChange(42)
         let eff_body = {
-            let mut blocks = HashMap::new();
+            let mut blocks = std::collections::BTreeMap::new();
             blocks.insert(
                 0,
                 BasicBlock {
@@ -204,7 +204,7 @@ fn setter_prop_propagates_to_shared_state() {
         };
         // Render: let onChange = props.onChange (FieldAccess)
         let render = {
-            let mut blocks = HashMap::new();
+            let mut blocks = std::collections::BTreeMap::new();
             blocks.insert(
                 0,
                 BasicBlock {
@@ -246,7 +246,7 @@ fn setter_prop_propagates_to_shared_state() {
     // Parent: const [count, setCount] = useState(0); return <Child onChange={setCount} />
     let parent = {
         let render = {
-            let mut blocks = HashMap::new();
+            let mut blocks = std::collections::BTreeMap::new();
             blocks.insert(
                 0,
                 BasicBlock {
@@ -321,7 +321,7 @@ fn setter_prop_propagates_to_shared_state() {
 fn recursive_component_does_not_crash() {
     // TreeNode renders <TreeNode /> recursion detected, returns ⊤.
     let tree_node = {
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -554,7 +554,7 @@ fn prop_drilling_direct_ir() {
     // Leaf: useEffect(() => { action(99); }, [action]);  param = "props"
     let leaf = {
         let eff_body = {
-            let mut blocks = HashMap::new();
+            let mut blocks = std::collections::BTreeMap::new();
             blocks.insert(
                 0,
                 BasicBlock {
@@ -596,7 +596,7 @@ fn prop_drilling_direct_ir() {
     };
     // Middle: return <Leaf action={props.action} />  param = "props"
     let middle = {
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -635,7 +635,7 @@ fn prop_drilling_direct_ir() {
     };
     // Root: const [v, setV] = useState(0); return <Middle action={setV} />
     let root = {
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {

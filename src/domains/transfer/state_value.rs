@@ -1358,7 +1358,7 @@ mod tests {
         env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
-        let mut blocks = std::collections::HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -1437,7 +1437,7 @@ mod tests {
         // A back edge conservatively joins the return value to Top. This empty
         // self-loop has no statements, so it exercises the forced-Top-on-back-edge
         // path with no side effects.
-        let mut blocks = std::collections::HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -1474,7 +1474,7 @@ mod tests {
     /// Build a `while`-shaped body CFG (`pre → header ⇄ body`; `header → exit`)
     /// whose loop body runs `body_stmts`.
     fn while_loop_body(body_stmts: Vec<Stmt>) -> CFG {
-        let mut blocks = std::collections::HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -1598,7 +1598,7 @@ mod tests {
         env.bind_setter("setN".to_string(), 0);
         env.extend("setN".to_string(), StateValue::reference(Stability::Stable));
 
-        let mut blocks = std::collections::HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {

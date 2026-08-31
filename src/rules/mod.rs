@@ -2,7 +2,8 @@
 //!
 //! Layout:
 //! - [`api`] — the typed surface a rule programs against (ADR-021): query
-//!   primitives, the sealed [`Diagnostic`], the witness vocabulary.
+//!   primitives, the sealed [`Diagnostic`], the witness vocabulary, and the
+//!   [`ProgramCache`] that holds whole-program derived data.
 //! - [`impls`] — the rule implementations, one file per rule.
 //! - [`helpers`] — shared analysis machinery (setter/churn/eval/scans).
 //! - [`docs`] — static documentation for every diagnostic name.
@@ -21,6 +22,7 @@ pub mod helpers;
 pub mod impls;
 pub mod registry;
 
+pub use api::cache::ProgramCache;
 pub use api::diagnostic::{Diagnostic, Severity};
 pub use api::query::{
     Certified, CleanupVerdict, ConditionalHookCall, DominatesAllExits, EffectCycleProof,

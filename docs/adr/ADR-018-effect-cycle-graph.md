@@ -34,9 +34,12 @@ after every render, self-sustaining with no partner).
 
 ## Decision
 
-A graph arm of `InfiniteLoop` (`src/rules/churn_graph.rs`), run once per
-`check`, over **qualified slots** `(component, HookLabel)` so parent slots
-written through `ComponentSetter` props are first-class:
+A graph arm of `InfiniteLoop` (`src/rules/helpers/churn_graph.rs`), built once
+per **program** and shared by every component's `check` through the ctx's
+`ProgramCache` (ADR-021 §4 amendment; building it per `check` made the rules
+phase quadratic — issue #86), over **qualified slots**
+`(component, HookLabel)` so parent slots written through `ComponentSetter`
+props are first-class:
 
 ```text
 edge x → y  ≡  "a change of x re-runs an effect that stores a fresh

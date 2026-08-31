@@ -1547,7 +1547,7 @@ mod tests {
     #[test]
     fn collect_thresholds_gathers_branch_and_init_literals() {
         // render: branch on `x < 10`; state init 0; effect writes `+1`.
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -1819,7 +1819,7 @@ mod tests {
     fn two_block_cfg_propagates_exit_env() {
         // block 0: let x = 42; jump 1
         // block 1: return x   ← exit env should have x=Number([42,42])
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -2074,7 +2074,7 @@ mod tests {
     /// A `while`-shaped handler body (`pre → header ⇄ body`; `header → exit`)
     /// running `body_stmts` in the loop body.
     fn handler_loop_cfg(body_stmts: Vec<Stmt>) -> CFG {
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -2286,7 +2286,7 @@ mod tests {
         // CFG: effect block 0 → Branch(count>1, then=1, else=2)
         //       block 1 → setCount(count+1); Jump(2)
         //       block 2 → Return
-        let mut eff_blocks = HashMap::new();
+        let mut eff_blocks = std::collections::BTreeMap::new();
         eff_blocks.insert(
             0,
             BasicBlock {
@@ -2443,7 +2443,7 @@ mod tests {
     fn free_vars_captured_from_branch_condition() {
         // Effect body: `if (x > 0) { setN(1); }` x appears only in the Branch cond.
         // Before the fix, compute_free_vars skipped terminators → x was not a free var.
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         // block 0: Branch { cond: x > 0 } → then=1, else=2
         blocks.insert(
             0,

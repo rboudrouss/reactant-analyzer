@@ -17,6 +17,7 @@ use crate::rules::helpers::churn::{
     ChurnSetterCall, Freshness, classify_effect_deps, collect_churn_calls, converges_once_written,
     reference_part,
 };
+use crate::rules::helpers::churn_graph::{ChurnEdge, ChurnGraph};
 use crate::rules::{
     Certified, Diagnostic, MustResult, OnAllPaths, Rule, Severity, all_deps_provably_stable,
     all_setter_labels, collect_fn_bindings, collect_setter_calls, collect_setter_calls_with_extra,
@@ -213,8 +214,10 @@ impl Rule for InfiniteLoop {
         }
 
         // ── F5b: multi-effect churn cycles (see churn_graph.rs) ───────────────
+        // The graph is whole-program data: read it from the ctx cache, which
+        // builds it once for the run (issue #86).
         let (cycle_diags, covered) =
-            check_multi_effect_cycles(result, component, &reported_effects);
+            check_multi_effect_cycles(ctx.cache().churn(), result, component, &reported_effects);
         diags.extend(cycle_diags);
         // Self-churn arm last: its Info branch skips writes a cycle covers.
         diags.extend(check_object_churn(result, component, &covered));
@@ -230,17 +233,15 @@ impl Rule for InfiniteLoop {
 /// the `(effect label, local state label)` writes covered by a reported
 /// cycle so the self-churn Info arm doesn't duplicate them.
 fn check_multi_effect_cycles(
+    graph: &ChurnGraph,
     result: &ProgramAnalysisResult,
     component: &Symbol,
     reported_effects: &HashSet<HookLabel>,
 ) -> (Vec<Diagnostic>, HashSet<(HookLabel, HookLabel)>) {
-    use crate::rules::helpers::churn_graph::{ChurnEdge, build_churn_graph, find_churn_cycles};
-
-    let edges = build_churn_graph(result);
+    let (edges, cycles) = (&graph.edges, &graph.cycles);
     if edges.is_empty() {
         return (Vec::new(), HashSet::new());
     }
-    let cycles = find_churn_cycles(&edges);
     let comp_result = &result.components[component];
 
     let mut diags = Vec::new();
@@ -248,7 +249,7 @@ fn check_multi_effect_cycles(
     // Slot display names, resolved lazily per involved component.
     let mut names: HashMap<Symbol, HashMap<Var, HookLabel>> = HashMap::new();
 
-    for cycle in &cycles {
+    for cycle in cycles {
         let cyc: Vec<&ChurnEdge> = cycle.edge_idx.iter().map(|&i| &edges[i]).collect();
         let path = {
             let mut parts: Vec<String> = cyc
@@ -277,7 +278,7 @@ fn check_multi_effect_cycles(
             } else {
                 "infinite-loop"
             };
-            let cycle_proof = match must_effect_cycle(&edges, cycle) {
+            let cycle_proof = match must_effect_cycle(edges, cycle) {
                 MustResult::All(c) => Some(c),
                 _ => None,
             };
@@ -604,7 +605,7 @@ mod tests {
         },
         rules::Rule,
     };
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
 
     fn prog(name: &str, r: &AnalysisResult<StateValue>) -> ProgramAnalysisResult {
         crate::test_support::prog(name, r.clone())
@@ -670,6 +671,58 @@ mod tests {
         let diags = InfiniteLoop.check(&RuleCtx::new(&prog("C", &result), &"C".to_string()));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].hook_label, Some(0));
+    }
+
+    /// Issue #86: the churn graph is whole-program data. Checking N components
+    /// must build it once — rebuilding it inside every `check` made the rules
+    /// phase quadratic in component count (dub/twenty never finished).
+    #[test]
+    fn churn_graph_is_built_once_per_program() {
+        use crate::rules::api::cache::ProgramCache;
+        use crate::rules::helpers::churn_graph::BUILDS;
+
+        let eff_cfg = crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setN".to_string())),
+                args: vec![Expr::ObjectLit {
+                    id: crate::ir::types::ExprId(0),
+                    fields: vec![],
+                }],
+            },
+            None,
+        )]);
+        let one = make_result_with_widened(
+            HashSet::from([0]),
+            vec![HookEntry::Effect {
+                label: 1,
+                body_cfg: eff_cfg,
+                deps: None,
+                span: None,
+            }],
+            vec![Stmt::Let {
+                var: "setN".to_string(),
+                rhs: Expr::StateSetter(0),
+                span: None,
+            }],
+        );
+
+        let names = ["A".to_string(), "B".to_string(), "C".to_string()];
+        let mut program = prog(&names[0], &one);
+        for n in &names[1..] {
+            program.components.insert(n.clone(), one.clone());
+        }
+
+        BUILDS.with(|n| n.set(0));
+        let cache = ProgramCache::new(&program);
+        for n in &names {
+            let diags = InfiniteLoop.check(&RuleCtx::cached(&cache, n, Default::default()));
+            assert!(!diags.is_empty(), "the churn arm must actually run for {n}");
+        }
+        assert_eq!(
+            BUILDS.with(|n| n.get()),
+            1,
+            "churn graph rebuilt per component (#86)"
+        );
     }
 
     #[test]
@@ -900,7 +953,7 @@ mod tests {
     #[test]
     fn setter_in_non_entry_block_still_warns() {
         // block 0 (empty entry) → jump → block 1 (has setter)
-        let mut eff_blocks = HashMap::new();
+        let mut eff_blocks = std::collections::BTreeMap::new();
         eff_blocks.insert(
             0,
             BasicBlock {
@@ -1121,7 +1174,7 @@ mod tests {
     #[test]
     fn back_edge_in_then_callback_now_detected() {
         // useEffect(() => { p.then(() => { loop { setN(n+1) } }) }) back edge in callback
-        let mut cb_blocks = HashMap::new();
+        let mut cb_blocks = std::collections::BTreeMap::new();
         cb_blocks.insert(
             0,
             BasicBlock {
@@ -1184,7 +1237,7 @@ mod tests {
     #[test]
     fn setter_in_loop_in_then_does_not_loop_when_bounded() {
         // useEffect(() => { p.then(() => { while (..) { setN(0) } }) }, [n]) constant setter stabilises
-        let mut cb_blocks = HashMap::new();
+        let mut cb_blocks = std::collections::BTreeMap::new();
         cb_blocks.insert(
             0,
             BasicBlock {
@@ -1292,7 +1345,7 @@ mod tests {
         stmts: Vec<Stmt>,
         deps: Option<Vec<Expr>>,
     ) -> ComponentIR {
-        let mut eff_blocks = HashMap::new();
+        let mut eff_blocks = std::collections::BTreeMap::new();
         let mut all_stmts = vec![Stmt::Let {
             var: setter_name.to_string(),
             rhs: Expr::StateSetter(0),

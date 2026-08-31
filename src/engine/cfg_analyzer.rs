@@ -323,7 +323,7 @@ mod tests {
     /// `let i = 0; while (i < 5) { i = i + 1; }` — back-edge loop on `i`.
     fn counting_loop_cfg() -> CFG {
         use crate::ir::cfg::{Edge, EdgeKind};
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -552,7 +552,7 @@ mod tests {
         // block 0: let x = {}; → jump 1
         // block 1: return
         // exit_envs[1] should have x = Unstable (propagated from exit of block 0)
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -612,7 +612,7 @@ mod tests {
         // block 1 (then): let x = 1  → Stable
         // block 2 (else): let x = {} → Unstable
         // block 3: join → exit_envs[3].x = Unknown
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -717,7 +717,7 @@ mod tests {
         // block 0: let x = Number([0,+∞)); branch x < 10 → 1, else → 2
         // block 1 (then): x narrowed to [0, 9]
         // block 2 (else): x narrowed to [10, +∞)
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -807,7 +807,7 @@ mod tests {
     /// Setter call in Return terminator updates state (`() => setN(99)` concise-arrow).
     #[test]
     fn setter_in_return_terminator_updates_state() {
-        let mut blocks = std::collections::HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -853,7 +853,7 @@ mod tests {
     /// Block-body Return (Lit::Unit) is a no-op no spurious state changes.
     #[test]
     fn unit_return_terminator_is_noop() {
-        let mut blocks = std::collections::HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -900,7 +900,7 @@ mod tests {
         use crate::ir::types::ExprId;
         use std::sync::Arc;
 
-        let mut updater_blocks = std::collections::HashMap::new();
+        let mut updater_blocks = std::collections::BTreeMap::new();
         updater_blocks.insert(
             0,
             BasicBlock {
@@ -919,7 +919,7 @@ mod tests {
             edges: vec![],
         });
 
-        let mut blocks = std::collections::HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {

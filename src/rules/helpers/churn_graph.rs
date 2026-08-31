@@ -474,3 +474,36 @@ fn find_cycle_from(
     }
     None
 }
+
+/// The program's churn graph: every edge plus the cycles found in it.
+///
+/// Whole-program data — `build` walks every component — so it is computed once
+/// per program and shared by every component's rule pass (see
+/// [`crate::rules::api::cache::ProgramCache`]).
+pub(in crate::rules) struct ChurnGraph {
+    pub edges: Vec<ChurnEdge>,
+    pub cycles: Vec<ChurnCycle>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of [`ChurnGraph::build`] calls on the current thread —
+    /// the guard for issue #86 (built once per program, never once per
+    /// component). Thread-local, so parallel tests never observe each other.
+    pub(in crate::rules) static BUILDS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+impl ChurnGraph {
+    pub(in crate::rules) fn build(result: &ProgramAnalysisResult) -> Self {
+        #[cfg(test)]
+        BUILDS.with(|n| n.set(n.get() + 1));
+        let edges = build_churn_graph(result);
+        let cycles = if edges.is_empty() {
+            Vec::new()
+        } else {
+            find_churn_cycles(&edges)
+        };
+        ChurnGraph { edges, cycles }
+    }
+}

@@ -24,7 +24,7 @@ use crate::project::{self, ProjectKind};
 use crate::resolver::{
     DefaultFileDiscoverer, FileDiscoverer, FileSystem, analyze_lowered, lower_files_with,
 };
-use crate::rules::{Diagnostic, RuleRegistry, SafeCheck, Severity};
+use crate::rules::{Diagnostic, ProgramCache, RuleRegistry, SafeCheck, Severity};
 
 pub use palette::Palette;
 pub use report::{CheckReport, ComponentReport};
@@ -303,6 +303,11 @@ pub fn run_check(
     let mut components = Vec::new();
     let (mut errors, mut warnings, mut infos) = (0usize, 0usize, 0usize);
 
+    // One cache for the whole run: rules needing whole-program structure (the
+    // churn graph of `infinite-loop`) build it once here instead of once per
+    // component, which used to make the rules phase quadratic (issue #86).
+    let rule_cache = ProgramCache::new(&program_result);
+
     for name in names {
         if opts.verbose {
             let result = &program_result.components[name];
@@ -319,7 +324,7 @@ pub fn run_check(
         // off/allow filters + deterministic sort) lives in the registry —
         // shared with every other frontend. Only the `--info` visibility
         // filter is a display concern kept here.
-        let findings = registry.check_component(&program_result, name);
+        let findings = registry.check_component(&rule_cache, name);
         let mut diags: Vec<Diagnostic> = findings.diagnostics;
         let safe_checks: Vec<SafeCheck> = findings.safe_checks;
         let suspended_safe_checks = findings.suspended_safe_checks;

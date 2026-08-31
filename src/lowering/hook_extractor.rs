@@ -760,7 +760,7 @@ fn hook_body_cfg(arg: Option<Expr>) -> CFG {
         // No callback argument at all — not valid React; nothing runs.
         None => vec![],
     };
-    let mut blocks = std::collections::HashMap::new();
+    let mut blocks = std::collections::BTreeMap::new();
     blocks.insert(
         0,
         BasicBlock {

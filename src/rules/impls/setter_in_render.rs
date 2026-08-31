@@ -237,7 +237,6 @@ mod tests {
         },
         rules::{Rule, Severity},
     };
-    use std::collections::HashMap;
 
     fn prog(name: &str, r: &AnalysisResult<StateValue>) -> ProgramAnalysisResult {
         crate::test_support::prog(name, r.clone())
@@ -303,7 +302,7 @@ mod tests {
     #[test]
     fn setter_in_branch_block_is_warning() {
         // block 0: branch → 1 / 2; block 1: setN(42) conditional → Warning
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -428,7 +427,7 @@ mod tests {
                 None,
             ),
         ];
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {

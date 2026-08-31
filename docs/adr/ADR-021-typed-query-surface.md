@@ -187,6 +187,16 @@ external frontends bind to, so deferring the frontend is clean, not a rewrite.
 Config **rides** on the ctx (`ctx.config()`), but its schema/format is deferred
 to the frontend ADR (config only matters for parameterized/external rules).
 
+**Amendment (2026-09-01) — `ProgramCache`, the ctx's program-level scope.**
+A rule's `check` is per component, but some rules need whole-program structure
+(`infinite-loop` needs the churn graph of ADR-018, which walks every
+component); computing it inside `check` made the rules phase quadratic in
+component count and hung the dub/twenty corpora (issue #86). `RuleCtx` now
+borrows a `ProgramCache` (`src/rules/api/cache.rs`) holding one lazily-built
+entry per program-level structure, and the dispatcher gives every component of
+a run the same cache (`RuleRegistry::check_component`). Program-level data
+belongs there; `check` reads it, never rebuilds it.
+
 ### 5. First consequence — the verified FN is fixed
 
 `may_change` replaces `is_unstable` inside `all_deps_unstable`; `is_unstable`

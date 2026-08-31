@@ -18,9 +18,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::engine::ProgramAnalysisResult;
 use crate::ir::types::Symbol;
 
+use super::api::cache::ProgramCache;
 use super::api::diagnostic::{Diagnostic, Severity};
 use super::api::query::{RuleConfig, RuleCtx};
 use super::docs::{RULE_DOCS, RuleDoc};
@@ -205,17 +205,23 @@ impl RuleRegistry {
     /// options) → check → `safe_check` fallback → clamp (§3, before the sort:
     /// severity is a sort key) → off/allow filter → deterministic sort.
     ///
+    /// The program comes in through a [`ProgramCache`], not on its own: a
+    /// frontend builds one cache per run and passes it for every component, so
+    /// whole-program structures (the churn graph) are built once rather than
+    /// once per component — what made the rules phase quadratic (issue #86).
+    ///
     /// The Info visibility filter (`--info`) is a display concern and stays
     /// with the caller.
-    pub fn check_component(
+    pub fn check_component<'a>(
         &self,
-        program: &ProgramAnalysisResult,
-        component: &Symbol,
+        cache: &'a ProgramCache<'a>,
+        component: &'a Symbol,
     ) -> ComponentFindings {
+        let program = cache.program();
         let mut diags: Vec<Diagnostic> = Vec::new();
         let mut safe_checks: Vec<SafeCheck> = Vec::new();
         for r in &self.rules {
-            let ctx = RuleCtx::with_config(program, component, self.options_for(r.name()));
+            let ctx = RuleCtx::cached(cache, component, self.options_for(r.name()));
             let produced = r.check(&ctx);
             // `safe_check` is consulted on the *raw* output: a rule whose
             // findings were all filtered away still ran and found something —
@@ -313,6 +319,7 @@ impl RuleRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::ProgramAnalysisResult;
 
     /// Stub rule emitting one Warning under a fixed diagnostic name.
     struct Stub {
@@ -445,7 +452,7 @@ mod tests {
     #[test]
     fn stub_rule_fires_through_the_registry() {
         let (prog, name) = one_component();
-        let findings = registry_with_stub().check_component(&prog, &name);
+        let findings = registry_with_stub().check_component(&ProgramCache::new(&prog), &name);
         assert!(findings.diagnostics.iter().any(|d| d.rule == "test/stub"));
     }
 
@@ -462,7 +469,7 @@ mod tests {
             },
         );
         reg.set_overrides(o).unwrap();
-        let findings = reg.check_component(&prog, &name);
+        let findings = reg.check_component(&ProgramCache::new(&prog), &name);
         assert!(!findings.diagnostics.iter().any(|d| d.rule == "test/stub"));
     }
 
@@ -475,7 +482,7 @@ mod tests {
             ..Default::default()
         };
         reg.set_overrides(o).unwrap();
-        let findings = reg.check_component(&prog, &name);
+        let findings = reg.check_component(&ProgramCache::new(&prog), &name);
         assert!(!findings.diagnostics.iter().any(|d| d.rule == "test/stub"));
     }
 
@@ -495,7 +502,7 @@ mod tests {
         );
         o.allow = Some(BTreeSet::from(["test/stub".to_string()]));
         reg.set_overrides(o).unwrap();
-        let findings = reg.check_component(&prog, &name);
+        let findings = reg.check_component(&ProgramCache::new(&prog), &name);
         assert!(!findings.diagnostics.iter().any(|d| d.rule == "test/stub"));
     }
 
@@ -512,7 +519,7 @@ mod tests {
             },
         );
         reg.set_overrides(o).unwrap();
-        let findings = reg.check_component(&prog, &name);
+        let findings = reg.check_component(&ProgramCache::new(&prog), &name);
         let d = findings
             .diagnostics
             .iter()
@@ -536,7 +543,7 @@ mod tests {
             },
         );
         reg.set_overrides(o).unwrap();
-        let findings = reg.check_component(&prog, &name);
+        let findings = reg.check_component(&ProgramCache::new(&prog), &name);
         let d = findings
             .diagnostics
             .iter()
@@ -578,7 +585,7 @@ mod tests {
             },
         );
         reg.set_overrides(o).unwrap();
-        let findings = reg.check_component(&prog, &name);
+        let findings = reg.check_component(&ProgramCache::new(&prog), &name);
         assert!(!findings.diagnostics.iter().any(|d| d.rule == "test/two"));
         assert!(
             findings
@@ -621,7 +628,7 @@ mod tests {
         let reg = RuleRegistry::natives();
 
         let (clean, name) = one_component_with_hooks(false);
-        let baseline = reg.check_component(&clean, &name);
+        let baseline = reg.check_component(&ProgramCache::new(&clean), &name);
         assert!(
             !baseline.safe_checks.is_empty(),
             "the baseline must publish at least one assurance, else this test proves nothing"
@@ -629,7 +636,7 @@ mod tests {
         assert_eq!(baseline.suspended_safe_checks, 0);
 
         let (truncated, name) = one_component_with_hooks(true);
-        let findings = reg.check_component(&truncated, &name);
+        let findings = reg.check_component(&ProgramCache::new(&truncated), &name);
         assert!(
             findings
                 .diagnostics
@@ -665,7 +672,7 @@ mod tests {
         );
         reg.set_overrides(o).unwrap();
 
-        let findings = reg.check_component(&truncated, &name);
+        let findings = reg.check_component(&ProgramCache::new(&truncated), &name);
         assert!(
             !findings
                 .diagnostics

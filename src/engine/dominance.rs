@@ -121,7 +121,7 @@ mod tests {
 
     fn linear_cfg() -> CFG {
         // 0 → 1 → 2
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {
@@ -166,7 +166,7 @@ mod tests {
 
     fn diamond_cfg() -> CFG {
         // 0 → {1, 2}, 1 → 3, 2 → 3
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {

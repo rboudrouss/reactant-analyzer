@@ -181,7 +181,6 @@ mod tests {
         },
         rules::Rule,
     };
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     fn prog(
@@ -195,7 +194,7 @@ mod tests {
     }
 
     fn component(hooks: Vec<HookEntry>, render_stmts: Vec<Stmt>) -> ComponentIR {
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {

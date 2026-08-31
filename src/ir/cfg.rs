@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::ir::{expr::Expr, stmt::Stmt, types::BlockId};
 
@@ -39,10 +39,16 @@ pub struct Edge {
     pub kind: EdgeKind,
 }
 
+/// The block map is a [`BTreeMap`], not a `HashMap`, on purpose: every walk
+/// over `blocks` then visits them in ascending [`BlockId`] — i.e. lowering
+/// order — so a pass that picks a *representative* block (the first setter
+/// call site of a witness, say) reports the same one on every run. Under a
+/// `HashMap` that choice followed the per-process hash seed and diagnostics
+/// were not reproducible.
 #[derive(Debug, Clone)]
 pub struct CFG {
     pub entry: BlockId,
-    pub blocks: HashMap<BlockId, BasicBlock>,
+    pub blocks: BTreeMap<BlockId, BasicBlock>,
     pub edges: Vec<Edge>,
 }
 

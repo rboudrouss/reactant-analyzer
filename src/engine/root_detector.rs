@@ -130,7 +130,6 @@ mod tests {
             expr::{Expr, Prim},
         },
     };
-    use std::collections::HashMap;
 
     fn trivial_cfg() -> CFG {
         crate::test_support::single_block_cfg(vec![])
@@ -150,7 +149,7 @@ mod tests {
     }
 
     fn component_rendering_child(name: &str, child: &str) -> ComponentIR {
-        let mut blocks = HashMap::new();
+        let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(
             0,
             BasicBlock {

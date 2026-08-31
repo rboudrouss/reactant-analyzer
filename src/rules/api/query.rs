@@ -30,6 +30,7 @@ use crate::{
     },
 };
 
+use crate::rules::api::cache::ProgramCache;
 use crate::rules::{ConvergedEval, Note, SetterCall, Step, arg_is_call_free, local_bindings};
 
 /// Where a certified fact lives, and the witness chain that proves it (ADR-019).
@@ -248,16 +249,37 @@ impl RuleConfig {
 /// query primitives (methods, added in the primitives section). The stable anchor
 /// the future external frontends bind to (ADR-021 §4).
 pub struct RuleCtx<'a> {
-    program: &'a ProgramAnalysisResult,
+    cache: CacheRef<'a>,
     component: &'a Symbol,
     comp: &'a AnalysisResult<StateValue>,
     config: RuleConfig,
+}
+
+/// The ctx's [`ProgramCache`]: shared with every other component of the same
+/// program when the dispatcher supplies one, private when a caller builds a
+/// one-off ctx (single-component callers, tests).
+enum CacheRef<'a> {
+    Shared(&'a ProgramCache<'a>),
+    Own(ProgramCache<'a>),
+}
+
+impl<'a> CacheRef<'a> {
+    fn get(&self) -> &ProgramCache<'a> {
+        match self {
+            CacheRef::Shared(c) => c,
+            CacheRef::Own(c) => c,
+        }
+    }
 }
 
 impl<'a> RuleCtx<'a> {
     /// Resolve `component`'s per-component result once. Panics if the component
     /// is absent (the dispatcher only builds a ctx for analysed components, and
     /// every rule indexed `result.components[component]` before).
+    ///
+    /// The ctx gets a private [`ProgramCache`], so whole-program data is
+    /// recomputed for it — the dispatcher uses [`RuleCtx::cached`] to share one
+    /// cache across the whole program instead.
     pub fn new(program: &'a ProgramAnalysisResult, component: &'a Symbol) -> Self {
         Self::with_config(program, component, RuleConfig::default())
     }
@@ -268,9 +290,20 @@ impl<'a> RuleCtx<'a> {
         component: &'a Symbol,
         config: RuleConfig,
     ) -> Self {
-        let comp = &program.components[component];
+        Self::build(CacheRef::Own(ProgramCache::new(program)), component, config)
+    }
+
+    /// The dispatcher's constructor: every component of a program binds to the
+    /// same [`ProgramCache`], so program-level structures are built once
+    /// instead of once per component (issue #86).
+    pub fn cached(cache: &'a ProgramCache<'a>, component: &'a Symbol, config: RuleConfig) -> Self {
+        Self::build(CacheRef::Shared(cache), component, config)
+    }
+
+    fn build(cache: CacheRef<'a>, component: &'a Symbol, config: RuleConfig) -> Self {
+        let comp = &cache.get().program().components[component];
         RuleCtx {
-            program,
+            cache,
             component,
             comp,
             config,
@@ -278,7 +311,12 @@ impl<'a> RuleCtx<'a> {
     }
 
     pub fn program(&self) -> &'a ProgramAnalysisResult {
-        self.program
+        self.cache.get().program()
+    }
+
+    /// The program-scoped derived-data cache backing this ctx.
+    pub(in crate::rules) fn cache(&self) -> &ProgramCache<'a> {
+        self.cache.get()
     }
 
     pub fn component(&self) -> &'a Symbol {
@@ -934,5 +972,86 @@ fn classify_returned(expr: &Expr, body: &CFG) -> CleanupVerdict {
             None => CleanupVerdict::Unknown,
         },
         _ => CleanupVerdict::Unknown,
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::cfg::{BasicBlock, Edge, EdgeKind, Terminator};
+    use crate::ir::expr::Prim;
+
+    fn set_call(line: u32) -> Stmt {
+        Stmt::ExprStmt(
+            Expr::Call {
+                fn_: Box::new(Expr::Var("setX".to_string())),
+                args: vec![Expr::Lit(Prim::Int(0))],
+            },
+            Some(SourceRange {
+                file: crate::ir::FileTable::default().intern(std::path::Path::new("t.tsx")),
+                line,
+                col: 0,
+            }),
+        )
+    }
+
+    /// When one setter is called from several blocks, the witness must name
+    /// the call site of the *lowest* block — lowering order, i.e. source
+    /// order. `CFG::blocks` is a `BTreeMap` so the pick is the same on every
+    /// run; under the former `HashMap` it followed the per-process hash seed
+    /// and the reported span flipped between runs of the same binary.
+    #[test]
+    fn setter_witness_names_the_first_call_site_in_block_order() {
+        // 0 → 1 → 2, `setX` called in 1 and 2, inserted back to front.
+        let mut blocks = std::collections::BTreeMap::new();
+        blocks.insert(
+            2,
+            BasicBlock {
+                id: 2,
+                stmts: vec![set_call(20)],
+                term: Terminator::Return(Expr::Lit(Prim::Unit)),
+            },
+        );
+        blocks.insert(
+            1,
+            BasicBlock {
+                id: 1,
+                stmts: vec![set_call(10)],
+                term: Terminator::Jump(2),
+            },
+        );
+        blocks.insert(
+            0,
+            BasicBlock {
+                id: 0,
+                stmts: vec![],
+                term: Terminator::Jump(1),
+            },
+        );
+        let cfg = CFG {
+            entry: 0,
+            blocks,
+            edges: vec![
+                Edge {
+                    from: 0,
+                    to: 1,
+                    kind: EdgeKind::Unconditional,
+                },
+                Edge {
+                    from: 1,
+                    to: 2,
+                    kind: EdgeKind::Unconditional,
+                },
+            ],
+        };
+
+        let setters = HashSet::from(["setX".to_string()]);
+        let MustResult::All(proof) = must_setter_on_all_paths(&cfg, &setters, None) else {
+            panic!("the setter is called on every path — expected an all-paths proof");
+        };
+        assert_eq!(proof.evidence().block_id, Some(1));
+        assert_eq!(proof.evidence().span.map(|s| s.line), Some(10));
     }
 }
