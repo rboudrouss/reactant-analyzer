@@ -177,7 +177,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 
     // Utility-function inlining. Runs before `expand_custom_hooks` so utility
     // bodies containing hook calls become visible to the hook expansion pass.
-    expand_utility_calls(
+    if expand_utility_calls(
         &mut render_cfg,
         &mut hooks,
         &config.function_registry,
@@ -185,7 +185,14 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         config.max_inline_depth,
         &mut inline_origins,
         &mut splice_salt,
-    );
+    ) && let Some(inter) = inter
+    {
+        inter
+            .stats
+            .borrow_mut()
+            .inline_budget_exhausted
+            .insert(comp_name.clone());
+    }
 
     // Expand Custom entries before seeding so inlined State entries are seeded.
     expand_custom_hooks(
@@ -1249,6 +1256,25 @@ fn collect_handler_info(hooks: &[HookEntry]) -> HashMap<HookLabel, HandlerInfo> 
 /// "Statement-level" means the call is the rhs of a `Let` or the entirety of
 /// an `ExprStmt` calls in expression positions (`if (util(x))`,
 /// `setState(util(x))`) stay opaque (`Top`); expression-position inlining deferred.
+/// What every round of utility inlining in one component shares: where to look
+/// callees up, the per-CFG splice budget, and the accumulators the whole
+/// component writes into.
+struct InlineCtx<'a> {
+    registry: &'a FunctionRegistry,
+    caller_file: &'a std::path::Path,
+    max_depth: usize,
+    origins: &'a mut Vec<crate::engine::InlineOrigin>,
+    /// Monotonic across every splice in the component, so alpha-renamed callee
+    /// locals (`name#salt`) cannot collide.
+    salt: &'a mut u32,
+    /// Set once the budget cut a call off anywhere. The caller turns it into
+    /// the `analysis-limit` Info: a *silent* truncation is what lets a
+    /// component publish assurances over code that was never read.
+    truncated: bool,
+}
+
+/// Returns `true` when the splice budget cut a utility call off anywhere in the
+/// component — the caller records that as an `analysis-limit`.
 fn expand_utility_calls(
     render_cfg: &mut CFG,
     hooks: &mut [HookEntry],
@@ -1257,38 +1283,31 @@ fn expand_utility_calls(
     max_depth: usize,
     origins: &mut Vec<crate::engine::InlineOrigin>,
     salt: &mut u32,
-) {
+) -> bool {
     if registry.is_empty() {
-        return;
+        return false;
     }
-    inline_in_cfg(
-        render_cfg,
+    let mut ctx = InlineCtx {
         registry,
         caller_file,
         max_depth,
-        &mut HashSet::new(),
         origins,
         salt,
-    );
+        truncated: false,
+    };
+    inline_in_cfg(render_cfg, &mut ctx, &mut HashSet::new());
     for hook in hooks.iter_mut() {
         match hook {
             HookEntry::Effect { body_cfg, .. }
             | HookEntry::Memo { body_cfg, .. }
             | HookEntry::Callback { body_cfg, .. }
             | HookEntry::Handler { body_cfg, .. } => {
-                inline_in_cfg(
-                    body_cfg,
-                    registry,
-                    caller_file,
-                    max_depth,
-                    &mut HashSet::new(),
-                    origins,
-                    salt,
-                );
+                inline_in_cfg(body_cfg, &mut ctx, &mut HashSet::new());
             }
             _ => {}
         }
     }
+    ctx.truncated
 }
 
 /// Splice utility calls in `cfg`. Each utility name is inlined at most once
@@ -1296,31 +1315,28 @@ fn expand_utility_calls(
 /// `A → B → A` chains, terminate after a single round-trip; subsequent calls
 /// remain `Call` → opaque `Top`).
 ///
-/// `max_depth` caps the total number of splices into this CFG so a single
+/// `max_depth` caps the total number of splices into one CFG so a single
 /// inlining never explodes the IR even with deep utility chains.
-fn inline_in_cfg(
-    cfg: &mut CFG,
-    registry: &FunctionRegistry,
-    caller_file: &std::path::Path,
-    max_depth: usize,
-    expanding: &mut HashSet<String>,
-    origins: &mut Vec<crate::engine::InlineOrigin>,
-    salt: &mut u32,
-) {
-    let mut budget = max_depth;
+fn inline_in_cfg(cfg: &mut CFG, ctx: &mut InlineCtx<'_>, expanding: &mut HashSet<String>) {
+    let mut budget = ctx.max_depth;
     loop {
+        let target = find_inlining_target(cfg, ctx.registry, ctx.caller_file, expanding);
         if budget == 0 {
+            // Exhausting the budget leaves the remaining calls opaque (⊤) —
+            // sound, but a truncation, and one that measurably happens (20 CFGs
+            // in the excalidraw corpus, 6 in memos). Record it so the component
+            // withholds its assurances instead of publishing `verified:` over
+            // utility bodies the analysis never read.
+            ctx.truncated |= target.is_some();
             break;
         }
-        let Some((block_id, stmt_idx, name)) =
-            find_inlining_target(cfg, registry, caller_file, expanding)
-        else {
+        let Some((block_id, stmt_idx, name)) = target else {
             break;
         };
         // Provenance (ADR-019): record what was spliced and where it lives,
         // before the splice consumes the call statement.
-        if let Some(util) = resolve_utility(registry, caller_file, &name) {
-            origins.push(crate::engine::InlineOrigin {
+        if let Some(util) = resolve_utility(ctx.registry, ctx.caller_file, &name) {
+            ctx.origins.push(crate::engine::InlineOrigin {
                 name: name.clone(),
                 from: util.file.clone(),
                 kind: crate::engine::InlineKind::Utility,
@@ -1329,7 +1345,14 @@ fn inline_in_cfg(
         // Mark before splicing so a self-recursive call inside the spliced
         // body is skipped on the next scan.
         expanding.insert(name);
-        splice_one_call(cfg, block_id, stmt_idx, registry, caller_file, salt);
+        splice_one_call(
+            cfg,
+            block_id,
+            stmt_idx,
+            ctx.registry,
+            ctx.caller_file,
+            ctx.salt,
+        );
         budget -= 1;
     }
 }

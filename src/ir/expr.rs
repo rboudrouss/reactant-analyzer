@@ -31,6 +31,24 @@ pub enum BinOp {
     Gt,
     Leq,
     Geq,
+    /// Bitwise and shift: `&`, `|`, `^`, `<<`, `>>`, `>>>`.
+    ///
+    /// Real variants rather than one opaque `Unknown`, because they carry
+    /// information `Unknown` cannot express: JS coerces both operands to int32
+    /// (uint32 for `>>>`), so the result is *always* a number in a known range.
+    /// Folding them into `Unknown` erased which operator it was, and with it
+    /// every one of those guarantees.
+    ///
+    /// This is the shared decision for every unmodelled operator: give it a
+    /// variant, never widen `Unknown`'s meaning. `Unknown` is for operators
+    /// nothing is known about at all.
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    /// `>>>` — unsigned, so the result is a *uint32*, not an int32.
+    UShr,
     /// An operator whose concrete semantics are not modeled by the abstract domain.
     Unknown,
 }
@@ -39,9 +57,16 @@ pub enum BinOp {
 pub enum UnaryOp {
     Neg,
     Not,
+    /// `~x` — int32 bitwise NOT, i.e. `-(x + 1)`.
+    BitNot,
+    /// `typeof x` — always a string, and an exact one when the operand has a
+    /// single inhabited kind.
+    TypeOf,
+    /// Unary `+x` — numeric coercion, not the identity (`+"5"` is the number 5).
+    Plus,
     /// An operator whose concrete semantics are not modeled by the abstract
-    /// domain (`~`, `typeof`, unary `+`). Evaluated as ⊤ — never as the
-    /// identity, which would falsify the operand's value.
+    /// domain. Evaluated as ⊤ — never as the identity, which would falsify the
+    /// operand's value.
     Unknown,
 }
 
@@ -151,8 +176,15 @@ pub enum Expr {
 /// stability-gated rule on it: a false negative, and the forbidden direction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkerVal {
-    /// Reads as `undefined` — React's own value-less hooks.
+    /// Reads as `undefined` — React's own value-less hooks (an effect returns
+    /// nothing).
     Undefined,
+    /// Reads as a reference whose identity is constant across renders —
+    /// `useRef`. Reading it as `Undefined` instead was *stable enough* for the
+    /// deps rules (`to_stability` joins `Stable` for `undef` too), but it threw
+    /// the identity away: the container is a reference, and every rule that
+    /// reasons about references rather than about stability saw nothing there.
+    StableRef,
     /// Reads as ⊤ — a custom hook the engine could neither inline nor
     /// summarize. Paired with the `analysis-limit/unknown-hook` Info.
     Unknown,
@@ -181,9 +213,17 @@ impl Expr {
     ///
     /// This is the canonical child enumeration: walkers write only the arms
     /// they treat specially and delegate the default case here, so a new
-    /// `Expr` variant breaks compilation in exactly one place and every
-    /// walker inherits the fix. The match is deliberately exhaustive — do
-    /// NOT add a `_` arm.
+    /// `Expr` variant is descended into everywhere without each walker
+    /// spelling it out. The match is deliberately exhaustive — do NOT add a
+    /// `_` arm.
+    ///
+    /// What that buys, precisely: adding a variant does *not* break compilation
+    /// in one place — measured, it breaks about twenty exhaustive matches
+    /// across the crate. But every one of them is a compiler error you are led
+    /// to, and none of them silently mistreats the new variant. The arm below
+    /// is what keeps that true, so a walker that clones this enumeration with a
+    /// `_` arm instead of delegating here defeats the whole scheme: it will
+    /// absorb the new variant as "no children" and lose everything under it.
     ///
     /// `FnLit` bodies are CFGs, not child expressions: crossing the function
     /// boundary is a per-walker decision (see [`crate::ir::cfg::CFG::for_each_expr`]).

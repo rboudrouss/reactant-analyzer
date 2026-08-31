@@ -18,6 +18,15 @@ REPOS=(
   "satnaing/shadcn-admin        shadcn-admin"
   "pmndrs/zustand               zustand"
 
+  # Monorepos. Big, multi-package, and the ones that actually exercise the
+  # scaling paths — they are where the utility-inlining budget is exhausted and
+  # where the `infinite-loop` O(C²) hang (#86) shows up. `dub` and `twenty` do
+  # not currently finish a `--all-roots` run; keep them out of any timed sweep
+  # until #86 is fixed.
+  "mantinedev/mantine           mantine"
+  "dubinc/dub                   dub"
+  "twentyhq/twenty              twenty"
+
   # Next.js (ADR-026). Chosen to cover the four layouts that change how the
   # analyzer resolves a project, not just to add volume :
   #   commerce                       app/ à la racine, tsconfig `baseUrl` SANS `paths`

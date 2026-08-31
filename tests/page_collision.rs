@@ -55,16 +55,10 @@ impl Drop for Tmp {
 fn parse_file(path: &Path) -> (Vec<reactant::ir::ComponentIR>, Vec<reactant::ir::HookIR>) {
     use oxc_allocator::Allocator;
     use oxc_parser::{ParseOptions, Parser as OxcParser};
-    use oxc_span::SourceType;
 
     let source = fs::read_to_string(path).expect("read source");
     let alloc = Allocator::default();
-    let source_type = match path.extension().and_then(|e| e.to_str()) {
-        Some("tsx") => SourceType::tsx(),
-        Some("ts") => SourceType::ts(),
-        Some("jsx") => SourceType::jsx(),
-        _ => SourceType::cjs(),
-    };
+    let source_type = reactant::resolver::source_type_for(path);
     let ret = OxcParser::new(&alloc, &source, source_type)
         .with_options(ParseOptions::default())
         .parse();

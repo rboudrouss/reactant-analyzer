@@ -237,6 +237,36 @@ impl StateValue {
             && *other
     }
 
+    /// What `typeof` returns for this value, when exactly one answer is
+    /// possible.
+    ///
+    /// `None` when the value spans several kinds, or when its one kind does not
+    /// determine the answer: the reference slot covers objects, arrays *and*
+    /// functions (`"object"` or `"function"`), and the residual `other` slot is
+    /// opaque by construction. `null` is `"object"` — that is JavaScript.
+    ///
+    /// Derived from [`Self::populated_kinds`] like every other kind predicate,
+    /// so a new slot is a compile error here too.
+    pub fn typeof_name(&self) -> Option<&'static str> {
+        let kinds = self.populated_kinds();
+        if kinds.count() != 1 {
+            return None;
+        }
+        for (bit, name) in [
+            (KindMask::NUM, "number"),
+            (KindMask::BOOL, "boolean"),
+            (KindMask::STR, "string"),
+            (KindMask::NULL, "object"),
+            (KindMask::UNDEF, "undefined"),
+            (KindMask::SETTER, "function"),
+        ] {
+            if kinds.only(bit) {
+                return Some(name);
+            }
+        }
+        None
+    }
+
     /// Exact setter identity, only when the value can be nothing else.
     pub fn as_setter(&self) -> Option<(&Symbol, &HookLabel)> {
         // Only the setter slot may be populated (`as_one` still yields `None`

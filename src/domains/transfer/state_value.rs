@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     domains::{
@@ -126,6 +126,10 @@ fn eval_state_value(
         // on it — a false negative.
         Expr::HookMarker(_, MarkerVal::Undefined) => StateValue::undefined(),
         Expr::HookMarker(_, MarkerVal::Unknown) => StateValue::top(),
+        // `useRef` hands back the same container every render — a reference,
+        // and a stable one. Both halves matter: `undefined` was stable too, but
+        // it was not a reference, so the identity was invisible.
+        Expr::HookMarker(_, MarkerVal::StableRef) => StateValue::reference(Stability::Stable),
         // A summarized library hook reads exactly as its summary; the marker
         // is kept (rather than replaced by a bare `SummaryVal`) so the label
         // stays anchored at the call site.
@@ -234,7 +238,7 @@ fn havoc_setter_props(
         }
         // Everything a function value can smuggle a setter through: spread
         // objects, closures wrapping a setter call, heap-allocated FnLits.
-        collect_escaping_setters(v, env, ctx.heap, &own, &mut setters, 0);
+        collect_escaping_setters(v, env, ctx.heap, &own, &mut setters, &mut HashSet::new());
     }
     for (comp, label) in setters {
         if comp == own {
@@ -257,20 +261,24 @@ fn havoc_setter_props(
 /// to a setter. The child may invoke any function it receives, with any
 /// argument, at any time — reachability is decided by escape, not by prop
 /// names (TODO.md B).
+///
+/// The walk is bounded by *identity*, not by a depth budget: `walked` records
+/// the `(body, captured-environment)` pairs already visited, so every body is
+/// entered once and the chase always terminates. The old `depth > 4` cut-off
+/// was a budget doing a cycle guard's job — a setter smuggled through a fifth
+/// closure was silently missed, and the analysis then concluded the state was
+/// stable (a false negative, the forbidden direction).
 fn collect_escaping_setters(
     v: &Expr,
     env: &AbstractEnv<StateValue>,
     heap: &Heap,
     own: &Symbol,
     out: &mut Vec<(Symbol, crate::ir::types::HookLabel)>,
-    depth: usize,
+    walked: &mut HashSet<(usize, usize)>,
 ) {
-    if depth > 4 {
-        return;
-    }
     match v {
         Expr::FnLit { body_cfg, .. } => {
-            setter_calls_in_cfg(body_cfg, env, None, heap, own, out, depth + 1);
+            setter_calls_in_cfg(body_cfg, env, None, heap, own, out, walked);
         }
         Expr::Var(name) => {
             let Some(EnvVal::Loc(ids)) = env.lookup_env_val(name) else {
@@ -281,15 +289,7 @@ fn collect_escaping_setters(
                     Some(HeapValue::Fn {
                         body_cfg, captured, ..
                     }) => {
-                        setter_calls_in_cfg(
-                            body_cfg,
-                            env,
-                            Some(captured),
-                            heap,
-                            own,
-                            out,
-                            depth + 1,
-                        );
+                        setter_calls_in_cfg(body_cfg, env, Some(captured), heap, own, out, walked);
                     }
                     Some(HeapValue::Obj(obj_fields)) => {
                         for ev in obj_fields.values() {
@@ -303,16 +303,16 @@ fn collect_escaping_setters(
             }
         }
         Expr::TSAnnotated(inner) => {
-            collect_escaping_setters(inner, env, heap, own, out, depth);
+            collect_escaping_setters(inner, env, heap, own, out, walked);
         }
         Expr::ObjectLit { fields, .. } => {
             for (_, f) in fields {
-                collect_escaping_setters(f, env, heap, own, out, depth + 1);
+                collect_escaping_setters(f, env, heap, own, out, walked);
             }
         }
         Expr::ArrayLit { elems, .. } => {
             for e in elems {
-                collect_escaping_setters(e, env, heap, own, out, depth + 1);
+                collect_escaping_setters(e, env, heap, own, out, walked);
             }
         }
         // Deliberately NOT the generic `for_each_child` recursion: only
@@ -325,6 +325,10 @@ fn collect_escaping_setters(
 /// Walk a function body for calls whose callee resolves to a setter.
 /// `captured` is the closure's creation-time environment (heap `Fn`);
 /// syntactic FnLits resolve through the live `env` instead.
+///
+/// The `(body, captured)` pair is the memo key, not the body alone: the same
+/// closure body reached under a different creation-time environment resolves
+/// its callees differently, so skipping it would lose a setter.
 fn setter_calls_in_cfg(
     cfg: &crate::ir::cfg::CFG,
     env: &AbstractEnv<StateValue>,
@@ -332,12 +336,16 @@ fn setter_calls_in_cfg(
     heap: &Heap,
     own: &Symbol,
     out: &mut Vec<(Symbol, crate::ir::types::HookLabel)>,
-    depth: usize,
+    walked: &mut HashSet<(usize, usize)>,
 ) {
-    if depth > 4 {
+    let key = (
+        cfg as *const _ as usize,
+        captured.map_or(0, |c| c as *const _ as usize),
+    );
+    if !walked.insert(key) {
         return;
     }
-    cfg.for_each_expr(&mut |e| setter_calls_in_expr(e, env, captured, heap, own, out, depth));
+    cfg.for_each_expr(&mut |e| setter_calls_in_expr(e, env, captured, heap, own, out, walked));
 }
 
 fn setter_calls_in_expr(
@@ -347,7 +355,7 @@ fn setter_calls_in_expr(
     heap: &Heap,
     own: &Symbol,
     out: &mut Vec<(Symbol, crate::ir::types::HookLabel)>,
-    depth: usize,
+    walked: &mut HashSet<(usize, usize)>,
 ) {
     match e {
         Expr::Call { fn_, .. } => {
@@ -355,15 +363,15 @@ fn setter_calls_in_expr(
                 out.push((c, l));
             }
             e.for_each_child(&mut |c| {
-                setter_calls_in_expr(c, env, captured, heap, own, out, depth)
+                setter_calls_in_expr(c, env, captured, heap, own, out, walked)
             });
         }
         Expr::FnLit { body_cfg, .. } => {
-            setter_calls_in_cfg(body_cfg, env, captured, heap, own, out, depth + 1);
+            setter_calls_in_cfg(body_cfg, env, captured, heap, own, out, walked);
         }
         other => {
             other.for_each_child(&mut |c| {
-                setter_calls_in_expr(c, env, captured, heap, own, out, depth)
+                setter_calls_in_expr(c, env, captured, heap, own, out, walked)
             });
         }
     }
@@ -689,8 +697,139 @@ fn eval_binop(op: &BinOp, lhs: StateValue, rhs: StateValue) -> StateValue {
         BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Leq | BinOp::Geq => {
             StateValue::boolean(BoolVal::Top)
         }
+        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr | BinOp::UShr => {
+            eval_bitwise(op, &lhs, &rhs)
+        }
         BinOp::Unknown => StateValue::top(),
     }
+}
+
+const I32_MIN: f64 = i32::MIN as f64;
+const I32_MAX: f64 = i32::MAX as f64;
+const U32_MAX: f64 = u32::MAX as f64;
+
+/// Every value `x` such that `x = ToInt32(_)` — the range every bitwise and
+/// shift operator but `>>>` lands in.
+fn int32_range() -> Interval {
+    Interval {
+        lo: I32_MIN,
+        hi: I32_MAX,
+        is_int: true,
+    }
+}
+
+/// The `>>>` range: unsigned, so a uint32.
+fn uint32_range() -> Interval {
+    Interval {
+        lo: 0.0,
+        hi: U32_MAX,
+        is_int: true,
+    }
+}
+
+/// The constant an operand denotes, when it denotes exactly one number.
+fn const_of(iv: &Option<Interval>) -> Option<f64> {
+    iv.filter(|i| !i.is_bottom() && i.is_point()).map(|i| i.lo)
+}
+
+/// A shift distance is taken mod 32, so only its low five bits matter.
+fn shift_amount(k: f64) -> Option<u32> {
+    (k.is_finite() && k.abs() < 1e9).then(|| (k as i64).rem_euclid(32) as u32)
+}
+
+/// Bitwise and shift operators.
+///
+/// JS coerces *both* operands to int32 (uint32 for `>>>`) whatever they are, so
+/// the result is always a number in a known range — which no operand check is
+/// needed to claim. That floor alone beats ⊤: it puts the string, boolean and
+/// reference components at ⊥, so a downstream guard can still narrow on the
+/// result. Constant operands tighten it further, exactly where React code
+/// actually uses these (`flags & MASK`, `hash >>> 0`, `i << 1`).
+fn eval_bitwise(op: &BinOp, lhs: &StateValue, rhs: &StateValue) -> StateValue {
+    // A ⊥ operand is an unreachable path: the result stays ⊥ rather than
+    // widening back to a live range.
+    if lhs.is_bottom_value() || rhs.is_bottom_value() {
+        return StateValue::bottom();
+    }
+    let l = as_arith(lhs);
+    let r = as_arith(rhs);
+    let in_i32 = |i: &Interval| !i.is_bottom() && i.lo >= I32_MIN && i.hi <= I32_MAX;
+
+    let refined = match op {
+        // `x & mask` can only keep bits the mask has: with a non-negative
+        // constant mask the result is in `[0, mask]`. Either side may be it.
+        BinOp::BitAnd => const_of(&r)
+            .or_else(|| const_of(&l))
+            .filter(|m| (0.0..=I32_MAX).contains(m))
+            .map(|m| Interval {
+                lo: 0.0,
+                hi: m,
+                is_int: true,
+            }),
+        // `x | y` and `x ^ y` on non-negative operands cannot set a bit above
+        // the highest one either operand could have.
+        BinOp::BitOr | BinOp::BitXor => match (&l, &r) {
+            (Some(a), Some(b)) if in_i32(a) && in_i32(b) && a.lo >= 0.0 && b.lo >= 0.0 => {
+                Some(Interval {
+                    lo: 0.0,
+                    hi: all_ones_above(a.hi.max(b.hi)),
+                    is_int: true,
+                })
+            }
+            _ => None,
+        },
+        // `x << k` with a constant shift: multiply the bounds, and keep the
+        // result only when neither can wrap past int32 (a wrap makes the
+        // operation non-monotone, so the bounds would no longer bound it).
+        BinOp::Shl => match (&l, const_of(&r).and_then(shift_amount)) {
+            (Some(a), Some(k)) if in_i32(a) => {
+                let f = (1u64 << k) as f64;
+                let (lo, hi) = (a.lo * f, a.hi * f);
+                (lo >= I32_MIN && hi <= I32_MAX).then_some(Interval {
+                    lo,
+                    hi,
+                    is_int: true,
+                })
+            }
+            _ => None,
+        },
+        // `x >> k` is a floor-division by `2^k` on int32 — monotone, so the
+        // bounds carry straight through.
+        BinOp::Shr => match (&l, const_of(&r).and_then(shift_amount)) {
+            (Some(a), Some(k)) if in_i32(a) => {
+                let f = (1u64 << k) as f64;
+                Some(Interval {
+                    lo: (a.lo / f).floor(),
+                    hi: (a.hi / f).floor(),
+                    is_int: true,
+                })
+            }
+            _ => None,
+        },
+        // `x >>> k` is unsigned: whatever `x` is, the result fits in the low
+        // `32 - k` bits.
+        BinOp::UShr => const_of(&r).and_then(shift_amount).map(|k| Interval {
+            lo: 0.0,
+            hi: (u32::MAX >> k) as f64,
+            is_int: true,
+        }),
+        _ => None,
+    };
+
+    StateValue::number(refined.unwrap_or_else(|| match op {
+        BinOp::UShr => uint32_range(),
+        _ => int32_range(),
+    }))
+}
+
+/// The smallest `2^n - 1` that is at least `m` — the largest value any bitwise
+/// OR/XOR of non-negative operands bounded by `m` can produce.
+fn all_ones_above(m: f64) -> f64 {
+    if m <= 0.0 {
+        return 0.0;
+    }
+    let bits = (m.max(1.0).log2().floor() as u32 + 1).min(31);
+    ((1u64 << bits) - 1) as f64
 }
 
 fn eval_unary(op: &UnaryOp, val: StateValue) -> StateValue {
@@ -718,8 +857,80 @@ fn eval_unary(op: &UnaryOp, val: StateValue) -> StateValue {
                 StateValue::top()
             }
         }
+        // `typeof x` is *always* a string, and an exact one whenever the operand
+        // has a single inhabited kind. That exactness is what makes
+        // `typeof x === "string"` a narrowable guard instead of `BoolVal::Top`.
+        UnaryOp::TypeOf => {
+            if val.is_bottom_value() {
+                return StateValue::bottom();
+            }
+            match val.typeof_name() {
+                Some(name) => StateValue::str_singleton(name.to_string()),
+                None => StateValue::str_top(),
+            }
+        }
+        // `~x` is `-(ToInt32(x) + 1)` — decreasing, so the bounds swap. Outside
+        // int32 the coercion wraps and monotonicity is gone; the int32 range is
+        // still guaranteed.
+        UnaryOp::BitNot => {
+            if val.is_bottom_value() {
+                return StateValue::bottom();
+            }
+            let refined = as_arith(&val).filter(|i| !i.is_bottom()).and_then(|i| {
+                (i.lo >= I32_MIN && i.hi <= I32_MAX).then_some(Interval {
+                    lo: -i.hi.ceil() - 1.0,
+                    hi: -i.lo.floor() - 1.0,
+                    is_int: true,
+                })
+            });
+            StateValue::number(refined.unwrap_or_else(int32_range))
+        }
+        // Unary `+` is `ToNumber`, not the identity: `+"5"` is the number 5 and
+        // `+true` is 1. Anything that could coerce to `NaN` (an unparseable
+        // string, `undefined`, an object) is ⊤ — the interval domain has no
+        // `NaN`.
+        UnaryOp::Plus => match as_arith(&val) {
+            Some(i) => StateValue::number(i),
+            None => coerce_to_number(&val).unwrap_or_else(StateValue::top),
+        },
         UnaryOp::Unknown => StateValue::top(),
     }
+}
+
+/// `ToNumber` for the operands `as_arith` refuses: a boolean is 0 or 1, and a
+/// known string is its parse — but only when *every* string in the set parses,
+/// since one `NaN` makes the whole result unrepresentable.
+fn coerce_to_number(val: &StateValue) -> Option<StateValue> {
+    if val.is_bottom_value() {
+        return Some(StateValue::bottom());
+    }
+    if val.typeof_name() == Some("boolean") {
+        return Some(StateValue::number(match val.boolean {
+            BoolVal::True => Interval::point(1.0),
+            BoolVal::False => Interval::point(0.0),
+            _ => Interval {
+                lo: 0.0,
+                hi: 1.0,
+                is_int: true,
+            },
+        }));
+    }
+    if let Some(StrConst::Set(set)) = as_str_only(val) {
+        let mut acc: Option<Interval> = None;
+        for s in set.iter() {
+            let n: f64 = s.trim().parse().ok()?;
+            if !n.is_finite() {
+                return None;
+            }
+            let p = Interval::point(n);
+            acc = Some(match acc {
+                Some(a) => a.hull(&p),
+                None => p,
+            });
+        }
+        return acc.map(StateValue::number);
+    }
+    None
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -861,6 +1072,151 @@ mod tests {
         assert_eq!(value, StateValue::top());
     }
 
+    fn num(lo: f64, hi: f64) -> StateValue {
+        StateValue::number(Interval {
+            lo,
+            hi,
+            is_int: true,
+        })
+    }
+
+    /// The floor every bitwise operator gets for free: a number in int32 range.
+    /// ⊤ threw that away, so `str`, `boolean` and the reference component were
+    /// all live on a value that can only ever be a number.
+    #[test]
+    fn bitwise_of_unknown_operands_is_still_an_int32() {
+        let value = eval_binop(&BinOp::BitOr, StateValue::top(), StateValue::top());
+        assert_eq!(value, num(i32::MIN as f64, i32::MAX as f64));
+        assert!(value.str == StrConst::Bottom && value.boolean == BoolVal::Bottom);
+    }
+
+    #[test]
+    fn unsigned_shift_of_unknown_operands_is_a_uint32() {
+        let value = eval_binop(&BinOp::UShr, StateValue::top(), StateValue::top());
+        assert_eq!(value, num(0.0, u32::MAX as f64));
+    }
+
+    #[test]
+    fn bitwise_and_with_a_constant_mask_is_bounded_by_it() {
+        assert_eq!(
+            eval_binop(&BinOp::BitAnd, StateValue::top(), num(7.0, 7.0)),
+            num(0.0, 7.0)
+        );
+        // Either side may be the mask.
+        assert_eq!(
+            eval_binop(&BinOp::BitAnd, num(255.0, 255.0), StateValue::top()),
+            num(0.0, 255.0)
+        );
+    }
+
+    #[test]
+    fn constant_shifts_move_the_bounds() {
+        assert_eq!(
+            eval_binop(&BinOp::Shl, num(1.0, 4.0), num(2.0, 2.0)),
+            num(4.0, 16.0)
+        );
+        assert_eq!(
+            eval_binop(&BinOp::Shr, num(8.0, 9.0), num(1.0, 1.0)),
+            num(4.0, 4.0)
+        );
+        assert_eq!(
+            eval_binop(&BinOp::Shr, num(-3.0, -3.0), num(1.0, 1.0)),
+            num(-2.0, -2.0)
+        );
+        assert_eq!(
+            eval_binop(&BinOp::UShr, StateValue::top(), num(24.0, 24.0)),
+            num(0.0, 255.0)
+        );
+    }
+
+    /// A shift that would wrap past int32 is not monotone, so the bounds no
+    /// longer bound it — fall back to the range floor rather than claim them.
+    #[test]
+    fn a_wrapping_shift_falls_back_to_the_int32_range() {
+        assert_eq!(
+            eval_binop(&BinOp::Shl, num(1.0, 1.0), num(31.0, 31.0)),
+            num(i32::MIN as f64, i32::MAX as f64)
+        );
+    }
+
+    /// An unreachable operand must stay unreachable: widening ⊥ back to a live
+    /// range would resurrect a path the narrowing killed.
+    #[test]
+    fn bitwise_on_a_bottom_operand_stays_bottom() {
+        let value = eval_binop(&BinOp::BitAnd, StateValue::bottom(), num(1.0, 1.0));
+        assert!(value.is_bottom_value(), "got {value:?}");
+    }
+
+    #[test]
+    fn bitwise_not_is_minus_x_minus_one() {
+        assert_eq!(eval_unary(&UnaryOp::BitNot, num(5.0, 5.0)), num(-6.0, -6.0));
+        assert_eq!(eval_unary(&UnaryOp::BitNot, num(0.0, 3.0)), num(-4.0, -1.0));
+        assert_eq!(
+            eval_unary(&UnaryOp::BitNot, StateValue::top()),
+            num(i32::MIN as f64, i32::MAX as f64)
+        );
+    }
+
+    /// `typeof x === "string"` is a real guard shape: an exact string makes it
+    /// narrowable, `StrConst::Top` only makes it a boolean.
+    #[test]
+    fn typeof_is_exact_for_a_single_inhabited_kind() {
+        assert_eq!(
+            eval_unary(&UnaryOp::TypeOf, num(1.0, 9.0)),
+            StateValue::str_singleton("number".to_string())
+        );
+        assert_eq!(
+            eval_unary(&UnaryOp::TypeOf, StateValue::str_top()),
+            StateValue::str_singleton("string".to_string())
+        );
+        assert_eq!(
+            eval_unary(&UnaryOp::TypeOf, StateValue::boolean(BoolVal::Top)),
+            StateValue::str_singleton("boolean".to_string())
+        );
+        assert_eq!(
+            eval_unary(&UnaryOp::TypeOf, StateValue::undefined()),
+            StateValue::str_singleton("undefined".to_string())
+        );
+        // `typeof null === "object"` — that is JavaScript.
+        assert_eq!(
+            eval_unary(&UnaryOp::TypeOf, StateValue::null()),
+            StateValue::str_singleton("object".to_string())
+        );
+        // A reference is an object *or* a function: no exact answer, but still
+        // a string.
+        assert_eq!(
+            eval_unary(
+                &UnaryOp::TypeOf,
+                StateValue::reference(Stability::PerRender)
+            ),
+            StateValue::str_top()
+        );
+        // Several kinds: unknown content, still a string.
+        assert_eq!(
+            eval_unary(&UnaryOp::TypeOf, StateValue::top()),
+            StateValue::str_top()
+        );
+    }
+
+    /// Unary `+` is `ToNumber`, not the identity — `+"5"` is the number 5.
+    #[test]
+    fn unary_plus_coerces_to_a_number() {
+        assert_eq!(
+            eval_unary(&UnaryOp::Plus, StateValue::str_singleton("5".to_string())),
+            num(5.0, 5.0)
+        );
+        assert_eq!(
+            eval_unary(&UnaryOp::Plus, StateValue::boolean(BoolVal::True)),
+            num(1.0, 1.0)
+        );
+        assert_eq!(eval_unary(&UnaryOp::Plus, num(2.0, 4.0)), num(2.0, 4.0));
+        // `+"abc"` is NaN, which the interval domain cannot hold.
+        assert_eq!(
+            eval_unary(&UnaryOp::Plus, StateValue::str_singleton("abc".to_string())),
+            StateValue::top()
+        );
+    }
+
     #[test]
     fn eval_unary_not_true_is_false() {
         let (env, mut state, mut memo) = empty();
@@ -889,6 +1245,51 @@ mod tests {
             &mut AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap),
         );
         assert_eq!(v, StateValue::str_singleton("dark".to_string()));
+    }
+
+    // ── escaping setters ──────────────────────────────────────────────────────
+
+    /// A setter nested deeper than the old `depth > 4` budget was silently
+    /// missed, so the state read as stable — a false negative. Termination now
+    /// comes from visiting each body once, so nesting costs nothing.
+    #[test]
+    fn a_deeply_nested_escaping_setter_is_still_found() {
+        let (env, _state, _memo) = empty();
+        let heap = Heap::new();
+
+        // `() => setN(1)`, wrapped in six levels of object literal.
+        let call_setter = single_block_cfg(
+            vec![Stmt::ExprStmt(
+                Expr::Call {
+                    fn_: Box::new(Expr::StateSetter(0)),
+                    args: vec![Expr::Lit(Prim::Int(1))],
+                },
+                None,
+            )],
+            Expr::Lit(Prim::Unit),
+        );
+        let mut value = Expr::FnLit {
+            id: crate::ir::types::ExprId(0),
+            params: vec![],
+            body_cfg: Arc::new(call_setter),
+        };
+        for depth in 0..6 {
+            value = Expr::ObjectLit {
+                id: crate::ir::types::ExprId(depth + 1),
+                fields: vec![("nested".to_string(), value)],
+            };
+        }
+
+        let mut found = Vec::new();
+        collect_escaping_setters(
+            &value,
+            &env,
+            &heap,
+            &"C".to_string(),
+            &mut found,
+            &mut HashSet::new(),
+        );
+        assert_eq!(found, vec![("C".to_string(), 0)], "six levels deep");
     }
 
     // ── exec_stmt / setter ────────────────────────────────────────────────────

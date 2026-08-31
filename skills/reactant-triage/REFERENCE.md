@@ -79,7 +79,10 @@ collision is itself a known defect (#7).
 `line` counts from 1, `col` from 0. Both are `null` when the finding has no
 source range.
 
-`parse_errors[]` lists the files that never entered the analysis at all.
+`parse_errors[]` lists the files the parser complained about. `analyzed: true`
+means it recovered and the file was analysed anyway — noise. `analyzed: false`
+means the file never entered the analysis, so anything it held is missing from
+the report.
 
 `summary.exit_code` mirrors the process exit code under the active `--fail-on`.
 
@@ -91,5 +94,5 @@ source range.
 | `--trace` | Witness chains in human format, capped at 8 steps |
 | `--show-clean` | List the components with no findings, hidden by default |
 | `--all-roots` | Analyze every component as an entry point, with its props unknown. More findings, more noise |
-| `--entry Foo,Bar` | Pin the root components. An ambiguous or misspelt name matches nothing and says nothing about it (#8) |
+| `--entry Foo,Bar` | Pin the root components. `Foo@path` picks one of several with the same name; a name matching nothing is a usage error (exit 2) |
 | `--verbose` | Fixpoint statistics on stderr. Worth it only when a finding looks impossible |

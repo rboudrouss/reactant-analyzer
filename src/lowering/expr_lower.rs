@@ -12,7 +12,9 @@ use crate::ir::{
     stmt::{MemberKey, Stmt},
 };
 
-use super::cfg_builder::{BlockBuilder, build_expr_fn_body_cfg, build_fn_body_cfg};
+use super::cfg_builder::{
+    BlockBuilder, build_expr_fn_body_cfg, build_fn_body_cfg, build_stmts_cfg,
+};
 
 /// An opaque value of unknown kind (⊤). Used for expressions the analysis does
 /// not model (exotic operators, `this`/`super`, unhandled syntax). A typed
@@ -40,6 +42,97 @@ fn lower_for_effect(expr: &Expression, builder: &mut BlockBuilder) {
 /// so the value stays fully visible to them. Same device as the JSX spread key.
 fn synthetic_key(builder: &mut BlockBuilder, prefix: &str) -> String {
     format!("{prefix}{}", builder.next_expr_id().0)
+}
+
+/// Lower a class into an `ObjectLit` holding its member bodies under synthetic
+/// keys.
+///
+/// A class binds nothing the env models — `new X()` and `X.m()` are both ⊤, and
+/// the synthetic keys make sure no real `FieldAccess` ever resolves to a member.
+/// But its **bodies are code**: dropping the whole declaration lost every setter
+/// call and every capture inside it, so `class X { m() { setC(1) } }` read as a
+/// component that never writes `c` — a path the fixpoint never explores, not a
+/// widened one. Same device as an object spread: the value is kept for its
+/// reads, under a name nothing can ask for.
+///
+/// Shared by the declaration and the expression form so neither can drift.
+pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
+    let id = builder.next_expr_id();
+    let mut fields: Vec<(String, Expr)> = vec![];
+    let smap = builder.smap.clone();
+
+    // A computed member name (`class X { [k]() {} }`) is an expression that
+    // runs where the class is defined — its reads have to survive.
+    let computed_key = |key: &PropertyKey, builder: &mut BlockBuilder| {
+        if let PropertyKey::StaticIdentifier(_) | PropertyKey::StringLiteral(_) = key {
+            return;
+        }
+        if let Some(e) = key.as_expression() {
+            lower_for_effect(e, builder);
+        }
+    };
+
+    for elem in &class.body.body {
+        match elem {
+            ClassElement::MethodDefinition(m) => {
+                computed_key(&m.key, builder);
+                if let Some(body) = m.value.body.as_deref() {
+                    let (params, body_cfg) = build_fn_body_cfg(&m.value.params, body, &smap);
+                    let fn_id = builder.next_expr_id();
+                    fields.push((
+                        synthetic_key(builder, "[method]"),
+                        Expr::FnLit {
+                            id: fn_id,
+                            params,
+                            body_cfg: Arc::new(body_cfg),
+                        },
+                    ));
+                }
+            }
+            // `handle = () => setC(1)` — a field initializer is an ordinary
+            // expression, and the arrow-bound-method form is the one React
+            // class components use everywhere.
+            ClassElement::PropertyDefinition(p) => {
+                computed_key(&p.key, builder);
+                if let Some(value) = &p.value {
+                    let lowered = lower_expr(value, builder);
+                    fields.push((synthetic_key(builder, "[field]"), lowered));
+                }
+            }
+            ClassElement::AccessorProperty(a) => {
+                computed_key(&a.key, builder);
+                if let Some(value) = &a.value {
+                    let lowered = lower_expr(value, builder);
+                    fields.push((synthetic_key(builder, "[accessor]"), lowered));
+                }
+            }
+            // `static { … }` runs at definition time. Kept as a zero-arg body
+            // rather than lowered inline: over-approximating *when* it runs
+            // loses nothing, while splicing its blocks into a half-built
+            // expression would.
+            ClassElement::StaticBlock(b) => {
+                let fn_id = builder.next_expr_id();
+                fields.push((
+                    synthetic_key(builder, "[static]"),
+                    Expr::FnLit {
+                        id: fn_id,
+                        params: vec![],
+                        body_cfg: Arc::new(build_stmts_cfg(&b.body, &smap)),
+                    },
+                ));
+            }
+            // A type-only index signature erases before anything runs.
+            ClassElement::TSIndexSignature(_) => {}
+        }
+    }
+
+    // `class X extends base()` — the superclass expression runs too.
+    if let Some(super_class) = &class.super_class {
+        let lowered = lower_expr(super_class, builder);
+        fields.push((synthetic_key(builder, "[extends]"), lowered));
+    }
+
+    Expr::ObjectLit { id, fields }
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -138,10 +231,23 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                     builder.push_stmt(Stmt::ExprStmt(arg, builder.span_at(un.span.start)));
                     Expr::Lit(Prim::Unit)
                 }
-                // `~e`, `typeof e`, `+e`: coercions the domain does not model.
-                // Returning `arg` unchanged aliased them onto the *identity*,
-                // which falsifies the value (`~5` is `-6`, not `5`) — the same
-                // defect `BinOp::Unknown` fixed on the binary side.
+                // Coercions, each modelled as itself. Returning `arg` unchanged
+                // once aliased them onto the *identity*, which falsifies the
+                // value (`~5` is `-6`, not `5`); collapsing them into
+                // `Unknown` was sound but threw away that `typeof` is always a
+                // string and `~` always an int32.
+                UnaryOperator::BitwiseNot => Expr::UnaryOp {
+                    op: IrUnaryOp::BitNot,
+                    arg: Box::new(arg),
+                },
+                UnaryOperator::Typeof => Expr::UnaryOp {
+                    op: IrUnaryOp::TypeOf,
+                    arg: Box::new(arg),
+                },
+                UnaryOperator::UnaryPlus => Expr::UnaryOp {
+                    op: IrUnaryOp::Plus,
+                    arg: Box::new(arg),
+                },
                 _ => Expr::UnaryOp {
                     op: IrUnaryOp::Unknown,
                     arg: Box::new(arg),
@@ -423,6 +529,7 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
             }
             value
         }
+        Expression::ClassExpression(class) => lower_class(class, builder),
         Expression::AwaitExpression(aw) => lower_expr(&aw.argument, builder),
         Expression::YieldExpression(y) => y
             .argument
@@ -959,13 +1066,21 @@ fn lower_assignment_maybe_default(
 
 /// `IrBinOp` for a compound-assignment operator, restricted to those
 /// [`lower_binop`] maps faithfully. Returns `None` for `=` and for operators
-/// that would silently fall back to `Add` (%=, **=, bitwise, logical).
+/// that would silently fall back to `Add` (%=, **=, logical).
 fn faithful_compound_binop(op: AssignmentOperator) -> Option<IrBinOp> {
     match op {
         AssignmentOperator::Addition => Some(IrBinOp::Add),
         AssignmentOperator::Subtraction => Some(IrBinOp::Sub),
         AssignmentOperator::Multiplication => Some(IrBinOp::Mul),
         AssignmentOperator::Division => Some(IrBinOp::Div),
+        // Faithful since the bitwise operators became real `IrBinOp` variants:
+        // `x &= mask` is now `x = x & mask` rather than a havoc to ⊤.
+        AssignmentOperator::BitwiseAnd => Some(IrBinOp::BitAnd),
+        AssignmentOperator::BitwiseOR => Some(IrBinOp::BitOr),
+        AssignmentOperator::BitwiseXOR => Some(IrBinOp::BitXor),
+        AssignmentOperator::ShiftLeft => Some(IrBinOp::Shl),
+        AssignmentOperator::ShiftRight => Some(IrBinOp::Shr),
+        AssignmentOperator::ShiftRightZeroFill => Some(IrBinOp::UShr),
         _ => None,
     }
 }
@@ -982,6 +1097,14 @@ fn lower_binop(op: BinaryOperator) -> IrBinOp {
         BinaryOperator::GreaterThan => IrBinOp::Gt,
         BinaryOperator::LessEqualThan => IrBinOp::Leq,
         BinaryOperator::GreaterEqualThan => IrBinOp::Geq,
+        // Bitwise/shift: modelled as themselves so `eval_binop` can use the
+        // int32/uint32 range they guarantee (`IrBinOp::Unknown` erased it).
+        BinaryOperator::BitwiseAnd => IrBinOp::BitAnd,
+        BinaryOperator::BitwiseOR => IrBinOp::BitOr,
+        BinaryOperator::BitwiseXOR => IrBinOp::BitXor,
+        BinaryOperator::ShiftLeft => IrBinOp::Shl,
+        BinaryOperator::ShiftRight => IrBinOp::Shr,
+        BinaryOperator::ShiftRightZeroFill => IrBinOp::UShr,
         _ => IrBinOp::Unknown, // keep unsupported operators soundly opaque.
     }
 }
@@ -1261,48 +1384,96 @@ mod tests {
         );
     }
 
+    /// `x &= mask` used to havoc `x` to ⊤ only because `lower_binop` had no
+    /// faithful op for `&`. It has one now, so the compound is exact.
+    #[test]
+    fn bitwise_compound_assignment_is_faithful() {
+        let cfg = build("function f() { let x = 9; x &= 3; }");
+        let assigns = entry_assigns(&cfg);
+        let (_, rhs) = assigns
+            .iter()
+            .find(|(v, _)| v == "x")
+            .expect("expected Assign for x");
+        assert!(
+            matches!(
+                rhs,
+                Expr::BinOp {
+                    op: IrBinOp::BitAnd,
+                    ..
+                }
+            ),
+            "`x &= 3` must lower to `x = x & 3`, got {rhs:?}"
+        );
+    }
+
     #[test]
     fn unsupported_binary_operators_remain_opaque() {
-        for source in [
-            "function f(n) { return n % 2; }",
-            "function f(n) { return n >> 3; }",
+        // `%` has no `IrBinOp` of its own: opaque, and above all never aliased
+        // onto `Add`.
+        let cfg = build("function f(n) { return n % 2; }");
+        let body = cfg.blocks.get(&0).expect("expected entry block");
+        assert!(
+            matches!(
+                body.term,
+                Terminator::Return(Expr::BinOp {
+                    op: IrBinOp::Unknown,
+                    ..
+                })
+            ),
+            "unsupported operators must not be modeled as addition: {:?}",
+            body.term
+        );
+    }
+
+    /// Bitwise and shift operators keep their identity through lowering. Folded
+    /// into `Unknown` they were sound but told the domain nothing, so the
+    /// int32 range they guarantee was unavailable.
+    #[test]
+    fn bitwise_operators_keep_their_identity() {
+        for (source, expected) in [
+            ("function f(n) { return n & 3; }", IrBinOp::BitAnd),
+            ("function f(n) { return n | 3; }", IrBinOp::BitOr),
+            ("function f(n) { return n ^ 3; }", IrBinOp::BitXor),
+            ("function f(n) { return n << 3; }", IrBinOp::Shl),
+            ("function f(n) { return n >> 3; }", IrBinOp::Shr),
+            ("function f(n) { return n >>> 3; }", IrBinOp::UShr),
         ] {
             let cfg = build(source);
             let body = cfg.blocks.get(&0).expect("expected entry block");
-            assert!(
-                matches!(
-                    body.term,
-                    Terminator::Return(Expr::BinOp {
-                        op: IrBinOp::Unknown,
-                        ..
-                    })
-                ),
-                "unsupported operators must not be modeled as addition: {source}"
+            let Terminator::Return(Expr::BinOp { op, .. }) = &body.term else {
+                panic!("expected a BinOp return for {source}, got {:?}", body.term);
+            };
+            assert_eq!(
+                std::mem::discriminant(op),
+                std::mem::discriminant(&expected),
+                "{source} lowered to {op:?}"
             );
         }
     }
 
     #[test]
     fn unary_coercions_are_not_the_identity() {
-        // `~n`, `typeof n`, `+n` are coercions the domain does not model.
-        // Returning the operand aliased them onto the identity, so `~5`
-        // evaluated to `5` instead of `-6` — the `BinOp::Add` defect, unary.
-        for source in [
-            "function f(n) { return ~n; }",
-            "function f(n) { return typeof n; }",
-            "function f(n) { return +n; }",
+        // `~n`, `typeof n`, `+n` are coercions. Returning the operand aliased
+        // them onto the identity, so `~5` evaluated to `5` instead of `-6` —
+        // the `BinOp::Add` defect, unary. Each now keeps its own operator, so
+        // the domain can compute the coercion instead of widening to ⊤.
+        for (source, expected) in [
+            ("function f(n) { return ~n; }", IrUnaryOp::BitNot),
+            ("function f(n) { return typeof n; }", IrUnaryOp::TypeOf),
+            ("function f(n) { return +n; }", IrUnaryOp::Plus),
         ] {
             let cfg = build(source);
             let body = cfg.blocks.get(&0).expect("expected entry block");
-            assert!(
-                matches!(
-                    body.term,
-                    Terminator::Return(Expr::UnaryOp {
-                        op: IrUnaryOp::Unknown,
-                        ..
-                    })
-                ),
-                "unmodeled unary operator must stay opaque: {source}"
+            let Terminator::Return(Expr::UnaryOp { op, .. }) = &body.term else {
+                panic!(
+                    "expected a UnaryOp return for {source}, got {:?}",
+                    body.term
+                );
+            };
+            assert_eq!(
+                std::mem::discriminant(op),
+                std::mem::discriminant(&expected),
+                "{source} lowered to {op:?}"
             );
         }
     }

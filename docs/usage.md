@@ -41,7 +41,7 @@ reactant check src/ --ignore-rule lazy-init      # all but this one
 | `--info` | Also display `Info` diagnostics (known analysis limits: widening, recursion cutoff, unknown hooks), plus, per shown component, the applicable checks that ran and found nothing (`verified: …`) or, where the analysis was truncated, the count withheld (`suspended: …`). See [The assurance channel](#the-assurance-channel---info). |
 | `--show-clean` | Show components with no findings (hidden by default). Without it, a trailing note reports how many clean components were hidden. |
 | `--trace` | Show each finding's witness chain (ADR-019): typed `→` steps explaining why the rule fired (e.g. `` `loadPrefs` resolves to an import from ./prefs.ts `` → `` `fetch` has side effects ``). Steps pointing into another file (cross-file inlining) show `file:line:col`. Capped at 8 steps (`… n more step(s)`). Hidden by default; a finding with steps shows a `(N trace step(s) — rerun with --trace)` hint instead. `json` output always includes the chain. |
-| `--entry <names>` | Explicit root components. Repeatable or comma-separated (`--entry Foo,Bar`). On a name collision across files, use `Foo@/abs/path.tsx` (shown in the output). |
+| `--entry <names>` | Explicit root components. Repeatable or comma-separated (`--entry Foo,Bar`). On a name collision across files, use the qualified `Foo@path` form the output prints. A name matching no component is a usage error (exit 2). |
 | `--all-roots` | Analyze every component as an entry point (`props = ⊤`). |
 | `--verbose` | Debug output on stderr: symbol graph topo order, fixpoint stats, per-component iterations/widened labels. |
 | `--no-color` | Disable ANSI colors. Also honored: a non-empty `NO_COLOR` env var, or stdout not being a terminal. |
@@ -203,7 +203,7 @@ the path from an entry leaves that subtree unclassified.
 {
   "version": 2,
   "files_analyzed": 12,
-  "parse_errors": [ { "file": "src/broken.tsx", "message": "..." } ],
+  "parse_errors": [ { "file": "src/broken.tsx", "message": "...", "analyzed": true } ],
   "diagnostics": [
     {
       "rule": "infinite-loop",
@@ -265,6 +265,11 @@ Semantics:
   `--fail-on`.
 - stdout is exactly one JSON document; parse errors are both listed in
   `parse_errors` and kept off stdout.
+- `parse_errors[].analyzed` says what became of the file. `true`: the parser
+  recovered and the file was analysed anyway, so the entry is noise. `false`:
+  the file was dropped from the run (read error, or a parser panic leaving an
+  empty program), so its findings are *missing*, not absent — a dropped file is
+  also reported on stderr whatever the `--format`.
 
 ## Reading the human output
 
@@ -389,9 +394,8 @@ Most impactful:
   the notice is `--info`-only: pass the target directory too.
 - Utility inlining is statement-level only; `if (util(x))` and `setX(util(y))`
   stay opaque.
-- `--entry Foo`, when ambiguous across files, analyzes **both**, and there is
-  currently **no way to disambiguate**: the qualified `Foo@/path` form matches
-  nothing and is accepted silently.
+- `--entry Foo`, when ambiguous across files, analyzes **both**. Use the
+  qualified `Foo@path` form — exactly what the report prints back — to pin one.
 
 ## Tests
 

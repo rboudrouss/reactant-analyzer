@@ -6,7 +6,7 @@ use crate::rules::{Diagnostic, Rule};
 /// Emits `Info` diagnostics when the analyser deliberately truncates analysis
 /// to preserve soundness.  Each site is a potential source of false negatives.
 ///
-/// Four cases:
+/// Five cases:
 /// - `recursion-cutoff` — component references itself (directly or transitively);
 ///   the recursive call is resolved to ⊤.
 /// - `unknown-component` — component instantiates a child not found in the
@@ -16,6 +16,8 @@ use crate::rules::{Diagnostic, Rule};
 ///   HOF chains (`.then(() => .then(…))`) not descended.
 /// - `unknown-hook` — custom hook call whose source is not in the registry and
 ///   has no `HookSummary`; its internals are opaque (FN possible).
+/// - `inline-budget` — utility inlining used up `Config::max_inline_depth`
+///   splices for this component; the utility calls still standing stay ⊤.
 pub struct AnalysisLimitInfo;
 
 impl AnalysisLimitInfo {
@@ -65,6 +67,15 @@ impl Rule for AnalysisLimitInfo {
                          deeper HOF chains not descended (FN possible on nested callbacks)",
                     crate::domains::interp::MAX_INLINE_DEPTH
                 ),
+            ));
+        }
+
+        if stats.inline_budget_exhausted.contains(component) {
+            diags.push(Diagnostic::info(
+                "analysis-limit",
+                "utility inlining ran out of splice budget here — the remaining \
+                 utility calls are treated as unknown (FN possible); raise \
+                 `max_inline_depth` to inline more",
             ));
         }
 

@@ -74,6 +74,19 @@ pub fn splice_callee_into_cfg(
     } = rename_vars_cfg(callee, rename);
     let renamed_params: Vec<Var> = params.iter().map(|p| rename_one(rename, p)).collect();
 
+    // 1b. Both preconditions, checked before anything is mutated. Step 6 used
+    //     to bail here instead — after the caller's block had already been split
+    //     and its terminator replaced with `Unreachable`, so the bail left the
+    //     caller truncated: `post` dropped, the original terminator lost, and
+    //     no assertion or rollback to say so. Either way the splice is skipped;
+    //     the difference is that the caller now survives it intact.
+    if !callee_block_map.contains_key(&callee_entry_orig) {
+        return; // headless callee: nothing to graft
+    }
+    if !caller.blocks.contains_key(&block_id) {
+        return; // the call site named a block that is not there
+    }
+
     // 2. Split the caller block at the call site: `pre` stays, the call stmt is
     //    dropped, `post` moves to a fresh join block.
     let block = caller.blocks.get_mut(&block_id).unwrap();
@@ -151,15 +164,17 @@ pub fn splice_callee_into_cfg(
         };
     }
 
-    // 6. Prepend param-binding Lets to the callee's entry block.
+    // 6. Prepend param-binding Lets to the callee's entry block. Present by
+    //    step 1b — the caller is already half-rewritten here, so this cannot be
+    //    a bail-out point.
     let callee_entry = callee_entry_orig + block_offset;
-    if let Some((_, entry)) = callee_blocks.iter_mut().find(|(id, _)| *id == callee_entry) {
-        let mut new_stmts = param_lets;
-        new_stmts.extend(std::mem::take(&mut entry.stmts));
-        entry.stmts = new_stmts;
-    } else {
-        return; // defensive: entry block missing
-    }
+    let (_, entry) = callee_blocks
+        .iter_mut()
+        .find(|(id, _)| *id == callee_entry)
+        .expect("callee entry block, checked before the caller was touched");
+    let mut new_stmts = param_lets;
+    new_stmts.extend(std::mem::take(&mut entry.stmts));
+    entry.stmts = new_stmts;
 
     // 7. Insert callee blocks into the caller CFG.
     for (id, block) in callee_blocks {
@@ -208,6 +223,15 @@ pub fn splice_callee_into_cfg(
             kind: EdgeKind::Unconditional,
         });
     }
+
+    // A splice rewrites blocks, terminators and edges at once; a target left
+    // without its edge is code the worklist never enters, and nothing else in
+    // the pipeline would report it.
+    debug_assert!(
+        caller.validate().is_ok(),
+        "splice left the caller malformed: {}",
+        caller.validate().unwrap_err()
+    );
 }
 
 /// Fresh-name map for every variable bound inside `cfg`: its `params` plus every
@@ -719,6 +743,76 @@ mod tests {
 
     fn all_stmts(cfg: &CFG) -> Vec<&Stmt> {
         cfg.blocks.values().flat_map(|b| b.stmts.iter()).collect()
+    }
+
+    /// A callee whose entry block is missing is not spliceable — and bailing
+    /// out used to happen *after* the caller had been split and its terminator
+    /// replaced with `Unreachable`, dropping the post-call statements and the
+    /// caller's own exit with no assertion and no rollback.
+    #[test]
+    fn a_headless_callee_leaves_the_caller_untouched() {
+        let callee = CFG {
+            entry: 3, // no such block
+            blocks: HashMap::new(),
+            edges: vec![],
+        };
+        let x = "x".to_string();
+        let mut caller = caller(vec![
+            let_("x", Expr::HookMarker(0, MarkerVal::Unknown)),
+            let_("after", Expr::Lit(Prim::Int(1))),
+        ]);
+        let before = format!("{caller:?}");
+
+        splice_callee_into_cfg(
+            &mut caller,
+            0,
+            0,
+            Splice {
+                callee,
+                params: &[],
+                args: &[],
+                bound_var: Some(&x),
+                rename: &HashMap::new(),
+            },
+        );
+
+        assert_eq!(
+            format!("{caller:?}"),
+            before,
+            "a skipped splice must not mutate the caller at all"
+        );
+        assert!(caller.validate().is_ok(), "{:?}", caller.validate());
+    }
+
+    /// The same guarantee for the other precondition: a call site naming a
+    /// block the caller does not have.
+    #[test]
+    fn a_missing_call_site_block_leaves_the_caller_untouched() {
+        let mut cblocks = HashMap::new();
+        let (id, b) = one_block(0, vec![], Terminator::Return(Expr::Lit(Prim::Unit)));
+        cblocks.insert(id, b);
+        let callee = CFG {
+            entry: 0,
+            blocks: cblocks,
+            edges: vec![],
+        };
+        let mut caller = caller(vec![let_("x", Expr::HookMarker(0, MarkerVal::Unknown))]);
+        let before = format!("{caller:?}");
+
+        splice_callee_into_cfg(
+            &mut caller,
+            42,
+            0,
+            Splice {
+                callee,
+                params: &[],
+                args: &[],
+                bound_var: None,
+                rename: &HashMap::new(),
+            },
+        );
+
+        assert_eq!(format!("{caller:?}"), before);
     }
 
     #[test]

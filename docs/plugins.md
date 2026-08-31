@@ -118,6 +118,33 @@ impl ImportResolver for AliasResolver {
 }
 ```
 
+## Composing resolvers, and per-file resolution
+
+Two combinators in `reactant::resolver` cover the cases that used to need a
+bespoke `impl`:
+
+```rust
+use reactant::resolver::{ChainResolver, DefaultImportResolver, ScopedResolver};
+
+// Try each in order; the first to answer wins.
+let chain = ChainResolver::new(vec![
+    Box::new(AliasResolver { /* … */ }),
+    Box::new(DefaultImportResolver::default()),
+]);
+
+// Route by the *importing* file — a monorepo where `packages/ui` and
+// `apps/web` resolve the same specifier to different files.
+let resolver = ScopedResolver::new(Box::new(DefaultImportResolver::default()))
+    .scope("/repo/packages/ui", Box::new(ui_resolver))
+    .scope("/repo/apps/web", Box::new(web_resolver));
+```
+
+`ScopedResolver` picks the scope whose root is the **longest** prefix of the
+importing file, so a nested package overrides the one containing it; a file
+under no scope goes to the fallback. This is the per-file override a run used
+to lack — before it, one `ImportResolver` served the whole run and the dispatch
+had to be hand-rolled inside a custom impl.
+
 ## How custom resolvers flow through the pipeline
 
 When a relative specifier is resolved successfully, it populates

@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use crate::ir::FileTable;
+use crate::resolver::ParseError;
 use crate::rules::{Diagnostic, SafeCheck};
 
 /// One component's report: display name, defining file, hook count, visible
@@ -28,7 +29,7 @@ pub struct ComponentReport {
 pub struct CheckReport {
     pub components: Vec<ComponentReport>,
     pub files_analyzed: usize,
-    pub parse_errors: Vec<(PathBuf, String)>,
+    pub parse_errors: Vec<ParseError>,
     pub errors: usize,
     pub warnings: usize,
     pub infos: usize,

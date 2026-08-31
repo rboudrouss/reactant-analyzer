@@ -139,27 +139,16 @@ pub(crate) fn arg_is_call_free(
             }
             None => true,
         },
-        Expr::Lit(_)
-        | Expr::StateVal(_)
-        | Expr::StateSetter(_)
-        | Expr::MemoVal(_)
-        | Expr::CallbackVal(_)
-        | Expr::HookMarker(..)
-        | Expr::SummaryVal(_)
-        | Expr::FnLit { .. } => true,
-        Expr::ObjectLit { fields, .. } => fields
-            .iter()
-            .all(|(_, v)| arg_is_call_free(v, bindings, seen)),
-        Expr::ArrayLit { elems, .. } => elems.iter().all(|x| arg_is_call_free(x, bindings, seen)),
-        Expr::FieldAccess { obj, .. } => arg_is_call_free(obj, bindings, seen),
-        Expr::IndexAccess { arr, idx } => {
-            arg_is_call_free(arr, bindings, seen) && arg_is_call_free(idx, bindings, seen)
+        // Everything else is call-free exactly when its children are. Delegate
+        // the enumeration instead of restating it: this used to be a full
+        // hand-written twin of `Expr::is_call_free`, so a new `Expr` variant
+        // had to be remembered in two places. `FnLit` bodies are CFGs, not
+        // child expressions, so they stay uninspected here — same as before.
+        _ => {
+            let mut free = true;
+            e.for_each_child(&mut |c| free &= arg_is_call_free(c, bindings, seen));
+            free
         }
-        Expr::BinOp { lhs, rhs, .. } => {
-            arg_is_call_free(lhs, bindings, seen) && arg_is_call_free(rhs, bindings, seen)
-        }
-        Expr::UnaryOp { arg, .. } => arg_is_call_free(arg, bindings, seen),
-        Expr::TSAnnotated(inner) => arg_is_call_free(inner, bindings, seen),
     }
 }
 

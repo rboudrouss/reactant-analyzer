@@ -126,13 +126,19 @@ impl HookEntry {
 
     /// The body CFG of hook kinds that have one (`Effect`, `Memo`, `Callback`,
     /// `Handler`); `None` for `State`/`Ref`/`Custom`.
+    ///
+    /// Every variant is spelled out on purpose. A `_ => None` arm here reads as
+    /// "this kind has no body", which is exactly what a new body-bearing
+    /// variant would silently inherit: its statements would then be invisible
+    /// to every caller of this function, with no compiler error anywhere. The
+    /// exhaustive match makes adding such a variant a build failure instead.
     pub fn body_cfg(&self) -> Option<&CFG> {
         match self {
             HookEntry::Effect { body_cfg, .. }
             | HookEntry::Memo { body_cfg, .. }
             | HookEntry::Callback { body_cfg, .. }
             | HookEntry::Handler { body_cfg, .. } => Some(body_cfg),
-            _ => None,
+            HookEntry::State { .. } | HookEntry::Ref { .. } | HookEntry::Custom { .. } => None,
         }
     }
 }

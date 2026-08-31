@@ -11,9 +11,26 @@ pub enum RootStrategy {
     Heuristic,
     /// `--all-roots`: every component analyzed as a root (props = ⊤ if not inlined).
     AllComponents,
-    /// `--entry Foo,Bar`: explicit list (matched against component names; every
-    /// `(file, name)` registry entry whose name matches becomes a root).
+    /// `--entry Foo,Bar`: explicit list. A bare `Foo` makes every `(file, name)`
+    /// entry called `Foo` a root; the qualified `Foo@src/a/Foo.tsx` form — what
+    /// [`ComponentRegistry::display_name`] mints for a collision, and what the
+    /// report prints back — selects exactly one.
     Explicit(Vec<Symbol>),
+}
+
+/// The components an `--entry` name selects.
+///
+/// One function so the root set and [`RootStrategy::unmatched`] cannot disagree
+/// about what "matches" means.
+fn explicit_matches(registry: &ComponentRegistry, name: &Symbol) -> Vec<ComponentKey> {
+    if name.contains('@') {
+        return registry.resolve_display_name(name).into_iter().collect();
+    }
+    registry
+        .find_all_by_name(name)
+        .into_iter()
+        .map(|c| (c.file.clone(), c.name.clone()))
+        .collect()
 }
 
 impl RootStrategy {
@@ -40,16 +57,31 @@ impl RootStrategy {
                 keys
             }
             RootStrategy::Explicit(names) => {
-                let mut keys: Vec<ComponentKey> = Vec::new();
-                for name in names {
-                    for c in registry.find_all_by_name(name) {
-                        keys.push((c.file.clone(), c.name.clone()));
-                    }
-                }
+                let mut keys: Vec<ComponentKey> = names
+                    .iter()
+                    .flat_map(|name| explicit_matches(registry, name))
+                    .collect();
                 keys.sort();
                 keys.dedup();
                 keys
             }
+        }
+    }
+
+    /// The `--entry` names that select no component at all.
+    ///
+    /// A typo used to match nothing and silently collapse the run to
+    /// intra-component analysis, costing every cross-component finding with no
+    /// warning — so the caller reports these rather than analysing a set the
+    /// user never asked for. Only `Explicit` can be wrong this way.
+    pub fn unmatched(&self, registry: &ComponentRegistry) -> Vec<Symbol> {
+        match self {
+            RootStrategy::Explicit(names) => names
+                .iter()
+                .filter(|name| explicit_matches(registry, name).is_empty())
+                .cloned()
+                .collect(),
+            RootStrategy::Heuristic | RootStrategy::AllComponents => Vec::new(),
         }
     }
 }
@@ -203,6 +235,44 @@ mod tests {
         let reg = registry(vec![component("A"), component("B"), component("C")]);
         let roots = RootStrategy::Explicit(vec!["B".to_string()]).detect(&reg);
         assert_eq!(names(&roots), vec!["B".to_string()]);
+        assert!(
+            RootStrategy::Explicit(vec!["B".to_string()])
+                .unmatched(&reg)
+                .is_empty()
+        );
+    }
+
+    /// A name matching nothing selects no root, which collapses the run to
+    /// intra-component analysis. It has to be reportable, not silent.
+    #[test]
+    fn explicit_reports_a_name_that_matches_nothing() {
+        let reg = registry(vec![component("A")]);
+        let strategy = RootStrategy::Explicit(vec!["A".to_string(), "Nope".to_string()]);
+        assert_eq!(strategy.unmatched(&reg), vec!["Nope".to_string()]);
+        assert_eq!(names(&strategy.detect(&reg)), vec!["A".to_string()]);
+    }
+
+    /// The qualified form is what the report prints back for a collision, so it
+    /// has to select the one component it names — and only it.
+    #[test]
+    fn explicit_accepts_the_qualified_display_name() {
+        let mut a = component("Widget");
+        a.file = std::path::PathBuf::from("a/Widget.tsx");
+        let mut b = component("Widget");
+        b.file = std::path::PathBuf::from("b/Widget.tsx");
+        let reg = registry(vec![a, b]);
+
+        let key = ("a/Widget.tsx".into(), "Widget".to_string());
+        let display = reg.display_name(&key);
+        let strategy = RootStrategy::Explicit(vec![display]);
+        assert!(strategy.unmatched(&reg).is_empty());
+        assert_eq!(strategy.detect(&reg), vec![key]);
+
+        assert_eq!(
+            RootStrategy::Explicit(vec!["Widget@nowhere.tsx".to_string()]).unmatched(&reg),
+            vec!["Widget@nowhere.tsx".to_string()],
+            "a qualified name pointing at no file must not pass silently"
+        );
     }
 
     #[test]

@@ -181,9 +181,15 @@ impl BlockBuilder {
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub fn build_cfg(body: &FunctionBody, smap: &SourceMap) -> CFG {
+    build_stmts_cfg(&body.statements, smap)
+}
+
+/// [`build_cfg`] for a bare statement list — a class `static { … }` block,
+/// which has no `FunctionBody` wrapper.
+pub fn build_stmts_cfg(stmts: &[Statement], smap: &SourceMap) -> CFG {
     let mut builder = BlockBuilder::new_with_smap(smap);
     builder.start_block(0);
-    lower_stmts(&body.statements, &mut builder);
+    lower_stmts(stmts, &mut builder);
     builder.into_cfg(0)
 }
 
@@ -360,8 +366,52 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
                 });
             }
         }
-        Statement::EmptyStatement(_) | Statement::ClassDeclaration(_) => {}
-        _ => {}
+        // A class binds nothing the env models, but its method bodies are code:
+        // this used to fall into the empty arm, so `class X { m() { setC(1) } }`
+        // read as a component that never writes `c`.
+        Statement::ClassDeclaration(class) => {
+            let span = builder.span_at(class.span.start);
+            let value = crate::lowering::expr_lower::lower_class(class, builder);
+            match &class.id {
+                Some(id) => builder.push_stmt(Stmt::Let {
+                    var: id.name.to_string(),
+                    rhs: value,
+                    span,
+                }),
+                // `export default class { … }` — unnamed, still executable.
+                None => builder.push_stmt(Stmt::ExprStmt(value, span)),
+            }
+        }
+        // `with (o) { … }` is illegal in a module and in strict mode, so it
+        // cannot occur in React sources — but if it ever parses, the body is
+        // still real code. Lowering it treats each name as an ordinary binding
+        // rather than a lookup on `o`, which can only invent a read, never lose
+        // one; dropping the body loses the whole path.
+        Statement::WithStatement(w) => {
+            let obj = lower_expr(&w.object, builder);
+            builder.push_stmt(Stmt::ExprStmt(obj, builder.span_at(w.span.start)));
+            lower_stmt(&w.body, builder);
+        }
+        // Nothing executable — and spelled out, with no `_` arm, so a statement
+        // kind that *does* carry code cannot join this list by accident. That is
+        // how class bodies were lost in the first place.
+        Statement::EmptyStatement(_)
+        | Statement::DebuggerStatement(_)
+        // Types erase before anything runs.
+        | Statement::TSTypeAliasDeclaration(_)
+        | Statement::TSInterfaceDeclaration(_)
+        | Statement::TSEnumDeclaration(_)
+        | Statement::TSModuleDeclaration(_)
+        | Statement::TSGlobalDeclaration(_)
+        | Statement::TSImportEqualsDeclaration(_)
+        // `import`/`export` are module-level only: a syntax error inside the
+        // function bodies this lowers, so they never reach here.
+        | Statement::ImportDeclaration(_)
+        | Statement::ExportAllDeclaration(_)
+        | Statement::ExportDefaultDeclaration(_)
+        | Statement::ExportNamedDeclaration(_)
+        | Statement::TSExportAssignment(_)
+        | Statement::TSNamespaceExportDeclaration(_) => {}
     }
 }
 
@@ -598,45 +648,70 @@ fn lower_iter_loop(
 }
 
 fn lower_switch(sw: &SwitchStatement, builder: &mut BlockBuilder) {
-    let cases_block = builder.new_block();
     let exit_block = builder.new_block();
     let disc = lower_expr(&sw.discriminant, builder);
     builder.push_stmt(Stmt::ExprStmt(disc, None));
 
-    // No case has to match, so the exit is reachable without entering any of
-    // them. Falling straight into the cases made everything after a switch
-    // whose every case leaves (`continue`, `return`) unreachable — a missing
-    // path, the forbidden direction. The condition is opaque on purpose: which
-    // case runs is not a truthiness test on the discriminant.
-    let head = builder.seal_with(Terminator::Branch {
-        cond: Expr::Lit(Prim::Bool(true)),
-        then_: cases_block,
-        else_: exit_block,
-        span: None,
-    });
-    builder.add_edge(head, cases_block, EdgeKind::IfTrue);
-    builder.add_edge(head, exit_block, EdgeKind::IfFalse);
-    builder.start_block(cases_block);
+    if sw.cases.is_empty() {
+        let b = builder.seal_with(Terminator::Jump(exit_block));
+        builder.add_edge(b, exit_block, EdgeKind::Unconditional);
+        builder.start_block(exit_block);
+        return;
+    }
 
-    // Lower each case's body sequentially. `break` is the generic statement
-    // arm now that the switch pushes a frame, so a guarded `if (x) break;`
-    // reaches the exit too — the old special case only saw a bare `break` at
-    // the top of a consequent.
+    // One block per case, fronted by a chain of opaque dispatches: dispatch `i`
+    // either enters case `i` or moves on to dispatch `i + 1`, and the last one
+    // falls to the exit. Which case matches is not a truthiness test on the
+    // discriminant, so every dispatch is opaque, and no case has to match — the
+    // exit is reachable without entering any of them (a `default` clause is
+    // over-approximated as optional).
+    //
+    // Chaining the consequents into one straight line instead was an
+    // under-approximation twice over: entering `case 2` without running `case 1`
+    // was unrepresentable, and the first `break` sealed the chain, so every
+    // later case was dropped from the CFG entirely.
+    let case_blocks: Vec<BlockId> = sw.cases.iter().map(|_| builder.new_block()).collect();
+    // The first dispatch is the block the discriminant was evaluated in; the
+    // rest need blocks of their own.
+    let later_dispatch: Vec<BlockId> = (1..case_blocks.len())
+        .map(|_| builder.new_block())
+        .collect();
+
+    for (i, &case_block) in case_blocks.iter().enumerate() {
+        let skip_to = later_dispatch.get(i).copied().unwrap_or(exit_block);
+        let d = builder.seal_with(Terminator::Branch {
+            cond: Expr::Lit(Prim::Bool(true)),
+            then_: case_block,
+            else_: skip_to,
+            span: None,
+        });
+        builder.add_edge(d, case_block, EdgeKind::IfTrue);
+        builder.add_edge(d, skip_to, EdgeKind::IfFalse);
+        if let Some(&next) = later_dispatch.get(i) {
+            builder.start_block(next);
+        }
+    }
+
+    // Lower each case's body into its own block. `break` is the generic
+    // statement arm now that the switch pushes a frame, so a guarded
+    // `if (x) break;` reaches the exit too. A case that runs off its end falls
+    // through to the next one, as JavaScript does.
     builder.push_loop(exit_block, None);
-    for case in &sw.cases {
+    for (i, case) in sw.cases.iter().enumerate() {
+        builder.start_block(case_blocks[i]);
         for stmt in &case.consequent {
             if builder.is_terminated() {
                 break;
             }
             lower_stmt(stmt, builder);
         }
+        if !builder.is_terminated() {
+            let fallthrough = case_blocks.get(i + 1).copied().unwrap_or(exit_block);
+            let b = builder.seal_with(Terminator::Jump(fallthrough));
+            builder.add_edge(b, fallthrough, EdgeKind::Unconditional);
+        }
     }
     builder.pop_loop();
-
-    if !builder.is_terminated() {
-        let b = builder.seal_with(Terminator::Jump(exit_block));
-        builder.add_edge(b, exit_block, EdgeKind::Unconditional);
-    }
 
     builder.start_block(exit_block);
 }
@@ -988,6 +1063,86 @@ mod tests {
             preds(&cfg, after_switch),
             1,
             "the no-case-matched edge is the only way here, and it must exist: {:?}",
+            cfg.edges
+        );
+    }
+
+    /// A class body is code. It used to land in `lower_stmt`'s empty arm, so
+    /// `class X { m() { setC(1) } }` read as a body that never calls `setC` —
+    /// a path the fixpoint never explores.
+    #[test]
+    fn a_class_body_keeps_its_method_code() {
+        let cfg = cfg_of("class X { m() { setC(1); } handle = () => setD(2); }");
+        let free = crate::ir::free_vars::compute_free_vars(&cfg);
+        assert!(
+            free.contains("setC"),
+            "the method body's capture must survive: {free:?}"
+        );
+        assert!(
+            free.contains("setD"),
+            "an arrow-bound field's capture must survive: {free:?}"
+        );
+        assert!(
+            entry_lets(&cfg).iter().any(|v| v == "X"),
+            "the class name must still be bound"
+        );
+    }
+
+    /// A `static { … }` block and a computed member name both run where the
+    /// class is defined.
+    #[test]
+    fn a_class_keeps_its_static_block_and_computed_key_reads() {
+        let cfg = cfg_of("class X { static { init(); } [key]() {} }");
+        let free = crate::ir::free_vars::compute_free_vars(&cfg);
+        assert!(
+            free.contains("init"),
+            "the static block runs — its reads must survive: {free:?}"
+        );
+        assert!(
+            free.contains("key"),
+            "a computed member name is an expression that runs: {free:?}"
+        );
+    }
+
+    /// Every case is lowered, not just the ones before the first `break`.
+    /// Chaining the consequents into one block let the `break` of `case 1` seal
+    /// the chain, so `case 2` never entered the CFG at all — an
+    /// under-approximation the run then published a `verified:` assurance over.
+    #[test]
+    fn a_break_does_not_drop_the_cases_after_it() {
+        let cfg = cfg_of("switch (k) { case 1: f(); break; case 2: g(); break; case 3: h(); }");
+        for name in ["f", "g", "h"] {
+            block_calling(&cfg, name); // panics if the case was dropped
+        }
+    }
+
+    /// A case is reachable without the ones before it: which case matches is
+    /// not decided by running the earlier consequents.
+    #[test]
+    fn a_later_case_is_reachable_without_the_earlier_ones() {
+        let cfg = cfg_of("switch (k) { case 1: f(); break; case 2: g(); break; }");
+        let first = block_calling(&cfg, "f");
+        let second = block_calling(&cfg, "g");
+        assert!(
+            !reaches(&cfg, first, second),
+            "`case 1` breaks — it must not reach `case 2`: {:?}",
+            cfg.edges
+        );
+        assert!(
+            reaches(&cfg, cfg.entry, second),
+            "`case 2` must be reachable from the entry: {:?}",
+            cfg.edges
+        );
+    }
+
+    /// A case that runs off its end falls through to the next one, as
+    /// JavaScript does.
+    #[test]
+    fn a_case_without_a_break_falls_through_to_the_next() {
+        let cfg = cfg_of("switch (k) { case 1: f(); case 2: g(); }");
+        assert!(
+            reaches(&cfg, block_calling(&cfg, "f"), block_calling(&cfg, "g")),
+            "`case 1` has no `break` — it must fall into `case 2`: {:?}",
             cfg.edges
         );
     }

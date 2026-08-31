@@ -436,9 +436,11 @@ fn an_unmodelled_react_hook_still_reports_the_limit() {
     );
 }
 
-/// An effect returns nothing and a ref's identity is constant, so those two
-/// keep reading as `undefined` — the fix narrows what counts as value-less, it
-/// does not abolish the category.
+/// An effect returns nothing, so it stays value-less — the category narrowed,
+/// it was not abolished. A ref is the other half: not value-less at all, but a
+/// container with a constant identity, so it reads as a *stable reference*.
+/// Both were `Undefined` once, which was stable enough for the deps rules and
+/// blind to the ref's identity.
 #[test]
 fn effects_and_refs_stay_value_less() {
     use reactant::ir::expr::{Expr, MarkerVal};
@@ -470,7 +472,15 @@ fn effects_and_refs_stay_value_less() {
         .collect();
     assert_eq!(markers.len(), 2, "one for the ref, one for the effect");
     assert!(
-        markers.iter().all(|m| **m == MarkerVal::Undefined),
-        "{markers:?}"
+        markers.contains(&&MarkerVal::StableRef),
+        "the ref must read as a stable reference: {markers:?}"
+    );
+    assert!(
+        markers.contains(&&MarkerVal::Undefined),
+        "the effect must stay value-less: {markers:?}"
+    );
+    assert!(
+        !markers.contains(&&MarkerVal::Unknown),
+        "neither may degrade to ⊤: {markers:?}"
     );
 }

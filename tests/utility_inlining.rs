@@ -323,3 +323,75 @@ fn recursion_guard_does_not_loop_forever() {
     let result = analyze(components, hooks, utilities);
     assert!(result.components.contains_key("Page"));
 }
+
+/// The splice budget is a real limit, not a theoretical one — it is exhausted
+/// 20 times over the excalidraw corpus and 6 over memos. Exhausting it leaves
+/// the remaining utility calls opaque, which is sound; staying *silent* about
+/// it is not, because the component then still publishes `verified:` assurances
+/// over bodies the analysis never read.
+#[test]
+fn an_exhausted_inline_budget_is_reported() {
+    let tmp = Tmp::new("inline-budget");
+    let path = tmp.write(
+        "main.tsx",
+        r#"
+        function u0() { log(); }
+        function u1() { log(); }
+        function u2() { log(); }
+        function u3() { log(); }
+        function u4() { log(); }
+        function u5() { log(); }
+        function u6() { log(); }
+        function u7() { log(); }
+        function u8() { log(); }
+        function u9() { log(); }
+        function Page() {
+            const [c, setC] = useState(0);
+            u0(); u1(); u2(); u3(); u4(); u5(); u6(); u7(); u8(); u9();
+            return <div>{c}</div>;
+        }
+        "#,
+    );
+    let (components, hooks, utilities) = lower_file(&path);
+    let result = analyze(components, hooks, utilities);
+
+    assert!(
+        result.stats.inline_budget_exhausted.contains("Page"),
+        "ten utilities against a budget of {} must exhaust it",
+        Config::default().max_inline_depth
+    );
+
+    let component = "Page".to_string();
+    let ctx = RuleCtx::new(&result, &component);
+    let infos: Vec<String> = all_rules()
+        .iter()
+        .flat_map(|r| r.check(&ctx))
+        .filter(|d| d.rule == "analysis-limit")
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        infos.iter().any(|m| m.contains("splice budget")),
+        "the truncation must be reported, got {infos:?}"
+    );
+}
+
+/// The other side of the contract: a component whose utilities all fit inside
+/// the budget must not claim it was truncated.
+#[test]
+fn a_budget_that_is_not_exhausted_reports_nothing() {
+    let tmp = Tmp::new("inline-budget-ok");
+    let path = tmp.write(
+        "main.tsx",
+        r#"
+        function u0() { log(); }
+        function Page() {
+            const [c, setC] = useState(0);
+            u0();
+            return <div>{c}</div>;
+        }
+        "#,
+    );
+    let (components, hooks, utilities) = lower_file(&path);
+    let result = analyze(components, hooks, utilities);
+    assert!(result.stats.inline_budget_exhausted.is_empty());
+}

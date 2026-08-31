@@ -74,7 +74,111 @@ impl Default for DefaultImportResolver {
     }
 }
 
+// ── Resolver combinators ─────────────────────────────────────────────────────
+
+/// Try each resolver in order; the first one to resolve the specifier wins.
+///
+/// The "wrap another resolver and fall back to it" shape was being hand-written
+/// at every site that needed two schemes at once (`TsconfigPathsResolver` keeps
+/// its own `fallback` field, and the plugin guide told you to build one). One
+/// combinator instead, so a chain is a value rather than a new `impl`.
+///
+/// An empty chain resolves nothing — it is `None`, not a panic.
+pub struct ChainResolver(Vec<Box<dyn ImportResolver>>);
+
+impl ChainResolver {
+    pub fn new(resolvers: Vec<Box<dyn ImportResolver>>) -> Self {
+        ChainResolver(resolvers)
+    }
+}
+
+impl ImportResolver for ChainResolver {
+    fn resolve(&self, from: &Path, specifier: &str) -> Option<PathBuf> {
+        self.0.iter().find_map(|r| r.resolve(from, specifier))
+    }
+}
+
+/// Per-file resolution: route by the *importing* file's location.
+///
+/// A run used to have exactly one `ImportResolver`, which is wrong for a
+/// monorepo — `packages/ui` and `apps/web` genuinely resolve the same
+/// specifier to different files, and the only way to express that was to
+/// hand-roll the dispatch inside a custom impl.
+///
+/// The scope whose root is the **longest** prefix of the importing file wins,
+/// so a nested package overrides its parent; a file under no scope goes to
+/// `fallback`. Same longest-prefix discipline as tsconfig `paths`.
+pub struct ScopedResolver {
+    scopes: Vec<(PathBuf, Box<dyn ImportResolver>)>,
+    fallback: Box<dyn ImportResolver>,
+}
+
+impl ScopedResolver {
+    pub fn new(fallback: Box<dyn ImportResolver>) -> Self {
+        ScopedResolver {
+            scopes: Vec::new(),
+            fallback,
+        }
+    }
+
+    /// Route imports written in files under `root` through `resolver`.
+    pub fn scope(mut self, root: impl Into<PathBuf>, resolver: Box<dyn ImportResolver>) -> Self {
+        self.scopes.push((root.into(), resolver));
+        self
+    }
+}
+
+impl ImportResolver for ScopedResolver {
+    fn resolve(&self, from: &Path, specifier: &str) -> Option<PathBuf> {
+        self.scopes
+            .iter()
+            .filter(|(root, _)| from.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count())
+            .map(|(_, r)| r.as_ref())
+            .unwrap_or(self.fallback.as_ref())
+            .resolve(from, specifier)
+    }
+}
+
 // ── Plugin-facing high-level entry points ────────────────────────────────────
+
+/// A file the parser or the filesystem complained about.
+///
+/// The two cases are not equally serious, and the caller cannot tell them apart
+/// from the message alone: a recovered syntax error is noise, while a dropped
+/// file means every finding it held is a silent false negative — the direction
+/// the project forbids. Hence `analyzed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseError {
+    pub file: PathBuf,
+    pub message: String,
+    /// `true` when the parser recovered and the file was still lowered;
+    /// `false` when the file was dropped from the run (read error, or a parser
+    /// panic that leaves the program empty).
+    pub analyzed: bool,
+}
+
+/// Source type for a path, by extension.
+///
+/// `.js` and `.jsx` are JSX-enabled: the React ecosystem routinely puts JSX in
+/// `.js` (Babel, CRA, Docusaurus), and JSX in a non-JSX source type makes the
+/// parser *panic*, which drops the whole file — three real excalidraw
+/// components were lost that way. Module kind stays unambiguous so a `.js` that
+/// is a CommonJS script and one that uses `import.meta` both parse.
+///
+/// TypeScript is the exception that cannot share the flag: `<T>expr` is a type
+/// assertion in `.ts` and a JSX element in `.tsx`, so the two must stay split.
+///
+/// `pub`: this mapping decides whether a file is analysed at all, so no caller
+/// gets to keep a private copy of it that can drift.
+pub fn source_type_for(path: &Path) -> oxc_span::SourceType {
+    use oxc_span::SourceType;
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("tsx") => SourceType::tsx(),
+        Some("ts") | Some("mts") | Some("cts") => SourceType::ts(),
+        _ => SourceType::unambiguous().with_jsx(true),
+    }
+}
 
 /// Output of the parse+lower phase over a set of files, before any analysis.
 ///
@@ -91,9 +195,10 @@ pub struct LoweredProgram {
     /// Files that hit a read or parse error, with the first message. A read
     /// error or a parser panic means the file was skipped; a *recovered*
     /// syntax error means the file was still lowered from a partial AST, so
-    /// this list is a report channel, not a skip list.
+    /// this list is a report channel, not a skip list — [`ParseError::analyzed`]
+    /// says which of the two happened.
     /// Not printed here — the caller decides how to report them.
-    pub parse_errors: Vec<(PathBuf, String)>,
+    pub parse_errors: Vec<ParseError>,
     /// `FileId ↔ path` interning table shared by every span produced during
     /// this lowering (ADR-019). Moved into the analysis result by
     /// [`analyze_lowered`].
@@ -122,7 +227,6 @@ pub fn lower_files_with(
 ) -> LoweredProgram {
     use oxc_allocator::Allocator;
     use oxc_parser::{ParseOptions, Parser as OxcParser};
-    use oxc_span::SourceType;
 
     let mut lowered = LoweredProgram {
         components: Vec::new(),
@@ -142,31 +246,35 @@ pub fn lower_files_with(
         let source = match fs.read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
-                lowered.parse_errors.push((path.clone(), e));
+                lowered.parse_errors.push(ParseError {
+                    file: path.clone(),
+                    message: e,
+                    analyzed: false,
+                });
                 continue;
             }
         };
         let alloc = Allocator::default();
-        let source_type = match path.extension().and_then(|e| e.to_str()) {
-            Some("tsx") => SourceType::tsx(),
-            Some("ts") => SourceType::ts(),
-            Some("jsx") => SourceType::jsx(),
-            _ => SourceType::cjs(),
-        };
-        let ret = OxcParser::new(&alloc, &source, source_type)
+        let ret = OxcParser::new(&alloc, &source, source_type_for(path))
             .with_options(ParseOptions::default())
             .parse();
-        if let Some(first) = ret.diagnostics.first() {
-            lowered
-                .parse_errors
-                .push((path.clone(), first.message.to_string()));
-        }
         // `panicked` is oxc's only "this AST is unusable" signal (the program
         // is empty). The parser recovers from every other syntax error and
         // still returns a lowerable program, so skipping on a non-empty
         // diagnostic list would drop whole files from the analysis — a
         // forbidden false negative, and a growing one: oxc keeps moving TS
         // semantic checks into the parser.
+        if ret.panicked || !ret.diagnostics.is_empty() {
+            lowered.parse_errors.push(ParseError {
+                file: path.clone(),
+                message: ret
+                    .diagnostics
+                    .first()
+                    .map(|d| d.message.to_string())
+                    .unwrap_or_else(|| "the parser produced no usable program".to_string()),
+                analyzed: !ret.panicked,
+            });
+        }
         if ret.panicked {
             continue;
         }
@@ -285,8 +393,16 @@ pub fn analyze_files(
     config: Config,
 ) -> (ProgramAnalysisResult, usize) {
     let lowered = lower_files(files, resolver);
-    for (path, msg) in &lowered.parse_errors {
-        eprintln!("[parse error] {}: {}", path.display(), msg);
+    for e in &lowered.parse_errors {
+        if e.analyzed {
+            eprintln!("[parse error] {}: {}", e.file.display(), e.message);
+        } else {
+            eprintln!(
+                "[skipped] {}: {} — the file was not analyzed",
+                e.file.display(),
+                e.message
+            );
+        }
     }
     let file_count = lowered.file_count;
     (analyze_lowered(lowered, strategy, config), file_count)
@@ -677,7 +793,11 @@ export function App() {
             1,
             "the diagnostic is still reported, it just no longer skips"
         );
-        assert_eq!(lowered.parse_errors[0].0, file);
+        assert_eq!(lowered.parse_errors[0].file, file);
+        assert!(
+            lowered.parse_errors[0].analyzed,
+            "a recovered error must not read as a dropped file"
+        );
     }
 
     /// The other side of the contract: when the parser panics the program is
@@ -698,7 +818,114 @@ export function App() {
         assert_eq!(lowered.file_count, 0);
         assert!(lowered.components.is_empty());
         assert_eq!(lowered.parse_errors.len(), 1);
-        assert_eq!(lowered.parse_errors[0].0, file);
+        assert_eq!(lowered.parse_errors[0].file, file);
+        assert!(
+            !lowered.parse_errors[0].analyzed,
+            "a dropped file must say so — its findings are missing, not absent"
+        );
+    }
+
+    /// JSX in a `.js` file is the Babel/CRA/Docusaurus convention. Parsing
+    /// `.js` as a CommonJS script made the parser panic on the first JSX
+    /// element, dropping the whole file — three real excalidraw components were
+    /// lost that way.
+    #[test]
+    fn jsx_in_a_dot_js_file_is_analyzed() {
+        let tmp = Tmp::new("jsx-in-js");
+        let file = tmp.write(
+            "Loop.js",
+            "import { useState } from 'react';\n\
+             export function Loop() {\n\
+               const [n, setN] = useState(0);\n\
+               setN(n + 1);\n\
+               return <div>{n}</div>;\n\
+             }\n",
+        );
+
+        let lowered = lower_files(
+            std::slice::from_ref(&file),
+            &DefaultImportResolver::default(),
+        );
+
+        assert!(
+            lowered.parse_errors.is_empty(),
+            "JSX in `.js` must parse cleanly: {:?}",
+            lowered.parse_errors
+        );
+        assert_eq!(lowered.file_count, 1);
+        assert!(
+            lowered.components.iter().any(|c| c.name == "Loop"),
+            "the component must be lowered, got {:?}",
+            lowered
+                .components
+                .iter()
+                .map(|c| &c.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// `import.meta` is legal in a `.js` module and appears in real config
+    /// files (three chakra-ui `eslint.config.js`). Script mode rejected it.
+    #[test]
+    fn import_meta_in_a_dot_js_file_parses() {
+        let tmp = Tmp::new("import-meta-js");
+        let file = tmp.write(
+            "eslint.config.js",
+            "const dir = import.meta.url;\nexport default [dir];\n",
+        );
+
+        let lowered = lower_files(
+            std::slice::from_ref(&file),
+            &DefaultImportResolver::default(),
+        );
+
+        assert!(
+            lowered.parse_errors.is_empty(),
+            "`import.meta` in `.js` must parse cleanly: {:?}",
+            lowered.parse_errors
+        );
+    }
+
+    /// The other half of `.js`: a CommonJS script must keep parsing. The module
+    /// kind is unambiguous, so `require`/`module.exports` and `import.meta` are
+    /// both fine in the same extension.
+    #[test]
+    fn commonjs_in_a_dot_js_file_still_parses() {
+        let tmp = Tmp::new("cjs-in-js");
+        let file = tmp.write(
+            "util.js",
+            "const path = require('path');\nmodule.exports = { path };\n",
+        );
+
+        let lowered = lower_files(
+            std::slice::from_ref(&file),
+            &DefaultImportResolver::default(),
+        );
+
+        assert!(
+            lowered.parse_errors.is_empty(),
+            "a CommonJS `.js` must parse cleanly: {:?}",
+            lowered.parse_errors
+        );
+    }
+
+    /// `.ts` is the extension that cannot share the JSX flag: `<T>expr` is a
+    /// type assertion there, and a JSX element in `.tsx`.
+    #[test]
+    fn ts_keeps_angle_bracket_type_assertions() {
+        let tmp = Tmp::new("ts-assertion");
+        let file = tmp.write("cast.ts", "const n = <number>maybe;\nexport default n;\n");
+
+        let lowered = lower_files(
+            std::slice::from_ref(&file),
+            &DefaultImportResolver::default(),
+        );
+
+        assert!(
+            lowered.parse_errors.is_empty(),
+            "`<number>x` must stay a type assertion in `.ts`: {:?}",
+            lowered.parse_errors
+        );
     }
 
     #[test]
@@ -710,6 +937,98 @@ export function App() {
             DefaultImportResolver::default()
                 .resolve(&from, "./nope")
                 .is_none()
+        );
+    }
+
+    // ── Combinators ───────────────────────────────────────────────────────────
+
+    /// Answers `specifier` with a fixed path, and nothing else.
+    struct Fixed(&'static str, PathBuf);
+
+    impl ImportResolver for Fixed {
+        fn resolve(&self, _from: &Path, specifier: &str) -> Option<PathBuf> {
+            (specifier == self.0).then(|| self.1.clone())
+        }
+    }
+
+    #[test]
+    fn chain_takes_the_first_resolver_that_answers() {
+        let chain = ChainResolver::new(vec![
+            Box::new(Fixed("@ui", PathBuf::from("/first.tsx"))),
+            Box::new(Fixed("@ui", PathBuf::from("/second.tsx"))),
+            Box::new(Fixed("@app", PathBuf::from("/app.tsx"))),
+        ]);
+        let from = Path::new("/x/y.tsx");
+
+        assert_eq!(
+            chain.resolve(from, "@ui"),
+            Some(PathBuf::from("/first.tsx")),
+            "earlier resolvers win"
+        );
+        assert_eq!(
+            chain.resolve(from, "@app"),
+            Some(PathBuf::from("/app.tsx")),
+            "later resolvers still get their turn"
+        );
+        assert_eq!(chain.resolve(from, "@nope"), None);
+    }
+
+    #[test]
+    fn empty_chain_resolves_nothing() {
+        assert!(
+            ChainResolver::new(vec![])
+                .resolve(Path::new("/x/y.tsx"), "@ui")
+                .is_none()
+        );
+    }
+
+    /// The point of #59: two files in the same run resolving one specifier to
+    /// two different places, which a single per-run resolver cannot express.
+    #[test]
+    fn scoped_routes_by_the_importing_file() {
+        let resolver = ScopedResolver::new(Box::new(Fixed("@x", PathBuf::from("/root.tsx"))))
+            .scope(
+                "/repo/packages/ui",
+                Box::new(Fixed("@x", PathBuf::from("/ui.tsx"))),
+            )
+            .scope(
+                "/repo/apps/web",
+                Box::new(Fixed("@x", PathBuf::from("/web.tsx"))),
+            );
+
+        assert_eq!(
+            resolver.resolve(Path::new("/repo/packages/ui/Button.tsx"), "@x"),
+            Some(PathBuf::from("/ui.tsx"))
+        );
+        assert_eq!(
+            resolver.resolve(Path::new("/repo/apps/web/Page.tsx"), "@x"),
+            Some(PathBuf::from("/web.tsx"))
+        );
+        assert_eq!(
+            resolver.resolve(Path::new("/elsewhere/Other.tsx"), "@x"),
+            Some(PathBuf::from("/root.tsx")),
+            "a file under no scope falls back"
+        );
+    }
+
+    /// A nested scope overrides the one that contains it — longest prefix wins,
+    /// the same rule tsconfig `paths` follows.
+    #[test]
+    fn the_innermost_scope_wins() {
+        let resolver = ScopedResolver::new(Box::new(Fixed("@x", PathBuf::from("/root.tsx"))))
+            .scope("/repo", Box::new(Fixed("@x", PathBuf::from("/outer.tsx"))))
+            .scope(
+                "/repo/packages/ui",
+                Box::new(Fixed("@x", PathBuf::from("/inner.tsx"))),
+            );
+
+        assert_eq!(
+            resolver.resolve(Path::new("/repo/packages/ui/Button.tsx"), "@x"),
+            Some(PathBuf::from("/inner.tsx"))
+        );
+        assert_eq!(
+            resolver.resolve(Path::new("/repo/other.tsx"), "@x"),
+            Some(PathBuf::from("/outer.tsx"))
         );
     }
 }

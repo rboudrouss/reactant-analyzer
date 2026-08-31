@@ -85,4 +85,8 @@ pub struct AnalysisStats {
     pub unknown_component_refs: HashSet<SymbolPair>,
     /// Components whose callback traversal hit the inline depth cap.
     pub callback_depth_capped: HashSet<Symbol>,
+    /// Components where the utility-inlining splice budget
+    /// (`Config::max_inline_depth`) ran out with calls still to inline, so
+    /// those utility bodies stayed opaque (⊤).
+    pub inline_budget_exhausted: HashSet<Symbol>,
 }

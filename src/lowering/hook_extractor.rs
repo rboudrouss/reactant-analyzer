@@ -699,12 +699,15 @@ fn make_hook_entry(
 /// `Undefined`/`Unknown` split was introduced to close, left open on React's
 /// side of it.
 ///
-/// `Undefined` is therefore reserved for the hooks the engine models as
-/// genuinely value-less: an effect returns nothing, and a ref's identity is
-/// constant across renders, which is what `undefined` reads as anyway.
+/// `Undefined` is therefore reserved for the one hook the engine models as
+/// genuinely value-less: an effect returns nothing. A ref is *not* value-less —
+/// it is a container with a constant identity, which is `StableRef`. Reading it
+/// as `undefined` was stable enough for the deps rules and blind everywhere
+/// identity is what matters.
 fn marker_val(entry: Option<&HookEntry>) -> MarkerVal {
     match entry {
-        Some(HookEntry::Effect { .. } | HookEntry::Ref { .. }) => MarkerVal::Undefined,
+        Some(HookEntry::Effect { .. }) => MarkerVal::Undefined,
+        Some(HookEntry::Ref { .. }) => MarkerVal::StableRef,
         _ => MarkerVal::Unknown,
     }
 }

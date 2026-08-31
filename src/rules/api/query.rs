@@ -33,8 +33,20 @@ use crate::{
 use crate::rules::{ConvergedEval, Note, SetterCall, Step, arg_is_call_free, local_bindings};
 
 /// Where a certified fact lives, and the witness chain that proves it (ADR-019).
-/// [`crate::rules::Diagnostic::error`] absorbs these into the finding, so the evidence's
-/// own span/label/provenance ride the `Error` instead of being threaded by hand.
+///
+/// [`crate::rules::Diagnostic::error`] absorbs these into the finding, so a
+/// primitive that knows where its proof sits does not have to hand the position
+/// back to the rule through a side channel. It is a *default*, not a lock: a
+/// rule that has a better anchor still refines it with `with_range`/`with_label`
+/// (`state-mutation` points at the mutation site, not at the write that proves
+/// the cycle).
+///
+/// Some primitives legitimately leave it [`Default`]: they are handed the shape
+/// of the proof and not its location — `must_same_ref_mutation` receives
+/// container ids, `must_init_calls_setter` an `Expr` (which carries no span),
+/// `must_on_all_paths` a block set. Empty provenance there is honest, not an
+/// omission; enriching it would mean widening those signatures for a position
+/// the rule already has.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Provenance {
     pub range: Option<SourceRange>,
@@ -493,6 +505,8 @@ pub fn must_setter_on_all_paths(
 /// must-forward (ADR-021 §3).
 pub fn must_on_all_paths(cfg: &CFG, blocks: &HashSet<BlockId>) -> MustResult<OnAllPaths> {
     if crate::rules::helpers::churn::on_all_paths(cfg, blocks) {
+        // No provenance: the proof is a property of the whole CFG, not of one
+        // position in it. The blocks it holds are on the evidence.
         MustResult::All(Certified::mint(
             OnAllPaths {
                 blocks: blocks.iter().copied().collect(),
@@ -558,6 +572,8 @@ impl ExitDominance {
             .iter()
             .all(|&exit| self.domtree.dominates(block, exit))
         {
+            // No provenance: a dominance relation over exits has no single
+            // position — the block it holds is on the evidence.
             MustResult::All(Certified::mint(
                 DominatesAllExits { block },
                 Provenance::default(),
@@ -593,6 +609,9 @@ pub fn must_init_calls_setter(init: &Expr, setters: &HashSet<Var>) -> MustResult
         matches!(c, Expr::StateSetter(_)) || matches!(c, Expr::Var(v) if setters.contains(v))
     });
     if calls_setter {
+        // No provenance: an `Expr` carries no span, so the position of the
+        // offending call is something the *caller* holds and this primitive
+        // never sees.
         MustResult::All(Certified::mint(InitSetterCall, Provenance::default()))
     } else {
         MustResult::None
@@ -682,7 +701,12 @@ pub fn classify_motion(val: &StateValue, result: &ProgramAnalysisResult) -> Moti
                         display,
                         write_span,
                     },
-                    Provenance::default(),
+                    // The write that moves the feeding slot *is* the proof, and
+                    // this is where it was found. The consuming rule anchors
+                    // the finding at the seed site instead — a better place to
+                    // point a user — but the token now says where the proof
+                    // lives without anyone reading back into the evidence.
+                    Provenance::at(write_span, None),
                 ));
             }
         }
@@ -751,7 +775,16 @@ pub(in crate::rules) fn must_effect_cycle(
         comps.insert(&edges[i].component);
     }
     if all_must && comps.len() == 1 {
-        MustResult::All(Certified::mint(EffectCycleProof, Provenance::default()))
+        // The cycle's first edge is where the proof starts: the write that
+        // re-triggers the effect carrying it. Both are on the edge already, so
+        // the token carries them rather than leaving the rule to re-derive
+        // them from a `Vec` index.
+        let first = cycle.edge_idx.first().map(|&i| &edges[i]);
+        let provenance = match first {
+            Some(e) => Provenance::at(e.write_span, Some(e.effect_label)),
+            None => Provenance::default(),
+        };
+        MustResult::All(Certified::mint(EffectCycleProof, provenance))
     } else {
         MustResult::None
     }
@@ -775,6 +808,8 @@ pub fn must_same_ref_mutation(
         .next()
         .is_some()
     {
+        // No provenance: the inputs are container ids, so neither the mutation
+        // site nor the setter call reaches this primitive. The rule anchors it.
         MustResult::All(Certified::mint(SameRefMutation, Provenance::default()))
     } else {
         MustResult::None

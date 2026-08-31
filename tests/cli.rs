@@ -17,6 +17,10 @@ fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
 // ── check ─────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -150,6 +154,47 @@ fn nonexistent_path_is_usage_error() {
     assert_eq!(out.status.code(), Some(2));
 }
 
+/// An `--entry` name matching nothing selects no root, which silently collapses
+/// the run to intra-component analysis: a typo used to cost every cross-component
+/// finding and still print a clean report.
+#[test]
+fn unknown_entry_is_usage_error() {
+    let out = reactant(&["check", "tests/fixtures/vite_project", "--entry", "Bogus"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).contains("no component named `Bogus`"),
+        "stderr must name the entry that matched nothing, got:\n{}",
+        stderr(&out)
+    );
+}
+
+/// The qualified `Name@path` form is what the report prints back for a
+/// collision, so `--entry` has to accept it — it used to match nothing, making
+/// the documented collision workaround a silent no-op.
+#[test]
+fn qualified_entry_name_is_accepted() {
+    let out = reactant(&[
+        "check",
+        "tests/fixtures/vite_project",
+        "--entry",
+        "App@tests/fixtures/vite_project/src/App.tsx",
+        "--format",
+        "json",
+    ]);
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "the qualified form must resolve, stderr:\n{}",
+        stderr(&out)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&stdout(&out)).expect("stdout must be valid JSON");
+    assert_eq!(
+        doc["summary"]["components_analyzed"], 1,
+        "exactly the named component is a root: {doc}"
+    );
+}
+
 // ── rules / explain ───────────────────────────────────────────────────────────
 
 #[test]
@@ -262,25 +307,42 @@ fn assurances_and_suspensions_are_both_info_gated() {
     assert!(!out.contains("suspended"), "got:\n{out}");
 }
 
+fn assert_byte_identical_across_runs(args: &[&str]) {
+    let first = stdout(&reactant(args));
+    assert!(!first.is_empty(), "nothing to compare for {args:?}");
+    for _ in 0..3 {
+        assert_eq!(
+            stdout(&reactant(args)),
+            first,
+            "output must be byte-identical across runs: {args:?}"
+        );
+    }
+}
+
+const DETERMINISM_ARGS: &[&str] = &[
+    "check",
+    "tests/fixtures",
+    "--all-roots",
+    "--info",
+    "--fail-on",
+    "never",
+];
+
 #[test]
 fn consecutive_runs_are_byte_identical() {
     // Rules iterate HashMaps internally; the output layer's total ordering
     // must absorb that — consecutive runs over a fixture set with many
     // same-severity diagnostics (analysis-limit Infos) must not reorder.
-    let args = &[
-        "check",
-        "tests/fixtures",
-        "--all-roots",
-        "--info",
-        "--fail-on",
-        "never",
-    ];
-    let first = stdout(&reactant(args));
-    for _ in 0..3 {
-        assert_eq!(
-            stdout(&reactant(args)),
-            first,
-            "diagnostic output must be byte-identical across runs"
-        );
-    }
+    assert_byte_identical_across_runs(DETERMINISM_ARGS);
+}
+
+#[test]
+fn consecutive_traced_runs_are_byte_identical() {
+    // The total order above covers diagnostics, not the notes *inside* one:
+    // `Diagnostic::notes` is not sorted, so a witness chain built by iterating
+    // a HashMap (a churn-graph `CycleEdge`, say) would reorder here and
+    // nowhere else. Without `--trace` no test walks that output at all.
+    let mut args = DETERMINISM_ARGS.to_vec();
+    args.push("--trace");
+    assert_byte_identical_across_runs(&args);
 }

@@ -27,6 +27,9 @@ struct JsonReport<'a> {
 struct JsonParseError {
     file: String,
     message: String,
+    /// `false` when the file was dropped from the run instead of recovered:
+    /// its findings are missing, not absent.
+    analyzed: bool,
 }
 
 #[derive(Serialize)]
@@ -234,9 +237,10 @@ pub fn render(report: &CheckReport, display: &dyn Fn(&Path) -> String) -> String
         parse_errors: report
             .parse_errors
             .iter()
-            .map(|(f, m)| JsonParseError {
-                file: display(f),
-                message: m.clone(),
+            .map(|e| JsonParseError {
+                file: display(&e.file),
+                message: e.message.clone(),
+                analyzed: e.analyzed,
             })
             .collect(),
         diagnostics,

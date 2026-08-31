@@ -181,11 +181,32 @@ pub fn run_check(
 
     // ── Lower ─────────────────────────────────────────────────────────────────
     let mut lowered = lower_files_with(fs.as_ref(), &files, ctx.resolver.as_ref());
-    if opts.format == ReportFormat::Human {
-        for (path, msg) in &lowered.parse_errors {
-            let _ = writeln!(err, "[parse error] {}: {}", path.display(), msg);
+    // A file the parser recovered from is noise, and stays on the human
+    // channel. A *dropped* file is not: everything it held is a silent false
+    // negative, so it is reported whatever the format — stderr is a separate
+    // stream, so stdout stays exactly one JSON document.
+    for e in &lowered.parse_errors {
+        if e.analyzed {
+            if opts.format == ReportFormat::Human {
+                let _ = writeln!(err, "[parse error] {}: {}", e.file.display(), e.message);
+            }
+        } else {
+            let _ = writeln!(
+                err,
+                "[skipped] {}: {} — the file was not analyzed",
+                e.file.display(),
+                e.message
+            );
         }
     }
+
+    let strategy = if !opts.entry.is_empty() {
+        RootStrategy::Explicit(opts.entry.iter().map(|s| s.trim().to_string()).collect())
+    } else if opts.all_roots {
+        RootStrategy::AllComponents
+    } else {
+        RootStrategy::Heuristic
+    };
 
     // Display-name → (file, hook count) map, built before analysis consumes
     // the components. Keyed by display name to disambiguate same-named
@@ -198,6 +219,22 @@ pub fn run_check(
             temp_registry.display_name(&key),
             (c.file.clone(), c.hooks.len()),
         );
+    }
+
+    // An `--entry` name that matches nothing selects no root, which silently
+    // collapses the run to intra-component analysis — every cross-component
+    // finding lost to a typo, with an otherwise clean report. Fail instead.
+    let unmatched = strategy.unmatched(&temp_registry);
+    if !unmatched.is_empty() {
+        for name in &unmatched {
+            let _ = writeln!(err, "[error] --entry: no component named `{name}`");
+        }
+        let _ = writeln!(
+            err,
+            "[error] name a component defined in the analysed files, `Name@path` \
+             to pick one of several with the same name"
+        );
+        return CheckOutput::usage(err);
     }
     drop(temp_registry);
 
@@ -234,14 +271,6 @@ pub fn run_check(
     }
 
     // ── Analyze ───────────────────────────────────────────────────────────────
-    let strategy = if !opts.entry.is_empty() {
-        RootStrategy::Explicit(opts.entry.iter().map(|s| s.trim().to_string()).collect())
-    } else if opts.all_roots {
-        RootStrategy::AllComponents
-    } else {
-        RootStrategy::Heuristic
-    };
-
     let file_count = lowered.file_count;
     let parse_errors = std::mem::take(&mut lowered.parse_errors);
     // Ship with the common library-hook summaries (TanStack Query, React Router)

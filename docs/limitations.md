@@ -29,13 +29,11 @@ shapes, do not trust a clean result for it.**
 
 | Shape in your code | Effect | Issue |
 |---|---|---|
-| A `switch` with more than one case | Every case after the first `break` is invisible | [#1](https://github.com/rboudrouss/reactant-analyzer/issues/1) |
 | `try` whose body returns unconditionally | The whole `catch`/`finally` vanishes | [#2](https://github.com/rboudrouss/reactant-analyzer/issues/2) |
 | A hook called in `return` or in a branch condition | The component reports zero hooks | [#4](https://github.com/rboudrouss/reactant-analyzer/issues/4) |
 | A concise arrow component/hook (`const C = () => <div/>`) | The component or hook disappears | [#5](https://github.com/rboudrouss/reactant-analyzer/issues/5) |
 | A pack rule anchored on `kind: "custom"` | Sees only hooks the engine could *not* resolve | [#6](https://github.com/rboudrouss/reactant-analyzer/issues/6) |
 | Two components with the same name | One finding reported twice, wrong body inlined, counts inflated | [#7](https://github.com/rboudrouss/reactant-analyzer/issues/7) |
-| `--entry` with a typo or the qualified `Name@path` form | Matches nothing, silently, and drops all cross-component analysis | [#8](https://github.com/rboudrouss/reactant-analyzer/issues/8) |
 | An import alias pointing outside the discovery root | Resolved, then never read; the notice is `--info`-only | [#9](https://github.com/rboudrouss/reactant-analyzer/issues/9) |
 
 ## What reactant may miss (false negatives)
@@ -110,13 +108,16 @@ Aliases declared only in `vite.config.*` / `next.config.*` or in `jsconfig.json`
 supported extension point [#51](https://github.com/rboudrouss/reactant-analyzer/issues/51).
 
 Utility inlining: statement position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52), once per
-recursive utility [#53](https://github.com/rboudrouss/reactant-analyzer/issues/53), a global depth budget of 8
+recursive utility [#53](https://github.com/rboudrouss/reactant-analyzer/issues/53), a global splice budget of 8 — reached on real
+projects, and now reported as `analysis-limit` when it truncates
 [#54](https://github.com/rboudrouss/reactant-analyzer/issues/54), no default exports [#55](https://github.com/rboudrouss/reactant-analyzer/issues/55), no nested closures
 [#56](https://github.com/rboudrouss/reactant-analyzer/issues/56), and a returned `FnLit`'s call site stays opaque
 [#57](https://github.com/rboudrouss/reactant-analyzer/issues/57).
 
-Plugin interface: synchronous traits only [#58](https://github.com/rboudrouss/reactant-analyzer/issues/58), one `ImportResolver` per
-run [#59](https://github.com/rboudrouss/reactant-analyzer/issues/59), eager parsing of all discovered files [#60](https://github.com/rboudrouss/reactant-analyzer/issues/60).
+Plugin interface: synchronous traits only [#58](https://github.com/rboudrouss/reactant-analyzer/issues/58), eager parsing of all
+discovered files [#60](https://github.com/rboudrouss/reactant-analyzer/issues/60). (Per-file import resolution is available:
+`resolver::ScopedResolver` routes by the importing file, `resolver::ChainResolver`
+tries several in order — see [docs/plugins.md](plugins.md).)
 
 ## Writing declarative packs (Tier A)
 
