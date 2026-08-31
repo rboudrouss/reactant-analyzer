@@ -245,7 +245,7 @@ impl StateValue {
     /// functions (`"object"` or `"function"`), and the residual `other` slot is
     /// opaque by construction. `null` is `"object"` — that is JavaScript.
     ///
-    /// Derived from [`Self::populated_kinds`] like every other kind predicate,
+    /// Derived from `populated_kinds` like every other kind predicate,
     /// so a new slot is a compile error here too.
     pub fn typeof_name(&self) -> Option<&'static str> {
         let kinds = self.populated_kinds();
