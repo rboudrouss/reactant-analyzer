@@ -318,10 +318,8 @@ pub(crate) fn callee_parts(fn_: &Expr) -> Option<(&str, Option<&str>)> {
 /// Returns the callee's display name and the span of the statement carrying
 /// the call — the span's `FileId` points into the body's own source file.
 pub fn find_effectful_call(cfg: &CFG) -> Option<(String, Option<SourceRange>)> {
-    let mut block_ids: Vec<_> = cfg.blocks.keys().copied().collect();
-    block_ids.sort_unstable();
-    for bid in block_ids {
-        for stmt in &cfg.blocks[&bid].stmts {
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
             let (expr, span) = match stmt {
                 Stmt::Let { rhs, span, .. } => (rhs, span),
                 Stmt::ExprStmt(e, span) => (e, span),

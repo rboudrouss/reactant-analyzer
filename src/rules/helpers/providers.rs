@@ -120,15 +120,12 @@ fn value_identity(
     }
 }
 
-/// Top-level expressions per block in **block-id order**: `CFG::for_each_expr`
-/// iterates a `HashMap` and documents its order as unspecified, which would
-/// make the finding order seed-dependent.
+/// Top-level expressions per block, in block-id order — unlike
+/// [`CFG::for_each_expr`], the caller keeps the id each expression came from.
 fn top_level_exprs(cfg: &CFG) -> Vec<(BlockId, Vec<&Expr>)> {
-    let mut ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
-    ids.sort();
-    ids.into_iter()
-        .map(|id| {
-            let block = &cfg.blocks[&id];
+    cfg.blocks
+        .iter()
+        .map(|(&id, block)| {
             let mut exprs: Vec<&Expr> = Vec::new();
             for stmt in &block.stmts {
                 match stmt {

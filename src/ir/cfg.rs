@@ -56,7 +56,7 @@ impl CFG {
     /// Apply `f` to every TOP-LEVEL expression of the CFG: statement
     /// right-hand sides / expression statements, plus `Return` and `Branch`
     /// terminator expressions. Companion of [`crate::ir::expr::Expr::for_each_child`]
-    /// for walkers that scan whole bodies. Block order is unspecified.
+    /// for walkers that scan whole bodies. Blocks are visited in id order.
     pub fn for_each_expr<'a>(&'a self, f: &mut impl FnMut(&'a crate::ir::expr::Expr)) {
         for block in self.blocks.values() {
             for stmt in &block.stmts {
@@ -142,10 +142,7 @@ impl CFG {
                 return Err(format!("edge to missing block {}", edge.to));
             }
         }
-        let mut ids: Vec<BlockId> = self.blocks.keys().copied().collect();
-        ids.sort();
-        for id in ids {
-            let block = &self.blocks[&id];
+        for (&id, block) in &self.blocks {
             if block.id != id {
                 return Err(format!("block keyed {} reports id {}", id, block.id));
             }

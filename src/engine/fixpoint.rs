@@ -904,10 +904,7 @@ fn expand_custom_hooks(
 /// (returns the bound var) or a bare `ExprStmt(HookMarker(l))` (void call).
 /// Blocks are scanned in id order for determinism.
 fn find_hook_marker(render_cfg: &CFG, label: HookLabel) -> Option<(BlockId, usize, Option<Var>)> {
-    let mut block_ids: Vec<BlockId> = render_cfg.blocks.keys().copied().collect();
-    block_ids.sort_unstable();
-    for bid in block_ids {
-        let block = &render_cfg.blocks[&bid];
+    for (&bid, block) in &render_cfg.blocks {
         for (idx, stmt) in block.stmts.iter().enumerate() {
             match stmt {
                 Stmt::Let { var, rhs, .. } if is_marker(rhs, label) => {
@@ -1085,22 +1082,17 @@ fn collect_hook_calls(hooks: &[HookEntry], cfg: &CFG) -> Vec<HookCallInfo> {
     // Scan blocks for label-bearing exprs (StateVal / StateSetter / MemoVal /
     // CallbackVal / HookMarker); first occurrence in block order wins.
     let mut call_map: HashMap<HookLabel, HookCallInfo> = HashMap::new();
-    let mut sorted_ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
-    sorted_ids.sort_unstable();
-
-    for block_id in sorted_ids {
-        if let Some(block) = cfg.blocks.get(&block_id) {
-            for stmt in &block.stmts {
-                for label in hook_labels_in_stmt(stmt) {
-                    if let Some(&kind) = label_to_kind.get(&label) {
-                        call_map.entry(label).or_insert(HookCallInfo {
-                            label,
-                            kind,
-                            block_id,
-                            span: label_to_span.get(&label).copied().flatten(),
-                            opaque: opaque.contains(&label),
-                        });
-                    }
+    for (&block_id, block) in &cfg.blocks {
+        for stmt in &block.stmts {
+            for label in hook_labels_in_stmt(stmt) {
+                if let Some(&kind) = label_to_kind.get(&label) {
+                    call_map.entry(label).or_insert(HookCallInfo {
+                        label,
+                        kind,
+                        block_id,
+                        span: label_to_span.get(&label).copied().flatten(),
+                        opaque: opaque.contains(&label),
+                    });
                 }
             }
         }
@@ -1396,10 +1388,7 @@ fn find_inlining_target(
     caller_file: &std::path::Path,
     expanding: &HashSet<String>,
 ) -> Option<(BlockId, usize, String)> {
-    let mut block_ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
-    block_ids.sort_unstable();
-    for bid in block_ids {
-        let block = &cfg.blocks[&bid];
+    for (&bid, block) in &cfg.blocks {
         for (idx, stmt) in block.stmts.iter().enumerate() {
             if let Some(name) = utility_call_target(stmt) {
                 if expanding.contains(&name) {

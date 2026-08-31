@@ -45,14 +45,7 @@ impl Rule for RedundantSetState {
         let mut diags = Vec::new();
 
         // ── Render body ───────────────────────────────────────────────────────
-        let mut sorted_ids: Vec<_> = result.render_cfg.blocks.keys().copied().collect();
-        sorted_ids.sort_unstable();
-
-        for block_id in sorted_ids {
-            let block = match result.render_cfg.blocks.get(&block_id) {
-                Some(b) => b,
-                None => continue,
-            };
+        for (&block_id, block) in &result.render_cfg.blocks {
             let env = match result.block_states.get(&block_id) {
                 Some(e) => e,
                 None => continue,
@@ -112,20 +105,16 @@ fn check_cfg_for_redundant_sets(
     diags: &mut Vec<Diagnostic>,
 ) {
     let skip_labels = collect_transition_setters(component, cfg, env, state, memo);
-    let mut sorted: Vec<_> = cfg.blocks.keys().copied().collect();
-    sorted.sort_unstable();
-    for block_id in sorted {
-        if let Some(block) = cfg.blocks.get(&block_id) {
-            check_setter_calls(
-                component,
-                &block.stmts,
-                env,
-                state,
-                memo,
-                diags,
-                &skip_labels,
-            );
-        }
+    for block in cfg.blocks.values() {
+        check_setter_calls(
+            component,
+            &block.stmts,
+            env,
+            state,
+            memo,
+            diags,
+            &skip_labels,
+        );
     }
 }
 

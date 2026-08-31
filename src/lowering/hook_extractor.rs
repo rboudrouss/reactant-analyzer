@@ -26,10 +26,7 @@ pub fn extract_subscriptions(hooks: &mut Vec<HookEntry>, next_label: &mut HookLa
 }
 
 fn collect_subscriptions_in_cfg(cfg: &CFG, out: &mut Vec<HookEntry>, next_label: &mut HookLabel) {
-    let mut ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
-    ids.sort_unstable();
-    for id in ids {
-        let block = &cfg.blocks[&id];
+    for block in cfg.blocks.values() {
         for stmt in &block.stmts {
             let (expr, span) = match stmt {
                 Stmt::Let { rhs, span, .. } => (rhs, *span),
@@ -274,8 +271,9 @@ pub fn extract_hooks(
     // Maps array-destructuring temps (e.g. "__arr_42") → hook label, for useState/useReducer.
     let mut state_temps: HashMap<String, HookLabel> = HashMap::new();
 
-    let mut ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
-    ids.sort_unstable();
+    // Collected up front because the loop takes `&mut cfg.blocks` — the ids
+    // already come out in order (`CFG::blocks` is a `BTreeMap`).
+    let ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
 
     for id in ids {
         let old = std::mem::take(&mut cfg.blocks.get_mut(&id).unwrap().stmts);

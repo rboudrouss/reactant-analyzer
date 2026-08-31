@@ -162,11 +162,8 @@ pub(crate) fn collect_registrations<'a>(
     fixed_block: Option<Option<BlockId>>,
     out: &mut Vec<Registration<'a>>,
 ) {
-    let mut block_ids: Vec<_> = cfg.blocks.keys().copied().collect();
-    block_ids.sort_unstable();
-    for bid in block_ids {
+    for (&bid, block) in &cfg.blocks {
         let block_id = fixed_block.unwrap_or(Some(bid));
-        let block = &cfg.blocks[&bid];
         for stmt in &block.stmts {
             let (expr, span) = match stmt {
                 Stmt::ExprStmt(e, span) => (e, *span),
