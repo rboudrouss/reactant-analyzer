@@ -32,7 +32,7 @@ use crate::rules::{
     hook_kind_word, hook_val_labels, resolve_setter_aliases, state_val_labels,
 };
 
-use super::schema::{HookKindFilter, PhaseName, ReturnsName, StabilityName};
+use super::schema::{HookKindFilter, PhaseName, ReturnsName, StabilityName, UpdaterName};
 use super::validate::Field;
 
 // ── Entities ──────────────────────────────────────────────────────────────────
@@ -634,6 +634,16 @@ fn cleanup_word(c: CleanupVerdict) -> &'static str {
 }
 
 /// `ValueIdentity` → schema name (total).
+/// The `updater` guard's total mirror of a `writers` row's argument-0 column
+/// (ADR-028 §2): only a proven function literal is `functional`.
+pub(crate) fn updater_name(u: &crate::engine::setters::Updater) -> UpdaterName {
+    if u.is_functional() {
+        UpdaterName::Functional
+    } else {
+        UpdaterName::Unknown
+    }
+}
+
 pub(crate) fn identity_name(i: ValueIdentity) -> super::schema::IdentityName {
     match i {
         ValueIdentity::FreshEveryRender => super::schema::IdentityName::FreshEveryRender,

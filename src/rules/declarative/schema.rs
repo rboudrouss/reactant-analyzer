@@ -308,6 +308,30 @@ pub enum Guard {
         of: String,
         includes: PVal<Vec<PhaseName>>,
     },
+    /// How a `writers` row's argument 0 classifies (ADR-028 §2). A total
+    /// mirror of [`UpdaterName`] — ⊤ (`unknown`) is nameable, so a rule that
+    /// wants "not proven functional" says so instead of getting it by
+    /// accident. Positive-only: there is no negated form.
+    ///
+    /// `functional` is claimed only for a proven function literal — inline, or
+    /// a variable bound exactly once to one. Everything else folds to
+    /// `unknown`, so a rule keyed on it over-reports rather than missing a
+    /// write.
+    Updater {
+        of: String,
+        is: PVal<Vec<UpdaterName>>,
+    },
+    /// A `writers` row whose slot may be written **again** in the same tick:
+    /// another sync write of the same slot in the same region is CFG-reachable
+    /// from this one, self-reachability through a back edge included (a lone
+    /// write inside a loop co-executes with itself).
+    ///
+    /// The guard carries no value field, and that is the design: the fact is
+    /// may-typed in one direction only. Reachability is exact on the CFG, but
+    /// the walk that found the writes is depth-capped, so "no other write is
+    /// reachable" is not a promise the engine can keep — there is no negated
+    /// form to assert it with.
+    SameTick { of: String },
     /// Universal quantification over `anchor.deps` (ADR-023 §4, whose stated
     /// gate — "making truncation representable in the IR" — the `exact` bit
     /// discharges): passes when every element satisfies the nested guards.
@@ -427,6 +451,19 @@ pub enum StabilityName {
     Stable,
     Versioned,
     PerRender,
+    Unknown,
+}
+
+/// Total mirror of the `writers` updater column (ADR-028 §2); ⊤ = `unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum UpdaterName {
+    /// Proven a function literal: `set(prev => …)`, or a variable bound
+    /// exactly once to one.
+    Functional,
+    /// ⊤ — a value expression, a call, an argument the walk could not resolve,
+    /// or no argument at all.
     Unknown,
 }
 

@@ -2339,3 +2339,234 @@ fn the_quantifier_owns_the_element_slot_inside_its_body() {
     ));
     assert!(e.message.contains("unknown binding `outer`"), "{e}");
 }
+
+// ── `writers` per-site rows, the updater column, the same-tick fact (#105) ────
+
+/// One finding per `writers` row — the granularity itself, with no guard in
+/// the way.
+const ROWS_PACK: &str = r#"{"schemaVersion":1,"name":"t","rules":[
+    {"id":"rows","docs":{"description":"d","why":"w","fix":"f"},
+     "severity":"warning",
+     "anchor":{"relation":"hook_calls","kind":"state"},
+     "forEach":{"edge":"writers","as":"w"},
+     "guards":[],
+     "message":"write in {w.region}"}]}"#;
+
+#[test]
+fn writers_rows_are_per_call_site() {
+    // The reversal: the relation used to key rows by (setter variable, phase
+    // class), so two `setCount(…)` calls in one handler collapsed into one row
+    // and the relation could not say there were two.
+    let two = run_pack(
+        ROWS_PACK,
+        r#"
+        function C() {
+            const [count, setCount] = useState(0);
+            const bump = () => { setCount(count + 1); setCount(count + 1); };
+            return <button onClick={bump}>{count}</button>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(two.len(), 2, "two call sites, two rows: {two:?}");
+
+    let one = run_pack(
+        ROWS_PACK,
+        r#"
+        function C() {
+            const [count, setCount] = useState(0);
+            const bump = () => { setCount(count + 1); };
+            return <button onClick={bump}>{count}</button>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(one.len(), 1, "{one:?}");
+}
+
+const UPDATER_PACK: &str = r#"{"schemaVersion":1,"name":"t","rules":[
+    {"id":"fn-updater","docs":{"description":"d","why":"w","fix":"f"},
+     "severity":"warning",
+     "anchor":{"relation":"hook_calls","kind":"state"},
+     "forEach":{"edge":"writers","as":"w"},
+     "guards":[{"kind":"updater","of":"w","is":["functional"]}],
+     "message":"functional"}]}"#;
+
+#[test]
+fn updater_claims_functional_only_for_a_proven_function_literal() {
+    let cases = [
+        ("setCount((c) => c + 1)", 1, "an inline FnLit is proven"),
+        ("setCount(count + 1)", 0, "a value expression is not"),
+        (
+            "setCount(next)",
+            0,
+            "an unresolved variable is ⊤, not functional",
+        ),
+    ];
+    for (call, want, why) in cases {
+        let src = format!(
+            r#"
+            function C({{ next }}) {{
+                const [count, setCount] = useState(0);
+                const bump = () => {{ {call}; }};
+                return <button onClick={{bump}}>{{count}}</button>;
+            }}
+            "#
+        );
+        let got = run_pack(UPDATER_PACK, &src, &Options::new());
+        assert_eq!(got.len(), want, "`{call}`: {why}: {got:?}");
+    }
+}
+
+#[test]
+fn updater_resolves_a_variable_only_under_the_single_binding_certificate() {
+    // Same bar as every other Var-resolving reader: bound exactly once to a
+    // function literal, never re-bound. `collect_fn_bindings` keeps the last
+    // binding of a re-bound name, which is why it is not the bar.
+    let certified = run_pack(
+        UPDATER_PACK,
+        r#"
+        function C() {
+            const [count, setCount] = useState(0);
+            const inc = (c) => c + 1;
+            const bump = () => { setCount(inc); };
+            return <button onClick={bump}>{count}</button>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(certified.len(), 1, "{certified:?}");
+
+    let rebound = run_pack(
+        UPDATER_PACK,
+        r#"
+        function C({ flag }) {
+            const [count, setCount] = useState(0);
+            let inc = (c) => c + 1;
+            inc = (c) => c + 2;
+            const bump = () => { setCount(inc); };
+            return <button onClick={bump}>{count}</button>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(
+        rebound.is_empty(),
+        "a re-bound name is not a proven literal: {rebound:?}"
+    );
+}
+
+const SAME_TICK_PACK: &str = r#"{"schemaVersion":1,"name":"t","rules":[
+    {"id":"paired","docs":{"description":"d","why":"w","fix":"f"},
+     "severity":"warning",
+     "anchor":{"relation":"hook_calls","kind":"state"},
+     "forEach":{"edge":"writers","as":"w"},
+     "guards":[{"kind":"same_tick","of":"w"}],
+     "message":"pairs"}]}"#;
+
+#[test]
+fn same_tick_pairs_two_writes_that_co_execute() {
+    let paired = run_pack(
+        SAME_TICK_PACK,
+        r#"
+        function C() {
+            const [count, setCount] = useState(0);
+            const bump = () => { setCount(count + 1); setCount(count + 1); };
+            return <button onClick={bump}>{count}</button>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(paired.len(), 2, "both rows pair with the other: {paired:?}");
+
+    let alone = run_pack(
+        SAME_TICK_PACK,
+        r#"
+        function C() {
+            const [count, setCount] = useState(0);
+            const bump = () => { setCount(count + 1); };
+            return <button onClick={bump}>{count}</button>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(
+        alone.is_empty(),
+        "a lone write pairs with nothing: {alone:?}"
+    );
+}
+
+#[test]
+fn same_tick_sees_a_lone_write_inside_a_loop() {
+    // Self-reachability through the back edge. Missing it would let the
+    // clearest instance of the bug — a write repeated by iteration — read as
+    // a write that happens once.
+    let looped = run_pack(
+        SAME_TICK_PACK,
+        r#"
+        function C({ items }) {
+            const [count, setCount] = useState(0);
+            const bump = () => { for (const i of items) { setCount(count + 1); } };
+            return <button onClick={bump}>{count}</button>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(
+        looped.len(),
+        1,
+        "the loop makes it pair with itself: {looped:?}"
+    );
+}
+
+#[test]
+fn same_tick_does_not_pair_across_regions() {
+    // Two writes in two handlers are two ticks, not one.
+    let split = run_pack(
+        SAME_TICK_PACK,
+        r#"
+        function C() {
+            const [count, setCount] = useState(0);
+            return (
+                <div>
+                    <button onClick={() => setCount(count + 1)}>a</button>
+                    <button onClick={() => setCount(count + 1)}>b</button>
+                </div>
+            );
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(
+        split.is_empty(),
+        "separate handlers are separate ticks: {split:?}"
+    );
+}
+
+#[test]
+fn the_writers_facts_are_writers_rows_only() {
+    for kind in [
+        "updater\",\"of\":\"anchor\",\"is\":[\"functional\"]",
+        "same_tick\",\"of\":\"anchor\"",
+    ] {
+        let e = load_err(&one_rule(&format!(
+            r#"{{"id":"r","docs":{{"description":"d","why":"w","fix":"f"}},"severity":"warning",
+                "anchor":{{"relation":"hook_calls","kind":"state"}},
+                "guards":[{{"kind":"{kind}}}],"message":"m"}}"#
+        )));
+        assert!(e.message.contains("`writers` row"), "{e}");
+    }
+}
+
+#[test]
+fn same_tick_has_no_negated_form() {
+    // The walk is depth-capped, so "no other write is reachable" is not a
+    // promise the engine can keep — there is no field to assert it with.
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls","kind":"state"},
+            "forEach":{"edge":"writers","as":"w"},
+            "guards":[{"kind":"same_tick","of":"w","eq":false}],"message":"m"}"#,
+    ));
+    assert!(e.message.contains("eq"), "{e}");
+}

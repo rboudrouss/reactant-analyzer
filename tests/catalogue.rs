@@ -173,6 +173,30 @@ fn run_rule_on(pack_json: &str, rule_id: &str, fixture: &Fixture) -> Vec<Diagnos
 /// The committed guardrails pack proves the three ADR-022 baseline entries.
 const GUARDRAILS: &str = include_str!("../packs/guardrails.json");
 
+/// #105: the canonical stale-read shape — a slot written twice in one tick
+/// without a functional updater. Both halves are per-row facts, so the rule
+/// stays single-anchor and existential: no fold over the `writers` edge.
+const STALE_UPDATE_PACK: &str = r#"{
+  "schemaVersion": 1, "name": "cat-stale",
+  "rules": [{
+    "id": "non-functional-same-tick",
+    "docs": {
+      "description": "a state slot is written twice in one tick without a functional updater",
+      "why": "React batches the writes of one tick, and every non-functional updater reads the same rendered value. Two `setCount(count + 1)` calls in one handler therefore advance the count by one, not two.",
+      "fix": "Pass the functional form, `setCount(c => c + 1)`, so each write reads the value the previous one produced.",
+      "example": "const bump = () => { setCount(count + 1); setCount(count + 1) }"
+    },
+    "severity": "warning",
+    "anchor": { "relation": "hook_calls", "kind": "state" },
+    "forEach": { "edge": "writers", "as": "w" },
+    "guards": [
+      { "kind": "same_tick", "of": "w" },
+      { "kind": "updater", "of": "w", "is": ["unknown"] }
+    ],
+    "message": "{w.region} writes this slot more than once in a tick without a functional updater — the writes read the same value"
+  }]
+}"#;
+
 const SELECTOR_PACK: &str = r#"{
   "schemaVersion": 1, "name": "cat-selector",
   "rules": [{
@@ -604,12 +628,29 @@ fn catalogue() -> Vec<Entry> {
         },
         Entry {
             id: "stale-update-without-functional-updater",
-            status: Status::Blocked {
-                class: "engine-facts",
-                missing: "per-site `writers` rows (the relation collapses same-slot \
-                          writes per `(Var, WalkClass)` today), the `updater` column and \
-                          a same-tick reachability fact on the row (#105; the Tier 1 \
-                          `stale-update` native proposal is #61)",
+            status: Status::Expressible {
+                pack_json: STALE_UPDATE_PACK,
+                rule: "cat-stale/non-functional-same-tick",
+                fires_on: Fixture::Single(
+                    "import { useState } from \"react\";\nfunction C() {\n  const [count, setCount] = useState(0);\n  const bump = () => { setCount(count + 1); setCount(count + 1); };\n  return <button onClick={bump}>{count}</button>;\n}",
+                ),
+                silent_on: Fixture::Single(
+                    "import { useState } from \"react\";\nfunction C() {\n  const [count, setCount] = useState(0);\n  const bump = () => { setCount((c) => c + 1); setCount((c) => c + 1); };\n  return <button onClick={bump}>{count}</button>;\n}",
+                ),
+                weakened: Some(
+                    "same-tick pairs are proven within one Sync region only — a write in a \
+                     deferred continuation or another handler carries no block id and never \
+                     pairs, and a post-await write still reads as sync (the IR gate recorded \
+                     in ADR-027 §2), so the async half of #61 is not covered. `functional` is \
+                     claimed only for an inline `FnLit` or a variable bound exactly once to \
+                     one, so a shape the walk cannot resolve fires — the may direction. A \
+                     shape-functional updater that ignores its `prev` parameter and reads the \
+                     captured slot (`set(() => count + 1)`) classifies functional and is \
+                     suppressed: correct for the value-updater claim this rule makes, and the \
+                     stale-capture residue belongs to stale-closure. Warning only — #61's own \
+                     gate applies, batching semantics being React-version-dependent, so no \
+                     must primitive and no Error path",
+                ),
             },
         },
         Entry {
@@ -729,7 +770,7 @@ fn catalogue() -> Vec<Entry> {
 /// after the single-binding certificate resolved Var-bound selectors (#103) →
 /// 13/22 after the `identity` verdict reached call-site arguments (#112).
 /// Flip an entry (rule + fixtures), then update this constant.
-const EXPRESSIBLE_NOW: usize = 14;
+const EXPRESSIBLE_NOW: usize = 15;
 
 #[test]
 fn catalogue_is_pinned_at_22_entries() {

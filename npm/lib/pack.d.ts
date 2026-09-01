@@ -127,6 +127,13 @@ export type Guard = {
   "kind": "writer_phases";
   "of": string;
 } | {
+  "is": PVal_Array_of_UpdaterName;
+  "kind": "updater";
+  "of": string;
+} | {
+  "kind": "same_tick";
+  "of": string;
+} | {
   /**
    * Name the element binds under inside `guards`. It is the same slot a
    * rule-level `forEach` binding uses, which the quantifier owns for
@@ -198,6 +205,10 @@ export type PVal_Array_of_ReturnsName = ReturnsName[] | {
 };
 
 export type PVal_Array_of_StabilityName = StabilityName[] | {
+  "$param": string;
+};
+
+export type PVal_Array_of_UpdaterName = UpdaterName[] | {
   "$param": string;
 };
 
@@ -289,6 +300,11 @@ export type SeverityPin = "error" | "warning" | "info";
  * Total mirror of `StabilityVerdict`.
  */
 export type StabilityName = "stable" | "versioned" | "per-render" | "unknown";
+
+/**
+ * Total mirror of the `writers` updater column (ADR-028 §2); ⊤ = `unknown`.
+ */
+export type UpdaterName = "functional" | "unknown";
 
 /** The type an authored pack module exports (or returns from a function). */
 export type Pack = PackFile;

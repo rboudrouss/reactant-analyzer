@@ -205,6 +205,17 @@ pub(crate) enum ResolvedGuard {
     DepsDeclared {
         eq: bool,
     },
+    /// ADR-028 §2: the updater classifier of a `writers` row, a total mirror
+    /// of the column so ⊤ is named rather than implied.
+    Updater {
+        of: BindRef,
+        names: Vec<crate::rules::declarative::schema::UpdaterName>,
+    },
+    /// ADR-028 §2: the row's precomputed same-tick pair fact. No value — the
+    /// negative is not assertable.
+    SameTick {
+        of: BindRef,
+    },
     Must {
         kind: MustKind,
         of: BindRef,
@@ -521,6 +532,8 @@ fn guard_allowed_keys(g: &Guard) -> (&'static str, &'static [&'static str]) {
             ("guard `must_hook_is_conditional`", &["kind", "of", "else"])
         }
         Guard::MustDirectWrite { .. } => ("guard `must_direct_write`", &["kind", "of", "else"]),
+        Guard::Updater { .. } => ("guard `updater`", &["kind", "of", "is"]),
+        Guard::SameTick { .. } => ("guard `same_tick`", &["kind", "of"]),
         Guard::AnyOf { .. } => ("guard `any_of`", &["kind", "guards"]),
         Guard::Every { .. } => ("guard `every`", &["kind", "of", "as", "guards"]),
     }
@@ -1186,6 +1199,39 @@ fn validate_guard(
                 return Err(PackError::new(g_path, "the verdict list must not be empty"));
             }
             ResolvedGuard::Cleanup { of, names, negated }
+        }
+        Guard::Updater { of, is } => {
+            let (of, sort) = cx.resolve_of(of, g_path)?;
+            if sort != Sort::Writer {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    format!(
+                        "guard `updater` applies to a `writers` row, but the subject binds {}",
+                        sort.describe()
+                    ),
+                ));
+            }
+            let names = cx.env.resolve(is, None, &format!("{g_path}.is"))?;
+            if names.is_empty() {
+                return Err(PackError::new(
+                    format!("{g_path}.is"),
+                    "guard `updater` needs at least one verdict name",
+                ));
+            }
+            ResolvedGuard::Updater { of, names }
+        }
+        Guard::SameTick { of } => {
+            let (of, sort) = cx.resolve_of(of, g_path)?;
+            if sort != Sort::Writer {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    format!(
+                        "guard `same_tick` applies to a `writers` row, but the subject binds {}",
+                        sort.describe()
+                    ),
+                ));
+            }
+            ResolvedGuard::SameTick { of }
         }
         Guard::Provenance {
             of,

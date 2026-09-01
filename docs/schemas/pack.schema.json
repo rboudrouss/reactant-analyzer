@@ -515,6 +515,44 @@
           ]
         },
         {
+          "description": "How a `writers` row's argument 0 classifies (ADR-028 §2). A total\nmirror of [`UpdaterName`] — ⊤ (`unknown`) is nameable, so a rule that\nwants \"not proven functional\" says so instead of getting it by\naccident. Positive-only: there is no negated form.\n\n`functional` is claimed only for a proven function literal — inline, or\na variable bound exactly once to one. Everything else folds to\n`unknown`, so a rule keyed on it over-reports rather than missing a\nwrite.",
+          "type": "object",
+          "properties": {
+            "is": {
+              "$ref": "#/$defs/PVal_Array_of_UpdaterName"
+            },
+            "kind": {
+              "type": "string",
+              "const": "updater"
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of",
+            "is"
+          ]
+        },
+        {
+          "description": "A `writers` row whose slot may be written **again** in the same tick:\nanother sync write of the same slot in the same region is CFG-reachable\nfrom this one, self-reachability through a back edge included (a lone\nwrite inside a loop co-executes with itself).\n\nThe guard carries no value field, and that is the design: the fact is\nmay-typed in one direction only. Reachability is exact on the CFG, but\nthe walk that found the writes is depth-capped, so \"no other write is\nreachable\" is not a promise the engine can keep — there is no negated\nform to assert it with.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "same_tick"
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        },
+        {
           "description": "Universal quantification over `anchor.deps` (ADR-023 §4, whose stated\ngate — \"making truncation representable in the IR\" — the `exact` bit\ndischarges): passes when every element satisfies the nested guards.\n\n**Whether ⊤ satisfies is the body's decision, not the quantifier's.**\nThe verdict guards name their own ⊤: `is: [\"stable\"]` means *provably*\nstable and a ⊤ element fails it, exactly as it does under a `forEach`;\n`is: [\"stable\", \"unknown\"]` accepts a list that may conform. Folding\n⊤-satisfies into `every` instead would make the two quantifiers of the\nsame guard disagree about the same fact, and would fire every\n\"all deps stable\" rule on every effect keyed on a ⊤ prop.\n\nPositive-only — there is no negated form, and `not every` is just the\nexistential a `forEach` already writes.\n\nQuantifying needs a domain. A **written** array supplies one even when\na spread hides part of it — the fold ranges over the elements the\nengine can see, and one visible violator refutes ∀ outright. An absent\nor unreadable deps argument supplies no element at all, and a claim\nabout nothing is not a claim the engine may make, so the guard fails\nthere. A list that is known empty quantifies vacuously true; pair with\n`count` when a rule needs at least one element.\n\nNever mints a proof: a `must_*` guard anywhere inside a rule that uses\n`every` is rejected at load time, so an `every`-selected finding cannot\ncarry Error authority for a row a may-fact put there (ADR-021).",
           "type": "object",
           "properties": {
@@ -859,6 +897,28 @@
         }
       ]
     },
+    "PVal_Array_of_UpdaterName": {
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UpdaterName"
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "$param": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "$param"
+          ]
+        }
+      ]
+    },
     "PVal_Array_of_string": {
       "oneOf": [
         {
@@ -1100,6 +1160,21 @@
         "versioned",
         "per-render",
         "unknown"
+      ]
+    },
+    "UpdaterName": {
+      "description": "Total mirror of the `writers` updater column (ADR-028 §2); ⊤ = `unknown`.",
+      "oneOf": [
+        {
+          "description": "Proven a function literal: `set(prev => …)`, or a variable bound\nexactly once to one.",
+          "type": "string",
+          "const": "functional"
+        },
+        {
+          "description": "⊤ — a value expression, a call, an argument the walk could not resolve,\nor no argument at all.",
+          "type": "string",
+          "const": "unknown"
+        }
       ]
     }
   }

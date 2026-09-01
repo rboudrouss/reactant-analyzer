@@ -165,6 +165,11 @@ pinning its arity, which closes [#69](https://github.com/rboudrouss/reactant-ana
 arity buys is one sentence: a reader may enumerate a truncated deps list to
 make a rule **fire**, never to make one *stop*, and it may answer an arity
 question only from what the bound settles.)
+**→ 15/22** (2026-09-01, [#105](https://github.com/rboudrouss/reactant-analyzer/issues/105), ADR-028: the `writers`
+relation keeps one row per call site — reversing a documented collapse that
+made "two writes of one slot" unsayable — plus one shared column for the write's
+argument 0 and a per-row same-tick reachability boolean. Both new facts are
+per-row, never folds over the edge, which is what keeps the rule single-anchor).
 Run
 `cargo test --test catalogue -- --nocapture` for the full blocked-entry report. What still blocks,
 in decreasing leverage: prop, provider-value and setter-argument positions carry no expression

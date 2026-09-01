@@ -59,8 +59,9 @@ pub fn collect_setter_calls_with_extra(
             .entry(k.clone())
             .or_insert_with(|| Arc::clone(v));
     }
-    let mut found: Found = HashMap::new();
+    let mut found: Found = Vec::new();
     let empty = HashSet::new();
+    let certified = certified_fn_names(cfg, &fn_bindings);
     let mut walk = SetterWalk {
         setter_vars,
         fn_bindings: &fn_bindings,
@@ -68,17 +69,19 @@ pub fn collect_setter_calls_with_extra(
         root: cfg as *const CFG as usize,
         effect_body: false,
         shadowed: &empty,
+        certified_fns: &certified,
     };
     walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None);
     // Collapse to the historical one-row-per-var shape, preferring the sync
-    // row: its block id serves dominance, where any other class records
-    // `None`.
+    // site: its block id serves dominance, where any other class records
+    // `None`. The walk itself no longer collapses, so this is the one place
+    // the old granularity still exists — and the only consumer that wants it.
+    found.sort_by_key(|s| s.class); // WalkClass derives Ord with Sync first
     let mut by_var: HashMap<Var, (Option<SourceRange>, Option<BlockId>)> = HashMap::new();
-    let mut keys: Vec<(Var, WalkClass)> = found.keys().cloned().collect();
-    keys.sort(); // WalkClass derives Ord with Sync first
-    for key in keys {
-        let (span, block_id, _) = found[&key];
-        by_var.entry(key.0).or_insert((span, block_id));
+    for site in &found {
+        by_var
+            .entry(site.var.clone())
+            .or_insert((site.span, site.block_id));
     }
     by_var
         .into_iter()
@@ -99,35 +102,61 @@ pub(crate) struct WriteSite {
     pub span: Option<SourceRange>,
     pub class: WalkClass,
     pub prov_block: Option<BlockId>,
+    /// The block the call sits in; `Some` only for `Sync` sites.
+    pub block_id: Option<BlockId>,
+    pub updater: Updater,
 }
 
-/// Every write site in `cfg`, WITHOUT the per-var collapse: one row per
-/// (setter variable, phase class), each with a witness span. The slot-writer
-/// relation needs the distinct rows when a setter is called in several ways.
+/// Every write site in `cfg`, one row per call site — no collapse of any
+/// kind. The slot-writer relation needs the distinct rows: a slot written
+/// twice in one body is a different fact from a slot written once.
+///
+/// `outer_fns` carries function bindings certified in an enclosing scope — a
+/// handler body is extracted out of the render CFG, so a `set(inc)` whose
+/// `inc` was defined in render is invisible to a walk of the body alone. A
+/// name the walked body binds itself drops out of the set, fail-closed, the
+/// same device as `shadowed`.
 pub(crate) fn collect_write_sites(
     cfg: &CFG,
     setter_vars: &HashSet<Var>,
     max_depth: usize,
     effect_body: bool,
     shadowed: &HashSet<Var>,
+    outer_fns: &HashMap<Var, Arc<CFG>>,
 ) -> Vec<WriteSite> {
-    let mut found: Found = HashMap::new();
+    let mut found: Found = Vec::new();
+    let mut fn_bindings = collect_fn_bindings(cfg);
+    let mut certified = certified_fn_names(cfg, &fn_bindings);
+    let mut local_binders: HashSet<Var> = HashSet::new();
+    collect_binders(cfg, &mut local_binders);
+    for (v, body) in outer_fns {
+        if local_binders.contains(v) {
+            continue;
+        }
+        fn_bindings
+            .entry(v.clone())
+            .or_insert_with(|| Arc::clone(body));
+        certified.insert(v.clone());
+    }
     let mut walk = SetterWalk {
         setter_vars,
-        fn_bindings: &collect_fn_bindings(cfg),
+        fn_bindings: &fn_bindings,
         walking: HashSet::new(),
         root: cfg as *const CFG as usize,
         effect_body,
         shadowed,
+        certified_fns: &certified,
     };
     walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None);
     found
         .into_iter()
-        .map(|((var, class), (span, _, prov_block))| WriteSite {
-            var,
-            span,
-            class,
-            prov_block,
+        .map(|s| WriteSite {
+            var: s.var,
+            span: s.span,
+            class: s.class,
+            prov_block: s.prov_block,
+            block_id: s.block_id,
+            updater: s.updater,
         })
         .collect()
 }
@@ -206,6 +235,16 @@ pub(crate) fn cross_component_setters(
 }
 
 /// Scan all Let stmts in `cfg` for `let X = FnLit{...}` and return X → body_cfg.
+/// The subset of `bindings` whose name is bound exactly once, to a function
+/// literal, and never re-bound — [`crate::ir::bindings::fn_binding_in`]'s bar.
+fn certified_fn_names(cfg: &CFG, bindings: &HashMap<Var, Arc<CFG>>) -> HashSet<Var> {
+    bindings
+        .keys()
+        .filter(|v| crate::ir::bindings::fn_binding_in(v, cfg).is_some())
+        .cloned()
+        .collect()
+}
+
 pub(crate) fn collect_fn_bindings(cfg: &CFG) -> HashMap<Var, Arc<CFG>> {
     let mut map: HashMap<Var, Arc<CFG>> = HashMap::new();
     for block in cfg.blocks.values() {
@@ -445,10 +484,41 @@ pub enum WriterPhase {
     Unknown,
 }
 
-/// One writer of a state slot. Granularity: one row per (region,
-/// alias-resolved setter variable, phase class), each with a witness span
-/// — two same-var calls in one body collapse to one row, two bodies (or a
-/// sync and a deferred call) never do.
+/// Argument 0 of a write, classified where the walk still has it.
+///
+/// One column, deliberately: the functional/non-functional classifier and the
+/// body-purity classifier are two questions about the same expression, and
+/// recording it twice would put two bespoke passes on one walk site — the
+/// thing ADR-027 §4's one-relation rule exists to prevent.
+#[derive(Debug, Clone)]
+pub enum Updater {
+    /// Proven a function literal: an inline `set(prev => …)`, or a variable
+    /// bound exactly once to one and never re-bound. The body is kept for the
+    /// consumers that need to look inside it.
+    Functional(Arc<CFG>),
+    /// ⊤ — everything else: a value expression, a call, an argument the walk
+    /// could not resolve to a literal, or no argument at all. Only a *proven*
+    /// function literal escapes this, so a rule keyed on "not functional"
+    /// over-reports rather than missing a write.
+    Unknown,
+}
+
+impl Updater {
+    pub fn is_functional(&self) -> bool {
+        matches!(self, Updater::Functional(_))
+    }
+}
+
+/// One writer of a state slot, one row **per call site**.
+///
+/// The granularity used to be one row per (region, alias-resolved setter
+/// variable, phase class), collapsing two `setCount(count + 1)` calls in one
+/// body into a single row. That is reversed here, and the reversal is the
+/// point: the canonical stale-read shape is *two* non-functional writes of one
+/// slot in one handler, and a relation that cannot say there are two cannot
+/// express it. Multiplying rows is monotone — same slots, same phases, more
+/// witnesses — and every shipped consumer of the stored relation reads it
+/// existentially, so nothing that matched before stops matching (ADR-028 §2).
 #[derive(Debug, Clone)]
 pub struct SlotWriter {
     pub slot: HookLabel,
@@ -462,6 +532,20 @@ pub struct SlotWriter {
     /// Whether the write is caller-authored or reached through inlined
     /// wrappers (ADR-027 §4).
     pub via: WriteProvenance,
+    /// Argument 0 of this write.
+    pub updater: Updater,
+    /// MAY: another write of the same slot in this region is CFG-reachable
+    /// from this one, so the two can land in the same tick — self-reachability
+    /// through a back edge included, which is how a single write inside a loop
+    /// pairs with itself.
+    ///
+    /// A per-row boolean, never a fold over the edge: precomputing it here is
+    /// what keeps a Tier-A rule about co-executing writes single-anchor and
+    /// existential, the same move that dissolved the effect+handler join in
+    /// ADR-027 §1. It is may-typed in one direction only — the walk is
+    /// depth-capped, so a write it never saw cannot make this `false` a
+    /// promise, which is why no guard may assert the negative.
+    pub same_tick: bool,
 }
 
 /// Provenance of one write site (ADR-027 §4).
@@ -538,6 +622,28 @@ impl InlineRegions {
     }
 }
 
+/// Is any block of `targets` reachable from `from` along at least one edge?
+///
+/// The BFS starts at `from`'s successors rather than at `from`, so a block
+/// reaches itself only through a genuine cycle — which is exactly the case
+/// worth reporting: a single write inside a loop does co-execute with itself.
+fn reaches_any(cfg: &CFG, from: BlockId, targets: &[BlockId]) -> bool {
+    let mut seen: HashSet<BlockId> = HashSet::new();
+    let mut queue: VecDeque<BlockId> = cfg.successors(from).into_iter().collect();
+    seen.extend(queue.iter().copied());
+    while let Some(b) = queue.pop_front() {
+        if targets.contains(&b) {
+            return true;
+        }
+        for succ in cfg.successors(b) {
+            if seen.insert(succ) {
+                queue.push_back(succ);
+            }
+        }
+    }
+    false
+}
+
 fn class_phase(class: WalkClass, region: WriterRegion) -> WriterPhase {
     match class {
         WalkClass::Sync => region.sync_phase(),
@@ -586,6 +692,17 @@ pub(crate) fn collect_slot_writers(
             .map(|p| &p.origin_hook)
     };
 
+    // Render-scope function bindings that clear the single-binding bar across
+    // every body below — the same certificate a consumer needs before it may
+    // treat a name as the function it was bound to (ADR-023 §3, #103).
+    let hook_bodies: Vec<&CFG> = hooks.iter().filter_map(|h| h.body_cfg()).collect();
+    let outer_fns: HashMap<Var, Arc<CFG>> = collect_fn_bindings(render_cfg)
+        .into_iter()
+        .filter(|(v, _)| {
+            crate::ir::bindings::certified_fn_binding(v, render_cfg, &hook_bodies).is_some()
+        })
+        .collect();
+
     let mut out: Vec<SlotWriter> = Vec::new();
     let push_sites = |region: WriterRegion, cfg: &CFG, out: &mut Vec<SlotWriter>| {
         let (cfg_key, hook_origin) = match region {
@@ -596,10 +713,35 @@ pub(crate) fn collect_slot_writers(
             | WriterRegion::Handler(l) => (Some(l), inlined_origin(l)),
         };
         let effect_body = matches!(region, WriterRegion::Effect(_));
-        for site in collect_write_sites(cfg, &setter_vars, 2, effect_body, &shadowed) {
+        let sites = collect_write_sites(cfg, &setter_vars, 2, effect_body, &shadowed, &outer_fns);
+        // Where every SYNC write of each slot sits in this region's CFG — the
+        // domain the same-tick reachability question ranges over. Only sync
+        // sites carry a block id, and only they can co-execute within a tick:
+        // a deferred or handler write is a separate turn by construction.
+        let mut sync_blocks: HashMap<HookLabel, Vec<BlockId>> = HashMap::new();
+        for s in &sites {
+            if s.class == WalkClass::Sync
+                && let (Some(&slot), Some(b)) = (labels.get(&s.var), s.block_id)
+            {
+                sync_blocks.entry(slot).or_default().push(b);
+            }
+        }
+        for site in sites {
             let Some(&slot) = labels.get(&site.var) else {
                 continue;
             };
+            let same_tick = match site.block_id {
+                Some(b) => {
+                    let blocks = sync_blocks.get(&slot).map_or(&[][..], Vec::as_slice);
+                    // Another write already in this very block, or one the
+                    // control flow can still reach — including this block
+                    // itself through a back edge, which is how a lone write
+                    // inside a loop co-executes with itself.
+                    blocks.iter().filter(|t| **t == b).count() > 1 || reaches_any(cfg, b, blocks)
+                }
+                None => false,
+            };
+            let updater = site.updater.clone();
             let via = {
                 let mut chain: Vec<Symbol> = hook_origin.into_iter().cloned().collect();
                 match site.prov_block {
@@ -613,6 +755,8 @@ pub(crate) fn collect_slot_writers(
                             region,
                             phase: class_phase(site.class, region),
                             via: WriteProvenance::Unknown,
+                            updater,
+                            same_tick,
                         });
                         continue;
                     }
@@ -637,6 +781,8 @@ pub(crate) fn collect_slot_writers(
                 region,
                 phase: class_phase(site.class, region),
                 via,
+                updater,
+                same_tick,
             });
         }
     };
@@ -702,6 +848,26 @@ struct SetterWalk<'a> {
     /// (fail-closed: `let setTimeout = …` anywhere in the component makes
     /// the bare name mean nothing).
     shadowed: &'a HashSet<Var>,
+    /// Names bound exactly once, to a function literal, in the walked root —
+    /// the bar a `set(fn)` argument must clear before it counts as a proven
+    /// functional updater. `collect_fn_bindings` is not that bar: it keeps the
+    /// last binding of a re-bound name.
+    certified_fns: &'a HashSet<Var>,
+}
+
+impl SetterWalk<'_> {
+    /// Argument 0 of a write, claimed `Functional` only when it is provably a
+    /// function literal.
+    fn updater_of(&self, args: &[Expr]) -> Updater {
+        match args.first().map(Expr::peel_ts) {
+            Some(Expr::FnLit { body_cfg, .. }) => Updater::Functional(Arc::clone(body_cfg)),
+            Some(Expr::Var(v)) if self.certified_fns.contains(v) => self
+                .fn_bindings
+                .get(v)
+                .map_or(Updater::Unknown, |b| Updater::Functional(Arc::clone(b))),
+            _ => Updater::Unknown,
+        }
+    }
 }
 
 /// The phase class a walk context assigns to writes found under it —
@@ -731,13 +897,35 @@ pub(crate) enum WalkClass {
     Unknown,
 }
 
-/// Keyed by (setter variable, phase class); the block id is `Some` only for
-/// `Sync` rows, where it is meaningful for dominance. The third element is
-/// the PROVENANCE block: the top-level block the walk descended from —
-/// meaningful for every row, since region membership is decided by where the
-/// code lexically sits (a nested callback defined inside a spliced wrapper
-/// belongs to the wrapper).
-type Found = HashMap<(Var, WalkClass), (Option<SourceRange>, Option<BlockId>, Option<BlockId>)>;
+/// One row per *call site*, in walk order.
+///
+/// This used to be a `HashMap<(Var, WalkClass), …>`, which collapsed two
+/// `setCount(count + 1)` calls in one body into a single row. That collapse
+/// was deliberate and documented, and it is what made the canonical stale-read
+/// shape — two non-functional writes of one slot in one handler — inexpressible:
+/// the relation could not say there were two. Per-site rows are a monotone
+/// refinement (more rows, same slots), and every shipped consumer of the stored
+/// relation is existential, so no query that matched before can stop matching.
+/// The one consumer that wants the old shape, `collect_setter_calls`, collapses
+/// explicitly at the end.
+type Found = Vec<FoundSite>;
+
+/// One raw call site the walk saw.
+struct FoundSite {
+    var: Var,
+    class: WalkClass,
+    span: Option<SourceRange>,
+    /// `Some` only for `Sync` rows, where it is meaningful for dominance and
+    /// for same-tick reachability.
+    block_id: Option<BlockId>,
+    /// The top-level block the walk descended from — meaningful for every row,
+    /// since region membership is decided by where the code lexically sits (a
+    /// nested callback defined inside a spliced wrapper belongs to the
+    /// wrapper).
+    prov_block: Option<BlockId>,
+    /// Argument 0 of the call, classified where the walk still has it.
+    updater: Updater,
+}
 
 /// Names that defer their function argument when they resolve to the bare
 /// host global (fail-closed: any local binding of the name disables the
@@ -903,9 +1091,14 @@ impl<'a> SetterWalk<'a> {
         if let Expr::Call { fn_, args } = expr {
             if let Expr::Var(name) = fn_.as_ref() {
                 if self.setter_vars.contains(name) {
-                    found
-                        .entry((name.clone(), mode))
-                        .or_insert((stmt_span, block_id, prov));
+                    found.push(FoundSite {
+                        var: name.clone(),
+                        class: mode,
+                        span: stmt_span,
+                        block_id,
+                        prov_block: prov,
+                        updater: self.updater_of(args),
+                    });
                 }
                 // B6: direct call to a locally-bound function — its body runs
                 // in the CURRENT mode, so sync-in-helper writes take this call
@@ -918,17 +1111,17 @@ impl<'a> SetterWalk<'a> {
                 {
                     let mut inner = Found::new();
                     self.cfg(body, depth - 1, &mut inner, WalkClass::Sync, prov);
-                    for ((var, inner_class), (span, _, _)) in inner {
+                    for site in inner {
                         // Inner rows' provenance is this call site: the local
                         // helper's definition is only reachable from code that
                         // shares its region (salted names stay region-local).
-                        if inner_class == WalkClass::Sync {
-                            found.entry((var, mode)).or_insert((span, block_id, prov));
-                        } else {
-                            found
-                                .entry((var, inner_class))
-                                .or_insert((span, None, prov));
-                        }
+                        let sync = site.class == WalkClass::Sync;
+                        found.push(FoundSite {
+                            class: if sync { mode } else { site.class },
+                            block_id: if sync { block_id } else { None },
+                            prov_block: prov,
+                            ..site
+                        });
                     }
                 }
             }

@@ -24,6 +24,7 @@ use crate::rules::{Rule, SetterCall};
 
 use super::entity::{
     ArgEntity, DepEntity, EntityCtx, EntityVal, HookRow, SetterEntity, cleanup_name, identity_name,
+    updater_name,
 };
 use super::schema::{EdgeName, ElseBehavior, SeverityPin};
 use super::validate::{
@@ -355,6 +356,18 @@ impl TierARule {
                     unreachable!("validated: `cleanup` reads an effect-hook anchor")
                 };
                 names.contains(&cleanup_name(e.cleanup(row))) != *negated
+            }
+            ResolvedGuard::Updater { of, names } => {
+                let EntityVal::Writer(w) = cand.entity_at(*of) else {
+                    unreachable!("validated: `updater` binds a writers row")
+                };
+                names.contains(&updater_name(&w.updater))
+            }
+            ResolvedGuard::SameTick { of } => {
+                let EntityVal::Writer(w) = cand.entity_at(*of) else {
+                    unreachable!("validated: `same_tick` binds a writers row")
+                };
+                w.same_tick
             }
             ResolvedGuard::Provenance {
                 of,
