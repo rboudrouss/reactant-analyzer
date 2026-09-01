@@ -38,9 +38,13 @@ export type Anchor = {
   "relation": "hook_calls";
 } | {
   "relation": "render_setter_calls";
+} | {
+  "relation": "hook_origins";
+} | {
+  "relation": "context_providers";
 };
 
-export type EdgeName = "deps" | "body_setter_calls" | "args";
+export type EdgeName = "deps" | "body_setter_calls" | "args" | "writers";
 
 /**
  * What happens to a finding whose must-guard did not certify: `keep` (the
@@ -94,6 +98,20 @@ export type Guard = {
   "one_of"?: PVal_Array_of_string | null;
   "prefix"?: PVal_string | null;
 } | {
+  "is"?: PVal_Array_of_IdentityName | null;
+  "kind": "identity";
+  "not"?: PVal_Array_of_IdentityName | null;
+  "of": string;
+} | {
+  "direct"?: PVal_boolean | null;
+  "kind": "provenance";
+  "of": string;
+  "through"?: PVal_Array_of_string | null;
+} | {
+  "includes": PVal_Array_of_PhaseName;
+  "kind": "writer_phases";
+  "of": string;
+} | {
   "equals"?: PVal_uint64 | null;
   "kind": "count";
   "less_than"?: PVal_uint64 | null;
@@ -120,11 +138,30 @@ export type Guard = {
   "kind": "must_hook_is_conditional";
   "of": string;
 } | {
+  "else"?: ElseBehavior;
+  "kind": "must_direct_write";
+  "of": string;
+} | {
   "guards": Guard[];
   "kind": "any_of";
 };
 
 export type HookKindFilter = "state" | "effect" | "memo" | "callback" | "ref" | "custom" | "handler";
+
+/**
+ * Total mirror of `ValueIdentity` (#71): what a provider's `value` hands
+ * consumers across renders. Two-valued on purpose — `fresh-every-render` is
+ * a proven fact, everything else is `unknown` (may side, never actionable).
+ */
+export type IdentityName = "fresh-every-render" | "unknown";
+
+export type PVal_Array_of_IdentityName = IdentityName[] | {
+  "$param": string;
+};
+
+export type PVal_Array_of_PhaseName = PhaseName[] | {
+  "$param": string;
+};
 
 export type PVal_Array_of_ReturnsName = ReturnsName[] | {
   "$param": string;
@@ -156,6 +193,11 @@ export interface ParamDecl {
 }
 
 export type ParamType = "number" | "string" | "boolean" | "string[]";
+
+/**
+ * Total mirror of `WriterPhase` (ADR-027 §1); ⊤ = `unknown`.
+ */
+export type PhaseName = "render" | "effect" | "memo" | "callback" | "handler" | "unknown" | "deferred" | "cleanup";
 
 /**
  * Total mirror of `ReturnsVerdict`.

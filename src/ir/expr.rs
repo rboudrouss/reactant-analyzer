@@ -234,6 +234,24 @@ impl Expr {
     ///
     /// `FnLit` bodies are CFGs, not child expressions: crossing the function
     /// boundary is a per-walker decision (see [`crate::ir::cfg::CFG::for_each_expr`]).
+    /// The `target.addEventListener("event", <FnLit>)` registration shape.
+    /// Returns the event name and the listener body. Shared between
+    /// `extract_subscriptions` (which reifies it as a `HookEntry::Handler`)
+    /// and the slot-writer walk (which skips the listener it would otherwise
+    /// double-count as a ⊤-phase nested write — ADR-027 §1). One predicate,
+    /// so the two sides cannot drift.
+    pub fn subscription_listener(&self) -> Option<(&str, &Arc<CFG>)> {
+        if let Expr::Call { fn_, args } = self
+            && let Expr::FieldAccess { field, .. } = fn_.as_ref()
+            && field == "addEventListener"
+            && let (Some(Expr::Lit(Prim::String(event))), Some(Expr::FnLit { body_cfg, .. })) =
+                (args.first(), args.get(1))
+        {
+            return Some((event, body_cfg));
+        }
+        None
+    }
+
     pub fn for_each_child<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
         match self {
             Expr::Lit(_)

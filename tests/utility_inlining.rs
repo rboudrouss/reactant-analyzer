@@ -178,23 +178,158 @@ fn cross_file_utility_inlines_via_caller_name_lookup() {
         }
         "#,
     );
-    let (mut components, mut hooks, mut utilities) = lower_file(&page);
     let helper = tmp.0.join("lib/helper.ts");
-    let (cs, hs, us) = lower_file(&helper);
-    components.extend(cs);
-    hooks.extend(hs);
-    utilities.extend(us);
-
-    assert!(
-        utilities.iter().any(|u| u.name == "bump"),
-        "bump should be lowered from helper.ts"
+    let lowered = reactant::resolver::lower_files(
+        &[page, helper],
+        &reactant::resolver::DefaultImportResolver::default(),
     );
+    assert!(
+        lowered.parse_errors.is_empty(),
+        "{:?}",
+        lowered.parse_errors
+    );
+    assert!(
+        lowered
+            .utility_imports
+            .iter()
+            .any(|((_, local), (_, exported))| local == "bump" && exported == "bump"),
+        "the import edge must be recorded: {:?}",
+        lowered.utility_imports
+    );
+    let result = reactant::resolver::analyze_lowered(
+        lowered,
+        RootStrategy::AllComponents,
+        Config::default(),
+    );
+    let comp = &result.components[&"Page".to_string()];
+    assert!(
+        comp.inline_origins
+            .iter()
+            .any(|o| o.from.ends_with("lib/helper.ts")),
+        "bump must inline through the resolved import (ADR-027 §3): {:?}",
+        comp.inline_origins
+    );
+}
 
-    // Pre-Phase-3 behaviour: bump(setC) would be opaque → setter call
-    // invisible to the engine. After splicing, the setter call shows up in
-    // the useEffect body. Smoke-check: analysis completes.
-    let result = analyze(components, hooks, utilities);
-    assert!(result.components.contains_key("Page"));
+/// ADR-027 §3: an ALIASED utility import resolves — `import {{ bump as b }}`
+/// used to stay opaque because resolution guessed by name only.
+#[test]
+fn aliased_utility_import_inlines() {
+    let tmp = Tmp::new("aliased");
+    tmp.write(
+        "lib/helper.ts",
+        "export function bump(setter) { setter(1); }\n",
+    );
+    let page = tmp.write(
+        "Page.tsx",
+        r#"
+        import { bump as b } from './lib/helper';
+        import { useState, useEffect } from 'react';
+        function Page() {
+            const [c, setC] = useState(0);
+            useEffect(() => { b(setC); }, []);
+            return <div>{c}</div>;
+        }
+        "#,
+    );
+    let lowered = reactant::resolver::lower_files(
+        &[page, tmp.0.join("lib/helper.ts")],
+        &reactant::resolver::DefaultImportResolver::default(),
+    );
+    let result = reactant::resolver::analyze_lowered(
+        lowered,
+        RootStrategy::AllComponents,
+        Config::default(),
+    );
+    let comp = &result.components[&"Page".to_string()];
+    assert!(
+        comp.inline_origins
+            .iter()
+            .any(|o| o.from.ends_with("lib/helper.ts")),
+        "the aliased import must inline: {:?}",
+        comp.inline_origins
+    );
+    // The spliced `setter#salt = setC` alias makes the write visible: the
+    // slot-writer relation sees an effect-phase write of `c`.
+    assert!(
+        comp.slot_writers
+            .iter()
+            .any(|w| matches!(w.region, reactant::engine::WriterRegion::Effect(_))),
+        "{:?}",
+        comp.slot_writers
+    );
+}
+
+/// ADR-027 §3: a cross-file name collision resolves to the file the caller
+/// IMPORTS, never to the first file in sort order.
+#[test]
+fn colliding_utility_names_resolve_to_the_imported_file() {
+    let tmp = Tmp::new("collision");
+    // "aaa.ts" sorts before "zzz.ts" — the old first-match guess would pick it.
+    tmp.write("aaa.ts", "export function tag(setter) { }\n");
+    tmp.write("zzz.ts", "export function tag(setter) { setter(1); }\n");
+    let page = tmp.write(
+        "Page.tsx",
+        r#"
+        import { tag } from './zzz';
+        import { useState, useEffect } from 'react';
+        function Page() {
+            const [c, setC] = useState(0);
+            useEffect(() => { tag(setC); }, []);
+            return <div>{c}</div>;
+        }
+        "#,
+    );
+    let lowered = reactant::resolver::lower_files(
+        &[page, tmp.0.join("aaa.ts"), tmp.0.join("zzz.ts")],
+        &reactant::resolver::DefaultImportResolver::default(),
+    );
+    let result = reactant::resolver::analyze_lowered(
+        lowered,
+        RootStrategy::AllComponents,
+        Config::default(),
+    );
+    let comp = &result.components[&"Page".to_string()];
+    let origins: Vec<_> = comp.inline_origins.iter().map(|o| &o.from).collect();
+    assert!(
+        origins.iter().any(|f| f.ends_with("zzz.ts"))
+            && !origins.iter().any(|f| f.ends_with("aaa.ts")),
+        "must splice the imported zzz.ts body: {origins:?}"
+    );
+}
+
+/// ADR-027 §3, fail-closed: a utility defined in another analyzed file but
+/// NOT imported stays opaque — never a by-name guess.
+#[test]
+fn unimported_cross_file_utility_stays_opaque() {
+    let tmp = Tmp::new("opaque");
+    tmp.write("other.ts", "export function bump(setter) { setter(1); }\n");
+    let page = tmp.write(
+        "Page.tsx",
+        r#"
+        import { useState, useEffect } from 'react';
+        function Page() {
+            const [c, setC] = useState(0);
+            useEffect(() => { bump(setC); }, []);
+            return <div>{c}</div>;
+        }
+        "#,
+    );
+    let lowered = reactant::resolver::lower_files(
+        &[page, tmp.0.join("other.ts")],
+        &reactant::resolver::DefaultImportResolver::default(),
+    );
+    let result = reactant::resolver::analyze_lowered(
+        lowered,
+        RootStrategy::AllComponents,
+        Config::default(),
+    );
+    let comp = &result.components[&"Page".to_string()];
+    assert!(
+        comp.inline_origins.is_empty(),
+        "an unimported bare name must not splice a foreign body: {:?}",
+        comp.inline_origins
+    );
 }
 
 #[test]

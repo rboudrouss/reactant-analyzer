@@ -260,3 +260,69 @@ fn banned_hook_is_opt_in_and_matches_the_resolved_name() {
         .expect("configured ban must fire");
     assert!(d.message.contains("useLegacyStore"), "{}", d.message);
 }
+
+/// The #6 repro (ADR-027 §7): passing the DEFINING file alongside the
+/// consumer used to silence `banned-hook`, because `expand_custom_hooks`
+/// removed the `kind: custom` row the old anchor bound. The `hook_origins`
+/// anchor reads the provenance relation, which survives expansion — the ban
+/// must fire either way.
+#[test]
+fn banned_hook_fires_even_when_the_defining_file_is_analyzed() {
+    use reactant::engine::RootStrategy;
+    use reactant::resolver::{DefaultImportResolver, analyze_lowered, lower_files};
+
+    let dir = std::env::temp_dir().join(format!("reactant-banned-hook-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("hooks.ts"),
+        "import { useState } from \"react\";\n\
+         export function useLegacyStore() {\n  const [v] = useState(0);\n  return v;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("App.tsx"),
+        "import { useLegacyStore } from \"./hooks\";\n\
+         export function App() {\n  const store = useLegacyStore();\n  return <div>{store}</div>;\n}\n",
+    )
+    .unwrap();
+
+    let lowered = lower_files(
+        &[dir.join("hooks.ts"), dir.join("App.tsx")],
+        &DefaultImportResolver::default(),
+    );
+    assert!(
+        lowered.parse_errors.is_empty(),
+        "{:?}",
+        lowered.parse_errors
+    );
+    let prog = analyze_lowered(lowered, RootStrategy::AllComponents, Config::default());
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let mut opts = serde_json::Map::new();
+    opts.insert("banned".into(), serde_json::json!(["useLegacyStore"]));
+    let mut options = Options::new();
+    options.insert("guardrails/banned-hook".into(), opts);
+    let pack = load_pack(GUARDRAILS, &options).expect("the shipped pack must load");
+
+    let fired: Vec<Diagnostic> = prog
+        .components
+        .keys()
+        .flat_map(|name| {
+            let ctx = RuleCtx::new(&prog, name);
+            pack.rules
+                .iter()
+                .flat_map(|r| r.rule.check(&ctx))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let d = fired
+        .iter()
+        .find(|d| d.rule == "guardrails/banned-hook")
+        .expect("the ban must fire even though the engine resolved the hook (#6)");
+    assert!(d.message.contains("useLegacyStore"), "{}", d.message);
+    assert!(
+        d.range.is_some(),
+        "a provenance-anchored finding must carry the call-site range (ADR-027 §7)"
+    );
+}

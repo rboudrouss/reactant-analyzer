@@ -32,6 +32,13 @@ pub struct HookProvenance {
     /// `false` = written in the component itself; `true` = reached through an
     /// inlined custom hook.
     pub inlined: bool,
+    /// Call-site span, pointing into the file the row was lowered from (for
+    /// an inlined row, the custom hook's own file — ADR-024 renders the
+    /// origin). Provenance-anchored findings need it because the row's label
+    /// can dangle: `expand_custom_hooks` keeps the wrapper call's direct row
+    /// but splices its `HookEntry` away, so there is no `hook_calls` row left
+    /// to join back to for a `SourceRange` (ADR-027 §7).
+    pub span: Option<SourceRange>,
 }
 
 #[derive(Debug, Clone)]

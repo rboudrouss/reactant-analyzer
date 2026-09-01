@@ -171,6 +171,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 
     // Provenance of every splice below (ADR-019) — ends up on the result.
     let mut inline_origins: Vec<crate::engine::InlineOrigin> = Vec::new();
+    // Spliced-callee block ranges per CFG (ADR-027 §4): what decides whether
+    // a write site is caller-authored or wrapper-mediated.
+    let mut inline_regions = crate::engine::setters::InlineRegions::default();
     // Monotonic salt shared by every splice in this component so alpha-renamed
     // callee locals (`name#salt`) never collide across utility and hook splices.
     let mut splice_salt: u32 = 0;
@@ -184,6 +187,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         &comp_file,
         config.max_inline_depth,
         &mut inline_origins,
+        &mut inline_regions,
         &mut splice_salt,
     ) && let Some(inter) = inter
     {
@@ -201,6 +205,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         &mut render_cfg,
         inter,
         &mut inline_origins,
+        &mut inline_regions,
         &mut splice_salt,
     );
 
@@ -564,6 +569,12 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     let hook_calls = collect_hook_calls(&hooks, &render_cfg);
     let effect_info = collect_effect_info(&hooks);
     let handler_info = collect_handler_info(&hooks);
+    let slot_writers = crate::engine::setters::collect_slot_writers(
+        &render_cfg,
+        &hooks,
+        &inline_regions,
+        &hook_provenance,
+    );
     let hooks_clone = hooks.clone();
 
     AnalysisResult {
@@ -587,6 +598,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         render_cfg,
         hooks: hooks_clone,
         hook_provenance,
+        slot_writers,
         iterations: iteration,
         heap,
     }
@@ -708,6 +720,7 @@ fn expand_custom_hooks(
     render_cfg: &mut CFG,
     inter: Option<&InterCtx<'_>>,
     origins: &mut Vec<crate::engine::InlineOrigin>,
+    regions: &mut crate::engine::setters::InlineRegions,
     salt: &mut u32,
 ) {
     let Some(inter) = inter else { return };
@@ -826,7 +839,7 @@ fn expand_custom_hooks(
         // destructuring rebind (the return is now actually bound).
         let body = remap_cfg(hook_ir.body_cfg.clone(), offset);
         if let Some((block_id, stmt_idx, bound_var)) = find_hook_marker(render_cfg, custom_label) {
-            crate::ir::splice_callee_into_cfg(
+            let range = crate::ir::splice_callee_into_cfg(
                 render_cfg,
                 block_id,
                 stmt_idx,
@@ -838,10 +851,32 @@ fn expand_custom_hooks(
                     rename: &rename,
                 },
             );
+            // Provenance region (ADR-027 §4): the hook's render-level
+            // statements now live in these blocks — a setter call in them is
+            // wrapper-mediated, chained to whatever region the call site
+            // itself sat in.
+            // (A bailed splice grafts nothing — nothing to record.)
+            if let Some(r) = range {
+                let parent = regions
+                    .render
+                    .iter()
+                    .position(|reg| reg.start <= block_id && block_id < reg.end);
+                regions.render.push(crate::engine::setters::InlineRegion {
+                    start: r.start,
+                    end: r.end,
+                    name: name.clone(),
+                    from: hook_ir.file.clone(),
+                    parent,
+                });
+            }
         } else {
             // Defensive: no marker in the render CFG (should not happen for a
             // lowered call). Graft the renamed body's entry stmts so nothing is
             // dropped, preserving the pre-Thème-1 behavior for this rare case.
+            // The graft lands in pre-existing blocks, outside every
+            // recordable range — poison render-CFG provenance so no write
+            // there can claim `Direct` (ADR-027 §4, fail-closed).
+            regions.render_poisoned = true;
             let body = crate::ir::rename_vars_cfg(body, &rename);
             let param_lets: Vec<Stmt> = hook_ir
                 .params
@@ -1300,6 +1335,7 @@ struct InlineCtx<'a> {
 
 /// Returns `true` when the splice budget cut a utility call off anywhere in the
 /// component — the caller records that as an `analysis-limit`.
+#[allow(clippy::too_many_arguments)]
 fn expand_utility_calls(
     render_cfg: &mut CFG,
     hooks: &mut [HookEntry],
@@ -1307,6 +1343,7 @@ fn expand_utility_calls(
     caller_file: &std::path::Path,
     max_depth: usize,
     origins: &mut Vec<crate::engine::InlineOrigin>,
+    regions: &mut crate::engine::setters::InlineRegions,
     salt: &mut u32,
 ) -> bool {
     if registry.is_empty() {
@@ -1320,14 +1357,28 @@ fn expand_utility_calls(
         salt,
         truncated: false,
     };
-    inline_in_cfg(render_cfg, &mut ctx, &mut HashSet::new());
+    inline_in_cfg(
+        render_cfg,
+        &mut ctx,
+        &mut regions.render,
+        &mut HashSet::new(),
+    );
     for hook in hooks.iter_mut() {
         match hook {
-            HookEntry::Effect { body_cfg, .. }
-            | HookEntry::Memo { body_cfg, .. }
-            | HookEntry::Callback { body_cfg, .. }
-            | HookEntry::Handler { body_cfg, .. } => {
-                inline_in_cfg(body_cfg, &mut ctx, &mut HashSet::new());
+            HookEntry::Effect {
+                label, body_cfg, ..
+            }
+            | HookEntry::Memo {
+                label, body_cfg, ..
+            }
+            | HookEntry::Callback {
+                label, body_cfg, ..
+            }
+            | HookEntry::Handler {
+                label, body_cfg, ..
+            } => {
+                let body_regions = regions.bodies.entry(*label).or_default();
+                inline_in_cfg(body_cfg, &mut ctx, body_regions, &mut HashSet::new());
             }
             _ => {}
         }
@@ -1342,10 +1393,15 @@ fn expand_utility_calls(
 ///
 /// `max_depth` caps the total number of splices into one CFG so a single
 /// inlining never explodes the IR even with deep utility chains.
-fn inline_in_cfg(cfg: &mut CFG, ctx: &mut InlineCtx<'_>, expanding: &mut HashSet<String>) {
+fn inline_in_cfg(
+    cfg: &mut CFG,
+    ctx: &mut InlineCtx<'_>,
+    regions: &mut Vec<crate::engine::setters::InlineRegion>,
+    expanding: &mut HashSet<String>,
+) {
     let mut budget = ctx.max_depth;
     loop {
-        let target = find_inlining_target(cfg, ctx.registry, ctx.caller_file, expanding);
+        let target = find_inlining_target(cfg, ctx.registry, ctx.caller_file, regions, expanding);
         if budget == 0 {
             // Exhausting the budget leaves the remaining calls opaque (⊤) —
             // sound, but a truncation, and one that measurably happens (20 CFGs
@@ -1358,26 +1414,37 @@ fn inline_in_cfg(cfg: &mut CFG, ctx: &mut InlineCtx<'_>, expanding: &mut HashSet
         let Some((block_id, stmt_idx, name)) = target else {
             break;
         };
-        // Provenance (ADR-019): record what was spliced and where it lives,
-        // before the splice consumes the call statement.
-        if let Some(util) = resolve_utility(ctx.registry, ctx.caller_file, &name) {
-            ctx.origins.push(crate::engine::InlineOrigin {
-                name: name.clone(),
-                from: util.file.clone(),
-                kind: crate::engine::InlineKind::Utility,
-            });
-        }
         // Mark before splicing so a self-recursive call inside the spliced
         // body is skipped on the next scan.
-        expanding.insert(name);
-        splice_one_call(
-            cfg,
-            block_id,
-            stmt_idx,
-            ctx.registry,
-            ctx.caller_file,
-            ctx.salt,
-        );
+        expanding.insert(name.clone());
+        // Provenance (ADR-019 origins, ADR-027 §4 regions): recorded as an
+        // explicit pair with the splice, only when it actually happened —
+        // the old push-before-splice let an early-returning splice desync
+        // salts from origins.
+        let res_file = regions
+            .iter()
+            .find(|r| r.start <= block_id && block_id < r.end)
+            .map(|r| r.from.clone())
+            .unwrap_or_else(|| ctx.caller_file.to_path_buf());
+        if let Some((range, exported, from)) =
+            splice_one_call(cfg, block_id, stmt_idx, ctx.registry, &res_file, ctx.salt)
+        {
+            ctx.origins.push(crate::engine::InlineOrigin {
+                name: name.clone(),
+                from: from.clone(),
+                kind: crate::engine::InlineKind::Utility,
+            });
+            let parent = regions
+                .iter()
+                .position(|r| r.start <= block_id && block_id < r.end);
+            regions.push(crate::engine::setters::InlineRegion {
+                start: range.start,
+                end: range.end,
+                name: exported,
+                from,
+                parent,
+            });
+        }
         budget -= 1;
     }
 }
@@ -1386,19 +1453,25 @@ fn find_inlining_target(
     cfg: &CFG,
     registry: &FunctionRegistry,
     caller_file: &std::path::Path,
+    regions: &[crate::engine::setters::InlineRegion],
     expanding: &HashSet<String>,
 ) -> Option<(BlockId, usize, String)> {
     for (&bid, block) in &cfg.blocks {
+        // A statement inside a spliced region came from the wrapper's file:
+        // its bare calls resolve through THAT file's definitions and imports
+        // (ADR-027 §3-§4) — `putState → helper` chains where the component
+        // never imported `helper`.
+        let res_file = regions
+            .iter()
+            .find(|r| r.start <= bid && bid < r.end)
+            .map(|r| r.from.as_path())
+            .unwrap_or(caller_file);
         for (idx, stmt) in block.stmts.iter().enumerate() {
             if let Some(name) = utility_call_target(stmt) {
                 if expanding.contains(&name) {
                     continue;
                 }
-                if registry
-                    .get(&(caller_file.to_path_buf(), name.clone()))
-                    .is_some()
-                    || registry.get_by_name(&name).is_some()
-                {
+                if registry.resolve(res_file, &name).is_some() {
                     return Some((bid, idx, name));
                 }
             }
@@ -1429,15 +1502,15 @@ fn utility_call_target(stmt: &Stmt) -> Option<String> {
     }
 }
 
-/// Resolve `name` to a [`FunctionIR`], preferring `(caller_file, name)`.
+/// Resolve `name` to a [`FunctionIR`] — the fail-closed import-aware lookup
+/// (ADR-027 §3): own file, else the caller's resolved import edge, else
+/// opaque. Never a by-name guess across files.
 fn resolve_utility<'a>(
     registry: &'a FunctionRegistry,
     caller_file: &std::path::Path,
     name: &str,
 ) -> Option<&'a crate::ir::FunctionIR> {
-    registry
-        .get(&(caller_file.to_path_buf(), name.to_string()))
-        .or_else(|| registry.get_by_name(&name.to_string()))
+    registry.resolve(caller_file, name)
 }
 
 /// Splice a single utility call at `(block_id, stmt_idx)` into `cfg`, via the
@@ -1452,32 +1525,30 @@ fn splice_one_call(
     registry: &FunctionRegistry,
     caller_file: &std::path::Path,
     salt: &mut u32,
-) {
+) -> Option<(
+    std::ops::Range<BlockId>,
+    crate::ir::types::Symbol,
+    std::path::PathBuf,
+)> {
     let call_stmt = cfg.blocks[&block_id].stmts[stmt_idx].clone();
     let (bound_var, call_args) = match &call_stmt {
         Stmt::Let { var, rhs, .. } => match strip_ts_annot(rhs) {
             Expr::Call { args, .. } => (Some(var.clone()), args.clone()),
-            _ => return,
+            _ => return None,
         },
         Stmt::ExprStmt(expr, _) => match strip_ts_annot(expr) {
             Expr::Call { args, .. } => (None, args.clone()),
-            _ => return,
+            _ => return None,
         },
-        _ => return,
+        _ => return None,
     };
-    let name = match utility_call_target(&call_stmt) {
-        Some(n) => n,
-        None => return,
-    };
-    let utility = match resolve_utility(registry, caller_file, &name) {
-        Some(u) => u.clone(),
-        None => return,
-    };
+    let name = utility_call_target(&call_stmt)?;
+    let utility = resolve_utility(registry, caller_file, &name)?.clone();
 
     let s = *salt;
     *salt += 1;
     let rename = crate::ir::callee_rename_map(&utility.body_cfg, &utility.params, s);
-    crate::ir::splice_callee_into_cfg(
+    let range = crate::ir::splice_callee_into_cfg(
         cfg,
         block_id,
         stmt_idx,
@@ -1488,7 +1559,10 @@ fn splice_one_call(
             bound_var: bound_var.as_ref(),
             rename: &rename,
         },
-    );
+    )?;
+    // The EXPORTED name (`utility.name`), not the local callee: an aliased
+    // import must chain under the identity a team's rule names (ADR-027 §3).
+    Some((range, utility.name, utility.file))
 }
 
 fn strip_ts_annot(expr: &Expr) -> &Expr {

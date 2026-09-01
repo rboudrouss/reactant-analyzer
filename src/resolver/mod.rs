@@ -206,6 +206,11 @@ pub struct LoweredProgram {
     /// Per-file directive prologue and resolved import edges (ADR-026 §1).
     /// Moved into the analysis result by [`analyze_lowered`].
     pub module_table: ModuleTable,
+    /// Utility import edges (ADR-027 §3): `(importing file, local name) →
+    /// (defining file, exported name)` for every resolved import that points
+    /// at a lowered utility. Consumed by
+    /// [`crate::engine::FunctionRegistry::from_functions_and_imports`].
+    pub utility_imports: Vec<((PathBuf, String), (PathBuf, String))>,
 }
 
 /// Parse and lower an explicit list of files with the given `ImportResolver`.
@@ -236,6 +241,7 @@ pub fn lower_files_with(
         parse_errors: Vec::new(),
         file_table: FileTable::default(),
         module_table: ModuleTable::default(),
+        utility_imports: Vec::new(),
     };
     // Per-file context bindings and resolved imports, for the cross-file pass
     // below: a context is only provable once every file has been scanned.
@@ -312,7 +318,36 @@ pub fn lower_files_with(
     }
 
     resolve_imported_contexts(&mut lowered, &contexts, &file_imports);
+    resolve_imported_utilities(&mut lowered, &file_imports);
     lowered
+}
+
+/// Record the import edges that point at lowered utilities (ADR-027 §3), so
+/// `FunctionRegistry::resolve` can answer `(caller file, local name)` for an
+/// imported — possibly aliased — utility. One level, like every other
+/// cross-file resolution (#49).
+fn resolve_imported_utilities(
+    lowered: &mut LoweredProgram,
+    file_imports: &[(PathBuf, HashMap<String, ResolvedImport>)],
+) {
+    let defined: HashSet<(&PathBuf, &String)> = lowered
+        .utilities
+        .iter()
+        .map(|f| (&f.file, &f.name))
+        .collect();
+    for (file, imports) in file_imports {
+        for (local, origin) in imports {
+            if defined.contains(&(&origin.file, &origin.imported)) {
+                lowered.utility_imports.push((
+                    (file.clone(), local.clone()),
+                    (origin.file.clone(), origin.imported.clone()),
+                ));
+            }
+        }
+    }
+    // HashMap iteration order is seed-dependent; the registry map is
+    // order-insensitive but the stored Vec should not be.
+    lowered.utility_imports.sort();
 }
 
 /// Mark a context imported from another analyzed file as a context *here*.
@@ -372,7 +407,8 @@ pub fn analyze_lowered(
     strategy: RootStrategy,
     mut config: Config,
 ) -> ProgramAnalysisResult {
-    config.function_registry = FunctionRegistry::from_functions(lowered.utilities);
+    config.function_registry =
+        FunctionRegistry::from_functions_and_imports(lowered.utilities, lowered.utility_imports);
     let registry = ComponentRegistry::from_components(lowered.components);
     let hook_registry = HookRegistry::from_hooks(lowered.hooks);
     let mut result = analyze_program(registry, hook_registry, strategy, &config);

@@ -14,19 +14,21 @@ use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
 use crate::domains::StateValue;
-use crate::engine::{AnalysisResult, EffectInfo, HookCallInfo, HookKind};
+use crate::engine::setters::WriteProvenance;
+use crate::engine::{AnalysisResult, EffectInfo, HookCallInfo, HookKind, SlotWriter, WriterPhase};
 use crate::ir::SourceRange;
 use crate::ir::expr::Expr;
 use crate::ir::free_vars::{AccessPath, dep_paths};
-use crate::ir::hooks::HookEntry;
+use crate::ir::hooks::{HookEntry, HookProvenance};
 use crate::ir::types::{BlockId, HookLabel, Var};
 use crate::rules::api::query::{Certified, ConditionalHookCall, ExitDominance, RuleCtx};
+use crate::rules::helpers::providers::{ProviderSite, ValueIdentity, collect_provider_sites};
 use crate::rules::{
     ReturnsVerdict, SetterCall, StabilityVerdict, all_setter_labels, collect_setter_calls,
     hook_kind_word, hook_val_labels, resolve_setter_aliases, state_val_labels,
 };
 
-use super::schema::{HookKindFilter, ReturnsName, StabilityName};
+use super::schema::{HookKindFilter, PhaseName, ReturnsName, StabilityName};
 use super::validate::Field;
 
 // ── Entities ──────────────────────────────────────────────────────────────────
@@ -68,6 +70,12 @@ pub(crate) enum EntityVal<'a, 'b> {
     Setter(&'b SetterEntity),
     Dep(&'b DepEntity<'a>),
     Arg(&'b ArgEntity),
+    /// One `hook_origins` row (ADR-027 §7).
+    Origin(&'a HookProvenance),
+    /// One writer of a state slot (ADR-027 §1).
+    Writer(&'a SlotWriter),
+    /// One proven context-provider element (#71).
+    Provider(&'b ProviderSite<'a>),
 }
 
 // ── Per-component index ───────────────────────────────────────────────────────
@@ -142,7 +150,32 @@ impl<'a> EntityCtx<'a> {
         ))
     }
 
+    /// `hook_origins` rows in label order (labels are unique after the
+    /// offset merge; the origin name breaks ties defensively so the order
+    /// stays total either way).
+    pub fn origin_rows(&self) -> Vec<&'a HookProvenance> {
+        let mut rows: Vec<&'a HookProvenance> = self.comp.hook_provenance.iter().collect();
+        rows.sort_by(|a, b| (a.label, &a.origin_hook).cmp(&(b.label, &b.origin_hook)));
+        rows
+    }
+
+    /// `context_providers` rows: every proven provider element in the render
+    /// body, deterministic order (the relation sorts by site).
+    pub fn provider_rows(&self) -> Vec<ProviderSite<'a>> {
+        collect_provider_sites(self.comp)
+    }
+
     // ── Edges ─────────────────────────────────────────────────────────────────
+
+    /// `writers`: the anchor slot's rows of the slot-writer relation, in the
+    /// relation's (already deterministic) order.
+    pub fn writers(&self, row: &HookRow<'a>) -> Vec<&'a SlotWriter> {
+        self.comp
+            .slot_writers
+            .iter()
+            .filter(|w| w.slot == row.info.label)
+            .collect()
+    }
 
     /// `body_setter_calls`: setter calls in the anchor's body CFG.
     pub fn body_setters(&self, row: &HookRow<'a>) -> Vec<SetterEntity> {
@@ -236,6 +269,16 @@ impl<'a> EntityCtx<'a> {
         verdict_name(&self.ctx.stability_verdict(dep.expr))
     }
 
+    /// `writer_phases includes` (ADR-027 §1): does some write of `label` MAY
+    /// run in one of the named phases? A ⊤ row satisfies every query.
+    pub fn writer_phase_includes(&self, label: HookLabel, names: &[PhaseName]) -> bool {
+        self.comp
+            .slot_writers
+            .iter()
+            .filter(|w| w.slot == label)
+            .any(|w| w.phase == WriterPhase::Unknown || names.contains(&phase_name(w.phase)))
+    }
+
     /// Returns-verdict of a call-site argument (⊤-total, ADR-023 §3).
     pub fn arg_verdict(&self, arg: &ArgEntity) -> ReturnsName {
         returns_name(self.ctx.returns_verdict(arg.label, arg.index))
@@ -256,7 +299,12 @@ impl<'a> EntityCtx<'a> {
         match field {
             Field::Kind => match v {
                 EntityVal::Hook(h) => Some(hook_kind_word(h.info.kind).to_string()),
-                EntityVal::Setter(_) | EntityVal::Dep(_) | EntityVal::Arg(_) => None,
+                EntityVal::Setter(_)
+                | EntityVal::Dep(_)
+                | EntityVal::Arg(_)
+                | EntityVal::Origin(_)
+                | EntityVal::Writer(_)
+                | EntityVal::Provider(_) => None,
             },
             Field::Name => match v {
                 // A custom hook is called by its own name; every other kind is
@@ -267,7 +315,15 @@ impl<'a> EntityCtx<'a> {
                     }
                     _ => self.binding_name(h.info.label),
                 },
-                EntityVal::Setter(_) | EntityVal::Dep(_) | EntityVal::Arg(_) => None,
+                // The origin hook's own name — the resolved identity, never a
+                // binding variable (there may be none: the row survives
+                // inlining). A provider's name is its context binding.
+                EntityVal::Origin(p) => Some(p.origin_hook.clone()),
+                EntityVal::Provider(p) => Some(crate::ir::source_name(p.context).to_string()),
+                EntityVal::Setter(_)
+                | EntityVal::Dep(_)
+                | EntityVal::Arg(_)
+                | EntityVal::Writer(_) => None,
             },
             // The import specifier, and only that: `resolved_file` is an
             // absolute path, so printing or matching it would make a pack's
@@ -277,27 +333,101 @@ impl<'a> EntityCtx<'a> {
                     Some(HookEntry::Custom { import_source, .. }) => import_source.clone(),
                     _ => None,
                 },
-                EntityVal::Setter(_) | EntityVal::Dep(_) | EntityVal::Arg(_) => None,
+                EntityVal::Origin(p) => p.specifier.clone(),
+                EntityVal::Setter(_)
+                | EntityVal::Dep(_)
+                | EntityVal::Arg(_)
+                | EntityVal::Writer(_)
+                | EntityVal::Provider(_) => None,
             },
             Field::Slot => match v {
                 EntityVal::Setter(s) => s.slot.and_then(|l| self.slot_source_name(l)),
-                EntityVal::Hook(_) | EntityVal::Dep(_) | EntityVal::Arg(_) => None,
+                EntityVal::Writer(w) => self.slot_source_name(w.slot),
+                EntityVal::Hook(_)
+                | EntityVal::Dep(_)
+                | EntityVal::Arg(_)
+                | EntityVal::Origin(_)
+                | EntityVal::Provider(_) => None,
             },
             Field::Setter => match v {
                 EntityVal::Setter(s) => Some(crate::ir::source_name(&s.var).to_string()),
-                EntityVal::Hook(_) | EntityVal::Dep(_) | EntityVal::Arg(_) => None,
+                EntityVal::Writer(w) => Some(crate::ir::source_name(&w.setter).to_string()),
+                EntityVal::Hook(_)
+                | EntityVal::Dep(_)
+                | EntityVal::Arg(_)
+                | EntityVal::Origin(_)
+                | EntityVal::Provider(_) => None,
             },
             Field::Path => match v {
                 EntityVal::Dep(d) => d.path.as_ref().map(|p| p.to_string()),
-                EntityVal::Hook(_) | EntityVal::Setter(_) | EntityVal::Arg(_) => None,
+                EntityVal::Hook(_)
+                | EntityVal::Setter(_)
+                | EntityVal::Arg(_)
+                | EntityVal::Origin(_)
+                | EntityVal::Writer(_)
+                | EntityVal::Provider(_) => None,
             },
             Field::Stability => match v {
                 EntityVal::Dep(d) => Some(verdict_word(self.dep_verdict(d)).to_string()),
-                EntityVal::Hook(_) | EntityVal::Setter(_) | EntityVal::Arg(_) => None,
+                EntityVal::Hook(_)
+                | EntityVal::Setter(_)
+                | EntityVal::Arg(_)
+                | EntityVal::Origin(_)
+                | EntityVal::Writer(_)
+                | EntityVal::Provider(_) => None,
             },
             Field::Returns => match v {
                 EntityVal::Arg(a) => Some(returns_word(self.arg_verdict(a)).to_string()),
-                EntityVal::Hook(_) | EntityVal::Setter(_) | EntityVal::Dep(_) => None,
+                EntityVal::Hook(_)
+                | EntityVal::Setter(_)
+                | EntityVal::Dep(_)
+                | EntityVal::Origin(_)
+                | EntityVal::Writer(_)
+                | EntityVal::Provider(_) => None,
+            },
+            Field::Region => match v {
+                EntityVal::Writer(w) => Some(w.region.word().to_string()),
+                EntityVal::Hook(_)
+                | EntityVal::Setter(_)
+                | EntityVal::Dep(_)
+                | EntityVal::Arg(_)
+                | EntityVal::Origin(_)
+                | EntityVal::Provider(_) => None,
+            },
+            Field::Phase => match v {
+                EntityVal::Writer(w) => Some(phase_word(w.phase).to_string()),
+                EntityVal::Hook(_)
+                | EntityVal::Setter(_)
+                | EntityVal::Dep(_)
+                | EntityVal::Arg(_)
+                | EntityVal::Origin(_)
+                | EntityVal::Provider(_) => None,
+            },
+            Field::Via => match v {
+                EntityVal::Writer(w) => Some(match &w.via {
+                    WriteProvenance::Direct => "direct".to_string(),
+                    WriteProvenance::Via(chain) => chain
+                        .iter()
+                        .map(|n| crate::ir::source_name(n).to_string())
+                        .collect::<Vec<_>>()
+                        .join(" → "),
+                    WriteProvenance::Unknown => "unknown".to_string(),
+                }),
+                EntityVal::Hook(_)
+                | EntityVal::Setter(_)
+                | EntityVal::Dep(_)
+                | EntityVal::Arg(_)
+                | EntityVal::Origin(_)
+                | EntityVal::Provider(_) => None,
+            },
+            Field::Identity => match v {
+                EntityVal::Provider(p) => Some(identity_word(p.identity).to_string()),
+                EntityVal::Hook(_)
+                | EntityVal::Setter(_)
+                | EntityVal::Dep(_)
+                | EntityVal::Arg(_)
+                | EntityVal::Origin(_)
+                | EntityVal::Writer(_) => None,
             },
         }
     }
@@ -310,7 +440,13 @@ impl<'a> EntityCtx<'a> {
             // A missing specifier is not an anonymous entity — it is a hook
             // whose origin we do not know.
             Field::Source => raw.unwrap_or_else(|| "unknown".to_string()),
-            Field::Kind | Field::Stability | Field::Returns => raw.unwrap_or_else(|| anonymous(v)),
+            Field::Kind
+            | Field::Stability
+            | Field::Returns
+            | Field::Region
+            | Field::Phase
+            | Field::Via
+            | Field::Identity => raw.unwrap_or_else(|| anonymous(v)),
             // Source identifiers are quoted, verdict words are not.
             Field::Name | Field::Slot | Field::Setter | Field::Path => match raw {
                 Some(s) => format!("`{s}`"),
@@ -359,6 +495,9 @@ fn anonymous(v: &EntityVal<'_, '_>) -> String {
         },
         EntityVal::Dep(d) => format!("dep #{}", d.index),
         EntityVal::Arg(a) => format!("argument #{}", a.index),
+        EntityVal::Origin(p) => format!("`{}`", p.origin_hook),
+        EntityVal::Writer(w) => format!("`{}`", crate::ir::source_name(&w.setter)),
+        EntityVal::Provider(p) => format!("`{}.Provider`", crate::ir::source_name(p.context)),
     }
 }
 
@@ -371,6 +510,50 @@ fn pick_name(names: &HashMap<Var, HookLabel>, label: HookLabel) -> Option<String
         .map(|(var, _)| var)
         .min()
         .map(|var| crate::ir::source_name(var).to_string())
+}
+
+/// `WriterPhase` → schema name (total — a new phase is a compile error here).
+pub(crate) fn phase_name(p: WriterPhase) -> PhaseName {
+    match p {
+        WriterPhase::Render => PhaseName::Render,
+        WriterPhase::Effect => PhaseName::Effect,
+        WriterPhase::Memo => PhaseName::Memo,
+        WriterPhase::Callback => PhaseName::Callback,
+        WriterPhase::Handler => PhaseName::Handler,
+        WriterPhase::Deferred => PhaseName::Deferred,
+        WriterPhase::Cleanup => PhaseName::Cleanup,
+        WriterPhase::Unknown => PhaseName::Unknown,
+    }
+}
+
+/// `ValueIdentity` → schema name (total).
+pub(crate) fn identity_name(i: ValueIdentity) -> super::schema::IdentityName {
+    match i {
+        ValueIdentity::FreshEveryRender => super::schema::IdentityName::FreshEveryRender,
+        ValueIdentity::Unknown => super::schema::IdentityName::Unknown,
+    }
+}
+
+/// The word `{anchor.identity}` renders.
+fn identity_word(i: ValueIdentity) -> &'static str {
+    match i {
+        ValueIdentity::FreshEveryRender => "fresh-every-render",
+        ValueIdentity::Unknown => "unknown",
+    }
+}
+
+/// The word `{w.phase}` renders.
+fn phase_word(p: WriterPhase) -> &'static str {
+    match p {
+        WriterPhase::Render => "render",
+        WriterPhase::Effect => "effect",
+        WriterPhase::Memo => "memo",
+        WriterPhase::Callback => "callback",
+        WriterPhase::Handler => "handler",
+        WriterPhase::Deferred => "deferred",
+        WriterPhase::Cleanup => "cleanup",
+        WriterPhase::Unknown => "unknown",
+    }
 }
 
 fn kind_matches(kind: HookKind, filter: HookKindFilter) -> bool {

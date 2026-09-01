@@ -125,6 +125,9 @@ chemins (`must_*` = certifié), émettre le finding.
 |----------|------------------------|
 | `hook_calls` | Chaque appel de hook du composant, y compris ceux atteints via des hooks custom inlinés cross-file. Filtre optionnel `"kind"` : `state`, `effect`, `memo`, `callback`, `ref`, `custom`, `handler`. |
 | `render_setter_calls` | Chaque appel de setter dans le corps du render, résolu à travers les alias. |
+| `hook_origins` | Chaque ligne de provenance : tout appel de hook dont l'identité est résolue, **y compris** ceux que l'inlining a dissous. C'est l'ancre des règles d'identité (bannir un hook, imposer un wrapper) : contrairement à `hook_calls` + `kind: "custom"`, elle voit aussi les hooks que le moteur a résolus. Sans `kind`, sans arête ; `name` = nom d'origine du hook, `source` = spécificateur d'import brut. |
+
+| `context_providers` | Chaque élément `<Ctx.Provider value={…}>` du corps du render dont `Ctx` est un `createContext` prouvé au niveau module (#71). Render-only par sémantique (un provider construit dans un `useMemo` garde son identité). `name` = le binding du contexte, `identity` = le verdict d'identité de la value. Sans `kind`, sans arête. |
 
 Il n'y a volontairement aucune ancre syntaxique (pas de « tout appel de
 fonction », pas de pattern AST) : une règle inexprimable sémantiquement est
@@ -139,6 +142,7 @@ Au plus une arête, un binding. Pas de jointure entre deux ancres libres.
 | `deps` | effect / memo / callback | Les entrées déclarées du deps array. |
 | `body_setter_calls` | effect (et hooks à corps) | Les appels de setters dans le corps, résolus via alias. |
 | `args` | hook `custom` | Les arguments du site d'appel (admet le guard `returns`, pas `stability`). |
+| `writers` | hook `state` | Les écrivains du slot de l'ancre : une ligne par (région, variable setter résolue par alias, sync vs imbriqué), wrappers splicés compris. `{w.region}` = le corps lexical (exact) ; `{w.phase}` = verdict MAY (`unknown` = peut tourner dans n'importe quelle phase). |
 
 ### Les guards
 
@@ -154,8 +158,11 @@ Guards filtrants (le finding reste plafonné Warning) :
 | `returns` | Ce que *retourne* un argument-fonction d'un hook custom (un sélecteur de store qui retourne une référence fraîche vs un primitif). | Exactement un de `is` / `not`, parmi `stable`, `fresh-reference`, `unknown`. |
 | `origin` | Provenance d'un appel de hook : identité résolue (`useLayoutEffect` même atteint via un alias) et/ou appel direct dans le composant vs via un hook wrapper inliné. | Au moins un de `hook` (liste de noms) / `direct` (bool). Une ligne sans provenance échoue. |
 | `in_deps` | Le slot écrit par le setter figure dans les deps de l'ancre. | `negate` optionnel. |
-| `name` | Nom source de l'entité résolue : nom d'un hook custom, ou variable liée par un state/memo/callback/ref. | Exactement un de `one_of` (liste) / `prefix`. |
-| `source` | Spécificateur d'import d'un hook custom (`@chakra-ui/react`), pour bannir une dépendance entière. Un hook local ou importé relativement n'a pas de `source` : valeur absente, guard échoué. Jamais « passe par défaut ». | Exactement un de `one_of` / `prefix`. |
+| `identity` | Verdict d'identité de la value d'une ligne `context_providers` : `fresh-every-render` (référence neuve à chaque render, un must-fait) ou `unknown` (⊤, jamais actionnable). | Exactement un de `is` / `not`, liste non vide. |
+| `provenance` | Provenance d'une ligne `writers` : écriture directe (`direct`) ou atteinte via des wrappers inlinés nommés (`through`, matché n'importe où dans la chaîne, sur les noms EXPORTÉS — un import aliasé n'y échappe pas). Une ligne non plaçable échoue les deux formes. | Au moins un de `through` (liste) / `direct` (bool). |
+| `writer_phases` | Existentiel MAY sur les écrivains du slot d'une ancre `state` : passe si une écriture du slot *peut* tourner dans une des phases nommées. Une écriture ⊤ (`unknown`) satisfait toute requête — supprimer un finding sur un may-fait serait un faux négatif. Positif seulement, pas de forme niée. | `includes`, liste non vide parmi `render`, `effect`, `memo`, `callback`, `handler`, `deferred` (timer/microtask/continuation de promesse — prouvé hors de toute phase React), `cleanup` (fonction retournée d'un effect), `unknown`. |
+| `name` | Nom source de l'entité résolue : nom d'un hook custom, variable liée par un state/memo/callback/ref, ou — sur `hook_origins` — le nom d'origine du hook résolu. | Exactement un de `one_of` (liste) / `prefix`. |
+| `source` | Spécificateur d'import d'un hook custom ou d'une ligne `hook_origins` (`@chakra-ui/react`), pour bannir une dépendance entière. Un hook local ou importé relativement n'a pas de `source` : valeur absente, guard échoué. Jamais « passe par défaut ». | Exactement un de `one_of` / `prefix`. |
 | `count` | Cardinalité de `anchor.deps`. | Exactement un de `equals` / `more_than` / `less_than`. |
 | `deps_declared` | L'ancre déclare-t-elle un deps array du tout ? | `eq: true/false`. |
 | `any_of` | Disjonction : passe si au moins un des guards imbriqués passe. Seule façon d'écrire « X ou Y » sans dupliquer la règle. | `guards: [...]`. |
@@ -169,6 +176,7 @@ les chemins », le finding porte une preuve et peut atteindre Error.
 | `must_dominates_all_exits` | l'entité domine toutes les sorties. |
 | `must_init_calls_setter` | l'initialisation appelle le setter. |
 | `must_hook_is_conditional` | l'appel de hook est conditionnel. |
+| `must_direct_write` | la ligne `writers` visée est une écriture directe (hors de toute région splicée) — la preuve derrière une règle de politique « le state ne s'écrit qu'à travers notre wrapper » pinnée `error`. |
 
 Chaque `must_*` accepte `"else"` : `"keep"` (défaut, un finding non certifié
 survit en Warning) ou `"drop"` (le finding non certifié est abandonné, pour
@@ -226,6 +234,9 @@ option inconnue rejette le pack ou la config (exit 2) avec une erreur précise.
 | Entité | Champs |
 |--------|--------|
 | Appel de hook (ancre `hook_calls`) | `kind`, `name` (nom du hook custom, ou variable liée), `source` (spécificateur d'import, `unknown` si absent) |
+| Ligne de provenance (ancre `hook_origins`) | `name` (nom d'origine du hook), `source` (spécificateur d'import, `unknown` si absent) |
+| Provider (`context_providers`) | `name` (binding du contexte), `identity` (le verdict, en mots) |
+| Écrivain (`writers`) | `slot`, `setter`, `region` (corps lexical, exact), `phase` (verdict MAY, `unknown` = ⊤), `via` (chaîne de wrappers `outer → inner`, ou `direct` / `unknown`) |
 | Setter (`render_setter_calls`, `body_setter_calls`) | `slot` (le state écrit), `setter` (le nom du setter) |
 | Dep (`deps`) | `path`, `stability` (le verdict, en mots) |
 | Argument (`args`) | `returns` (le verdict, en mots) |

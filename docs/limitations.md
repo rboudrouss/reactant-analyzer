@@ -135,7 +135,13 @@ engine resolved, which silently disables the rules a team actually writes. It ou
 here.
 
 `tests/catalogue.rs` materializes the 21-rule catalogue and *proves* every expressible entry. The
-curve is **3/21 → 5/21** after ADR-023 steps 1–2. Run
+curve is **3/21 → 5/21** (ADR-023 steps 1–2) **→ 6/21** (ADR-027 §1: `writers` +
+`writer_phases` dissolve the effect+handler join without a second anchor)
+**→ 7/22** (2026-09-01, ADR-027 §4–§6: setter provenance + `must_direct_write`
+make wrapper-enforcement rules expressible; the catalogue is re-based to 22 —
+the new class joined WITH the vocabulary, so the /21 datapoints stay
+comparable) **→ 8/22** (the `context_providers` anchor + `identity` guard, #71).
+Run
 `cargo test --test catalogue -- --nocapture` for the full blocked-entry report. What still blocks,
 in decreasing leverage: prop, provider-value and setter-argument positions carry no expression
 verdict [#67](https://github.com/rboudrouss/reactant-analyzer/issues/67); Tier A is single-anchor, so cross-component

@@ -15,8 +15,8 @@ use std::collections::BTreeMap;
 use crate::rules::docs::rule_doc;
 
 use super::schema::{
-    Anchor, EdgeName, ElseBehavior, Guard, HookKindFilter, PVal, PackFile, ParamDecl, ParamType,
-    ReturnsName, RuleDef, SeverityPin, StabilityName,
+    Anchor, EdgeName, ElseBehavior, Guard, HookKindFilter, IdentityName, PVal, PackFile, ParamDecl,
+    ParamType, PhaseName, ReturnsName, RuleDef, SeverityPin, StabilityName,
 };
 
 /// A pack rejection: `path` is the JSON location (`rules[1].guards[0].of`),
@@ -70,6 +70,14 @@ pub(crate) enum Sort {
     Dep,
     /// One call-site argument of a custom-hook anchor.
     Arg,
+    /// One `hook_provenance` row (ADR-027 §7): a resolved hook identity.
+    /// Kind-less and edge-less by design — the row survives inlining, so
+    /// there may be no `hook_calls` row (and no body, no deps) behind it.
+    HookOrigin,
+    /// One writer of a state-hook anchor's slot (ADR-027 §1).
+    Writer,
+    /// One proven context-provider element (#71).
+    Provider,
 }
 
 impl Sort {
@@ -81,6 +89,9 @@ impl Sort {
             Sort::SetterBody => "a body setter call".into(),
             Sort::Dep => "a deps entry".into(),
             Sort::Arg => "a call-site argument".into(),
+            Sort::HookOrigin => "a resolved hook origin row".into(),
+            Sort::Writer => "a slot writer".into(),
+            Sort::Provider => "a context-provider element".into(),
         }
     }
 }
@@ -122,6 +133,7 @@ pub(crate) enum MustKind {
     DominatesAllExits,
     InitCallsSetter,
     HookIsConditional,
+    DirectWrite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +175,22 @@ pub(crate) enum ResolvedGuard {
         one_of: Option<Vec<String>>,
         prefix: Option<String>,
     },
+    /// MAY existential over the anchor slot's writers (ADR-027 §1).
+    WriterPhases {
+        includes: Vec<PhaseName>,
+    },
+    /// Identity verdict of a provider row's value (#71).
+    Identity {
+        of: BindRef,
+        names: Vec<IdentityName>,
+        negated: bool,
+    },
+    /// Write-provenance filter on a writer row (ADR-027 §4).
+    Provenance {
+        of: BindRef,
+        through: Option<Vec<String>>,
+        direct: Option<bool>,
+    },
     /// Cardinality of `anchor.deps`.
     Count(CountCmp),
     DepsDeclared {
@@ -199,6 +227,10 @@ pub(crate) enum Field {
     Path,
     Stability,
     Returns,
+    Region,
+    Phase,
+    Via,
+    Identity,
 }
 
 impl Field {
@@ -214,6 +246,10 @@ impl Field {
         Field::Path,
         Field::Stability,
         Field::Returns,
+        Field::Region,
+        Field::Phase,
+        Field::Via,
+        Field::Identity,
     ];
 
     /// The name authors write: `{anchor.<token>}`.
@@ -227,6 +263,10 @@ impl Field {
             Field::Path => "path",
             Field::Stability => "stability",
             Field::Returns => "returns",
+            Field::Region => "region",
+            Field::Phase => "phase",
+            Field::Via => "via",
+            Field::Identity => "identity",
         }
     }
 
@@ -236,7 +276,15 @@ impl Field {
         match self {
             Field::Kind => match sort {
                 Sort::Hook(_) => true,
-                Sort::SetterRender | Sort::SetterBody | Sort::Dep | Sort::Arg => false,
+                // A provenance row survives inlining precisely because it is
+                // not a modeled entry — it has no HookKind.
+                Sort::SetterRender
+                | Sort::SetterBody
+                | Sort::Dep
+                | Sort::Arg
+                | Sort::HookOrigin
+                | Sort::Writer
+                | Sort::Provider => false,
             },
             // Effects and handlers are the two kinds with nothing to call them;
             // an any-kind anchor is admitted and falls back per row.
@@ -250,29 +298,80 @@ impl Field {
                     | HookKindFilter::Custom => true,
                     HookKindFilter::Effect | HookKindFilter::Handler => false,
                 },
-                Sort::SetterRender | Sort::SetterBody | Sort::Dep | Sort::Arg => false,
+                // A provenance row's only identity is its resolved origin:
+                // `name` is the origin hook's name (`useLayoutEffect` even
+                // through an alias), never a binding variable. A provider's
+                // `name` is the context binding.
+                Sort::HookOrigin | Sort::Provider => true,
+                Sort::SetterRender | Sort::SetterBody | Sort::Dep | Sort::Arg | Sort::Writer => {
+                    false
+                }
             },
             // The import specifier is recorded on custom hook rows only.
             Field::Source => match sort {
                 Sort::Hook(Some(HookKindFilter::Custom)) => true,
-                Sort::Hook(_) | Sort::SetterRender | Sort::SetterBody | Sort::Dep | Sort::Arg => {
-                    false
-                }
+                // The raw import specifier, recorded for every resolved call —
+                // this closes the #6-noted blind spot where `source` was
+                // readable on unresolved customs only.
+                Sort::HookOrigin => true,
+                Sort::Hook(_)
+                | Sort::SetterRender
+                | Sort::SetterBody
+                | Sort::Dep
+                | Sort::Arg
+                | Sort::Writer
+                | Sort::Provider => false,
             },
+            // A writer row is setter-shaped: it names the slot it writes and
+            // the setter variable at the call site.
             Field::Slot | Field::Setter => match sort {
-                Sort::SetterRender | Sort::SetterBody => true,
-                Sort::Hook(_) | Sort::Dep | Sort::Arg => false,
+                Sort::SetterRender | Sort::SetterBody | Sort::Writer => true,
+                Sort::Hook(_) | Sort::Dep | Sort::Arg | Sort::HookOrigin | Sort::Provider => false,
             },
             // `stability` stays a deps-entry fact: reading it for a call-site
             // argument is the program-point error ADR-023 §2 refuses — this
             // table is where the refusal is enforced.
             Field::Path | Field::Stability => match sort {
                 Sort::Dep => true,
-                Sort::Hook(_) | Sort::SetterRender | Sort::SetterBody | Sort::Arg => false,
+                Sort::Hook(_)
+                | Sort::SetterRender
+                | Sort::SetterBody
+                | Sort::Arg
+                | Sort::HookOrigin
+                | Sort::Writer
+                | Sort::Provider => false,
             },
             Field::Returns => match sort {
                 Sort::Arg => true,
-                Sort::Hook(_) | Sort::SetterRender | Sort::SetterBody | Sort::Dep => false,
+                Sort::Hook(_)
+                | Sort::SetterRender
+                | Sort::SetterBody
+                | Sort::Dep
+                | Sort::HookOrigin
+                | Sort::Writer
+                | Sort::Provider => false,
+            },
+            // `region` is the lexical body (exact); `phase` the MAY verdict;
+            // `via` the wrapper chain (or `direct` / `unknown`).
+            Field::Region | Field::Phase | Field::Via => match sort {
+                Sort::Writer => true,
+                Sort::Hook(_)
+                | Sort::SetterRender
+                | Sort::SetterBody
+                | Sort::Dep
+                | Sort::Arg
+                | Sort::HookOrigin
+                | Sort::Provider => false,
+            },
+            Field::Identity => match sort {
+                Sort::Provider => true,
+                Sort::Hook(_)
+                | Sort::SetterRender
+                | Sort::SetterBody
+                | Sort::Dep
+                | Sort::Arg
+                | Sort::HookOrigin
+                | Sort::Writer => false,
             },
         }
     }
@@ -288,6 +387,8 @@ pub(crate) enum Segment {
 pub(crate) enum ResolvedAnchor {
     HookCalls(Option<HookKindFilter>),
     RenderSetterCalls,
+    HookOrigins,
+    ContextProviders,
 }
 
 /// A fully-typed, param-baked rule — the executor never sees `PVal` or raw
@@ -337,6 +438,9 @@ fn guard_allowed_keys(g: &Guard) -> (&'static str, &'static [&'static str]) {
         Guard::InDeps { .. } => ("guard `in_deps`", &["kind", "of", "negate"]),
         Guard::Name { .. } => ("guard `name`", &["kind", "of", "one_of", "prefix"]),
         Guard::Source { .. } => ("guard `source`", &["kind", "of", "one_of", "prefix"]),
+        Guard::WriterPhases { .. } => ("guard `writer_phases`", &["kind", "of", "includes"]),
+        Guard::Provenance { .. } => ("guard `provenance`", &["kind", "of", "through", "direct"]),
+        Guard::Identity { .. } => ("guard `identity`", &["kind", "of", "is", "not"]),
         Guard::Count { .. } => (
             "guard `count`",
             &["kind", "of", "more_than", "less_than", "equals"],
@@ -354,6 +458,7 @@ fn guard_allowed_keys(g: &Guard) -> (&'static str, &'static [&'static str]) {
         Guard::MustHookIsConditional { .. } => {
             ("guard `must_hook_is_conditional`", &["kind", "of", "else"])
         }
+        Guard::MustDirectWrite { .. } => ("guard `must_direct_write`", &["kind", "of", "else"]),
         Guard::AnyOf { .. } => ("guard `any_of`", &["kind", "guards"]),
     }
 }
@@ -552,7 +657,9 @@ fn validate_rule(
         &raw_rule["anchor"],
         match def.anchor {
             Anchor::HookCalls { .. } => &["relation", "kind"],
-            Anchor::RenderSetterCalls => &["relation"],
+            Anchor::RenderSetterCalls | Anchor::HookOrigins | Anchor::ContextProviders => {
+                &["relation"]
+            }
         },
         "this anchor",
         &format!("{path}.anchor"),
@@ -560,6 +667,8 @@ fn validate_rule(
     let (anchor, anchor_sort) = match &def.anchor {
         Anchor::HookCalls { kind } => (ResolvedAnchor::HookCalls(*kind), Sort::Hook(*kind)),
         Anchor::RenderSetterCalls => (ResolvedAnchor::RenderSetterCalls, Sort::SetterRender),
+        Anchor::HookOrigins => (ResolvedAnchor::HookOrigins, Sort::HookOrigin),
+        Anchor::ContextProviders => (ResolvedAnchor::ContextProviders, Sort::Provider),
     };
 
     // forEach: at most one typed edge, one binding (ADR-022 §2).
@@ -621,6 +730,19 @@ fn validate_rule(
                 }
                 Sort::Arg
             }
+            EdgeName::Writers => {
+                if !matches!(anchor_sort, Sort::Hook(Some(HookKindFilter::State))) {
+                    return Err(PackError::new(
+                        format!("{fe_path}.edge"),
+                        format!(
+                            "edge `writers` needs a state-hook anchor (the slot whose \
+                             writers it enumerates), but the anchor binds {}",
+                            anchor_sort.describe()
+                        ),
+                    ));
+                }
+                Sort::Writer
+            }
         };
         bound_sort = Some(element);
         bound_name = Some(fe.bind.as_str());
@@ -676,6 +798,28 @@ fn validate_rule(
                 .into(),
         });
     }
+    // #6 (ADR-027 §7): a `kind: "custom"` anchor binds only the hooks the
+    // engine could NOT resolve — expansion removes the row — so an identity
+    // rule written on it silently under-reports exactly when the analysis
+    // gets better. Warn only when the rule can actually move: no edge (origin
+    // rows are edge-less) and every guard expressible there — a rule that
+    // needs `args` has no better formulation, so the blindness is a recorded
+    // limitation for it, not an actionable warning.
+    if matches!(
+        anchor,
+        ResolvedAnchor::HookCalls(Some(HookKindFilter::Custom))
+    ) && def.for_each.is_none()
+        && !guards.is_empty()
+        && guards.iter().all(anchor_identity_guard)
+    {
+        warnings.push(LoadWarning {
+            rule: full_id.clone(),
+            message: "a `kind: \"custom\"` anchor only binds hooks the engine could not \
+                      resolve (#6) — identity rules belong on the `hook_origins` anchor, \
+                      which survives inlining"
+                .into(),
+        });
+    }
     // Unused params load fine, but the author probably meant something.
     let used = env.used.into_inner();
     for name in def.params.keys() {
@@ -695,6 +839,19 @@ fn validate_rule(
         guards,
         message,
     })
+}
+
+/// Does this guard (or any `any_of` branch of it) match the ANCHOR's
+/// identity (`name` / `source` / `origin`)? The trigger of the #6 warning.
+fn anchor_identity_guard(g: &ResolvedGuard) -> bool {
+    match g {
+        ResolvedGuard::Text { of, field, .. } => {
+            *of == BindRef::Anchor && matches!(field, Field::Name | Field::Source)
+        }
+        ResolvedGuard::Origin { of, .. } => *of == BindRef::Anchor,
+        ResolvedGuard::AnyOf(children) => children.iter().any(anchor_identity_guard),
+        _ => false,
+    }
 }
 
 /// Everything a guard is validated against: the anchor's sort, the `forEach`
@@ -794,7 +951,7 @@ fn validate_guard(
         }
         Guard::Origin { of, hook, direct } => {
             let (of, sort) = cx.resolve_of(of, g_path)?;
-            if !matches!(sort, Sort::Hook(_)) {
+            if !matches!(sort, Sort::Hook(_) | Sort::HookOrigin) {
                 return Err(PackError::new(
                     format!("{g_path}.of"),
                     format!(
@@ -865,6 +1022,104 @@ fn validate_guard(
         }
         Guard::Source { of, one_of, prefix } => {
             text_guard(Field::Source, of, one_of, prefix, cx, g_path)?
+        }
+        Guard::WriterPhases { of, includes } => {
+            let (of_ref, sort) = cx.resolve_of(of, g_path)?;
+            if of_ref != BindRef::Anchor || !matches!(sort, Sort::Hook(Some(HookKindFilter::State)))
+            {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    format!(
+                        "guard `writer_phases` reads the writers of a state-hook ANCHOR's \
+                         slot, but the subject binds {}",
+                        sort.describe()
+                    ),
+                ));
+            }
+            let includes = cx
+                .env
+                .resolve(includes, None, &format!("{g_path}.includes"))?;
+            if includes.is_empty() {
+                return Err(PackError::new(
+                    format!("{g_path}.includes"),
+                    "the phase list must not be empty",
+                ));
+            }
+            ResolvedGuard::WriterPhases { includes }
+        }
+        Guard::Identity { of, is, not } => {
+            let (of, sort) = cx.resolve_of(of, g_path)?;
+            if sort != Sort::Provider {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    format!(
+                        "guard `identity` applies to a context-provider element, but the \
+                         subject binds {}",
+                        sort.describe()
+                    ),
+                ));
+            }
+            let (names, negated) = match (is, not) {
+                (Some(pv), None) => (cx.env.resolve(pv, None, &format!("{g_path}.is"))?, false),
+                (None, Some(pv)) => (cx.env.resolve(pv, None, &format!("{g_path}.not"))?, true),
+                _ => {
+                    return Err(PackError::new(
+                        g_path,
+                        "guard `identity` takes exactly one of `is` / `not`",
+                    ));
+                }
+            };
+            if names.is_empty() {
+                return Err(PackError::new(g_path, "the verdict list must not be empty"));
+            }
+            ResolvedGuard::Identity { of, names, negated }
+        }
+        Guard::Provenance {
+            of,
+            through,
+            direct,
+        } => {
+            let (of, sort) = cx.resolve_of(of, g_path)?;
+            if sort != Sort::Writer {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    format!(
+                        "guard `provenance` applies to a `writers` row, but the subject \
+                         binds {}",
+                        sort.describe()
+                    ),
+                ));
+            }
+            let through = match through {
+                Some(pv) => Some(cx.env.resolve(
+                    pv,
+                    Some(ParamType::StringList),
+                    &format!("{g_path}.through"),
+                )?),
+                None => None,
+            };
+            let direct = match direct {
+                Some(pv) => Some(cx.env.resolve(
+                    pv,
+                    Some(ParamType::Boolean),
+                    &format!("{g_path}.direct"),
+                )?),
+                None => None,
+            };
+            if through.is_none() && direct.is_none() {
+                return Err(PackError::new(
+                    g_path,
+                    "guard `provenance` needs at least one of `through` / `direct`",
+                ));
+            }
+            if through.as_ref().is_some_and(|t| t.is_empty()) {
+                return Err(PackError::new(g_path, "the wrapper list must not be empty"));
+            }
+            ResolvedGuard::Provenance {
+                of,
+                through,
+                direct,
+            }
         }
         Guard::Count {
             of,
@@ -999,6 +1254,25 @@ fn validate_guard(
             ResolvedGuard::Must {
                 kind: MustKind::HookIsConditional,
                 of: of_ref,
+                els: *r#else,
+            }
+        }
+        Guard::MustDirectWrite { of, r#else } => {
+            let (of, sort) = cx.resolve_of(of, g_path)?;
+            if sort != Sort::Writer {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    format!(
+                        "guard `must_direct_write` applies to a `writers` row, but the \
+                         subject binds {}",
+                        sort.describe()
+                    ),
+                ));
+            }
+            *has_must = true;
+            ResolvedGuard::Must {
+                kind: MustKind::DirectWrite,
+                of,
                 els: *r#else,
             }
         }

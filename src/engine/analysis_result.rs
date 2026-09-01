@@ -181,6 +181,12 @@ pub struct AnalysisResult<D: AbstractDomain> {
     /// rule can tell a direct `useLayoutEffect` call from one reached through
     /// a wrapper. Empty for hand-built IR.
     pub hook_provenance: Vec<crate::ir::hooks::HookProvenance>,
+    /// The slot → writers relation (ADR-027 §1): one row per (region,
+    /// alias-resolved setter variable, sync-vs-nested) with a witness span,
+    /// `region` lexical-exact and `phase` a MAY verdict (⊤ = `Unknown`).
+    /// Computed once at convergence over the post-expansion CFGs. Empty for
+    /// hand-built IR.
+    pub slot_writers: Vec<crate::engine::setters::SlotWriter>,
     /// Number of outer fixpoint iterations before convergence.  Useful for
     /// --verbose output and for Info diagnostics about analysis depth.
     pub iterations: usize,

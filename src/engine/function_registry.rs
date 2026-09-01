@@ -1,7 +1,8 @@
 //! Registry of utility [`FunctionIR`]s, mirroring [`crate::engine::ComponentRegistry`] /
 //! [`crate::engine::HookRegistry`].
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crate::ir::{FunctionIR, types::Symbol};
 use crate::registry::KeyedRegistry;
@@ -10,7 +11,14 @@ use crate::registry::KeyedRegistry;
 pub type FunctionKey = (PathBuf, Symbol);
 
 #[derive(Debug, Default, Clone)]
-pub struct FunctionRegistry(KeyedRegistry<FunctionIR>);
+pub struct FunctionRegistry {
+    functions: KeyedRegistry<FunctionIR>,
+    /// Import edges: `(importing file, local name) → (defining file, exported
+    /// name)` — one level, resolved by the program's `ImportResolver` at
+    /// lowering (ADR-027 §3). What makes `import { putState as ps }` resolve
+    /// and a cross-file name collision resolve to the RIGHT file.
+    aliases: HashMap<FunctionKey, FunctionKey>,
+}
 
 impl FunctionRegistry {
     pub fn new() -> Self {
@@ -18,39 +26,64 @@ impl FunctionRegistry {
     }
 
     pub fn from_functions(functions: Vec<FunctionIR>) -> Self {
-        Self(KeyedRegistry::from_keyed(
-            functions
-                .into_iter()
-                .map(|f| ((f.file.clone(), f.name.clone()), f)),
-        ))
+        Self::from_functions_and_imports(functions, Vec::new())
+    }
+
+    /// Build from lowered definitions plus resolved import edges.
+    pub fn from_functions_and_imports(
+        functions: Vec<FunctionIR>,
+        imports: Vec<(FunctionKey, FunctionKey)>,
+    ) -> Self {
+        FunctionRegistry {
+            functions: KeyedRegistry::from_keyed(
+                functions
+                    .into_iter()
+                    .map(|f| ((f.file.clone(), f.name.clone()), f)),
+            ),
+            aliases: imports.into_iter().collect(),
+        }
     }
 
     pub fn get(&self, key: &FunctionKey) -> Option<&FunctionIR> {
-        self.0.get(key)
+        self.functions.get(key)
+    }
+
+    /// Resolve a bare callee name at a call site, fail-closed (ADR-027 §3):
+    /// a definition in the caller's own file, else the caller's resolved
+    /// import edge for that local name — never a by-name guess across files
+    /// (the first-match fallback silently spliced the wrong body on a name
+    /// collision, and an aliased import did not resolve at all).
+    pub fn resolve(&self, caller_file: &Path, name: &str) -> Option<&FunctionIR> {
+        let key = (caller_file.to_path_buf(), name.to_string());
+        self.functions.get(&key).or_else(|| {
+            self.aliases
+                .get(&key)
+                .and_then(|target| self.functions.get(target))
+        })
     }
 
     /// Legacy lookup by name only, returning the first match (sorted) when
-    /// the same name appears in multiple files. Used when no resolved import-file
-    /// is available at the call site.
+    /// the same name appears in multiple files. Test-support only — call-site
+    /// resolution goes through [`FunctionRegistry::resolve`].
     #[doc(hidden)]
     pub fn get_by_name(&self, name: &Symbol) -> Option<&FunctionIR> {
-        self.0.get_by_name(name)
+        self.functions.get_by_name(name)
     }
 
     pub fn contains(&self, key: &FunctionKey) -> bool {
-        self.0.contains(key)
+        self.functions.contains(key)
     }
 
     pub fn all_functions(&self) -> impl Iterator<Item = &FunctionIR> {
-        self.0.values()
+        self.functions.values()
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.functions.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.functions.is_empty()
     }
 }
 

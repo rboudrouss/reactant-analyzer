@@ -9,7 +9,11 @@ pub mod churn_graph;
 pub mod mount;
 pub mod providers;
 pub mod registrations;
-pub mod setters;
+/// Moved to the engine (ADR-027 §1): the slot-writer relation is computed at
+/// convergence and stored on `AnalysisResult`, so the collection/alias
+/// machinery lives below the rules layer. Re-exported here so rule-side
+/// paths keep reading `helpers::setters::*`.
+pub use crate::engine::setters;
 
 use std::collections::{HashMap, HashSet};
 

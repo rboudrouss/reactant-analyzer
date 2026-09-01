@@ -49,17 +49,15 @@ fn collect_subscriptions_in_expr(
     // `target.addEventListener("event", handlerFn)` in an effect body registers
     // a subscription → emit a Handler. Recurse into the receiver and any extra
     // args, but NOT arg[1] (the handler FnLit — extracted as the Handler's CFG).
-    if let Expr::Call { fn_, args } = expr
-        && let Expr::FieldAccess { field, .. } = fn_.as_ref()
-        && field == "addEventListener"
-        && let (Some(Expr::Lit(Prim::String(event_name))), Some(Expr::FnLit { body_cfg, .. })) =
-            (args.first(), args.get(1))
-    {
+    if let Some((event_name, body_cfg)) = expr.subscription_listener() {
+        let Expr::Call { fn_, args } = expr else {
+            unreachable!("subscription_listener only matches calls")
+        };
         let label = *next_label;
         *next_label += 1;
         out.push(HookEntry::Handler {
             label,
-            event: event_name.clone(),
+            event: event_name.to_string(),
             body_cfg: (**body_cfg).clone(),
             span: stmt_span,
         });
@@ -321,7 +319,7 @@ fn process_stmt(
 
                 let entry = make_hook_entry(&call, lbl, args, stmt_span);
                 let marker = hook_result_expr(&call, lbl, entry.as_ref());
-                provenance.push(call.provenance(lbl));
+                provenance.push(call.provenance(lbl, stmt_span));
                 if let Some(entry) = entry {
                     hooks.push(entry);
                 }
@@ -361,7 +359,7 @@ fn process_stmt(
                 *label += 1;
                 let entry = make_hook_entry(&call, lbl, args, stmt_span);
                 let marker = marker_val(entry.as_ref());
-                provenance.push(call.provenance(lbl));
+                provenance.push(call.provenance(lbl, stmt_span));
                 if let Some(entry) = entry {
                     hooks.push(entry);
                 }
@@ -419,7 +417,7 @@ pub struct ResolvedHookCall {
 }
 
 impl ResolvedHookCall {
-    fn provenance(&self, label: HookLabel) -> HookProvenance {
+    fn provenance(&self, label: HookLabel, span: Option<SourceRange>) -> HookProvenance {
         HookProvenance {
             label,
             origin_hook: self.origin_name.clone(),
@@ -427,6 +425,7 @@ impl ResolvedHookCall {
             specifier: self.specifier.clone(),
             file: self.resolved_file.clone(),
             inlined: false,
+            span,
         }
     }
 

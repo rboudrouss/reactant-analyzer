@@ -657,6 +657,39 @@ pub fn must_init_calls_setter(init: &Expr, setters: &HashSet<Var>) -> MustResult
     }
 }
 
+/// Evidence that a write site is caller-authored (ADR-027 §5): it sits
+/// outside every spliced region.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectWrite {
+    /// The setter variable at the site.
+    pub setter: crate::ir::types::Var,
+    pub slot: HookLabel,
+}
+
+/// `All` iff the writer row's provenance is [`WriteProvenance::Direct`]
+/// (ADR-027 §5). The certainty is per-row and structural: splice regions are
+/// recorded exhaustively at the single splice primitive
+/// (`splice_callee_into_cfg` returns the range, and every caller records the
+/// pair), and `Direct` is only assigned to a site whose provenance block
+/// lies outside all of them, in a CFG no defensive graft poisoned. The known
+/// blind spots — expression-position wrapper calls (#52), the splice budget
+/// (#54), utilities inside custom-hook bodies — remove ROWS from the
+/// relation (missed findings, compensated through the analysis-limit
+/// assurance channel); they never make a present row's `Direct` uncertain.
+/// `Via`/`Unknown` rows certify nothing.
+pub fn must_direct_write(w: &crate::engine::SlotWriter) -> MustResult<DirectWrite> {
+    match w.via {
+        crate::engine::setters::WriteProvenance::Direct => MustResult::All(Certified::mint(
+            DirectWrite {
+                setter: w.setter.clone(),
+                slot: w.slot,
+            },
+            Provenance::at(w.span, Some(w.slot)),
+        )),
+        _ => MustResult::None,
+    }
+}
+
 /// A state slot in an analyzed owner that provably moves: its setter is
 /// referenced in the owner, with the first provable write site when one is
 /// syntactically visible. The evidence carried by [`Motion::Proven`].

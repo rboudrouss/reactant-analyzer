@@ -17,16 +17,19 @@ use crate::ir::hooks::HookEntry;
 use crate::ir::types::HookLabel;
 use crate::rules::api::diagnostic::Diagnostic;
 use crate::rules::api::query::{
-    Certified, ConditionalHookCall, DominatesAllExits, InitSetterCall, MustResult, Provenance,
-    RuleCtx, must_init_calls_setter, must_setter_on_all_paths,
+    Certified, ConditionalHookCall, DirectWrite, DominatesAllExits, InitSetterCall, MustResult,
+    Provenance, RuleCtx, must_direct_write, must_init_calls_setter, must_setter_on_all_paths,
 };
 use crate::rules::{Rule, SetterCall};
 
-use super::entity::{ArgEntity, DepEntity, EntityCtx, EntityVal, HookRow, SetterEntity};
+use super::entity::{
+    ArgEntity, DepEntity, EntityCtx, EntityVal, HookRow, SetterEntity, identity_name,
+};
 use super::schema::{EdgeName, ElseBehavior, SeverityPin};
 use super::validate::{
     BindRef, CountCmp, MustKind, ResolvedAnchor, ResolvedGuard, ResolvedRule, Segment,
 };
+use crate::rules::helpers::providers::ProviderSite;
 
 pub(crate) struct TierARule {
     pub def: ResolvedRule,
@@ -40,6 +43,7 @@ enum Proof {
     Dominates(Certified<DominatesAllExits>),
     Init(Certified<InitSetterCall>),
     Conditional(Certified<ConditionalHookCall>),
+    Direct(Certified<DirectWrite>),
 }
 
 impl Proof {
@@ -49,6 +53,7 @@ impl Proof {
             Proof::Dominates(c) => c.provenance(),
             Proof::Init(c) => c.provenance(),
             Proof::Conditional(c) => c.provenance(),
+            Proof::Direct(c) => c.provenance(),
         }
     }
 }
@@ -58,6 +63,7 @@ enum Bound<'a, 'b> {
     Setter(&'b SetterEntity),
     Dep(&'b DepEntity<'a>),
     Arg(&'b ArgEntity),
+    Writer(&'a crate::engine::SlotWriter),
 }
 
 /// One candidate under evaluation: whatever the anchor bound, plus the
@@ -70,20 +76,24 @@ enum Candidate<'a, 'b> {
         bound: Option<Bound<'a, 'b>>,
     },
     RenderSetter(&'b SetterEntity),
+    /// One `hook_origins` row (ADR-027 §7) — edge-less by construction.
+    Origin(&'a crate::ir::hooks::HookProvenance),
+    /// One `context_providers` row (#71) — edge-less in v1.
+    Provider(&'b ProviderSite<'a>),
 }
 
 impl<'a, 'b> Candidate<'a, 'b> {
     fn row(&self) -> Option<&'b HookRow<'a>> {
         match self {
             Candidate::Hook { row, .. } => Some(row),
-            Candidate::RenderSetter(_) => None,
+            Candidate::RenderSetter(_) | Candidate::Origin(_) | Candidate::Provider(_) => None,
         }
     }
 
     fn bound(&self) -> Option<&Bound<'a, 'b>> {
         match self {
             Candidate::Hook { bound, .. } => bound.as_ref(),
-            Candidate::RenderSetter(_) => None,
+            Candidate::RenderSetter(_) | Candidate::Origin(_) | Candidate::Provider(_) => None,
         }
     }
 
@@ -92,10 +102,13 @@ impl<'a, 'b> Candidate<'a, 'b> {
         match (r, self) {
             (BindRef::Anchor, Candidate::Hook { row, .. }) => EntityVal::Hook(row),
             (BindRef::Anchor, Candidate::RenderSetter(s)) => EntityVal::Setter(s),
+            (BindRef::Anchor, Candidate::Origin(p)) => EntityVal::Origin(p),
+            (BindRef::Anchor, Candidate::Provider(p)) => EntityVal::Provider(p),
             (BindRef::Bound, _) => match self.bound().expect("validated: binding exists") {
                 Bound::Setter(s) => EntityVal::Setter(s),
                 Bound::Dep(d) => EntityVal::Dep(d),
                 Bound::Arg(a) => EntityVal::Arg(a),
+                Bound::Writer(w) => EntityVal::Writer(w),
             },
         }
     }
@@ -105,6 +118,8 @@ impl<'a, 'b> Candidate<'a, 'b> {
         match self {
             Candidate::Hook { row, .. } => Some(row.info.label),
             Candidate::RenderSetter(s) => s.slot,
+            Candidate::Origin(p) => Some(p.label),
+            Candidate::Provider(_) => None,
         }
     }
 
@@ -114,9 +129,15 @@ impl<'a, 'b> Candidate<'a, 'b> {
         match self {
             Candidate::Hook { row, bound } => match bound {
                 Some(Bound::Setter(s)) => s.span,
+                Some(Bound::Writer(w)) => w.span.or(row.info.span),
                 Some(Bound::Dep(_) | Bound::Arg(_)) | None => row.info.span,
             },
             Candidate::RenderSetter(s) => s.span,
+            // The provenance row's own call-site span: the label can dangle
+            // (an expanded wrapper keeps its direct row but loses its entry),
+            // so there is no `hook_calls` row to borrow a range from.
+            Candidate::Origin(p) => p.span,
+            Candidate::Provider(p) => p.span,
         }
     }
 }
@@ -169,6 +190,18 @@ impl Rule for TierARule {
                                 );
                             }
                         }
+                        Some(EdgeName::Writers) => {
+                            for writer in e.writers(&row) {
+                                self.eval(
+                                    &e,
+                                    &Candidate::Hook {
+                                        row: &row,
+                                        bound: Some(Bound::Writer(writer)),
+                                    },
+                                    &mut out,
+                                );
+                            }
+                        }
                         None => self.eval(
                             &e,
                             &Candidate::Hook {
@@ -183,6 +216,17 @@ impl Rule for TierARule {
             ResolvedAnchor::RenderSetterCalls => {
                 for setter in e.render_setters() {
                     self.eval(&e, &Candidate::RenderSetter(&setter), &mut out);
+                }
+            }
+            // Edge-less (validated): no forEach dispatch to do.
+            ResolvedAnchor::HookOrigins => {
+                for p in e.origin_rows() {
+                    self.eval(&e, &Candidate::Origin(p), &mut out);
+                }
+            }
+            ResolvedAnchor::ContextProviders => {
+                for site in e.provider_rows() {
+                    self.eval(&e, &Candidate::Provider(&site), &mut out);
                 }
             }
         }
@@ -229,23 +273,30 @@ impl TierARule {
         match guard {
             ResolvedGuard::Stability { names, negated, .. } => match cand.bound() {
                 Some(Bound::Dep(dep)) => names.contains(&e.dep_verdict(dep)) != *negated,
-                Some(Bound::Setter(_) | Bound::Arg(_)) | None => {
+                Some(Bound::Setter(_) | Bound::Arg(_) | Bound::Writer(_)) | None => {
                     unreachable!("validated: `stability` binds a deps entry")
                 }
             },
             ResolvedGuard::Returns { names, negated, .. } => match cand.bound() {
                 Some(Bound::Arg(arg)) => names.contains(&e.arg_verdict(arg)) != *negated,
-                Some(Bound::Setter(_) | Bound::Dep(_)) | None => {
+                Some(Bound::Setter(_) | Bound::Dep(_) | Bound::Writer(_)) | None => {
                     unreachable!("validated: `returns` binds a call-site argument")
                 }
             },
             ResolvedGuard::Origin { hook, direct, .. } => {
-                // Validated: the subject is a hook-call row, which only the
-                // anchor can bind in v1. Positive-only: no provenance row ⇒ fail.
-                let Some(row) = cand.row() else {
-                    unreachable!("validated: `origin` binds a hook-call row")
+                // Validated: the subject is a hook-call or hook-origin row,
+                // which only the anchor can bind in v1. Positive-only: no
+                // provenance row ⇒ fail.
+                let prov = match cand {
+                    Candidate::Origin(p) => Some(*p),
+                    _ => {
+                        let Some(row) = cand.row() else {
+                            unreachable!("validated: `origin` binds a hook-call row")
+                        };
+                        e.provenance(row.info.label)
+                    }
                 };
-                match e.provenance(row.info.label) {
+                match prov {
                     Some(p) => {
                         hook.as_ref()
                             .is_none_or(|names| names.iter().any(|n| n == p.origin_hook.as_str()))
@@ -269,6 +320,42 @@ impl TierARule {
                 one_of,
                 prefix,
             } => text_matches(e.field_raw(&cand.entity_at(*of), *field), one_of, prefix),
+            ResolvedGuard::Identity { of, names, negated } => {
+                let EntityVal::Provider(p) = cand.entity_at(*of) else {
+                    unreachable!("validated: `identity` binds a provider element")
+                };
+                names.contains(&identity_name(p.identity)) != *negated
+            }
+            ResolvedGuard::Provenance {
+                of,
+                through,
+                direct,
+            } => {
+                let EntityVal::Writer(w) = cand.entity_at(*of) else {
+                    unreachable!("validated: `provenance` binds a writers row")
+                };
+                use crate::engine::setters::WriteProvenance;
+                // Conjunction of the given fields; an unplaceable site fails
+                // both forms (positive-only, ADR-027 §4).
+                match &w.via {
+                    WriteProvenance::Unknown => false,
+                    WriteProvenance::Direct => through.is_none() && direct.is_none_or(|d| d),
+                    WriteProvenance::Via(chain) => {
+                        through
+                            .as_ref()
+                            .is_none_or(|names| chain.iter().any(|c| names.iter().any(|n| n == c)))
+                            && direct.is_none_or(|d| !d)
+                    }
+                }
+            }
+            ResolvedGuard::WriterPhases { includes } => {
+                // Validated: the anchor is a state hook — its label is the
+                // slot. MAY existential: a ⊤-phase write satisfies any query.
+                let Some(row) = cand.row() else {
+                    unreachable!("validated: `writer_phases` reads a state-hook anchor")
+                };
+                e.writer_phase_includes(row.info.label, includes)
+            }
             ResolvedGuard::Count(cmp) => {
                 let len = cand
                     .row()
@@ -341,7 +428,7 @@ impl TierARule {
             MustKind::DominatesAllExits => {
                 let setter = match cand {
                     Candidate::RenderSetter(s) => s,
-                    Candidate::Hook { .. } => {
+                    Candidate::Hook { .. } | Candidate::Origin(_) | Candidate::Provider(_) => {
                         unreachable!("validated: `must_dominates_all_exits` binds a render setter")
                     }
                 };
@@ -368,6 +455,15 @@ impl TierARule {
                     .cloned()
                     .map(Proof::Conditional)
             }
+            MustKind::DirectWrite => {
+                let Some(Bound::Writer(w)) = cand.bound() else {
+                    unreachable!("validated: `must_direct_write` binds a writers row")
+                };
+                match must_direct_write(w) {
+                    MustResult::All(c) => Some(Proof::Direct(c)),
+                    _ => None,
+                }
+            }
         }
     }
 
@@ -390,6 +486,7 @@ impl TierARule {
                     Proof::Dominates(c) => Diagnostic::error(id, c, message),
                     Proof::Init(c) => Diagnostic::error(id, c, message),
                     Proof::Conditional(c) => Diagnostic::error(id, c, message),
+                    Proof::Direct(c) => Diagnostic::error(id, c, message),
                 }
             }
             (SeverityPin::Error | SeverityPin::Warning, _) => Diagnostic::warn(id, message),

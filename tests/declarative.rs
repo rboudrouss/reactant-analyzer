@@ -976,3 +976,619 @@ fn js_authored_pack_output_loads_in_the_core() {
     );
     assert!(load.warnings.is_empty(), "{:?}", load.warnings);
 }
+
+// ── The `hook_origins` anchor (ADR-027 §7, the #6 fix) ────────────────────────
+
+#[test]
+fn hook_origins_is_kindless_and_edgeless() {
+    // No `kind` filter: the row is not a modeled entry.
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_origins","kind":"custom"},"message":"m"}"#,
+    ));
+    assert!(e.message.contains("kind"), "{e}");
+
+    // No edges: there may be no hook_calls row (no body, no deps) behind it.
+    for edge in ["deps", "body_setter_calls", "args"] {
+        let e = load_err(&one_rule(&format!(
+            r#"{{"id":"r","docs":{{"description":"d","why":"w","fix":"f"}},"severity":"warning",
+                "anchor":{{"relation":"hook_origins"}},
+                "forEach":{{"edge":"{edge}","as":"x"}},"message":"m"}}"#
+        )));
+        assert_eq!(e.path, "rules[0].forEach.edge", "edge `{edge}`: {e}");
+        assert!(e.message.contains("hook origin row"), "edge `{edge}`: {e}");
+    }
+
+    // `kind` is a field it does not carry — templates reject it too.
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_origins"},"message":"{anchor.kind}"}"#,
+    ));
+    assert!(
+        e.message.contains("does not carry") || e.message.contains("kind"),
+        "{e}"
+    );
+
+    // `stability` stays a deps-entry fact (ADR-023 §2), origin rows included.
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_origins"},
+            "guards":[{"kind":"stability","of":"anchor","is":["stable"]}],"message":"m"}"#,
+    ));
+    assert!(e.message.contains("deps entry"), "{e}");
+}
+
+#[test]
+fn legacy_custom_anchor_identity_rule_warns_toward_hook_origins() {
+    let pack = one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls","kind":"custom"},
+            "guards":[{"kind":"name","of":"anchor","one_of":["useLegacyStore"]}],
+            "message":"m"}"#,
+    );
+    let loaded = load(&pack).expect("the legacy form still loads");
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .any(|w| w.message.contains("hook_origins")),
+        "the #6-blind form must warn toward `hook_origins`: {:?}",
+        loaded.warnings
+    );
+
+    // The same rule on `hook_origins` loads clean.
+    let pack = one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_origins"},
+            "guards":[{"kind":"name","of":"anchor","one_of":["useLegacyStore"]}],
+            "message":"m"}"#,
+    );
+    assert!(load(&pack).expect("must load").warnings.is_empty());
+}
+
+#[test]
+fn hook_origins_matches_resolved_identity_and_renders_fields() {
+    // `name` is the ORIGIN name: an aliased import still matches, and the
+    // finding renders the resolved identity, not the local alias.
+    let pack = one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_origins"},
+            "guards":[{"kind":"name","of":"anchor","one_of":["useLegacyStore"]}],
+            "message":"{anchor.name} from {anchor.source}"}"#,
+    );
+    let fired = run_pack(
+        &pack,
+        r#"
+        import { useLegacyStore as useStore } from "legacy";
+        function C() {
+            const store = useStore();
+            return <div>{store}</div>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(fired.len(), 1, "{fired:?}");
+    assert_eq!(fired[0].message, "`useLegacyStore` from legacy");
+    assert!(
+        fired[0].range.is_some(),
+        "origin rows carry the call-site span"
+    );
+
+    // Silent when nothing matches.
+    let silent = run_pack(
+        &pack,
+        r#"
+        import { useTheme } from "ui";
+        function C() {
+            const t = useTheme();
+            return <div>{t}</div>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(silent.is_empty(), "{silent:?}");
+}
+
+#[test]
+fn hook_origins_sees_react_hooks_and_direct_origin_guard_composes() {
+    // Ban direct useLayoutEffect via the origins anchor (the catalogue's
+    // hook-identity rule, restated on the new anchor).
+    let pack = one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_origins"},
+            "guards":[{"kind":"origin","of":"anchor","hook":["useLayoutEffect"],"direct":true}],
+            "message":"direct {anchor.name}"}"#,
+    );
+    let fired = run_pack(
+        &pack,
+        r#"
+        import { useLayoutEffect } from "react";
+        function C() {
+            useLayoutEffect(() => {}, []);
+            return <div/>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(fired.len(), 1, "{fired:?}");
+    assert_eq!(fired[0].message, "direct `useLayoutEffect`");
+}
+
+// ── The `writers` edge and `writer_phases` guard (ADR-027 §1, #70) ───────────
+
+#[test]
+fn writers_vocabulary_requires_a_state_anchor() {
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls","kind":"effect"},
+            "forEach":{"edge":"writers","as":"w"},"message":"m"}"#,
+    ));
+    assert_eq!(e.path, "rules[0].forEach.edge");
+    assert!(e.message.contains("state-hook anchor"), "{e}");
+
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls","kind":"effect"},
+            "guards":[{"kind":"writer_phases","of":"anchor","includes":["handler"]}],
+            "message":"m"}"#,
+    ));
+    assert!(e.message.contains("state-hook ANCHOR"), "{e}");
+
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls","kind":"state"},
+            "guards":[{"kind":"writer_phases","of":"anchor","includes":[]}],
+            "message":"m"}"#,
+    ));
+    assert!(e.message.contains("must not be empty"), "{e}");
+}
+
+const TUG_OF_WAR_PACK: &str = r#"{"schemaVersion":1,"name":"t","rules":[
+    {"id":"tug","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+     "anchor":{"relation":"hook_calls","kind":"state"},
+     "guards":[
+        {"kind":"writer_phases","of":"anchor","includes":["effect"]},
+        {"kind":"writer_phases","of":"anchor","includes":["handler"]}
+     ],
+     "message":"{anchor.name} is written by both an effect and a handler"}]}"#;
+
+#[test]
+fn writer_phases_dissolves_the_effect_plus_handler_join() {
+    // The tug-of-war: an effect resyncs the slot a handler also writes.
+    let fired = run_pack(
+        TUG_OF_WAR_PACK,
+        r#"
+        import { useState, useEffect } from "react";
+        function C({ items }) {
+            const [sel, setSel] = useState(null);
+            useEffect(() => { setSel(items[0]); }, [items]);
+            return <button onClick={() => setSel(null)}>x</button>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(fired.len(), 1, "{fired:?}");
+    assert_eq!(
+        fired[0].message,
+        "`sel` is written by both an effect and a handler"
+    );
+
+    // Handler-only writes: `includes effect` must fail — the lexical facts
+    // are exact, and no ⊤ row shadows them.
+    let silent = run_pack(
+        TUG_OF_WAR_PACK,
+        r#"
+        import { useState } from "react";
+        function C() {
+            const [sel, setSel] = useState(null);
+            return <button onClick={() => setSel(null)}>x</button>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(silent.is_empty(), "{silent:?}");
+}
+
+fn phase_pack(includes: &str) -> String {
+    format!(
+        r#"{{"schemaVersion":1,"name":"t","rules":[
+        {{"id":"r","docs":{{"description":"d","why":"w","fix":"f"}},"severity":"warning",
+         "anchor":{{"relation":"hook_calls","kind":"state"}},
+         "guards":[{{"kind":"writer_phases","of":"anchor","includes":[{includes}]}}],
+         "message":"phase write of {{anchor.name}}"}}]}}"#
+    )
+}
+
+fn phase_query(src: &str, includes: &str) -> bool {
+    !run_pack(&phase_pack(includes), src, &Options::new()).is_empty()
+}
+
+#[test]
+fn callee_summaries_classify_phases() {
+    // setTimeout: the summary proves deferral (ADR-027 §2) — never inside a
+    // React phase, so `handler`/`effect` queries stop matching.
+    let timer = r#"
+        import { useState, useEffect } from "react";
+        function C() {
+            const [n, setN] = useState(0);
+            useEffect(() => { setTimeout(() => setN(1), 100); }, []);
+            return <div>{n}</div>;
+        }
+    "#;
+    assert!(phase_query(timer, "\"deferred\""));
+    assert!(!phase_query(timer, "\"handler\""));
+    assert!(!phase_query(timer, "\"effect\""));
+
+    // A promise continuation defers too.
+    let then = r#"
+        import { useState, useEffect } from "react";
+        function C() {
+            const [n, setN] = useState(0);
+            useEffect(() => { fetch("/x").then(() => setN(1)); }, []);
+            return <div>{n}</div>;
+        }
+    "#;
+    assert!(phase_query(then, "\"deferred\""));
+    assert!(!phase_query(then, "\"effect\""));
+
+    // A sync HOF runs its argument in the ENCLOSING phase.
+    let hof = r#"
+        import { useState, useEffect } from "react";
+        function C({ xs }) {
+            const [n, setN] = useState(0);
+            useEffect(() => { xs.forEach((x) => setN(x)); }, [xs]);
+            return <div>{n}</div>;
+        }
+    "#;
+    assert!(phase_query(hof, "\"effect\""));
+    assert!(!phase_query(hof, "\"deferred\""));
+
+    // An unknown callee stays ⊤: every query matches (may side).
+    let unknown = r#"
+        import { useState, useEffect } from "react";
+        import { mystery } from "./lib";
+        function C() {
+            const [n, setN] = useState(0);
+            useEffect(() => { mystery(() => setN(1)); }, []);
+            return <div>{n}</div>;
+        }
+    "#;
+    assert!(phase_query(unknown, "\"handler\""));
+    assert!(phase_query(unknown, "\"render\""));
+    assert!(phase_query(unknown, "\"unknown\""));
+
+    // Shadowing a deferring global disables its summary — fail-closed back
+    // to ⊤, never a wrong `deferred`.
+    let shadowed = r#"
+        import { useState, useEffect } from "react";
+        function C() {
+            const [n, setN] = useState(0);
+            const setTimeout = (f) => f();
+            useEffect(() => { setTimeout(() => setN(1)); }, []);
+            return <div>{n}</div>;
+        }
+    "#;
+    assert!(
+        phase_query(shadowed, "\"effect\""),
+        "shadowed timer is ⊤, not deferred"
+    );
+
+    // An effect's returned function is its cleanup.
+    let cleanup = r#"
+        import { useState, useEffect } from "react";
+        function C() {
+            const [n, setN] = useState(0);
+            useEffect(() => { return () => setN(0); }, []);
+            return <div>{n}</div>;
+        }
+    "#;
+    assert!(phase_query(cleanup, "\"cleanup\""));
+    assert!(!phase_query(cleanup, "\"effect\""));
+}
+
+#[test]
+fn extracted_subscription_listener_is_handler_not_top() {
+    // `addEventListener` in an effect is reified as a Handler entry while the
+    // FnLit stays in the effect body — the ⊤ duplicate row is dropped in
+    // favor of the handler row (same witness span), so `includes effect`
+    // must NOT fire on a listener-only writer.
+    let pack = r#"{"schemaVersion":1,"name":"t","rules":[
+        {"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+         "anchor":{"relation":"hook_calls","kind":"state"},
+         "guards":[{"kind":"writer_phases","of":"anchor","includes":["effect"]}],
+         "message":"effect-phase write of {anchor.name}"}]}"#;
+    let src = r#"
+        import { useState, useEffect } from "react";
+        function C() {
+            const [n, setN] = useState(0);
+            useEffect(() => { window.addEventListener("resize", () => setN(1)); }, []);
+            return <div>{n}</div>;
+        }
+    "#;
+    let fired = run_pack(pack, src, &Options::new());
+    assert!(fired.is_empty(), "{fired:?}");
+
+    // …while `includes handler` fires on the same source.
+    let pack_h = pack
+        .replace("\"effect\"", "\"handler\"")
+        .replace("effect-phase", "handler-phase");
+    let fired = run_pack(&pack_h, src, &Options::new());
+    assert_eq!(fired.len(), 1, "{fired:?}");
+}
+
+#[test]
+fn writers_edge_renders_region_phase_and_finds_spliced_setters() {
+    let pack = r#"{"schemaVersion":1,"name":"t","rules":[
+        {"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+         "anchor":{"relation":"hook_calls","kind":"state"},
+         "forEach":{"edge":"writers","as":"w"},
+         "message":"{w.setter} writes {w.slot} in {w.region} (phase {w.phase})"}]}"#;
+    let fired = run_pack(
+        pack,
+        r#"
+        import { useState, useEffect } from "react";
+        function C({ items }) {
+            const [sel, setSel] = useState(null);
+            useEffect(() => { setSel(items[0]); }, [items]);
+            return <div>{sel}</div>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(
+        fired.iter().map(|d| d.message.as_str()).collect::<Vec<_>>(),
+        vec!["`setSel` writes `sel` in effect (phase effect)"],
+        "one row per writer, fields rendered"
+    );
+}
+
+// ── The `provenance` guard: wrapper enforcement (ADR-027 §4) ─────────────────
+
+fn putstate_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("helpers.ts"),
+        "export function putState(setter, v) { setter(v); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("App.tsx"),
+        r#"
+        import { putState as ps } from "./helpers";
+        import { useState, useEffect } from "react";
+        export function App({ items }) {
+            const [n, setN] = useState(0);
+            useEffect(() => { ps(setN, items.length); }, [items]);
+            return <button onClick={() => setN(0)}>reset</button>;
+        }
+        "#,
+    )
+    .unwrap();
+    vec![dir.join("helpers.ts"), dir.join("App.tsx")]
+}
+
+fn run_pack_multi(pack_json: &str, files: &[std::path::PathBuf]) -> Vec<Diagnostic> {
+    use reactant::engine::{Config, RootStrategy};
+    use reactant::resolver::{DefaultImportResolver, analyze_lowered, lower_files};
+    let pack = load_pack(pack_json, &Options::new()).expect("pack must load");
+    let lowered = lower_files(files, &DefaultImportResolver::default());
+    assert!(
+        lowered.parse_errors.is_empty(),
+        "{:?}",
+        lowered.parse_errors
+    );
+    let prog = analyze_lowered(lowered, RootStrategy::AllComponents, Config::default());
+    let mut names: Vec<&String> = prog.components.keys().collect();
+    names.sort();
+    names
+        .iter()
+        .flat_map(|name| {
+            let ctx = RuleCtx::new(&prog, name);
+            pack.rules
+                .iter()
+                .flat_map(|r| r.rule.check(&ctx))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[test]
+fn provenance_guard_states_the_putstate_policy() {
+    let dir = std::env::temp_dir().join(format!("reactant-putstate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let files = putstate_files(&dir);
+
+    // "State is only written through putState": fire on each DIRECT write.
+    let direct_rule = r#"{"schemaVersion":1,"name":"team","rules":[
+        {"id":"put-state-only","docs":{"description":"d","why":"w","fix":"f"},
+         "severity":"warning",
+         "anchor":{"relation":"hook_calls","kind":"state"},
+         "forEach":{"edge":"writers","as":"w"},
+         "guards":[{"kind":"provenance","of":"w","direct":true}],
+         "message":"{w.setter} writes {w.slot} directly in {w.region} — route it through putState"}]}"#;
+    let fired = run_pack_multi(direct_rule, &files);
+    assert_eq!(
+        fired.iter().map(|d| d.message.as_str()).collect::<Vec<_>>(),
+        vec!["`setN` writes `n` directly in handler — route it through putState"],
+        "exactly the handler write is direct; the ps(...) write is wrapper-mediated"
+    );
+    assert!(fired[0].range.is_some());
+
+    // `through` names the wrapper by its EXPORTED name — the `ps` alias does
+    // not let the effect write escape.
+    let through_rule = r#"{"schemaVersion":1,"name":"team","rules":[
+        {"id":"via-putstate","docs":{"description":"d","why":"w","fix":"f"},
+         "severity":"warning",
+         "anchor":{"relation":"hook_calls","kind":"state"},
+         "forEach":{"edge":"writers","as":"w"},
+         "guards":[{"kind":"provenance","of":"w","through":["putState"]}],
+         "message":"{w.slot} written via {w.via}"}]}"#;
+    let fired = run_pack_multi(through_rule, &files);
+    assert_eq!(
+        fired.iter().map(|d| d.message.as_str()).collect::<Vec<_>>(),
+        vec!["`n` written via putState"]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn provenance_chain_names_every_wrapper() {
+    let dir = std::env::temp_dir().join(format!("reactant-chain-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("helpers.ts"),
+        "export function inner(setter, v) { setter(v); }\n\
+         export function outer(setter, v) { inner(setter, v); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("App.tsx"),
+        r#"
+        import { outer } from "./helpers";
+        import { useState, useEffect } from "react";
+        export function App() {
+            const [n, setN] = useState(0);
+            useEffect(() => { outer(setN, 1); }, []);
+            return <div>{n}</div>;
+        }
+        "#,
+    )
+    .unwrap();
+    let files = vec![dir.join("helpers.ts"), dir.join("App.tsx")];
+    let pack = r#"{"schemaVersion":1,"name":"team","rules":[
+        {"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+         "anchor":{"relation":"hook_calls","kind":"state"},
+         "forEach":{"edge":"writers","as":"w"},
+         "guards":[{"kind":"provenance","of":"w","direct":false}],
+         "message":"via {w.via}"}]}"#;
+    let fired = run_pack_multi(pack, &files);
+    assert_eq!(
+        fired.iter().map(|d| d.message.as_str()).collect::<Vec<_>>(),
+        vec!["via outer → inner"],
+        "the chain names every wrapper, outermost first"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn provenance_guard_requires_a_writers_row() {
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls","kind":"state"},
+            "guards":[{"kind":"provenance","of":"anchor","direct":true}],"message":"m"}"#,
+    ));
+    assert!(e.message.contains("`writers` row"), "{e}");
+
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls","kind":"state"},
+            "forEach":{"edge":"writers","as":"w"},
+            "guards":[{"kind":"provenance","of":"w"}],"message":"m"}"#,
+    ));
+    assert!(e.message.contains("at least one of"), "{e}");
+}
+
+#[test]
+fn must_direct_write_reaches_error_on_the_proof() {
+    let dir = std::env::temp_dir().join(format!("reactant-mustdirect-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let files = putstate_files(&dir);
+    let pack = r#"{"schemaVersion":1,"name":"team","rules":[
+        {"id":"put-state-only","docs":{"description":"d","why":"w","fix":"f"},
+         "severity":"error",
+         "anchor":{"relation":"hook_calls","kind":"state"},
+         "forEach":{"edge":"writers","as":"w"},
+         "guards":[{"kind":"must_direct_write","of":"w","else":"drop"}],
+         "message":"direct write of {w.slot}"}]}"#;
+    let fired = run_pack_multi(pack, &files);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(fired.len(), 1, "{fired:?}");
+    assert_eq!(
+        fired[0].severity(),
+        Severity::Error,
+        "pin ⊓ polarity: the certified direct write honors the error pin"
+    );
+    assert!(fired[0].range.is_some());
+}
+
+#[test]
+fn must_direct_write_requires_a_writers_row() {
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"error",
+            "anchor":{"relation":"hook_calls","kind":"state"},
+            "guards":[{"kind":"must_direct_write","of":"anchor"}],"message":"m"}"#,
+    ));
+    assert!(e.message.contains("`writers` row"), "{e}");
+}
+
+// ── The `context_providers` anchor (#71, ADR-027 §8) ─────────────────────────
+
+#[test]
+fn context_providers_anchor_reads_the_identity_verdict() {
+    let pack = r#"{"schemaVersion":1,"name":"t","rules":[
+        {"id":"fresh-provider","docs":{"description":"d","why":"w","fix":"f"},
+         "severity":"warning",
+         "anchor":{"relation":"context_providers"},
+         "guards":[{"kind":"identity","of":"anchor","is":["fresh-every-render"]}],
+         "message":"{anchor.name} hands consumers a {anchor.identity} value"}]}"#;
+
+    // Buggy: an inline object literal — a fresh reference on every render.
+    let fired = run_pack(
+        pack,
+        r#"
+        import { createContext, useState } from "react";
+        const TabsContext = createContext(null);
+        function C() {
+            const [tab, setTab] = useState(0);
+            return <TabsContext.Provider value={{ tab, setTab }}><div/></TabsContext.Provider>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(fired.len(), 1, "{fired:?}");
+    assert_eq!(
+        fired[0].message,
+        "`TabsContext` hands consumers a fresh-every-render value"
+    );
+    assert!(fired[0].range.is_some());
+
+    // Conformant: a memoized value keeps identity between recomputations.
+    let silent = run_pack(
+        pack,
+        r#"
+        import { createContext, useState, useMemo } from "react";
+        const TabsContext = createContext(null);
+        function C() {
+            const [tab, setTab] = useState(0);
+            const value = useMemo(() => ({ tab, setTab }), [tab]);
+            return <TabsContext.Provider value={value}><div/></TabsContext.Provider>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(silent.is_empty(), "{silent:?}");
+}
+
+#[test]
+fn context_providers_is_kindless_edgeless_and_identity_is_provider_only() {
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"context_providers","kind":"custom"},"message":"m"}"#,
+    ));
+    assert!(e.message.contains("kind"), "{e}");
+
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"context_providers"},
+            "forEach":{"edge":"writers","as":"w"},"message":"m"}"#,
+    ));
+    assert!(e.message.contains("context-provider element"), "{e}");
+
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls","kind":"state"},
+            "guards":[{"kind":"identity","of":"anchor","is":["unknown"]}],"message":"m"}"#,
+    ));
+    assert!(e.message.contains("context-provider element"), "{e}");
+}

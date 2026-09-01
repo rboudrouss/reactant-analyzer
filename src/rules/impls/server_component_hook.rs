@@ -208,6 +208,7 @@ mod tests {
             specifier: specifier.map(str::to_string),
             file: None,
             inlined: false,
+            span: None,
         }
     }
 

@@ -1,4 +1,8 @@
-//! The 21-rule catalogue, as an automated measure (NEXTSTEPS phase 2, item 6).
+//! The rule catalogue, as an automated measure (NEXTSTEPS phase 2, item 6) —
+//! 21 entries from the ADR-022/023 survey, re-based to 22 by ADR-027 §6 (the
+//! wrapper-enforcement class joined WITH the vocabulary that makes it
+//! expressible, so the historical datapoints stay comparable: they are all
+//! /21 readings).
 //!
 //! ADR-022/ADR-023 measured Tier-A expressibility against a catalogue of 21
 //! semantic rule classes drawn from the eight `test-repo/` corpora, but the
@@ -12,10 +16,11 @@
 //! - a `Blocked` entry names the missing vocabulary, so flipping it means
 //!   writing the pack rule and fixtures, never editing a number.
 //!
-//! The curve so far: 3/21 (ADR-022 baseline) → **5/21** (ADR-023 steps 1-2:
+//! The curve so far: 3/21 (ADR-022 baseline) → 5/21 (ADR-023 steps 1-2:
 //! hook provenance + the `origin` guard, the `args` edge + the `returns`
-//! guard). The count assertion at the bottom is the measure; update it only
-//! by flipping entries.
+//! guard) → **6/21** (ADR-027 §1: the `writers` edge + `writer_phases`).
+//! The count assertion at the bottom is the measure; update it only by
+//! flipping entries.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -177,6 +182,85 @@ const SELECTOR_PACK: &str = r#"{
   }]
 }"#;
 
+const TUG_OF_WAR_PACK: &str = r#"{
+  "schemaVersion": 1, "name": "cat-writers",
+  "rules": [{
+    "id": "tug-of-war",
+    "docs": {
+      "description": "a state slot is resynced by an effect and written by a handler",
+      "why": "the two writers race: the effect keeps snapping the slot back over user input",
+      "fix": "derive the value at render, or make one side the owner"
+    },
+    "severity": "warning",
+    "anchor": { "relation": "hook_calls", "kind": "state" },
+    "guards": [
+      { "kind": "writer_phases", "of": "anchor", "includes": ["effect"] },
+      { "kind": "writer_phases", "of": "anchor", "includes": ["handler"] }
+    ],
+    "message": "{anchor.name} is written by both an effect and a handler"
+  }]
+}"#;
+
+const PROVIDER_PACK: &str = r#"{
+  "schemaVersion": 1, "name": "cat-provider",
+  "rules": [{
+    "id": "fresh-provider-value",
+    "docs": {
+      "description": "a context provider hands consumers a fresh reference every render",
+      "why": "Object.is fails for every consumer on every render of the provider",
+      "fix": "memoize the value, or split the context"
+    },
+    "severity": "warning",
+    "anchor": { "relation": "context_providers" },
+    "guards": [
+      { "kind": "identity", "of": "anchor", "is": ["fresh-every-render"] }
+    ],
+    "message": "{anchor.name} hands consumers a {anchor.identity} value"
+  }]
+}"#;
+
+const PUTSTATE_PACK: &str = r#"{
+  "schemaVersion": 1, "name": "cat-wrapper",
+  "rules": [{
+    "id": "put-state-only",
+    "docs": {
+      "description": "state is written directly instead of through the team wrapper",
+      "why": "the wrapper is where validation/telemetry/undo live; a direct write skips them",
+      "fix": "route the write through putState"
+    },
+    "severity": "error",
+    "anchor": { "relation": "hook_calls", "kind": "state" },
+    "forEach": { "edge": "writers", "as": "w" },
+    "guards": [
+      { "kind": "must_direct_write", "of": "w", "else": "drop" }
+    ],
+    "message": "{w.setter} writes {w.slot} directly in {w.region} — route it through putState"
+  }]
+}"#;
+
+const PUTSTATE_VIOLATION: &[(&str, &str)] = &[
+    (
+        "helpers.ts",
+        "export function putState(setter, v) { setter(v); }\n",
+    ),
+    (
+        "App.tsx",
+        "import { putState } from \"./helpers\";\nimport { useState, useEffect } from \"react\";\nexport function App({ items }) {\n  const [n, setN] = useState(0);\n  useEffect(() => { putState(setN, items.length); }, [items]);\n  return <button onClick={() => setN(0)}>reset</button>;\n}\n",
+    ),
+];
+
+const PUTSTATE_CONFORMANT: &[(&str, &str)] = &[
+    (
+        "helpers.ts",
+        "export function putState(setter, v) { setter(v); }\n",
+    ),
+    (
+        // The alias must not let the effect write read as direct.
+        "App.tsx",
+        "import { putState as ps } from \"./helpers\";\nimport { useState, useEffect } from \"react\";\nexport function App({ items }) {\n  const [n, setN] = useState(0);\n  useEffect(() => { ps(setN, items.length); }, [items]);\n  return <div>{n}</div>;\n}\n",
+    ),
+];
+
 const LAYOUT_EFFECT_PACK: &str = r#"{
   "schemaVersion": 1, "name": "cat-ssr",
   "rules": [{
@@ -229,10 +313,21 @@ fn catalogue() -> Vec<Entry> {
         },
         Entry {
             id: "unstable-context-provider-value",
-            status: Status::Blocked {
-                class: "expression-position",
-                missing: "Tier-A `context_providers` anchor with an `identity` field \
-                          (covered natively by unstable-context-value)",
+            status: Status::Expressible {
+                pack_json: PROVIDER_PACK,
+                rule: "cat-provider/fresh-provider-value",
+                fires_on: Fixture::Single(
+                    "import { createContext, useState } from \"react\";\nconst Ctx = createContext(null);\nfunction C() {\n  const [tab, setTab] = useState(0);\n  return <Ctx.Provider value={{ tab, setTab }}><div/></Ctx.Provider>;\n}",
+                ),
+                silent_on: Fixture::Single(
+                    "import { createContext, useState, useMemo } from \"react\";\nconst Ctx = createContext(null);\nfunction C() {\n  const [tab, setTab] = useState(0);\n  const value = useMemo(() => ({ tab, setTab }), [tab]);\n  return <Ctx.Provider value={value}><div/></Ctx.Provider>;\n}",
+                ),
+                weakened: Some(
+                    "same-file proven contexts only in the single-file fixture; the \
+                     relation is render-only by semantics (a useMemo-built provider \
+                     keeps identity), and the value prop only — the any-prop \
+                     generalisation (identity-keyed-jsx-prop) rides this relation later",
+                ),
             },
         },
         Entry {
@@ -285,9 +380,20 @@ fn catalogue() -> Vec<Entry> {
         // ── Single anchor, no joins ──────────────────────────────────────────
         Entry {
             id: "effect-and-handler-write-same-slot",
-            status: Status::Blocked {
-                class: "joins",
-                missing: "slot-centric `writers` edge (`writer_phases includes`, planned step)",
+            status: Status::Expressible {
+                pack_json: TUG_OF_WAR_PACK,
+                rule: "cat-writers/tug-of-war",
+                fires_on: Fixture::Single(
+                    "import { useState, useEffect } from \"react\";\nfunction C({ items }) {\n  const [sel, setSel] = useState(null);\n  useEffect(() => { setSel(items[0]); }, [items]);\n  return <button onClick={() => setSel(null)}>x</button>;\n}",
+                ),
+                silent_on: Fixture::Single(
+                    "import { useState } from \"react\";\nfunction C() {\n  const [sel, setSel] = useState(null);\n  return <button onClick={() => setSel(null)}>x</button>;\n}",
+                ),
+                weakened: Some(
+                    "set-level MAY existential (`writer_phases includes`), not a join: no \
+                     pairing of the two write sites, and a ⊤-phase nested-callback write \
+                     satisfies every phase query (ADR-027 §1)",
+                ),
             },
         },
         Entry {
@@ -411,18 +517,42 @@ fn catalogue() -> Vec<Entry> {
                 weakened: Some("existential per setter — no join with narrowing facts"),
             },
         },
+        // ── Wrapper enforcement (ADR-027 §4-§6): joined at the re-base, ─────
+        // ── proven the day it became expressible ────────────────────────────
+        Entry {
+            id: "state-writes-only-through-the-team-wrapper",
+            status: Status::Expressible {
+                pack_json: PUTSTATE_PACK,
+                rule: "cat-wrapper/put-state-only",
+                fires_on: Fixture::Multi(PUTSTATE_VIOLATION),
+                silent_on: Fixture::Multi(PUTSTATE_CONFORMANT),
+                weakened: Some(
+                    "statement-position wrappers only: an expression-position wrapper \
+                     call (#52), a budget-truncated splice (#54) or a wrapper inside a \
+                     custom hook is invisible to the relation — missed findings, \
+                     compensated through the analysis-limit assurance channel",
+                ),
+            },
+        },
     ]
 }
 
 // ── The measure ───────────────────────────────────────────────────────────────
 
-/// The curve: 3/21 at the ADR-022 baseline → 5/21 after ADR-023 steps 1-2.
-/// Flip an entry (rule + fixtures), then update this constant.
-const EXPRESSIBLE_NOW: usize = 5;
+/// The curve: 3/21 at the ADR-022 baseline → 5/21 after ADR-023 steps 1-2 →
+/// 6/21 after the `writers`/`writer_phases` vocabulary (ADR-027 §1, #70) →
+/// 7/22 after setter provenance + `must_direct_write` (ADR-027 §4-§6, the
+/// catalogue re-based to 22) → 8/22 after the `context_providers` anchor +
+/// `identity` guard (#71, ADR-027 §8). Flip an entry (rule + fixtures), then
+/// update this constant.
+const EXPRESSIBLE_NOW: usize = 8;
 
 #[test]
-fn catalogue_has_21_entries() {
-    assert_eq!(catalogue().len(), 21);
+fn catalogue_is_pinned_at_22_entries() {
+    // 21 from the ADR-022/023 survey + the wrapper-enforcement class
+    // (ADR-027 §6 re-base). Growing it again needs the same treatment:
+    // record the re-base datapoint in docs/limitations.md.
+    assert_eq!(catalogue().len(), 22);
 }
 
 #[test]

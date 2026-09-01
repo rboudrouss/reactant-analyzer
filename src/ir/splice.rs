@@ -53,12 +53,18 @@ pub struct Splice<'a> {
 
 /// Splice `splice.callee` into `caller`, replacing the call statement located
 /// at `(block_id, stmt_idx)`.
+///
+/// Returns the half-open `BlockId` range the callee's blocks landed in (the
+/// join block just past it belongs to the caller), or `None` when the splice
+/// was skipped — the recorded pair every caller needs for provenance
+/// (ADR-027 §4: an unrecorded splice would let `must_direct_write` certify a
+/// wrapper-mediated write as caller-authored).
 pub fn splice_callee_into_cfg(
     caller: &mut CFG,
     block_id: BlockId,
     stmt_idx: usize,
     splice: Splice<'_>,
-) {
+) -> Option<std::ops::Range<BlockId>> {
     let Splice {
         callee,
         params,
@@ -81,10 +87,10 @@ pub fn splice_callee_into_cfg(
     //     no assertion or rollback to say so. Either way the splice is skipped;
     //     the difference is that the caller now survives it intact.
     if !callee_block_map.contains_key(&callee_entry_orig) {
-        return; // headless callee: nothing to graft
+        return None; // headless callee: nothing to graft
     }
     if !caller.blocks.contains_key(&block_id) {
-        return; // the call site named a block that is not there
+        return None; // the call site named a block that is not there
     }
 
     // 2. Split the caller block at the call site: `pre` stays, the call stmt is
@@ -232,6 +238,7 @@ pub fn splice_callee_into_cfg(
         "splice left the caller malformed: {}",
         caller.validate().unwrap_err()
     );
+    Some(block_offset..join_block_id)
 }
 
 /// Fresh-name map for every variable bound inside `cfg`: its `params` plus every

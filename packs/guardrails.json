@@ -76,7 +76,7 @@
       },
       "severity": "warning",
       "params": { "banned": { "type": "string[]", "default": [] } },
-      "anchor": { "relation": "hook_calls", "kind": "custom" },
+      "anchor": { "relation": "hook_origins" },
       "guards": [
         { "kind": "name", "of": "anchor", "one_of": { "$param": "banned" } }
       ],

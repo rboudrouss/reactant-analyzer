@@ -116,6 +116,20 @@ pub enum Anchor {
     },
     /// Alias-resolved setter calls in the render body.
     RenderSetterCalls,
+    /// One `hook_provenance` row: every hook call whose identity the engine
+    /// resolved, *surviving* custom-hook inlining (ADR-027 §7 — the #6 fix:
+    /// a resolved hook keeps no `hook_calls` row of kind `custom`, so
+    /// identity rules anchor here). `name` reads the origin hook's name,
+    /// `source` its import specifier; the row carries no kind and no edges.
+    HookOrigins,
+    /// One proven context-provider element in the render body (#71, ADR-027
+    /// §8): `<Ctx.Provider value={…}>` where `Ctx` is a module-level
+    /// `createContext` proven by import. `name` reads the context binding,
+    /// `identity` the value prop's identity verdict. Render-only by
+    /// semantics: an element built inside `useMemo` keeps identity between
+    /// recomputations. Edge-less in v1; the any-prop generalisation rides
+    /// this same relation later.
+    ContextProviders,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -155,6 +169,11 @@ pub enum EdgeName {
     /// call, so reading the render-exit stability there is the program-point
     /// error ADR-023 §2 refuses.
     Args,
+    /// Writers of a state-hook anchor's slot (ADR-027 §1): one row per
+    /// (region, alias-resolved setter variable, sync-vs-nested), spliced
+    /// wrappers' setter params included. `{w.region}` is the lexical body —
+    /// exact; `{w.phase}` is a MAY verdict, `unknown` = may run in any phase.
+    Writers,
 }
 
 /// A guard: a predicate over an engine verdict. `must_*` guards certify
@@ -231,6 +250,38 @@ pub enum Guard {
         #[serde(default)]
         prefix: Option<PVal<String>>,
     },
+    /// Identity verdict of a `context_providers` row's value (#71). Exactly
+    /// one of `is`/`not`; the names mirror `ValueIdentity` totally — ⊤
+    /// (`unknown`) is matchable, never dropped.
+    Identity {
+        of: String,
+        #[serde(default)]
+        is: Option<PVal<Vec<IdentityName>>>,
+        #[serde(default)]
+        not: Option<PVal<Vec<IdentityName>>>,
+    },
+    /// Write-provenance filter on a `writers` row (ADR-027 §4): whether the
+    /// write is caller-authored (`direct`) or reached through named inlined
+    /// wrappers (`through` — matched anywhere in the chain, against EXPORTED
+    /// names, so aliased imports don't escape). At least one of
+    /// `through`/`direct`; a row whose site could not be placed fails both
+    /// forms (positive-only).
+    Provenance {
+        of: String,
+        #[serde(default)]
+        through: Option<PVal<Vec<String>>>,
+        #[serde(default)]
+        direct: Option<PVal<bool>>,
+    },
+    /// MAY existential over the writers of a state-hook anchor's slot
+    /// (ADR-027 §1 — the #70 join dissolver): passes when some write of the
+    /// slot may run in one of the named phases. A ⊤-phase write (`unknown`)
+    /// satisfies every query — suppressing a finding on a may-fact would be
+    /// a false negative. Positive-only; there is no negated form.
+    WriterPhases {
+        of: String,
+        includes: PVal<Vec<PhaseName>>,
+    },
     /// Cardinality of `anchor.<edge>` (only `anchor.deps` in v1). Exactly
     /// one comparator.
     Count {
@@ -264,6 +315,14 @@ pub enum Guard {
         #[serde(rename = "else", default)]
         r#else: ElseBehavior,
     },
+    /// Certifies that a `writers` row is caller-authored (ADR-027 §5): the
+    /// site sits outside every spliced wrapper region. The proof behind an
+    /// Error-pinned "state is only written through our wrapper" policy rule.
+    MustDirectWrite {
+        of: String,
+        #[serde(rename = "else", default)]
+        r#else: ElseBehavior,
+    },
     /// Disjunction: the candidate passes when **any** listed guard passes.
     /// The guard list of a rule is a conjunction, so this is the only way to
     /// write "X or Y" without duplicating a rule and its docs.
@@ -286,6 +345,9 @@ pub enum ElseBehavior {
     Drop,
 }
 
+// (`must_direct_write` lives in the Guard enum above; this marker keeps the
+// section comment structure intact.)
+
 /// Total mirror of `StabilityVerdict`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
@@ -294,6 +356,35 @@ pub enum StabilityName {
     Stable,
     Versioned,
     PerRender,
+    Unknown,
+}
+
+/// Total mirror of `WriterPhase` (ADR-027 §1); ⊤ = `unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum PhaseName {
+    Render,
+    Effect,
+    Memo,
+    Callback,
+    Handler,
+    /// Proved deferred (timer, microtask, promise continuation) — never
+    /// inside a React phase.
+    Deferred,
+    /// An effect's returned cleanup function.
+    Cleanup,
+    Unknown,
+}
+
+/// Total mirror of `ValueIdentity` (#71): what a provider's `value` hands
+/// consumers across renders. Two-valued on purpose — `fresh-every-render` is
+/// a proven fact, everything else is `unknown` (may side, never actionable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum IdentityName {
+    FreshEveryRender,
     Unknown,
 }
 

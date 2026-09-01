@@ -334,6 +334,27 @@ fn wrapped_use_layout_effect_row_survives_expansion_marked_inlined() {
             .any(|h| matches!(h, HookEntry::Effect { label, .. } if *label == inner.label)),
         "provenance label must match the remapped Effect entry"
     );
+
+    // Spans (ADR-027 §7): the wrapper's direct row keeps the COMPONENT-side
+    // call-site span even though its entry was spliced away — that dangling
+    // label is exactly why the row carries its own range — and the inlined
+    // row's span points into the wrapper's file (ADR-024 renders origins).
+    let wrapper_span = wrapper.span.expect("direct row carries its call-site span");
+    assert!(
+        result
+            .file_table
+            .path(wrapper_span.file)
+            .is_some_and(|p| p.ends_with("comp.tsx")),
+        "{wrapper_span:?}"
+    );
+    let inner_span = inner.span.expect("inlined row keeps the origin-side span");
+    assert!(
+        result
+            .file_table
+            .path(inner_span.file)
+            .is_some_and(|p| p.ends_with("use-safe-layout-effect.ts")),
+        "{inner_span:?}"
+    );
 }
 
 // ── Aliased custom hook still inlines cross-file ───────────────────────────────

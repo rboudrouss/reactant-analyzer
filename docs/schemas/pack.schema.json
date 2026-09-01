@@ -73,6 +73,32 @@
           "required": [
             "relation"
           ]
+        },
+        {
+          "description": "One `hook_provenance` row: every hook call whose identity the engine\nresolved, *surviving* custom-hook inlining (ADR-027 §7 — the #6 fix:\na resolved hook keeps no `hook_calls` row of kind `custom`, so\nidentity rules anchor here). `name` reads the origin hook's name,\n`source` its import specifier; the row carries no kind and no edges.",
+          "type": "object",
+          "properties": {
+            "relation": {
+              "type": "string",
+              "const": "hook_origins"
+            }
+          },
+          "required": [
+            "relation"
+          ]
+        },
+        {
+          "description": "One proven context-provider element in the render body (#71, ADR-027\n§8): `<Ctx.Provider value={…}>` where `Ctx` is a module-level\n`createContext` proven by import. `name` reads the context binding,\n`identity` the value prop's identity verdict. Render-only by\nsemantics: an element built inside `useMemo` keeps identity between\nrecomputations. Edge-less in v1; the any-prop generalisation rides\nthis same relation later.",
+          "type": "object",
+          "properties": {
+            "relation": {
+              "type": "string",
+              "const": "context_providers"
+            }
+          },
+          "required": [
+            "relation"
+          ]
         }
       ]
     },
@@ -92,6 +118,11 @@
           "description": "Call-site arguments of a custom-hook anchor (ADR-023 §3). Admits the\n`returns` guard and NOT `stability`: an argument is evaluated at the\ncall, so reading the render-exit stability there is the program-point\nerror ADR-023 §2 refuses.",
           "type": "string",
           "const": "args"
+        },
+        {
+          "description": "Writers of a state-hook anchor's slot (ADR-027 §1): one row per\n(region, alias-resolved setter variable, sync-vs-nested), spliced\nwrappers' setter params included. `{w.region}` is the lexical body —\nexact; `{w.phase}` is a MAY verdict, `unknown` = may run in any phase.",
+          "type": "string",
+          "const": "writers"
         }
       ]
     },
@@ -330,6 +361,101 @@
           ]
         },
         {
+          "description": "Identity verdict of a `context_providers` row's value (#71). Exactly\none of `is`/`not`; the names mirror `ValueIdentity` totally — ⊤\n(`unknown`) is matchable, never dropped.",
+          "type": "object",
+          "properties": {
+            "is": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_Array_of_IdentityName"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "identity"
+            },
+            "not": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_Array_of_IdentityName"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        },
+        {
+          "description": "Write-provenance filter on a `writers` row (ADR-027 §4): whether the\nwrite is caller-authored (`direct`) or reached through named inlined\nwrappers (`through` — matched anywhere in the chain, against EXPORTED\nnames, so aliased imports don't escape). At least one of\n`through`/`direct`; a row whose site could not be placed fails both\nforms (positive-only).",
+          "type": "object",
+          "properties": {
+            "direct": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "provenance"
+            },
+            "of": {
+              "type": "string"
+            },
+            "through": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_Array_of_string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        },
+        {
+          "description": "MAY existential over the writers of a state-hook anchor's slot\n(ADR-027 §1 — the #70 join dissolver): passes when some write of the\nslot may run in one of the named phases. A ⊤-phase write (`unknown`)\nsatisfies every query — suppressing a finding on a may-fact would be\na false negative. Positive-only; there is no negated form.",
+          "type": "object",
+          "properties": {
+            "includes": {
+              "$ref": "#/$defs/PVal_Array_of_PhaseName"
+            },
+            "kind": {
+              "type": "string",
+              "const": "writer_phases"
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of",
+            "includes"
+          ]
+        },
+        {
           "description": "Cardinality of `anchor.<edge>` (only `anchor.deps` in v1). Exactly\none comparator.",
           "type": "object",
           "properties": {
@@ -474,6 +600,26 @@
           ]
         },
         {
+          "description": "Certifies that a `writers` row is caller-authored (ADR-027 §5): the\nsite sits outside every spliced wrapper region. The proof behind an\nError-pinned \"state is only written through our wrapper\" policy rule.",
+          "type": "object",
+          "properties": {
+            "else": {
+              "$ref": "#/$defs/ElseBehavior"
+            },
+            "kind": {
+              "type": "string",
+              "const": "must_direct_write"
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        },
+        {
           "description": "Disjunction: the candidate passes when **any** listed guard passes.\nThe guard list of a rule is a conjunction, so this is the only way to\nwrite \"X or Y\" without duplicating a rule and its docs.\n\nUniversal quantification over a `forEach` edge is a different question\nand stays refused (ADR-023 §4): this composes guards, it does not fold\nover elements.",
           "type": "object",
           "properties": {
@@ -505,6 +651,58 @@
         "ref",
         "custom",
         "handler"
+      ]
+    },
+    "IdentityName": {
+      "description": "Total mirror of `ValueIdentity` (#71): what a provider's `value` hands\nconsumers across renders. Two-valued on purpose — `fresh-every-render` is\na proven fact, everything else is `unknown` (may side, never actionable).",
+      "type": "string",
+      "enum": [
+        "fresh-every-render",
+        "unknown"
+      ]
+    },
+    "PVal_Array_of_IdentityName": {
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/IdentityName"
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "$param": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "$param"
+          ]
+        }
+      ]
+    },
+    "PVal_Array_of_PhaseName": {
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PhaseName"
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "$param": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "$param"
+          ]
+        }
       ]
     },
     "PVal_Array_of_ReturnsName": {
@@ -653,6 +851,32 @@
         "string",
         "boolean",
         "string[]"
+      ]
+    },
+    "PhaseName": {
+      "description": "Total mirror of `WriterPhase` (ADR-027 §1); ⊤ = `unknown`.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "render",
+            "effect",
+            "memo",
+            "callback",
+            "handler",
+            "unknown"
+          ]
+        },
+        {
+          "description": "Proved deferred (timer, microtask, promise continuation) — never\ninside a React phase.",
+          "type": "string",
+          "const": "deferred"
+        },
+        {
+          "description": "An effect's returned cleanup function.",
+          "type": "string",
+          "const": "cleanup"
+        }
       ]
     },
     "ReturnsName": {

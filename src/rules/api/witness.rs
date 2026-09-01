@@ -360,9 +360,7 @@ pub fn resolve_and_classify(
     component_file: &Path,
     name: &str,
 ) -> Vec<Note> {
-    let resolved = registry
-        .get(&(component_file.to_path_buf(), name.to_string()))
-        .or_else(|| registry.get_by_name(&name.to_string()));
+    let resolved = registry.resolve(component_file, name);
     let Some(func) = resolved else {
         return vec![note(
             Step::Resolve {
