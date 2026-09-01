@@ -69,6 +69,8 @@ pub fn collect_setter_calls_with_extra(
         root: cfg as *const CFG as usize,
         effect_body: false,
         shadowed: &empty,
+        repeating: false,
+        callback_bodies: &HashMap::new(),
         certified_fns: &certified,
     };
     walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None);
@@ -102,8 +104,8 @@ pub(crate) struct WriteSite {
     pub span: Option<SourceRange>,
     pub class: WalkClass,
     pub prov_block: Option<BlockId>,
-    /// The block the call sits in; `Some` only for `Sync` sites.
-    pub block_id: Option<BlockId>,
+    /// The site may run many times per tick (a sync HOF callback).
+    pub repeats: bool,
     pub updater: Updater,
 }
 
@@ -123,6 +125,7 @@ pub(crate) fn collect_write_sites(
     effect_body: bool,
     shadowed: &HashSet<Var>,
     outer_fns: &HashMap<Var, Arc<CFG>>,
+    callback_bodies: &HashMap<HookLabel, Arc<CFG>>,
 ) -> Vec<WriteSite> {
     let mut found: Found = Vec::new();
     let mut fn_bindings = collect_fn_bindings(cfg);
@@ -145,6 +148,8 @@ pub(crate) fn collect_write_sites(
         root: cfg as *const CFG as usize,
         effect_body,
         shadowed,
+        repeating: false,
+        callback_bodies,
         certified_fns: &certified,
     };
     walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None);
@@ -155,7 +160,7 @@ pub(crate) fn collect_write_sites(
             span: s.span,
             class: s.class,
             prov_block: s.prov_block,
-            block_id: s.block_id,
+            repeats: s.repeats,
             updater: s.updater,
         })
         .collect()
@@ -236,11 +241,16 @@ pub(crate) fn cross_component_setters(
 
 /// Scan all Let stmts in `cfg` for `let X = FnLit{...}` and return X → body_cfg.
 /// The subset of `bindings` whose name is bound exactly once, to a function
-/// literal, and never re-bound — [`crate::ir::bindings::fn_binding_in`]'s bar.
+/// literal, and never re-bound *anywhere below* — including inside nested
+/// closures, which `fn_binding_in` alone does not scan.
+///
+/// `Functional` is a must-claim sitting on a suppression path, so it takes the
+/// strong bar: a name a nested callback reassigns is not the function it was
+/// bound to by the time the write runs.
 fn certified_fn_names(cfg: &CFG, bindings: &HashMap<Var, Arc<CFG>>) -> HashSet<Var> {
     bindings
         .keys()
-        .filter(|v| crate::ir::bindings::fn_binding_in(v, cfg).is_some())
+        .filter(|v| crate::ir::bindings::certified_fn_binding(v, cfg, &[]).is_some())
         .cloned()
         .collect()
 }
@@ -622,26 +632,120 @@ impl InlineRegions {
     }
 }
 
-/// Is any block of `targets` reachable from `from` along at least one edge?
+/// Names bound exactly once, anywhere below, to the result of a `useCallback`
+/// — mapped to that callback's body.
 ///
-/// The BFS starts at `from`'s successors rather than at `from`, so a block
-/// reaches itself only through a genuine cycle — which is exactly the case
-/// worth reporting: a single write inside a loop does co-execute with itself.
-fn reaches_any(cfg: &CFG, from: BlockId, targets: &[BlockId]) -> bool {
-    let mut seen: HashSet<BlockId> = HashSet::new();
-    let mut queue: VecDeque<BlockId> = cfg.successors(from).into_iter().collect();
-    seen.extend(queue.iter().copied());
-    while let Some(b) = queue.pop_front() {
-        if targets.contains(&b) {
-            return true;
-        }
-        for succ in cfg.successors(b) {
-            if seen.insert(succ) {
-                queue.push_back(succ);
+/// The same single-binding bar the literal certificate uses: a name any body
+/// re-binds is not the memoized function by the time the write runs.
+fn callback_bound_vars(
+    render_cfg: &CFG,
+    also: &[&CFG],
+    callback_bodies: &HashMap<HookLabel, Arc<CFG>>,
+) -> HashMap<Var, Arc<CFG>> {
+    fn scan<'a>(cfg: &'a CFG, out: &mut HashMap<&'a str, Vec<&'a Expr>>) {
+        for block in cfg.blocks.values() {
+            for stmt in &block.stmts {
+                if let Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } = stmt {
+                    out.entry(var.as_str()).or_default().push(rhs);
+                    rhs.for_each_child(&mut |c| {
+                        if let Expr::FnLit { body_cfg, .. } = c {
+                            scan(body_cfg, out);
+                        }
+                    });
+                    if let Expr::FnLit { body_cfg, .. } = rhs {
+                        scan(body_cfg, out);
+                    }
+                }
             }
         }
     }
-    false
+    let mut binds: HashMap<&str, Vec<&Expr>> = HashMap::new();
+    scan(render_cfg, &mut binds);
+    for cfg in also {
+        scan(cfg, &mut binds);
+    }
+    binds
+        .into_iter()
+        .filter_map(|(name, rhs)| {
+            let [only] = rhs.as_slice() else { return None };
+            let Expr::CallbackVal(label) = only.peel_ts() else {
+                return None;
+            };
+            callback_bodies
+                .get(label)
+                .map(|b| (name.to_string(), Arc::clone(b)))
+        })
+        .collect()
+}
+
+/// Two source sites are the same write when they name the same span in the
+/// same region and class — which is what a local helper called twice produces,
+/// since the walk pulls its inner site in once per call. The duplicates carry
+/// a fact that must survive the collapse: being reached from two call sites is
+/// co-execution.
+fn dedup_source_sites(sites: &mut Vec<WriteSite>) {
+    let mut seen: HashMap<(Var, SourceRange, WalkClass), usize> = HashMap::new();
+    let mut out: Vec<WriteSite> = Vec::with_capacity(sites.len());
+    for site in std::mem::take(sites) {
+        // A site with no span cannot be identified with another; keep it.
+        let Some(span) = site.span else {
+            out.push(site);
+            continue;
+        };
+        match seen.get(&(site.var.clone(), span, site.class)) {
+            Some(&i) => out[i].repeats = true,
+            None => {
+                seen.insert((site.var.clone(), span, site.class), out.len());
+                out.push(site);
+            }
+        }
+    }
+    *sites = out;
+}
+
+/// Forward reachability within one CFG, computed once per region.
+///
+/// A BFS per row was O(rows × blocks × edges), and `CFG::successors` is a
+/// linear scan of the edge vector, so a component with many writers paid for
+/// it twice over. One BFS per block answers every query by lookup.
+struct Reachability {
+    /// `from → every block reachable along at least one edge`. Starting at the
+    /// successors rather than at the block itself is what makes a block reach
+    /// itself only through a genuine cycle.
+    forward: HashMap<BlockId, HashSet<BlockId>>,
+}
+
+impl Reachability {
+    fn of(cfg: &CFG) -> Self {
+        let succs: HashMap<BlockId, Vec<BlockId>> = cfg
+            .blocks
+            .keys()
+            .map(|&bid| (bid, cfg.successors(bid)))
+            .collect();
+        let forward = cfg
+            .blocks
+            .keys()
+            .map(|&start| {
+                let mut seen: HashSet<BlockId> = HashSet::new();
+                let mut queue: VecDeque<BlockId> =
+                    succs.get(&start).cloned().unwrap_or_default().into();
+                seen.extend(queue.iter().copied());
+                while let Some(b) = queue.pop_front() {
+                    for &succ in succs.get(&b).map(Vec::as_slice).unwrap_or(&[]) {
+                        if seen.insert(succ) {
+                            queue.push_back(succ);
+                        }
+                    }
+                }
+                (start, seen)
+            })
+            .collect();
+        Reachability { forward }
+    }
+
+    fn reaches(&self, from: BlockId, to: BlockId) -> bool {
+        self.forward.get(&from).is_some_and(|s| s.contains(&to))
+    }
 }
 
 fn class_phase(class: WalkClass, region: WriterRegion) -> WriterPhase {
@@ -696,12 +800,29 @@ pub(crate) fn collect_slot_writers(
     // every body below — the same certificate a consumer needs before it may
     // treat a name as the function it was bound to (ADR-023 §3, #103).
     let hook_bodies: Vec<&CFG> = hooks.iter().filter_map(|h| h.body_cfg()).collect();
-    let outer_fns: HashMap<Var, Arc<CFG>> = collect_fn_bindings(render_cfg)
+    let callback_bodies: HashMap<HookLabel, Arc<CFG>> = hooks
+        .iter()
+        .filter_map(|h| match h {
+            HookEntry::Callback {
+                label, body_cfg, ..
+            } => Some((*label, Arc::new(body_cfg.clone()))),
+            _ => None,
+        })
+        .collect();
+    let mut outer_fns: HashMap<Var, Arc<CFG>> = collect_fn_bindings(render_cfg)
         .into_iter()
         .filter(|(v, _)| {
             crate::ir::bindings::certified_fn_binding(v, render_cfg, &hook_bodies).is_some()
         })
         .collect();
+    // `const inc = useCallback(…)` binds a `CallbackVal`, not an `FnLit`, so
+    // the literal certificate never sees it — and a memoized updater read as ⊤
+    // fired the non-functional rules on correct code.
+    outer_fns.extend(callback_bound_vars(
+        render_cfg,
+        &hook_bodies,
+        &callback_bodies,
+    ));
 
     let mut out: Vec<SlotWriter> = Vec::new();
     let push_sites = |region: WriterRegion, cfg: &CFG, out: &mut Vec<SlotWriter>| {
@@ -713,34 +834,56 @@ pub(crate) fn collect_slot_writers(
             | WriterRegion::Handler(l) => (Some(l), inlined_origin(l)),
         };
         let effect_body = matches!(region, WriterRegion::Effect(_));
-        let sites = collect_write_sites(cfg, &setter_vars, 2, effect_body, &shadowed, &outer_fns);
-        // Where every SYNC write of each slot sits in this region's CFG — the
-        // domain the same-tick reachability question ranges over. Only sync
-        // sites carry a block id, and only they can co-execute within a tick:
-        // a deferred or handler write is a separate turn by construction.
+        let mut sites = collect_write_sites(
+            cfg,
+            &setter_vars,
+            2,
+            effect_body,
+            &shadowed,
+            &outer_fns,
+            &callback_bodies,
+        );
+        // One source site is one row. A local helper called twice pulls its
+        // inner write in twice, and both copies name the same source span —
+        // the same write, not two. They collapse, but their facts join first:
+        // being reached from two call sites is exactly co-execution.
+        dedup_source_sites(&mut sites);
+
+        // Where every SYNC write of each slot sits in this region's CFG. The
+        // key is `prov_block`, never `block_id`: a site inside a nested body
+        // records a block of *that* body's CFG, and block ids are per-CFG, so
+        // resolving one in the region CFG answers about an unrelated block.
+        // Only sync sites can co-execute within a tick — a deferred or handler
+        // write is a separate turn by construction.
         let mut sync_blocks: HashMap<HookLabel, Vec<BlockId>> = HashMap::new();
         for s in &sites {
             if s.class == WalkClass::Sync
-                && let (Some(&slot), Some(b)) = (labels.get(&s.var), s.block_id)
+                && let (Some(&slot), Some(b)) = (labels.get(&s.var), s.prov_block)
             {
                 sync_blocks.entry(slot).or_default().push(b);
             }
         }
+        let reach = Reachability::of(cfg);
         for site in sites {
             let Some(&slot) = labels.get(&site.var) else {
                 continue;
             };
-            let same_tick = match site.block_id {
-                Some(b) => {
-                    let blocks = sync_blocks.get(&slot).map_or(&[][..], Vec::as_slice);
-                    // Another write already in this very block, or one the
-                    // control flow can still reach — including this block
-                    // itself through a back edge, which is how a lone write
-                    // inside a loop co-executes with itself.
-                    blocks.iter().filter(|t| **t == b).count() > 1 || reaches_any(cfg, b, blocks)
-                }
-                None => false,
-            };
+            let same_tick = site.repeats
+                || match (site.class, site.prov_block) {
+                    (WalkClass::Sync, Some(b)) => {
+                        let blocks = sync_blocks.get(&slot).map_or(&[][..], Vec::as_slice);
+                        // Co-execution is symmetric — "these two land in the
+                        // same tick" does not care which runs first — so the
+                        // question is reachability in EITHER direction, plus
+                        // the same block, plus this block through a back edge.
+                        blocks.iter().filter(|t| **t == b).count() > 1
+                            || reach.reaches(b, b)
+                            || blocks
+                                .iter()
+                                .any(|&t| reach.reaches(b, t) || reach.reaches(t, b))
+                    }
+                    _ => false,
+                };
             let updater = site.updater.clone();
             let via = {
                 let mut chain: Vec<Symbol> = hook_origin.into_iter().cloned().collect();
@@ -848,6 +991,13 @@ struct SetterWalk<'a> {
     /// (fail-closed: `let setTimeout = …` anywhere in the component makes
     /// the bare name mean nothing).
     shadowed: &'a HashSet<Var>,
+    /// The walk is currently inside a callback a synchronous higher-order
+    /// function runs, so anything it finds may execute many times per tick.
+    repeating: bool,
+    /// Bodies of the component's `useCallback` hooks, by label — a memoized
+    /// function is as proven a function literal as an inline one, and reading
+    /// it as ⊤ fired the non-functional rules on correct code.
+    callback_bodies: &'a HashMap<HookLabel, Arc<CFG>>,
     /// Names bound exactly once, to a function literal, in the walked root —
     /// the bar a `set(fn)` argument must clear before it counts as a proven
     /// functional updater. `collect_fn_bindings` is not that bar: it keeps the
@@ -856,11 +1006,20 @@ struct SetterWalk<'a> {
 }
 
 impl SetterWalk<'_> {
+    /// Does this callee run its function argument once per element?
+    fn is_sync_hof(&self, fn_: &Expr) -> bool {
+        matches!(fn_, Expr::FieldAccess { field, .. } if SYNC_HOF_METHODS.contains(&field.as_str()))
+    }
+
     /// Argument 0 of a write, claimed `Functional` only when it is provably a
     /// function literal.
     fn updater_of(&self, args: &[Expr]) -> Updater {
         match args.first().map(Expr::peel_ts) {
             Some(Expr::FnLit { body_cfg, .. }) => Updater::Functional(Arc::clone(body_cfg)),
+            Some(Expr::CallbackVal(l)) => self
+                .callback_bodies
+                .get(l)
+                .map_or(Updater::Unknown, |b| Updater::Functional(Arc::clone(b))),
             Some(Expr::Var(v)) if self.certified_fns.contains(v) => self
                 .fn_bindings
                 .get(v)
@@ -915,14 +1074,20 @@ struct FoundSite {
     var: Var,
     class: WalkClass,
     span: Option<SourceRange>,
-    /// `Some` only for `Sync` rows, where it is meaningful for dominance and
-    /// for same-tick reachability.
+    /// `Some` only for `Sync` rows, where it is meaningful for dominance.
+    /// NOT usable for reachability: a site inside a nested body records a
+    /// block of *that* body's CFG, and `BlockId` is per-CFG.
     block_id: Option<BlockId>,
-    /// The top-level block the walk descended from — meaningful for every row,
-    /// since region membership is decided by where the code lexically sits (a
-    /// nested callback defined inside a spliced wrapper belongs to the
-    /// wrapper).
+    /// The top-level block the walk descended from — always a block of the
+    /// walked root, which makes it the only id that means anything in the
+    /// region's CFG. Region membership reads it (a nested callback defined
+    /// inside a spliced wrapper belongs to the wrapper), and so does same-tick
+    /// reachability.
     prov_block: Option<BlockId>,
+    /// The site sits inside a callback a synchronous higher-order function
+    /// runs — `xs.forEach(x => setC(x))`. Such a write executes 0..N times in
+    /// one tick, so it co-executes with itself without any CFG cycle.
+    repeats: bool,
     /// Argument 0 of the call, classified where the walk still has it.
     updater: Updater,
 }
@@ -998,6 +1163,10 @@ impl<'a> SetterWalk<'a> {
             return;
         }
         let at_root = key == self.root;
+        // A block that reaches itself is a loop body: everything in it runs
+        // 0..N times per tick, whichever CFG the loop happens to live in — the
+        // caller's, or a helper's the walk pulled in.
+        let reach = Reachability::of(cfg);
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
         queue.push_back(cfg.entry);
@@ -1010,6 +1179,8 @@ impl<'a> SetterWalk<'a> {
                 None
             };
             let prov_block = if at_root { Some(bid) } else { prov };
+            let outer_repeating = self.repeating;
+            self.repeating = outer_repeating || reach.reaches(bid, bid);
             if let Some(block) = cfg.blocks.get(&bid) {
                 for stmt in &block.stmts {
                     self.stmt(stmt, block_id, depth, found, mode, at_root, prov_block);
@@ -1049,6 +1220,7 @@ impl<'a> SetterWalk<'a> {
                     }
                 }
             }
+            self.repeating = outer_repeating;
         }
         self.walking.remove(&key);
     }
@@ -1097,6 +1269,7 @@ impl<'a> SetterWalk<'a> {
                         span: stmt_span,
                         block_id,
                         prov_block: prov,
+                        repeats: self.repeating,
                         updater: self.updater_of(args),
                     });
                 }
@@ -1141,6 +1314,11 @@ impl<'a> SetterWalk<'a> {
                 } else {
                     self.arg_class(fn_, mode)
                 };
+                // A callback a sync HOF runs executes once per element: its
+                // writes co-execute with themselves in a single tick, with no
+                // CFG cycle to show for it.
+                let outer_repeating = self.repeating;
+                self.repeating = outer_repeating || self.is_sync_hof(fn_);
                 match arg {
                     // Inline FnLit arg descend body, costs one depth level.
                     Expr::FnLit { body_cfg, .. } if depth > 0 => {
@@ -1156,6 +1334,7 @@ impl<'a> SetterWalk<'a> {
                     }
                     _ => {}
                 }
+                self.repeating = outer_repeating;
             }
         }
     }

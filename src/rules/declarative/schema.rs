@@ -175,10 +175,12 @@ pub enum EdgeName {
     /// call, so reading the render-exit stability there is the program-point
     /// error ADR-023 §2 refuses.
     Args,
-    /// Writers of a state-hook anchor's slot (ADR-027 §1): one row per
-    /// (region, alias-resolved setter variable, sync-vs-nested), spliced
-    /// wrappers' setter params included. `{w.region}` is the lexical body —
-    /// exact; `{w.phase}` is a MAY verdict, `unknown` = may run in any phase.
+    /// Writers of a state-hook anchor's slot (ADR-027 §1, ADR-028 §1): one row
+    /// per **call site**, spliced wrappers' setter params included. Two
+    /// `setCount(…)` calls in one body are two rows; one write a local helper
+    /// contributes is one row however many times the helper is called.
+    /// `{w.region}` is the lexical body — exact; `{w.phase}` is a MAY verdict,
+    /// `unknown` = may run in any phase.
     Writers,
 }
 

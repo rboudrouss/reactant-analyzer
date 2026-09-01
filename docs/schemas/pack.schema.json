@@ -142,7 +142,7 @@
           "const": "args"
         },
         {
-          "description": "Writers of a state-hook anchor's slot (ADR-027 §1): one row per\n(region, alias-resolved setter variable, sync-vs-nested), spliced\nwrappers' setter params included. `{w.region}` is the lexical body —\nexact; `{w.phase}` is a MAY verdict, `unknown` = may run in any phase.",
+          "description": "Writers of a state-hook anchor's slot (ADR-027 §1, ADR-028 §1): one row\nper **call site**, spliced wrappers' setter params included. Two\n`setCount(…)` calls in one body are two rows; one write a local helper\ncontributes is one row however many times the helper is called.\n`{w.region}` is the lexical body — exact; `{w.phase}` is a MAY verdict,\n`unknown` = may run in any phase.",
           "type": "string",
           "const": "writers"
         }

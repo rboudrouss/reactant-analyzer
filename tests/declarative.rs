@@ -2674,3 +2674,185 @@ fn updater_body_is_a_writers_row_fact() {
     ));
     assert!(e.message.contains("`writers` row"), "{e}");
 }
+
+// ── What the adversarial review of 54677a6 found (all reproduced then) ───────
+
+/// The shipped catalogue rule, verbatim: the two guards conjoined on one row.
+const STALE_PAIR_PACK: &str = r#"{"schemaVersion":1,"name":"t","rules":[
+    {"id":"stale","docs":{"description":"d","why":"w","fix":"f"},
+     "severity":"warning",
+     "anchor":{"relation":"hook_calls","kind":"state"},
+     "forEach":{"edge":"writers","as":"w"},
+     "guards":[{"kind":"same_tick","of":"w"},
+               {"kind":"updater","of":"w","is":["unknown"]}],
+     "message":"stale pair"}]}"#;
+
+fn stale_pair(body: &str) -> Vec<Diagnostic> {
+    let src = format!(
+        r#"
+        function C({{ xs, flag, n }}) {{
+            const [count, setCount] = useState(0);
+            const bump = () => {{ {body} }};
+            return <button onClick={{bump}}>{{count}}</button>;
+        }}
+        "#
+    );
+    run_pack(STALE_PAIR_PACK, &src, &Options::new())
+}
+
+#[test]
+fn same_tick_sees_a_write_a_sync_hof_repeats() {
+    // A `forEach` callback runs once per element, so its lone write
+    // co-executes with itself — the design's own loop rationale, in the form
+    // that has no CFG cycle to show for it. It used to be silent because the
+    // callback's block ids belong to the callback's CFG, not the region's.
+    assert_eq!(
+        stale_pair("xs.forEach((x) => { setCount(count + x); });").len(),
+        1
+    );
+}
+
+#[test]
+fn same_tick_pairs_a_direct_write_with_a_nested_one() {
+    // Two genuinely co-executing writes, one at the top of the handler and one
+    // inside a callback. Comparing block ids across the two CFGs answered
+    // `false` for both.
+    let both =
+        stale_pair("setCount(count + 1); xs.forEach((x) => { if (x) { setCount(count + x); } });");
+    assert_eq!(both.len(), 2, "{both:?}");
+}
+
+#[test]
+fn same_tick_follows_a_loop_inside_a_called_helper() {
+    // The loop lives in the helper's CFG, and the site is attributed to the
+    // caller's block — so the back edge is only visible where the loop is.
+    let src = r#"
+        function C({ n }) {
+            const [count, setCount] = useState(0);
+            const bumpAll = () => { for (let i = 0; i < n; i++) { setCount(count + 1); } };
+            const onClick = () => { bumpAll(); };
+            return <button onClick={onClick}>{count}</button>;
+        }
+    "#;
+    assert_eq!(run_pack(STALE_PAIR_PACK, src, &Options::new()).len(), 1);
+}
+
+#[test]
+fn same_tick_is_symmetric_so_source_order_does_not_decide() {
+    // Co-execution does not care which write runs first. Forward reachability
+    // alone put the fact on the earlier row only, so a pair whose offending
+    // write came second was lost — the same program firing or not purely by
+    // the order its lines were written.
+    let late = stale_pair(
+        "setCount((c) => c + 1); setCount((c) => c + 1); if (flag) { setCount(count + 1); }",
+    );
+    assert_eq!(
+        late.len(),
+        1,
+        "the non-functional write comes last: {late:?}"
+    );
+
+    let early = stale_pair("if (flag) { setCount(count + 1); } setCount((c) => c + 1);");
+    assert_eq!(
+        early.len(),
+        1,
+        "the same program, written the other way: {early:?}"
+    );
+}
+
+#[test]
+fn a_helper_called_twice_is_one_row_that_co_executes() {
+    // The walk pulls the helper's inner write in once per call site, and both
+    // copies name the same source span: one write, reached twice. Emitting it
+    // twice was a duplicate diagnostic on one line.
+    let src = r#"
+        function C() {
+            const [count, setCount] = useState(0);
+            const bump = () => { setCount(count + 1); };
+            const onClick = () => { bump(); bump(); };
+            return <button onClick={onClick}>{count}</button>;
+        }
+    "#;
+    let got = run_pack(STALE_PAIR_PACK, src, &Options::new());
+    assert_eq!(got.len(), 1, "one row, and it does co-execute: {got:?}");
+}
+
+#[test]
+fn mutually_exclusive_branches_still_do_not_pair() {
+    // The block-id collision used to invent a pair across an early return and
+    // an `else` path. Keying on the region block removes it; what fires here
+    // is the `forEach` write on its own, which genuinely repeats.
+    let src = r#"
+        function C({ a, items }) {
+            const [count, setCount] = useState(0);
+            const bump = () => {
+                if (a) { setCount(count + 1); return; }
+                items.forEach((x) => { if (x) { setCount(count + x); } });
+            };
+            return <button onClick={bump}>{count}</button>;
+        }
+    "#;
+    let got = run_pack(STALE_PAIR_PACK, src, &Options::new());
+    assert_eq!(got.len(), 1, "only the repeating write: {got:?}");
+
+    let no_hof = run_pack(
+        STALE_PAIR_PACK,
+        r#"
+        function C({ a }) {
+            const [count, setCount] = useState(0);
+            const bump = () => {
+                if (a) { setCount(count + 1); return; }
+                setCount(count + 2);
+            };
+            return <button onClick={bump}>{count}</button>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(
+        no_hof.is_empty(),
+        "two exclusive branches never pair: {no_hof:?}"
+    );
+}
+
+#[test]
+fn functional_is_not_claimed_for_a_name_a_nested_closure_reassigns() {
+    // `Functional` sits on a suppression path, so it takes the strong
+    // certificate. `fn_binding_in` does not scan nested bodies, so a name a
+    // callback reassigns still read as the function it was first bound to —
+    // deleting the finding on two genuinely non-functional writes.
+    let src = r#"
+        function C({ xs }) {
+            const [count, setCount] = useState(0);
+            const onClick = () => {
+                let inc = (c) => c + 1;
+                xs.forEach(() => { inc = count + 1; });
+                setCount(inc);
+                setCount(inc);
+            };
+            return <button onClick={onClick}>{count}</button>;
+        }
+    "#;
+    let got = run_pack(STALE_PAIR_PACK, src, &Options::new());
+    assert_eq!(
+        got.len(),
+        2,
+        "`inc` is a number by the time it is passed: {got:?}"
+    );
+}
+
+#[test]
+fn a_memoized_updater_is_a_proven_function() {
+    // A `useCallback` result is as proven a function literal as an inline one.
+    // Reading it as ⊤ fired the non-functional rule on correct code.
+    let src = r#"
+        function C() {
+            const [count, setCount] = useState(0);
+            const inc = useCallback((c) => c + 1, []);
+            const bump = () => { setCount(inc); setCount(inc); };
+            return <button onClick={bump}>{count}</button>;
+        }
+    "#;
+    let got = run_pack(STALE_PAIR_PACK, src, &Options::new());
+    assert!(got.is_empty(), "a memoized updater is functional: {got:?}");
+}

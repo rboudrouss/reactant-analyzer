@@ -678,10 +678,12 @@ fn catalogue() -> Vec<Entry> {
                     "import { useState } from \"react\";\nfunction C() {\n  const [count, setCount] = useState(0);\n  const bump = () => { setCount((c) => c + 1); setCount((c) => c + 1); };\n  return <button onClick={bump}>{count}</button>;\n}",
                 ),
                 weakened: Some(
-                    "same-tick pairs are proven within one Sync region only — a write in a \
-                     deferred continuation or another handler carries no block id and never \
-                     pairs, and a post-await write still reads as sync (the IR gate recorded \
-                     in ADR-027 §2), so the async half of #61 is not covered. `functional` is \
+                    "same-tick pairs are read within one region only — two writes in one \
+                     deferred continuation are a genuine pair the relation cannot see at all, \
+                     since a non-sync row carries no block to reason about; a write in \
+                     another handler is correctly not a pair, being another tick; and a \
+                     post-await write still reads as sync (the IR gate recorded in ADR-027 \
+                     §2), so the async half of #61 is not covered. `functional` is \
                      claimed only for an inline `FnLit` or a variable bound exactly once to \
                      one, so a shape the walk cannot resolve fires — the may direction. A \
                      shape-functional updater that ignores its `prev` parameter and reads the \

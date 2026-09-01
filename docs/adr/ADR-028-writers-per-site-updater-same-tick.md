@@ -118,11 +118,15 @@ nothing.
 - `updater_body` — a total mirror of the purity classifier. An updater the
   walk cannot resolve to a literal has no body and answers ⊤, so the
   unresolved case never fires.
-- `same_tick` — **no value field at all**. Reachability is exact on the CFG, but
-  the walk that found the writes is depth-capped, so "no other write is
-  reachable" is not a promise the engine can keep. There is therefore no negated
-  form to assert it with, and the guard's shape enforces that rather than a
-  validator rule spelling it out.
+- `same_tick` — **no value field at all**. The negative is unstatable for two
+  reasons, and the weaker one is not the depth cap: the *relation itself* is a
+  may-relation. The walk resolves calls only as far as it can, so a write it
+  never placed cannot contradict a `false`, and a write it placed by
+  attribution rather than by CFG position (a helper's inner site) carries its
+  caller's block, not its own. "No other write can co-execute" is therefore
+  never a promise the engine keeps. There is no negated form to assert it with,
+  and the guard's shape enforces that rather than a validator rule spelling it
+  out.
 
 None touches the `proofs` vector, so none mints `Certified`.
 
@@ -136,9 +140,23 @@ None touches the `proofs` vector, so none mints `Certified`.
   resolve is ⊤. The failure direction is over-reporting on `unknown`.
 - **`same_tick: true` is a may-claim** — the two writes are CFG-reachable, which
   does not mean both execute. That is the tolerated direction for a rule that
-  fires on it. `false` is *not* published as a claim, because the depth cap
-  means an unseen write could contradict it; the missing negated form is what
-  makes that unstatable rather than merely undocumented.
+  fires on it. `false` is *not* published as a claim: an unseen or
+  attribution-placed write could contradict it, and the missing negated form is
+  what makes that unstatable rather than merely undocumented.
+- **The reachability key is the region block, never the site block.**
+  `BlockId` is per-CFG, so a site inside a nested body records a block of
+  *that* body's CFG; resolving it in the region CFG answers about an unrelated
+  block, which invents pairs across mutually exclusive branches as readily as
+  it loses real ones. `prov_block` — the top-level block the walk descended
+  from — is the only id that means anything in the region.
+- **Co-execution is symmetric**, so the fact is reachability in either
+  direction. Forward reachability alone put it on the earlier row only, and a
+  pair whose offending write came second was lost: the same program firing or
+  not by the order its lines happen to be written.
+- **A write a loop or a sync HOF repeats co-executes with itself**, with no CFG
+  cycle in the region to show for it. That is a per-block property of whichever
+  CFG the loop lives in — the caller's, or a helper's the walk pulled in — so
+  it is read where the block is, not where the row is attributed.
 - **Severity is capped at Warning by #61's own gate**, restated: batching
   semantics are React-version-dependent, so the class gets no must primitive and
   no Error path.
