@@ -95,8 +95,14 @@ and now has one home, beside the two binding *certificates* that strengthen it.
 - **Row multiplication is monotone.** A slot with three seeding props has three
   rows; the native rule folds them existentially exactly as it folded the
   in-place vector, so nothing that matched stops matching.
-- **The native output is byte-identical on all fourteen corpora**, verified by
-  building the pre-migration commit in a worktree and diffing the findings.
+- **The native output matched on all fourteen corpora**, verified by building
+  the pre-migration commit in a worktree and diffing the findings — but that was
+  ONE run per side, and the analyzer turned out not to be run-to-run
+  deterministic (#120: a true-positive `frozen-initial-state` finding on mantine
+  appears in roughly one run in six). The §3 defect and its fix stand on their
+  own regression test, which fails without the fix; the corpus comparison is
+  weaker evidence than this ADR first claimed, and #120 carries the obligation
+  to re-run it once the nondeterminism is fixed.
 
 ## Consequences
 
