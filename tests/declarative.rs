@@ -1693,3 +1693,114 @@ fn cleanup_guard_is_effect_anchors_only() {
     ));
     assert!(e.message.contains("`is` / `not`"), "{e}");
 }
+
+// ── The `jsx_props` anchor (#102, #71 step 2) ────────────────────────────────
+
+#[test]
+fn jsx_props_anchor_reads_the_identity_of_any_prop() {
+    let pack = r#"{"schemaVersion":1,"name":"t","rules":[
+        {"id":"fresh-prop","docs":{"description":"d","why":"w","fix":"f"},
+         "severity":"warning",
+         "anchor":{"relation":"jsx_props"},
+         "guards":[{"kind":"name","of":"anchor","one_of":["Row"]},
+                   {"kind":"identity","of":"anchor","is":["fresh-every-render"]}],
+         "message":"{anchor.prop} on {anchor.name} is {anchor.identity}"}]}"#;
+
+    // An inline object literal: a new reference on every render.
+    let fired = run_pack(
+        pack,
+        r#"
+        function C({ items }) {
+            return <Row style={{ margin: 0 }} items={items} onPick={() => {}} />;
+        }
+        "#,
+        &Options::new(),
+    );
+    let msgs: Vec<&str> = fired.iter().map(|d| d.message.as_str()).collect();
+    assert!(
+        msgs.contains(&"`style` on `Row` is fresh-every-render"),
+        "{msgs:?}"
+    );
+    // Every prop is a row, so the inline arrow is caught by the same guard —
+    // the relation is not `value`-shaped any more.
+    assert!(
+        msgs.contains(&"`onPick` on `Row` is fresh-every-render"),
+        "{msgs:?}"
+    );
+    // …and a prop that merely forwards the parent's own value is not this
+    // component's finding.
+    assert!(!msgs.iter().any(|m| m.starts_with("`items`")), "{msgs:?}");
+
+    // Memoized: identity survives, so the rule is silent.
+    let silent = run_pack(
+        pack,
+        r#"
+        import { useMemo } from "react";
+        function C({ items }) {
+            const style = useMemo(() => ({ margin: 0 }), []);
+            return <Row style={style} items={items} />;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(silent.is_empty(), "{silent:?}");
+
+    // The element filter is the rule's job: an unlisted child is not reported.
+    let unlisted = run_pack(
+        pack,
+        r#"
+        function C() {
+            return <Cell style={{ margin: 0 }} />;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(unlisted.is_empty(), "{unlisted:?}");
+}
+
+#[test]
+fn jsx_props_rows_are_component_elements_only() {
+    // A host element's props are not compared across a memo boundary, and
+    // lowering already resolved it as something other than a component
+    // application — so no row, no finding (ADR-023 §1: the criterion is the
+    // resolved relation, not the tag's spelling).
+    let pack = r#"{"schemaVersion":1,"name":"t","rules":[
+        {"id":"any-fresh","docs":{"description":"d","why":"w","fix":"f"},
+         "severity":"warning",
+         "anchor":{"relation":"jsx_props"},
+         "guards":[{"kind":"identity","of":"anchor","is":["fresh-every-render"]}],
+         "message":"{anchor.prop} on {anchor.name}"}]}"#;
+    let host = run_pack(
+        pack,
+        r#"
+        function C() {
+            return <div style={{ margin: 0 }} />;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(host.is_empty(), "{host:?}");
+}
+
+#[test]
+fn jsx_props_is_kindless_and_edgeless() {
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"jsx_props","kind":"state"},"message":"m"}"#,
+    ));
+    assert!(e.message.contains("kind"), "{e}");
+
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"jsx_props"},
+            "forEach":{"edge":"writers","as":"w"},"message":"m"}"#,
+    ));
+    assert!(e.message.contains("JSX prop"), "{e}");
+
+    // `prop` belongs to this relation alone.
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"context_providers"},"message":"{anchor.prop}"}"#,
+    ));
+    assert!(e.message.contains("prop"), "{e}");
+}

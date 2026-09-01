@@ -24,7 +24,9 @@
 //! `identity` guard) → 9/22 (the deferred writer phase, already shipped
 //! by ADR-027 §2, proves the weakened `async-set-state-race`) → **10/22**
 //! (the `cleanup` guard, a total mirror of the teardown verdict the native
-//! rule already computes).
+//! rule already computes) → **11/22** (the `jsx_props` anchor: the provider
+//! relation's walk and identity verdict, generalized to every prop of every
+//! resolved element).
 //! The count assertion at the bottom is the measure; update it only by
 //! flipping entries.
 
@@ -267,6 +269,25 @@ const PUTSTATE_CONFORMANT: &[(&str, &str)] = &[
     ),
 ];
 
+const JSX_PROP_PACK: &str = r#"{
+  "schemaVersion": 1, "name": "cat-jsx",
+  "rules": [{
+    "id": "fresh-prop-on-memo-child",
+    "docs": {
+      "description": "a memoized child is handed a fresh reference every render",
+      "why": "the prop defeats the child's memo boundary — it re-renders on every parent render",
+      "fix": "memoize the value, or hoist it out of the component"
+    },
+    "severity": "warning",
+    "anchor": { "relation": "jsx_props" },
+    "guards": [
+      { "kind": "name", "of": "anchor", "one_of": ["Row"] },
+      { "kind": "identity", "of": "anchor", "is": ["fresh-every-render"] }
+    ],
+    "message": "{anchor.prop} on {anchor.name} is {anchor.identity}"
+  }]
+}"#;
+
 const CLEANUP_PACK: &str = r#"{
   "schemaVersion": 1, "name": "cat-cleanup",
   "rules": [{
@@ -374,10 +395,24 @@ fn catalogue() -> Vec<Entry> {
         },
         Entry {
             id: "identity-keyed-jsx-prop",
-            status: Status::Blocked {
-                class: "expression-position",
-                missing: "jsx_props sink generalized from the `value` prop to any prop \
-                          (planned step: JSX props as a sink)",
+            status: Status::Expressible {
+                pack_json: JSX_PROP_PACK,
+                rule: "cat-jsx/fresh-prop-on-memo-child",
+                fires_on: Fixture::Single(
+                    "function C({ items }) {\n  return <Row style={{ margin: 0 }} items={items} />;\n}",
+                ),
+                silent_on: Fixture::Single(
+                    "import { useMemo } from \"react\";\nfunction C({ items }) {\n  const style = useMemo(() => ({ margin: 0 }), []);\n  return <Row style={style} items={items} />;\n}",
+                ),
+                weakened: Some(
+                    "the relation states the identity fact and nothing about memoization: \
+                     which children actually memoize is unknown here, so the rule must name \
+                     them (the `name` guard) — an unlisted memo child is a missed finding. \
+                     Render-body elements only, and an element built inside an inline arrow \
+                     is missed (#30, kept: the alternative confuses it with the memoized \
+                     shape); a rebound or parent-owned prop value reads Unknown and stays \
+                     silent",
+                ),
             },
         },
         Entry {
@@ -619,9 +654,11 @@ fn catalogue() -> Vec<Entry> {
 /// `identity` guard (#71, ADR-027 §8) → 9/22 after the deferred writer phase
 /// proved the weakened `async-set-state-race` (#99 — no engine change: the
 /// vocabulary shipped with ADR-027 §2) → 10/22 after the `cleanup` guard
-/// exposed the teardown verdict the native rule already computes (#100).
+/// exposed the teardown verdict the native rule already computes (#100) →
+/// 11/22 after the `jsx_props` anchor generalized the provider relation to
+/// every prop of every resolved element (#102, closing #71 step 2).
 /// Flip an entry (rule + fixtures), then update this constant.
-const EXPRESSIBLE_NOW: usize = 10;
+const EXPRESSIBLE_NOW: usize = 11;
 
 #[test]
 fn catalogue_is_pinned_at_22_entries() {

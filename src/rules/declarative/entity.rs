@@ -24,6 +24,7 @@ use crate::ir::types::{BlockId, HookLabel, Var};
 use crate::rules::api::query::{
     Certified, CleanupVerdict, ConditionalHookCall, ExitDominance, RuleCtx,
 };
+use crate::rules::helpers::jsx::{JsxPropSite, collect_jsx_prop_sites};
 use crate::rules::helpers::providers::{ProviderSite, ValueIdentity, collect_provider_sites};
 use crate::rules::{
     ReturnsVerdict, SetterCall, StabilityVerdict, all_setter_labels, collect_setter_calls,
@@ -78,6 +79,8 @@ pub(crate) enum EntityVal<'a, 'b> {
     Writer(&'a SlotWriter),
     /// One proven context-provider element (#71).
     Provider(&'b ProviderSite<'a>),
+    /// One prop of one resolved component element (#71 step 2).
+    JsxProp(&'b JsxPropSite<'a>),
 }
 
 // ── Per-component index ───────────────────────────────────────────────────────
@@ -165,6 +168,12 @@ impl<'a> EntityCtx<'a> {
     /// body, deterministic order (the relation sorts by site).
     pub fn provider_rows(&self) -> Vec<ProviderSite<'a>> {
         collect_provider_sites(self.comp)
+    }
+
+    /// `jsx_props` rows: every prop of every resolved component element in the
+    /// render body, deterministic order (the relation sorts by site).
+    pub fn jsx_prop_rows(&self) -> Vec<JsxPropSite<'a>> {
+        collect_jsx_prop_sites(self.comp)
     }
 
     // ── Edges ─────────────────────────────────────────────────────────────────
@@ -318,7 +327,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Arg(_)
                 | EntityVal::Origin(_)
                 | EntityVal::Writer(_)
-                | EntityVal::Provider(_) => None,
+                | EntityVal::Provider(_)
+                | EntityVal::JsxProp(_) => None,
             },
             Field::Name => match v {
                 // A custom hook is called by its own name; every other kind is
@@ -334,6 +344,7 @@ impl<'a> EntityCtx<'a> {
                 // inlining). A provider's name is its context binding.
                 EntityVal::Origin(p) => Some(p.origin_hook.clone()),
                 EntityVal::Provider(p) => Some(crate::ir::source_name(p.context).to_string()),
+                EntityVal::JsxProp(j) => Some(j.element.to_string()),
                 EntityVal::Setter(_)
                 | EntityVal::Dep(_)
                 | EntityVal::Arg(_)
@@ -352,7 +363,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Dep(_)
                 | EntityVal::Arg(_)
                 | EntityVal::Writer(_)
-                | EntityVal::Provider(_) => None,
+                | EntityVal::Provider(_)
+                | EntityVal::JsxProp(_) => None,
             },
             Field::Slot => match v {
                 EntityVal::Setter(s) => s.slot.and_then(|l| self.slot_source_name(l)),
@@ -361,7 +373,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Dep(_)
                 | EntityVal::Arg(_)
                 | EntityVal::Origin(_)
-                | EntityVal::Provider(_) => None,
+                | EntityVal::Provider(_)
+                | EntityVal::JsxProp(_) => None,
             },
             Field::Setter => match v {
                 EntityVal::Setter(s) => Some(crate::ir::source_name(&s.var).to_string()),
@@ -370,7 +383,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Dep(_)
                 | EntityVal::Arg(_)
                 | EntityVal::Origin(_)
-                | EntityVal::Provider(_) => None,
+                | EntityVal::Provider(_)
+                | EntityVal::JsxProp(_) => None,
             },
             Field::Path => match v {
                 EntityVal::Dep(d) => d.path.as_ref().map(|p| p.to_string()),
@@ -379,7 +393,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Arg(_)
                 | EntityVal::Origin(_)
                 | EntityVal::Writer(_)
-                | EntityVal::Provider(_) => None,
+                | EntityVal::Provider(_)
+                | EntityVal::JsxProp(_) => None,
             },
             Field::Stability => match v {
                 EntityVal::Dep(d) => Some(verdict_word(self.dep_verdict(d)).to_string()),
@@ -388,7 +403,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Arg(_)
                 | EntityVal::Origin(_)
                 | EntityVal::Writer(_)
-                | EntityVal::Provider(_) => None,
+                | EntityVal::Provider(_)
+                | EntityVal::JsxProp(_) => None,
             },
             Field::Returns => match v {
                 EntityVal::Arg(a) => Some(returns_word(self.arg_verdict(a)).to_string()),
@@ -397,7 +413,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Dep(_)
                 | EntityVal::Origin(_)
                 | EntityVal::Writer(_)
-                | EntityVal::Provider(_) => None,
+                | EntityVal::Provider(_)
+                | EntityVal::JsxProp(_) => None,
             },
             Field::Region => match v {
                 EntityVal::Writer(w) => Some(w.region.word().to_string()),
@@ -406,7 +423,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Dep(_)
                 | EntityVal::Arg(_)
                 | EntityVal::Origin(_)
-                | EntityVal::Provider(_) => None,
+                | EntityVal::Provider(_)
+                | EntityVal::JsxProp(_) => None,
             },
             Field::Phase => match v {
                 EntityVal::Writer(w) => Some(phase_word(w.phase).to_string()),
@@ -415,7 +433,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Dep(_)
                 | EntityVal::Arg(_)
                 | EntityVal::Origin(_)
-                | EntityVal::Provider(_) => None,
+                | EntityVal::Provider(_)
+                | EntityVal::JsxProp(_) => None,
             },
             Field::Via => match v {
                 EntityVal::Writer(w) => Some(match &w.via {
@@ -432,16 +451,28 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Dep(_)
                 | EntityVal::Arg(_)
                 | EntityVal::Origin(_)
-                | EntityVal::Provider(_) => None,
+                | EntityVal::Provider(_)
+                | EntityVal::JsxProp(_) => None,
             },
             Field::Identity => match v {
                 EntityVal::Provider(p) => Some(identity_word(p.identity).to_string()),
+                EntityVal::JsxProp(j) => Some(identity_word(j.identity).to_string()),
                 EntityVal::Hook(_)
                 | EntityVal::Setter(_)
                 | EntityVal::Dep(_)
                 | EntityVal::Arg(_)
                 | EntityVal::Origin(_)
                 | EntityVal::Writer(_) => None,
+            },
+            Field::Prop => match v {
+                EntityVal::JsxProp(j) => Some(j.prop.to_string()),
+                EntityVal::Hook(_)
+                | EntityVal::Setter(_)
+                | EntityVal::Dep(_)
+                | EntityVal::Arg(_)
+                | EntityVal::Origin(_)
+                | EntityVal::Writer(_)
+                | EntityVal::Provider(_) => None,
             },
             Field::Cleanup => match v {
                 EntityVal::Hook(row) => Some(cleanup_word(self.cleanup(row)).to_string()),
@@ -450,7 +481,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Arg(_)
                 | EntityVal::Origin(_)
                 | EntityVal::Writer(_)
-                | EntityVal::Provider(_) => None,
+                | EntityVal::Provider(_)
+                | EntityVal::JsxProp(_) => None,
             },
         }
     }
@@ -472,7 +504,7 @@ impl<'a> EntityCtx<'a> {
             | Field::Identity
             | Field::Cleanup => raw.unwrap_or_else(|| anonymous(v)),
             // Source identifiers are quoted, verdict words are not.
-            Field::Name | Field::Slot | Field::Setter | Field::Path => match raw {
+            Field::Name | Field::Slot | Field::Setter | Field::Path | Field::Prop => match raw {
                 Some(s) => format!("`{s}`"),
                 None => anonymous(v),
             },
@@ -522,6 +554,7 @@ fn anonymous(v: &EntityVal<'_, '_>) -> String {
         EntityVal::Origin(p) => format!("`{}`", p.origin_hook),
         EntityVal::Writer(w) => format!("`{}`", crate::ir::source_name(&w.setter)),
         EntityVal::Provider(p) => format!("`{}.Provider`", crate::ir::source_name(p.context)),
+        EntityVal::JsxProp(j) => format!("`{}` of `<{}>`", j.prop, j.element),
     }
 }
 

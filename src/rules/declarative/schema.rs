@@ -130,6 +130,12 @@ pub enum Anchor {
     /// recomputations. Edge-less in v1; the any-prop generalisation rides
     /// this same relation later.
     ContextProviders,
+    /// Every prop of every resolved component element in the render body
+    /// (#71 step 2). Kind-less and edge-less; `name` is the element, `prop`
+    /// the prop's name, `identity` the value's identity verdict. Host
+    /// elements (`<div/>`) produce no rows — lowering resolved them as
+    /// something other than a component application.
+    JsxProps,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

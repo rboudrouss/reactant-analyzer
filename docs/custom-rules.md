@@ -128,6 +128,7 @@ chemins (`must_*` = certifié), émettre le finding.
 | `hook_origins` | Chaque ligne de provenance : tout appel de hook dont l'identité est résolue, **y compris** ceux que l'inlining a dissous. C'est l'ancre des règles d'identité (bannir un hook, imposer un wrapper) : contrairement à `hook_calls` + `kind: "custom"`, elle voit aussi les hooks que le moteur a résolus. Sans `kind`, sans arête ; `name` = nom d'origine du hook, `source` = spécificateur d'import brut. |
 
 | `context_providers` | Chaque élément `<Ctx.Provider value={…}>` du corps du render dont `Ctx` est un `createContext` prouvé au niveau module (#71). Render-only par sémantique (un provider construit dans un `useMemo` garde son identité). `name` = le binding du contexte, `identity` = le verdict d'identité de la value. Sans `kind`, sans arête. |
+| `jsx_props` | Chaque prop de chaque **élément composant résolu** du corps du render (#71 étape 2). Les éléments hôtes (`<div/>`) ne produisent aucune ligne. `name` = l'élément, `prop` = le nom de la prop, `identity` = le verdict d'identité de sa valeur — le même que celui de la relation provider. Quels enfants mémoïsent est inconnu ici : nommez-les avec une garde `name`. Sans `kind`, sans arête. |
 
 Il n'y a volontairement aucune ancre syntaxique (pas de « tout appel de
 fonction », pas de pattern AST) : une règle inexprimable sémantiquement est
@@ -158,7 +159,7 @@ Guards filtrants (le finding reste plafonné Warning) :
 | `returns` | Ce que *retourne* un argument-fonction d'un hook custom (un sélecteur de store qui retourne une référence fraîche vs un primitif). | Exactement un de `is` / `not`, parmi `stable`, `fresh-reference`, `unknown`. |
 | `origin` | Provenance d'un appel de hook : identité résolue (`useLayoutEffect` même atteint via un alias) et/ou appel direct dans le composant vs via un hook wrapper inliné. | Au moins un de `hook` (liste de noms) / `direct` (bool). Une ligne sans provenance échoue. |
 | `in_deps` | Le slot écrit par le setter figure dans les deps de l'ancre. | `negate` optionnel. |
-| `identity` | Verdict d'identité de la value d'une ligne `context_providers` : `fresh-every-render` (référence neuve à chaque render, un must-fait) ou `unknown` (⊤, jamais actionnable). | Exactement un de `is` / `not`, liste non vide. |
+| `identity` | Verdict d'identité de la value d'une ligne `context_providers` ou de la prop d'une ligne `jsx_props` : `fresh-every-render` (référence neuve à chaque render, un must-fait) ou `unknown` (⊤, jamais actionnable). | Exactement un de `is` / `not`, liste non vide. |
 | `cleanup` | Verdict de teardown du corps d'une ancre `effect` : `absent` (toutes les sorties ne renvoient rien — le seul côté prouvé), `present`, ou `unknown` (⊤, replié du côté may : ne se lit jamais comme une absence). Ne dit rien de ce que l'effet enregistre — à la règle de se restreindre. | Exactement un de `is` / `not`, liste non vide. Ancres `kind: "effect"` uniquement. |
 | `provenance` | Provenance d'une ligne `writers` : écriture directe (`direct`) ou atteinte via des wrappers inlinés nommés (`through`, matché n'importe où dans la chaîne, sur les noms EXPORTÉS — un import aliasé n'y échappe pas). Une ligne non plaçable échoue les deux formes. | Au moins un de `through` (liste) / `direct` (bool). |
 | `writer_phases` | Existentiel MAY sur les écrivains du slot d'une ancre `state` : passe si une écriture du slot *peut* tourner dans une des phases nommées. Une écriture ⊤ (`unknown`) satisfait toute requête — supprimer un finding sur un may-fait serait un faux négatif. Positif seulement, pas de forme niée. | `includes`, liste non vide parmi `render`, `effect`, `memo`, `callback`, `handler`, `deferred` (timer/microtask/continuation de promesse — prouvé hors de toute phase React), `cleanup` (fonction retournée d'un effect), `unknown`. |
@@ -237,6 +238,7 @@ option inconnue rejette le pack ou la config (exit 2) avec une erreur précise.
 | Appel de hook (ancre `hook_calls`) | `kind`, `name` (nom du hook custom, ou variable liée), `source` (spécificateur d'import, `unknown` si absent) |
 | Ligne de provenance (ancre `hook_origins`) | `name` (nom d'origine du hook), `source` (spécificateur d'import, `unknown` si absent) |
 | Provider (`context_providers`) | `name` (binding du contexte), `identity` (le verdict, en mots) |
+| Prop JSX (`jsx_props`) | `name` (l'élément), `prop` (le nom de la prop), `identity` (le verdict, en mots) |
 | Écrivain (`writers`) | `slot`, `setter`, `region` (corps lexical, exact), `phase` (verdict MAY, `unknown` = ⊤), `via` (chaîne de wrappers `outer → inner`, ou `direct` / `unknown`) |
 | Setter (`render_setter_calls`, `body_setter_calls`) | `slot` (le state écrit), `setter` (le nom du setter) |
 | Dep (`deps`) | `path`, `stability` (le verdict, en mots) |

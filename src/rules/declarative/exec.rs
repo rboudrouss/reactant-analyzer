@@ -29,6 +29,7 @@ use super::schema::{EdgeName, ElseBehavior, SeverityPin};
 use super::validate::{
     BindRef, CountCmp, MustKind, ResolvedAnchor, ResolvedGuard, ResolvedRule, Segment,
 };
+use crate::rules::helpers::jsx::JsxPropSite;
 use crate::rules::helpers::providers::ProviderSite;
 
 pub(crate) struct TierARule {
@@ -80,20 +81,27 @@ enum Candidate<'a, 'b> {
     Origin(&'a crate::ir::hooks::HookProvenance),
     /// One `context_providers` row (#71) — edge-less in v1.
     Provider(&'b ProviderSite<'a>),
+    JsxProp(&'b JsxPropSite<'a>),
 }
 
 impl<'a, 'b> Candidate<'a, 'b> {
     fn row(&self) -> Option<&'b HookRow<'a>> {
         match self {
             Candidate::Hook { row, .. } => Some(row),
-            Candidate::RenderSetter(_) | Candidate::Origin(_) | Candidate::Provider(_) => None,
+            Candidate::RenderSetter(_)
+            | Candidate::Origin(_)
+            | Candidate::Provider(_)
+            | Candidate::JsxProp(_) => None,
         }
     }
 
     fn bound(&self) -> Option<&Bound<'a, 'b>> {
         match self {
             Candidate::Hook { bound, .. } => bound.as_ref(),
-            Candidate::RenderSetter(_) | Candidate::Origin(_) | Candidate::Provider(_) => None,
+            Candidate::RenderSetter(_)
+            | Candidate::Origin(_)
+            | Candidate::Provider(_)
+            | Candidate::JsxProp(_) => None,
         }
     }
 
@@ -104,6 +112,7 @@ impl<'a, 'b> Candidate<'a, 'b> {
             (BindRef::Anchor, Candidate::RenderSetter(s)) => EntityVal::Setter(s),
             (BindRef::Anchor, Candidate::Origin(p)) => EntityVal::Origin(p),
             (BindRef::Anchor, Candidate::Provider(p)) => EntityVal::Provider(p),
+            (BindRef::Anchor, Candidate::JsxProp(j)) => EntityVal::JsxProp(j),
             (BindRef::Bound, _) => match self.bound().expect("validated: binding exists") {
                 Bound::Setter(s) => EntityVal::Setter(s),
                 Bound::Dep(d) => EntityVal::Dep(d),
@@ -119,7 +128,7 @@ impl<'a, 'b> Candidate<'a, 'b> {
             Candidate::Hook { row, .. } => Some(row.info.label),
             Candidate::RenderSetter(s) => s.slot,
             Candidate::Origin(p) => Some(p.label),
-            Candidate::Provider(_) => None,
+            Candidate::Provider(_) | Candidate::JsxProp(_) => None,
         }
     }
 
@@ -138,6 +147,7 @@ impl<'a, 'b> Candidate<'a, 'b> {
             // so there is no `hook_calls` row to borrow a range from.
             Candidate::Origin(p) => p.span,
             Candidate::Provider(p) => p.span,
+            Candidate::JsxProp(j) => j.span,
         }
     }
 }
@@ -227,6 +237,11 @@ impl Rule for TierARule {
             ResolvedAnchor::ContextProviders => {
                 for site in e.provider_rows() {
                     self.eval(&e, &Candidate::Provider(&site), &mut out);
+                }
+            }
+            ResolvedAnchor::JsxProps => {
+                for site in e.jsx_prop_rows() {
+                    self.eval(&e, &Candidate::JsxProp(&site), &mut out);
                 }
             }
         }
@@ -321,10 +336,13 @@ impl TierARule {
                 prefix,
             } => text_matches(e.field_raw(&cand.entity_at(*of), *field), one_of, prefix),
             ResolvedGuard::Identity { of, names, negated } => {
-                let EntityVal::Provider(p) = cand.entity_at(*of) else {
-                    unreachable!("validated: `identity` binds a provider element")
+                // Both JSX relations carry the one shared verdict.
+                let identity = match cand.entity_at(*of) {
+                    EntityVal::Provider(p) => p.identity,
+                    EntityVal::JsxProp(j) => j.identity,
+                    _ => unreachable!("validated: `identity` binds a JSX element or prop"),
                 };
-                names.contains(&identity_name(p.identity)) != *negated
+                names.contains(&identity_name(identity)) != *negated
             }
             ResolvedGuard::Cleanup { of, names, negated } => {
                 // Validated: `of` binds a kind-pinned effect anchor, so the
@@ -439,7 +457,10 @@ impl TierARule {
             MustKind::DominatesAllExits => {
                 let setter = match cand {
                     Candidate::RenderSetter(s) => s,
-                    Candidate::Hook { .. } | Candidate::Origin(_) | Candidate::Provider(_) => {
+                    Candidate::Hook { .. }
+                    | Candidate::Origin(_)
+                    | Candidate::Provider(_)
+                    | Candidate::JsxProp(_) => {
                         unreachable!("validated: `must_dominates_all_exits` binds a render setter")
                     }
                 };

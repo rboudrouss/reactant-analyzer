@@ -40,6 +40,7 @@ Numbers like #67 below are issues on the analyzer's tracker, at
 | `hook_origins` | Every provenance row: each hook call whose identity resolved, INCLUDING calls that inlining dissolved. The anchor for identity rules (ban a hook, enforce a wrapper). No `kind`, no edges; `name` is the origin hook's name, `source` its raw import specifier |
 
 | `context_providers` | Every `<Ctx.Provider value={…}>` element in the render body whose `Ctx` is a module-level `createContext` proven by import (#71). Render-only by semantics (a `useMemo`-built provider keeps identity). `name` is the context binding, `identity` the value's identity verdict. No `kind`, no edges |
+| `jsx_props` | Every prop of every **resolved component element** in the render body (#71 step 2). Host elements (`<div/>`) produce no rows. `name` is the element, `prop` the prop's name, `identity` its value's identity verdict — the same verdict the provider relation uses. Which children memoize is unknown, so name them with a `name` guard. No `kind`, no edges |
 
 `kind: "custom"` matches only the hooks the engine could NOT resolve (#6):
 a resolved hook loses its `custom` row to inlining. Identity rules go on
@@ -67,7 +68,7 @@ Filtering guards, where the finding stays capped at Warning:
 | `returns` | What a hook's function argument returns, such as a store selector handing back a fresh reference instead of a primitive | Exactly one of `is` or `not`, from `stable`, `fresh-reference`, `unknown` |
 | `origin` | Where a hook call comes from. The resolved identity, so `useLayoutEffect` matches even through an alias, and whether the component calls it directly or reaches it through an inlined wrapper hook | At least one of `hook` (names) or `direct` (bool). A call with no known provenance fails |
 | `in_deps` | The slot the setter writes appears in the anchor's deps | optional `negate` |
-| `identity` | Identity verdict of a `context_providers` row's value: `fresh-every-render` (a new reference on every render — a proven fact) or `unknown` (⊤, never actionable) | Exactly one of `is` / `not`, non-empty |
+| `identity` | Identity verdict of a `context_providers` row's value or a `jsx_props` row's prop: `fresh-every-render` (a new reference on every render — a proven fact) or `unknown` (⊤, never actionable) | Exactly one of `is` / `not`, non-empty |
 | `cleanup` | Teardown verdict of an `effect` anchor's own body: `absent` (every exit returns nothing — the one proven side), `present`, or `unknown` (⊤, folds to may-have-cleanup, so it never reads as an absence). Says nothing about whether the effect registers anything — scope the rule yourself | Exactly one of `is` / `not`, non-empty. `kind: "effect"` anchors only |
 | `provenance` | Provenance of a `writers` row: caller-authored (`direct`) or reached through named inlined wrappers (`through`, matched anywhere in the chain against EXPORTED names — an aliased import does not escape). An unplaceable row fails both forms | At least one of `through` (list) / `direct` (bool) |
 | `writer_phases` | MAY existential over a state anchor's slot writers: passes when some write of the slot may run in one of the named phases. A ⊤ (`unknown`) write satisfies every query — suppressing on a may-fact would be a false negative. Positive-only, no negated form | `includes`, non-empty, from `render`, `effect`, `memo`, `callback`, `handler`, `deferred` (timer/microtask/promise continuation — proved outside every React phase), `cleanup` (an effect's returned function), `unknown` |
@@ -119,6 +120,7 @@ lists the fields the entity actually carries.
 | Hook call (`hook_calls`) | `kind`, `name` (custom hook name, or the bound variable), `source` (import specifier, `unknown` when absent) |
 | Provenance row (`hook_origins`) | `name` (the origin hook's name), `source` (import specifier, `unknown` when absent) |
 | Provider (`context_providers`) | `name` (context binding), `identity` (the verdict, in words) |
+| JSX prop (`jsx_props`) | `name` (the element), `prop` (the prop's name), `identity` (the verdict, in words) |
 | Writer (`writers`) | `slot`, `setter`, `region` (lexical body, exact), `phase` (MAY verdict, `unknown` = ⊤), `via` (wrapper chain `outer → inner`, or `direct` / `unknown`) |
 | Setter (`render_setter_calls`, `body_setter_calls`) | `slot`, `setter` |
 | Dep (`deps`) | `path`, `stability` |

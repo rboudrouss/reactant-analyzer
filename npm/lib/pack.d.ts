@@ -42,6 +42,8 @@ export type Anchor = {
   "relation": "hook_origins";
 } | {
   "relation": "context_providers";
+} | {
+  "relation": "jsx_props";
 };
 
 /**

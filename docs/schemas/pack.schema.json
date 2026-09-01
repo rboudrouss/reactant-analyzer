@@ -99,6 +99,19 @@
           "required": [
             "relation"
           ]
+        },
+        {
+          "description": "Every prop of every resolved component element in the render body\n(#71 step 2). Kind-less and edge-less; `name` is the element, `prop`\nthe prop's name, `identity` the value's identity verdict. Host\nelements (`<div/>`) produce no rows — lowering resolved them as\nsomething other than a component application.",
+          "type": "object",
+          "properties": {
+            "relation": {
+              "type": "string",
+              "const": "jsx_props"
+            }
+          },
+          "required": [
+            "relation"
+          ]
         }
       ]
     },

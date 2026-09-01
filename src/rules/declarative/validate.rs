@@ -78,6 +78,8 @@ pub(crate) enum Sort {
     Writer,
     /// One proven context-provider element (#71).
     Provider,
+    /// One prop of one resolved component element (#71 step 2).
+    JsxProp,
 }
 
 impl Sort {
@@ -92,6 +94,7 @@ impl Sort {
             Sort::HookOrigin => "a resolved hook origin row".into(),
             Sort::Writer => "a slot writer".into(),
             Sort::Provider => "a context-provider element".into(),
+            Sort::JsxProp => "a JSX prop of a component element".into(),
         }
     }
 }
@@ -238,6 +241,7 @@ pub(crate) enum Field {
     Via,
     Identity,
     Cleanup,
+    Prop,
 }
 
 impl Field {
@@ -258,6 +262,7 @@ impl Field {
         Field::Via,
         Field::Identity,
         Field::Cleanup,
+        Field::Prop,
     ];
 
     /// The name authors write: `{anchor.<token>}`.
@@ -276,6 +281,7 @@ impl Field {
             Field::Via => "via",
             Field::Identity => "identity",
             Field::Cleanup => "cleanup",
+            Field::Prop => "prop",
         }
     }
 
@@ -293,7 +299,8 @@ impl Field {
                 | Sort::Arg
                 | Sort::HookOrigin
                 | Sort::Writer
-                | Sort::Provider => false,
+                | Sort::Provider
+                | Sort::JsxProp => false,
             },
             // Effects and handlers are the two kinds with nothing to call them;
             // an any-kind anchor is admitted and falls back per row.
@@ -311,7 +318,7 @@ impl Field {
                 // `name` is the origin hook's name (`useLayoutEffect` even
                 // through an alias), never a binding variable. A provider's
                 // `name` is the context binding.
-                Sort::HookOrigin | Sort::Provider => true,
+                Sort::HookOrigin | Sort::Provider | Sort::JsxProp => true,
                 Sort::SetterRender | Sort::SetterBody | Sort::Dep | Sort::Arg | Sort::Writer => {
                     false
                 }
@@ -329,13 +336,19 @@ impl Field {
                 | Sort::Dep
                 | Sort::Arg
                 | Sort::Writer
-                | Sort::Provider => false,
+                | Sort::Provider
+                | Sort::JsxProp => false,
             },
             // A writer row is setter-shaped: it names the slot it writes and
             // the setter variable at the call site.
             Field::Slot | Field::Setter => match sort {
                 Sort::SetterRender | Sort::SetterBody | Sort::Writer => true,
-                Sort::Hook(_) | Sort::Dep | Sort::Arg | Sort::HookOrigin | Sort::Provider => false,
+                Sort::Hook(_)
+                | Sort::Dep
+                | Sort::Arg
+                | Sort::HookOrigin
+                | Sort::Provider
+                | Sort::JsxProp => false,
             },
             // `stability` stays a deps-entry fact: reading it for a call-site
             // argument is the program-point error ADR-023 §2 refuses — this
@@ -348,7 +361,8 @@ impl Field {
                 | Sort::Arg
                 | Sort::HookOrigin
                 | Sort::Writer
-                | Sort::Provider => false,
+                | Sort::Provider
+                | Sort::JsxProp => false,
             },
             Field::Returns => match sort {
                 Sort::Arg => true,
@@ -358,7 +372,8 @@ impl Field {
                 | Sort::Dep
                 | Sort::HookOrigin
                 | Sort::Writer
-                | Sort::Provider => false,
+                | Sort::Provider
+                | Sort::JsxProp => false,
             },
             // `region` is the lexical body (exact); `phase` the MAY verdict;
             // `via` the wrapper chain (or `direct` / `unknown`).
@@ -370,10 +385,13 @@ impl Field {
                 | Sort::Dep
                 | Sort::Arg
                 | Sort::HookOrigin
-                | Sort::Provider => false,
+                | Sort::Provider
+                | Sort::JsxProp => false,
             },
+            // Both JSX relations answer it, through the one shared
+            // `site_identity` reader.
             Field::Identity => match sort {
-                Sort::Provider => true,
+                Sort::Provider | Sort::JsxProp => true,
                 Sort::Hook(_)
                 | Sort::SetterRender
                 | Sort::SetterBody
@@ -381,6 +399,17 @@ impl Field {
                 | Sort::Arg
                 | Sort::HookOrigin
                 | Sort::Writer => false,
+            },
+            Field::Prop => match sort {
+                Sort::JsxProp => true,
+                Sort::Hook(_)
+                | Sort::SetterRender
+                | Sort::SetterBody
+                | Sort::Dep
+                | Sort::Arg
+                | Sort::HookOrigin
+                | Sort::Writer
+                | Sort::Provider => false,
             },
             // Teardown is a property of an effect's own body: React honours a
             // returned function for effects and nothing else, so the field is
@@ -394,7 +423,8 @@ impl Field {
                 | Sort::Arg
                 | Sort::HookOrigin
                 | Sort::Writer
-                | Sort::Provider => false,
+                | Sort::Provider
+                | Sort::JsxProp => false,
             },
         }
     }
@@ -412,6 +442,8 @@ pub(crate) enum ResolvedAnchor {
     RenderSetterCalls,
     HookOrigins,
     ContextProviders,
+    /// Every prop of every resolved component element (#71 step 2).
+    JsxProps,
 }
 
 /// A fully-typed, param-baked rule — the executor never sees `PVal` or raw
@@ -681,9 +713,10 @@ fn validate_rule(
         &raw_rule["anchor"],
         match def.anchor {
             Anchor::HookCalls { .. } => &["relation", "kind"],
-            Anchor::RenderSetterCalls | Anchor::HookOrigins | Anchor::ContextProviders => {
-                &["relation"]
-            }
+            Anchor::RenderSetterCalls
+            | Anchor::HookOrigins
+            | Anchor::ContextProviders
+            | Anchor::JsxProps => &["relation"],
         },
         "this anchor",
         &format!("{path}.anchor"),
@@ -693,6 +726,7 @@ fn validate_rule(
         Anchor::RenderSetterCalls => (ResolvedAnchor::RenderSetterCalls, Sort::SetterRender),
         Anchor::HookOrigins => (ResolvedAnchor::HookOrigins, Sort::HookOrigin),
         Anchor::ContextProviders => (ResolvedAnchor::ContextProviders, Sort::Provider),
+        Anchor::JsxProps => (ResolvedAnchor::JsxProps, Sort::JsxProp),
     };
 
     // forEach: at most one typed edge, one binding (ADR-022 §2).
@@ -1073,12 +1107,12 @@ fn validate_guard(
         }
         Guard::Identity { of, is, not } => {
             let (of, sort) = cx.resolve_of(of, g_path)?;
-            if sort != Sort::Provider {
+            if !matches!(sort, Sort::Provider | Sort::JsxProp) {
                 return Err(PackError::new(
                     format!("{g_path}.of"),
                     format!(
-                        "guard `identity` applies to a context-provider element, but the \
-                         subject binds {}",
+                        "guard `identity` applies to a context-provider element or a JSX \
+                         prop, but the subject binds {}",
                         sort.describe()
                     ),
                 ));
