@@ -24,7 +24,7 @@ use crate::rules::{Rule, SetterCall};
 
 use super::entity::{
     ArgEntity, DepEntity, EntityCtx, EntityVal, HookRow, SetterEntity, cleanup_name, identity_name,
-    updater_name,
+    seed_sync_name, updater_name,
 };
 use super::schema::{EdgeName, ElseBehavior, OwnershipName, SeverityPin};
 use super::validate::{
@@ -67,6 +67,7 @@ enum Bound<'a, 'b> {
     Dep(&'b DepEntity<'a>),
     Arg(&'b ArgEntity),
     Writer(&'a crate::engine::SlotWriter),
+    Seed(&'a crate::engine::SlotSeed),
 }
 
 /// One candidate under evaluation: whatever the anchor bound, plus the
@@ -127,6 +128,7 @@ impl<'a, 'b> Candidate<'a, 'b> {
                 Bound::Dep(d) => EntityVal::Dep(d),
                 Bound::Arg(a) => EntityVal::Arg(a),
                 Bound::Writer(w) => EntityVal::Writer(w),
+                Bound::Seed(s) => EntityVal::Seed(s),
             },
         }
     }
@@ -150,7 +152,7 @@ impl<'a, 'b> Candidate<'a, 'b> {
             Candidate::Hook { row, bound } => match bound {
                 Some(Bound::Setter(s)) => s.span,
                 Some(Bound::Writer(w)) => w.span.or(row.info.span),
-                Some(Bound::Dep(_) | Bound::Arg(_)) | None => row.info.span,
+                Some(Bound::Dep(_) | Bound::Arg(_) | Bound::Seed(_)) | None => row.info.span,
             },
             Candidate::RenderSetter(s) => s.span,
             // The provenance row's own call-site span: the label can dangle
@@ -209,6 +211,18 @@ impl Rule for TierARule {
                                     &Candidate::Hook {
                                         row: &row,
                                         bound: Some(Bound::Arg(&arg)),
+                                    },
+                                    &mut out,
+                                );
+                            }
+                        }
+                        Some(EdgeName::Seeds) => {
+                            for seed in e.seeds(&row) {
+                                self.eval(
+                                    &e,
+                                    &Candidate::Hook {
+                                        row: &row,
+                                        bound: Some(Bound::Seed(seed)),
                                     },
                                     &mut out,
                                 );
@@ -307,13 +321,15 @@ impl TierARule {
         match guard {
             ResolvedGuard::Stability { names, negated, .. } => match cand.bound() {
                 Some(Bound::Dep(dep)) => names.contains(&e.dep_verdict(dep)) != *negated,
-                Some(Bound::Setter(_) | Bound::Arg(_) | Bound::Writer(_)) | None => {
+                Some(Bound::Setter(_) | Bound::Arg(_) | Bound::Writer(_) | Bound::Seed(_))
+                | None => {
                     unreachable!("validated: `stability` binds a deps entry")
                 }
             },
             ResolvedGuard::Returns { names, negated, .. } => match cand.bound() {
                 Some(Bound::Arg(arg)) => names.contains(&e.arg_verdict(arg)) != *negated,
-                Some(Bound::Setter(_) | Bound::Dep(_) | Bound::Writer(_)) | None => {
+                Some(Bound::Setter(_) | Bound::Dep(_) | Bound::Writer(_) | Bound::Seed(_))
+                | None => {
                     unreachable!("validated: `returns` binds a call-site argument")
                 }
             },
@@ -386,6 +402,12 @@ impl TierARule {
                     unreachable!("validated: `updater_body` binds a writers row")
                 };
                 names.contains(&e.updater_purity(&w.updater))
+            }
+            ResolvedGuard::SeedSync { of, names } => {
+                let EntityVal::Seed(s) = cand.entity_at(*of) else {
+                    unreachable!("validated: `seed_sync` binds a seeds row")
+                };
+                names.contains(&seed_sync_name(s.sync))
             }
             ResolvedGuard::SlotOwnership { of, names } => {
                 let EntityVal::Setter(s) = cand.entity_at(*of) else {

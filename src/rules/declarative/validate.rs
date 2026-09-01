@@ -83,6 +83,8 @@ pub(crate) enum Sort {
     /// One render-loop cycle of the program churn graph, carried by an effect
     /// of this component (#108).
     ChurnCycle,
+    /// One prop seed of a state-hook anchor's slot (#106).
+    Seed,
 }
 
 impl Sort {
@@ -99,6 +101,7 @@ impl Sort {
             Sort::Provider => "a context-provider element".into(),
             Sort::JsxProp => "a JSX prop of a component element".into(),
             Sort::ChurnCycle => "a render-loop cycle".into(),
+            Sort::Seed => "a prop seed of a state slot".into(),
         }
     }
 }
@@ -226,6 +229,11 @@ pub(crate) enum ResolvedGuard {
     SameTick {
         of: BindRef,
     },
+    /// #106: whether a seed row's slot is visibly re-synced.
+    SeedSync {
+        of: BindRef,
+        names: Vec<crate::rules::declarative::schema::SeedSyncName>,
+    },
     /// #107: who owns the slot a render-setter row writes.
     SlotOwnership {
         of: BindRef,
@@ -343,7 +351,8 @@ impl Field {
                 | Sort::Writer
                 | Sort::Provider
                 | Sort::JsxProp
-                | Sort::ChurnCycle => false,
+                | Sort::ChurnCycle
+                | Sort::Seed => false,
             },
             // Effects and handlers are the two kinds with nothing to call them;
             // an any-kind anchor is admitted and falls back per row.
@@ -368,7 +377,8 @@ impl Field {
                 | Sort::Dep
                 | Sort::Arg
                 | Sort::Writer
-                | Sort::ChurnCycle => false,
+                | Sort::ChurnCycle
+                | Sort::Seed => false,
             },
             // The import specifier is recorded on custom hook rows only.
             Field::Source => match sort {
@@ -385,7 +395,8 @@ impl Field {
                 | Sort::Writer
                 | Sort::Provider
                 | Sort::JsxProp
-                | Sort::ChurnCycle => false,
+                | Sort::ChurnCycle
+                | Sort::Seed => false,
             },
             // A writer row is setter-shaped: it names the slot it writes and
             // the setter variable at the call site.
@@ -397,13 +408,18 @@ impl Field {
                 | Sort::HookOrigin
                 | Sort::Provider
                 | Sort::JsxProp
-                | Sort::ChurnCycle => false,
+                | Sort::ChurnCycle
+                | Sort::Seed => false,
             },
             // `stability` stays a deps-entry fact: reading it for a call-site
             // argument is the program-point error ADR-023 §2 refuses — this
             // table is where the refusal is enforced.
-            Field::Path | Field::Stability => match sort {
-                Sort::Dep => true,
+            // A seed row IS a prop path; a dep entry is one too. `stability`
+            // is not shared: it is a render-exit verdict of a deps entry, and
+            // reading it for a seed would be the program-point error ADR-023
+            // §2 refuses.
+            Field::Path => match sort {
+                Sort::Dep | Sort::Seed => true,
                 Sort::Hook(_)
                 | Sort::SetterRender
                 | Sort::SetterBody
@@ -413,6 +429,19 @@ impl Field {
                 | Sort::Provider
                 | Sort::JsxProp
                 | Sort::ChurnCycle => false,
+            },
+            Field::Stability => match sort {
+                Sort::Dep => true,
+                Sort::Hook(_)
+                | Sort::SetterRender
+                | Sort::SetterBody
+                | Sort::Arg
+                | Sort::HookOrigin
+                | Sort::Writer
+                | Sort::Provider
+                | Sort::JsxProp
+                | Sort::ChurnCycle
+                | Sort::Seed => false,
             },
             Field::Returns => match sort {
                 Sort::Arg => true,
@@ -424,7 +453,8 @@ impl Field {
                 | Sort::Writer
                 | Sort::Provider
                 | Sort::JsxProp
-                | Sort::ChurnCycle => false,
+                | Sort::ChurnCycle
+                | Sort::Seed => false,
             },
             // `region` is the lexical body (exact); `phase` the MAY verdict;
             // `via` the wrapper chain (or `direct` / `unknown`).
@@ -438,7 +468,8 @@ impl Field {
                 | Sort::HookOrigin
                 | Sort::Provider
                 | Sort::JsxProp
-                | Sort::ChurnCycle => false,
+                | Sort::ChurnCycle
+                | Sort::Seed => false,
             },
             // Both JSX relations answer it, through the one shared
             // `site_identity` reader — and so does a call-site argument, read
@@ -453,7 +484,8 @@ impl Field {
                 | Sort::Dep
                 | Sort::HookOrigin
                 | Sort::Writer
-                | Sort::ChurnCycle => false,
+                | Sort::ChurnCycle
+                | Sort::Seed => false,
             },
             Field::Prop => match sort {
                 Sort::JsxProp => true,
@@ -465,7 +497,8 @@ impl Field {
                 | Sort::HookOrigin
                 | Sort::Writer
                 | Sort::Provider
-                | Sort::ChurnCycle => false,
+                | Sort::ChurnCycle
+                | Sort::Seed => false,
             },
             // Teardown is a property of an effect's own body: React honours a
             // returned function for effects and nothing else, so the field is
@@ -481,7 +514,8 @@ impl Field {
                 | Sort::Writer
                 | Sort::Provider
                 | Sort::JsxProp
-                | Sort::ChurnCycle => false,
+                | Sort::ChurnCycle
+                | Sort::Seed => false,
             },
             // Which component owns the slot the row writes (#107). Total on a
             // render-setter row: local rows answer with the anchored component
@@ -497,7 +531,8 @@ impl Field {
                 | Sort::Writer
                 | Sort::Provider
                 | Sort::JsxProp
-                | Sort::ChurnCycle => false,
+                | Sort::ChurnCycle
+                | Sort::Seed => false,
             },
             // The loop path, already node-qualified by owning component. Only
             // a cycle row has one; no other sort could invent it.
@@ -511,7 +546,8 @@ impl Field {
                 | Sort::HookOrigin
                 | Sort::Writer
                 | Sort::Provider
-                | Sort::JsxProp => false,
+                | Sort::JsxProp
+                | Sort::Seed => false,
             },
         }
     }
@@ -613,6 +649,7 @@ fn guard_allowed_keys(g: &Guard) -> (&'static str, &'static [&'static str]) {
         Guard::Updater { .. } => ("guard `updater`", &["kind", "of", "is"]),
         Guard::UpdaterBody { .. } => ("guard `updater_body`", &["kind", "of", "is"]),
         Guard::SameTick { .. } => ("guard `same_tick`", &["kind", "of"]),
+        Guard::SeedSync { .. } => ("guard `seed_sync`", &["kind", "of", "is"]),
         Guard::SlotOwnership { .. } => ("guard `slot_ownership`", &["kind", "of", "is"]),
         Guard::Cycle { .. } => (
             "guard `cycle`",
@@ -911,6 +948,19 @@ fn validate_rule(
                     ));
                 }
                 Sort::Writer
+            }
+            EdgeName::Seeds => {
+                if !matches!(anchor_sort, Sort::Hook(Some(HookKindFilter::State))) {
+                    return Err(PackError::new(
+                        format!("{fe_path}.edge"),
+                        format!(
+                            "edge `seeds` needs a state-hook anchor (the slot whose \
+                             initializer it reads), but the anchor binds {}",
+                            anchor_sort.describe()
+                        ),
+                    ));
+                }
+                Sort::Seed
             }
         };
         bound_sort = Some(element);
@@ -1366,6 +1416,26 @@ fn validate_guard(
                 ));
             }
             ResolvedGuard::SameTick { of }
+        }
+        Guard::SeedSync { of, is } => {
+            let (of, sort) = cx.resolve_of(of, g_path)?;
+            if sort != Sort::Seed {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    format!(
+                        "guard `seed_sync` applies to a `seeds` row, but the subject binds {}",
+                        sort.describe()
+                    ),
+                ));
+            }
+            let names = cx.env.resolve(is, None, &format!("{g_path}.is"))?;
+            if names.is_empty() {
+                return Err(PackError::new(
+                    format!("{g_path}.is"),
+                    "guard `seed_sync` needs at least one verdict name",
+                ));
+            }
+            ResolvedGuard::SeedSync { of, names }
         }
         Guard::SlotOwnership { of, is } => {
             let (of, sort) = cx.resolve_of(of, g_path)?;

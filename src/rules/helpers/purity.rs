@@ -15,6 +15,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::{
+    bindings::local_bindings,
     cfg::{CFG, Terminator},
     expr::Expr,
     stmt::Stmt,
@@ -106,22 +107,6 @@ pub(crate) fn classify_body(body: &CFG, setter_vars: &HashSet<Var>) -> ImpureBod
 struct Chase<'a> {
     locals: HashMap<&'a str, Vec<&'a Expr>>,
     setter_vars: &'a HashSet<Var>,
-}
-
-/// Every `let`/assignment right-hand side in `cfg`, by name — the bindings a
-/// receiver can be chased through. Nested `FnLit` bodies are deliberately not
-/// descended: a name bound inside a closure is that closure's local, not this
-/// body's.
-fn local_bindings(cfg: &CFG) -> HashMap<&str, Vec<&Expr>> {
-    let mut out: HashMap<&str, Vec<&Expr>> = HashMap::new();
-    for block in cfg.blocks.values() {
-        for stmt in &block.stmts {
-            if let Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } = stmt {
-                out.entry(var.as_str()).or_default().push(rhs);
-            }
-        }
-    }
-    out
 }
 
 impl<'a> Chase<'a> {

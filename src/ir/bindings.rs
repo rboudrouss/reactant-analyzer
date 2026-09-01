@@ -15,7 +15,28 @@
 //! Both fail closed. An unproven name is not "not a function" — it is a name
 //! whose meaning we decline to fix, so callers answer ⊤ rather than guess.
 
+use std::collections::HashMap;
+
 use crate::ir::{cfg::CFG, expr::Expr, stmt::Stmt, types::Var};
+
+/// Every `let`/assignment right-hand side in `cfg`, by name — the bindings a
+/// chase can follow. Nested `FnLit` bodies are deliberately not descended: a
+/// name bound inside a closure is that closure's local, not this body's.
+///
+/// The weakest of the three readings here, and the only one that keeps ALL of
+/// a name's right-hand sides: a consumer that needs certainty asks how many
+/// there are, one that only needs "could this be X" scans them all.
+pub fn local_bindings(cfg: &CFG) -> HashMap<&str, Vec<&Expr>> {
+    let mut map: HashMap<&str, Vec<&Expr>> = HashMap::new();
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            if let Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } = stmt {
+                map.entry(var.as_str()).or_default().push(rhs);
+            }
+        }
+    }
+    map
+}
 
 /// The params and body of the unique `FnLit` bound to `var` in `cfg`, if any.
 /// Conditional or repeated re-binding bails out (`None`): the captured

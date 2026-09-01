@@ -193,6 +193,14 @@ pub enum EdgeName {
     /// `{w.region}` is the lexical body — exact; `{w.phase}` is a MAY verdict,
     /// `unknown` = may run in any phase.
     Writers,
+    /// Prop seeds of a state-hook anchor's slot (#106, ADR-031): one row per
+    /// prop path the `useState` initializer reads. `{s.path}` is the path as
+    /// written; the `seed_sync` guard reads whether anything visibly re-syncs
+    /// the slot when that prop moves.
+    ///
+    /// A slot whose initializer reads no prop has no rows, so a rule on this
+    /// edge is silent on it by construction — that is knowledge, not a filter.
+    Seeds,
 }
 
 /// A guard: a predicate over an engine verdict. `must_*` guards certify
@@ -364,6 +372,26 @@ pub enum Guard {
     /// reachable" is not a promise the engine can keep — there is no negated
     /// form to assert it with.
     SameTick { of: String },
+    /// Whether anything visibly re-syncs a `seeds` row's slot when that prop
+    /// moves (#106): a render-time write, or an effect whose declared deps
+    /// cover the seed path (or that declares none, so it re-runs every
+    /// render).
+    ///
+    /// MAY-typed in one direction, and the guard is positive-only for exactly
+    /// that reason: `synced` is a claim the relation makes from a write it
+    /// saw, `none-seen` is the absence of one. A setter the component handed
+    /// out could be called from anywhere, so "no sync exists" is not a promise
+    /// the engine keeps — which is why the name is `none-seen` and not
+    /// `unsynced`.
+    ///
+    /// Structurally may-typed: no `must_*` guard binds a seed row, so a rule
+    /// keyed on this cannot reach Error. `must_frozen_seed` stays native and
+    /// is deliberately not exposed — it certifies a motion proof this relation
+    /// does not carry.
+    SeedSync {
+        of: String,
+        is: PVal<Vec<SeedSyncName>>,
+    },
     /// Who owns the state slot a `render_setter_calls` row writes (#107):
     /// `local` — the anchored component's own `useState` — or `foreign`, a
     /// `ComponentSetter`-valued prop the top-down inter-component pass placed
@@ -547,6 +575,18 @@ pub enum UpdaterName {
     /// ⊤ — a value expression, a call, an argument the walk could not resolve,
     /// or no argument at all.
     Unknown,
+}
+
+/// Total mirror of the seed-sync verdict (#106). Two-valued: `none-seen` is
+/// the may side and reads as an absence of evidence, never as a proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum SeedSyncName {
+    /// A write that re-runs when this prop moves was seen.
+    Synced,
+    /// None was seen. Not a proof that none exists.
+    NoneSeen,
 }
 
 /// Who owns the slot a render-setter row writes (#107). Two-valued and total:

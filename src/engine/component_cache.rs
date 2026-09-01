@@ -171,6 +171,7 @@ mod tests {
             hooks: vec![],
             hook_provenance: vec![],
             slot_writers: vec![],
+            slot_seeds: vec![],
             custom_arg_returns: HashMap::new(),
             iterations: 1,
             heap: crate::domains::stores::Heap::new(),

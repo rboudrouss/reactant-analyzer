@@ -188,6 +188,16 @@ shipped before the rows existed keeps matching exactly what it matched — chang
 what a shipped sort enumerates changes which findings fire. The owner attribution
 is may-typed, inherited from the native rule
 ([#119](https://github.com/rboudrouss/reactant-analyzer/issues/119)).)
+**→ 19/22** (2026-09-01, [#106](https://github.com/rboudrouss/reactant-analyzer/issues/106), ADR-031: the
+`slot_seeds` relation — which slots a `useState` initializer seeds from a prop,
+and whether anything visibly re-syncs them — computed at convergence beside the
+writer relation. The "prop + slot join" turned out to be a fold
+`frozen-initial-state` already computed inside its own `check`; promoting it to
+the engine gave both consumers one relation, and cost that rule ~110 lines and
+all of its scanning machinery. The migration also surfaced a real false
+negative: the render-time kill must read a write's proven *phase*, not its
+lexical region, or a callback literal written inline in render suppresses the
+finding.)
 Run
 `cargo test --test catalogue -- --nocapture` for the full blocked-entry report. What still blocks,
 in decreasing leverage: prop, provider-value and setter-argument positions carry no expression

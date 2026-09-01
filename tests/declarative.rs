@@ -3202,3 +3202,133 @@ fn slot_ownership_needs_a_render_setter_row() {
     ));
     assert!(e.message.contains("body setter call"), "{e}");
 }
+
+// ── #106: the `seeds` edge and the `seed_sync` guard ──────────────────────────
+
+const SEED_PACK: &str = r#"{
+  "schemaVersion": 1, "name": "seed",
+  "rules": [{
+    "id": "unsynced-seed",
+    "docs": {"description":"d","why":"w","fix":"f"},
+    "severity": "warning",
+    "anchor": { "relation": "hook_calls", "kind": "state" },
+    "forEach": { "edge": "seeds", "as": "s" },
+    "guards": [{ "kind": "seed_sync", "of": "s", "is": ["none-seen"] }],
+    "message": "{anchor.name} seeded from `{s.path}`"
+  }]
+}"#;
+
+#[test]
+fn seeds_edge_binds_the_prop_a_slot_is_seeded_from() {
+    let got = run_pack(
+        SEED_PACK,
+        r#"
+        function C({ value }) {
+            const [v, setV] = useState(value);
+            return <input value={v} onChange={(e) => setV(e.target.value)} />;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(got.len(), 1, "one seed row: {got:?}");
+    assert!(
+        got[0].message.contains("`v`") && got[0].message.contains("`value`"),
+        "{}",
+        got[0].message
+    );
+}
+
+#[test]
+fn seed_sync_is_synced_when_an_effect_covers_the_seed() {
+    let got = run_pack(
+        SEED_PACK,
+        r#"
+        function C({ value }) {
+            const [v, setV] = useState(value);
+            useEffect(() => { setV(value); }, [value]);
+            return <input value={v} />;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(got.is_empty(), "the effect re-runs on the prop: {got:?}");
+}
+
+#[test]
+fn an_effect_gated_by_an_unreadable_deps_list_is_not_a_sync() {
+    // `DepsArg::Opaque`: the hook IS gated, by a list nobody can read. That
+    // proves no sync, so it must not suppress one — the same discipline the
+    // native rule applies.
+    let got = run_pack(
+        SEED_PACK,
+        r#"
+        function C({ value, deps }) {
+            const [v, setV] = useState(value);
+            useEffect(() => { setV(value); }, deps);
+            return <input value={v} />;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(got.len(), 1, "an unreadable list proves nothing: {got:?}");
+}
+
+#[test]
+fn a_slot_with_a_prop_free_initializer_has_no_seed_rows() {
+    let got = run_pack(
+        SEED_PACK,
+        r#"
+        function C({ value }) {
+            const [v, setV] = useState(0);
+            return <input value={v} onChange={() => setV(value)} />;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(got.is_empty(), "no prop in the initializer: {got:?}");
+}
+
+#[test]
+fn seeds_needs_a_state_anchor_and_seed_sync_needs_a_seed_row() {
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},
+            "severity":"warning","anchor":{"relation":"hook_calls","kind":"effect"},
+            "forEach":{"edge":"seeds","as":"s"},"message":"m"}"#,
+    ));
+    assert_eq!(e.path, "rules[0].forEach.edge");
+    assert!(e.message.contains("state-hook anchor"), "{e}");
+
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},
+            "severity":"warning","anchor":{"relation":"hook_calls","kind":"state"},
+            "forEach":{"edge":"writers","as":"w"},
+            "guards":[{"kind":"seed_sync","of":"w","is":["synced"]}],"message":"m"}"#,
+    ));
+    assert_eq!(e.path, "rules[0].guards[0].of");
+    assert!(e.message.contains("slot writer"), "{e}");
+}
+
+#[test]
+fn no_must_guard_binds_a_seed_row_so_error_is_unreachable() {
+    // `must_frozen_seed` certifies a motion proof the relation does not carry,
+    // and is deliberately not exposed. Every shipped must-guard refuses the
+    // sort, so the Warning ceiling is structural.
+    for kind in [
+        "must_setter_on_all_paths",
+        "must_dominates_all_exits",
+        "must_init_calls_setter",
+        "must_hook_is_conditional",
+        "must_direct_write",
+    ] {
+        let e = load_err(&one_rule(&format!(
+            r#"{{"id":"r","docs":{{"description":"d","why":"w","fix":"f"}},
+                "severity":"error","anchor":{{"relation":"hook_calls","kind":"state"}},
+                "forEach":{{"edge":"seeds","as":"s"}},
+                "guards":[{{"kind":"{kind}","of":"s"}}],"message":"m"}}"#
+        )));
+        assert_eq!(
+            e.path, "rules[0].guards[0].of",
+            "`{kind}` must refuse a seed row: {e}"
+        );
+    }
+}

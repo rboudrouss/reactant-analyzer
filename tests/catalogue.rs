@@ -413,6 +413,29 @@ const LAYOUT_EFFECT_PACK: &str = r#"{
   }]
 }"#;
 
+/// #106: the `seeds` edge and the `seed_sync` guard. Positive-only and
+/// may-typed — `none-seen` is an absence of evidence, so no `must_*` guard
+/// binds a seed row and Error is unreachable through the edge.
+const SEED_PACK: &str = r#"{
+  "schemaVersion": 1, "name": "cat-seed",
+  "rules": [{
+    "id": "state-mirrors-prop-without-sync",
+    "docs": {
+      "description": "a state slot is seeded from a prop and nothing re-syncs it when the prop changes",
+      "why": "`useState` reads its initializer on the first render only. A slot seeded from a prop therefore freezes at the prop's mount-time value, and the component keeps showing it after the parent has moved on.",
+      "fix": "Pick an ownership model: read the prop directly (controlled), remount on change with a `key`, or add a deliberate syncing effect keyed on the prop.",
+      "example": "function C({ value }) { const [v, setV] = useState(value); /* nothing syncs v */ }"
+    },
+    "severity": "warning",
+    "anchor": { "relation": "hook_calls", "kind": "state" },
+    "forEach": { "edge": "seeds", "as": "s" },
+    "guards": [
+      { "kind": "seed_sync", "of": "s", "is": ["none-seen"] }
+    ],
+    "message": "state {anchor.name} is seeded from `{s.path}` and nothing re-syncs it when that prop changes"
+  }]
+}"#;
+
 /// #107: owner-qualified render-setter rows. The `slot_ownership` guard is
 /// what widens the enumeration — a pack that never names ownership binds
 /// exactly the local rows it always did.
@@ -685,9 +708,26 @@ fn catalogue() -> Vec<Entry> {
         },
         Entry {
             id: "state-mirrors-prop-without-sync",
-            status: Status::Blocked {
-                class: "joins",
-                missing: "a prop+slot join (covered natively by frozen-initial-state)",
+            status: Status::Expressible {
+                pack_json: SEED_PACK,
+                rule: "cat-seed/state-mirrors-prop-without-sync",
+                fires_on: Fixture::Single(
+                    "import { useState } from \"react\";\nfunction C({ value }) {\n  const [v, setV] = useState(value);\n  return <input value={v} onChange={(e) => setV(e.target.value)} />;\n}",
+                ),
+                silent_on: Fixture::Single(
+                    "import { useState, useEffect } from \"react\";\nfunction C({ value }) {\n  const [v, setV] = useState(value);\n  useEffect(() => { setV(value); }, [value]);\n  return <input value={v} onChange={(e) => setV(e.target.value)} />;\n}",
+                ),
+                weakened: Some(
+                    "motion-blind variant — it fires on ANY prop-seeded slot with no visible \
+                     sync, without the native rule's moving-feeder proof (is the prop actually \
+                     fed by a slot that moves?), its Info strata (seed-once naming, a slot \
+                     never written at all), or the #95 mount-coupling downgrade. More FPs at \
+                     Warning, and no Error: `must_frozen_seed` certifies a motion proof this \
+                     relation does not carry, and is deliberately not exposed. The sync fold \
+                     is syntactic (ADR-020 item 3) and `none-seen` is an absence of evidence, \
+                     never a proof — an escaped setter means something unseen may sync the \
+                     slot, and the row still reads `none-seen`",
+                ),
             },
         },
         Entry {
@@ -912,7 +952,7 @@ fn catalogue() -> Vec<Entry> {
 /// after the single-binding certificate resolved Var-bound selectors (#103) →
 /// 13/22 after the `identity` verdict reached call-site arguments (#112).
 /// Flip an entry (rule + fixtures), then update this constant.
-const EXPRESSIBLE_NOW: usize = 18;
+const EXPRESSIBLE_NOW: usize = 19;
 
 #[test]
 fn catalogue_is_pinned_at_22_entries() {

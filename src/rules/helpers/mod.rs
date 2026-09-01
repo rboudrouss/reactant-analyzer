@@ -28,7 +28,6 @@ use crate::{
     ir::{
         cfg::CFG,
         expr::Expr,
-        stmt::Stmt,
         types::{HookLabel, Symbol, Var},
     },
 };
@@ -114,17 +113,7 @@ pub(crate) fn has_hook_kind(
 /// multiple paths — a lowered ternary/logical temp is). Used to chase a
 /// call hidden behind a local binding (`const x = f(); useState(x)`), which a
 /// syntactic linter cannot follow.
-pub(crate) fn local_bindings(cfg: &CFG) -> HashMap<&str, Vec<&Expr>> {
-    let mut map: HashMap<&str, Vec<&Expr>> = HashMap::new();
-    for block in cfg.blocks.values() {
-        for stmt in &block.stmts {
-            if let Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } = stmt {
-                map.entry(var.as_str()).or_default().push(rhs);
-            }
-        }
-    }
-    map
-}
+pub(crate) use crate::ir::bindings::local_bindings;
 
 /// Like [`Expr::is_call_free`], but a `Var` bound to local temp(s) is call-free
 /// only when *every* binding is — so a call hidden behind a branch temp or a

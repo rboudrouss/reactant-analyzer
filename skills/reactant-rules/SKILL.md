@@ -27,7 +27,7 @@ answer is to say so rather than approximate it.
    is no syntactic anchor, by design.
 2. Navigation. Does it need at most one edge (`deps`, `body_setter_calls`,
    `args`) and no join between two free anchors?
-3. Predicate. Is every condition one of the 19 guards listed in
+3. Predicate. Is every condition one of the 20 guards listed in
    [REFERENCE.md](REFERENCE.md)?
 4. Scope. Is it single-component? A pack cannot express a rule that spans a
    parent and its child.
@@ -121,5 +121,5 @@ Propose the next step. Run the new rule over the real codebase, report what it
 catches, and hand the resulting findings to the triage procedure in the
 `reactant-triage` skill.
 
-Full syntax, meaning anchors, edges, the 19 guards, the 5 `must_*`
+Full syntax, meaning anchors, edges, the 20 guards, the 5 `must_*`
 certifiers, params and message fields, is in [REFERENCE.md](REFERENCE.md).

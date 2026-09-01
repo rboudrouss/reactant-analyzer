@@ -15,7 +15,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::domains::StateValue;
 use crate::engine::setters::WriteProvenance;
-use crate::engine::{AnalysisResult, EffectInfo, HookCallInfo, HookKind, SlotWriter, WriterPhase};
+use crate::engine::{
+    AnalysisResult, EffectInfo, HookCallInfo, HookKind, SeedSync, SlotSeed, SlotWriter, WriterPhase,
+};
 use crate::ir::SourceRange;
 use crate::ir::expr::Expr;
 use crate::ir::free_vars::{AccessPath, dep_paths};
@@ -35,7 +37,7 @@ use crate::rules::{
 };
 
 use super::schema::{
-    HookKindFilter, ImpureName, PhaseName, ReturnsName, StabilityName, UpdaterName,
+    HookKindFilter, ImpureName, PhaseName, ReturnsName, SeedSyncName, StabilityName, UpdaterName,
 };
 use super::validate::Field;
 use crate::rules::helpers::purity::{ImpureBody, classify_body};
@@ -97,6 +99,8 @@ pub(crate) enum EntityVal<'a, 'b> {
     JsxProp(&'b JsxPropSite<'a>),
     /// One render-loop cycle carried by this component's effects (#108).
     Cycle(&'b CycleRow),
+    /// One prop seed of a state-hook anchor's slot (#106).
+    Seed(&'a SlotSeed),
 }
 
 // ── Per-component index ───────────────────────────────────────────────────────
@@ -329,6 +333,14 @@ impl<'a> EntityCtx<'a> {
             .collect()
     }
 
+    /// `seeds`: the anchor slot's prop seeds, in the relation's (already
+    /// deterministic) order. Computed at convergence and stored on the
+    /// component, so the native `frozen-initial-state` rule and this edge read
+    /// one relation (#106, ADR-031).
+    pub fn seeds(&self, row: &HookRow<'a>) -> Vec<&'a SlotSeed> {
+        self.comp.seeds_of(row.info.label).collect()
+    }
+
     /// `args`: call-site arguments of a custom-hook anchor, in call order.
     /// Only the anchor's row identity travels — the verdict of what a
     /// function-valued argument returns was computed during the fixpoint
@@ -419,7 +431,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Writer(_)
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
-                | EntityVal::Cycle(_) => None,
+                | EntityVal::Cycle(_)
+                | EntityVal::Seed(_) => None,
             },
             Field::Name => match v {
                 // A custom hook is called by its own name; every other kind is
@@ -440,7 +453,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Dep(_)
                 | EntityVal::Arg(_)
                 | EntityVal::Writer(_)
-                | EntityVal::Cycle(_) => None,
+                | EntityVal::Cycle(_)
+                | EntityVal::Seed(_) => None,
             },
             // The import specifier, and only that: `resolved_file` is an
             // absolute path, so printing or matching it would make a pack's
@@ -457,7 +471,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Writer(_)
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
-                | EntityVal::Cycle(_) => None,
+                | EntityVal::Cycle(_)
+                | EntityVal::Seed(_) => None,
             },
             Field::Slot => match v {
                 EntityVal::Setter(s) => self.setter_slot_name(s),
@@ -468,7 +483,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Origin(_)
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
-                | EntityVal::Cycle(_) => None,
+                | EntityVal::Cycle(_)
+                | EntityVal::Seed(_) => None,
             },
             Field::Setter => match v {
                 EntityVal::Setter(s) => Some(crate::ir::source_name(&s.var).to_string()),
@@ -479,10 +495,13 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Origin(_)
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
-                | EntityVal::Cycle(_) => None,
+                | EntityVal::Cycle(_)
+                | EntityVal::Seed(_) => None,
             },
+            // A seed row IS a prop path, and so is a deps entry.
             Field::Path => match v {
                 EntityVal::Dep(d) => d.path.as_ref().map(|p| p.to_string()),
+                EntityVal::Seed(s) => Some(s.path.to_string()),
                 EntityVal::Hook(_)
                 | EntityVal::Setter(_)
                 | EntityVal::Arg(_)
@@ -501,7 +520,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Writer(_)
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
-                | EntityVal::Cycle(_) => None,
+                | EntityVal::Cycle(_)
+                | EntityVal::Seed(_) => None,
             },
             Field::Returns => match v {
                 EntityVal::Arg(a) => Some(returns_word(self.arg_verdict(a)).to_string()),
@@ -512,7 +532,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Writer(_)
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
-                | EntityVal::Cycle(_) => None,
+                | EntityVal::Cycle(_)
+                | EntityVal::Seed(_) => None,
             },
             Field::Region => match v {
                 EntityVal::Writer(w) => Some(w.region.word().to_string()),
@@ -523,7 +544,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Origin(_)
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
-                | EntityVal::Cycle(_) => None,
+                | EntityVal::Cycle(_)
+                | EntityVal::Seed(_) => None,
             },
             Field::Phase => match v {
                 EntityVal::Writer(w) => Some(phase_word(w.phase).to_string()),
@@ -534,7 +556,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Origin(_)
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
-                | EntityVal::Cycle(_) => None,
+                | EntityVal::Cycle(_)
+                | EntityVal::Seed(_) => None,
             },
             Field::Via => match v {
                 EntityVal::Writer(w) => Some(match &w.via {
@@ -553,7 +576,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Origin(_)
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
-                | EntityVal::Cycle(_) => None,
+                | EntityVal::Cycle(_)
+                | EntityVal::Seed(_) => None,
             },
             Field::Identity => match v {
                 EntityVal::Provider(p) => Some(identity_word(p.identity).to_string()),
@@ -564,7 +588,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Dep(_)
                 | EntityVal::Origin(_)
                 | EntityVal::Writer(_)
-                | EntityVal::Cycle(_) => None,
+                | EntityVal::Cycle(_)
+                | EntityVal::Seed(_) => None,
             },
             Field::Prop => match v {
                 EntityVal::JsxProp(j) => Some(j.prop.to_string()),
@@ -575,7 +600,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Origin(_)
                 | EntityVal::Writer(_)
                 | EntityVal::Provider(_)
-                | EntityVal::Cycle(_) => None,
+                | EntityVal::Cycle(_)
+                | EntityVal::Seed(_) => None,
             },
             Field::Cleanup => match v {
                 EntityVal::Hook(row) => Some(cleanup_word(self.cleanup(row)).to_string()),
@@ -586,7 +612,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Writer(_)
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
-                | EntityVal::Cycle(_) => None,
+                | EntityVal::Cycle(_)
+                | EntityVal::Seed(_) => None,
             },
             // Which component owns the slot the row writes: this one for a
             // local setter, the parent for a `ComponentSetter`-valued prop.
@@ -603,7 +630,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Writer(_)
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
-                | EntityVal::Cycle(_) => None,
+                | EntityVal::Cycle(_)
+                | EntityVal::Seed(_) => None,
             },
             // The loop path: node names are already qualified and quoted by
             // the shared `node_display`, so this one is rendered bare.
@@ -616,7 +644,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Origin(_)
                 | EntityVal::Writer(_)
                 | EntityVal::Provider(_)
-                | EntityVal::JsxProp(_) => None,
+                | EntityVal::JsxProp(_)
+                | EntityVal::Seed(_) => None,
             },
         }
     }
@@ -729,6 +758,7 @@ fn anonymous(v: &EntityVal<'_, '_>) -> String {
         EntityVal::Provider(p) => format!("`{}.Provider`", crate::ir::source_name(p.context)),
         EntityVal::JsxProp(j) => format!("`{}` of `<{}>`", j.prop, j.element),
         EntityVal::Cycle(c) => format!("the loop through effect #{}", c.effect),
+        EntityVal::Seed(s) => format!("`{}`", s.path),
     }
 }
 
@@ -793,6 +823,14 @@ impl<'a> EntityCtx<'a> {
             ImpureBody::Impure => ImpureName::Impure,
             ImpureBody::Unknown => ImpureName::Unknown,
         }
+    }
+}
+
+/// Total mirror of the seed-sync verdict (#106).
+pub(crate) fn seed_sync_name(s: SeedSync) -> SeedSyncName {
+    match s {
+        SeedSync::Synced => SeedSyncName::Synced,
+        SeedSync::NoneSeen => SeedSyncName::NoneSeen,
     }
 }
 

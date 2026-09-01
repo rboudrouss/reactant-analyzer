@@ -56,7 +56,7 @@ export type Anchor = {
  */
 export type CleanupName = "present" | "absent" | "unknown";
 
-export type EdgeName = "deps" | "body_setter_calls" | "args" | "writers";
+export type EdgeName = "deps" | "body_setter_calls" | "args" | "writers" | "seeds";
 
 /**
  * What happens to a finding whose must-guard did not certify: `keep` (the
@@ -138,6 +138,10 @@ export type Guard = {
   "of": string;
 } | {
   "kind": "same_tick";
+  "of": string;
+} | {
+  "is": PVal_Array_of_SeedSyncName;
+  "kind": "seed_sync";
   "of": string;
 } | {
   "is": PVal_Array_of_OwnershipName;
@@ -239,6 +243,10 @@ export type PVal_Array_of_ReturnsName = ReturnsName[] | {
   "$param": string;
 };
 
+export type PVal_Array_of_SeedSyncName = SeedSyncName[] | {
+  "$param": string;
+};
+
 export type PVal_Array_of_StabilityName = StabilityName[] | {
   "$param": string;
 };
@@ -328,6 +336,12 @@ export interface RuleDocs {
    */
   "why": string;
 }
+
+/**
+ * Total mirror of the seed-sync verdict (#106). Two-valued: `none-seen` is
+ * the may side and reads as an absence of evidence, never as a proof.
+ */
+export type SeedSyncName = "synced" | "none-seen";
 
 export type SeverityPin = "error" | "warning" | "info";
 

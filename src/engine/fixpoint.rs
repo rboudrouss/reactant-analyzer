@@ -588,6 +588,22 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         &inline_regions,
         &hook_provenance,
     );
+    // The seed relation rides the same slice: it folds `slot_writers` rows and
+    // the effects' declared deps, so it must come after both (#106, ADR-031).
+    let slot_seeds = {
+        let mut labels = crate::engine::setters::setter_var_labels(&render_cfg);
+        for cfg in std::iter::once(&render_cfg).chain(hooks.iter().filter_map(|h| h.body_cfg())) {
+            labels = crate::engine::setters::resolve_setter_aliases(cfg, &labels);
+        }
+        crate::engine::seeds::collect_slot_seeds(
+            &render_cfg,
+            &hooks,
+            &comp_param,
+            &labels,
+            &slot_writers,
+            &effect_info,
+        )
+    };
     let hooks_clone = hooks.clone();
 
     AnalysisResult {
@@ -612,6 +628,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         hooks: hooks_clone,
         hook_provenance,
         slot_writers,
+        slot_seeds,
         iterations: iteration,
         heap,
     }

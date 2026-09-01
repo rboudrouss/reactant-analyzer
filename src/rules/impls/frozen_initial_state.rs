@@ -1,23 +1,20 @@
 use crate::rules::RuleCtx;
-use std::collections::{HashMap, HashSet};
 
 use crate::{
     domains::StateValue,
-    engine::AnalysisResult,
+    engine::{AnalysisResult, SeedSync, SlotSeed},
     ir::{
-        cfg::CFG,
         expr::Expr,
-        free_vars::{AccessPath, collect_used_paths, dep_paths, path_covered},
-        hooks::{DepsArg, HookEntry},
+        free_vars::AccessPath,
+        hooks::HookEntry,
         types::{HookLabel, Var},
     },
 };
 
 use crate::rules::{
     Certified, Diagnostic, Motion, MovingFeeder, MustResult, Rule, Severity, Step, ValueClass,
-    all_setter_labels, classify_motion, collect_fn_bindings, collect_setter_calls,
-    collect_setter_calls_with_extra, helpers::mount::MountCoupling, local_bindings,
-    may_written_slots, must_frozen_seed, state_slot_name, state_val_labels,
+    all_setter_labels, classify_motion, helpers::mount::MountCoupling, may_written_slots,
+    must_frozen_seed, state_slot_name, state_val_labels,
 };
 
 /// Fires when a `useState` initializer reads a prop and nothing ever syncs
@@ -60,188 +57,12 @@ use crate::rules::{
 ///   adjust-state-during-render pattern (`setter-in-render` owns misuse).
 pub struct FrozenInitialState;
 
-/// `props.a.b` / `value` as a plain member chain, `None` for anything else.
-fn as_member_chain(e: &Expr) -> Option<AccessPath> {
-    match e.peel_ts() {
-        Expr::Var(v) => Some(AccessPath {
-            root: v.clone(),
-            segments: vec![],
-        }),
-        Expr::FieldAccess { obj, field } => {
-            let mut p = as_member_chain(obj)?;
-            p.segments.push(field.clone());
-            Some(p)
-        }
-        _ => None,
-    }
-}
-
-/// Rewrite `path` into props-param-rooted form(s) by chasing single-binding
-/// local chains: destructuring preambles (`let value = __p0.value`), aliases,
-/// and derived bindings (`const v = props.a ?? d` roots at `props.a`). A
-/// multi-write binding is uncertain and not chased. For a complex RHS the
-/// outer segments are dropped (wider path — safe for rootedness, and coverage
-/// against a wider path only errs toward keeping the finding).
-fn normalize_to_prop(
-    path: &AccessPath,
-    param: &Var,
-    bindings: &HashMap<&str, Vec<&Expr>>,
-    seen: &mut HashSet<Var>,
-) -> Vec<AccessPath> {
-    if path.root == *param {
-        return vec![path.clone()];
-    }
-    if !seen.insert(path.root.clone()) {
-        return vec![];
-    }
-    let Some(rhss) = bindings.get(path.root.as_str()) else {
-        return vec![];
-    };
-    let [single] = rhss.as_slice() else {
-        return vec![];
-    };
-    if let Some(base) = as_member_chain(single) {
-        let combined = AccessPath {
-            root: base.root,
-            segments: base
-                .segments
-                .into_iter()
-                .chain(path.segments.iter().cloned())
-                .collect(),
-        };
-        return normalize_to_prop(&combined, param, bindings, seen);
-    }
-    let mut sub = HashSet::new();
-    collect_used_paths(single, &mut sub);
-    let mut out = Vec::new();
-    for p in sub {
-        out.extend(normalize_to_prop(&p, param, bindings, seen));
-    }
-    out
-}
-
-/// One prop read by a `useState` initializer.
-struct SeedPath {
-    /// Path as written in source (display + env evaluation).
-    orig: AccessPath,
-    /// Props-param-rooted forms (deps-coverage matching).
-    normalized: Vec<AccessPath>,
-}
-
 /// `initialValue` / `defaultTab` — the prop's own name declares seed-once
 /// intent (uncontrolled-with-default idiom).
 fn is_seed_named(p: &AccessPath) -> bool {
     let name = p.segments.last().map(String::as_str).unwrap_or(&p.root);
     let lower = name.to_ascii_lowercase();
     lower.starts_with("initial") || lower.starts_with("default")
-}
-
-/// `true` when some declared dep covers `seed` — matched on the syntactic
-/// path AND on the props-rooted normal forms of both sides, so `[value]`,
-/// `[props.value]` and `[props]` all cover a seed read as `value`.
-fn deps_cover_seed(
-    deps: &[Expr],
-    seed: &SeedPath,
-    param: &Var,
-    bindings: &HashMap<&str, Vec<&Expr>>,
-) -> bool {
-    let declared = dep_paths(deps);
-    let mut declared_norm: Vec<AccessPath> = Vec::new();
-    for d in &declared {
-        declared_norm.extend(normalize_to_prop(d, param, bindings, &mut HashSet::new()));
-    }
-    if path_covered(&seed.orig, &declared) {
-        return true;
-    }
-    seed.normalized
-        .iter()
-        .any(|n| path_covered(n, &declared_norm))
-}
-
-/// `true` when an alias of the slot's setter is used anywhere outside a
-/// direct call or a pure alias binding — passed as a prop, stored in an
-/// object, handed to an opaque call. An escaped setter means something we
-/// cannot see may sync the slot, so the no-sync claim loses certainty.
-fn setter_escapes(comp: &AnalysisResult<StateValue>, aliases: &HashSet<Var>) -> bool {
-    fn in_expr(e: &Expr, aliases: &HashSet<Var>) -> bool {
-        match e {
-            Expr::Var(v) => aliases.contains(v),
-            Expr::Call { fn_, args } => {
-                let callee_is_alias = matches!(fn_.peel_ts(), Expr::Var(v) if aliases.contains(v));
-                (!callee_is_alias && in_expr(fn_, aliases))
-                    || args.iter().any(|a| in_expr(a, aliases))
-            }
-            Expr::FnLit {
-                params, body_cfg, ..
-            } => {
-                // Params shadow same-named outer bindings inside the body.
-                let inner: HashSet<Var> = aliases
-                    .iter()
-                    .filter(|a| !params.contains(a))
-                    .cloned()
-                    .collect();
-                !inner.is_empty() && in_cfg(body_cfg, &inner)
-            }
-            other => {
-                let mut found = false;
-                other.for_each_child(&mut |c| found = found || in_expr(c, aliases));
-                found
-            }
-        }
-    }
-    fn in_cfg(cfg: &CFG, aliases: &HashSet<Var>) -> bool {
-        use crate::ir::{cfg::Terminator, stmt::Stmt};
-        cfg.blocks.values().any(|block| {
-            block.stmts.iter().any(|stmt| match stmt {
-                // `let s2 = s1` where both sides are known aliases is the
-                // alias chain itself, not an escape.
-                Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } => match rhs.peel_ts() {
-                    Expr::Var(v) if aliases.contains(v) => !aliases.contains(var),
-                    _ => in_expr(rhs, aliases),
-                },
-                Stmt::MemberWrite { obj, key, rhs, .. } => {
-                    in_expr(obj, aliases)
-                        || matches!(key, crate::ir::stmt::MemberKey::Index(i) if in_expr(i, aliases))
-                        || in_expr(rhs, aliases)
-                }
-                Stmt::ExprStmt(e, _) => in_expr(e, aliases),
-            }) || match &block.term {
-                Terminator::Return(e) | Terminator::Branch { cond: e, .. } => in_expr(e, aliases),
-                _ => false,
-            }
-        })
-    }
-    let cfgs =
-        std::iter::once(&comp.render_cfg).chain(comp.hooks.iter().filter_map(|h| h.body_cfg()));
-    for cfg in cfgs {
-        if in_cfg(cfg, aliases) {
-            return true;
-        }
-    }
-    // Custom-hook args and state/ref initializers can smuggle the setter too.
-    comp.hooks.iter().any(|h| match h {
-        HookEntry::Custom { args, .. } => args.iter().any(|a| in_expr(a, aliases)),
-        HookEntry::State { init, .. } | HookEntry::Ref { init, .. } => {
-            !matches!(init.peel_ts(), Expr::StateSetter(_)) && in_expr(init, aliases)
-        }
-        _ => false,
-    })
-}
-
-/// Prop paths read by a `useState` initializer, `None`-equivalent (empty)
-/// when the initializer is prop-free.
-fn seed_paths(init: &Expr, param: &Var, bindings: &HashMap<&str, Vec<&Expr>>) -> Vec<SeedPath> {
-    let mut used = HashSet::new();
-    collect_used_paths(init, &mut used);
-    let mut seeds: Vec<SeedPath> = used
-        .into_iter()
-        .filter_map(|orig| {
-            let normalized = normalize_to_prop(&orig, param, bindings, &mut HashSet::new());
-            (!normalized.is_empty()).then_some(SeedPath { orig, normalized })
-        })
-        .collect();
-    seeds.sort_by_key(|s| s.orig.to_string());
-    seeds
 }
 
 impl FrozenInitialState {
@@ -256,12 +77,7 @@ impl Rule for FrozenInitialState {
     fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
         let (result, component) = (ctx.program(), ctx.component());
         let comp = result.components.get(component)?;
-        let bindings = local_bindings(&comp.render_cfg);
-        let applicable = comp.hooks.iter().any(|h| {
-            matches!(h, HookEntry::State { init, .. }
-                if !seed_paths(init, &comp.param, &bindings).is_empty())
-        });
-        applicable.then_some(crate::rules::SafeCheck {
+        (!comp.slot_seeds.is_empty()).then_some(crate::rules::SafeCheck {
             rule: Self::NAME,
             message: "no state slot freezes a changing prop's first value",
         })
@@ -271,61 +87,30 @@ impl Rule for FrozenInitialState {
         let (result, component) = (ctx.program(), ctx.component());
         let comp = &result.components[component];
         let render_cfg = &comp.render_cfg;
-        let bindings = local_bindings(render_cfg);
         let setter_labels = all_setter_labels(comp);
         let state_labels = state_val_labels(render_cfg);
-        let render_fns = collect_fn_bindings(render_cfg);
         let locally_written = may_written_slots(render_cfg, &comp.hooks, &setter_labels);
         let name_of = |l: HookLabel| state_slot_name(l, &state_labels);
 
         let mut diags = Vec::new();
 
         for hook in &comp.hooks {
-            let HookEntry::State { label, init, span } = hook else {
+            let HookEntry::State { label, span, .. } = hook else {
                 continue;
             };
-            let seeds = seed_paths(init, &comp.param, &bindings);
+            // The seed and sync halves come from the engine relation (#106,
+            // ADR-031): the rule no longer runs its own scan of either. What
+            // stays here is everything the relation deliberately does not
+            // carry — the moving-feeder proof, the Info strata, and the #95
+            // mount-coupling downgrade.
+            let seeds: Vec<&SlotSeed> = comp.seeds_of(*label).collect();
             if seeds.is_empty() {
                 continue;
             }
-
-            let slot_setters: HashSet<Var> = setter_labels
-                .iter()
-                .filter(|(_, l)| **l == *label)
-                .map(|(v, _)| v.clone())
-                .collect();
-
-            // Render-time write: the adjust-state-during-render pattern —
-            // a sync path exists (misuse belongs to `setter-in-render`).
-            if !collect_setter_calls(render_cfg, &slot_setters, 2).is_empty() {
-                continue;
-            }
-
-            // Effect sync: an effect that may write the slot AND re-runs when
-            // the prop changes (deps cover the seed path, or no deps array).
-            let synced = comp.hooks.iter().any(|h| {
-                let HookEntry::Effect { body_cfg, deps, .. } = h else {
-                    return false;
-                };
-                if collect_setter_calls_with_extra(body_cfg, &slot_setters, 2, &render_fns)
-                    .is_empty()
-                {
-                    return false;
-                }
-                match deps {
-                    DepsArg::Absent => true, // re-runs every render
-                    // Gated by a list the engine cannot read: it proves no
-                    // sync, so it must not suppress one.
-                    DepsArg::Opaque => false,
-                    // A flattened spread declares its elements, not its
-                    // source, so crediting the source as covering the seed
-                    // would suppress on a coverage nobody wrote.
-                    DepsArg::List(deps) => seeds
-                        .iter()
-                        .any(|s| deps_cover_seed(&deps.covering(), s, &comp.param, &bindings)),
-                }
-            });
-            if synced {
+            // A render-time write, or an effect that re-runs when this prop
+            // moves: a sync path exists. Its quality is `derived-state`'s
+            // business, and the render-time case belongs to `setter-in-render`.
+            if seeds.iter().any(|s| s.sync == SeedSync::Synced) {
                 continue;
             }
 
@@ -340,7 +125,7 @@ impl Rule for FrozenInitialState {
             // moving seed reads the props object itself (`useState(props)`):
             // no single prop carries it, so no call site can prove anything.
             let mut moving_props: Option<Vec<Var>> = Some(Vec::new());
-            let note_moving = |seed: &SeedPath, moving_props: &mut Option<Vec<Var>>| {
+            let note_moving = |seed: &SlotSeed, moving_props: &mut Option<Vec<Var>>| {
                 let Some(names) = moving_props else { return };
                 for n in &seed.normalized {
                     match n.segments.first() {
@@ -353,8 +138,8 @@ impl Rule for FrozenInitialState {
                 }
             };
             for seed in &seeds {
-                let mut expr = Expr::Var(seed.orig.root.clone());
-                for seg in &seed.orig.segments {
+                let mut expr = Expr::Var(seed.path.root.clone());
+                for seg in &seed.path.segments {
                     expr = Expr::FieldAccess {
                         obj: Box::new(expr),
                         field: seg.clone(),
@@ -364,17 +149,17 @@ impl Rule for FrozenInitialState {
                 match classify_motion(&val, result) {
                     Motion::Still => continue,
                     Motion::Proven(proof) => {
-                        all_seed_named &= is_seed_named(&seed.orig);
+                        all_seed_named &= is_seed_named(&seed.path);
                         note_moving(seed, &mut moving_props);
                         if proven.is_none() {
-                            proven = Some((seed.orig.to_string(), proof));
+                            proven = Some((seed.path.to_string(), proof));
                         }
                     }
                     Motion::Unproven => {
-                        all_seed_named &= is_seed_named(&seed.orig);
+                        all_seed_named &= is_seed_named(&seed.path);
                         note_moving(seed, &mut moving_props);
                         if unproven_path.is_none() {
-                            unproven_path = Some(seed.orig.to_string());
+                            unproven_path = Some(seed.path.to_string());
                         }
                     }
                 }
@@ -397,7 +182,9 @@ impl Rule for FrozenInitialState {
                 None => MountCoupling::Free,
             };
 
-            let escaped = setter_escapes(comp, &slot_setters);
+            // Every row of one slot carries the same escape verdict — it is a
+            // property of the setter, not of the seed.
+            let escaped = seeds[0].setter_escapes;
             let slot_name = name_of(*label);
 
             let (mut severity, message, proven_evidence) = match (&proven, &unproven_path) {

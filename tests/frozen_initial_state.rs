@@ -772,3 +772,60 @@ fn nested_seed_guarded_mount_downgrades_to_info() {
         "nested guard must still count: {d:?}"
     );
 }
+
+// ── #106: the seed relation, and what it must NOT read as a sync ─────────────
+
+#[test]
+fn a_callback_literal_written_in_render_is_not_a_render_time_write() {
+    // The seed relation folds the slot-writer rows, and `region` is LEXICAL: a
+    // callback literal handed to a call in the render body puts a write in the
+    // render CFG without putting one in the render phase (the row's phase is
+    // ⊤). Reading region here suppressed the finding — a false negative, found
+    // on mantine's `use-provider-color-scheme` during the migration.
+    let src = r#"
+import { useState } from 'react';
+export function Parent() {
+  const [scheme, setScheme] = useState('auto');
+  return <div onClick={() => setScheme('dark')}><Child defaultScheme={scheme} /></div>;
+}
+function Child({ defaultScheme }) {
+  const [value, setValue] = useState(defaultScheme);
+  subscribe((v) => { setValue(v); });
+  return <div>{value}</div>;
+}
+"#;
+    let diags = diags_for(src, "Child");
+    assert_eq!(
+        diags.len(),
+        1,
+        "a callback literal is not an adjust-during-render write: {diags:?}"
+    );
+    assert!(
+        diags[0].message.contains("`defaultScheme`"),
+        "{}",
+        diags[0].message
+    );
+}
+
+#[test]
+fn a_real_render_time_write_still_kills_the_finding() {
+    // The other side of the same predicate: a write that provably runs in the
+    // render phase is the sanctioned adjust-during-render pattern.
+    let src = r#"
+import { useState } from 'react';
+export function Parent() {
+  const [n, setN] = useState(0);
+  return <Child value={n} onChange={setN} />;
+}
+function Child({ value }) {
+  const [prev, setPrev] = useState(value);
+  if (prev !== value) { setPrev(value); }
+  return <div>{prev}</div>;
+}
+"#;
+    let diags = diags_for(src, "Child");
+    assert!(
+        diags.is_empty(),
+        "the render-time write is a sync path: {diags:?}"
+    );
+}

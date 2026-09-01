@@ -158,6 +158,11 @@
           "description": "Writers of a state-hook anchor's slot (ADR-027 §1, ADR-028 §1): one row\nper **call site**, spliced wrappers' setter params included. Two\n`setCount(…)` calls in one body are two rows; one write a local helper\ncontributes is one row however many times the helper is called.\n`{w.region}` is the lexical body — exact; `{w.phase}` is a MAY verdict,\n`unknown` = may run in any phase.",
           "type": "string",
           "const": "writers"
+        },
+        {
+          "description": "Prop seeds of a state-hook anchor's slot (#106, ADR-031): one row per\nprop path the `useState` initializer reads. `{s.path}` is the path as\nwritten; the `seed_sync` guard reads whether anything visibly re-syncs\nthe slot when that prop moves.\n\nA slot whose initializer reads no prop has no rows, so a rule on this\nedge is silent on it by construction — that is knowledge, not a filter.",
+          "type": "string",
+          "const": "seeds"
         }
       ]
     },
@@ -584,6 +589,27 @@
           "required": [
             "kind",
             "of"
+          ]
+        },
+        {
+          "description": "Whether anything visibly re-syncs a `seeds` row's slot when that prop\nmoves (#106): a render-time write, or an effect whose declared deps\ncover the seed path (or that declares none, so it re-runs every\nrender).\n\nMAY-typed in one direction, and the guard is positive-only for exactly\nthat reason: `synced` is a claim the relation makes from a write it\nsaw, `none-seen` is the absence of one. A setter the component handed\nout could be called from anywhere, so \"no sync exists\" is not a promise\nthe engine keeps — which is why the name is `none-seen` and not\n`unsynced`.\n\nStructurally may-typed: no `must_*` guard binds a seed row, so a rule\nkeyed on this cannot reach Error. `must_frozen_seed` stays native and\nis deliberately not exposed — it certifies a motion proof this relation\ndoes not carry.",
+          "type": "object",
+          "properties": {
+            "is": {
+              "$ref": "#/$defs/PVal_Array_of_SeedSyncName"
+            },
+            "kind": {
+              "type": "string",
+              "const": "seed_sync"
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of",
+            "is"
           ]
         },
         {
@@ -1041,6 +1067,28 @@
         }
       ]
     },
+    "PVal_Array_of_SeedSyncName": {
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SeedSyncName"
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "$param": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "$param"
+          ]
+        }
+      ]
+    },
     "PVal_Array_of_StabilityName": {
       "oneOf": [
         {
@@ -1308,6 +1356,21 @@
         "description",
         "why",
         "fix"
+      ]
+    },
+    "SeedSyncName": {
+      "description": "Total mirror of the seed-sync verdict (#106). Two-valued: `none-seen` is\nthe may side and reads as an absence of evidence, never as a proof.",
+      "oneOf": [
+        {
+          "description": "A write that re-runs when this prop moves was seen.",
+          "type": "string",
+          "const": "synced"
+        },
+        {
+          "description": "None was seen. Not a proof that none exists.",
+          "type": "string",
+          "const": "none-seen"
+        }
       ]
     },
     "SeverityPin": {

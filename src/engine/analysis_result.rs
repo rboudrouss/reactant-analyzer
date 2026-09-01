@@ -238,6 +238,12 @@ pub struct AnalysisResult<D: AbstractDomain> {
     /// Computed once at convergence over the post-expansion CFGs. Empty for
     /// hand-built IR.
     pub slot_writers: Vec<crate::engine::setters::SlotWriter>,
+    /// The slot → seeds relation (#106, ADR-031): one row per (state slot,
+    /// prop path its `useState` initializer reads), carrying a syntactic sync
+    /// verdict folded from `slot_writers` and the effects' declared deps.
+    /// Computed at convergence in the same slice as `slot_writers`. Empty for
+    /// hand-built IR.
+    pub slot_seeds: Vec<crate::engine::seeds::SlotSeed>,
     /// Number of outer fixpoint iterations before convergence.  Useful for
     /// --verbose output and for Info diagnostics about analysis depth.
     pub iterations: usize,
