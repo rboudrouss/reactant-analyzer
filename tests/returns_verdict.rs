@@ -113,13 +113,29 @@ fn param_shadowing_a_module_const_stays_unknown() {
 }
 
 #[test]
-fn var_bound_selector_is_unknown() {
-    // Not an inline FnLit → no stored value → the ⊤-total reader answers
-    // Unknown (the v1 scope: Var-bound selectors are deferred, ADR-023 §3).
+fn certified_var_bound_selector_resolves() {
+    // One `Let` of a function literal, never re-bound: the name reads like the
+    // literal (#103). No heap is consulted, so ADR-023 §3's `locs` deferral is
+    // untouched — the certificate is syntactic.
     let v = arg0_verdict(
         "function C() {\n  const sel = (s) => ({ a: s.x });\n  const x = useStore(sel);\n  return <div>{x}</div>;\n}",
     );
-    assert_eq!(v, ReturnsVerdict::Unknown);
+    assert_eq!(v, ReturnsVerdict::FreshReference);
+}
+
+#[test]
+fn uncertified_var_bound_selector_is_unknown() {
+    // A second binding, and a rebinding hidden in a hook body: both make the
+    // value at the call something other than the literal, so both fail closed.
+    let rebound = arg0_verdict(
+        "function C({ f }) {\n  let sel = (s) => ({ a: s.x });\n  if (f) { sel = (s) => s.x; }\n  const x = useStore(sel);\n  return <div>{x}</div>;\n}",
+    );
+    assert_eq!(rebound, ReturnsVerdict::Unknown);
+
+    let rebound_in_effect = arg0_verdict(
+        "import { useEffect } from \"react\";\nfunction C({ other }) {\n  let sel = (s) => ({ a: s.x });\n  useEffect(() => { sel = other; }, [other]);\n  const x = useStore(sel);\n  return <div>{x}</div>;\n}",
+    );
+    assert_eq!(rebound_in_effect, ReturnsVerdict::Unknown);
 }
 
 #[test]

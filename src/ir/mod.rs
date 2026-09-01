@@ -1,3 +1,4 @@
+pub mod bindings;
 pub mod cfg;
 pub mod component;
 pub mod expr;

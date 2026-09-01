@@ -1804,3 +1804,77 @@ fn jsx_props_is_kindless_and_edgeless() {
     ));
     assert!(e.message.contains("prop"), "{e}");
 }
+
+// ── The single-binding certificate (#103) ────────────────────────────────────
+
+#[test]
+fn a_certified_var_bound_selector_reads_like_the_literal() {
+    let pack = r#"{"schemaVersion":1,"name":"t","rules":[
+        {"id":"fresh-selector","docs":{"description":"d","why":"w","fix":"f"},
+         "severity":"warning",
+         "anchor":{"relation":"hook_calls","kind":"custom"},
+         "forEach":{"edge":"args","as":"sel"},
+         "guards":[{"kind":"name","of":"anchor","one_of":["useStore"]},
+                   {"kind":"returns","of":"sel","is":["fresh-reference"]}],
+         "message":"the selector returns {sel.returns}"}]}"#;
+
+    // One `const`, a function literal, never re-bound: reads like the literal.
+    let fired = run_pack(
+        pack,
+        r#"
+        function C() {
+            const sel = (s) => ({ a: s.items });
+            const x = useStore(sel);
+            return <div>{x}</div>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(fired.len(), 1, "{fired:?}");
+
+    // A second binding: the name no longer certainly means that literal.
+    let rebound = run_pack(
+        pack,
+        r#"
+        function C({ flag }) {
+            let sel = (s) => ({ a: s.items });
+            if (flag) { sel = (s) => s.items; }
+            const x = useStore(sel);
+            return <div>{x}</div>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(rebound.is_empty(), "{rebound:?}");
+
+    // The clause `fn_lit_binding` alone would miss: the rebinding hides in a
+    // nested body, so the value reaching the call is not this literal.
+    let rebound_below = run_pack(
+        pack,
+        r#"
+        import { useEffect } from "react";
+        function C({ other }) {
+            let sel = (s) => ({ a: s.items });
+            useEffect(() => { sel = other; }, [other]);
+            const x = useStore(sel);
+            return <div>{x}</div>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(rebound_below.is_empty(), "{rebound_below:?}");
+
+    // A selector that keeps the store's identity is not a finding either.
+    let stable = run_pack(
+        pack,
+        r#"
+        function C() {
+            const sel = (s) => s.items;
+            const x = useStore(sel);
+            return <div>{x}</div>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(stable.is_empty(), "{stable:?}");
+}

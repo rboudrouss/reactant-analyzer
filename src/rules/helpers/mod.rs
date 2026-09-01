@@ -167,24 +167,7 @@ pub(in crate::rules) fn fn_lit_binding<'c>(
     var: &str,
     cfg: &'c CFG,
 ) -> Option<(&'c [Var], &'c CFG)> {
-    let mut found: Option<(&[Var], &CFG)> = None;
-    for block in cfg.blocks.values() {
-        for stmt in &block.stmts {
-            let (Stmt::Let { var: v, rhs, .. } | Stmt::Assign { var: v, rhs, .. }) = stmt else {
-                continue;
-            };
-            if v != var {
-                continue;
-            }
-            match rhs.peel_ts() {
-                Expr::FnLit {
-                    params, body_cfg, ..
-                } if found.is_none() => found = Some((params, body_cfg)),
-                _ => return None,
-            }
-        }
-    }
-    found
+    crate::ir::bindings::fn_binding_in(var, cfg)
 }
 
 /// Every callee expression (plus rendered components/elements, which are real

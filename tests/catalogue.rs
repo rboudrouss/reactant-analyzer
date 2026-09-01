@@ -26,7 +26,9 @@
 //! (the `cleanup` guard, a total mirror of the teardown verdict the native
 //! rule already computes) → **11/22** (the `jsx_props` anchor: the provider
 //! relation's walk and identity verdict, generalized to every prop of every
-//! resolved element).
+//! resolved element) → **12/22** (the single-binding certificate: a name
+//! bound exactly once to a function literal and never re-bound below reads
+//! like the literal itself).
 //! The count assertion at the bottom is the measure; update it only by
 //! flipping entries.
 
@@ -371,7 +373,10 @@ fn catalogue() -> Vec<Entry> {
                 silent_on: Fixture::Single(
                     "function C() {\n  const x = useStore((s) => s.items);\n  return <div>{x}</div>;\n}",
                 ),
-                weakened: Some("inline FnLit selectors only; Var-bound selectors read Unknown"),
+                weakened: Some(
+                    "inline FnLit selectors, and Var-bound ones under the single-binding \
+                     certificate (#103); a rebound or imported selector reads Unknown",
+                ),
             },
         },
         Entry {
@@ -441,10 +446,23 @@ fn catalogue() -> Vec<Entry> {
         },
         Entry {
             id: "var-bound-selector",
-            status: Status::Blocked {
-                class: "expression-position",
-                missing: "heap resolution of a Var-bound selector — unsound while `locs` \
-                          never invalidates on reassignment (ADR-023 §3 recorded deferral)",
+            status: Status::Expressible {
+                pack_json: SELECTOR_PACK,
+                rule: "cat-selector/fresh-selector",
+                fires_on: Fixture::Single(
+                    "function C() {\n  const sel = (s) => ({ a: s.items });\n  const x = useStore(sel);\n  return <div>{x}</div>;\n}",
+                ),
+                silent_on: Fixture::Single(
+                    "function C({ flag }) {\n  let sel = (s) => ({ a: s.items });\n  if (flag) { sel = (s) => s.items; }\n  const x = useStore(sel);\n  return <div>{x}</div>;\n}",
+                ),
+                weakened: Some(
+                    "the single-binding certificate only: one `Let` of a function literal, \
+                     never re-bound or assigned in any nested body (#103). A reassigned, \
+                     conditionally-bound, imported or param-received selector keeps `returns` \
+                     Unknown and the guard fails closed. No heap is read, so ADR-023 §3's \
+                     `locs`-invalidation deferral is untouched — lifting it is what would \
+                     resolve the rest",
+                ),
             },
         },
         Entry {
@@ -656,9 +674,10 @@ fn catalogue() -> Vec<Entry> {
 /// vocabulary shipped with ADR-027 §2) → 10/22 after the `cleanup` guard
 /// exposed the teardown verdict the native rule already computes (#100) →
 /// 11/22 after the `jsx_props` anchor generalized the provider relation to
-/// every prop of every resolved element (#102, closing #71 step 2).
+/// every prop of every resolved element (#102, closing #71 step 2) → 12/22
+/// after the single-binding certificate resolved Var-bound selectors (#103).
 /// Flip an entry (rule + fixtures), then update this constant.
-const EXPRESSIBLE_NOW: usize = 11;
+const EXPRESSIBLE_NOW: usize = 12;
 
 #[test]
 fn catalogue_is_pinned_at_22_entries() {

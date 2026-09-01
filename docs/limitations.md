@@ -144,7 +144,13 @@ comparable) **→ 8/22** (the `context_providers` anchor + `identity` guard, #71
 **→ 9/22** (2026-09-01, [#99](https://github.com/rboudrouss/reactant-analyzer/issues/99): no engine change — the deferred writer
 phase shipped with ADR-027 §2 already proves the weakened `async-set-state-race`,
 timer/microtask/promise continuations only, post-await writes still read as sync
-until [#117](https://github.com/rboudrouss/reactant-analyzer/issues/117)).
+until [#117](https://github.com/rboudrouss/reactant-analyzer/issues/117))
+**→ 12/22** (2026-09-01, wave 1: the `cleanup` guard
+[#100](https://github.com/rboudrouss/reactant-analyzer/issues/100), the `jsx_props` anchor generalizing the provider
+relation to every prop of every resolved element
+[#102](https://github.com/rboudrouss/reactant-analyzer/issues/102), and the single-binding certificate resolving
+Var-bound selectors [#103](https://github.com/rboudrouss/reactant-analyzer/issues/103) — the latter reads no heap, so
+ADR-023 §3's `locs`-invalidation deferral still stands).
 Run
 `cargo test --test catalogue -- --nocapture` for the full blocked-entry report. What still blocks,
 in decreasing leverage: prop, provider-value and setter-argument positions carry no expression

@@ -215,6 +215,9 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // are bound to ⊤ over the module-const env: every non-const capture reads
     // ⊤, which over-approximates the value at any program point, so the stored
     // join is sound for whenever the store chooses to invoke the selector.
+    // Every body hook extraction lifted out of the render CFG — the rest of
+    // the scope a binding certificate has to see.
+    let hook_bodies: Vec<&CFG> = hooks.iter().filter_map(|h| h.body_cfg()).collect();
     let custom_arg_returns: HashMap<(HookLabel, usize), StateValue> = {
         let mut out = HashMap::new();
         let mut seed_state = StateStore::bottom();
@@ -231,10 +234,20 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 continue;
             };
             for (i, arg) in args.iter().enumerate() {
-                let Expr::FnLit {
-                    params, body_cfg, ..
-                } = arg.peel_ts()
-                else {
+                // An inline literal, or a name whose binding is certified: one
+                // `Let` of a function literal, never re-bound in any nested
+                // body (ADR-023 §3's deferral is about the HEAP — this reads
+                // no heap, only the syntactic certificate, so a rebind cannot
+                // silently swap the body underneath the verdict).
+                let Some((params, body_cfg)) = (match arg.peel_ts() {
+                    Expr::FnLit {
+                        params, body_cfg, ..
+                    } => Some((params.as_slice(), body_cfg.as_ref())),
+                    Expr::Var(v) => {
+                        crate::ir::bindings::certified_fn_binding(v, &render_cfg, &hook_bodies)
+                    }
+                    _ => None,
+                }) else {
                     continue;
                 };
                 let mut env = module_env.clone();
