@@ -154,13 +154,21 @@ ADR-023 §3's `locs`-invalidation deferral still stands) **→ 13/22**
 (2026-09-01, [#112](https://github.com/rboudrouss/reactant-analyzer/issues/112): the `identity` verdict reaches
 call-site arguments, read at the call's own block — ADR-023 §2's own escape,
 since the bind-once rule answers Unknown for exactly the case §2 warns about;
-the setter-argument position stays gated, [#67](https://github.com/rboudrouss/reactant-analyzer/issues/67)).
+the setter-argument position stays gated, [#67](https://github.com/rboudrouss/reactant-analyzer/issues/67))
+**→ 14/22** (2026-09-01, [#104](https://github.com/rboudrouss/reactant-analyzer/issues/104) +
+[#113](https://github.com/rboudrouss/reactant-analyzer/issues/113): deps lists carry an `exact` bit, which
+discharges ADR-023 §4's own gate and lets the `every` quantifier ship — it
+refuses a list the IR could not read exactly, and leaves ⊤-handling to the
+body's name list rather than folding it into the quantifier, so the two
+quantifiers of a verdict guard agree; `guardrails/inert-single-dep` quantifies
+instead of pinning its arity, which closes [#69](https://github.com/rboudrouss/reactant-analyzer/issues/69)).
 Run
 `cargo test --test catalogue -- --nocapture` for the full blocked-entry report. What still blocks,
 in decreasing leverage: prop, provider-value and setter-argument positions carry no expression
 verdict [#67](https://github.com/rboudrouss/reactant-analyzer/issues/67); Tier A is single-anchor, so cross-component
-rules are inexpressible [#68](https://github.com/rboudrouss/reactant-analyzer/issues/68); guards over a `forEach` binding are existential
-only, so "every dep is stable" cannot be stated [#69](https://github.com/rboudrouss/reactant-analyzer/issues/69).
+rules are inexpressible [#68](https://github.com/rboudrouss/reactant-analyzer/issues/68); the `writers` relation
+collapses two same-slot writes in one body into one row, so same-tick
+multi-write classes stay out of reach [#105](https://github.com/rboudrouss/reactant-analyzer/issues/105).
 
 ## Out of scope
 

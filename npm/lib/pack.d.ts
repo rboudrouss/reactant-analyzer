@@ -127,6 +127,17 @@ export type Guard = {
   "kind": "writer_phases";
   "of": string;
 } | {
+  /**
+   * Name the element binds under inside `guards`. It is the same slot a
+   * rule-level `forEach` binding uses, which the quantifier owns for
+   * its own subtree — so the outer binding is not visible inside, and
+   * this name is not visible in the message.
+   */
+  "as": string;
+  "guards": Guard[];
+  "kind": "every";
+  "of": string;
+} | {
   "equals"?: PVal_uint64 | null;
   "kind": "count";
   "less_than"?: PVal_uint64 | null;

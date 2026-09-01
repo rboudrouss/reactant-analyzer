@@ -500,11 +500,27 @@ fn catalogue() -> Vec<Entry> {
         },
         Entry {
             id: "all-deps-stable",
-            status: Status::Blocked {
-                class: "expression-position",
-                missing: "∀ over an edge — refused (ADR-023 §4) until truncation is \
-                          representable in the IR; `inert-effect-single-dep` is the pinned-arity \
-                          weakening",
+            status: Status::Expressible {
+                pack_json: GUARDRAILS,
+                rule: "guardrails/inert-single-dep",
+                fires_on: Fixture::Single(
+                    "import { useEffect, useRef, useState } from \"react\";\nfunction C() {\n  const box = useRef(null);\n  const [n, setN] = useState(0);\n  useEffect(() => { sync(box.current); }, [box, setN]);\n  return <div onClick={() => setN(n + 1)}>{n}</div>;\n}",
+                ),
+                silent_on: Fixture::Single(
+                    "import { useEffect, useRef, useState } from \"react\";\nfunction C() {\n  const box = useRef(null);\n  const [n, setN] = useState(0);\n  useEffect(() => { search(box.current, n); }, [box, n]);\n  return <button onClick={() => setN(n + 1)}>x</button>;\n}",
+                ),
+                weakened: Some(
+                    "exact literal deps lists only — an absent or truncated list (`[...rest]`, \
+                     an elision) fails the quantifier rather than quantifying over a domain \
+                     the IR cannot enumerate (#104). Whether ⊤ counts is the body's name \
+                     list, not the quantifier's: with `is: [\"stable\"]` a dep the engine \
+                     cannot classify (a root component's prop, an unresolved hook's return) \
+                     fails it, so the class is silent there — a precision limit, not a \
+                     missed claim, since \"can never re-run\" is exactly what those deps \
+                     leave unproven; `is: [\"stable\", \"unknown\"]` buys the may reading \
+                     at the cost of firing on every ⊤-keyed effect. Never Certified: a rule \
+                     using `every` may not carry a `must_*`, so the class caps at Warning",
+                ),
             },
         },
         // ── Single anchor, no joins ──────────────────────────────────────────
@@ -659,7 +675,7 @@ fn catalogue() -> Vec<Entry> {
                 silent_on: Fixture::Single(
                     "function C({ a }) {\n  useEffect(() => { console.log(a); }, [a]);\n  return <div/>;\n}",
                 ),
-                weakened: Some("arity pinned to 1 — ∀ over deps is refused (ADR-023 §4)"),
+                weakened: None,
             },
         },
         Entry {
@@ -711,7 +727,7 @@ fn catalogue() -> Vec<Entry> {
 /// after the single-binding certificate resolved Var-bound selectors (#103) →
 /// 13/22 after the `identity` verdict reached call-site arguments (#112).
 /// Flip an entry (rule + fixtures), then update this constant.
-const EXPRESSIBLE_NOW: usize = 13;
+const EXPRESSIBLE_NOW: usize = 14;
 
 #[test]
 fn catalogue_is_pinned_at_22_entries() {

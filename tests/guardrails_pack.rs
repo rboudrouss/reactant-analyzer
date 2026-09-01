@@ -147,7 +147,47 @@ fn inert_single_dep_fires_on_a_lone_stable_dep() {
         "#,
         "guardrails/inert-single-dep",
     );
-    assert!(d.message.contains("`box`"), "{}", d.message);
+    assert!(d.message.contains("can never re-run"), "{}", d.message);
+}
+
+#[test]
+fn inert_single_dep_now_covers_more_than_one_dependency() {
+    // What the arity pin (`count equals 1`) could not say. The rule keeps its
+    // id — suppressions in shipped configs still resolve — but the class it
+    // covers is no longer capped at one dependency.
+    let d = one(
+        r#"
+        import { useEffect, useRef, useState } from "react";
+        function C() {
+            const box = useRef(null);
+            const [n, setN] = useState(0);
+            useEffect(() => { sync(box.current); }, [box, setN]);
+            return <div onClick={() => setN(n + 1)}>{n}</div>;
+        }
+        "#,
+        "guardrails/inert-single-dep",
+    );
+    assert!(d.message.contains("can never re-run"), "{}", d.message);
+}
+
+#[test]
+fn inert_single_dep_stays_silent_on_a_mount_only_effect() {
+    // `every` over a known-empty list is vacuously true; the `count more_than
+    // 0` guard is what keeps `[]` — a deliberate mount-only effect — out.
+    let all = findings(
+        r#"
+        import { useEffect } from "react";
+        function C() {
+            useEffect(() => { start(); }, []);
+            return <div>x</div>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(
+        !all.iter().any(|d| d.rule == "guardrails/inert-single-dep"),
+        "a written `[]` says mount-only on purpose: {all:?}"
+    );
 }
 
 #[test]

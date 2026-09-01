@@ -77,6 +77,7 @@ Filtering guards, where the finding stays capped at Warning:
 | `count` | Cardinality of `anchor.deps`. Fails when the engine does not know it: no readable deps array, or one whose lowering flattened a spread (`[...rest]`) or dropped an elision (`[a, , b]`), so the length is no longer the source array's. An unknown list does not have zero deps | Exactly one of `equals`, `more_than` or `less_than` |
 | `deps_declared` | Does the anchor declare a deps array at all. A written `[]` counts; an argument the engine cannot read (a variable) does not | `eq: true/false` |
 | `any_of` | Disjunction. The only way to write "X or Y" without duplicating the rule | `guards: [...]` |
+| `every` | ∀ over `anchor.deps`: passes when **every** element satisfies the nested guards. The body decides whether ⊤ counts — `is: ["stable"]` means *provably* stable and a ⊤ dep fails it, exactly as under a `forEach`; `is: ["stable", "unknown"]` accepts a list that may conform. Positive-only, no negated form. An absent or truncated list (spread, elision) **fails** the guard — quantifying over a domain the engine cannot enumerate says nothing. A known-empty list is vacuously true; pair with `count` when a rule needs at least one element. A rule using `every` may carry no `must_*` guard: Warning ceiling by construction | `of: "anchor.deps"`, `as` (the element's name inside `guards`), non-empty `guards: [...]` |
 
 Certifying guards, the `must_*` family. When the engine answers "proved on
 every path", the finding carries a proof and may reach Error.

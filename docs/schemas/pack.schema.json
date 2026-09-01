@@ -515,6 +515,35 @@
           ]
         },
         {
+          "description": "Universal quantification over `anchor.deps` (ADR-023 §4, whose stated\ngate — \"making truncation representable in the IR\" — the `exact` bit\ndischarges): passes when every element satisfies the nested guards.\n\n**Whether ⊤ satisfies is the body's decision, not the quantifier's.**\nThe verdict guards name their own ⊤: `is: [\"stable\"]` means *provably*\nstable and a ⊤ element fails it, exactly as it does under a `forEach`;\n`is: [\"stable\", \"unknown\"]` accepts a list that may conform. Folding\n⊤-satisfies into `every` instead would make the two quantifiers of the\nsame guard disagree about the same fact, and would fire every\n\"all deps stable\" rule on every effect keyed on a ⊤ prop.\n\nPositive-only — there is no negated form, and `not every` is just the\nexistential a `forEach` already writes.\n\nThe list must be one the engine read exactly. An absent deps array, or\none whose lowering flattened a spread or dropped an elision, fails the\nguard rather than quantifying over a domain it cannot enumerate — the\nvacuity hazard §4 names, and the same absent-⇒-fail discipline `count`\nfollows. A list that is *known* empty quantifies vacuously true; pair\nwith `count` when a rule needs at least one element.\n\nNever mints a proof: a `must_*` guard anywhere inside a rule that uses\n`every` is rejected at load time, so an `every`-selected finding cannot\ncarry Error authority for a row a may-fact put there (ADR-021).",
+          "type": "object",
+          "properties": {
+            "as": {
+              "description": "Name the element binds under inside `guards`. It is the same slot a\nrule-level `forEach` binding uses, which the quantifier owns for\nits own subtree — so the outer binding is not visible inside, and\nthis name is not visible in the message.",
+              "type": "string"
+            },
+            "guards": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Guard"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "every"
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of",
+            "as",
+            "guards"
+          ]
+        },
+        {
           "description": "Cardinality of `anchor.<edge>` (only `anchor.deps` in v1). Exactly\none comparator.",
           "type": "object",
           "properties": {

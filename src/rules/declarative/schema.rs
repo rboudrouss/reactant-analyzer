@@ -308,6 +308,41 @@ pub enum Guard {
         of: String,
         includes: PVal<Vec<PhaseName>>,
     },
+    /// Universal quantification over `anchor.deps` (ADR-023 §4, whose stated
+    /// gate — "making truncation representable in the IR" — the `exact` bit
+    /// discharges): passes when every element satisfies the nested guards.
+    ///
+    /// **Whether ⊤ satisfies is the body's decision, not the quantifier's.**
+    /// The verdict guards name their own ⊤: `is: ["stable"]` means *provably*
+    /// stable and a ⊤ element fails it, exactly as it does under a `forEach`;
+    /// `is: ["stable", "unknown"]` accepts a list that may conform. Folding
+    /// ⊤-satisfies into `every` instead would make the two quantifiers of the
+    /// same guard disagree about the same fact, and would fire every
+    /// "all deps stable" rule on every effect keyed on a ⊤ prop.
+    ///
+    /// Positive-only — there is no negated form, and `not every` is just the
+    /// existential a `forEach` already writes.
+    ///
+    /// The list must be one the engine read exactly. An absent deps array, or
+    /// one whose lowering flattened a spread or dropped an elision, fails the
+    /// guard rather than quantifying over a domain it cannot enumerate — the
+    /// vacuity hazard §4 names, and the same absent-⇒-fail discipline `count`
+    /// follows. A list that is *known* empty quantifies vacuously true; pair
+    /// with `count` when a rule needs at least one element.
+    ///
+    /// Never mints a proof: a `must_*` guard anywhere inside a rule that uses
+    /// `every` is rejected at load time, so an `every`-selected finding cannot
+    /// carry Error authority for a row a may-fact put there (ADR-021).
+    Every {
+        of: String,
+        /// Name the element binds under inside `guards`. It is the same slot a
+        /// rule-level `forEach` binding uses, which the quantifier owns for
+        /// its own subtree — so the outer binding is not visible inside, and
+        /// this name is not visible in the message.
+        #[serde(rename = "as")]
+        r#as: String,
+        guards: Vec<Guard>,
+    },
     /// Cardinality of `anchor.<edge>` (only `anchor.deps` in v1). Exactly
     /// one comparator.
     Count {

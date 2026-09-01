@@ -215,6 +215,10 @@ pub(crate) enum ResolvedGuard {
     /// and stopping at the first pass would make the finding's severity depend
     /// on the order the author happened to write the branches in.
     AnyOf(Vec<ResolvedGuard>),
+    /// MAY-typed ∀ over the anchor's deps (ADR-023 §4's amendment): passes
+    /// when no element definitely violates `body`. The elements are read from
+    /// the anchor's own deps edge, so the variant carries only the body.
+    Every(Vec<ResolvedGuard>),
 }
 
 /// A field of a bound entity — what `{binding.field}` renders and what a
@@ -518,6 +522,7 @@ fn guard_allowed_keys(g: &Guard) -> (&'static str, &'static [&'static str]) {
         }
         Guard::MustDirectWrite { .. } => ("guard `must_direct_write`", &["kind", "of", "else"]),
         Guard::AnyOf { .. } => ("guard `any_of`", &["kind", "guards"]),
+        Guard::Every { .. } => ("guard `every`", &["kind", "of", "as", "guards"]),
     }
 }
 
@@ -832,6 +837,18 @@ fn validate_rule(
         )?);
     }
 
+    // A may-typed quantifier can select a row on the strength of ⊤ elements
+    // alone, so a rule that uses one must not also carry Error authority: with
+    // no `must_*` anywhere, the finding stratifies to Warning structurally
+    // rather than by policy (ADR-023 §4's amendment).
+    if has_must && guards.iter().any(quantifies) {
+        return Err(PackError::new(
+            format!("{path}.guards"),
+            "a rule using `every` cannot also use a `must_*` guard: the quantifier is \
+             may-typed, so a row it selected cannot carry a certified claim",
+        ));
+    }
+
     // Message template.
     let message = parse_template(
         &def.message,
@@ -899,6 +916,15 @@ fn validate_rule(
         guards,
         message,
     })
+}
+
+/// Does this guard tree contain a `every` quantifier anywhere?
+fn quantifies(g: &ResolvedGuard) -> bool {
+    match g {
+        ResolvedGuard::Every(_) => true,
+        ResolvedGuard::AnyOf(children) => children.iter().any(quantifies),
+        _ => false,
+    }
 }
 
 /// Does this guard (or any `any_of` branch of it) match the ANCHOR's
@@ -1402,6 +1428,64 @@ fn validate_guard(
                 )?);
             }
             ResolvedGuard::AnyOf(children)
+        }
+        Guard::Every { of, r#as, guards } => {
+            // Same subject spelling as `count`: an edge, not a binding.
+            if of != "anchor.deps" {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    format!("guard `every` quantifies over `anchor.deps` (got `{of}`)"),
+                ));
+            }
+            if !admits_deps(cx.anchor_sort) {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    format!(
+                        "guard `every` quantifies over the deps of an effect/memo/callback \
+                         anchor, but the anchor binds {}",
+                        cx.anchor_sort.describe()
+                    ),
+                ));
+            }
+            if guards.is_empty() {
+                return Err(PackError::new(
+                    format!("{g_path}.guards"),
+                    "guard `every` needs at least one guard to quantify",
+                ));
+            }
+            // The quantifier owns the element slot for its own subtree: inside
+            // it, `as` is the binding and the rule's `forEach` name is not
+            // reachable. One slot, so one visible element at a time.
+            let inner = GuardCx {
+                anchor_sort: cx.anchor_sort,
+                bound_name: Some(r#as),
+                bound_sort: Some(Sort::Dep),
+                env: cx.env,
+            };
+            let mut body = Vec::with_capacity(guards.len());
+            for (i, child) in guards.iter().enumerate() {
+                // A `must_*` inside the quantifier would mint a proof for a
+                // row a may-fact selected. Refused at load time rather than
+                // dropped at exec: the author gets told, not silently ignored.
+                let mut child_must = false;
+                let resolved = validate_guard(
+                    child,
+                    &raw["guards"][i],
+                    &format!("{g_path}.guards[{i}]"),
+                    &inner,
+                    &mut child_must,
+                    warnings,
+                )?;
+                if child_must {
+                    return Err(PackError::new(
+                        format!("{g_path}.guards[{i}]"),
+                        "a `must_*` guard cannot appear inside `every`: the quantifier is \
+                         may-typed, so a row it selected cannot carry a certified claim",
+                    ));
+                }
+                body.push(resolved);
+            }
+            ResolvedGuard::Every(body)
         }
     })
 }

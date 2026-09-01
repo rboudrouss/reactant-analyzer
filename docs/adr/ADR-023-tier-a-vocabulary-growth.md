@@ -147,23 +147,34 @@ the gate asked for: the second refusal reason no longer holds, because a pack
 author now has the signal that distinguishes "zero deps" from "deps I could not
 see".
 
-The first reason — ⊤ folding to "violates" — was never an argument against ∀,
-only against the naive one. It is answered by the semantics this section
-already blessed, which ship verbatim as the contract of the `every` guard:
+The first reason — ⊤ folding to "violates" — is answered, but **not** the way
+this section proposed. §4 asked for ⊤-satisfies to be built into the
+quantifier. Shipping it that way was tried and rejected on the measure: with
+`stability is ["stable"]` accepting ⊤, `guardrails/inert-single-dep` fires on
+every effect keyed on a prop, because a root component's props are ⊤. The rule
+survives as noise, which is worse for soundness in practice than the finding it
+was meant to make.
 
-- **"No element *definitely* violates"**, so a ⊤ element satisfies. Suppressing
-  on a may-fact stays forbidden.
-- **Typed may**, and **positive-only**: the validator rejects a negated form,
-  the same posture as `writer_phases` (ADR-027 §1).
+The answer is composition instead. **Whether ⊤ satisfies is the body's
+decision, not the quantifier's**: the verdict guards already name their own ⊤,
+so `is: ["stable"]` means provably stable and `is: ["stable", "unknown"]` is
+the may reading §4 wants — available, explicit, and the author's call. The
+decisive argument is consistency: the *existential* form of the same guard
+already treats ⊤ as not-stable, and a language whose two quantifiers disagree
+about one fact is worse than either reading. What ships:
+
+- **`every` folds its body over the elements.** ⊤-handling belongs to the body.
+- **Positive-only**: the validator rejects a negated form, the same posture as
+  `writer_phases` (ADR-027 §1).
 - **An inexact or absent list fails the guard.** ∀ over a domain the engine
   cannot enumerate is the vacuity hazard named above; the guard refuses rather
   than answering from the elements it happens to have. This is the shipped
   absent-⇒-fail discipline of the field guards, and it is the same rule the
   `count` guard now follows for the same reason.
-- **Structurally excluded from the `proofs` vector** in `exec.rs`'s recursive
-  `eval_guard`, so no `every`-guarded rule can mint `Certified`. Severity being
-  `pin ⊓ polarity`, such findings cap at Warning by construction (ADR-021: no
-  Error authority from an untrusted frontend).
+- **No Error authority.** `every` never touches the `proofs` vector, and a rule
+  using it may not carry a `must_*` guard at all — a fold over may-classified
+  elements cannot certify the row it selected. Severity being `pin ⊓ polarity`,
+  such findings cap at Warning by construction (ADR-021).
 
 What this replaces is the arity pin. `count equals 1` was the workaround this
 section named, and per-N copies of a rule are exactly the per-rule hack the

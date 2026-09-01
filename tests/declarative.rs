@@ -2036,3 +2036,219 @@ fn deps_declared_is_false_for_a_deps_argument_the_ir_cannot_read() {
     );
     assert!(written.is_empty(), "`[]` does declare deps: {written:?}");
 }
+
+// ── `every`: may-typed ∀ over the deps edge (ADR-023 §4's amendment) ──────────
+
+/// A rule that fires on an effect whose deps are all provably stable — the
+/// inert-effect shape, quantified instead of arity-pinned.
+const EVERY_PACK: &str = r#"{"schemaVersion":1,"name":"t","rules":[
+    {"id":"inert","docs":{"description":"d","why":"w","fix":"f"},
+     "severity":"warning",
+     "anchor":{"relation":"hook_calls","kind":"effect"},
+     "guards":[
+        {"kind":"count","of":"anchor.deps","more_than":0},
+        {"kind":"every","of":"anchor.deps","as":"dep",
+         "guards":[{"kind":"stability","of":"dep","is":["stable"]}]}
+     ],
+     "message":"every dependency is stable"}]}"#;
+
+#[test]
+fn every_fires_when_no_element_violates() {
+    let inert = run_pack(
+        EVERY_PACK,
+        r#"
+        function C() {
+            const ref = useRef(null);
+            const [n, setN] = useState(0);
+            useEffect(() => { sync(ref.current, n); }, [ref, setN]);
+            return <div/>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(
+        inert.len(),
+        1,
+        "a ref container and a setter are both stable: {inert:?}"
+    );
+}
+
+#[test]
+fn every_fails_on_an_element_that_definitely_violates() {
+    let moving = run_pack(
+        EVERY_PACK,
+        r#"
+        function C() {
+            const ref = useRef(null);
+            const [n, setN] = useState(0);
+            useEffect(() => { sync(ref.current, n); }, [ref, n]);
+            return <button onClick={() => setN(n + 1)}/>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(
+        moving.is_empty(),
+        "a state dep is versioned, not stable, so the effect is not inert: {moving:?}"
+    );
+}
+
+#[test]
+fn whether_top_satisfies_is_the_bodys_decision() {
+    // The quantifier folds; it does not second-guess the body's name list.
+    // `is: ["stable"]` means provably stable, so a ⊤ element fails it — exactly
+    // as the same guard behaves under a `forEach`. Naming `unknown` is how an
+    // author asks for the may reading, and it is visible in the rule.
+    const SRC: &str = r#"
+        import { useOpaque } from "some-uninstalled-pkg";
+        function C() {
+            const ref = useRef(null);
+            const thing = useOpaque();
+            useEffect(() => { sync(ref.current, thing); }, [ref, thing]);
+            return <div/>;
+        }
+    "#;
+    assert!(
+        run_pack(EVERY_PACK, SRC, &Options::new()).is_empty(),
+        "an unresolved hook's return is ⊤, which is not provably stable"
+    );
+
+    const MAY: &str = r#"{"schemaVersion":1,"name":"t","rules":[
+        {"id":"inert","docs":{"description":"d","why":"w","fix":"f"},
+         "severity":"warning",
+         "anchor":{"relation":"hook_calls","kind":"effect"},
+         "guards":[
+            {"kind":"count","of":"anchor.deps","more_than":0},
+            {"kind":"every","of":"anchor.deps","as":"dep",
+             "guards":[{"kind":"stability","of":"dep","is":["stable","unknown"]}]}
+         ],
+         "message":"m"}]}"#;
+    assert_eq!(
+        run_pack(MAY, SRC, &Options::new()).len(),
+        1,
+        "naming `unknown` is the opt-in to the may reading"
+    );
+}
+
+#[test]
+fn every_refuses_a_deps_list_it_cannot_enumerate() {
+    // ∀ over a domain the engine cannot enumerate is the vacuity hazard §4
+    // names. Both an inexact list and an absent one fail the guard (#104's
+    // `exact` bit is what makes the distinction visible at all).
+    for deps_arg in ["[...rest]", "[ref, ,]", "rest"] {
+        let src = format!(
+            r#"
+            function C({{ rest }}) {{
+                const ref = useRef(null);
+                useEffect(() => {{ sync(ref.current, rest); }}, {deps_arg});
+                return <div/>;
+            }}
+            "#
+        );
+        let got = run_pack(EVERY_PACK, &src, &Options::new());
+        assert!(
+            got.is_empty(),
+            "`{deps_arg}` is not a list the engine can quantify over: {got:?}"
+        );
+    }
+}
+
+#[test]
+fn every_over_a_known_empty_list_is_vacuously_true() {
+    // Standard ∀ semantics, and why the pack pairs it with `count more_than 0`:
+    // without the arity guard a mount-only effect would match.
+    const NO_COUNT: &str = r#"{"schemaVersion":1,"name":"t","rules":[
+        {"id":"inert","docs":{"description":"d","why":"w","fix":"f"},
+         "severity":"warning",
+         "anchor":{"relation":"hook_calls","kind":"effect"},
+         "guards":[{"kind":"every","of":"anchor.deps","as":"dep",
+                    "guards":[{"kind":"stability","of":"dep","is":["stable"]}]}],
+         "message":"m"}]}"#;
+    let src = r#"
+        function C() {
+            useEffect(() => { start(); }, []);
+            return <div/>;
+        }
+    "#;
+    assert_eq!(run_pack(NO_COUNT, src, &Options::new()).len(), 1);
+    assert!(
+        run_pack(EVERY_PACK, src, &Options::new()).is_empty(),
+        "`count more_than 0` is what excludes the mount-only effect"
+    );
+}
+
+#[test]
+fn every_is_positive_only_and_needs_a_body() {
+    // No negated form exists: `not` is not a key of the guard, and `not every`
+    // is the existential a `forEach` already writes.
+    let negated = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls","kind":"effect"},
+            "guards":[{"kind":"every","of":"anchor.deps","as":"dep","not":true,
+                       "guards":[{"kind":"stability","of":"dep","is":["stable"]}]}],
+            "message":"m"}"#,
+    ));
+    assert!(negated.message.contains("not"), "{negated}");
+
+    let empty = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls","kind":"effect"},
+            "guards":[{"kind":"every","of":"anchor.deps","as":"dep","guards":[]}],
+            "message":"m"}"#,
+    ));
+    assert!(empty.message.contains("at least one guard"), "{empty}");
+}
+
+#[test]
+fn every_quantifies_over_a_deps_bearing_anchor_only() {
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls","kind":"state"},
+            "guards":[{"kind":"every","of":"anchor.deps","as":"dep",
+                       "guards":[{"kind":"stability","of":"dep","is":["stable"]}]}],
+            "message":"m"}"#,
+    ));
+    assert!(e.message.contains("effect/memo/callback"), "{e}");
+}
+
+#[test]
+fn every_can_never_reach_error() {
+    // Two locks. A `must_*` inside the quantifier would certify a per-element
+    // claim for a row a ⊤ may have selected; a `must_*` beside it would pin the
+    // whole finding to Error on the same row. Both are refused at load time, so
+    // an `every`-guarded finding caps at Warning structurally.
+    let inside = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"error",
+            "anchor":{"relation":"hook_calls","kind":"effect"},
+            "guards":[{"kind":"every","of":"anchor.deps","as":"dep","guards":[
+                {"kind":"must_hook_is_conditional","of":"anchor","else":"drop"}]}],
+            "message":"m"}"#,
+    ));
+    assert!(inside.message.contains("cannot appear inside"), "{inside}");
+
+    let beside = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"error",
+            "anchor":{"relation":"hook_calls","kind":"effect"},
+            "forEach":{"edge":"body_setter_calls","as":"s"},
+            "guards":[{"kind":"every","of":"anchor.deps","as":"dep",
+                       "guards":[{"kind":"stability","of":"dep","is":["stable"]}]},
+                      {"kind":"must_setter_on_all_paths","of":"s","else":"drop"}],
+            "message":"m"}"#,
+    ));
+    assert!(beside.message.contains("cannot also use"), "{beside}");
+}
+
+#[test]
+fn the_quantifier_owns_the_element_slot_inside_its_body() {
+    // One element slot: inside `every`, its own `as` is the binding and the
+    // rule-level `forEach` name is not reachable.
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls","kind":"effect"},
+            "forEach":{"edge":"deps","as":"outer"},
+            "guards":[{"kind":"every","of":"anchor.deps","as":"dep",
+                       "guards":[{"kind":"stability","of":"outer","is":["stable"]}]}],
+            "message":"m"}"#,
+    ));
+    assert!(e.message.contains("unknown binding `outer`"), "{e}");
+}

@@ -19,19 +19,23 @@
     {
       "id": "inert-single-dep",
       "docs": {
-        "description": "an effect's only dependency is provably stable, so it can never re-run",
-        "why": "A single dependency that the engine proves stable (a `useRef` container, a state setter, a module constant) can never change identity, so the effect fires once at mount and never again. Writing it as a reactive effect states an intent the code cannot honour — the feature the author expected to re-run silently does not.",
+        "description": "every dependency of an effect is provably stable, so it can never re-run",
+        "why": "A dependency the engine proves stable (a `useRef` container, a state setter, a module constant) can never change identity. When every dependency is one, the effect fires once at mount and never again. Writing it as a reactive effect states an intent the code cannot honour — the feature the author expected to re-run silently does not.",
         "fix": "If mount-only was intended, write `[]` and say so. If the effect should react to something, depend on the value that actually moves, not on the container that holds it.",
         "example": "useEffect(() => { sync(ref.current) }, [ref])  // ref identity never changes"
       },
       "severity": "warning",
       "anchor": { "relation": "hook_calls", "kind": "effect" },
-      "forEach": { "edge": "deps", "as": "dep" },
       "guards": [
-        { "kind": "count", "of": "anchor.deps", "equals": 1 },
-        { "kind": "stability", "of": "dep", "is": ["stable"] }
+        { "kind": "count", "of": "anchor.deps", "more_than": 0 },
+        {
+          "kind": "every",
+          "of": "anchor.deps",
+          "as": "dep",
+          "guards": [{ "kind": "stability", "of": "dep", "is": ["stable"] }]
+        }
       ],
-      "message": "the only dependency {dep.path} is {dep.stability} — this effect can never re-run after mount"
+      "message": "every dependency of this effect is provably stable — it can never re-run after mount"
     },
     {
       "id": "self-retriggering-effect",

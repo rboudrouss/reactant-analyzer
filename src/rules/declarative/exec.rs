@@ -434,6 +434,33 @@ impl TierARule {
                 }
                 passed
             }
+            ResolvedGuard::Every(body) => {
+                let Some(row) = cand.row() else {
+                    unreachable!("validated: `every` quantifies over a deps-bearing anchor")
+                };
+                // Quantifying needs a domain. An absent deps array, or one
+                // whose lowering flattened a spread or dropped an elision, is
+                // not a list of known elements — the guard refuses rather than
+                // answering from the ones it happens to have (ADR-023 §4).
+                if row.effect.and_then(|i| i.deps_arity()).is_none() {
+                    return false;
+                }
+                // `proofs` is deliberately not threaded in: a may-typed
+                // quantifier must never contribute Error authority. The
+                // validator already refuses a `must_*` inside the body, so
+                // this scratch vector stays empty — it is the second lock.
+                let mut scratch: Vec<Proof> = Vec::new();
+                let all = e.deps(row).into_iter().all(|dep| {
+                    let elem = Candidate::Hook {
+                        row,
+                        bound: Some(Bound::Dep(&dep)),
+                    };
+                    body.iter()
+                        .all(|g| self.eval_guard(e, &elem, g, &mut scratch))
+                });
+                debug_assert!(scratch.is_empty(), "`every` must not mint a proof");
+                all
+            }
         }
     }
 
