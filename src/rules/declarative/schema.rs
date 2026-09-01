@@ -321,6 +321,25 @@ pub enum Guard {
         of: String,
         is: PVal<Vec<UpdaterName>>,
     },
+    /// Whether a `writers` row's updater body writes to something it does not
+    /// own (ADR-028 §2) — a mutation whose receiver roots at a parameter or a
+    /// captured name, or a setter call.
+    ///
+    /// A derived reading of the same `updater` column the [`Guard::Updater`]
+    /// guard classifies, never a second column and never a second pass over
+    /// the setter argument (ADR-027 §4). A total mirror: `impure` is claimed
+    /// only for a proven-rooted site, and everything else — including an
+    /// updater the walk could not resolve to a literal — is `unknown`, so ⊤
+    /// cannot misfire.
+    ///
+    /// It is a **presence** fact: the site is in the body CFG or it is not, no
+    /// abstract value is read at any program point, so ADR-023 §2's gate does
+    /// not apply. Whether a call reaches the site is conditional, which caps
+    /// the class at Warning.
+    UpdaterBody {
+        of: String,
+        is: PVal<Vec<ImpureName>>,
+    },
     /// A `writers` row whose slot may be written **again** in the same tick:
     /// another sync write of the same slot in the same region is CFG-reachable
     /// from this one, self-reachability through a back edge included (a lone
@@ -451,6 +470,19 @@ pub enum StabilityName {
     Stable,
     Versioned,
     PerRender,
+    Unknown,
+}
+
+/// Total mirror of the updater-body purity classifier (ADR-028 §2);
+/// ⊤ = `unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum ImpureName {
+    /// A mutation rooted at a parameter or a captured name, or a setter call.
+    Impure,
+    /// ⊤ — nothing provable was found, the updater is not a resolvable
+    /// literal, or the receiver could not be rooted.
     Unknown,
 }
 

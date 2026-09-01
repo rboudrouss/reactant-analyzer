@@ -131,6 +131,10 @@ export type Guard = {
   "kind": "updater";
   "of": string;
 } | {
+  "is": PVal_Array_of_ImpureName;
+  "kind": "updater_body";
+  "of": string;
+} | {
   "kind": "same_tick";
   "of": string;
 } | {
@@ -188,11 +192,21 @@ export type HookKindFilter = "state" | "effect" | "memo" | "callback" | "ref" | 
  */
 export type IdentityName = "fresh-every-render" | "unknown";
 
+/**
+ * Total mirror of the updater-body purity classifier (ADR-028 §2);
+ * ⊤ = `unknown`.
+ */
+export type ImpureName = "impure" | "unknown";
+
 export type PVal_Array_of_CleanupName = CleanupName[] | {
   "$param": string;
 };
 
 export type PVal_Array_of_IdentityName = IdentityName[] | {
+  "$param": string;
+};
+
+export type PVal_Array_of_ImpureName = ImpureName[] | {
   "$param": string;
 };
 

@@ -176,6 +176,30 @@ const GUARDRAILS: &str = include_str!("../packs/guardrails.json");
 /// #105: the canonical stale-read shape — a slot written twice in one tick
 /// without a functional updater. Both halves are per-row facts, so the rule
 /// stays single-anchor and existential: no fold over the `writers` edge.
+/// #114: a functional updater that mutates what it was handed. The guard reads
+/// the SAME updater column #105 records — a derived verdict over one recorded
+/// expression, never a second setter-argument pass (ADR-027 §4).
+const IMPURE_UPDATER_PACK: &str = r#"{
+  "schemaVersion": 1, "name": "cat-impure",
+  "rules": [{
+    "id": "mutating-updater",
+    "docs": {
+      "description": "a functional state updater mutates the value it was handed instead of returning a new one",
+      "why": "React hands the updater the current value and compares what comes back with `Object.is`. An updater that mutates its parameter and returns it returns the same reference, so the re-render is skipped and the change is invisible.",
+      "fix": "Copy before writing — `prev => [...prev, x]` — so the updater returns a value React can tell apart from the old one.",
+      "example": "setItems(prev => { prev.push(x); return prev })"
+    },
+    "severity": "warning",
+    "anchor": { "relation": "hook_calls", "kind": "state" },
+    "forEach": { "edge": "writers", "as": "w" },
+    "guards": [
+      { "kind": "updater", "of": "w", "is": ["functional"] },
+      { "kind": "updater_body", "of": "w", "is": ["impure"] }
+    ],
+    "message": "the updater passed to this setter in {w.region} writes to a value it does not own"
+  }]
+}"#;
+
 const STALE_UPDATE_PACK: &str = r#"{
   "schemaVersion": 1, "name": "cat-stale",
   "rules": [{
@@ -467,11 +491,27 @@ fn catalogue() -> Vec<Entry> {
         },
         Entry {
             id: "impure-state-updater",
-            status: Status::Blocked {
-                class: "expression-position",
-                missing: "an `updater` column on the existing `writers` rows (never a \
-                          second setter-argument relation — ADR-027 §4) plus a purity \
-                          classifier over the updater body (#114)",
+            status: Status::Expressible {
+                pack_json: IMPURE_UPDATER_PACK,
+                rule: "cat-impure/mutating-updater",
+                fires_on: Fixture::Single(
+                    "import { useState } from \"react\";\nfunction C() {\n  const [items, setItems] = useState([]);\n  const add = (x) => setItems((prev) => { prev.push(x); return prev; });\n  return <button onClick={() => add(1)}>{items.length}</button>;\n}",
+                ),
+                silent_on: Fixture::Single(
+                    "import { useState } from \"react\";\nfunction C() {\n  const [items, setItems] = useState([]);\n  const add = (x) => setItems((prev) => { const next = [...prev]; next.push(x); return next; });\n  return <button onClick={() => add(1)}>{items.length}</button>;\n}",
+                ),
+                weakened: Some(
+                    "inline-`FnLit` updaters and certificate-bound Vars only — an updater the \
+                     walk cannot resolve to a literal (imported, or a Var re-bound below) has \
+                     no body to classify and reads ⊤, so it stays silent. `impure` means a \
+                     mutation site rooted outside the body, or a setter call, is PRESENT: \
+                     whether a given call reaches it is conditional, which is why the class \
+                     is may-typed and capped at Warning. The claim is made strictly for a \
+                     proven root — a receiver the chase cannot place, including the \
+                     kind-ambiguous fresh methods of the closed wontfix #22, stays non-impure, \
+                     an accepted under-fire. The certain same-reference case keeps its native \
+                     Error through `must_same_ref_mutation`, untouched by this",
+                ),
             },
         },
         Entry {
@@ -770,7 +810,7 @@ fn catalogue() -> Vec<Entry> {
 /// after the single-binding certificate resolved Var-bound selectors (#103) →
 /// 13/22 after the `identity` verdict reached call-site arguments (#112).
 /// Flip an entry (rule + fixtures), then update this constant.
-const EXPRESSIBLE_NOW: usize = 15;
+const EXPRESSIBLE_NOW: usize = 16;
 
 #[test]
 fn catalogue_is_pinned_at_22_entries() {

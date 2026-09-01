@@ -363,6 +363,12 @@ impl TierARule {
                 };
                 names.contains(&updater_name(&w.updater))
             }
+            ResolvedGuard::UpdaterBody { of, names } => {
+                let EntityVal::Writer(w) = cand.entity_at(*of) else {
+                    unreachable!("validated: `updater_body` binds a writers row")
+                };
+                names.contains(&e.updater_purity(&w.updater))
+            }
             ResolvedGuard::SameTick { of } => {
                 let EntityVal::Writer(w) = cand.entity_at(*of) else {
                     unreachable!("validated: `same_tick` binds a writers row")

@@ -2570,3 +2570,107 @@ fn same_tick_has_no_negated_form() {
     ));
     assert!(e.message.contains("eq"), "{e}");
 }
+
+// ── `updater_body`: the purity classifier over the same column (#114) ────────
+
+const PURITY_PACK: &str = r#"{"schemaVersion":1,"name":"t","rules":[
+    {"id":"impure","docs":{"description":"d","why":"w","fix":"f"},
+     "severity":"warning",
+     "anchor":{"relation":"hook_calls","kind":"state"},
+     "forEach":{"edge":"writers","as":"w"},
+     "guards":[{"kind":"updater_body","of":"w","is":["impure"]}],
+     "message":"impure updater"}]}"#;
+
+fn purity(body: &str) -> Vec<Diagnostic> {
+    let src = format!(
+        r#"
+        function C({{ outer }}) {{
+            const [items, setItems] = useState([]);
+            const add = (x) => setItems((prev) => {{ {body} }});
+            return <button onClick={{() => add(1)}}>{{items.length}}</button>;
+        }}
+        "#
+    );
+    run_pack(PURITY_PACK, &src, &Options::new())
+}
+
+#[test]
+fn updater_body_fires_on_a_mutation_of_what_the_updater_was_handed() {
+    assert_eq!(purity("prev.push(x); return prev;").len(), 1);
+    assert_eq!(purity("prev[0] = x; return prev;").len(), 1);
+    assert_eq!(purity("Object.assign(prev, { x }); return prev;").len(), 1);
+}
+
+#[test]
+fn updater_body_is_silent_when_the_updater_mutates_what_it_allocated() {
+    // The whole point of the copy: `next` is bound to a fresh allocation
+    // inside the body, so writing to it is the body's own business.
+    assert!(purity("const next = [...prev]; next.push(x); return next;").is_empty());
+    assert!(purity("return [...prev, x];").is_empty());
+}
+
+#[test]
+fn updater_body_follows_a_local_alias_to_what_it_aliases() {
+    // `const next = prev` copies nothing; mutating `next` mutates `prev`.
+    assert_eq!(
+        purity("const next = prev; next.push(x); return next;").len(),
+        1
+    );
+}
+
+#[test]
+fn updater_body_counts_a_captured_value_and_a_setter_call() {
+    assert_eq!(
+        purity("outer.push(x); return prev;").len(),
+        1,
+        "a capture is not the body's to write"
+    );
+    assert_eq!(
+        purity("setItems([]); return prev;").len(),
+        1,
+        "a setter call is an external write whatever it is rooted at"
+    );
+}
+
+#[test]
+fn updater_body_never_fires_on_an_updater_it_cannot_resolve() {
+    // ⊤ is silent by construction: no body, no claim. This is the half that
+    // keeps the classifier from inventing impurity.
+    let opaque = run_pack(
+        PURITY_PACK,
+        r#"
+        import { bump } from "./elsewhere";
+        function C() {
+            const [items, setItems] = useState([]);
+            const add = () => setItems(bump);
+            return <button onClick={add}>{items.length}</button>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(opaque.is_empty(), "{opaque:?}");
+
+    let value = run_pack(
+        PURITY_PACK,
+        r#"
+        function C() {
+            const [items, setItems] = useState([]);
+            const add = () => setItems([]);
+            return <button onClick={add}>{items.length}</button>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(value.is_empty(), "a value updater has no body: {value:?}");
+}
+
+#[test]
+fn updater_body_is_a_writers_row_fact() {
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls","kind":"state"},
+            "guards":[{"kind":"updater_body","of":"anchor","is":["impure"]}],
+            "message":"m"}"#,
+    ));
+    assert!(e.message.contains("`writers` row"), "{e}");
+}

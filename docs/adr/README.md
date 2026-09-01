@@ -29,4 +29,4 @@
 | [ADR-025](ADR-025-fall-through-is-a-return.md) | A body that falls off the end returns `undefined` — `Unreachable` means only "control stops" | Accepted |
 | [ADR-026](ADR-026-nextjs-projects.md) | Next.js projects — module directives + import graph in the IR, the `"use client"` server graph, Server Components analysed rather than skipped | Implemented |
 | [ADR-027](ADR-027-writer-relation-setter-provenance.md) | Slot-writer relation (region + may-phase), callee phase summaries, setter provenance, `must_direct_write`, catalogue re-based to 22 | Accepted |
-| [ADR-028](ADR-028-writers-per-site-updater-same-tick.md) | `writers` per-site rows (reversing the documented collapse), one shared updater column, the same-tick pair fact as a per-row boolean | Accepted |
+| [ADR-028](ADR-028-writers-per-site-updater-same-tick.md) | `writers` per-site rows (reversing the documented collapse), one shared updater column with two derived verdicts, the same-tick pair fact as a per-row boolean | Accepted |

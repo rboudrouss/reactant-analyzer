@@ -169,7 +169,11 @@ question only from what the bound settles.)
 relation keeps one row per call site — reversing a documented collapse that
 made "two writes of one slot" unsayable — plus one shared column for the write's
 argument 0 and a per-row same-tick reachability boolean. Both new facts are
-per-row, never folds over the edge, which is what keeps the rule single-anchor).
+per-row, never folds over the edge, which is what keeps the rule single-anchor)
+**→ 16/22** ([#114](https://github.com/rboudrouss/reactant-analyzer/issues/114): a second verdict derived from that
+same updater column — is the updater body writing something it does not own? —
+sharing the mutation-site recognizer with the native `state-mutation` rule while
+each keeps its own rooting question).
 Run
 `cargo test --test catalogue -- --nocapture` for the full blocked-entry report. What still blocks,
 in decreasing leverage: prop, provider-value and setter-argument positions carry no expression

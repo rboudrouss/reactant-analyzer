@@ -32,8 +32,11 @@ use crate::rules::{
     hook_kind_word, hook_val_labels, resolve_setter_aliases, state_val_labels,
 };
 
-use super::schema::{HookKindFilter, PhaseName, ReturnsName, StabilityName, UpdaterName};
+use super::schema::{
+    HookKindFilter, ImpureName, PhaseName, ReturnsName, StabilityName, UpdaterName,
+};
 use super::validate::Field;
+use crate::rules::helpers::purity::{ImpureBody, classify_body};
 
 // ── Entities ──────────────────────────────────────────────────────────────────
 
@@ -634,6 +637,26 @@ fn cleanup_word(c: CleanupVerdict) -> &'static str {
 }
 
 /// `ValueIdentity` → schema name (total).
+/// The `updater_body` guard's total mirror: is the recorded updater a function
+/// literal whose body writes something it does not own?
+///
+/// Reads the same column [`updater_name`] classifies — one recorded
+/// expression, two derived verdicts (ADR-028 §2). An updater the walk could
+/// not resolve to a literal has no body to classify and answers ⊤, so the
+/// unresolved case never fires.
+impl<'a> EntityCtx<'a> {
+    pub fn updater_purity(&self, u: &crate::engine::setters::Updater) -> ImpureName {
+        use crate::engine::setters::Updater;
+        let Updater::Functional(body) = u else {
+            return ImpureName::Unknown;
+        };
+        match classify_body(body, &self.setter_vars) {
+            ImpureBody::Impure => ImpureName::Impure,
+            ImpureBody::Unknown => ImpureName::Unknown,
+        }
+    }
+}
+
 /// The `updater` guard's total mirror of a `writers` row's argument-0 column
 /// (ADR-028 §2): only a proven function literal is `functional`.
 pub(crate) fn updater_name(u: &crate::engine::setters::Updater) -> UpdaterName {

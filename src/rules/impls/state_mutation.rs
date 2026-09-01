@@ -10,29 +10,11 @@ use crate::ir::{
     types::{HookLabel, Var},
 };
 
+use crate::rules::helpers::purity::mutation_receiver;
 use crate::rules::{
     Diagnostic, MustResult, Rule, Step, ValueClass, all_setter_labels, must_same_ref_mutation,
     state_slot_name, state_val_labels,
 };
-
-/// Methods that mutate their receiver in place (Array, Map/Set, typed arrays).
-/// The receiver's reference identity is unchanged — that is the bug when the
-/// receiver is state: React compares with `Object.is` and bails out.
-const MUTATING_METHODS: &[&str] = &[
-    "push",
-    "pop",
-    "shift",
-    "unshift",
-    "splice",
-    "sort",
-    "reverse",
-    "fill",
-    "copyWithin",
-    "add",
-    "delete",
-    "clear",
-    "set",
-];
 
 /// Fires when a state or prop object is mutated in place.
 ///
@@ -250,23 +232,13 @@ impl<'a> Collector<'a> {
     ) {
         match expr {
             Expr::Call { fn_, args } => {
+                // Which shapes are mutation sites is the one fact this rule
+                // shares with the Tier-A purity classifier (ADR-028 §2); what
+                // the receiver has to root at stays this rule's own question.
+                if let Some(receiver) = mutation_receiver(expr) {
+                    self.record_mutation(receiver, scopes, span, container);
+                }
                 match fn_.as_ref() {
-                    // Mutating method on a chased receiver: `items.push(x)`.
-                    Expr::FieldAccess { obj, field }
-                        if MUTATING_METHODS.contains(&field.as_str()) =>
-                    {
-                        // `Object.assign(target, …)` is caught below, not here.
-                        self.record_mutation(obj, scopes, span, container);
-                    }
-                    // `Object.assign(target, …)` mutates its first argument.
-                    Expr::FieldAccess { obj, field }
-                        if field == "assign"
-                            && matches!(obj.as_ref(), Expr::Var(v) if v == "Object") =>
-                    {
-                        if let Some(target) = args.first() {
-                            self.record_mutation(target, scopes, span, container);
-                        }
-                    }
                     // Setter call: is the argument the slot's own reference?
                     Expr::Var(name) => {
                         if let Some(&label) = self.setter_label.get(name.as_str()) {

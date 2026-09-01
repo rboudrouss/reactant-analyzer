@@ -536,6 +536,27 @@
           ]
         },
         {
+          "description": "Whether a `writers` row's updater body writes to something it does not\nown (ADR-028 §2) — a mutation whose receiver roots at a parameter or a\ncaptured name, or a setter call.\n\nA derived reading of the same `updater` column the [`Guard::Updater`]\nguard classifies, never a second column and never a second pass over\nthe setter argument (ADR-027 §4). A total mirror: `impure` is claimed\nonly for a proven-rooted site, and everything else — including an\nupdater the walk could not resolve to a literal — is `unknown`, so ⊤\ncannot misfire.\n\nIt is a **presence** fact: the site is in the body CFG or it is not, no\nabstract value is read at any program point, so ADR-023 §2's gate does\nnot apply. Whether a call reaches the site is conditional, which caps\nthe class at Warning.",
+          "type": "object",
+          "properties": {
+            "is": {
+              "$ref": "#/$defs/PVal_Array_of_ImpureName"
+            },
+            "kind": {
+              "type": "string",
+              "const": "updater_body"
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of",
+            "is"
+          ]
+        },
+        {
           "description": "A `writers` row whose slot may be written **again** in the same tick:\nanother sync write of the same slot in the same region is CFG-reachable\nfrom this one, self-reachability through a back edge included (a lone\nwrite inside a loop co-executes with itself).\n\nThe guard carries no value field, and that is the design: the fact is\nmay-typed in one direction only. Reachability is exact on the CFG, but\nthe walk that found the writes is depth-capped, so \"no other write is\nreachable\" is not a promise the engine can keep — there is no negated\nform to assert it with.",
           "type": "object",
           "properties": {
@@ -787,6 +808,21 @@
         "unknown"
       ]
     },
+    "ImpureName": {
+      "description": "Total mirror of the updater-body purity classifier (ADR-028 §2);\n⊤ = `unknown`.",
+      "oneOf": [
+        {
+          "description": "A mutation rooted at a parameter or a captured name, or a setter call.",
+          "type": "string",
+          "const": "impure"
+        },
+        {
+          "description": "⊤ — nothing provable was found, the updater is not a resolvable\nliteral, or the receiver could not be rooted.",
+          "type": "string",
+          "const": "unknown"
+        }
+      ]
+    },
     "PVal_Array_of_CleanupName": {
       "oneOf": [
         {
@@ -815,6 +851,28 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/IdentityName"
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "$param": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "$param"
+          ]
+        }
+      ]
+    },
+    "PVal_Array_of_ImpureName": {
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ImpureName"
           }
         },
         {

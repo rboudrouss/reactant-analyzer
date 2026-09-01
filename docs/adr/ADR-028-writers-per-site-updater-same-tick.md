@@ -76,18 +76,55 @@ move that dissolved the effect+handler join in ADR-027 §1: pushing the relation
 between two rows down into a fact *on* a row is what keeps Tier A single-anchor
 and existential, with no ∀ over `writers` and no second binding.
 
-### 4. The vocabulary is two guards, both may-typed
+### 4. `ImpureBody` is a second derived verdict over the same column
+
+The updater column records the *expression*; each consumer derives its own
+verdict from it. The second one is `ImpureBody` — {Impure, Unknown}, ⊤-total,
+polarity-typed in the vetted-primitive channel, the `returns_verdict` precedent
+from ADR-023 §3.
+
+**Impure iff a mutation site whose receiver roots outside the body is present,
+or a setter call is.** A receiver roots outside iff its root name is not bound
+to a fresh allocation within the body, which needs no separate parameter rule:
+an unbound name is outside by that definition, and one the body rebinds to a
+literal is genuinely the body's own — `set(prev => { const next = [...prev];
+next.push(x); return next })` mutates what it allocated.
+
+Only *which shapes are mutation sites* is shared with the native
+`state-mutation` rule, in `rules::helpers::purity`. The rooting question is not,
+and deliberately: `state-mutation` asks "is this receiver *that* state slot", to
+pair a mutation with a same-reference set; this asks "does the body touch
+anything it did not allocate". Forcing one helper to answer both would be a
+shared mechanism in name only. What the sharing buys is that a method added to
+`MUTATING_METHODS`, or a new mutation form, is seen by both — which is the drift
+that actually costs findings.
+
+**ADR-023 §2's gate does not apply.** This is a body-*presence* fact: the site
+is in the CFG or it is not, and no abstract value is read at any program point.
+#67's own comment names the exempt class — "`writer_phases`,
+`provenance`/`must_direct_write` are identity/position facts, not value
+verdicts" — and this joins it. The §2-gated stability reading of a setter
+argument is untouched, and #67 stays open for it.
+
+`must_same_ref_mutation`'s native Error path is untouched: the certain
+same-reference case keeps its certified diagnostic, and this classifier mints
+nothing.
+
+### 5. The vocabulary is three guards, all may-typed
 
 - `updater` — a total mirror of the column, ⊤ nameable as `unknown`, positive
   only. Whether ⊤ counts is the author's choice in the name list, the posture
   settled in ADR-023 §4's amendment.
+- `updater_body` — a total mirror of the purity classifier. An updater the
+  walk cannot resolve to a literal has no body and answers ⊤, so the
+  unresolved case never fires.
 - `same_tick` — **no value field at all**. Reachability is exact on the CFG, but
   the walk that found the writes is depth-capped, so "no other write is
   reachable" is not a promise the engine can keep. There is therefore no negated
   form to assert it with, and the guard's shape enforces that rather than a
   validator rule spelling it out.
 
-Neither touches the `proofs` vector, so neither mints `Certified`.
+None touches the `proofs` vector, so none mints `Certified`.
 
 ## Soundness arguments
 
@@ -108,17 +145,19 @@ Neither touches the `proofs` vector, so neither mints `Certified`.
 
 ## Consequences
 
-- `stale-update-without-functional-updater` flips Blocked → Expressible; the
-  measure moves 14/22 → 15/22.
+- `stale-update-without-functional-updater` and `impure-state-updater` both
+  flip Blocked → Expressible; the measure moves 14/22 → 16/22.
 - **#61 stays open.** This flips the Tier-A entry and covers the sync half. The
   async half waits on the `await` phase boundary — lowering erases
   `AwaitExpression`, the IR gate recorded in ADR-027 §2 and tracked as #117 — so
   a post-await write still reads as sync and never pairs across the suspension.
-- No native rule computes the updater or the pair fact today, so nothing
-  migrates here. The `state_mutation` migration onto the updater column belongs
-  to the follow-up that adds the body-purity classifier.
-- Two facts the relation now carries and nothing yet reads: the updater's
-  *body*, and `same_tick` on rows outside a Sync region (always `false`, since
-  those rows carry no block id). Both are deliberate — the first is the shared
-  column, the second is the honest answer for a write that is a separate turn by
-  construction.
+- No native rule computes the updater or the pair fact, so nothing migrates for
+  those. `state-mutation` migrates onto the shared mutation-site recognizer, its
+  diagnostics unchanged.
+- One fact the relation carries that nothing yet reads: `same_tick` on rows
+  outside a Sync region, always `false` since those rows carry no block id. That
+  is the honest answer for a write that is a separate turn by construction.
+- The catalogue entry's stale `missing:` text ("setter-argument edge plus a
+  purity fact") is corrected. As written it would have sent an implementer to
+  build the second bespoke setter-argument relation ADR-027 §4 forbids; what was
+  actually missing was the column plus a classifier over it.
