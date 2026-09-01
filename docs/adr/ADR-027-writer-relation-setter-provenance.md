@@ -193,3 +193,9 @@ wrapper-enforcement story is the user demand that deferral was waiting for.
   test alongside the existing schema/`.d.ts`/guardrails gates — they are the
   only vocabulary surfaces not test-gated today.
 - NEXTSTEPS Phase 4 item 12 is superseded by §8.
+- The `identity` guard of §8 sets the *total-mirror verdict guard* precedent:
+  a guard whose names mirror an engine verdict exhaustively (⊤ included) and
+  which reads it at the anchor's own position. ADR-023 §1's "entities, not
+  guards" refuses guards that name a syntactic shape, not this pattern. The
+  `cleanup` guard (#100) is the second instance and cites this trail; the
+  vocabulary that follows it should too, rather than re-arguing §1 each time.

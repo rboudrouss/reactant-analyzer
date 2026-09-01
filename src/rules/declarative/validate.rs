@@ -15,8 +15,8 @@ use std::collections::BTreeMap;
 use crate::rules::docs::rule_doc;
 
 use super::schema::{
-    Anchor, EdgeName, ElseBehavior, Guard, HookKindFilter, IdentityName, PVal, PackFile, ParamDecl,
-    ParamType, PhaseName, ReturnsName, RuleDef, SeverityPin, StabilityName,
+    Anchor, CleanupName, EdgeName, ElseBehavior, Guard, HookKindFilter, IdentityName, PVal,
+    PackFile, ParamDecl, ParamType, PhaseName, ReturnsName, RuleDef, SeverityPin, StabilityName,
 };
 
 /// A pack rejection: `path` is the JSON location (`rules[1].guards[0].of`),
@@ -185,6 +185,12 @@ pub(crate) enum ResolvedGuard {
         names: Vec<IdentityName>,
         negated: bool,
     },
+    /// Teardown verdict of an effect anchor's own body (#100).
+    Cleanup {
+        of: BindRef,
+        names: Vec<CleanupName>,
+        negated: bool,
+    },
     /// Write-provenance filter on a writer row (ADR-027 §4).
     Provenance {
         of: BindRef,
@@ -231,6 +237,7 @@ pub(crate) enum Field {
     Phase,
     Via,
     Identity,
+    Cleanup,
 }
 
 impl Field {
@@ -250,6 +257,7 @@ impl Field {
         Field::Phase,
         Field::Via,
         Field::Identity,
+        Field::Cleanup,
     ];
 
     /// The name authors write: `{anchor.<token>}`.
@@ -267,6 +275,7 @@ impl Field {
             Field::Phase => "phase",
             Field::Via => "via",
             Field::Identity => "identity",
+            Field::Cleanup => "cleanup",
         }
     }
 
@@ -373,6 +382,20 @@ impl Field {
                 | Sort::HookOrigin
                 | Sort::Writer => false,
             },
+            // Teardown is a property of an effect's own body: React honours a
+            // returned function for effects and nothing else, so the field is
+            // total only on a kind-pinned effect anchor.
+            Field::Cleanup => match sort {
+                Sort::Hook(Some(HookKindFilter::Effect)) => true,
+                Sort::Hook(_)
+                | Sort::SetterRender
+                | Sort::SetterBody
+                | Sort::Dep
+                | Sort::Arg
+                | Sort::HookOrigin
+                | Sort::Writer
+                | Sort::Provider => false,
+            },
         }
     }
 }
@@ -441,6 +464,7 @@ fn guard_allowed_keys(g: &Guard) -> (&'static str, &'static [&'static str]) {
         Guard::WriterPhases { .. } => ("guard `writer_phases`", &["kind", "of", "includes"]),
         Guard::Provenance { .. } => ("guard `provenance`", &["kind", "of", "through", "direct"]),
         Guard::Identity { .. } => ("guard `identity`", &["kind", "of", "is", "not"]),
+        Guard::Cleanup { .. } => ("guard `cleanup`", &["kind", "of", "is", "not"]),
         Guard::Count { .. } => (
             "guard `count`",
             &["kind", "of", "more_than", "less_than", "equals"],
@@ -1073,6 +1097,33 @@ fn validate_guard(
                 return Err(PackError::new(g_path, "the verdict list must not be empty"));
             }
             ResolvedGuard::Identity { of, names, negated }
+        }
+        Guard::Cleanup { of, is, not } => {
+            let (of, sort) = cx.resolve_of(of, g_path)?;
+            if sort != Sort::Hook(Some(HookKindFilter::Effect)) {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    format!(
+                        "guard `cleanup` applies to a `kind: \"effect\"` hook anchor, but the \
+                         subject binds {}",
+                        sort.describe()
+                    ),
+                ));
+            }
+            let (names, negated) = match (is, not) {
+                (Some(pv), None) => (cx.env.resolve(pv, None, &format!("{g_path}.is"))?, false),
+                (None, Some(pv)) => (cx.env.resolve(pv, None, &format!("{g_path}.not"))?, true),
+                _ => {
+                    return Err(PackError::new(
+                        g_path,
+                        "guard `cleanup` takes exactly one of `is` / `not`",
+                    ));
+                }
+            };
+            if names.is_empty() {
+                return Err(PackError::new(g_path, "the verdict list must not be empty"));
+            }
+            ResolvedGuard::Cleanup { of, names, negated }
         }
         Guard::Provenance {
             of,

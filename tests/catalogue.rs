@@ -18,7 +18,13 @@
 //!
 //! The curve so far: 3/21 (ADR-022 baseline) → 5/21 (ADR-023 steps 1-2:
 //! hook provenance + the `origin` guard, the `args` edge + the `returns`
-//! guard) → **6/21** (ADR-027 §1: the `writers` edge + `writer_phases`).
+//! guard) → 6/21 (ADR-027 §1: the `writers` edge + `writer_phases`) → 7/22
+//! (ADR-027 §4-§6: setter provenance + `must_direct_write`, the catalogue
+//! re-based to 22) → 8/22 (ADR-027 §8: the `context_providers` anchor + the
+//! `identity` guard) → 9/22 (the deferred writer phase, already shipped
+//! by ADR-027 §2, proves the weakened `async-set-state-race`) → **10/22**
+//! (the `cleanup` guard, a total mirror of the teardown verdict the native
+//! rule already computes).
 //! The count assertion at the bottom is the measure; update it only by
 //! flipping entries.
 
@@ -261,6 +267,42 @@ const PUTSTATE_CONFORMANT: &[(&str, &str)] = &[
     ),
 ];
 
+const CLEANUP_PACK: &str = r#"{
+  "schemaVersion": 1, "name": "cat-cleanup",
+  "rules": [{
+    "id": "effect-without-teardown",
+    "docs": {
+      "description": "an effect registers work and returns no teardown",
+      "why": "the registration outlives the component — a leak, and a write after unmount",
+      "fix": "return a cleanup function that undoes the registration"
+    },
+    "severity": "warning",
+    "anchor": { "relation": "hook_calls", "kind": "effect" },
+    "guards": [
+      { "kind": "cleanup", "of": "anchor", "is": ["absent"] }
+    ],
+    "message": "this effect's teardown is {anchor.cleanup}"
+  }]
+}"#;
+
+const ASYNC_PACK: &str = r#"{
+  "schemaVersion": 1, "name": "cat-async",
+  "rules": [{
+    "id": "deferred-set-state",
+    "docs": {
+      "description": "a state slot is written from a deferred continuation",
+      "why": "the write lands outside every React phase — after unmount, or after a newer response",
+      "fix": "guard the write with a cancellation flag, or move it into an event handler"
+    },
+    "severity": "warning",
+    "anchor": { "relation": "hook_calls", "kind": "state" },
+    "guards": [
+      { "kind": "writer_phases", "of": "anchor", "includes": ["deferred"] }
+    ],
+    "message": "{anchor.name} is written from a deferred continuation"
+  }]
+}"#;
+
 const LAYOUT_EFFECT_PACK: &str = r#"{
   "schemaVersion": 1, "name": "cat-ssr",
   "rules": [{
@@ -342,7 +384,9 @@ fn catalogue() -> Vec<Entry> {
             id: "impure-state-updater",
             status: Status::Blocked {
                 class: "expression-position",
-                missing: "setter-argument edge plus a purity fact on the updater body",
+                missing: "an `updater` column on the existing `writers` rows (never a \
+                          second setter-argument relation — ADR-027 §4) plus a purity \
+                          classifier over the updater body (#114)",
             },
         },
         Entry {
@@ -413,26 +457,55 @@ fn catalogue() -> Vec<Entry> {
         // ── Facts the engine does not compute (for Tier A) ───────────────────
         Entry {
             id: "missing-effect-cleanup",
-            status: Status::Blocked {
-                class: "engine-facts",
-                missing: "a cleanup verdict guard (the fact shipped as the NATIVE \
-                          missing-cleanup rule; Tier-A exposure not planned)",
+            status: Status::Expressible {
+                pack_json: CLEANUP_PACK,
+                rule: "cat-cleanup/effect-without-teardown",
+                fires_on: Fixture::Single(
+                    "import { useEffect } from \"react\";\nfunction C({ ms }) {\n  useEffect(() => { setInterval(() => { console.log(1); }, ms); }, [ms]);\n  return <div/>;\n}",
+                ),
+                silent_on: Fixture::Single(
+                    "import { useEffect } from \"react\";\nfunction C({ ms }) {\n  useEffect(() => {\n    const id = setInterval(() => { console.log(1); }, ms);\n    return () => { clearInterval(id); };\n  }, [ms]);\n  return <div/>;\n}",
+                ),
+                weakened: Some(
+                    "no registration fact yet: the guard says only `this effect returns no \
+                     teardown`, so the pack rule cannot restrict to repeating registrars the \
+                     way the NATIVE missing-cleanup rule does — teams must scope it (by hook \
+                     `origin`, say) or keep the native rule. The `registers` guard shipping \
+                     with the registrations anchor (#116) un-weakens it. `unknown` folds to \
+                     the may side, so an unclassifiable return never reads as an absence",
+                ),
             },
         },
         Entry {
             id: "async-set-state-race",
-            status: Status::Blocked {
-                class: "engine-facts",
-                missing: "async continuation phase (a `.then`/post-await write is not \
-                          distinguishable from a sync one)",
+            status: Status::Expressible {
+                pack_json: ASYNC_PACK,
+                rule: "cat-async/deferred-set-state",
+                fires_on: Fixture::Single(
+                    "import { useState, useEffect } from \"react\";\nfunction C({ url }) {\n  const [data, setData] = useState(null);\n  useEffect(() => { fetch(url).then((r) => setData(r)); }, [url]);\n  return <div>{data}</div>;\n}",
+                ),
+                silent_on: Fixture::Single(
+                    "import { useState, useEffect } from \"react\";\nfunction C({ url }) {\n  const [data, setData] = useState(null);\n  useEffect(() => { setData(url); }, [url]);\n  return <div>{data}</div>;\n}",
+                ),
+                weakened: Some(
+                    "proven timer/microtask/promise-continuation writes only: a post-await \
+                     write still reads as sync (lowering erases `AwaitExpression` — the IR \
+                     gate recorded in ADR-027 §2, lifted by #117), ⊤-phase rows satisfy the \
+                     query, there is no cancellation-guard fact so an AbortController-guarded \
+                     write fires too, and `deferred` matches `then`/`catch`/`finally` by \
+                     method name, so a same-named method on a non-Promise receiver fires as \
+                     well — all FP-side. #62 (the native Tier-2 rule) is unaffected",
+                ),
             },
         },
         Entry {
             id: "stale-update-without-functional-updater",
             status: Status::Blocked {
                 class: "engine-facts",
-                missing: "a same-tick multi-write fact on one slot (the Tier 1 \
-                          `stale-update` proposal, #61)",
+                missing: "per-site `writers` rows (the relation collapses same-slot \
+                          writes per `(Var, WalkClass)` today), the `updater` column and \
+                          a same-tick reachability fact on the row (#105; the Tier 1 \
+                          `stale-update` native proposal is #61)",
             },
         },
         Entry {
@@ -543,9 +616,12 @@ fn catalogue() -> Vec<Entry> {
 /// 6/21 after the `writers`/`writer_phases` vocabulary (ADR-027 §1, #70) →
 /// 7/22 after setter provenance + `must_direct_write` (ADR-027 §4-§6, the
 /// catalogue re-based to 22) → 8/22 after the `context_providers` anchor +
-/// `identity` guard (#71, ADR-027 §8). Flip an entry (rule + fixtures), then
-/// update this constant.
-const EXPRESSIBLE_NOW: usize = 8;
+/// `identity` guard (#71, ADR-027 §8) → 9/22 after the deferred writer phase
+/// proved the weakened `async-set-state-race` (#99 — no engine change: the
+/// vocabulary shipped with ADR-027 §2) → 10/22 after the `cleanup` guard
+/// exposed the teardown verdict the native rule already computes (#100).
+/// Flip an entry (rule + fixtures), then update this constant.
+const EXPRESSIBLE_NOW: usize = 10;
 
 #[test]
 fn catalogue_is_pinned_at_22_entries() {

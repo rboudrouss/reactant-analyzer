@@ -1592,3 +1592,104 @@ fn context_providers_is_kindless_edgeless_and_identity_is_provider_only() {
     ));
     assert!(e.message.contains("context-provider element"), "{e}");
 }
+
+// ── The `cleanup` guard (#100) ───────────────────────────────────────────────
+
+#[test]
+fn cleanup_guard_reads_the_teardown_verdict_of_the_effect_body() {
+    let pack = r#"{"schemaVersion":1,"name":"t","rules":[
+        {"id":"no-teardown","docs":{"description":"d","why":"w","fix":"f"},
+         "severity":"warning",
+         "anchor":{"relation":"hook_calls","kind":"effect"},
+         "guards":[{"kind":"cleanup","of":"anchor","is":["absent"]}],
+         "message":"this effect's teardown is {anchor.cleanup}"}]}"#;
+
+    // Absent: every exit returns nothing at all — the one proven side.
+    let fired = run_pack(
+        pack,
+        r#"
+        import { useEffect } from "react";
+        function C({ ms }) {
+            useEffect(() => { setInterval(() => { console.log(1); }, ms); }, [ms]);
+            return <div/>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(fired.len(), 1, "{fired:?}");
+    assert_eq!(fired[0].message, "this effect's teardown is absent");
+
+    // Present: a returned function literal.
+    let silent = run_pack(
+        pack,
+        r#"
+        import { useEffect } from "react";
+        function C({ ms }) {
+            useEffect(() => {
+                const id = setInterval(() => { console.log(1); }, ms);
+                return () => { clearInterval(id); };
+            }, [ms]);
+            return <div/>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(silent.is_empty(), "{silent:?}");
+
+    // Unknown folds to the MAY side: an unclassifiable return is never an
+    // absence, so `is: ["absent"]` cannot fire on it.
+    let unknown = run_pack(
+        pack,
+        r#"
+        import { useEffect } from "react";
+        function C({ subscribe }) {
+            useEffect(() => { return subscribe(); }, [subscribe]);
+            return <div/>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(unknown.is_empty(), "{unknown:?}");
+
+    // …and it IS matchable, because the mirror is total.
+    let matched = run_pack(
+        &pack.replace(r#""is":["absent"]"#, r#""is":["unknown"]"#),
+        r#"
+        import { useEffect } from "react";
+        function C({ subscribe }) {
+            useEffect(() => { return subscribe(); }, [subscribe]);
+            return <div/>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(matched.len(), 1, "{matched:?}");
+    assert_eq!(matched[0].message, "this effect's teardown is unknown");
+}
+
+#[test]
+fn cleanup_guard_is_effect_anchors_only() {
+    // A state anchor has no body whose return React honours.
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls","kind":"state"},
+            "guards":[{"kind":"cleanup","of":"anchor","is":["absent"]}],"message":"m"}"#,
+    ));
+    assert!(e.message.contains("effect"), "{e}");
+
+    // A kind-less hook anchor is not enough: the field must be total.
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls"},
+            "guards":[{"kind":"cleanup","of":"anchor","is":["absent"]}],"message":"m"}"#,
+    ));
+    assert!(e.message.contains("effect"), "{e}");
+
+    // Exactly one of `is` / `not`.
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls","kind":"effect"},
+            "guards":[{"kind":"cleanup","of":"anchor"}],"message":"m"}"#,
+    ));
+    assert!(e.message.contains("`is` / `not`"), "{e}");
+}

@@ -260,6 +260,26 @@ pub enum Guard {
         #[serde(default)]
         not: Option<PVal<Vec<IdentityName>>>,
     },
+    /// Teardown verdict of an `effect` anchor's own body (#100). Exactly one
+    /// of `is`/`not`; the names mirror `CleanupVerdict` totally — ⊤
+    /// (`unknown`) is matchable, never dropped. `absent` is the only proven
+    /// side (every exit returns nothing), so `is: ["absent"]` cannot fire on
+    /// a body whose return could not be classified.
+    ///
+    /// ADR-023 §1 says the growth path is entities, not guards. This is the
+    /// admissible exception the shipped vocabulary already established — §3's
+    /// `returns`, then ADR-027's `identity` and `writer_phases`: what §1
+    /// refuses is a guard naming a *syntactic shape*, and a total mirror of an
+    /// engine verdict read at the anchor's own position names none. There is
+    /// no new entity to grow here — the effect row IS the subject, and the
+    /// verdict is a property of the body it already carries.
+    Cleanup {
+        of: String,
+        #[serde(default)]
+        is: Option<PVal<Vec<CleanupName>>>,
+        #[serde(default)]
+        not: Option<PVal<Vec<CleanupName>>>,
+    },
     /// Write-provenance filter on a `writers` row (ADR-027 §4): whether the
     /// write is caller-authored (`direct`) or reached through named inlined
     /// wrappers (`through` — matched anywhere in the chain, against EXPORTED
@@ -385,6 +405,19 @@ pub enum PhaseName {
 #[serde(rename_all = "kebab-case")]
 pub enum IdentityName {
     FreshEveryRender,
+    Unknown,
+}
+
+/// Total mirror of `CleanupVerdict` (#100): what an effect body returns, seen
+/// as teardown. `absent` is the claim — every exit returns nothing at all —
+/// and `unknown` folds to the may side (there may be a cleanup), so it is
+/// matchable but never actionable as an absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum CleanupName {
+    Present,
+    Absent,
     Unknown,
 }
 

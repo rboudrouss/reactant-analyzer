@@ -44,6 +44,14 @@ export type Anchor = {
   "relation": "context_providers";
 };
 
+/**
+ * Total mirror of `CleanupVerdict` (#100): what an effect body returns, seen
+ * as teardown. `absent` is the claim — every exit returns nothing at all —
+ * and `unknown` folds to the may side (there may be a cleanup), so it is
+ * matchable but never actionable as an absence.
+ */
+export type CleanupName = "present" | "absent" | "unknown";
+
 export type EdgeName = "deps" | "body_setter_calls" | "args" | "writers";
 
 /**
@@ -103,6 +111,11 @@ export type Guard = {
   "not"?: PVal_Array_of_IdentityName | null;
   "of": string;
 } | {
+  "is"?: PVal_Array_of_CleanupName | null;
+  "kind": "cleanup";
+  "not"?: PVal_Array_of_CleanupName | null;
+  "of": string;
+} | {
   "direct"?: PVal_boolean | null;
   "kind": "provenance";
   "of": string;
@@ -154,6 +167,10 @@ export type HookKindFilter = "state" | "effect" | "memo" | "callback" | "ref" | 
  * a proven fact, everything else is `unknown` (may side, never actionable).
  */
 export type IdentityName = "fresh-every-render" | "unknown";
+
+export type PVal_Array_of_CleanupName = CleanupName[] | {
+  "$param": string;
+};
 
 export type PVal_Array_of_IdentityName = IdentityName[] | {
   "$param": string;

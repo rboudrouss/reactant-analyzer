@@ -130,9 +130,9 @@ tries several in order — see [docs/plugins.md](plugins.md).)
 
 ## Writing declarative packs (Tier A)
 
-Read [#6](https://github.com/rboudrouss/reactant-analyzer/issues/6) first — a `kind: "custom"` anchor is blind to every hook the
-engine resolved, which silently disables the rules a team actually writes. It outranks everything
-here.
+A `kind: "custom"` anchor used to be blind to every hook the engine resolved, silently disabling
+the rules a team actually writes — fixed in ADR-027 §7 ([#6](https://github.com/rboudrouss/reactant-analyzer/issues/6)): anchor on the
+`hook_origins` relation, which sees resolved and inlined hooks alike.
 
 `tests/catalogue.rs` materializes the 21-rule catalogue and *proves* every expressible entry. The
 curve is **3/21 → 5/21** (ADR-023 steps 1–2) **→ 6/21** (ADR-027 §1: `writers` +
@@ -140,7 +140,11 @@ curve is **3/21 → 5/21** (ADR-023 steps 1–2) **→ 6/21** (ADR-027 §1: `wri
 **→ 7/22** (2026-09-01, ADR-027 §4–§6: setter provenance + `must_direct_write`
 make wrapper-enforcement rules expressible; the catalogue is re-based to 22 —
 the new class joined WITH the vocabulary, so the /21 datapoints stay
-comparable) **→ 8/22** (the `context_providers` anchor + `identity` guard, #71).
+comparable) **→ 8/22** (the `context_providers` anchor + `identity` guard, #71)
+**→ 9/22** (2026-09-01, [#99](https://github.com/rboudrouss/reactant-analyzer/issues/99): no engine change — the deferred writer
+phase shipped with ADR-027 §2 already proves the weakened `async-set-state-race`,
+timer/microtask/promise continuations only, post-await writes still read as sync
+until [#117](https://github.com/rboudrouss/reactant-analyzer/issues/117)).
 Run
 `cargo test --test catalogue -- --nocapture` for the full blocked-entry report. What still blocks,
 in decreasing leverage: prop, provider-value and setter-argument positions carry no expression

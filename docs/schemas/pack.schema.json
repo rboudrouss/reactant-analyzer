@@ -102,6 +102,15 @@
         }
       ]
     },
+    "CleanupName": {
+      "description": "Total mirror of `CleanupVerdict` (#100): what an effect body returns, seen\nas teardown. `absent` is the claim — every exit returns nothing at all —\nand `unknown` folds to the may side (there may be a cleanup), so it is\nmatchable but never actionable as an absence.",
+      "type": "string",
+      "enum": [
+        "present",
+        "absent",
+        "unknown"
+      ]
+    },
     "EdgeName": {
       "oneOf": [
         {
@@ -398,6 +407,43 @@
           ]
         },
         {
+          "description": "Teardown verdict of an `effect` anchor's own body (#100). Exactly one\nof `is`/`not`; the names mirror `CleanupVerdict` totally — ⊤\n(`unknown`) is matchable, never dropped. `absent` is the only proven\nside (every exit returns nothing), so `is: [\"absent\"]` cannot fire on\na body whose return could not be classified.\n\nADR-023 §1 says the growth path is entities, not guards. This is the\nadmissible exception the shipped vocabulary already established — §3's\n`returns`, then ADR-027's `identity` and `writer_phases`: what §1\nrefuses is a guard naming a *syntactic shape*, and a total mirror of an\nengine verdict read at the anchor's own position names none. There is\nno new entity to grow here — the effect row IS the subject, and the\nverdict is a property of the body it already carries.",
+          "type": "object",
+          "properties": {
+            "is": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_Array_of_CleanupName"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "cleanup"
+            },
+            "not": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_Array_of_CleanupName"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        },
+        {
           "description": "Write-provenance filter on a `writers` row (ADR-027 §4): whether the\nwrite is caller-authored (`direct`) or reached through named inlined\nwrappers (`through` — matched anywhere in the chain, against EXPORTED\nnames, so aliased imports don't escape). At least one of\n`through`/`direct`; a row whose site could not be placed fails both\nforms (positive-only).",
           "type": "object",
           "properties": {
@@ -659,6 +705,28 @@
       "enum": [
         "fresh-every-render",
         "unknown"
+      ]
+    },
+    "PVal_Array_of_CleanupName": {
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CleanupName"
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "$param": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "$param"
+          ]
+        }
       ]
     },
     "PVal_Array_of_IdentityName": {

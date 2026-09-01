@@ -23,7 +23,7 @@ use crate::rules::api::query::{
 use crate::rules::{Rule, SetterCall};
 
 use super::entity::{
-    ArgEntity, DepEntity, EntityCtx, EntityVal, HookRow, SetterEntity, identity_name,
+    ArgEntity, DepEntity, EntityCtx, EntityVal, HookRow, SetterEntity, cleanup_name, identity_name,
 };
 use super::schema::{EdgeName, ElseBehavior, SeverityPin};
 use super::validate::{
@@ -325,6 +325,17 @@ impl TierARule {
                     unreachable!("validated: `identity` binds a provider element")
                 };
                 names.contains(&identity_name(p.identity)) != *negated
+            }
+            ResolvedGuard::Cleanup { of, names, negated } => {
+                // Validated: `of` binds a kind-pinned effect anchor, so the
+                // verdict is a property of the anchor's OWN body CFG — read at
+                // the anchor's position, not at some later program point
+                // (ADR-023 §2 is not in play).
+                let _ = of;
+                let Some(row) = cand.row() else {
+                    unreachable!("validated: `cleanup` reads an effect-hook anchor")
+                };
+                names.contains(&cleanup_name(e.cleanup(row))) != *negated
             }
             ResolvedGuard::Provenance {
                 of,

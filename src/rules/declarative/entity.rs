@@ -21,7 +21,9 @@ use crate::ir::expr::Expr;
 use crate::ir::free_vars::{AccessPath, dep_paths};
 use crate::ir::hooks::{HookEntry, HookProvenance};
 use crate::ir::types::{BlockId, HookLabel, Var};
-use crate::rules::api::query::{Certified, ConditionalHookCall, ExitDominance, RuleCtx};
+use crate::rules::api::query::{
+    Certified, CleanupVerdict, ConditionalHookCall, ExitDominance, RuleCtx,
+};
 use crate::rules::helpers::providers::{ProviderSite, ValueIdentity, collect_provider_sites};
 use crate::rules::{
     ReturnsVerdict, SetterCall, StabilityVerdict, all_setter_labels, collect_setter_calls,
@@ -175,6 +177,18 @@ impl<'a> EntityCtx<'a> {
             .iter()
             .filter(|w| w.slot == row.info.label)
             .collect()
+    }
+
+    /// The anchor effect's teardown verdict (#100). The one shared reader of
+    /// `query::cleanup_verdict`, which the native missing-cleanup rule calls
+    /// too — the fact is computed in one place, never mirrored (ADR-027 §1).
+    /// A row with no body CFG answers `Unknown`, the may side, so the only
+    /// actionable verdict (`Absent`) is never claimed for a body we cannot see.
+    pub fn cleanup(&self, row: &HookRow<'a>) -> CleanupVerdict {
+        row.entry.and_then(|e| e.body_cfg()).map_or(
+            CleanupVerdict::Unknown,
+            crate::rules::api::query::cleanup_verdict,
+        )
     }
 
     /// `body_setter_calls`: setter calls in the anchor's body CFG.
@@ -429,6 +443,15 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Origin(_)
                 | EntityVal::Writer(_) => None,
             },
+            Field::Cleanup => match v {
+                EntityVal::Hook(row) => Some(cleanup_word(self.cleanup(row)).to_string()),
+                EntityVal::Setter(_)
+                | EntityVal::Dep(_)
+                | EntityVal::Arg(_)
+                | EntityVal::Origin(_)
+                | EntityVal::Writer(_)
+                | EntityVal::Provider(_) => None,
+            },
         }
     }
 
@@ -446,7 +469,8 @@ impl<'a> EntityCtx<'a> {
             | Field::Region
             | Field::Phase
             | Field::Via
-            | Field::Identity => raw.unwrap_or_else(|| anonymous(v)),
+            | Field::Identity
+            | Field::Cleanup => raw.unwrap_or_else(|| anonymous(v)),
             // Source identifiers are quoted, verdict words are not.
             Field::Name | Field::Slot | Field::Setter | Field::Path => match raw {
                 Some(s) => format!("`{s}`"),
@@ -523,6 +547,24 @@ pub(crate) fn phase_name(p: WriterPhase) -> PhaseName {
         WriterPhase::Deferred => PhaseName::Deferred,
         WriterPhase::Cleanup => PhaseName::Cleanup,
         WriterPhase::Unknown => PhaseName::Unknown,
+    }
+}
+
+/// `CleanupVerdict` → schema name (total).
+pub(crate) fn cleanup_name(c: CleanupVerdict) -> super::schema::CleanupName {
+    match c {
+        CleanupVerdict::Present => super::schema::CleanupName::Present,
+        CleanupVerdict::Absent => super::schema::CleanupName::Absent,
+        CleanupVerdict::Unknown => super::schema::CleanupName::Unknown,
+    }
+}
+
+/// The word rendered by `{anchor.cleanup}`.
+fn cleanup_word(c: CleanupVerdict) -> &'static str {
+    match c {
+        CleanupVerdict::Present => "present",
+        CleanupVerdict::Absent => "absent",
+        CleanupVerdict::Unknown => "unknown",
     }
 }
 
