@@ -198,11 +198,22 @@ all of its scanning machinery. The migration also surfaced a real false
 negative: the render-time kill must read a write's proven *phase*, not its
 lexical region, or a callback literal written inline in render suppresses the
 finding.)
+**→ 20/22** (2026-09-01, [#115](https://github.com/rboudrouss/reactant-analyzer/issues/115), ADR-032, on
+[#109](https://github.com/rboudrouss/reactant-analyzer/issues/109) + [#110](https://github.com/rboudrouss/reactant-analyzer/issues/110):
+the `context_consumers` relation, a diagnostics-only post-pass that pairs a
+`useContext` call with the providers above it. It needs no context *value*, so
+[#28](https://github.com/rboudrouss/reactant-analyzer/issues/28) is untouched. The design is
+entirely the ancestry gate: the verdict is an ABSENCE, phase 2 records no
+call-graph edges, and an unreached component reads as a caller-less root — so a
+row exists only where the whole closure is inter-analyzed AND no unreached
+component syntactically mentions it. Both gates have a test that fails when
+that gate alone is removed.)
 Run
 `cargo test --test catalogue -- --nocapture` for the full blocked-entry report. What still blocks,
 in decreasing leverage: prop, provider-value and setter-argument positions carry no expression
-verdict [#67](https://github.com/rboudrouss/reactant-analyzer/issues/67); Tier A is single-anchor, so cross-component
-rules are inexpressible [#68](https://github.com/rboudrouss/reactant-analyzer/issues/68); the `writers` relation
+verdict [#67](https://github.com/rboudrouss/reactant-analyzer/issues/67); Tier A is single-anchor, though three
+wave-4/5 entries turned out not to need a second one — a whole-program relation
+projects onto the anchored component [#68](https://github.com/rboudrouss/reactant-analyzer/issues/68); the `writers` relation
 collapses two same-slot writes in one body into one row, so same-tick
 multi-write classes stay out of reach [#105](https://github.com/rboudrouss/reactant-analyzer/issues/105).
 

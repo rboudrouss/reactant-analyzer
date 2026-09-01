@@ -85,6 +85,8 @@ pub(crate) enum Sort {
     ChurnCycle,
     /// One prop seed of a state-hook anchor's slot (#106).
     Seed,
+    /// One `useContext` call site with complete ancestry (#115).
+    ContextConsumer,
 }
 
 impl Sort {
@@ -102,6 +104,7 @@ impl Sort {
             Sort::JsxProp => "a JSX prop of a component element".into(),
             Sort::ChurnCycle => "a render-loop cycle".into(),
             Sort::Seed => "a prop seed of a state slot".into(),
+            Sort::ContextConsumer => "a context consumer site".into(),
         }
     }
 }
@@ -229,6 +232,11 @@ pub(crate) enum ResolvedGuard {
     SameTick {
         of: BindRef,
     },
+    /// #115: whether a provider of the consumed context is on a reaching path.
+    Provider {
+        of: BindRef,
+        names: Vec<crate::rules::declarative::schema::ProviderName>,
+    },
     /// #106: whether a seed row's slot is visibly re-synced.
     SeedSync {
         of: BindRef,
@@ -352,7 +360,8 @@ impl Field {
                 | Sort::Provider
                 | Sort::JsxProp
                 | Sort::ChurnCycle
-                | Sort::Seed => false,
+                | Sort::Seed
+                | Sort::ContextConsumer => false,
             },
             // Effects and handlers are the two kinds with nothing to call them;
             // an any-kind anchor is admitted and falls back per row.
@@ -370,7 +379,9 @@ impl Field {
                 // `name` is the origin hook's name (`useLayoutEffect` even
                 // through an alias), never a binding variable. A provider's
                 // `name` is the context binding.
-                Sort::HookOrigin | Sort::Provider | Sort::JsxProp => true,
+                // A consumer row is named by the local binding it reads the
+                // context through — the only name the call site has.
+                Sort::HookOrigin | Sort::Provider | Sort::JsxProp | Sort::ContextConsumer => true,
                 // A cycle is named by its path, not by a binding.
                 Sort::SetterRender
                 | Sort::SetterBody
@@ -396,7 +407,8 @@ impl Field {
                 | Sort::Provider
                 | Sort::JsxProp
                 | Sort::ChurnCycle
-                | Sort::Seed => false,
+                | Sort::Seed
+                | Sort::ContextConsumer => false,
             },
             // A writer row is setter-shaped: it names the slot it writes and
             // the setter variable at the call site.
@@ -409,7 +421,8 @@ impl Field {
                 | Sort::Provider
                 | Sort::JsxProp
                 | Sort::ChurnCycle
-                | Sort::Seed => false,
+                | Sort::Seed
+                | Sort::ContextConsumer => false,
             },
             // `stability` stays a deps-entry fact: reading it for a call-site
             // argument is the program-point error ADR-023 §2 refuses — this
@@ -428,7 +441,8 @@ impl Field {
                 | Sort::Writer
                 | Sort::Provider
                 | Sort::JsxProp
-                | Sort::ChurnCycle => false,
+                | Sort::ChurnCycle
+                | Sort::ContextConsumer => false,
             },
             Field::Stability => match sort {
                 Sort::Dep => true,
@@ -441,7 +455,8 @@ impl Field {
                 | Sort::Provider
                 | Sort::JsxProp
                 | Sort::ChurnCycle
-                | Sort::Seed => false,
+                | Sort::Seed
+                | Sort::ContextConsumer => false,
             },
             Field::Returns => match sort {
                 Sort::Arg => true,
@@ -454,7 +469,8 @@ impl Field {
                 | Sort::Provider
                 | Sort::JsxProp
                 | Sort::ChurnCycle
-                | Sort::Seed => false,
+                | Sort::Seed
+                | Sort::ContextConsumer => false,
             },
             // `region` is the lexical body (exact); `phase` the MAY verdict;
             // `via` the wrapper chain (or `direct` / `unknown`).
@@ -469,7 +485,8 @@ impl Field {
                 | Sort::Provider
                 | Sort::JsxProp
                 | Sort::ChurnCycle
-                | Sort::Seed => false,
+                | Sort::Seed
+                | Sort::ContextConsumer => false,
             },
             // Both JSX relations answer it, through the one shared
             // `site_identity` reader — and so does a call-site argument, read
@@ -485,7 +502,8 @@ impl Field {
                 | Sort::HookOrigin
                 | Sort::Writer
                 | Sort::ChurnCycle
-                | Sort::Seed => false,
+                | Sort::Seed
+                | Sort::ContextConsumer => false,
             },
             Field::Prop => match sort {
                 Sort::JsxProp => true,
@@ -498,7 +516,8 @@ impl Field {
                 | Sort::Writer
                 | Sort::Provider
                 | Sort::ChurnCycle
-                | Sort::Seed => false,
+                | Sort::Seed
+                | Sort::ContextConsumer => false,
             },
             // Teardown is a property of an effect's own body: React honours a
             // returned function for effects and nothing else, so the field is
@@ -515,7 +534,8 @@ impl Field {
                 | Sort::Provider
                 | Sort::JsxProp
                 | Sort::ChurnCycle
-                | Sort::Seed => false,
+                | Sort::Seed
+                | Sort::ContextConsumer => false,
             },
             // Which component owns the slot the row writes (#107). Total on a
             // render-setter row: local rows answer with the anchored component
@@ -532,7 +552,8 @@ impl Field {
                 | Sort::Provider
                 | Sort::JsxProp
                 | Sort::ChurnCycle
-                | Sort::Seed => false,
+                | Sort::Seed
+                | Sort::ContextConsumer => false,
             },
             // The loop path, already node-qualified by owning component. Only
             // a cycle row has one; no other sort could invent it.
@@ -547,7 +568,8 @@ impl Field {
                 | Sort::Writer
                 | Sort::Provider
                 | Sort::JsxProp
-                | Sort::Seed => false,
+                | Sort::Seed
+                | Sort::ContextConsumer => false,
             },
         }
     }
@@ -575,6 +597,8 @@ pub(crate) enum ResolvedAnchor {
     /// Render-loop cycles of the program churn graph carried by this
     /// component's effects (#108).
     ChurnCycles,
+    /// `useContext` call sites of this component with complete ancestry (#115).
+    ContextConsumers,
 }
 
 /// A fully-typed, param-baked rule — the executor never sees `PVal` or raw
@@ -649,6 +673,7 @@ fn guard_allowed_keys(g: &Guard) -> (&'static str, &'static [&'static str]) {
         Guard::Updater { .. } => ("guard `updater`", &["kind", "of", "is"]),
         Guard::UpdaterBody { .. } => ("guard `updater_body`", &["kind", "of", "is"]),
         Guard::SameTick { .. } => ("guard `same_tick`", &["kind", "of"]),
+        Guard::Provider { .. } => ("guard `provider`", &["kind", "of", "is"]),
         Guard::SeedSync { .. } => ("guard `seed_sync`", &["kind", "of", "is"]),
         Guard::SlotOwnership { .. } => ("guard `slot_ownership`", &["kind", "of", "is"]),
         Guard::Cycle { .. } => (
@@ -858,7 +883,8 @@ fn validate_rule(
             | Anchor::HookOrigins
             | Anchor::ContextProviders
             | Anchor::JsxProps
-            | Anchor::ChurnCycles => &["relation"],
+            | Anchor::ChurnCycles
+            | Anchor::ContextConsumers => &["relation"],
         },
         "this anchor",
         &format!("{path}.anchor"),
@@ -875,6 +901,7 @@ fn validate_rule(
         Anchor::ContextProviders => (ResolvedAnchor::ContextProviders, Sort::Provider),
         Anchor::JsxProps => (ResolvedAnchor::JsxProps, Sort::JsxProp),
         Anchor::ChurnCycles => (ResolvedAnchor::ChurnCycles, Sort::ChurnCycle),
+        Anchor::ContextConsumers => (ResolvedAnchor::ContextConsumers, Sort::ContextConsumer),
     };
 
     // forEach: at most one typed edge, one binding (ADR-022 §2).
@@ -1416,6 +1443,27 @@ fn validate_guard(
                 ));
             }
             ResolvedGuard::SameTick { of }
+        }
+        Guard::Provider { of, is } => {
+            let (of, sort) = cx.resolve_of(of, g_path)?;
+            if sort != Sort::ContextConsumer {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    format!(
+                        "guard `provider` applies to a `context_consumers` row, but the \
+                         subject binds {}",
+                        sort.describe()
+                    ),
+                ));
+            }
+            let names = cx.env.resolve(is, None, &format!("{g_path}.is"))?;
+            if names.is_empty() {
+                return Err(PackError::new(
+                    format!("{g_path}.is"),
+                    "guard `provider` needs at least one verdict name",
+                ));
+            }
+            ResolvedGuard::Provider { of, names }
         }
         Guard::SeedSync { of, is } => {
             let (of, sort) = cx.resolve_of(of, g_path)?;

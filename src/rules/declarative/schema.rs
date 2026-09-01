@@ -147,6 +147,18 @@ pub enum Anchor {
     /// cycle whose carrying edge has no span produces none. No `must_*` guard
     /// accepts this sort, so an Error is not reachable through the anchor.
     ChurnCycles,
+    /// One `useContext` call site whose ancestry the analysis could complete
+    /// (#115, ADR-032). `name` is the local name the call reads the context by;
+    /// the `provider` guard says whether any component that may render this one
+    /// provides that same cell.
+    ///
+    /// A row exists only when every ancestor chain is complete — inter-analysed,
+    /// non-recursive, and not mentioned by any component phase 1 never reached.
+    /// The verdict is an ABSENCE, and an absence is only as good as the paths
+    /// you can see, so an incomplete closure produces no row rather than a
+    /// confident one. Edge-less; no `must_*` accepts the sort, so Error is
+    /// unreachable.
+    ContextConsumers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -372,6 +384,19 @@ pub enum Guard {
     /// reachable" is not a promise the engine can keep — there is no negated
     /// form to assert it with.
     SameTick { of: String },
+    /// Whether a provider of a `context_consumers` row's context sits on a
+    /// path that reaches it (#115).
+    ///
+    /// MAY-typed and positive-only. `none-on-analyzed-paths` is named for what
+    /// it is: what the completed paths showed, never a proof that no provider
+    /// exists — an unanalyzed mounting shell above a root, an inline-arrow
+    /// provider (#30), or a value-position component reference (#63) all land
+    /// there. No `must_*` binds the sort, so a rule keyed on it is capped at
+    /// Warning by construction.
+    Provider {
+        of: String,
+        is: PVal<Vec<ProviderName>>,
+    },
     /// Whether anything visibly re-syncs a `seeds` row's slot when that prop
     /// moves (#106): a render-time write, or an effect whose declared deps
     /// cover the seed path (or that declares none, so it re-runs every
@@ -575,6 +600,18 @@ pub enum UpdaterName {
     /// ⊤ — a value expression, a call, an argument the walk could not resolve,
     /// or no argument at all.
     Unknown,
+}
+
+/// Total mirror of the provider verdict (#115). Two-valued: the second name
+/// reads as an absence of evidence, never as a proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderName {
+    /// Some component that may render this one provides the cell.
+    ProviderSeen,
+    /// None did, on the paths the analysis could complete.
+    NoneOnAnalyzedPaths,
 }
 
 /// Total mirror of the seed-sync verdict (#106). Two-valued: `none-seen` is

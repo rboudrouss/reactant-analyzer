@@ -27,6 +27,7 @@ use crate::rules::api::query::{
     Certified, CleanupVerdict, ConditionalHookCall, ExitDominance, RuleCtx,
 };
 use crate::rules::helpers::churn_graph::{CycleRow, collect_cycle_rows};
+use crate::rules::helpers::context_flow::{ConsumerRow, ProviderVerdict};
 use crate::rules::helpers::jsx::{JsxPropSite, collect_jsx_prop_sites, site_identity};
 use crate::rules::helpers::local_bindings;
 use crate::rules::helpers::providers::{ProviderSite, ValueIdentity, collect_provider_sites};
@@ -37,7 +38,8 @@ use crate::rules::{
 };
 
 use super::schema::{
-    HookKindFilter, ImpureName, PhaseName, ReturnsName, SeedSyncName, StabilityName, UpdaterName,
+    HookKindFilter, ImpureName, PhaseName, ProviderName, ReturnsName, SeedSyncName, StabilityName,
+    UpdaterName,
 };
 use super::validate::Field;
 use crate::rules::helpers::purity::{ImpureBody, classify_body};
@@ -101,6 +103,8 @@ pub(crate) enum EntityVal<'a, 'b> {
     Cycle(&'b CycleRow),
     /// One prop seed of a state-hook anchor's slot (#106).
     Seed(&'a SlotSeed),
+    /// One `useContext` call site with complete ancestry (#115).
+    Consumer(&'b ConsumerRow),
 }
 
 // ── Per-component index ───────────────────────────────────────────────────────
@@ -249,6 +253,19 @@ impl<'a> EntityCtx<'a> {
     /// render body, deterministic order (the relation sorts by site).
     pub fn jsx_prop_rows(&self) -> Vec<JsxPropSite<'a>> {
         collect_jsx_prop_sites(self.comp)
+    }
+
+    /// `context_consumers` rows (#115): this component's `useContext` calls
+    /// whose ancestry the analysis could complete.
+    ///
+    /// Read from the [`crate::rules::api::cache::ProgramCache`], so the
+    /// relation is built once per program — its verdict depends on every
+    /// component that may render this one, which makes it whole-program data
+    /// for the same reason the churn graph is (#86).
+    pub fn consumer_rows(&self) -> Vec<&'a ConsumerRow> {
+        // The cache outlives `self`, so the rows borrow for `'a`.
+        let consumers: &'a _ = self.ctx.cache().context_consumers();
+        consumers.of(self.ctx.component())
     }
 
     /// `churn_cycles` rows (#108): the program graph's render loops, projected
@@ -432,7 +449,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
-                | EntityVal::Seed(_) => None,
+                | EntityVal::Seed(_)
+                | EntityVal::Consumer(_) => None,
             },
             Field::Name => match v {
                 // A custom hook is called by its own name; every other kind is
@@ -449,6 +467,8 @@ impl<'a> EntityCtx<'a> {
                 EntityVal::Origin(p) => Some(p.origin_hook.clone()),
                 EntityVal::Provider(p) => Some(crate::ir::source_name(p.context).to_string()),
                 EntityVal::JsxProp(j) => Some(j.element.to_string()),
+                // The local binding the call reads the context through.
+                EntityVal::Consumer(c) => Some(crate::ir::source_name(&c.name).to_string()),
                 EntityVal::Setter(_)
                 | EntityVal::Dep(_)
                 | EntityVal::Arg(_)
@@ -472,7 +492,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
-                | EntityVal::Seed(_) => None,
+                | EntityVal::Seed(_)
+                | EntityVal::Consumer(_) => None,
             },
             Field::Slot => match v {
                 EntityVal::Setter(s) => self.setter_slot_name(s),
@@ -484,7 +505,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
-                | EntityVal::Seed(_) => None,
+                | EntityVal::Seed(_)
+                | EntityVal::Consumer(_) => None,
             },
             Field::Setter => match v {
                 EntityVal::Setter(s) => Some(crate::ir::source_name(&s.var).to_string()),
@@ -496,7 +518,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
-                | EntityVal::Seed(_) => None,
+                | EntityVal::Seed(_)
+                | EntityVal::Consumer(_) => None,
             },
             // A seed row IS a prop path, and so is a deps entry.
             Field::Path => match v {
@@ -509,7 +532,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Writer(_)
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
-                | EntityVal::Cycle(_) => None,
+                | EntityVal::Cycle(_)
+                | EntityVal::Consumer(_) => None,
             },
             Field::Stability => match v {
                 EntityVal::Dep(d) => Some(verdict_word(self.dep_verdict(d)).to_string()),
@@ -521,7 +545,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
-                | EntityVal::Seed(_) => None,
+                | EntityVal::Seed(_)
+                | EntityVal::Consumer(_) => None,
             },
             Field::Returns => match v {
                 EntityVal::Arg(a) => Some(returns_word(self.arg_verdict(a)).to_string()),
@@ -533,7 +558,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
-                | EntityVal::Seed(_) => None,
+                | EntityVal::Seed(_)
+                | EntityVal::Consumer(_) => None,
             },
             Field::Region => match v {
                 EntityVal::Writer(w) => Some(w.region.word().to_string()),
@@ -545,7 +571,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
-                | EntityVal::Seed(_) => None,
+                | EntityVal::Seed(_)
+                | EntityVal::Consumer(_) => None,
             },
             Field::Phase => match v {
                 EntityVal::Writer(w) => Some(phase_word(w.phase).to_string()),
@@ -557,7 +584,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
-                | EntityVal::Seed(_) => None,
+                | EntityVal::Seed(_)
+                | EntityVal::Consumer(_) => None,
             },
             Field::Via => match v {
                 EntityVal::Writer(w) => Some(match &w.via {
@@ -577,7 +605,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
-                | EntityVal::Seed(_) => None,
+                | EntityVal::Seed(_)
+                | EntityVal::Consumer(_) => None,
             },
             Field::Identity => match v {
                 EntityVal::Provider(p) => Some(identity_word(p.identity).to_string()),
@@ -589,7 +618,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Origin(_)
                 | EntityVal::Writer(_)
                 | EntityVal::Cycle(_)
-                | EntityVal::Seed(_) => None,
+                | EntityVal::Seed(_)
+                | EntityVal::Consumer(_) => None,
             },
             Field::Prop => match v {
                 EntityVal::JsxProp(j) => Some(j.prop.to_string()),
@@ -601,7 +631,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Writer(_)
                 | EntityVal::Provider(_)
                 | EntityVal::Cycle(_)
-                | EntityVal::Seed(_) => None,
+                | EntityVal::Seed(_)
+                | EntityVal::Consumer(_) => None,
             },
             Field::Cleanup => match v {
                 EntityVal::Hook(row) => Some(cleanup_word(self.cleanup(row)).to_string()),
@@ -613,7 +644,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
-                | EntityVal::Seed(_) => None,
+                | EntityVal::Seed(_)
+                | EntityVal::Consumer(_) => None,
             },
             // Which component owns the slot the row writes: this one for a
             // local setter, the parent for a `ComponentSetter`-valued prop.
@@ -631,7 +663,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
-                | EntityVal::Seed(_) => None,
+                | EntityVal::Seed(_)
+                | EntityVal::Consumer(_) => None,
             },
             // The loop path: node names are already qualified and quoted by
             // the shared `node_display`, so this one is rendered bare.
@@ -645,7 +678,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Writer(_)
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
-                | EntityVal::Seed(_) => None,
+                | EntityVal::Seed(_)
+                | EntityVal::Consumer(_) => None,
             },
         }
     }
@@ -759,6 +793,7 @@ fn anonymous(v: &EntityVal<'_, '_>) -> String {
         EntityVal::JsxProp(j) => format!("`{}` of `<{}>`", j.prop, j.element),
         EntityVal::Cycle(c) => format!("the loop through effect #{}", c.effect),
         EntityVal::Seed(s) => format!("`{}`", s.path),
+        EntityVal::Consumer(c) => format!("`{}`", crate::ir::source_name(&c.name)),
     }
 }
 
@@ -823,6 +858,14 @@ impl<'a> EntityCtx<'a> {
             ImpureBody::Impure => ImpureName::Impure,
             ImpureBody::Unknown => ImpureName::Unknown,
         }
+    }
+}
+
+/// Total mirror of the provider verdict (#115).
+pub(crate) fn provider_name(v: ProviderVerdict) -> ProviderName {
+    match v {
+        ProviderVerdict::ProviderSeen => ProviderName::ProviderSeen,
+        ProviderVerdict::NoneOnAnalyzedPaths => ProviderName::NoneOnAnalyzedPaths,
     }
 }
 

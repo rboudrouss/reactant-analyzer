@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 
 use crate::engine::ProgramAnalysisResult;
 use crate::rules::helpers::churn_graph::ChurnGraph;
+use crate::rules::helpers::context_flow::ContextConsumers;
 use crate::rules::helpers::mount::MountIndex;
 
 /// Program-scoped, lazily-computed derived data shared by every component's
@@ -24,6 +25,7 @@ pub struct ProgramCache<'a> {
     program: &'a ProgramAnalysisResult,
     churn: OnceLock<ChurnGraph>,
     mounts: OnceLock<MountIndex>,
+    consumers: OnceLock<ContextConsumers>,
 }
 
 impl<'a> ProgramCache<'a> {
@@ -32,6 +34,7 @@ impl<'a> ProgramCache<'a> {
             program,
             churn: OnceLock::new(),
             mounts: OnceLock::new(),
+            consumers: OnceLock::new(),
         }
     }
 
@@ -42,6 +45,15 @@ impl<'a> ProgramCache<'a> {
     /// The program's churn graph and its cycles, built on first request.
     pub(in crate::rules) fn churn(&self) -> &ChurnGraph {
         self.churn.get_or_init(|| ChurnGraph::build(self.program))
+    }
+
+    /// The program's context-consumer relation, built on first request
+    /// (#115). Whole-program by nature — a consumer's verdict depends on every
+    /// component that may render it — so it lives here for the same reason the
+    /// churn graph does (#86).
+    pub(in crate::rules) fn context_consumers(&self) -> &ContextConsumers {
+        self.consumers
+            .get_or_init(|| ContextConsumers::build(self.program))
     }
 
     /// Component → its JSX call sites, built on first request. The reverse

@@ -46,6 +46,8 @@ export type Anchor = {
   "relation": "jsx_props";
 } | {
   "relation": "churn_cycles";
+} | {
+  "relation": "context_consumers";
 };
 
 /**
@@ -138,6 +140,10 @@ export type Guard = {
   "of": string;
 } | {
   "kind": "same_tick";
+  "of": string;
+} | {
+  "is": PVal_Array_of_ProviderName;
+  "kind": "provider";
   "of": string;
 } | {
   "is": PVal_Array_of_SeedSyncName;
@@ -239,6 +245,10 @@ export type PVal_Array_of_PhaseName = PhaseName[] | {
   "$param": string;
 };
 
+export type PVal_Array_of_ProviderName = ProviderName[] | {
+  "$param": string;
+};
+
 export type PVal_Array_of_ReturnsName = ReturnsName[] | {
   "$param": string;
 };
@@ -282,6 +292,12 @@ export type ParamType = "number" | "string" | "boolean" | "string[]";
  * Total mirror of `WriterPhase` (ADR-027 §1); ⊤ = `unknown`.
  */
 export type PhaseName = "render" | "effect" | "memo" | "callback" | "handler" | "unknown" | "deferred" | "cleanup";
+
+/**
+ * Total mirror of the provider verdict (#115). Two-valued: the second name
+ * reads as an absence of evidence, never as a proof.
+ */
+export type ProviderName = "provider-seen" | "none-on-analyzed-paths";
 
 /**
  * Total mirror of `ReturnsVerdict`.

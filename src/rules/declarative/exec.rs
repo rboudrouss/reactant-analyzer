@@ -24,7 +24,7 @@ use crate::rules::{Rule, SetterCall};
 
 use super::entity::{
     ArgEntity, DepEntity, EntityCtx, EntityVal, HookRow, SetterEntity, cleanup_name, identity_name,
-    seed_sync_name, updater_name,
+    provider_name, seed_sync_name, updater_name,
 };
 use super::schema::{EdgeName, ElseBehavior, OwnershipName, SeverityPin};
 use super::validate::{
@@ -89,6 +89,9 @@ enum Candidate<'a, 'b> {
     /// edge-less, and no must-guard accepts its sort, so it can never mint a
     /// proof.
     Cycle(&'b CycleRow),
+    /// One `useContext` call site with complete ancestry (#115) — edge-less,
+    /// and no must-guard accepts its sort.
+    Consumer(&'a crate::rules::helpers::context_flow::ConsumerRow),
 }
 
 impl<'a, 'b> Candidate<'a, 'b> {
@@ -99,7 +102,8 @@ impl<'a, 'b> Candidate<'a, 'b> {
             | Candidate::Origin(_)
             | Candidate::Provider(_)
             | Candidate::JsxProp(_)
-            | Candidate::Cycle(_) => None,
+            | Candidate::Cycle(_)
+            | Candidate::Consumer(_) => None,
         }
     }
 
@@ -110,7 +114,8 @@ impl<'a, 'b> Candidate<'a, 'b> {
             | Candidate::Origin(_)
             | Candidate::Provider(_)
             | Candidate::JsxProp(_)
-            | Candidate::Cycle(_) => None,
+            | Candidate::Cycle(_)
+            | Candidate::Consumer(_) => None,
         }
     }
 
@@ -123,6 +128,7 @@ impl<'a, 'b> Candidate<'a, 'b> {
             (BindRef::Anchor, Candidate::Provider(p)) => EntityVal::Provider(p),
             (BindRef::Anchor, Candidate::JsxProp(j)) => EntityVal::JsxProp(j),
             (BindRef::Anchor, Candidate::Cycle(c)) => EntityVal::Cycle(c),
+            (BindRef::Anchor, Candidate::Consumer(c)) => EntityVal::Consumer(c),
             (BindRef::Bound, _) => match self.bound().expect("validated: binding exists") {
                 Bound::Setter(s) => EntityVal::Setter(s),
                 Bound::Dep(d) => EntityVal::Dep(d),
@@ -142,6 +148,7 @@ impl<'a, 'b> Candidate<'a, 'b> {
             Candidate::Provider(_) | Candidate::JsxProp(_) => None,
             // The carrying effect: the finding is about that effect's write.
             Candidate::Cycle(c) => Some(c.effect),
+            Candidate::Consumer(c) => Some(c.label),
         }
     }
 
@@ -164,6 +171,7 @@ impl<'a, 'b> Candidate<'a, 'b> {
             // ADR-024: the carrying edge's write site, which is why a spanless
             // edge produces no row at all.
             Candidate::Cycle(c) => Some(c.span),
+            Candidate::Consumer(c) => c.span,
         }
     }
 }
@@ -275,6 +283,11 @@ impl Rule for TierARule {
             ResolvedAnchor::ChurnCycles => {
                 for row in e.cycle_rows() {
                     self.eval(&e, &Candidate::Cycle(&row), &mut out);
+                }
+            }
+            ResolvedAnchor::ContextConsumers => {
+                for row in e.consumer_rows() {
+                    self.eval(&e, &Candidate::Consumer(row), &mut out);
                 }
             }
         }
@@ -402,6 +415,12 @@ impl TierARule {
                     unreachable!("validated: `updater_body` binds a writers row")
                 };
                 names.contains(&e.updater_purity(&w.updater))
+            }
+            ResolvedGuard::Provider { of, names } => {
+                let EntityVal::Consumer(c) = cand.entity_at(*of) else {
+                    unreachable!("validated: `provider` binds a context_consumers row")
+                };
+                names.contains(&provider_name(c.verdict))
             }
             ResolvedGuard::SeedSync { of, names } => {
                 let EntityVal::Seed(s) = cand.entity_at(*of) else {
@@ -605,7 +624,8 @@ impl TierARule {
                     | Candidate::Origin(_)
                     | Candidate::Provider(_)
                     | Candidate::JsxProp(_)
-                    | Candidate::Cycle(_) => {
+                    | Candidate::Cycle(_)
+                    | Candidate::Consumer(_) => {
                         unreachable!("validated: `must_dominates_all_exits` binds a render setter")
                     }
                 };

@@ -33,6 +33,11 @@ pub(crate) struct ProviderSite<'a> {
     /// The context binding the element hangs off (`TabsContext`) — the LOCAL
     /// name, which is what a message should show.
     pub context: &'a Var,
+    /// Canonical identity of the cell that name resolves to (#109). Two files
+    /// importing the same context under different local names share this; the
+    /// local name identifies nothing across files, which is why the
+    /// consumer↔provider pairing keys on this instead.
+    pub context_id: &'a ContextId,
     /// Identity of the `value` prop across renders.
     pub identity: ValueIdentity,
     /// Span of the element's opening tag.
@@ -61,13 +66,14 @@ pub(crate) fn collect_provider_sites(comp: &AnalysisResult<StateValue>) -> Vec<P
         let env = comp.block_states.get(&block_id);
         for (idx, expr) in exprs.into_iter().enumerate() {
             each_component_element(expr, &mut |name, props, span| {
-                let Some((context, _id)) = provider_context(name, &contexts) else {
+                let Some((context, context_id)) = provider_context(name, &contexts) else {
                     return;
                 };
                 found.push((
                     (block_id, idx),
                     ProviderSite {
                         context,
+                        context_id,
                         identity: site_identity(prop_value(props), env, &bindings, comp),
                         span,
                     },

@@ -6,6 +6,7 @@
 
 pub mod churn;
 pub mod churn_graph;
+pub mod context_flow;
 pub mod jsx;
 pub mod mount;
 pub mod providers;

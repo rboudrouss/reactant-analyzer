@@ -87,8 +87,19 @@ impl RootStrategy {
 }
 
 fn collect_compapp_in_component(comp: &ComponentIR, out: &mut HashSet<Symbol>) {
-    collect_compapp_in_cfg(&comp.render_cfg, out);
-    for hook in &comp.hooks {
+    collect_compapp_refs(&comp.render_cfg, &comp.hooks, out);
+}
+
+/// Every component name this body syntactically instantiates — the render CFG
+/// plus every hook body, nested `FnLit`s included.
+///
+/// A *syntactic* over-approximation of "may render", which is what both
+/// consumers want: root detection reads it as "referenced, so not a root", and
+/// the context-consumer relation reads it as "an unreached component may be a
+/// parent here, so the ancestry is not complete" (#115).
+pub(crate) fn collect_compapp_refs(cfg: &CFG, hooks: &[HookEntry], out: &mut HashSet<Symbol>) {
+    collect_compapp_in_cfg(cfg, out);
+    for hook in hooks {
         match hook {
             HookEntry::Effect { body_cfg, .. }
             | HookEntry::Memo { body_cfg, .. }

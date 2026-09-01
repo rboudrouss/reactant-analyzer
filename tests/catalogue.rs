@@ -414,6 +414,60 @@ const LAYOUT_EFFECT_PACK: &str = r#"{
   }]
 }"#;
 
+/// #115: the `context_consumers` anchor. Rows exist only where the ancestry is
+/// complete, and the verdict is an absence — so the guard names it
+/// `none-on-analyzed-paths`, never `no-provider`.
+const CONSUMER_PACK: &str = r#"{
+  "schemaVersion": 1, "name": "cat-consumer",
+  "rules": [{
+    "id": "consumer-without-provider",
+    "docs": {
+      "description": "a component reads a context that nothing above it provides",
+      "why": "`useContext` falls back to the value passed to `createContext` when no provider is above the consumer — usually `null` or `undefined`, so the failure shows up as a crash or an empty screen far from the missing provider.",
+      "fix": "Render the provider above the consumer, or give `createContext` a default that is safe to use on its own.",
+      "example": "<App/> renders <Panel/>, which calls useContext(ThemeContext) — and no ThemeContext.Provider is anywhere above it"
+    },
+    "severity": "warning",
+    "anchor": { "relation": "context_consumers" },
+    "guards": [
+      { "kind": "provider", "of": "anchor", "is": ["none-on-analyzed-paths"] }
+    ],
+    "message": "this component reads context {anchor.name}, and nothing that renders it provides that context"
+  }]
+}"#;
+
+/// A consumer whose whole analysed ancestry holds no provider of its cell.
+const CONSUMER_FILES: &[(&str, &str)] = &[
+    (
+        "ctx.ts",
+        "import { createContext } from \"react\";\nexport const ThemeContext = createContext(null);\n",
+    ),
+    (
+        "app.tsx",
+        "import { Panel } from \"./panel\";\nexport function App() {\n  return <div><Panel/></div>;\n}\n",
+    ),
+    (
+        "panel.tsx",
+        "import { useContext } from \"react\";\nimport { ThemeContext } from \"./ctx\";\nexport function Panel() {\n  const theme = useContext(ThemeContext);\n  return <div>{theme}</div>;\n}\n",
+    ),
+];
+
+/// The same tree with the provider on the ancestor.
+const CONSUMER_OK_FILES: &[(&str, &str)] = &[
+    (
+        "ctx.ts",
+        "import { createContext } from \"react\";\nexport const ThemeContext = createContext(null);\n",
+    ),
+    (
+        "app.tsx",
+        "import { ThemeContext } from \"./ctx\";\nimport { Panel } from \"./panel\";\nexport function App() {\n  return <ThemeContext.Provider value={\"dark\"}><Panel/></ThemeContext.Provider>;\n}\n",
+    ),
+    (
+        "panel.tsx",
+        "import { useContext } from \"react\";\nimport { ThemeContext } from \"./ctx\";\nexport function Panel() {\n  const theme = useContext(ThemeContext);\n  return <div>{theme}</div>;\n}\n",
+    ),
+];
+
 /// #109: the context is created in one file and provided in another, under a
 /// different local name. Proves the canonical `ContextId` pairs them.
 const CROSS_FILE_CTX_FILES: &[(&str, &str)] = &[
@@ -876,10 +930,23 @@ fn catalogue() -> Vec<Entry> {
         },
         Entry {
             id: "consumer-without-provider",
-            status: Status::Blocked {
-                class: "whole-program",
-                missing: "the useContext consumer→provider relation (#28: decide \
-                          post-pass vs unified phases first)",
+            status: Status::Expressible {
+                pack_json: CONSUMER_PACK,
+                rule: "cat-consumer/consumer-without-provider",
+                fires_on: Fixture::Multi(CONSUMER_FILES),
+                silent_on: Fixture::Multi(CONSUMER_OK_FILES),
+                weakened: Some(
+                    "in-project contexts only, and only where the WHOLE ancestor closure is \
+                     inter-analyzed: a consumer reached through a component phase 1 never \
+                     entered produces no row at all (#110's split, plus a syntactic \
+                     `CompApp` completion pass over unreached bodies). The unanalyzed \
+                     mounting shell above a root and inline-arrow providers (#30) leave a \
+                     Warning-level FP residue, and value-position component references \
+                     (#63, wontfix) join it. Library contexts self-exclude symmetrically \
+                     (#51 wontfix: their providers are invisible AND their contexts \
+                     unprovable), and identity is one re-export level deep (#49). No value \
+                     modeling: #28's post-pass-vs-unified-phases decision is untouched",
+                ),
             },
         },
         // ── Hook identity ────────────────────────────────────────────────────
@@ -976,7 +1043,7 @@ fn catalogue() -> Vec<Entry> {
 /// after the single-binding certificate resolved Var-bound selectors (#103) →
 /// 13/22 after the `identity` verdict reached call-site arguments (#112).
 /// Flip an entry (rule + fixtures), then update this constant.
-const EXPRESSIBLE_NOW: usize = 19;
+const EXPRESSIBLE_NOW: usize = 20;
 
 #[test]
 fn catalogue_is_pinned_at_22_entries() {
