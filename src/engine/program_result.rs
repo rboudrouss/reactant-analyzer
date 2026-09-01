@@ -33,6 +33,62 @@ pub struct ProgramAnalysisResult {
     /// the IR was built by hand — a rule reading it must treat "absent" as
     /// *unproven*, never as a proven negative.
     pub module_table: ModuleTable,
+    /// Components analysed in **phase 1** — the roots plus everything reached
+    /// top-down from them with an `InterCtx` (#110).
+    ///
+    /// **The reading discipline, and why the field exists.** Phase 2 sweeps
+    /// every component phase 1 did not reach and analyses it intra-only, with
+    /// no `InterCtx`, so it records no call-graph edges. Through
+    /// [`ComponentCallGraph::callers_of`] alone a phase-2 component is
+    /// therefore indistinguishable from a genuine root: both answer "no
+    /// callers". For a component NOT in this set, an empty `callers_of` means
+    /// **unknown ancestry**, never "proven root".
+    ///
+    /// Any relation that walks ancestry to conclude something is *absent* —
+    /// no provider above this consumer, no caller that could hold the setter —
+    /// must consult this set first, or it fails open on exactly the components
+    /// whose parents it cannot see. Empty for hand-built IR, which reads as
+    /// "nothing was inter-analysed": the conservative answer.
+    pub phase1_reached: HashSet<Symbol>,
+}
+
+impl ProgramAnalysisResult {
+    /// Was `comp` analysed top-down in phase 1, with its callers' props and
+    /// callbacks flowed in?
+    ///
+    /// `false` means one of two things the analysis cannot tell apart — the
+    /// component is genuinely unreachable, or nothing that renders it was a
+    /// root — so a consumer must treat its ancestry as unknown rather than
+    /// empty (#110, #20).
+    pub fn was_inter_analyzed(&self, comp: &Symbol) -> bool {
+        self.phase1_reached.contains(comp)
+    }
+
+    /// The transitive caller closure of `comp`, or `None` when any component on
+    /// the way up was not inter-analysed — the ancestry is then unknown, not
+    /// empty, and a caller reasoning about absence must not proceed.
+    ///
+    /// Cycle-safe: a recursive component's closure includes itself and
+    /// terminates. `comp` itself must be inter-analysed, otherwise even its
+    /// direct callers are unknown.
+    pub fn complete_ancestry(&self, comp: &Symbol) -> Option<HashSet<Symbol>> {
+        if !self.was_inter_analyzed(comp) {
+            return None;
+        }
+        let mut seen: HashSet<Symbol> = HashSet::new();
+        let mut queue = vec![comp.clone()];
+        while let Some(cur) = queue.pop() {
+            for caller in self.call_graph.callers_of(&cur) {
+                if !self.was_inter_analyzed(caller) {
+                    return None;
+                }
+                if seen.insert(caller.clone()) {
+                    queue.push(caller.clone());
+                }
+            }
+        }
+        Some(seen)
+    }
 }
 
 /// Directed call graph: caller → list of call sites.

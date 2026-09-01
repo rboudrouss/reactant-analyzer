@@ -155,7 +155,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 }
                 // A context object is a module-scoped reference like any
                 // literal — the role it also records is read by the rules layer.
-                ModuleConstInit::Ref | ModuleConstInit::Context => {
+                ModuleConstInit::Ref | ModuleConstInit::Context(_) => {
                     StateValue::reference(Stability::Stable)
                 }
             };
@@ -689,6 +689,13 @@ pub fn analyze_program(
         }
     }
 
+    // Everything phase 1 reached: the roots plus every component
+    // `eval_comp_app` analysed top-down under an `InterCtx`. Snapshotted HERE,
+    // before the sweep below adds intra-only results that record no call-graph
+    // edges and would otherwise be indistinguishable from genuine roots (#110).
+    let phase1_reached: std::collections::HashSet<crate::ir::types::Symbol> =
+        results.borrow().keys().cloned().collect();
+
     // Phase 2: analyze unreached components (props=⊤, intra only). Skip
     // those already in `results` inter-component pass inserted precise results.
     let mut remaining_keys: Vec<crate::engine::ComponentKey> = registry
@@ -729,6 +736,7 @@ pub fn analyze_program(
         // Exposed for witness producers (ADR-019): rules resolve callee
         // names against the same registry the inliner used.
         function_registry: config.function_registry.clone(),
+        phase1_reached,
     }
 }
 

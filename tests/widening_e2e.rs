@@ -73,6 +73,7 @@ fn rule_hits<R: Rule>(
         file_table: Default::default(),
         module_table: Default::default(),
         function_registry: Default::default(),
+        phase1_reached: Default::default(),
     };
     rule.check(&RuleCtx::new(&prog, &name.to_string())).len()
 }

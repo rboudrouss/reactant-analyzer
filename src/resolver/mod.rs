@@ -309,7 +309,7 @@ pub fn lower_files_with(
             path.clone(),
             crate::lowering::collect_module_facts(&ret.program, path, resolver),
         );
-        contexts.insert(path.clone(), scan_context_names(&ret.program));
+        contexts.insert(path.clone(), scan_context_names(&ret.program, path));
         file_imports.push((
             path.clone(),
             crate::lowering::build_resolved_imports(&ret.program, path, resolver),
@@ -365,14 +365,22 @@ fn resolve_imported_contexts(
     contexts: &HashMap<PathBuf, HashSet<String>>,
     file_imports: &[(PathBuf, HashMap<String, ResolvedImport>)],
 ) {
-    let mut extra: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    // `local name → the origin cell it names`. The origin is exactly what the
+    // match above already established, and dropping it was #109's defect.
+    let mut extra: HashMap<PathBuf, Vec<(String, crate::ir::ContextId)>> = HashMap::new();
     for (file, imports) in file_imports {
         for (local, origin) in imports {
             if contexts
                 .get(&origin.file)
                 .is_some_and(|names| names.contains(&origin.imported))
             {
-                extra.entry(file.clone()).or_default().push(local.clone());
+                extra.entry(file.clone()).or_default().push((
+                    local.clone(),
+                    crate::ir::ContextId {
+                        origin_file: origin.file.clone(),
+                        origin_name: origin.imported.clone(),
+                    },
+                ));
             }
         }
     }
@@ -387,8 +395,8 @@ fn resolve_imported_contexts(
         };
         let map = rebuilt.entry(comp.file.clone()).or_insert_with(|| {
             let mut m = (*comp.module_consts).clone();
-            for name in names {
-                m.insert(name.clone(), ModuleConstInit::Context);
+            for (name, id) in names {
+                m.insert(name.clone(), ModuleConstInit::Context(id.clone()));
             }
             Arc::new(m)
         });

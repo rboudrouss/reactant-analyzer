@@ -14,12 +14,12 @@
 //! the general JSX-prop relation — see [`super::jsx`]. This module adds only
 //! the context proof and the `value`-prop projection.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use crate::{
     domains::StateValue,
     engine::AnalysisResult,
-    ir::{BlockId, ModuleConstInit, SourceRange, expr::Expr, types::Var},
+    ir::{BlockId, ContextId, ModuleConstInit, SourceRange, expr::Expr, types::Var},
     rules::helpers::{
         jsx::{each_component_element, site_identity, top_level_exprs},
         local_bindings,
@@ -30,7 +30,8 @@ pub(crate) use super::jsx::ValueIdentity;
 
 /// One `<Ctx.Provider …>` element found in a component.
 pub(crate) struct ProviderSite<'a> {
-    /// The context binding the element hangs off (`TabsContext`).
+    /// The context binding the element hangs off (`TabsContext`) — the LOCAL
+    /// name, which is what a message should show.
     pub context: &'a Var,
     /// Identity of the `value` prop across renders.
     pub identity: ValueIdentity,
@@ -41,11 +42,13 @@ pub(crate) struct ProviderSite<'a> {
 /// Every proven context provider in the component's **render body**, in a
 /// deterministic order. Render-only for the reason given in [`super::jsx`].
 pub(crate) fn collect_provider_sites(comp: &AnalysisResult<StateValue>) -> Vec<ProviderSite<'_>> {
-    let contexts: HashSet<&Var> = comp
+    let contexts: HashMap<&Var, &ContextId> = comp
         .module_consts
         .iter()
-        .filter(|(_, init)| matches!(init, ModuleConstInit::Context))
-        .map(|(name, _)| name)
+        .filter_map(|(name, init)| match init {
+            ModuleConstInit::Context(id) => Some((name, id)),
+            _ => None,
+        })
         .collect();
     if contexts.is_empty() {
         return Vec::new();
@@ -58,7 +61,7 @@ pub(crate) fn collect_provider_sites(comp: &AnalysisResult<StateValue>) -> Vec<P
         let env = comp.block_states.get(&block_id);
         for (idx, expr) in exprs.into_iter().enumerate() {
             each_component_element(expr, &mut |name, props, span| {
-                let Some(context) = provider_context(name, &contexts) else {
+                let Some((context, _id)) = provider_context(name, &contexts) else {
                     return;
                 };
                 found.push((
@@ -76,10 +79,17 @@ pub(crate) fn collect_provider_sites(comp: &AnalysisResult<StateValue>) -> Vec<P
     found.into_iter().map(|(_, site)| site).collect()
 }
 
-/// `"TabsContext.Provider"` → the proven context binding it names.
-fn provider_context<'a>(name: &str, contexts: &HashSet<&'a Var>) -> Option<&'a Var> {
+/// `"TabsContext.Provider"` → the proven context binding it names, with the
+/// cell that binding resolves to.
+fn provider_context<'a>(
+    name: &str,
+    contexts: &HashMap<&'a Var, &'a ContextId>,
+) -> Option<(&'a Var, &'a ContextId)> {
     let base = name.strip_suffix(".Provider")?;
-    contexts.iter().find(|c| c.as_str() == base).copied()
+    contexts
+        .iter()
+        .find(|(c, _)| c.as_str() == base)
+        .map(|(c, id)| (*c, *id))
 }
 
 /// The `value` field of a lowered JSX props object.

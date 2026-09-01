@@ -49,6 +49,7 @@ fn diagnostics(src: &str) -> Vec<(String, String)> {
         file_table: Default::default(),
         module_table: Default::default(),
         function_registry: Default::default(),
+        phase1_reached: Default::default(),
     };
 
     let mut out = Vec::new();
@@ -102,6 +103,7 @@ fn diagnostics_sev(src: &str) -> Vec<(String, reactant::rules::Severity, String)
         file_table: Default::default(),
         module_table: Default::default(),
         function_registry: Default::default(),
+        phase1_reached: Default::default(),
     };
     let mut out = Vec::new();
     for name in &names {

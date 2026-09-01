@@ -185,3 +185,90 @@ export function P({ children }) {
     );
     assert_eq!(provider_findings(&tmp).len(), 1);
 }
+
+// ── #109: the identity the resolver used to discard ──────────────────────────
+
+/// Two files importing the same cell under different local names must resolve
+/// to the SAME [`ContextId`] — that is what a cross-file consumer↔provider
+/// pairing keys on, and what the unit variant made impossible.
+#[test]
+fn the_same_cell_imported_twice_has_one_canonical_identity() {
+    use reactant::engine::{Config, RootStrategy};
+    use reactant::ir::ModuleConstInit;
+    use reactant::resolver::{DefaultImportResolver, analyze_lowered, lower_files};
+
+    let tmp = Tmp::new("identity");
+    tmp.write(
+        "ctx.ts",
+        "import { createContext } from \"react\";\nexport const TabsContext = createContext(null);\n",
+    );
+    tmp.write(
+        "a.tsx",
+        "import { TabsContext } from \"./ctx\";\nexport function A() {\n  return <TabsContext.Provider value={{}}><div/></TabsContext.Provider>;\n}\n",
+    );
+    tmp.write(
+        "b.tsx",
+        "import { TabsContext as Tabs } from \"./ctx\";\nexport function B() {\n  return <Tabs.Provider value={{}}><div/></Tabs.Provider>;\n}\n",
+    );
+
+    let files: Vec<PathBuf> = ["ctx.ts", "a.tsx", "b.tsx"]
+        .iter()
+        .map(|f| tmp.0.join(f))
+        .collect();
+    let lowered = lower_files(&files, &DefaultImportResolver::default());
+    assert!(
+        lowered.parse_errors.is_empty(),
+        "{:?}",
+        lowered.parse_errors
+    );
+    let prog = analyze_lowered(lowered, RootStrategy::AllComponents, Config::default());
+
+    let id_of = |comp: &str, local: &str| {
+        let c = prog
+            .components
+            .get(comp)
+            .unwrap_or_else(|| panic!("no component {comp}"));
+        match c.module_consts.get(local) {
+            Some(ModuleConstInit::Context(id)) => id.clone(),
+            other => panic!("{comp}.{local} is not a proven context: {other:?}"),
+        }
+    };
+
+    let a = id_of("A", "TabsContext");
+    let b = id_of("B", "Tabs");
+    assert_eq!(a, b, "the local alias must not be what identifies the cell");
+    assert_eq!(
+        a.origin_name, "TabsContext",
+        "the EXPORTED name, not the alias"
+    );
+    assert!(
+        a.origin_file.ends_with("ctx.ts"),
+        "the defining file: {:?}",
+        a.origin_file
+    );
+}
+
+/// A locally-created context is its own origin.
+#[test]
+fn a_local_context_identifies_itself() {
+    use reactant::engine::{Config, RootStrategy};
+    use reactant::ir::ModuleConstInit;
+    use reactant::resolver::{DefaultImportResolver, analyze_lowered, lower_files};
+
+    let tmp = Tmp::new("local-identity");
+    tmp.write(
+        "own.tsx",
+        "import { createContext } from \"react\";\nconst Own = createContext(null);\nexport function C() {\n  return <Own.Provider value={{}}><div/></Own.Provider>;\n}\n",
+    );
+    let files = vec![tmp.0.join("own.tsx")];
+    let lowered = lower_files(&files, &DefaultImportResolver::default());
+    let prog = analyze_lowered(lowered, RootStrategy::AllComponents, Config::default());
+    let c = &prog.components[&"C".to_string()];
+    match c.module_consts.get("Own") {
+        Some(ModuleConstInit::Context(id)) => {
+            assert_eq!(id.origin_name, "Own");
+            assert!(id.origin_file.ends_with("own.tsx"), "{:?}", id.origin_file);
+        }
+        other => panic!("not a proven context: {other:?}"),
+    }
+}

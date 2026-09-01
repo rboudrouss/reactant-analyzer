@@ -127,6 +127,7 @@ fn run_rule_on(pack_json: &str, rule_id: &str, fixture: &Fixture) -> Vec<Diagnos
                     file_table: Default::default(),
                     module_table: Default::default(),
                     function_registry: Default::default(),
+                    phase1_reached: Default::default(),
                 },
                 names,
             )
@@ -413,6 +414,31 @@ const LAYOUT_EFFECT_PACK: &str = r#"{
   }]
 }"#;
 
+/// #109: the context is created in one file and provided in another, under a
+/// different local name. Proves the canonical `ContextId` pairs them.
+const CROSS_FILE_CTX_FILES: &[(&str, &str)] = &[
+    (
+        "ctx.ts",
+        "import { createContext } from \"react\";\nexport const TabsContext = createContext(null);\n",
+    ),
+    (
+        "tabs.tsx",
+        "import { useState } from \"react\";\nimport { TabsContext as Tabs } from \"./ctx\";\nexport function Tabs2() {\n  const [tab, setTab] = useState(0);\n  return <Tabs.Provider value={{ tab, setTab }}><div/></Tabs.Provider>;\n}\n",
+    ),
+];
+
+/// The same pair, with the value memoized.
+const CROSS_FILE_CTX_OK_FILES: &[(&str, &str)] = &[
+    (
+        "ctx.ts",
+        "import { createContext } from \"react\";\nexport const TabsContext = createContext(null);\n",
+    ),
+    (
+        "tabs.tsx",
+        "import { useState, useMemo } from \"react\";\nimport { TabsContext as Tabs } from \"./ctx\";\nexport function Tabs2() {\n  const [tab, setTab] = useState(0);\n  const value = useMemo(() => ({ tab, setTab }), [tab]);\n  return <Tabs.Provider value={value}><div/></Tabs.Provider>;\n}\n",
+    ),
+];
+
 /// #106: the `seeds` edge and the `seed_sync` guard. Positive-only and
 /// may-typed — `none-seen` is an absence of evidence, so no `must_*` guard
 /// binds a seed row and Error is unreachable through the edge.
@@ -551,17 +577,15 @@ fn catalogue() -> Vec<Entry> {
             status: Status::Expressible {
                 pack_json: PROVIDER_PACK,
                 rule: "cat-provider/fresh-provider-value",
-                fires_on: Fixture::Single(
-                    "import { createContext, useState } from \"react\";\nconst Ctx = createContext(null);\nfunction C() {\n  const [tab, setTab] = useState(0);\n  return <Ctx.Provider value={{ tab, setTab }}><div/></Ctx.Provider>;\n}",
-                ),
-                silent_on: Fixture::Single(
-                    "import { createContext, useState, useMemo } from \"react\";\nconst Ctx = createContext(null);\nfunction C() {\n  const [tab, setTab] = useState(0);\n  const value = useMemo(() => ({ tab, setTab }), [tab]);\n  return <Ctx.Provider value={value}><div/></Ctx.Provider>;\n}",
-                ),
+                fires_on: Fixture::Multi(CROSS_FILE_CTX_FILES),
+                silent_on: Fixture::Multi(CROSS_FILE_CTX_OK_FILES),
                 weakened: Some(
-                    "same-file proven contexts only in the single-file fixture; the \
-                     relation is render-only by semantics (a useMemo-built provider \
+                    "the relation is render-only by semantics (a useMemo-built provider \
                      keeps identity), and the value prop only — the any-prop \
-                     generalisation (identity-keyed-jsx-prop) rides this relation later",
+                     generalisation (identity-keyed-jsx-prop) rides this relation later. \
+                     Cross-file contexts pair (#109): the row carries the canonical \
+                     `ContextId` of the cell, so an importer's local alias is not what \
+                     identifies it — but only one re-export level deep (#49)",
                 ),
             },
         },

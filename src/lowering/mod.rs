@@ -105,11 +105,11 @@ fn build_react_ns(program: &Program) -> HashSet<String> {
 /// The cross-file pass in [`crate::resolver::lower_files_with`] needs this for
 /// *every* file, including files with no component of their own — a
 /// `contexts/ctx.ts` that only exports the context is the common shape.
-pub(crate) fn scan_context_names(program: &Program) -> HashSet<String> {
+pub(crate) fn scan_context_names(program: &Program, file: &Path) -> HashSet<String> {
     let react_ns = build_react_ns(program);
-    collect_module_consts(program, &react_ns)
+    collect_module_consts(program, &react_ns, file)
         .into_iter()
-        .filter(|(_, init)| matches!(init, ModuleConstInit::Context))
+        .filter(|(_, init)| matches!(init, ModuleConstInit::Context(_)))
         .map(|(name, _)| name)
         .collect()
 }
@@ -154,6 +154,7 @@ fn react_create_context_names(program: &Program) -> HashSet<String> {
 fn collect_module_consts(
     program: &Program,
     react_ns: &HashSet<String>,
+    file: &Path,
 ) -> HashMap<Var, ModuleConstInit> {
     fn peel_ts<'e, 'a>(mut expr: &'e Expression<'a>) -> &'e Expression<'a> {
         loop {
@@ -236,7 +237,14 @@ fn collect_module_consts(
             } else if let Expression::CallExpression(call) = init
                 && is_create_context(call)
             {
-                map.insert(id.name.to_string(), ModuleConstInit::Context);
+                // A locally-created context IS its own origin (#109).
+                map.insert(
+                    id.name.to_string(),
+                    ModuleConstInit::Context(crate::ir::ContextId {
+                        origin_file: file.to_path_buf(),
+                        origin_name: id.name.to_string(),
+                    }),
+                );
             }
         }
     }
@@ -342,7 +350,7 @@ pub fn lower_program_with_resolver(
     let smap = SourceMap::new(source, files.intern(file));
     let origins = build_hook_origins(program, file, resolver);
     let react_ns = build_react_ns(program);
-    let module_consts = Arc::new(collect_module_consts(program, &react_ns));
+    let module_consts = Arc::new(collect_module_consts(program, &react_ns, file));
     let local_hooks: HashSet<String> = detect_custom_hooks(program)
         .iter()
         .map(|c| c.name.clone())
@@ -402,11 +410,11 @@ mod tests {
             ret.diagnostics
         );
         let react_ns = build_react_ns(&ret.program);
-        collect_module_consts(&ret.program, &react_ns)
+        collect_module_consts(&ret.program, &react_ns, Path::new("t.tsx"))
     }
 
     fn is_context(map: &HashMap<Var, ModuleConstInit>, name: &str) -> bool {
-        matches!(map.get(name), Some(ModuleConstInit::Context))
+        matches!(map.get(name), Some(ModuleConstInit::Context(_)))
     }
 
     #[test]

@@ -31,6 +31,7 @@ fn make_prog(
         file_table: Default::default(),
         module_table: Default::default(),
         function_registry: Default::default(),
+        phase1_reached: Default::default(),
     }
 }
 

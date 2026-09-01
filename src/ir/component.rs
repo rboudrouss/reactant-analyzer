@@ -31,7 +31,29 @@ pub enum ModuleConstInit {
     /// `<X.Provider>` is a context provider only if `X` is a context, and
     /// nothing else in the IR can say so. Two-valued on purpose — absence
     /// means "not proven", never "not a context".
-    Context,
+    ///
+    /// It carries the [`ContextId`] of the cell, not just the role (#109): two
+    /// files that import the same context bind it under whatever local name
+    /// they like, and pairing a consumer with a provider needs to know they
+    /// mean the same cell. The resolver already had the origin in hand when it
+    /// marked an imported name; it used to drop it.
+    Context(ContextId),
+}
+
+/// Canonical identity of a React context cell: the file that called
+/// `createContext` and the name it bound the result to.
+///
+/// **As deep as the resolution chain, and no deeper.** A context re-exported
+/// through a third file resolves only one level (#49), so two importers that
+/// reach the same cell by different depths get different ids — a missed
+/// pairing, never a wrong one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ContextId {
+    /// The file whose module scope holds the `createContext` call.
+    pub origin_file: PathBuf,
+    /// The name bound there — the exported name, not the importer's local
+    /// alias.
+    pub origin_name: String,
 }
 
 #[derive(Debug, Clone)]
