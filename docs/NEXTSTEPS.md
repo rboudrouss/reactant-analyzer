@@ -84,9 +84,14 @@ et les issues `enhancement` + `area/tier-a` du tracker :
     unification des deux phases (« decide that first »). Plus
     gros gain de précision disponible (363 sites ⊤ sur les corpus), mais il
     sert les règles natives, pas le marché — il attend du feedback réel.
-12. **Étapes 3-4 ADR-023** (`writers` edge, anchor `context_providers`
+12. ~~**Étapes 3-4 ADR-023** (`writers` edge, anchor `context_providers`
     Tier A) au fil de l'eau, guidées par ce que les premiers packs
-    utilisateurs n'arrivent pas à exprimer.
+    utilisateurs n'arrivent pas à exprimer.~~ — **Remplacé par
+    [ADR-027](adr/ADR-027-writer-relation-setter-provenance.md) §8**
+    (2026-09-01) : la demande attendue est arrivée (famille
+    « wrapper-enforcement », règles type `putState`) ; la séquence est
+    tirée en avant : #6 → writers (#70) → résumés de phase → provenance
+    setters → `context_providers` (#71).
 
 ## Anti-priorités
 

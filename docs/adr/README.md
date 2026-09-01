@@ -28,3 +28,4 @@
 | [ADR-024](ADR-024-inlined-hook-finding-attribution.md) | Finding attribution across inlined hooks — render the origin, never collapse consumers | Accepted |
 | [ADR-025](ADR-025-fall-through-is-a-return.md) | A body that falls off the end returns `undefined` — `Unreachable` means only "control stops" | Accepted |
 | [ADR-026](ADR-026-nextjs-projects.md) | Next.js projects — module directives + import graph in the IR, the `"use client"` server graph, Server Components analysed rather than skipped | Implemented |
+| [ADR-027](ADR-027-writer-relation-setter-provenance.md) | Slot-writer relation (region + may-phase), callee phase summaries, setter provenance, `must_direct_write`, catalogue re-based to 22 | Accepted |
