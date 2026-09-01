@@ -24,7 +24,8 @@ use crate::ir::types::{BlockId, HookLabel, Var};
 use crate::rules::api::query::{
     Certified, CleanupVerdict, ConditionalHookCall, ExitDominance, RuleCtx,
 };
-use crate::rules::helpers::jsx::{JsxPropSite, collect_jsx_prop_sites};
+use crate::rules::helpers::jsx::{JsxPropSite, collect_jsx_prop_sites, site_identity};
+use crate::rules::helpers::local_bindings;
 use crate::rules::helpers::providers::{ProviderSite, ValueIdentity, collect_provider_sites};
 use crate::rules::{
     ReturnsVerdict, SetterCall, StabilityVerdict, all_setter_labels, collect_setter_calls,
@@ -168,6 +169,35 @@ impl<'a> EntityCtx<'a> {
     /// body, deterministic order (the relation sorts by site).
     pub fn provider_rows(&self) -> Vec<ProviderSite<'a>> {
         collect_provider_sites(self.comp)
+    }
+
+    /// Identity of a custom-hook call-site argument, read at the call's OWN
+    /// program point (#112).
+    ///
+    /// ADR-023 §2 forbids reading render-EXIT stability here, because exit is a
+    /// different point: `let x = {}; useThing(x); x = props.stable` is Stable
+    /// at exit and fresh at the call. This is §2's own escape rather than a
+    /// bypass — the expression is evaluated in the converged env of the block
+    /// the call sits in, and the shared bind-once rule collapses that very
+    /// counterexample (two bindings) to Unknown instead of answering it wrong.
+    pub fn arg_identity(&self, arg: &ArgEntity) -> ValueIdentity {
+        let Some(HookEntry::Custom { args, .. }) =
+            self.comp.hooks.iter().find(|h| h.label() == arg.label)
+        else {
+            return ValueIdentity::Unknown;
+        };
+        let Some(expr) = args.get(arg.index) else {
+            return ValueIdentity::Unknown;
+        };
+        let Some(info) = self.comp.hook_calls.iter().find(|i| i.label == arg.label) else {
+            return ValueIdentity::Unknown;
+        };
+        site_identity(
+            Some(expr),
+            self.comp.block_states.get(&info.block_id),
+            &local_bindings(&self.comp.render_cfg),
+            self.comp,
+        )
     }
 
     /// `jsx_props` rows: every prop of every resolved component element in the
@@ -457,10 +487,10 @@ impl<'a> EntityCtx<'a> {
             Field::Identity => match v {
                 EntityVal::Provider(p) => Some(identity_word(p.identity).to_string()),
                 EntityVal::JsxProp(j) => Some(identity_word(j.identity).to_string()),
+                EntityVal::Arg(a) => Some(identity_word(self.arg_identity(a)).to_string()),
                 EntityVal::Hook(_)
                 | EntityVal::Setter(_)
                 | EntityVal::Dep(_)
-                | EntityVal::Arg(_)
                 | EntityVal::Origin(_)
                 | EntityVal::Writer(_) => None,
             },

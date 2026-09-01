@@ -340,7 +340,8 @@ impl TierARule {
                 let identity = match cand.entity_at(*of) {
                     EntityVal::Provider(p) => p.identity,
                     EntityVal::JsxProp(j) => j.identity,
-                    _ => unreachable!("validated: `identity` binds a JSX element or prop"),
+                    EntityVal::Arg(a) => e.arg_identity(a),
+                    _ => unreachable!("validated: `identity` binds a JSX site or an argument"),
                 };
                 names.contains(&identity_name(identity)) != *negated
             }

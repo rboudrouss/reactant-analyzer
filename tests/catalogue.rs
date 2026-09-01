@@ -28,7 +28,8 @@
 //! relation's walk and identity verdict, generalized to every prop of every
 //! resolved element) → **12/22** (the single-binding certificate: a name
 //! bound exactly once to a function literal and never re-bound below reads
-//! like the literal itself).
+//! like the literal itself) → **13/22** (the `identity` verdict at a hook
+//! call's own program point, ADR-023 §2's escape rather than its error).
 //! The count assertion at the bottom is the measure; update it only by
 //! flipping entries.
 
@@ -271,6 +272,26 @@ const PUTSTATE_CONFORMANT: &[(&str, &str)] = &[
     ),
 ];
 
+const OPTIONS_PACK: &str = r#"{
+  "schemaVersion": 1, "name": "cat-options",
+  "rules": [{
+    "id": "fresh-options-object",
+    "docs": {
+      "description": "a hook is handed a fresh options object every render",
+      "why": "the hook re-subscribes or refetches on every render — Object.is never holds",
+      "fix": "memoize the options object, or hoist it out of the component"
+    },
+    "severity": "warning",
+    "anchor": { "relation": "hook_calls", "kind": "custom" },
+    "forEach": { "edge": "args", "as": "opt" },
+    "guards": [
+      { "kind": "name", "of": "anchor", "one_of": ["useQuery"] },
+      { "kind": "identity", "of": "opt", "is": ["fresh-every-render"] }
+    ],
+    "message": "the options handed to {anchor.name} are {opt.identity}"
+  }]
+}"#;
+
 const JSX_PROP_PACK: &str = r#"{
   "schemaVersion": 1, "name": "cat-jsx",
   "rules": [{
@@ -431,10 +452,22 @@ fn catalogue() -> Vec<Entry> {
         },
         Entry {
             id: "unstable-hook-options-object",
-            status: Status::Blocked {
-                class: "expression-position",
-                missing: "a call-point identity fact for non-function arguments — reading \
-                          the render-exit stability there is the ADR-023 §2 program-point error",
+            status: Status::Expressible {
+                pack_json: OPTIONS_PACK,
+                rule: "cat-options/fresh-options-object",
+                fires_on: Fixture::Single(
+                    "function C({ id }) {\n  const q = useQuery({ url: \"/x\", id });\n  return <div>{q}</div>;\n}",
+                ),
+                silent_on: Fixture::Single(
+                    "import { useMemo } from \"react\";\nfunction C({ id }) {\n  const opts = useMemo(() => ({ url: \"/x\", id }), [id]);\n  const q = useQuery(opts);\n  return <div>{q}</div>;\n}",
+                ),
+                weakened: Some(
+                    "read at the call's own block env under the shared bind-once rule (#112): \
+                     ADR-023 §2's counterexample (a name bound twice) answers Unknown rather \
+                     than wrong, and a rebound, imported, spread or computed options object \
+                     reads Unknown and never fires. The setter-argument position stays gated \
+                     by §2 (#67)",
+                ),
             },
         },
         Entry {
@@ -675,9 +708,10 @@ fn catalogue() -> Vec<Entry> {
 /// exposed the teardown verdict the native rule already computes (#100) →
 /// 11/22 after the `jsx_props` anchor generalized the provider relation to
 /// every prop of every resolved element (#102, closing #71 step 2) → 12/22
-/// after the single-binding certificate resolved Var-bound selectors (#103).
+/// after the single-binding certificate resolved Var-bound selectors (#103) →
+/// 13/22 after the `identity` verdict reached call-site arguments (#112).
 /// Flip an entry (rule + fixtures), then update this constant.
-const EXPRESSIBLE_NOW: usize = 12;
+const EXPRESSIBLE_NOW: usize = 13;
 
 #[test]
 fn catalogue_is_pinned_at_22_entries() {

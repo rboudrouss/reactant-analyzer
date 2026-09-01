@@ -389,14 +389,16 @@ impl Field {
                 | Sort::JsxProp => false,
             },
             // Both JSX relations answer it, through the one shared
-            // `site_identity` reader.
+            // `site_identity` reader — and so does a call-site argument, read
+            // at the call's own block (#112). NOT a deps entry: `stability`
+            // is the deps fact, and reading identity there would be the same
+            // program-point error §2 refuses for the reverse direction.
             Field::Identity => match sort {
-                Sort::Provider | Sort::JsxProp => true,
+                Sort::Provider | Sort::JsxProp | Sort::Arg => true,
                 Sort::Hook(_)
                 | Sort::SetterRender
                 | Sort::SetterBody
                 | Sort::Dep
-                | Sort::Arg
                 | Sort::HookOrigin
                 | Sort::Writer => false,
             },
@@ -1107,12 +1109,12 @@ fn validate_guard(
         }
         Guard::Identity { of, is, not } => {
             let (of, sort) = cx.resolve_of(of, g_path)?;
-            if !matches!(sort, Sort::Provider | Sort::JsxProp) {
+            if !matches!(sort, Sort::Provider | Sort::JsxProp | Sort::Arg) {
                 return Err(PackError::new(
                     format!("{g_path}.of"),
                     format!(
-                        "guard `identity` applies to a context-provider element or a JSX \
-                         prop, but the subject binds {}",
+                        "guard `identity` applies to a context-provider element, a JSX prop \
+                         or a call-site argument, but the subject binds {}",
                         sort.describe()
                     ),
                 ));

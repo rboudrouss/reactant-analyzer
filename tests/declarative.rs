@@ -1878,3 +1878,76 @@ fn a_certified_var_bound_selector_reads_like_the_literal() {
     );
     assert!(stable.is_empty(), "{stable:?}");
 }
+
+// ── Call-point `identity` on the `args` edge (#112) ──────────────────────────
+
+#[test]
+fn arg_identity_is_read_at_the_call_not_at_render_exit() {
+    let pack = r#"{"schemaVersion":1,"name":"t","rules":[
+        {"id":"fresh-options","docs":{"description":"d","why":"w","fix":"f"},
+         "severity":"warning",
+         "anchor":{"relation":"hook_calls","kind":"custom"},
+         "forEach":{"edge":"args","as":"opt"},
+         "guards":[{"kind":"name","of":"anchor","one_of":["useQuery"]},
+                   {"kind":"identity","of":"opt","is":["fresh-every-render"]}],
+         "message":"the options are {opt.identity}"}]}"#;
+
+    // An inline object literal is fresh by construction.
+    let fired = run_pack(
+        pack,
+        r#"
+        function C({ id }) {
+            const q = useQuery({ url: "/x", id });
+            return <div>{q}</div>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(fired.len(), 1, "{fired:?}");
+    assert_eq!(fired[0].message, "the options are fresh-every-render");
+
+    // Memoized: identity survives.
+    let silent = run_pack(
+        pack,
+        r#"
+        import { useMemo } from "react";
+        function C({ id }) {
+            const opts = useMemo(() => ({ url: "/x", id }), [id]);
+            const q = useQuery(opts);
+            return <div>{q}</div>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(silent.is_empty(), "{silent:?}");
+
+    // ADR-023 §2's own counterexample: the exit env says something the call
+    // never saw. Two bindings, so the shared bind-once rule answers Unknown —
+    // the guard fails closed instead of reading the wrong program point.
+    let rebound = run_pack(
+        pack,
+        r#"
+        function C({ stable }) {
+            let opts = { url: "/x" };
+            const q = useQuery(opts);
+            opts = stable;
+            return <div>{q}{opts}</div>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(rebound.is_empty(), "{rebound:?}");
+}
+
+#[test]
+fn identity_is_not_a_deps_entry_fact() {
+    // `stability` is the deps fact; asking a deps entry for `identity` would
+    // be the mirror image of the §2 error, so the validator refuses it.
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+            "anchor":{"relation":"hook_calls","kind":"effect"},
+            "forEach":{"edge":"deps","as":"d"},
+            "guards":[{"kind":"identity","of":"d","is":["unknown"]}],"message":"m"}"#,
+    ));
+    assert!(e.message.contains("identity"), "{e}");
+}

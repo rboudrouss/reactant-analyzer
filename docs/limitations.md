@@ -150,7 +150,11 @@ until [#117](https://github.com/rboudrouss/reactant-analyzer/issues/117))
 relation to every prop of every resolved element
 [#102](https://github.com/rboudrouss/reactant-analyzer/issues/102), and the single-binding certificate resolving
 Var-bound selectors [#103](https://github.com/rboudrouss/reactant-analyzer/issues/103) — the latter reads no heap, so
-ADR-023 §3's `locs`-invalidation deferral still stands).
+ADR-023 §3's `locs`-invalidation deferral still stands) **→ 13/22**
+(2026-09-01, [#112](https://github.com/rboudrouss/reactant-analyzer/issues/112): the `identity` verdict reaches
+call-site arguments, read at the call's own block — ADR-023 §2's own escape,
+since the bind-once rule answers Unknown for exactly the case §2 warns about;
+the setter-argument position stays gated, [#67](https://github.com/rboudrouss/reactant-analyzer/issues/67)).
 Run
 `cargo test --test catalogue -- --nocapture` for the full blocked-entry report. What still blocks,
 in decreasing leverage: prop, provider-value and setter-argument positions carry no expression
