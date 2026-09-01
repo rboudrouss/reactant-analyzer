@@ -112,6 +112,19 @@
           "required": [
             "relation"
           ]
+        },
+        {
+          "description": "One render-loop cycle of the program's churn graph, seen from the\neffect of THIS component that carries one of its edges (#108,\nADR-029). Edge-less: `cycle` renders the loop as `a → b → a`, and the\n`cycle` guard filters on the two exact folds the graph already\ncomputed — whether the loop spans components, and whether every step\nis a must-step.\n\nA row's identity is the carrying edge's write site (ADR-024), so a\ncycle whose carrying edge has no span produces none. No `must_*` guard\naccepts this sort, so an Error is not reachable through the anchor.",
+          "type": "object",
+          "properties": {
+            "relation": {
+              "type": "string",
+              "const": "churn_cycles"
+            }
+          },
+          "required": [
+            "relation"
+          ]
         }
       ]
     },
@@ -563,6 +576,43 @@
             "kind": {
               "type": "string",
               "const": "same_tick"
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        },
+        {
+          "description": "Shape filter on a `churn_cycles` row (#108): whether the loop spans\nmore than one component, and whether every one of its steps is a\nmust-step. At least one of `cross_component` / `all_must`; the given\nfields are conjoined.\n\nBoth are **exact** booleans — folds of the node table and the edge\nstrengths the graph already computed — so unlike the may-typed verdict\nguards this one has a meaningful negative and takes plain booleans\nrather than a ⊤-bearing name list. What is may-typed is the graph\nitself: a cycle it never saw yields no row at all, which is the\nmissing-findings direction.",
+          "type": "object",
+          "properties": {
+            "all_must": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "cross_component": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "cycle"
             },
             "of": {
               "type": "string"

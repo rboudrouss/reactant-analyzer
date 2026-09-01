@@ -2856,3 +2856,213 @@ fn a_memoized_updater_is_a_proven_function() {
     let got = run_pack(STALE_PAIR_PACK, src, &Options::new());
     assert!(got.is_empty(), "a memoized updater is functional: {got:?}");
 }
+
+// ── #108: the `churn_cycles` anchor ───────────────────────────────────────────
+
+/// Analyze `src` as a whole PROGRAM (inter-component flow active) and run
+/// every rule of `pack_json` on every component.
+///
+/// The intra-component `run_pack` above analyzes each component alone, so a
+/// setter handed down as a prop never reaches the child's environment — and a
+/// cross-component churn cycle is exactly the shape that needs it.
+fn run_pack_program(pack_json: &str, src: &str) -> Vec<Diagnostic> {
+    use reactant::engine::{ComponentRegistry, HookRegistry, RootStrategy, analyze_program};
+
+    let pack = load_pack(pack_json, &Options::new()).expect("pack must load");
+    let alloc = Allocator::default();
+    let ret = Parser::new(&alloc, src, SourceType::tsx())
+        .with_options(ParseOptions::default())
+        .parse();
+    assert!(
+        ret.diagnostics.is_empty(),
+        "parse errors: {:?}",
+        ret.diagnostics
+    );
+    let components = lower_program(
+        &ret.program,
+        src,
+        std::path::Path::new("test.tsx"),
+        &mut Default::default(),
+    );
+    let prog = analyze_program(
+        ComponentRegistry::from_components(components),
+        HookRegistry::new(),
+        RootStrategy::Heuristic,
+        &Config::default(),
+    );
+    let mut names: Vec<String> = prog.components.keys().cloned().collect();
+    names.sort();
+    let mut out = Vec::new();
+    for name in &names {
+        let ctx = RuleCtx::new(&prog, name);
+        for rule in &pack.rules {
+            out.extend(rule.rule.check(&ctx));
+        }
+    }
+    out
+}
+
+const CYCLE_PACK: &str = r#"{
+  "schemaVersion": 1, "name": "cyc",
+  "rules": [{
+    "id": "cross-loop",
+    "docs": {"description":"d","why":"w","fix":"f"},
+    "severity": "error",
+    "anchor": { "relation": "churn_cycles" },
+    "guards": [{ "kind": "cycle", "of": "anchor", "cross_component": true }],
+    "message": "loop: {anchor.cycle}"
+  }]
+}"#;
+
+const CROSS_LOOP_SRC: &str = r#"
+import { useState, useEffect } from 'react';
+export function Parent() {
+  const [data, setData] = useState({ n: 0 });
+  return <Child value={data} onUpdate={setData} />;
+}
+function Child({ value, onUpdate }) {
+  useEffect(() => { onUpdate({ n: value.n, seen: true }); }, [value]);
+  return <div/>;
+}
+"#;
+
+#[test]
+fn churn_cycles_binds_a_cross_component_loop() {
+    let got = run_pack_program(CYCLE_PACK, CROSS_LOOP_SRC);
+    assert_eq!(got.len(), 1, "one row, one finding: {got:?}");
+    assert!(
+        got[0].message.contains(" → "),
+        "the path must be rendered: {}",
+        got[0].message
+    );
+    assert!(
+        got[0].message.contains("`Parent`"),
+        "a foreign node is qualified by its owner: {}",
+        got[0].message
+    );
+}
+
+#[test]
+fn no_must_guard_accepts_a_cycle_row_so_error_is_unreachable() {
+    // The pin is "error", and the rule loads — but with no must-guard able to
+    // bind the sort, the ceiling is structurally Warning (ADR-022 §3).
+    let load = load_pack(CYCLE_PACK, &Options::new()).expect("loads");
+    assert!(
+        load.warnings
+            .iter()
+            .any(|w| w.message.contains("no must_*")),
+        "the unreachable pin must warn: {:?}",
+        load.warnings
+    );
+    let got = run_pack_program(CYCLE_PACK, CROSS_LOOP_SRC);
+    assert_eq!(got[0].severity(), Severity::Warning, "{got:?}");
+
+    // And every must-guard is refused on the sort, one by one.
+    for kind in [
+        "must_setter_on_all_paths",
+        "must_dominates_all_exits",
+        "must_init_calls_setter",
+        "must_hook_is_conditional",
+        "must_direct_write",
+    ] {
+        let e = load_err(&one_rule(&format!(
+            r#"{{"id":"r","docs":{{"description":"d","why":"w","fix":"f"}},
+                "severity":"error","anchor":{{"relation":"churn_cycles"}},
+                "guards":[{{"kind":"{kind}","of":"anchor"}}],"message":"m"}}"#
+        )));
+        assert_eq!(
+            e.path, "rules[0].guards[0].of",
+            "`{kind}` must refuse a cycle row on its subject: {e}"
+        );
+    }
+}
+
+#[test]
+fn churn_cycles_is_silent_when_the_write_is_event_driven() {
+    // The same shape with the write moved to a click: no effect re-triggers
+    // itself, the graph has no cycle, the anchor has no row.
+    let got = run_pack_program(
+        CYCLE_PACK,
+        r#"
+import { useState, useEffect } from 'react';
+export function Parent() {
+  const [data, setData] = useState({ n: 0 });
+  return <Child value={data} onUpdate={setData} />;
+}
+function Child({ value, onUpdate }) {
+  useEffect(() => { console.log(value.n); }, [value]);
+  return <button onClick={() => onUpdate({ n: value.n + 1 })}>+</button>;
+}
+"#,
+    );
+    assert!(got.is_empty(), "no cycle, no row: {got:?}");
+}
+
+#[test]
+fn cycle_guard_needs_a_field_and_a_cycle_row() {
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},
+            "severity":"warning","anchor":{"relation":"churn_cycles"},
+            "guards":[{"kind":"cycle","of":"anchor"}],"message":"m"}"#,
+    ));
+    assert!(e.message.contains("at least one of"), "{e}");
+
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},
+            "severity":"warning","anchor":{"relation":"hook_calls","kind":"effect"},
+            "guards":[{"kind":"cycle","of":"anchor","all_must":true}],"message":"m"}"#,
+    ));
+    assert_eq!(e.path, "rules[0].guards[0].of");
+    assert!(e.message.contains("effect hook call"), "{e}");
+}
+
+#[test]
+fn churn_cycles_is_edgeless_and_its_field_is_cycle_only() {
+    for edge in ["deps", "body_setter_calls", "args", "writers"] {
+        let e = load_err(&one_rule(&format!(
+            r#"{{"id":"r","docs":{{"description":"d","why":"w","fix":"f"}},
+                "severity":"warning","anchor":{{"relation":"churn_cycles"}},
+                "forEach":{{"edge":"{edge}","as":"x"}},"message":"m"}}"#
+        )));
+        assert!(
+            e.message.contains("render-loop cycle"),
+            "edge `{edge}` must be refused: {e}"
+        );
+    }
+    // `{anchor.cycle}` is the cycle row's only field, and no other sort has it.
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},
+            "severity":"warning","anchor":{"relation":"hook_calls","kind":"effect"},
+            "message":"{anchor.cycle}"}"#,
+    ));
+    assert!(e.message.contains("cycle"), "{e}");
+}
+
+#[test]
+fn all_must_and_cross_component_are_independent_filters() {
+    // The same loop, asked about from the other side: it IS cross-component,
+    // and cross-component must-rerun is unprovable, so it is not all-must.
+    let intra = r#"{
+      "schemaVersion": 1, "name": "cyc2",
+      "rules": [{
+        "id": "intra",
+        "docs": {"description":"d","why":"w","fix":"f"},
+        "severity": "warning",
+        "anchor": { "relation": "churn_cycles" },
+        "guards": [{ "kind": "cycle", "of": "anchor", "cross_component": false }],
+        "message": "m"
+      }, {
+        "id": "certain",
+        "docs": {"description":"d","why":"w","fix":"f"},
+        "severity": "warning",
+        "anchor": { "relation": "churn_cycles" },
+        "guards": [{ "kind": "cycle", "of": "anchor", "all_must": true }],
+        "message": "m"
+      }]
+    }"#;
+    let got = run_pack_program(intra, CROSS_LOOP_SRC);
+    assert!(
+        got.is_empty(),
+        "the loop is cross-component and not all-must: {got:?}"
+    );
+}

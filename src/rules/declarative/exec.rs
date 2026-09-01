@@ -30,6 +30,7 @@ use super::schema::{EdgeName, ElseBehavior, SeverityPin};
 use super::validate::{
     BindRef, CountCmp, MustKind, ResolvedAnchor, ResolvedGuard, ResolvedRule, Segment,
 };
+use crate::rules::helpers::churn_graph::CycleRow;
 use crate::rules::helpers::jsx::JsxPropSite;
 use crate::rules::helpers::providers::ProviderSite;
 
@@ -83,6 +84,10 @@ enum Candidate<'a, 'b> {
     /// One `context_providers` row (#71) — edge-less in v1.
     Provider(&'b ProviderSite<'a>),
     JsxProp(&'b JsxPropSite<'a>),
+    /// One render-loop cycle carried by this component's effects (#108) —
+    /// edge-less, and no must-guard accepts its sort, so it can never mint a
+    /// proof.
+    Cycle(&'b CycleRow),
 }
 
 impl<'a, 'b> Candidate<'a, 'b> {
@@ -92,7 +97,8 @@ impl<'a, 'b> Candidate<'a, 'b> {
             Candidate::RenderSetter(_)
             | Candidate::Origin(_)
             | Candidate::Provider(_)
-            | Candidate::JsxProp(_) => None,
+            | Candidate::JsxProp(_)
+            | Candidate::Cycle(_) => None,
         }
     }
 
@@ -102,7 +108,8 @@ impl<'a, 'b> Candidate<'a, 'b> {
             Candidate::RenderSetter(_)
             | Candidate::Origin(_)
             | Candidate::Provider(_)
-            | Candidate::JsxProp(_) => None,
+            | Candidate::JsxProp(_)
+            | Candidate::Cycle(_) => None,
         }
     }
 
@@ -114,6 +121,7 @@ impl<'a, 'b> Candidate<'a, 'b> {
             (BindRef::Anchor, Candidate::Origin(p)) => EntityVal::Origin(p),
             (BindRef::Anchor, Candidate::Provider(p)) => EntityVal::Provider(p),
             (BindRef::Anchor, Candidate::JsxProp(j)) => EntityVal::JsxProp(j),
+            (BindRef::Anchor, Candidate::Cycle(c)) => EntityVal::Cycle(c),
             (BindRef::Bound, _) => match self.bound().expect("validated: binding exists") {
                 Bound::Setter(s) => EntityVal::Setter(s),
                 Bound::Dep(d) => EntityVal::Dep(d),
@@ -130,6 +138,8 @@ impl<'a, 'b> Candidate<'a, 'b> {
             Candidate::RenderSetter(s) => s.slot,
             Candidate::Origin(p) => Some(p.label),
             Candidate::Provider(_) | Candidate::JsxProp(_) => None,
+            // The carrying effect: the finding is about that effect's write.
+            Candidate::Cycle(c) => Some(c.effect),
         }
     }
 
@@ -149,6 +159,9 @@ impl<'a, 'b> Candidate<'a, 'b> {
             Candidate::Origin(p) => p.span,
             Candidate::Provider(p) => p.span,
             Candidate::JsxProp(j) => j.span,
+            // ADR-024: the carrying edge's write site, which is why a spanless
+            // edge produces no row at all.
+            Candidate::Cycle(c) => Some(c.span),
         }
     }
 }
@@ -243,6 +256,11 @@ impl Rule for TierARule {
             ResolvedAnchor::JsxProps => {
                 for site in e.jsx_prop_rows() {
                     self.eval(&e, &Candidate::JsxProp(&site), &mut out);
+                }
+            }
+            ResolvedAnchor::ChurnCycles => {
+                for row in e.cycle_rows() {
+                    self.eval(&e, &Candidate::Cycle(&row), &mut out);
                 }
             }
         }
@@ -368,6 +386,19 @@ impl TierARule {
                     unreachable!("validated: `updater_body` binds a writers row")
                 };
                 names.contains(&e.updater_purity(&w.updater))
+            }
+            ResolvedGuard::Cycle {
+                of,
+                cross_component,
+                all_must,
+            } => {
+                let EntityVal::Cycle(c) = cand.entity_at(*of) else {
+                    unreachable!("validated: `cycle` binds a churn_cycles row")
+                };
+                // Conjunction of the given fields; both are exact folds of the
+                // graph, so the negative is as answerable as the positive.
+                cross_component.is_none_or(|x| c.cross_component == x)
+                    && all_must.is_none_or(|x| c.all_must == x)
             }
             ResolvedGuard::SameTick { of } => {
                 let EntityVal::Writer(w) = cand.entity_at(*of) else {
@@ -540,7 +571,8 @@ impl TierARule {
                     Candidate::Hook { .. }
                     | Candidate::Origin(_)
                     | Candidate::Provider(_)
-                    | Candidate::JsxProp(_) => {
+                    | Candidate::JsxProp(_)
+                    | Candidate::Cycle(_) => {
                         unreachable!("validated: `must_dominates_all_exits` binds a render setter")
                     }
                 };

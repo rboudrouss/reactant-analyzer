@@ -136,6 +136,17 @@ pub enum Anchor {
     /// elements (`<div/>`) produce no rows — lowering resolved them as
     /// something other than a component application.
     JsxProps,
+    /// One render-loop cycle of the program's churn graph, seen from the
+    /// effect of THIS component that carries one of its edges (#108,
+    /// ADR-029). Edge-less: `cycle` renders the loop as `a → b → a`, and the
+    /// `cycle` guard filters on the two exact folds the graph already
+    /// computed — whether the loop spans components, and whether every step
+    /// is a must-step.
+    ///
+    /// A row's identity is the carrying edge's write site (ADR-024), so a
+    /// cycle whose carrying edge has no span produces none. No `must_*` guard
+    /// accepts this sort, so an Error is not reachable through the anchor.
+    ChurnCycles,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -353,6 +364,24 @@ pub enum Guard {
     /// reachable" is not a promise the engine can keep — there is no negated
     /// form to assert it with.
     SameTick { of: String },
+    /// Shape filter on a `churn_cycles` row (#108): whether the loop spans
+    /// more than one component, and whether every one of its steps is a
+    /// must-step. At least one of `cross_component` / `all_must`; the given
+    /// fields are conjoined.
+    ///
+    /// Both are **exact** booleans — folds of the node table and the edge
+    /// strengths the graph already computed — so unlike the may-typed verdict
+    /// guards this one has a meaningful negative and takes plain booleans
+    /// rather than a ⊤-bearing name list. What is may-typed is the graph
+    /// itself: a cycle it never saw yields no row at all, which is the
+    /// missing-findings direction.
+    Cycle {
+        of: String,
+        #[serde(default)]
+        cross_component: Option<PVal<bool>>,
+        #[serde(default)]
+        all_must: Option<PVal<bool>>,
+    },
     /// Universal quantification over `anchor.deps` (ADR-023 §4, whose stated
     /// gate — "making truncation representable in the IR" — the `exact` bit
     /// discharges): passes when every element satisfies the nested guards.

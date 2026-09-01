@@ -413,7 +413,44 @@ const LAYOUT_EFFECT_PACK: &str = r#"{
   }]
 }"#;
 
+/// #108: the `churn_cycles` anchor. Edge-less — the cycle IS the row, and the
+/// two shape folds the graph already computed are exact booleans on it.
+const CYCLE_PACK: &str = r#"{
+  "schemaVersion": 1, "name": "cat-cycle",
+  "rules": [{
+    "id": "cross-component-effect-cycle",
+    "docs": {
+      "description": "an effect of this component is one step of a render loop that spans components",
+      "why": "Each step of the loop stores a fresh reference the next step reacts to, so the render never settles. Spread across a parent and a child, no single component's code looks wrong.",
+      "fix": "Break one step: write the value only when it actually changed, move the write to an event handler, or hoist the state so one owner writes it.",
+      "example": "Parent holds `data`, passes `setData`; Child's effect on `[data]` calls `setData({...})`"
+    },
+    "severity": "warning",
+    "anchor": { "relation": "churn_cycles" },
+    "guards": [
+      { "kind": "cycle", "of": "anchor", "cross_component": true }
+    ],
+    "message": "this effect is one step of a render loop spanning components: {anchor.cycle}"
+  }]
+}"#;
+
 // ── Fixtures ──────────────────────────────────────────────────────────────────
+
+/// The cross-component churn loop: the parent owns `data` and hands its setter
+/// down; the child's effect reacts to the prop and writes a fresh object back.
+/// Needs the top-down inter-component pass, so it is a `Multi` fixture even
+/// though it is one file.
+const CYCLE_FILES: &[(&str, &str)] = &[(
+    "loop.tsx",
+    "import { useState, useEffect } from \"react\";\nexport function Parent() {\n  const [data, setData] = useState({ n: 0 });\n  return <Child value={data} onUpdate={setData} />;\n}\nfunction Child({ value, onUpdate }) {\n  useEffect(() => { onUpdate({ n: value.n, seen: true }); }, [value]);\n  return <div/>;\n}\n",
+)];
+
+/// The same shape with the write moved to a user event: an effect no longer
+/// re-triggers itself, so the graph has no cycle and the anchor no row.
+const CYCLE_OK_FILES: &[(&str, &str)] = &[(
+    "loop-ok.tsx",
+    "import { useState, useEffect } from \"react\";\nexport function Parent() {\n  const [data, setData] = useState({ n: 0 });\n  return <Child value={data} onUpdate={setData} />;\n}\nfunction Child({ value, onUpdate }) {\n  useEffect(() => { console.log(value.n); }, [value]);\n  return <button onClick={() => onUpdate({ n: value.n + 1 })}>+</button>;\n}\n",
+)];
 
 const WRAPPER_FILES: &[(&str, &str)] = &[
     (
@@ -705,9 +742,22 @@ fn catalogue() -> Vec<Entry> {
         // ── Whole-program / cross-file ───────────────────────────────────────
         Entry {
             id: "cross-component-effect-cycle",
-            status: Status::Blocked {
-                class: "whole-program",
-                missing: "cross-component anchors (covered natively by the churn graph)",
+            status: Status::Expressible {
+                pack_json: CYCLE_PACK,
+                rule: "cat-cycle/cross-component-effect-cycle",
+                fires_on: Fixture::Multi(CYCLE_FILES),
+                silent_on: Fixture::Multi(CYCLE_OK_FILES),
+                weakened: Some(
+                    "rows exist only for cycles the churn graph sees — a prop-mediated edge \
+                     needs the parent slot flowed top-down (#20), auto-run async callbacks \
+                     are blind (#26), convergent multi-writer FPs are inherited (#39), and \
+                     a carrying edge with no write span yields no row (ADR-024 anchor \
+                     identity). Only the graph arm is exposed: the self-churn arm's own \
+                     coverage is invisible to packs (ADR-020 item 2). Cross-component rows \
+                     are Warning-only — must-rerun through a `Versioned` prop dep is \
+                     unprovable — and no `must_*` guard accepts the sort, so the anchor \
+                     cannot reach Error at all",
+                ),
             },
         },
         Entry {
@@ -812,7 +862,7 @@ fn catalogue() -> Vec<Entry> {
 /// after the single-binding certificate resolved Var-bound selectors (#103) →
 /// 13/22 after the `identity` verdict reached call-site arguments (#112).
 /// Flip an entry (rule + fixtures), then update this constant.
-const EXPRESSIBLE_NOW: usize = 16;
+const EXPRESSIBLE_NOW: usize = 17;
 
 #[test]
 fn catalogue_is_pinned_at_22_entries() {

@@ -17,7 +17,9 @@ use crate::rules::helpers::churn::{
     ChurnSetterCall, Freshness, classify_effect_deps, collect_churn_calls, converges_once_written,
     reference_part,
 };
-use crate::rules::helpers::churn_graph::{ChurnEdge, ChurnGraph};
+use crate::rules::helpers::churn_graph::{
+    ChurnEdge, ChurnGraph, NodeNames, cycle_path, node_display,
+};
 use crate::rules::{
     Certified, Diagnostic, MustResult, OnAllPaths, Rule, Severity, all_deps_provably_stable,
     all_setter_labels, collect_fn_bindings, collect_setter_calls, collect_setter_calls_with_extra,
@@ -251,18 +253,11 @@ fn check_multi_effect_cycles(
     let mut diags = Vec::new();
     let mut covered: HashSet<(HookLabel, HookLabel)> = HashSet::new();
     // Slot display names, resolved lazily per involved component.
-    let mut names: HashMap<Symbol, HashMap<Var, HookLabel>> = HashMap::new();
+    let mut names: NodeNames = HashMap::new();
 
     for cycle in cycles {
         let cyc: Vec<&ChurnEdge> = cycle.edge_idx.iter().map(|&i| &edges[i]).collect();
-        let path = {
-            let mut parts: Vec<String> = cyc
-                .iter()
-                .map(|e| node_display(&e.from, component, result, &mut names))
-                .collect();
-            parts.push(node_display(&cyc[0].from, component, result, &mut names));
-            parts.join(" → ")
-        };
+        let path = cycle_path(edges, cycle, component, result, &mut names);
         for e in &cyc {
             if e.component != *component {
                 continue;
@@ -359,29 +354,6 @@ fn check_multi_effect_cycles(
         }
     }
     (diags, covered)
-}
-
-/// Display name of a qualified slot: `` `count` `` locally,
-/// `` `count` of `Parent` `` for another component's slot.
-fn node_display(
-    node: &crate::rules::helpers::churn::SlotNode,
-    component: &Symbol,
-    result: &ProgramAnalysisResult,
-    names: &mut HashMap<Symbol, HashMap<Var, HookLabel>>,
-) -> String {
-    let map = names.entry(node.0.clone()).or_insert_with(|| {
-        result
-            .components
-            .get(&node.0)
-            .map(|r| resolve_setter_aliases(&r.render_cfg, &state_val_labels(&r.render_cfg)))
-            .unwrap_or_default()
-    });
-    let base = state_slot_name(node.1, map);
-    if node.0 == *component {
-        base
-    } else {
-        format!("{base} of `{}`", node.0)
-    }
 }
 
 // ── Object-churn arm (ADR-017) ────────────────────────────────────────────────

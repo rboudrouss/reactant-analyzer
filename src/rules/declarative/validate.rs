@@ -80,6 +80,9 @@ pub(crate) enum Sort {
     Provider,
     /// One prop of one resolved component element (#71 step 2).
     JsxProp,
+    /// One render-loop cycle of the program churn graph, carried by an effect
+    /// of this component (#108).
+    ChurnCycle,
 }
 
 impl Sort {
@@ -95,6 +98,7 @@ impl Sort {
             Sort::Writer => "a slot writer".into(),
             Sort::Provider => "a context-provider element".into(),
             Sort::JsxProp => "a JSX prop of a component element".into(),
+            Sort::ChurnCycle => "a render-loop cycle".into(),
         }
     }
 }
@@ -222,6 +226,12 @@ pub(crate) enum ResolvedGuard {
     SameTick {
         of: BindRef,
     },
+    /// #108: exact shape folds of a `churn_cycles` row, conjoined.
+    Cycle {
+        of: BindRef,
+        cross_component: Option<bool>,
+        all_must: Option<bool>,
+    },
     Must {
         kind: MustKind,
         of: BindRef,
@@ -263,6 +273,7 @@ pub(crate) enum Field {
     Identity,
     Cleanup,
     Prop,
+    Cycle,
 }
 
 impl Field {
@@ -284,6 +295,7 @@ impl Field {
         Field::Identity,
         Field::Cleanup,
         Field::Prop,
+        Field::Cycle,
     ];
 
     /// The name authors write: `{anchor.<token>}`.
@@ -303,6 +315,7 @@ impl Field {
             Field::Identity => "identity",
             Field::Cleanup => "cleanup",
             Field::Prop => "prop",
+            Field::Cycle => "cycle",
         }
     }
 
@@ -321,7 +334,8 @@ impl Field {
                 | Sort::HookOrigin
                 | Sort::Writer
                 | Sort::Provider
-                | Sort::JsxProp => false,
+                | Sort::JsxProp
+                | Sort::ChurnCycle => false,
             },
             // Effects and handlers are the two kinds with nothing to call them;
             // an any-kind anchor is admitted and falls back per row.
@@ -340,9 +354,13 @@ impl Field {
                 // through an alias), never a binding variable. A provider's
                 // `name` is the context binding.
                 Sort::HookOrigin | Sort::Provider | Sort::JsxProp => true,
-                Sort::SetterRender | Sort::SetterBody | Sort::Dep | Sort::Arg | Sort::Writer => {
-                    false
-                }
+                // A cycle is named by its path, not by a binding.
+                Sort::SetterRender
+                | Sort::SetterBody
+                | Sort::Dep
+                | Sort::Arg
+                | Sort::Writer
+                | Sort::ChurnCycle => false,
             },
             // The import specifier is recorded on custom hook rows only.
             Field::Source => match sort {
@@ -358,7 +376,8 @@ impl Field {
                 | Sort::Arg
                 | Sort::Writer
                 | Sort::Provider
-                | Sort::JsxProp => false,
+                | Sort::JsxProp
+                | Sort::ChurnCycle => false,
             },
             // A writer row is setter-shaped: it names the slot it writes and
             // the setter variable at the call site.
@@ -369,7 +388,8 @@ impl Field {
                 | Sort::Arg
                 | Sort::HookOrigin
                 | Sort::Provider
-                | Sort::JsxProp => false,
+                | Sort::JsxProp
+                | Sort::ChurnCycle => false,
             },
             // `stability` stays a deps-entry fact: reading it for a call-site
             // argument is the program-point error ADR-023 §2 refuses — this
@@ -383,7 +403,8 @@ impl Field {
                 | Sort::HookOrigin
                 | Sort::Writer
                 | Sort::Provider
-                | Sort::JsxProp => false,
+                | Sort::JsxProp
+                | Sort::ChurnCycle => false,
             },
             Field::Returns => match sort {
                 Sort::Arg => true,
@@ -394,7 +415,8 @@ impl Field {
                 | Sort::HookOrigin
                 | Sort::Writer
                 | Sort::Provider
-                | Sort::JsxProp => false,
+                | Sort::JsxProp
+                | Sort::ChurnCycle => false,
             },
             // `region` is the lexical body (exact); `phase` the MAY verdict;
             // `via` the wrapper chain (or `direct` / `unknown`).
@@ -407,7 +429,8 @@ impl Field {
                 | Sort::Arg
                 | Sort::HookOrigin
                 | Sort::Provider
-                | Sort::JsxProp => false,
+                | Sort::JsxProp
+                | Sort::ChurnCycle => false,
             },
             // Both JSX relations answer it, through the one shared
             // `site_identity` reader — and so does a call-site argument, read
@@ -421,7 +444,8 @@ impl Field {
                 | Sort::SetterBody
                 | Sort::Dep
                 | Sort::HookOrigin
-                | Sort::Writer => false,
+                | Sort::Writer
+                | Sort::ChurnCycle => false,
             },
             Field::Prop => match sort {
                 Sort::JsxProp => true,
@@ -432,13 +456,29 @@ impl Field {
                 | Sort::Arg
                 | Sort::HookOrigin
                 | Sort::Writer
-                | Sort::Provider => false,
+                | Sort::Provider
+                | Sort::ChurnCycle => false,
             },
             // Teardown is a property of an effect's own body: React honours a
             // returned function for effects and nothing else, so the field is
             // total only on a kind-pinned effect anchor.
             Field::Cleanup => match sort {
                 Sort::Hook(Some(HookKindFilter::Effect)) => true,
+                Sort::Hook(_)
+                | Sort::SetterRender
+                | Sort::SetterBody
+                | Sort::Dep
+                | Sort::Arg
+                | Sort::HookOrigin
+                | Sort::Writer
+                | Sort::Provider
+                | Sort::JsxProp
+                | Sort::ChurnCycle => false,
+            },
+            // The loop path, already node-qualified by owning component. Only
+            // a cycle row has one; no other sort could invent it.
+            Field::Cycle => match sort {
+                Sort::ChurnCycle => true,
                 Sort::Hook(_)
                 | Sort::SetterRender
                 | Sort::SetterBody
@@ -467,6 +507,9 @@ pub(crate) enum ResolvedAnchor {
     ContextProviders,
     /// Every prop of every resolved component element (#71 step 2).
     JsxProps,
+    /// Render-loop cycles of the program churn graph carried by this
+    /// component's effects (#108).
+    ChurnCycles,
 }
 
 /// A fully-typed, param-baked rule — the executor never sees `PVal` or raw
@@ -541,6 +584,10 @@ fn guard_allowed_keys(g: &Guard) -> (&'static str, &'static [&'static str]) {
         Guard::Updater { .. } => ("guard `updater`", &["kind", "of", "is"]),
         Guard::UpdaterBody { .. } => ("guard `updater_body`", &["kind", "of", "is"]),
         Guard::SameTick { .. } => ("guard `same_tick`", &["kind", "of"]),
+        Guard::Cycle { .. } => (
+            "guard `cycle`",
+            &["kind", "of", "cross_component", "all_must"],
+        ),
         Guard::AnyOf { .. } => ("guard `any_of`", &["kind", "guards"]),
         Guard::Every { .. } => ("guard `every`", &["kind", "of", "as", "guards"]),
     }
@@ -743,7 +790,8 @@ fn validate_rule(
             Anchor::RenderSetterCalls
             | Anchor::HookOrigins
             | Anchor::ContextProviders
-            | Anchor::JsxProps => &["relation"],
+            | Anchor::JsxProps
+            | Anchor::ChurnCycles => &["relation"],
         },
         "this anchor",
         &format!("{path}.anchor"),
@@ -754,6 +802,7 @@ fn validate_rule(
         Anchor::HookOrigins => (ResolvedAnchor::HookOrigins, Sort::HookOrigin),
         Anchor::ContextProviders => (ResolvedAnchor::ContextProviders, Sort::Provider),
         Anchor::JsxProps => (ResolvedAnchor::JsxProps, Sort::JsxProp),
+        Anchor::ChurnCycles => (ResolvedAnchor::ChurnCycles, Sort::ChurnCycle),
     };
 
     // forEach: at most one typed edge, one binding (ADR-022 §2).
@@ -1260,6 +1309,50 @@ fn validate_guard(
                 ));
             }
             ResolvedGuard::SameTick { of }
+        }
+        Guard::Cycle {
+            of,
+            cross_component,
+            all_must,
+        } => {
+            let (of, sort) = cx.resolve_of(of, g_path)?;
+            if sort != Sort::ChurnCycle {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    format!(
+                        "guard `cycle` applies to a `churn_cycles` row, but the subject \
+                         binds {}",
+                        sort.describe()
+                    ),
+                ));
+            }
+            let cross_component = match cross_component {
+                Some(pv) => Some(cx.env.resolve(
+                    pv,
+                    Some(ParamType::Boolean),
+                    &format!("{g_path}.cross_component"),
+                )?),
+                None => None,
+            };
+            let all_must = match all_must {
+                Some(pv) => Some(cx.env.resolve(
+                    pv,
+                    Some(ParamType::Boolean),
+                    &format!("{g_path}.all_must"),
+                )?),
+                None => None,
+            };
+            if cross_component.is_none() && all_must.is_none() {
+                return Err(PackError::new(
+                    g_path,
+                    "guard `cycle` needs at least one of `cross_component` / `all_must`",
+                ));
+            }
+            ResolvedGuard::Cycle {
+                of,
+                cross_component,
+                all_must,
+            }
         }
         Guard::Provenance {
             of,

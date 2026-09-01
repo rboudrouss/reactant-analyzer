@@ -44,6 +44,8 @@ export type Anchor = {
   "relation": "context_providers";
 } | {
   "relation": "jsx_props";
+} | {
+  "relation": "churn_cycles";
 };
 
 /**
@@ -136,6 +138,11 @@ export type Guard = {
   "of": string;
 } | {
   "kind": "same_tick";
+  "of": string;
+} | {
+  "all_must"?: PVal_boolean | null;
+  "cross_component"?: PVal_boolean | null;
+  "kind": "cycle";
   "of": string;
 } | {
   /**

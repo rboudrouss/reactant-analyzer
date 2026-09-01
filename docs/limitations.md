@@ -174,6 +174,12 @@ per-row, never folds over the edge, which is what keeps the rule single-anchor)
 same updater column — is the updater body writing something it does not own? —
 sharing the mutation-site recognizer with the native `state-mutation` rule while
 each keeps its own rooting question).
+**→ 17/22** (2026-09-01, [#108](https://github.com/rboudrouss/reactant-analyzer/issues/108), ADR-029: the edge-less
+`churn_cycles` anchor over the program churn graph the `ProgramCache` already
+builds once. A whole-program relation turns out not to need a whole-program
+*schema*: the cycle is projected onto the effect of the anchored component that
+carries one of its steps, so each row is a fact about one component and the
+single-anchor property [#68](https://github.com/rboudrouss/reactant-analyzer/issues/68) is untouched.)
 Run
 `cargo test --test catalogue -- --nocapture` for the full blocked-entry report. What still blocks,
 in decreasing leverage: prop, provider-value and setter-argument positions carry no expression
