@@ -16,8 +16,8 @@ use crate::{
 use crate::rules::{
     Certified, Diagnostic, Motion, MovingFeeder, MustResult, Rule, Severity, Step, ValueClass,
     all_setter_labels, classify_motion, collect_fn_bindings, collect_setter_calls,
-    collect_setter_calls_with_extra, local_bindings, may_written_slots, must_frozen_seed,
-    state_slot_name, state_val_labels,
+    collect_setter_calls_with_extra, helpers::mount::MountCoupling, local_bindings,
+    may_written_slots, must_frozen_seed, state_slot_name, state_val_labels,
 };
 
 /// Fires when a `useState` initializer reads a prop and nothing ever syncs
@@ -34,16 +34,19 @@ use crate::rules::{
 /// - **Error**: the prop is *proven* fed by another component's state slot
 ///   (`Versioned` reference through ADR-012 top-down analysis), that slot may
 ///   actually be written in its owner, no effect keyed on the prop (and no
-///   render-time write) syncs the local slot, and the local setter never
-///   escapes this component (nothing else could sync it).
+///   render-time write) syncs the local slot, the local setter never escapes
+///   this component (nothing else could sync it), and the move is *observable*
+///   — no call site ties the mount condition to the feeder's own writers.
 /// - **Warning**: the freeze is real but the prop's motion is not proven
 ///   (props ⊤ in intra-only analysis, `VersionedTop`, per-render or unknown
 ///   values), or the proof chain has a hole (setter escapes, feeding slot's
-///   owner unavailable).
+///   owner unavailable, mount writer-coupled).
 /// - **Info**: intent is declared — every seeding prop is *named* for
-///   seed-once (`initial*` / `default*`) with unproven motion, or the local
-///   slot is never written at all (`const [{ snap }] = useState(...)`: a
-///   deliberate mount-time snapshot) — surfaced as advice only.
+///   seed-once (`initial*` / `default*`) with unproven motion, the local slot
+///   is never written at all (`const [{ snap }] = useState(...)`: a deliberate
+///   mount-time snapshot), or every call site re-seeds the consumer when the
+///   prop moves (`key={seed}`, or a render guarded by the seed —
+///   [`MountCoupling::Reseeds`], issue #95) — surfaced as advice only.
 ///
 /// Stays silent when (each kill is a proof, not a heuristic):
 /// - the initializer reads no prop;
@@ -326,6 +329,23 @@ impl Rule for FrozenInitialState {
             let mut proven: Option<(String, Certified<MovingFeeder>)> = None;
             let mut unproven_path: Option<String> = None;
             let mut all_seed_named = true;
+            // Prop names the moving seeds arrive through — what the call sites
+            // must re-seed for the freeze to be unobservable. `None` once a
+            // moving seed reads the props object itself (`useState(props)`):
+            // no single prop carries it, so no call site can prove anything.
+            let mut moving_props: Option<Vec<Var>> = Some(Vec::new());
+            let note_moving = |seed: &SeedPath, moving_props: &mut Option<Vec<Var>>| {
+                let Some(names) = moving_props else { return };
+                for n in &seed.normalized {
+                    match n.segments.first() {
+                        Some(prop) => names.push(prop.clone()),
+                        None => {
+                            *moving_props = None;
+                            return;
+                        }
+                    }
+                }
+            };
             for seed in &seeds {
                 let mut expr = Expr::Var(seed.orig.root.clone());
                 for seg in &seed.orig.segments {
@@ -339,12 +359,14 @@ impl Rule for FrozenInitialState {
                     Motion::Still => continue,
                     Motion::Proven(proof) => {
                         all_seed_named &= is_seed_named(&seed.orig);
+                        note_moving(seed, &mut moving_props);
                         if proven.is_none() {
                             proven = Some((seed.orig.to_string(), proof));
                         }
                     }
                     Motion::Unproven => {
                         all_seed_named &= is_seed_named(&seed.orig);
+                        note_moving(seed, &mut moving_props);
                         if unproven_path.is_none() {
                             unproven_path = Some(seed.orig.to_string());
                         }
@@ -355,15 +377,31 @@ impl Rule for FrozenInitialState {
                 continue; // every seeding prop provably never changes
             }
 
+            // Mount lifetime (issue #95): a prop that moves only freezes a
+            // consumer that stays mounted across the move.
+            let mount = match &moving_props {
+                Some(names) => ctx.cache().mounts().coupling(
+                    component,
+                    names,
+                    proven
+                        .as_ref()
+                        .map(|(_, p)| (&p.evidence().owner, p.evidence().slot)),
+                    result,
+                ),
+                None => MountCoupling::Free,
+            };
+
             let escaped = setter_escapes(comp, &slot_setters);
             let slot_name = name_of(*label);
 
             let (mut severity, message, proven_evidence) = match (&proven, &unproven_path) {
                 (Some((path, proof)), _) => {
                     let feeder = proof.evidence();
-                    let severity = if escaped {
-                        // Something outside this component holds the setter —
-                        // an unseen sync path may exist.
+                    // `escaped`: something outside this component holds the
+                    // setter — an unseen sync path may exist. `WriterCoupled`:
+                    // the mount condition moves with the feeder, so no mounted
+                    // instance need ever observe the change.
+                    let severity = if escaped || mount == MountCoupling::WriterCoupled {
                         Severity::Warning
                     } else {
                         Severity::Error
@@ -410,6 +448,14 @@ impl Rule for FrozenInitialState {
                 severity = Severity::Info;
             }
 
+            // Every call site re-seeds on change (`key={seed}`, or a render
+            // guarded by the seed): the freeze is real but expected to arrive
+            // on a fresh instance. Advice only — and never a kill, since
+            // neither shape proves the child cannot survive the change.
+            if mount == MountCoupling::Reseeds {
+                severity = Severity::Info;
+            }
+
             let primary_path = proven
                 .as_ref()
                 .map(|(p, _)| p.clone())
@@ -427,6 +473,7 @@ impl Rule for FrozenInitialState {
                     escaped,
                     all_seed_named,
                     locally_written.contains(label),
+                    mount,
                 ) {
                     MustResult::All(proof) => {
                         Diagnostic::error("frozen-initial-state", proof, message)

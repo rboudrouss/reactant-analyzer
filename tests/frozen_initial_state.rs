@@ -428,6 +428,283 @@ fn effect_not_keyed_on_prop_does_not_kill() {
     assert_eq!(d[0].severity(), Severity::Warning);
 }
 
+// ── Mount lifetime (issue #95) ────────────────────────────────────────────────
+
+#[test]
+fn key_built_from_the_seed_downgrades_to_info() {
+    // `key={group}` on the only call site: a change of `group` is expected to
+    // arrive on a new instance, whose initializer reads it. Advice, not a
+    // kill — an object key stringifies to a constant and remounts nothing.
+    let d = diags_for(
+        r#"
+        import { useState } from "react";
+        function Parent() {
+          const [group, setGroup] = useState({ id: "blue" });
+          return <Swatch key={group} group={group} onPick={() => setGroup({ id: "red" })} />;
+        }
+        function Swatch({ group }) {
+          const [active, setActive] = useState(group);
+          return <div onClick={() => setActive({ id: "x" })}>{active.id}</div>;
+        }
+        "#,
+        "Swatch",
+    );
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert_eq!(d[0].severity(), Severity::Info);
+}
+
+#[test]
+fn key_reading_less_than_the_seed_still_fires() {
+    // `key={label.id}` moves only with one field; the seed is the whole
+    // `label`, so a rename keeps the instance and freezes `text`.
+    let d = diags_for(
+        r#"
+        import { useState } from "react";
+        function Parent() {
+          const [label, setLabel] = useState({ id: 1, text: "a" });
+          return <Row key={label.id} label={label} onRename={() => setLabel({ id: 1, text: "b" })} />;
+        }
+        function Row({ label }) {
+          const [text, setText] = useState(label);
+          return <div onClick={() => setText({ id: 1, text: "x" })}>{text.text}</div>;
+        }
+        "#,
+        "Row",
+    );
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert_eq!(d[0].severity(), Severity::Error);
+}
+
+#[test]
+fn seed_guarded_conditional_mount_downgrades_to_info() {
+    // `{message && <Toast message={message}/>}` — the element leaves the tree
+    // whenever the seed goes falsy, so a change is expected to arrive on a
+    // fresh mount. Advice, not a kill: truthy → truthy keeps it mounted.
+    let d = diags_for(
+        r#"
+        import { useState } from "react";
+        function Parent() {
+          const [message, setMessage] = useState({ text: "a" });
+          return <div>{message && <Toast message={message} onClose={() => setMessage({ text: "b" })} />}</div>;
+        }
+        function Toast({ message }) {
+          const [shown, setShown] = useState(message);
+          return <div onClick={() => setShown({ text: "x" })}>{shown.text}</div>;
+        }
+        "#,
+        "Toast",
+    );
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert_eq!(d[0].severity(), Severity::Info);
+}
+
+#[test]
+fn writer_coupled_mount_caps_proven_at_warning() {
+    // The mount condition (`editing`) and the feeder (`link`) are written by
+    // the same two handlers, so `link` never moves while the child is mounted.
+    // The freeze stays reported — the coupling is not a proof — but it can no
+    // longer carry Error.
+    let d = diags_for(
+        r#"
+        import { useState } from "react";
+        function Links() {
+          const [editing, setEditing] = useState(false);
+          const [link, setLink] = useState({ url: "" });
+          return editing
+            ? <EditLink link={link} onCancel={() => { setEditing(false); setLink({ url: "" }); }} />
+            : <List onEdit={() => { setLink({ url: "a" }); setEditing(true); }} />;
+        }
+        function EditLink({ link }) {
+          const [locked, setLocked] = useState(link);
+          return <div onClick={() => setLocked({ url: "z" })}>{locked.url}</div>;
+        }
+        "#,
+        "EditLink",
+    );
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert_eq!(
+        d[0].severity(),
+        Severity::Warning,
+        "writer-coupled mount must not reach Error: {d:?}"
+    );
+}
+
+#[test]
+fn a_feeder_written_without_the_guard_stays_an_error() {
+    // `setLink` also fires on its own (`onPick`), a commit where a mounted
+    // `EditLink` really does see `link` move.
+    let d = diags_for(
+        r#"
+        import { useState } from "react";
+        function Links() {
+          const [editing, setEditing] = useState(false);
+          const [link, setLink] = useState({ url: "" });
+          return editing
+            ? <EditLink link={link} onPick={() => setLink({ url: "b" })} />
+            : <List onEdit={() => { setLink({ url: "a" }); setEditing(true); }} />;
+        }
+        function EditLink({ link }) {
+          const [locked, setLocked] = useState(link);
+          return <div onClick={() => setLocked({ url: "z" })}>{locked.url}</div>;
+        }
+        "#,
+        "EditLink",
+    );
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert_eq!(d[0].severity(), Severity::Error);
+}
+
+#[test]
+fn a_ternary_guarded_on_the_seed_itself_downgrades_to_info() {
+    // `state ? <Modal state={state}/> : null` — the guard is the seeding prop
+    // under its own name, the shape every "open when set" modal uses.
+    let d = diags_for(
+        r#"
+        import { useState } from "react";
+        function Parent() {
+          const [modalState, setModalState] = useState({ text: "a" });
+          return modalState ? (
+            <Modal state={modalState} onClose={() => setModalState({ text: "b" })} />
+          ) : null;
+        }
+        function Modal({ state }) {
+          const [text, setText] = useState(state.text);
+          return <div onClick={() => setText("x")}>{text}</div>;
+        }
+        "#,
+        "Modal",
+    );
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert_eq!(
+        d[0].severity(),
+        Severity::Info,
+        "a guard naming the seed must downgrade: {d:?}"
+    );
+}
+
+#[test]
+fn a_guard_does_not_read_the_element_it_guards() {
+    // `{enabled && <Row label={label}/>}` assigns the element to the very temp
+    // the branch tests. Following that assignment would hand the guard every
+    // path the element reads — `label` included — and make any conditionally
+    // rendered element its own mount condition.
+    let d = diags_for(
+        r#"
+        import { useState } from "react";
+        function Parent({ enabled }) {
+          const [label, setLabel] = useState({ text: "a" });
+          return (
+            <div>
+              {enabled && <Row label={label} onRename={() => setLabel({ text: "b" })} />}
+            </div>
+          );
+        }
+        function Row({ label }) {
+          const [text, setText] = useState(label);
+          return <div onClick={() => setText({ text: "x" })}>{text.text}</div>;
+        }
+        "#,
+        "Row",
+    );
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert_eq!(
+        d[0].severity(),
+        Severity::Error,
+        "a guard unrelated to the seed must not downgrade: {d:?}"
+    );
+}
+
+#[test]
+fn a_chained_guard_still_sees_its_right_operand() {
+    // `{enabled && message && <Toast/>}` lowers the left operand to a `let` and
+    // the right one to an `assign` in another block. Reading only the `let`
+    // finds `enabled` and loses `message` — the half that carries the seed.
+    let d = diags_for(
+        r#"
+        import { useState } from "react";
+        function Parent({ enabled }) {
+          const [message, setMessage] = useState({ text: "a" });
+          return (
+            <div>
+              {enabled && message && (
+                <Toast message={message} onClose={() => setMessage({ text: "b" })} />
+              )}
+            </div>
+          );
+        }
+        function Toast({ message }) {
+          const [shown, setShown] = useState(message);
+          return <div onClick={() => setShown({ text: "x" })}>{shown.text}</div>;
+        }
+        "#,
+        "Toast",
+    );
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert_eq!(
+        d[0].severity(),
+        Severity::Info,
+        "the right operand of a chained guard must count: {d:?}"
+    );
+}
+
+#[test]
+fn a_short_circuit_inside_a_prop_is_not_a_mount_guard() {
+    // `label={label || fallback}` lowers to a branch, but both its sides reach
+    // the element — the element renders unconditionally. Reading that branch as
+    // a mount guard would silence every prop written with `||` or `??`.
+    let d = diags_for(
+        r#"
+        import { useState } from "react";
+        function Parent() {
+          const [label, setLabel] = useState({ text: "a" });
+          const fallback = { text: "?" };
+          return <Row label={label || fallback} onRename={() => setLabel({ text: "b" })} />;
+        }
+        function Row({ label }) {
+          const [text, setText] = useState(label);
+          return <div onClick={() => setText({ text: "x" })}>{text.text}</div>;
+        }
+        "#,
+        "Row",
+    );
+    // `label || fallback` joins the versioned slot with a fresh object, so the
+    // motion is unproven and the tier is Warning either way. What matters is
+    // that it is not Info: no mount coupling was inferred from that branch.
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert_eq!(
+        d[0].severity(),
+        Severity::Warning,
+        "a short-circuit in a prop must not read as a mount guard: {d:?}"
+    );
+}
+
+#[test]
+fn one_free_call_site_among_several_keeps_the_finding() {
+    // The keyed site re-seeds, the bare one does not — and a single instance
+    // that survives the change is enough for the freeze to be observable.
+    let d = diags_for(
+        r#"
+        import { useState } from "react";
+        function Parent() {
+          const [group, setGroup] = useState({ id: "blue" });
+          return (
+            <div onClick={() => setGroup({ id: "red" })}>
+              <Swatch key={group} group={group} />
+              <Swatch group={group} />
+            </div>
+          );
+        }
+        function Swatch({ group }) {
+          const [active, setActive] = useState(group);
+          return <div onClick={() => setActive({ id: "x" })}>{active.id}</div>;
+        }
+        "#,
+        "Swatch",
+    );
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert_eq!(d[0].severity(), Severity::Error);
+}
+
 // ── safe_check ────────────────────────────────────────────────────────────────
 
 #[test]
@@ -463,5 +740,35 @@ fn safe_check_applicable_only_with_prop_seeded_state() {
             .safe_check(&RuleCtx::new(&literal, &"Counter".to_string()))
             .is_none(),
         "literal-only state → not applicable"
+    );
+}
+#[test]
+fn nested_seed_guarded_mount_downgrades_to_info() {
+    let d = diags_for(
+        r#"
+        import { useState } from "react";
+        function Parent() {
+          const [message, setMessage] = useState({ text: "a" });
+          const [other, setOther] = useState(0);
+          return (
+            <div>
+              <Header count={other} />
+              {message && <Toast message={message} onClose={() => setMessage({ text: "b" })} />}
+              <Footer onBump={() => setOther(other + 1)} />
+            </div>
+          );
+        }
+        function Toast({ message }) {
+          const [shown, setShown] = useState(message);
+          return <div onClick={() => setShown({ text: "x" })}>{shown.text}</div>;
+        }
+        "#,
+        "Toast",
+    );
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert_eq!(
+        d[0].severity(),
+        Severity::Info,
+        "nested guard must still count: {d:?}"
     );
 }

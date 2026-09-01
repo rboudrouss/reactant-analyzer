@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 
 use crate::engine::ProgramAnalysisResult;
 use crate::rules::helpers::churn_graph::ChurnGraph;
+use crate::rules::helpers::mount::MountIndex;
 
 /// Program-scoped, lazily-computed derived data shared by every component's
 /// rule pass. Bound to the program it was built from, so a cache can never be
@@ -22,6 +23,7 @@ use crate::rules::helpers::churn_graph::ChurnGraph;
 pub struct ProgramCache<'a> {
     program: &'a ProgramAnalysisResult,
     churn: OnceLock<ChurnGraph>,
+    mounts: OnceLock<MountIndex>,
 }
 
 impl<'a> ProgramCache<'a> {
@@ -29,6 +31,7 @@ impl<'a> ProgramCache<'a> {
         ProgramCache {
             program,
             churn: OnceLock::new(),
+            mounts: OnceLock::new(),
         }
     }
 
@@ -39,5 +42,11 @@ impl<'a> ProgramCache<'a> {
     /// The program's churn graph and its cycles, built on first request.
     pub(in crate::rules) fn churn(&self) -> &ChurnGraph {
         self.churn.get_or_init(|| ChurnGraph::build(self.program))
+    }
+
+    /// Component → its JSX call sites, built on first request. The reverse
+    /// index behind mount-lifetime reasoning (issue #95).
+    pub(in crate::rules) fn mounts(&self) -> &MountIndex {
+        self.mounts.get_or_init(|| MountIndex::build(self.program))
     }
 }

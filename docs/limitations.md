@@ -72,6 +72,12 @@ shapes, do not trust a clean result for it.**
   [#76](https://github.com/rboudrouss/reactant-analyzer/issues/76).
 - Class bodies declared inside a component are not lowered, so a setter called from a method is
   invisible [#77](https://github.com/rboudrouss/reactant-analyzer/issues/77).
+- **Mount-coupled seeds.** `frozen-initial-state` drops to Info — hidden without `--info` — when
+  every call site renders the consumer under a `key` built from the seeding prop, or under a guard
+  built from it (`{msg && <Toast msg={msg}/>}`). Neither shape is a proof: a `msg` moving between
+  two *truthy* values keeps the child mounted (`if (!data) return <Spinner/>` over refetched data),
+  and an object `key` stringifies to a constant. The finding is therefore downgraded, never
+  deleted [#95](https://github.com/rboudrouss/reactant-analyzer/issues/95).
 
 ## Why reactant may warn wrongly (false positives)
 
@@ -93,6 +99,9 @@ Every entry here is Warning-or-below by construction: an FP never carries an Err
   [#40](https://github.com/rboudrouss/reactant-analyzer/issues/40).
 - **`stale-closure`** treats any 2-arg `on`/`addListener` (or 1-arg `subscribe`) as a long-lived
   registration [#42](https://github.com/rboudrouss/reactant-analyzer/issues/42).
+- **`frozen-initial-state`** still fires on a child remounted by machinery it cannot see — a dialog
+  body unmounted by its library wrapper, a route that swaps the subtree
+  [#95](https://github.com/rboudrouss/reactant-analyzer/issues/95).
 - **The assurance channel** (`verified:` lines under `--info`) is withheld per component rather than
   per (limit kind, check), so an unanalysed *child* costs the parent guarantees about its own body
   [#31](https://github.com/rboudrouss/reactant-analyzer/issues/31). This affects `--info` output only — never a diagnostic,

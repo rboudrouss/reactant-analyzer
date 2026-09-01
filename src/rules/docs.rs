@@ -142,13 +142,16 @@ pub const RULE_DOCS: &[RuleDoc] = &[
                       stays frozen at the first prop value while the prop moves on — the \
                       classic \"my component doesn't update when props change\". Error when \
                       the prop is proven to be fed by another component's state that is \
-                      actually written (cross-component analysis); Warning when the prop's \
-                      motion is uncertain or the setter escapes the component; Info when \
+                      actually written (cross-component analysis) and a mounted instance can \
+                      observe the change; Warning when the prop's motion is uncertain, the \
+                      setter escapes the component, or the call sites mount the component under \
+                      a condition written by the feeder's own handlers; Info when \
                       intent is declared — every seeding prop is named for seed-once \
-                      (`initial*`/`default*`), or the slot is never written at all (a \
-                      deliberate mount-time snapshot). Silent when the feeding state provably \
-                      never changes or a sync path exists (that quality is `derived-state`'s \
-                      concern).",
+                      (`initial*`/`default*`), the slot is never written at all (a \
+                      deliberate mount-time snapshot), or every call site re-seeds the \
+                      component when the prop moves (`key={seed}`, or a render guarded by \
+                      the seed). Silent when the feeding state provably never changes or a \
+                      sync path exists (that quality is `derived-state`'s concern).",
         "function Row({ user }) {\n\
                   \x20 const [name, setName] = useState(user.name); // user changes later\n\
                   }",

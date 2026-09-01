@@ -31,6 +31,7 @@ use crate::{
 };
 
 use crate::rules::api::cache::ProgramCache;
+use crate::rules::helpers::mount::MountCoupling;
 use crate::rules::{ConvergedEval, Note, SetterCall, Step, arg_is_call_free, local_bindings};
 
 /// Where a certified fact lives, and the witness chain that proves it (ADR-019).
@@ -661,6 +662,10 @@ pub fn must_init_calls_setter(init: &Expr, setters: &HashSet<Var>) -> MustResult
 /// syntactically visible. The evidence carried by [`Motion::Proven`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct MovingFeeder {
+    /// Component the slot belongs to — the half of the version label a rule
+    /// needs to ask further questions about the slot (who writes it, when the
+    /// consumer is mounted relative to those writes).
+    pub owner: Symbol,
     pub slot: HookLabel,
     /// Owner's source-level name for the slot, pre-qualified for display
     /// ("state `text` of `Parent`").
@@ -735,6 +740,7 @@ pub fn classify_motion(val: &StateValue, result: &ProgramAnalysisResult) -> Moti
                 );
                 return Motion::Proven(Certified::mint(
                     MovingFeeder {
+                        owner: owner.clone(),
                         slot: *slot,
                         display,
                         write_span,
@@ -768,18 +774,24 @@ pub fn classify_motion(val: &StateValue, result: &ProgramAnalysisResult) -> Moti
 
 /// `All` iff a proven moving feeder survives the idiomatic downgrades: the
 /// setter does not escape, the seeds are not all seed-named (`initial*`/
-/// `default*`), and the slot is locally written — the certain
-/// `frozen-initial-state` Error (ADR-021 §3). Any failed gate *demotes* the
-/// proof ([`Certified::into_evidence`]) — the fact survives as a MAY, its
-/// Error eligibility does not. Forging is impossible: the input proof only
-/// comes from [`classify_motion`].
+/// `default*`), the slot is locally written, and the feeder's move is
+/// *observable* by a mounted consumer — the certain `frozen-initial-state`
+/// Error (ADR-021 §3). Any failed gate *demotes* the proof
+/// ([`Certified::into_evidence`]) — the fact survives as a MAY, its Error
+/// eligibility does not. Forging is impossible: the input proof only comes
+/// from [`classify_motion`].
+///
+/// `mount` is the call sites' verdict ([`MountCoupling`], issue #95): anything
+/// but `Free` means a mounted consumer may never observe the move, so the
+/// freeze is real but its Error certainty is gone — a MAY.
 pub fn must_frozen_seed(
     feeder: Certified<MovingFeeder>,
     escaped: bool,
     all_seed_named: bool,
     locally_written: bool,
+    mount: MountCoupling,
 ) -> MustResult<MovingFeeder> {
-    if !escaped && !all_seed_named && locally_written {
+    if !escaped && !all_seed_named && locally_written && mount == MountCoupling::Free {
         MustResult::All(feeder)
     } else {
         MustResult::Some(feeder.into_evidence())
