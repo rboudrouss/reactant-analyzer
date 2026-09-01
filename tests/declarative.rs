@@ -3066,3 +3066,139 @@ fn all_must_and_cross_component_are_independent_filters() {
         "the loop is cross-component and not all-must: {got:?}"
     );
 }
+
+// ── #107: owner-qualified render-setter rows ──────────────────────────────────
+
+const CHILD_RENDER_SRC: &str = r#"
+import { useState } from 'react';
+export function Parent() {
+  const [count, setCount] = useState(0);
+  return <Child onReady={setCount} />;
+}
+function Child({ onReady }) {
+  onReady(1);
+  return <div/>;
+}
+"#;
+
+const OWNERSHIP_PACK: &str = r#"{
+  "schemaVersion": 1, "name": "own",
+  "rules": [{
+    "id": "setter-in-child-render",
+    "docs": {"description":"d","why":"w","fix":"f"},
+    "severity": "error",
+    "anchor": { "relation": "render_setter_calls" },
+    "guards": [
+      { "kind": "slot_ownership", "of": "anchor", "is": ["foreign"] },
+      { "kind": "must_dominates_all_exits", "of": "anchor" }
+    ],
+    "message": "{anchor.setter} writes {anchor.slot} of {anchor.owner} during render"
+  }]
+}"#;
+
+/// A pack that never names ownership must bind exactly the rows it bound
+/// before foreign rows existed.
+const LOCAL_ONLY_PACK: &str = r#"{
+  "schemaVersion": 1, "name": "own2",
+  "rules": [{
+    "id": "any-render-setter",
+    "docs": {"description":"d","why":"w","fix":"f"},
+    "severity": "warning",
+    "anchor": { "relation": "render_setter_calls" },
+    "message": "{anchor.setter} in render"
+  }]
+}"#;
+
+#[test]
+fn ownership_guard_binds_a_parent_setter_prop_called_in_child_render() {
+    let got = run_pack_program(OWNERSHIP_PACK, CHILD_RENDER_SRC);
+    assert_eq!(got.len(), 1, "one foreign row: {got:?}");
+    assert_eq!(
+        got[0].severity(),
+        Severity::Error,
+        "the call dominates every exit: {got:?}"
+    );
+    assert!(
+        got[0].message.contains("`onReady`") && got[0].message.contains("`Parent`"),
+        "the owner must be named: {}",
+        got[0].message
+    );
+    assert!(
+        got[0].message.contains("`count`"),
+        "the slot name is resolved in the OWNER's component: {}",
+        got[0].message
+    );
+}
+
+#[test]
+fn a_shipped_pack_that_never_names_ownership_binds_the_same_rows() {
+    // The widening is gated on the guard, not on the anchor: without it the
+    // foreign call is not a row, exactly as before #107.
+    let got = run_pack_program(LOCAL_ONLY_PACK, CHILD_RENDER_SRC);
+    assert!(
+        got.is_empty(),
+        "the enumeration must not widen unconditionally: {got:?}"
+    );
+
+    // And a local render-setter call is still bound, guard or no guard.
+    let local = r#"
+import { useState } from 'react';
+export function C() {
+  const [n, setN] = useState(0);
+  setN(1);
+  return <div>{n}</div>;
+}
+"#;
+    let plain = run_pack_program(LOCAL_ONLY_PACK, local);
+    assert_eq!(plain.len(), 1, "local rows are unchanged: {plain:?}");
+    let owned = run_pack_program(
+        r#"{
+          "schemaVersion": 1, "name": "own3",
+          "rules": [{
+            "id": "local-render-setter",
+            "docs": {"description":"d","why":"w","fix":"f"},
+            "severity": "warning",
+            "anchor": { "relation": "render_setter_calls" },
+            "guards": [{ "kind": "slot_ownership", "of": "anchor", "is": ["local"] }],
+            "message": "{anchor.setter} writes {anchor.slot} of {anchor.owner}"
+          }]
+        }"#,
+        local,
+    );
+    assert_eq!(owned.len(), 1, "a local row answers `local`: {owned:?}");
+    assert!(
+        owned[0].message.contains("`C`"),
+        "a local row's owner is the anchored component: {}",
+        owned[0].message
+    );
+}
+
+#[test]
+fn an_unreached_parent_produces_no_foreign_row() {
+    // Analyzed component-by-component, no `ComponentSetter` ever reaches the
+    // child's environment — the phase-2 shape. Fail-closed: a missed finding,
+    // never a row attributed to a parent nobody analyzed.
+    let got = run_pack(OWNERSHIP_PACK, CHILD_RENDER_SRC, &Options::new());
+    assert!(got.is_empty(), "no top-down flow, no foreign rows: {got:?}");
+}
+
+#[test]
+fn slot_ownership_needs_a_render_setter_row() {
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},
+            "severity":"warning","anchor":{"relation":"hook_calls","kind":"effect"},
+            "forEach":{"edge":"body_setter_calls","as":"s"},
+            "guards":[{"kind":"slot_ownership","of":"s","is":["foreign"]}],"message":"m"}"#,
+    ));
+    assert_eq!(e.path, "rules[0].guards[0].of");
+    assert!(e.message.contains("body setter call"), "{e}");
+
+    // `must_setter_on_all_paths` stays restricted to SetterBody: the Error
+    // path for a render row is exit dominance, not that primitive.
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},
+            "severity":"error","anchor":{"relation":"render_setter_calls"},
+            "guards":[{"kind":"must_setter_on_all_paths","of":"anchor"}],"message":"m"}"#,
+    ));
+    assert!(e.message.contains("body setter call"), "{e}");
+}

@@ -140,6 +140,10 @@ export type Guard = {
   "kind": "same_tick";
   "of": string;
 } | {
+  "is": PVal_Array_of_OwnershipName;
+  "kind": "slot_ownership";
+  "of": string;
+} | {
   "all_must"?: PVal_boolean | null;
   "cross_component"?: PVal_boolean | null;
   "kind": "cycle";
@@ -205,6 +209,12 @@ export type IdentityName = "fresh-every-render" | "unknown";
  */
 export type ImpureName = "impure" | "unknown";
 
+/**
+ * Who owns the slot a render-setter row writes (#107). Two-valued and total:
+ * a row's owner is resolved or the row does not exist, so there is no ⊤.
+ */
+export type OwnershipName = "local" | "foreign";
+
 export type PVal_Array_of_CleanupName = CleanupName[] | {
   "$param": string;
 };
@@ -214,6 +224,10 @@ export type PVal_Array_of_IdentityName = IdentityName[] | {
 };
 
 export type PVal_Array_of_ImpureName = ImpureName[] | {
+  "$param": string;
+};
+
+export type PVal_Array_of_OwnershipName = OwnershipName[] | {
   "$param": string;
 };
 

@@ -226,6 +226,11 @@ pub(crate) enum ResolvedGuard {
     SameTick {
         of: BindRef,
     },
+    /// #107: who owns the slot a render-setter row writes.
+    SlotOwnership {
+        of: BindRef,
+        names: Vec<crate::rules::declarative::schema::OwnershipName>,
+    },
     /// #108: exact shape folds of a `churn_cycles` row, conjoined.
     Cycle {
         of: BindRef,
@@ -274,6 +279,7 @@ pub(crate) enum Field {
     Cleanup,
     Prop,
     Cycle,
+    Owner,
 }
 
 impl Field {
@@ -296,6 +302,7 @@ impl Field {
         Field::Cleanup,
         Field::Prop,
         Field::Cycle,
+        Field::Owner,
     ];
 
     /// The name authors write: `{anchor.<token>}`.
@@ -316,6 +323,7 @@ impl Field {
             Field::Cleanup => "cleanup",
             Field::Prop => "prop",
             Field::Cycle => "cycle",
+            Field::Owner => "owner",
         }
     }
 
@@ -475,6 +483,22 @@ impl Field {
                 | Sort::JsxProp
                 | Sort::ChurnCycle => false,
             },
+            // Which component owns the slot the row writes (#107). Total on a
+            // render-setter row: local rows answer with the anchored component
+            // itself. Only that sort has an owner question at all — a body
+            // setter call is always the anchored component's own.
+            Field::Owner => match sort {
+                Sort::SetterRender => true,
+                Sort::Hook(_)
+                | Sort::SetterBody
+                | Sort::Dep
+                | Sort::Arg
+                | Sort::HookOrigin
+                | Sort::Writer
+                | Sort::Provider
+                | Sort::JsxProp
+                | Sort::ChurnCycle => false,
+            },
             // The loop path, already node-qualified by owning component. Only
             // a cycle row has one; no other sort could invent it.
             Field::Cycle => match sort {
@@ -502,7 +526,12 @@ pub(crate) enum Segment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResolvedAnchor {
     HookCalls(Option<HookKindFilter>),
-    RenderSetterCalls,
+    /// `foreign` widens the enumeration with `ComponentSetter`-valued props
+    /// (#107). Set by the validator iff the rule names ownership, so a pack
+    /// that does not mention it binds exactly the rows it always did.
+    RenderSetterCalls {
+        foreign: bool,
+    },
     HookOrigins,
     ContextProviders,
     /// Every prop of every resolved component element (#71 step 2).
@@ -584,6 +613,7 @@ fn guard_allowed_keys(g: &Guard) -> (&'static str, &'static [&'static str]) {
         Guard::Updater { .. } => ("guard `updater`", &["kind", "of", "is"]),
         Guard::UpdaterBody { .. } => ("guard `updater_body`", &["kind", "of", "is"]),
         Guard::SameTick { .. } => ("guard `same_tick`", &["kind", "of"]),
+        Guard::SlotOwnership { .. } => ("guard `slot_ownership`", &["kind", "of", "is"]),
         Guard::Cycle { .. } => (
             "guard `cycle`",
             &["kind", "of", "cross_component", "all_must"],
@@ -798,7 +828,12 @@ fn validate_rule(
     )?;
     let (anchor, anchor_sort) = match &def.anchor {
         Anchor::HookCalls { kind } => (ResolvedAnchor::HookCalls(*kind), Sort::Hook(*kind)),
-        Anchor::RenderSetterCalls => (ResolvedAnchor::RenderSetterCalls, Sort::SetterRender),
+        Anchor::RenderSetterCalls => (
+            // Patched below once the guards are known: only a rule that names
+            // ownership gets the widened enumeration.
+            ResolvedAnchor::RenderSetterCalls { foreign: false },
+            Sort::SetterRender,
+        ),
         Anchor::HookOrigins => (ResolvedAnchor::HookOrigins, Sort::HookOrigin),
         Anchor::ContextProviders => (ResolvedAnchor::ContextProviders, Sort::Provider),
         Anchor::JsxProps => (ResolvedAnchor::JsxProps, Sort::JsxProp),
@@ -918,6 +953,16 @@ fn validate_rule(
         ));
     }
 
+    // #107: the render-setter enumeration widens ONLY for a rule that names
+    // ownership. Anywhere in the tree, `any_of` included — a foreign row a
+    // disjunct can select must exist for that disjunct to see it.
+    let anchor = match anchor {
+        ResolvedAnchor::RenderSetterCalls { .. } => ResolvedAnchor::RenderSetterCalls {
+            foreign: guards.iter().any(names_ownership),
+        },
+        other => other,
+    };
+
     // Message template.
     let message = parse_template(
         &def.message,
@@ -985,6 +1030,18 @@ fn validate_rule(
         guards,
         message,
     })
+}
+
+/// Does this guard tree name slot ownership anywhere (#107)? The trigger for
+/// the widened render-setter enumeration.
+fn names_ownership(g: &ResolvedGuard) -> bool {
+    match g {
+        ResolvedGuard::SlotOwnership { .. } => true,
+        ResolvedGuard::AnyOf(children) | ResolvedGuard::Every(children) => {
+            children.iter().any(names_ownership)
+        }
+        _ => false,
+    }
 }
 
 /// Does this guard tree contain a `every` quantifier anywhere?
@@ -1309,6 +1366,27 @@ fn validate_guard(
                 ));
             }
             ResolvedGuard::SameTick { of }
+        }
+        Guard::SlotOwnership { of, is } => {
+            let (of, sort) = cx.resolve_of(of, g_path)?;
+            if sort != Sort::SetterRender {
+                return Err(PackError::new(
+                    format!("{g_path}.of"),
+                    format!(
+                        "guard `slot_ownership` applies to a `render_setter_calls` row, but \
+                         the subject binds {}",
+                        sort.describe()
+                    ),
+                ));
+            }
+            let names = cx.env.resolve(is, None, &format!("{g_path}.is"))?;
+            if names.is_empty() {
+                return Err(PackError::new(
+                    format!("{g_path}.is"),
+                    "guard `slot_ownership` needs at least one ownership name",
+                ));
+            }
+            ResolvedGuard::SlotOwnership { of, names }
         }
         Guard::Cycle {
             of,

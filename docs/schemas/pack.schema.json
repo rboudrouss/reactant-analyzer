@@ -587,6 +587,27 @@
           ]
         },
         {
+          "description": "Who owns the state slot a `render_setter_calls` row writes (#107):\n`local` — the anchored component's own `useState` — or `foreign`, a\n`ComponentSetter`-valued prop the top-down inter-component pass placed\nin this component's environment.\n\n**Naming ownership is what widens the enumeration.** Without this\nguard the sort binds local rows only, exactly as it did before foreign\nrows existed: changing what a shipped sort enumerates changes which\nfindings a shipped pack fires (ADR-027 §2).\n\nTwo-valued and total — every enumerated row is one or the other by\nconstruction — but the *attribution* is may-typed: it is the same\nper-block existential the native `setter-in-render` rule consumes, so a\nvariable that holds the parent's setter on one path and something else\non another still produces a row. Over-reporting, never a miss.",
+          "type": "object",
+          "properties": {
+            "is": {
+              "$ref": "#/$defs/PVal_Array_of_OwnershipName"
+            },
+            "kind": {
+              "type": "string",
+              "const": "slot_ownership"
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of",
+            "is"
+          ]
+        },
+        {
           "description": "Shape filter on a `churn_cycles` row (#108): whether the loop spans\nmore than one component, and whether every one of its steps is a\nmust-step. At least one of `cross_component` / `all_must`; the given\nfields are conjoined.\n\nBoth are **exact** booleans — folds of the node table and the edge\nstrengths the graph already computed — so unlike the may-typed verdict\nguards this one has a meaningful negative and takes plain booleans\nrather than a ⊤-bearing name list. What is may-typed is the graph\nitself: a cycle it never saw yields no row at all, which is the\nmissing-findings direction.",
           "type": "object",
           "properties": {
@@ -873,6 +894,21 @@
         }
       ]
     },
+    "OwnershipName": {
+      "description": "Who owns the slot a render-setter row writes (#107). Two-valued and total:\na row's owner is resolved or the row does not exist, so there is no ⊤.",
+      "oneOf": [
+        {
+          "description": "The anchored component's own state slot.",
+          "type": "string",
+          "const": "local"
+        },
+        {
+          "description": "Another component's slot, reached through a `ComponentSetter` prop.",
+          "type": "string",
+          "const": "foreign"
+        }
+      ]
+    },
     "PVal_Array_of_CleanupName": {
       "oneOf": [
         {
@@ -923,6 +959,28 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/ImpureName"
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "$param": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "$param"
+          ]
+        }
+      ]
+    },
+    "PVal_Array_of_OwnershipName": {
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/OwnershipName"
           }
         },
         {

@@ -364,6 +364,25 @@ pub enum Guard {
     /// reachable" is not a promise the engine can keep — there is no negated
     /// form to assert it with.
     SameTick { of: String },
+    /// Who owns the state slot a `render_setter_calls` row writes (#107):
+    /// `local` — the anchored component's own `useState` — or `foreign`, a
+    /// `ComponentSetter`-valued prop the top-down inter-component pass placed
+    /// in this component's environment.
+    ///
+    /// **Naming ownership is what widens the enumeration.** Without this
+    /// guard the sort binds local rows only, exactly as it did before foreign
+    /// rows existed: changing what a shipped sort enumerates changes which
+    /// findings a shipped pack fires (ADR-027 §2).
+    ///
+    /// Two-valued and total — every enumerated row is one or the other by
+    /// construction — but the *attribution* is may-typed: it is the same
+    /// per-block existential the native `setter-in-render` rule consumes, so a
+    /// variable that holds the parent's setter on one path and something else
+    /// on another still produces a row. Over-reporting, never a miss.
+    SlotOwnership {
+        of: String,
+        is: PVal<Vec<OwnershipName>>,
+    },
     /// Shape filter on a `churn_cycles` row (#108): whether the loop spans
     /// more than one component, and whether every one of its steps is a
     /// must-step. At least one of `cross_component` / `all_must`; the given
@@ -528,6 +547,18 @@ pub enum UpdaterName {
     /// ⊤ — a value expression, a call, an argument the walk could not resolve,
     /// or no argument at all.
     Unknown,
+}
+
+/// Who owns the slot a render-setter row writes (#107). Two-valued and total:
+/// a row's owner is resolved or the row does not exist, so there is no ⊤.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum OwnershipName {
+    /// The anchored component's own state slot.
+    Local,
+    /// Another component's slot, reached through a `ComponentSetter` prop.
+    Foreign,
 }
 
 /// Total mirror of `WriterPhase` (ADR-027 §1); ⊤ = `unknown`.

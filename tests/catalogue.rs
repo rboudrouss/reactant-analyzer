@@ -413,6 +413,29 @@ const LAYOUT_EFFECT_PACK: &str = r#"{
   }]
 }"#;
 
+/// #107: owner-qualified render-setter rows. The `slot_ownership` guard is
+/// what widens the enumeration — a pack that never names ownership binds
+/// exactly the local rows it always did.
+const OWNERSHIP_PACK: &str = r#"{
+  "schemaVersion": 1, "name": "cat-own",
+  "rules": [{
+    "id": "setter-called-in-child-render",
+    "docs": {
+      "description": "a child calls a parent's state setter during its own render",
+      "why": "Writing a parent's state while the child renders schedules a parent re-render from inside a render. React re-runs the whole subtree, and if the write is unconditional it never settles.",
+      "fix": "Move the call into an effect or an event handler, or let the parent compute the value it needs itself.",
+      "example": "function Child({ onReady }) { onReady(1); return <div/> }"
+    },
+    "severity": "error",
+    "anchor": { "relation": "render_setter_calls" },
+    "guards": [
+      { "kind": "slot_ownership", "of": "anchor", "is": ["foreign"] },
+      { "kind": "must_dominates_all_exits", "of": "anchor" }
+    ],
+    "message": "prop {anchor.setter} writes {anchor.slot} of {anchor.owner} during this render"
+  }]
+}"#;
+
 /// #108: the `churn_cycles` anchor. Edge-less — the cycle IS the row, and the
 /// two shape folds the graph already computed are exact booleans on it.
 const CYCLE_PACK: &str = r#"{
@@ -435,6 +458,21 @@ const CYCLE_PACK: &str = r#"{
 }"#;
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
+
+/// A child calling a parent setter prop during render. Needs the top-down
+/// inter-component pass to place the `ComponentSetter` in the child's
+/// environment, so it is a `Multi` fixture.
+const CHILD_RENDER_FILES: &[(&str, &str)] = &[(
+    "child-render.tsx",
+    "import { useState } from \"react\";\nexport function Parent() {\n  const [count, setCount] = useState(0);\n  return <Child onReady={setCount} />;\n}\nfunction Child({ onReady }) {\n  onReady(1);\n  return <div/>;\n}\n",
+)];
+
+/// The same shape with the write moved into a mount effect: no setter call in
+/// the render body at all, so the enumeration has no row.
+const CHILD_RENDER_OK_FILES: &[(&str, &str)] = &[(
+    "child-render-ok.tsx",
+    "import { useState, useEffect } from \"react\";\nexport function Parent() {\n  const [count, setCount] = useState(0);\n  return <Child onReady={setCount} />;\n}\nfunction Child({ onReady }) {\n  useEffect(() => { onReady(1); }, [onReady]);\n  return <div/>;\n}\n",
+)];
 
 /// The cross-component churn loop: the parent owns `data` and hands its setter
 /// down; the child's effect reacts to the prop and writes a fresh object back.
@@ -654,9 +692,21 @@ fn catalogue() -> Vec<Entry> {
         },
         Entry {
             id: "setter-called-in-child-render",
-            status: Status::Blocked {
-                class: "joins",
-                missing: "cross-component anchor (covered natively by cross-component rules)",
+            status: Status::Expressible {
+                pack_json: OWNERSHIP_PACK,
+                rule: "cat-own/setter-called-in-child-render",
+                fires_on: Fixture::Multi(CHILD_RENDER_FILES),
+                silent_on: Fixture::Multi(CHILD_RENDER_OK_FILES),
+                weakened: Some(
+                    "only setters that flowed as `ComponentSetter` props (or FnLit captures \
+                     of one) through an ANALYZED top-down chain produce rows; setters routed \
+                     through context or a store, and any chain through a phase-2 parent \
+                     (analyzed without InterCtx), produce none — missed findings, never \
+                     wrong ones (#20 stays open). The owner attribution is may-typed, not \
+                     exact: it is the same per-block existential the native rule consumes, \
+                     so a variable holding the parent setter on one path and something else \
+                     on another still produces a row (#119)",
+                ),
             },
         },
         // ── Facts the engine does not compute (for Tier A) ───────────────────
@@ -862,7 +912,7 @@ fn catalogue() -> Vec<Entry> {
 /// after the single-binding certificate resolved Var-bound selectors (#103) →
 /// 13/22 after the `identity` verdict reached call-site arguments (#112).
 /// Flip an entry (rule + fixtures), then update this constant.
-const EXPRESSIBLE_NOW: usize = 17;
+const EXPRESSIBLE_NOW: usize = 18;
 
 #[test]
 fn catalogue_is_pinned_at_22_entries() {

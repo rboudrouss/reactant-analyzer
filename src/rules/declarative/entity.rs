@@ -20,7 +20,7 @@ use crate::ir::SourceRange;
 use crate::ir::expr::Expr;
 use crate::ir::free_vars::{AccessPath, dep_paths};
 use crate::ir::hooks::{HookEntry, HookProvenance};
-use crate::ir::types::{BlockId, HookLabel, Var};
+use crate::ir::types::{BlockId, HookLabel, Symbol, Var};
 use crate::rules::api::query::{
     Certified, CleanupVerdict, ConditionalHookCall, ExitDominance, RuleCtx,
 };
@@ -30,7 +30,8 @@ use crate::rules::helpers::local_bindings;
 use crate::rules::helpers::providers::{ProviderSite, ValueIdentity, collect_provider_sites};
 use crate::rules::{
     ReturnsVerdict, SetterCall, StabilityVerdict, all_setter_labels, collect_setter_calls,
-    hook_kind_word, hook_val_labels, resolve_setter_aliases, state_val_labels,
+    cross_component_setters, hook_kind_word, hook_val_labels, resolve_setter_aliases,
+    state_val_labels,
 };
 
 use super::schema::{
@@ -56,6 +57,14 @@ pub(crate) struct SetterEntity {
     pub slot: Option<HookLabel>,
     pub span: Option<SourceRange>,
     pub block_id: Option<BlockId>,
+    /// Which component owns the slot this call writes (#107). `None` for a
+    /// local setter — the anchored component owns it; `Some(parent)` for a
+    /// `ComponentSetter`-valued prop the top-down pass placed here.
+    ///
+    /// A foreign row's `slot` is a label of the OWNER's component, so it must
+    /// never be resolved against this component's naming table: labels are
+    /// per-component and would collide.
+    pub owner: Option<Symbol>,
 }
 
 /// One declared deps-array entry.
@@ -111,6 +120,9 @@ pub(crate) struct EntityCtx<'a> {
     /// Index into `comp.hook_provenance` by label (indices, not references:
     /// `OnceCell` is invariant, so a borrowed map would freeze `'a`).
     provenance: OnceCell<HashMap<HookLabel, usize>>,
+    /// `ComponentSetter`-valued props (#107), resolved on first use by the
+    /// ownership-aware enumeration.
+    cross_setters: OnceCell<HashMap<Var, (Symbol, HookLabel)>>,
 }
 
 impl<'a> EntityCtx<'a> {
@@ -130,6 +142,7 @@ impl<'a> EntityCtx<'a> {
             exit_dom: OnceCell::new(),
             conditional: OnceCell::new(),
             provenance: OnceCell::new(),
+            cross_setters: OnceCell::new(),
         }
     }
 
@@ -154,12 +167,34 @@ impl<'a> EntityCtx<'a> {
 
     /// Alias-resolved setter calls in the render body, deterministically
     /// sorted (`collect_setter_calls` returns HashMap order).
-    pub fn render_setters(&self) -> Vec<SetterEntity> {
-        self.sorted_setters(collect_setter_calls(
-            &self.comp.render_cfg,
-            &self.setter_vars,
-            2,
-        ))
+    /// `foreign` widens the enumeration with `ComponentSetter`-valued props —
+    /// parent setters the top-down pass placed in this component's environment
+    /// (#107).
+    ///
+    /// **Never widened unconditionally.** The validator sets the flag only for
+    /// a rule that names ownership, so a pack shipped before this existed
+    /// enumerates exactly the rows it enumerated then: changing what a shipped
+    /// sort binds changes which findings fire (the ADR-027 §2 sequencing
+    /// argument).
+    pub fn render_setters(&self, foreign: bool) -> Vec<SetterEntity> {
+        if !foreign {
+            return self.sorted_setters(
+                collect_setter_calls(&self.comp.render_cfg, &self.setter_vars, 2),
+                &HashMap::new(),
+            );
+        }
+        let cross = self.cross_setters();
+        let mut vars = self.setter_vars.clone();
+        vars.extend(cross.keys().cloned());
+        self.sorted_setters(collect_setter_calls(&self.comp.render_cfg, &vars, 2), cross)
+    }
+
+    /// `var → (owning component, slot)` for every `ComponentSetter`-valued
+    /// prop of this component — the engine resolution the native
+    /// `setter-in-render` rule consumes, read once and shared (ADR-027 §1).
+    fn cross_setters(&self) -> &HashMap<Var, (Symbol, HookLabel)> {
+        self.cross_setters
+            .get_or_init(|| cross_component_setters(self.comp, self.ctx.component()))
     }
 
     /// `hook_origins` rows in label order (labels are unique after the
@@ -255,7 +290,10 @@ impl<'a> EntityCtx<'a> {
         let Some(body) = row.entry.and_then(|e| e.body_cfg()) else {
             return vec![];
         };
-        self.sorted_setters(collect_setter_calls(body, &self.setter_vars, 2))
+        self.sorted_setters(
+            collect_setter_calls(body, &self.setter_vars, 2),
+            &HashMap::new(),
+        )
     }
 
     /// `deps`: declared deps-array entries, in declared order. An effect with
@@ -422,7 +460,7 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Cycle(_) => None,
             },
             Field::Slot => match v {
-                EntityVal::Setter(s) => s.slot.and_then(|l| self.slot_source_name(l)),
+                EntityVal::Setter(s) => self.setter_slot_name(s),
                 EntityVal::Writer(w) => self.slot_source_name(w.slot),
                 EntityVal::Hook(_)
                 | EntityVal::Dep(_)
@@ -550,6 +588,23 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_) => None,
             },
+            // Which component owns the slot the row writes: this one for a
+            // local setter, the parent for a `ComponentSetter`-valued prop.
+            Field::Owner => match v {
+                EntityVal::Setter(s) => Some(
+                    s.owner
+                        .clone()
+                        .unwrap_or_else(|| self.ctx.component().clone()),
+                ),
+                EntityVal::Hook(_)
+                | EntityVal::Dep(_)
+                | EntityVal::Arg(_)
+                | EntityVal::Origin(_)
+                | EntityVal::Writer(_)
+                | EntityVal::Provider(_)
+                | EntityVal::JsxProp(_)
+                | EntityVal::Cycle(_) => None,
+            },
             // The loop path: node names are already qualified and quoted by
             // the shared `node_display`, so this one is rendered bare.
             Field::Cycle => match v {
@@ -584,11 +639,32 @@ impl<'a> EntityCtx<'a> {
             | Field::Cleanup
             | Field::Cycle => raw.unwrap_or_else(|| anonymous(v)),
             // Source identifiers are quoted, verdict words are not.
-            Field::Name | Field::Slot | Field::Setter | Field::Path | Field::Prop => match raw {
+            Field::Name
+            | Field::Slot
+            | Field::Setter
+            | Field::Path
+            | Field::Prop
+            | Field::Owner => match raw {
                 Some(s) => format!("`{s}`"),
                 None => anonymous(v),
             },
         }
+    }
+
+    /// The unquoted source name of the slot a setter row writes.
+    ///
+    /// A foreign row's label belongs to the OWNER's component, so it is
+    /// resolved there. Resolving it against this component's table would name
+    /// an unrelated local slot that happens to share the label — labels are
+    /// per-component.
+    fn setter_slot_name(&self, s: &SetterEntity) -> Option<String> {
+        let label = s.slot?;
+        let Some(owner) = &s.owner else {
+            return self.slot_source_name(label);
+        };
+        let comp = self.ctx.program().components.get(owner)?;
+        let names = resolve_setter_aliases(&comp.render_cfg, &state_val_labels(&comp.render_cfg));
+        pick_name(&names, label)
     }
 
     /// The unquoted source name of the variable a hook's result binds to.
@@ -602,14 +678,31 @@ impl<'a> EntityCtx<'a> {
         pick_name(&self.state_names, label)
     }
 
-    fn sorted_setters(&self, calls: Vec<SetterCall>) -> Vec<SetterEntity> {
+    fn sorted_setters(
+        &self,
+        calls: Vec<SetterCall>,
+        cross: &HashMap<Var, (Symbol, HookLabel)>,
+    ) -> Vec<SetterEntity> {
         let mut setters: Vec<SetterEntity> = calls
             .into_iter()
-            .map(|c| SetterEntity {
-                slot: self.setter_labels.get(&c.var).copied(),
-                var: c.var,
-                span: c.span,
-                block_id: c.block_id,
+            .map(|c| {
+                // A local binding wins: a component passing its own setter down
+                // is not a foreign write, and `cross_component_setters` already
+                // filtered self-owned entries out.
+                let (slot, owner) = match self.setter_labels.get(&c.var) {
+                    Some(&label) => (Some(label), None),
+                    None => match cross.get(&c.var) {
+                        Some((comp, label)) => (Some(*label), Some(comp.clone())),
+                        None => (None, None),
+                    },
+                };
+                SetterEntity {
+                    slot,
+                    owner,
+                    var: c.var,
+                    span: c.span,
+                    block_id: c.block_id,
+                }
             })
             .collect();
         setters.sort_by(|a, b| {

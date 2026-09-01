@@ -180,6 +180,14 @@ builds once. A whole-program relation turns out not to need a whole-program
 *schema*: the cycle is projected onto the effect of the anchored component that
 carries one of its steps, so each row is a fact about one component and the
 single-anchor property [#68](https://github.com/rboudrouss/reactant-analyzer/issues/68) is untouched.)
+**→ 18/22** (2026-09-01, [#107](https://github.com/rboudrouss/reactant-analyzer/issues/107), ADR-030: the
+render-setter enumeration gains owner-qualified rows for `ComponentSetter`-valued
+props, from the same engine resolution the native rule consumes. The widening is
+gated on the `slot_ownership` guard rather than applied to the sort, so a pack
+shipped before the rows existed keeps matching exactly what it matched — changing
+what a shipped sort enumerates changes which findings fire. The owner attribution
+is may-typed, inherited from the native rule
+([#119](https://github.com/rboudrouss/reactant-analyzer/issues/119)).)
 Run
 `cargo test --test catalogue -- --nocapture` for the full blocked-entry report. What still blocks,
 in decreasing leverage: prop, provider-value and setter-argument positions carry no expression

@@ -26,7 +26,7 @@ use super::entity::{
     ArgEntity, DepEntity, EntityCtx, EntityVal, HookRow, SetterEntity, cleanup_name, identity_name,
     updater_name,
 };
-use super::schema::{EdgeName, ElseBehavior, SeverityPin};
+use super::schema::{EdgeName, ElseBehavior, OwnershipName, SeverityPin};
 use super::validate::{
     BindRef, CountCmp, MustKind, ResolvedAnchor, ResolvedGuard, ResolvedRule, Segment,
 };
@@ -237,8 +237,8 @@ impl Rule for TierARule {
                     }
                 }
             }
-            ResolvedAnchor::RenderSetterCalls => {
-                for setter in e.render_setters() {
+            ResolvedAnchor::RenderSetterCalls { foreign } => {
+                for setter in e.render_setters(foreign) {
                     self.eval(&e, &Candidate::RenderSetter(&setter), &mut out);
                 }
             }
@@ -386,6 +386,17 @@ impl TierARule {
                     unreachable!("validated: `updater_body` binds a writers row")
                 };
                 names.contains(&e.updater_purity(&w.updater))
+            }
+            ResolvedGuard::SlotOwnership { of, names } => {
+                let EntityVal::Setter(s) = cand.entity_at(*of) else {
+                    unreachable!("validated: `slot_ownership` binds a render setter call")
+                };
+                let owned = if s.owner.is_some() {
+                    OwnershipName::Foreign
+                } else {
+                    OwnershipName::Local
+                };
+                names.contains(&owned)
             }
             ResolvedGuard::Cycle {
                 of,
