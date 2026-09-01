@@ -238,10 +238,12 @@ impl<'a> Collector<'a> {
                 if let Some(receiver) = mutation_receiver(expr) {
                     self.record_mutation(receiver, scopes, span, container);
                 }
-                match fn_.as_ref() {
-                    // Setter call: is the argument the slot's own reference?
-                    Expr::Var(name) => {
-                        if let Some(&label) = self.setter_label.get(name.as_str()) {
+                // Setter call: is the argument the slot's own reference?
+                if let Expr::Var(name) = fn_.as_ref()
+                    && let Some(&label) = self.setter_label.get(name.as_str())
+                {
+                    {
+                        {
                             match args.first() {
                                 Some(Expr::FnLit {
                                     params, body_cfg, ..
@@ -272,7 +274,6 @@ impl<'a> Collector<'a> {
                             }
                         }
                     }
-                    _ => {}
                 }
                 self.walk_expr(fn_, scopes, span, container);
                 for a in args {

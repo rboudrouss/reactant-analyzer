@@ -45,7 +45,7 @@ pub(crate) const MUTATING_METHODS: &[&str] = &[
 ///
 /// The statement form is [`Stmt::MemberWrite`], whose `obj` is its receiver;
 /// it has no expression to match, which is why it is not folded in here.
-pub(crate) fn mutation_receiver<'a>(expr: &'a Expr) -> Option<&'a Expr> {
+pub(crate) fn mutation_receiver(expr: &Expr) -> Option<&Expr> {
     let Expr::Call { fn_, args } = expr else {
         return None;
     };
@@ -141,10 +141,8 @@ impl<'a> Chase<'a> {
                 }
             }
             match &block.term {
-                Terminator::Return(e) | Terminator::Branch { cond: e, .. } => {
-                    if self.expr(e) {
-                        return true;
-                    }
+                Terminator::Return(e) | Terminator::Branch { cond: e, .. } if self.expr(e) => {
+                    return true;
                 }
                 _ => {}
             }
