@@ -2,9 +2,9 @@
 //!
 //! Two relations live on the same walk of the render body: proven context
 //! providers ([`super::providers`]) and every prop of every resolved component
-//! element ([`collect_jsx_prop_sites`], #71 step 2). They ask the same question
+//! element (`collect_jsx_prop_sites`, #71 step 2). They ask the same question
 //! of an expression — *is this a brand-new reference on every render?* — so
-//! they ask it through one function, [`site_identity`].
+//! they ask it through one function, `site_identity`.
 //!
 //! Render only, and that is a semantic choice rather than a shortcut. An
 //! element built inside a hook body is constructed when that hook runs, not
