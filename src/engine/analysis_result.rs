@@ -244,6 +244,13 @@ pub struct AnalysisResult<D: AbstractDomain> {
     /// Computed at convergence in the same slice as `slot_writers`. Empty for
     /// hand-built IR.
     pub slot_seeds: Vec<crate::engine::seeds::SlotSeed>,
+    /// The callback-registration relation (#111, ADR-034): one row per call in
+    /// an effect body that hands a callback to something outliving the effect,
+    /// carrying the registrar, its firing and timing columns, the callback as
+    /// written, and whether the effect's cleanup tears it back down. Computed
+    /// at convergence in the same slice as `slot_writers`. Empty for
+    /// hand-built IR.
+    pub registrations: Vec<crate::engine::registrations::Registration>,
     /// Number of outer fixpoint iterations before convergence.  Useful for
     /// --verbose output and for Info diagnostics about analysis depth.
     pub iterations: usize,

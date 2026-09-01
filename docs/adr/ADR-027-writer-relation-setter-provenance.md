@@ -91,6 +91,17 @@ Everything else — a `Var`-bound callback consumed elsewhere, an unknown
 callee, a shadowed global — stays ⊤. This mirrors the `returns_verdict`
 FnLit-only v1 exactly.
 
+**Amended 2026-09-02 ([ADR-034](ADR-034-registration-relation.md), #111).** The
+registration half of that scope shipped only for the reified inline-`FnLit`
+`addEventListener` shape; every other registration argument fell to ⊤,
+including a `Var`-bound listener. ADR-034 §2 implements it off the one registrar
+table — and splits it, because the scope written above is not sound as written:
+`addEventListener` earns `handler` from the DOM's no-synchronous-dispatch
+contract, but a *subscribe-shaped* registration does not (an RxJS
+`BehaviorSubject` emits to a new subscriber on the spot), so `subscribe` / `on`
+/ `addListener` stay ⊤. The `Var`-bound restriction is lifted with it: a name
+bound to a literal in the same body takes the summary too.
+
 **Post-await continuations are out of scope**: the fact is not representable
 while lowering erases `await`. The gate is recorded for the #61/#62 rule
 proposals, same shape as ADR-023 §4's truncation gate — no phase summary may

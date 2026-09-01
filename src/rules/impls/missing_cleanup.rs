@@ -1,10 +1,7 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use crate::ir::{cfg::CFG, hooks::HookEntry, types::Var};
+use crate::engine::registrations::Firing;
+use crate::ir::hooks::HookEntry;
 use crate::rules::api::query::{CleanupVerdict, cleanup_verdict};
-use crate::rules::helpers::registrations::{Firing, collect_registrations};
-use crate::rules::{Diagnostic, Rule, RuleCtx, collect_fn_bindings};
+use crate::rules::{Diagnostic, Rule, RuleCtx};
 
 /// Fires when a `useEffect` starts something that keeps running — an interval,
 /// an event listener, a subscription — and returns no teardown.
@@ -54,7 +51,6 @@ impl Rule for MissingCleanup {
 
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
         let result = ctx.comp();
-        let fn_bodies: HashMap<Var, Arc<CFG>> = collect_fn_bindings(&result.render_cfg);
         let mut diags = Vec::new();
 
         for hook in &result.hooks {
@@ -68,14 +64,14 @@ impl Rule for MissingCleanup {
                 continue;
             }
 
-            let mut regs = Vec::new();
-            collect_registrations(body_cfg, &fn_bodies, 2, None, &mut regs);
-            // Deterministic: `collect_registrations` walks blocks in id order,
-            // but two registrations in one block tie — order by position, then
-            // by name.
-            let mut repeating: Vec<_> = regs
+            // The engine's registration relation (ADR-034), never a second
+            // scan of the same bodies.
+            // Deterministic: the scan walks blocks in id order, but two
+            // registrations in one block tie — order by position, then by name.
+            let mut repeating: Vec<_> = result
+                .registrations
                 .iter()
-                .filter(|r| r.firing == Firing::Repeating)
+                .filter(|r| r.effect == *label && r.firing == Firing::Repeating)
                 .collect();
             repeating.sort_by_key(|r| {
                 (

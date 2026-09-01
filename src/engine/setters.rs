@@ -32,6 +32,35 @@ pub struct SetterCall {
     /// Block in the top-level CFG where the call was found.
     /// `None` when the call is inside a nested `FnLit` body dominance unknowable.
     pub block_id: Option<BlockId>,
+    /// Phase class of the retained site. The collapse below keeps the most
+    /// synchronous site per variable, so this is the strongest reading of
+    /// "when does this setter run" the walk found — and the reason a consumer
+    /// can now tell an effect-body write from one only a keydown reaches
+    /// (ADR-034 §4, #93). It used to be computed and thrown away.
+    pub class: SetterCallPhase,
+}
+
+/// The externally-visible half of the walk's phase classification. A subset:
+/// only the distinction consumers of the collapsed row are allowed to make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetterCallPhase {
+    /// Runs when the enclosing body runs.
+    Sync,
+    /// Runs only on an external event — a registered DOM listener, a reified
+    /// JSX handler. A user event stands between the body and this write.
+    Handler,
+    /// Anything else: deferred, in a cleanup, or unclassified (⊤).
+    Other,
+}
+
+impl From<WalkClass> for SetterCallPhase {
+    fn from(c: WalkClass) -> Self {
+        match c {
+            WalkClass::Sync => SetterCallPhase::Sync,
+            WalkClass::Handler => SetterCallPhase::Handler,
+            _ => SetterCallPhase::Other,
+        }
+    }
 }
 
 /// Collect all setter variable names called in `cfg` together with their
@@ -79,18 +108,20 @@ pub fn collect_setter_calls_with_extra(
     // `None`. The walk itself no longer collapses, so this is the one place
     // the old granularity still exists — and the only consumer that wants it.
     found.sort_by_key(|s| s.class); // WalkClass derives Ord with Sync first
-    let mut by_var: HashMap<Var, (Option<SourceRange>, Option<BlockId>)> = HashMap::new();
+    let mut by_var: HashMap<Var, (Option<SourceRange>, Option<BlockId>, WalkClass)> =
+        HashMap::new();
     for site in &found {
         by_var
             .entry(site.var.clone())
-            .or_insert((site.span, site.block_id));
+            .or_insert((site.span, site.block_id, site.class));
     }
     by_var
         .into_iter()
-        .map(|(var, (span, block_id))| SetterCall {
+        .map(|(var, (span, block_id, class))| SetterCall {
             var,
             span,
             block_id,
+            class: class.into(),
         })
         .collect()
 }
@@ -1108,21 +1139,6 @@ struct FoundSite {
     updater: Updater,
 }
 
-/// Names that defer their function argument when they resolve to the bare
-/// host global (fail-closed: any local binding of the name disables the
-/// summary — see `shadowed`).
-const DEFERRING_GLOBALS: &[&str] = &[
-    "setTimeout",
-    "setInterval",
-    "setImmediate",
-    "queueMicrotask",
-    "requestAnimationFrame",
-    "requestIdleCallback",
-];
-
-/// Method names that defer their function argument (Promise continuations).
-const DEFERRING_METHODS: &[&str] = &["then", "catch", "finally"];
-
 /// `Array.prototype` HOFs that call their function argument synchronously —
 /// the argument runs in the ENCLOSING phase.
 const SYNC_HOF_METHODS: &[&str] = &[
@@ -1142,19 +1158,33 @@ const SYNC_HOF_METHODS: &[&str] = &[
 ];
 
 impl<'a> SetterWalk<'a> {
-    /// What class a `FnLit` argument of a call to `fn_` takes, given the
-    /// current `mode`. `None` = no summary — the argument is ⊤.
+    /// What class a function argument of a call to `fn_` takes, given the
+    /// current `mode`. `WalkClass::Unknown` = no summary — the argument is ⊤.
+    ///
+    /// The registration summary ADR-027 §2 promised, read off the one registrar
+    /// table (ADR-034 §2). It is not uniform: a timer or a promise continuation
+    /// is `Deferred`, `addEventListener` is `Handler` because the DOM has no
+    /// synchronous dispatch, and `subscribe`/`on`/`addListener` stay ⊤ because
+    /// a store may emit to a new subscriber on the spot. Narrowing a row off ⊤
+    /// is the one direction that can lose a finding, so it is allowed only
+    /// where the timing is a contract rather than a name-table guess.
+    ///
+    /// A bare-global registrar is fail-closed: any local binding of the name
+    /// anywhere disables its summary (`shadowed`).
     fn arg_class(&self, fn_: &Expr, mode: WalkClass) -> WalkClass {
+        use crate::engine::registrations::Timing;
+        if let Some((reg, _)) = crate::engine::registrations::match_registrar(fn_) {
+            let shadowed = !reg.method_only
+                && matches!(fn_.peel_ts(), Expr::Var(n) if self.shadowed.contains(n.as_str()));
+            if !shadowed {
+                return match reg.timing {
+                    Timing::Deferred => WalkClass::Deferred,
+                    Timing::Handler => WalkClass::Handler,
+                    Timing::Unknown => WalkClass::Unknown,
+                };
+            }
+        }
         match fn_ {
-            Expr::Var(name)
-                if DEFERRING_GLOBALS.contains(&name.as_str())
-                    && !self.shadowed.contains(name.as_str()) =>
-            {
-                WalkClass::Deferred
-            }
-            Expr::FieldAccess { field, .. } if DEFERRING_METHODS.contains(&field.as_str()) => {
-                WalkClass::Deferred
-            }
             Expr::FieldAccess { field, .. } if SYNC_HOF_METHODS.contains(&field.as_str()) => mode,
             _ => WalkClass::Unknown,
         }
@@ -1321,6 +1351,13 @@ impl<'a> SetterWalk<'a> {
             // shape was NOT reified: classify the listener as Handler.
             let listener = expr.subscription_listener().is_some();
             let reified = listener && self.effect_body && at_root && mode == WalkClass::Sync;
+            // A teardown takes the callback back, it does not call it
+            // (ADR-034 §5). Descending it here gave every registered listener
+            // a second ⊤ row — from the very cleanup that unregisters it —
+            // and a ⊤ row satisfies `writer_phases includes <anything>`.
+            if crate::engine::registrations::is_teardown(fn_) {
+                return;
+            }
             for (i, arg) in args.iter().enumerate() {
                 if reified && i == 1 {
                     continue;

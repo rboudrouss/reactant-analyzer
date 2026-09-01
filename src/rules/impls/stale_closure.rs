@@ -14,8 +14,8 @@ use crate::{
     },
 };
 
+use crate::engine::registrations::Firing;
 use crate::rules::helpers::churn::eval_in_exit_env;
-use crate::rules::helpers::registrations::{Firing, collect_registrations};
 use crate::rules::{
     Certified, Diagnostic, EffectClass, MustResult, OnAllPaths, Rule, Severity, Step, ValueClass,
     all_setter_labels, collect_fn_bindings, collect_setter_calls_with_extra, fn_lit_binding,
@@ -196,21 +196,11 @@ impl Rule for StaleClosure {
         // Applicable when some deps-gated effect registers a long-lived
         // callback at all.
         let comp_result = result.components.get(component)?;
-        let render_fns = collect_fn_bindings(&comp_result.render_cfg);
         let applicable = comp_result.hooks.iter().any(|h| {
-            let HookEntry::Effect { body_cfg, deps, .. } = h else {
+            let HookEntry::Effect { label, deps, .. } = h else {
                 return false;
             };
-            if !deps.is_declared() {
-                return false;
-            }
-            let mut fn_bodies = collect_fn_bindings(body_cfg);
-            for (k, v) in &render_fns {
-                fn_bodies.entry(k.clone()).or_insert_with(|| Arc::clone(v));
-            }
-            let mut regs = Vec::new();
-            collect_registrations(body_cfg, &fn_bodies, 2, None, &mut regs);
-            !regs.is_empty()
+            deps.is_declared() && comp_result.registrations.iter().any(|r| r.effect == *label)
         });
         applicable.then_some(crate::rules::SafeCheck {
             rule: Self::NAME,
@@ -275,8 +265,12 @@ impl Rule for StaleClosure {
             for (k, v) in &render_fns {
                 fn_bodies.entry(k.clone()).or_insert_with(|| Arc::clone(v));
             }
-            let mut regs = Vec::new();
-            collect_registrations(body_cfg, &fn_bodies, 2, None, &mut regs);
+            // The engine's registration relation (ADR-034), not a second scan.
+            let regs: Vec<_> = comp_result
+                .registrations
+                .iter()
+                .filter(|r| r.effect == *eff_label)
+                .collect();
             if regs.is_empty() {
                 continue;
             }
@@ -290,7 +284,7 @@ impl Rule for StaleClosure {
 
             for reg in &regs {
                 let Some((via, params, cb_body)) = resolve_callback(
-                    reg.callback,
+                    &reg.callback,
                     &declared,
                     body_cfg,
                     render_cfg,

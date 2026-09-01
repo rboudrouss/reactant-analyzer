@@ -11,7 +11,6 @@ pub mod jsx;
 pub mod mount;
 pub mod providers;
 pub mod purity;
-pub mod registrations;
 /// Moved to the engine (ADR-027 §1): the slot-writer relation is computed at
 /// convergence and stored on `AnalysisResult`, so the collection/alias
 /// machinery lives below the rules layer. Re-exported here so rule-side

@@ -12,6 +12,7 @@ use crate::{
     },
 };
 
+use crate::engine::setters::SetterCallPhase;
 use crate::rules::api::query::must_effect_cycle;
 use crate::rules::helpers::churn::{
     ChurnSetterCall, Freshness, classify_effect_deps, collect_churn_calls, converges_once_written,
@@ -120,6 +121,15 @@ impl Rule for InfiniteLoop {
                 collect_setter_calls_with_extra(body_cfg, &all_setter_vars, 1, &render_fn_bindings);
 
             for call in &calls {
+                // A write only a registered event listener reaches does not
+                // close the loop: it needs a user event per iteration, which
+                // is the churn graph's own reason for excluding handlers.
+                // Before ADR-034 §4 the walk computed this class and the
+                // collapse threw it away, so `addEventListener('keydown', h)`
+                // read as an effect-body write (#93).
+                if call.class == SetterCallPhase::Handler {
+                    continue;
+                }
                 if let Some(&state_label) = local_setter_labels.get(&call.var) {
                     // ── Intra ─────────────────────────────────────────────────
                     if !comp_result.widen_trace.contains_key(&state_label) {

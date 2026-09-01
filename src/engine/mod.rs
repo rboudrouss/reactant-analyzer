@@ -7,6 +7,7 @@ pub mod fixpoint;
 pub mod function_registry;
 pub mod hook_registry;
 pub mod program_result;
+pub mod registrations;
 pub mod root_detector;
 pub mod seeds;
 pub mod setters;
@@ -24,6 +25,7 @@ pub use fixpoint::{Config, analyze_component, analyze_component_inter, analyze_p
 pub use function_registry::{FunctionKey, FunctionRegistry};
 pub use hook_registry::{HookKey, HookRegistry};
 pub use program_result::{AnalysisStats, CallSite, ComponentCallGraph, ProgramAnalysisResult};
+pub use registrations::{Firing, Pairing, Registrar, Registration, Timing};
 pub use root_detector::RootStrategy;
 pub use seeds::{SeedSync, SlotSeed};
 pub use setters::{SlotWriter, WriterPhase, WriterRegion};

@@ -84,6 +84,7 @@ pub(crate) fn analysis_result(render_cfg: CFG) -> AnalysisResult<StateValue> {
         hook_provenance: vec![],
         slot_writers: vec![],
         slot_seeds: vec![],
+        registrations: vec![],
         custom_arg_returns: HashMap::new(),
         iterations: 0,
         effect_setter_writes: StateStore::bottom(),

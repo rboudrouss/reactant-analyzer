@@ -604,6 +604,10 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             &effect_info,
         )
     };
+    // The registration relation rides the same slice (#111, ADR-034): one
+    // scan of the effect bodies, read by `stale-closure`, `missing-cleanup`
+    // and the Tier-A `registrations` anchor alike.
+    let registrations = crate::engine::registrations::collect_registrations(&render_cfg, &hooks);
     let hooks_clone = hooks.clone();
 
     AnalysisResult {
@@ -629,6 +633,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         hook_provenance,
         slot_writers,
         slot_seeds,
+        registrations,
         iterations: iteration,
         heap,
     }

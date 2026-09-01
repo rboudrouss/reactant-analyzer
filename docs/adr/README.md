@@ -35,3 +35,4 @@
 | [ADR-031](ADR-031-slot-seed-relation.md) | The `slot_seeds` relation — a fold promoted to the engine; the render half reads proven phase, not lexical region | Accepted |
 | [ADR-032](ADR-032-context-consumers-relation.md) | The `context_consumers` relation — an absence is only as good as the paths you can see (the two ancestry gates) | Accepted |
 | [ADR-033](ADR-033-binding-chase-exactness.md) | The binding chase carries an exactness bit and a per-branch cycle guard — a widened path may not support a must-claim (#120) | Accepted |
+| [ADR-034](ADR-034-registration-relation.md) | The registration relation and one registrar table — the phase summary ADR-027 §2 promised, the registration↔teardown pairing fact, and a teardown that no longer reads as an invocation (#111) | Accepted |
