@@ -78,6 +78,32 @@ pub enum UnaryOp {
 /// never collide — `...` is not a valid property name.
 pub const SPREAD_KEY_PREFIX: &str = "...";
 
+/// The suffix of `fields` a name lookup may read: everything after the last
+/// spread. Members written before one may have been overwritten by something
+/// the per-member map cannot see, so they answer nothing.
+///
+/// Shared so the two readers that resolve members by name cannot drift apart
+/// on the rule — the abstract interpreter's `obj_members` and the binding
+/// chase in [`crate::engine::seeds`].
+pub fn members_after_last_spread(fields: &[(Symbol, Expr)]) -> &[(Symbol, Expr)] {
+    let start = fields
+        .iter()
+        .rposition(|(k, _)| k.starts_with(SPREAD_KEY_PREFIX))
+        .map_or(0, |i| i + 1);
+    &fields[start..]
+}
+
+/// The expression bound to `key` in an object literal, exactly — `None` when
+/// no readable member has that name, which includes every member a spread may
+/// have overwritten.
+pub fn object_member<'e>(fields: &'e [(Symbol, Expr)], key: &str) -> Option<&'e Expr> {
+    members_after_last_spread(fields)
+        .iter()
+        .rev()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v)
+}
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     // Primitive literals

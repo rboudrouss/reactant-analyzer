@@ -173,6 +173,13 @@ pub(crate) fn collect_write_sites(
 /// Returns `var → (component, label)`.
 ///
 /// Used by cross-component rules to find props that are parent setters.
+///
+/// **Blocks are visited in `CFG::blocks` order, not `block_states` order.**
+/// The first env that resolves a var decides its row, and `block_states` is a
+/// `HashMap` — reading it directly made the answer depend on Rust's per-process
+/// hash seed whenever two blocks disagreed (#120). Program order is the one
+/// stable order available here. Which block *should* win is a separate
+/// question, filed as #119.
 pub(crate) fn collect_component_setter_vars(
     cfg: &CFG,
     block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
@@ -190,8 +197,11 @@ pub(crate) fn collect_component_setter_vars(
         }
     }
 
+    let mut var_names: Vec<Var> = var_names.into_iter().collect();
+    var_names.sort();
+
     let mut result: HashMap<Var, (Symbol, HookLabel)> = HashMap::new();
-    for env in block_states.values() {
+    for env in cfg.blocks.keys().filter_map(|b| block_states.get(b)) {
         for var in &var_names {
             if result.contains_key(var) {
                 continue;
@@ -203,10 +213,16 @@ pub(crate) fn collect_component_setter_vars(
             }
             // Loc pointing to a FnLit that captures a ComponentSetter
             // (e.g. the parent passed `() => setCount(0)` as a prop).
+            // Allocation sites and captures are hash sets/maps, and the first
+            // setter found wins — so both are walked in sorted order (#120).
             if let Some(EnvVal::Loc { ids, .. }) = env.lookup_env_val(var) {
+                let mut ids: Vec<_> = ids.iter().copied().collect();
+                ids.sort();
                 for id in ids {
                     if let Some(HeapValue::Fn { captured, .. }) = heap.get(id) {
-                        for val in captured.values() {
+                        let mut caps: Vec<_> = captured.iter().collect();
+                        caps.sort_by_key(|(k, _)| *k);
+                        for (_, val) in caps {
                             if let Some((component, label)) = val.as_setter() {
                                 result.insert(var.clone(), (component.clone(), *label));
                                 break;

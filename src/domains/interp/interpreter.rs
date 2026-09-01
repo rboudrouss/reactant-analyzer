@@ -9,7 +9,7 @@ use crate::{
     },
     ir::{
         cfg::{CFG, EdgeKind, Terminator},
-        expr::{Expr, SPREAD_KEY_PREFIX},
+        expr::Expr,
         stmt::{MemberKey, Stmt},
         types::{BlockId, Symbol},
     },
@@ -284,12 +284,8 @@ fn obj_members<T: Transfer>(
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
 ) -> HashMap<Symbol, EnvVal<StateValue>> {
-    let after_last_spread = fields
-        .iter()
-        .rposition(|(k, _)| k.starts_with(SPREAD_KEY_PREFIX))
-        .map_or(0, |i| i + 1);
     let mut out = HashMap::new();
-    for (key, value) in &fields[after_last_spread..] {
+    for (key, value) in crate::ir::expr::members_after_last_spread(fields) {
         let ids = match value {
             Expr::FnLit {
                 id,

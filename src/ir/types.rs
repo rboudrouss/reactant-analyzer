@@ -3,7 +3,10 @@ pub type HookLabel = usize;
 pub type BlockId = usize;
 pub type Var = String;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Allocation-site key. `Ord` so that a walk over a set of sites has one
+/// stable order — the first match over a `HashSet<ExprId>` used to depend on
+/// the process hash seed (#120).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ExprId(pub usize);
 
 impl ExprId {

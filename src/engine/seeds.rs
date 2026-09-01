@@ -53,10 +53,16 @@ pub struct SlotSeed {
     /// The path as written at the seed site — what a message shows, and what
     /// an env evaluation is run against. Exact.
     pub path: AccessPath,
-    /// Props-param-rooted forms of [`Self::path`], for deps-coverage matching:
-    /// `[value]`, `[props.value]` and `[props]` must all cover a seed read as
-    /// `value`. Non-empty by construction — a path that does not normalize to
-    /// the props param is not a seed and produces no row.
+    /// Props-param-rooted forms of [`Self::path`]: `[value]`, `[props.value]`
+    /// and `[props]` must all cover a seed read as `value`. Non-empty by
+    /// construction — a path that does not normalize to the props param is not
+    /// a seed and produces no row.
+    ///
+    /// A **may**-set. Where the chase could not select through a binding it
+    /// widened to every path that binding reads, so a form here is one the
+    /// seed *may* denote (ADR-033 §3). The deps-coverage test is a must-claim
+    /// and therefore runs on the exact forms only, inside the relation — this
+    /// column is for consumers that want the possibilities.
     pub normalized: Vec<AccessPath>,
     pub sync: SeedSync,
     /// An alias of this slot's setter is used somewhere other than a direct
@@ -151,8 +157,8 @@ pub(crate) fn collect_slot_seeds(
             };
             out.push(SlotSeed {
                 slot: *label,
+                normalized: seed.paths(),
                 path: seed.orig,
-                normalized: seed.normalized,
                 sync,
                 setter_escapes: escapes,
             });
@@ -168,7 +174,14 @@ pub(crate) fn collect_slot_seeds(
 /// One prop read by a `useState` initializer, before it becomes a row.
 struct SeedPath {
     orig: AccessPath,
-    normalized: Vec<AccessPath>,
+    normalized: Vec<NormPath>,
+}
+
+impl SeedPath {
+    /// Every props-rooted form, exact or widened — the may-set the row keeps.
+    fn paths(&self) -> Vec<AccessPath> {
+        self.normalized.iter().map(|n| n.path.clone()).collect()
+    }
 }
 
 /// `props.a.b` / `value` as a plain member chain, `None` for anything else.
@@ -187,21 +200,49 @@ fn as_member_chain(e: &Expr) -> Option<AccessPath> {
     }
 }
 
+/// One props-param-rooted form of a chased path, and whether the chase that
+/// produced it was **exact**.
+///
+/// The two consumers ask opposite questions of the same chase, so the bit is
+/// not optional: "does this initializer read a prop" is a may-query a widened
+/// path answers, while "does this dep cover that seed" is a must-claim a
+/// widened path cannot support — crediting one suppresses a finding on a
+/// coincidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormPath {
+    path: AccessPath,
+    exact: bool,
+}
+
 /// Rewrite `path` into props-param-rooted form(s) by chasing single-binding
 /// local chains: destructuring preambles (`let value = __p0.value`), aliases,
-/// and derived bindings (`const v = props.a ?? d` roots at `props.a`). A
-/// multi-write binding is uncertain and not chased. For a complex RHS the
-/// outer segments are dropped (wider path — safe for rootedness, and coverage
-/// against a wider path only errs toward keeping the finding).
+/// object-literal members (`__p0 = { manager: colorSchemeManager }` resolves
+/// `__p0.manager`), and derived bindings (`const v = props.a ?? d` roots at
+/// `props.a`). A multi-write binding is uncertain and not chased.
+///
+/// A complex RHS the chase cannot select through widens to every path it
+/// reads, with the outer segments dropped — those results carry
+/// `exact: false`.
+///
+/// **`seen` is cloned per branch, never shared across siblings.** It keys on
+/// the root var while the recursion is over *paths*, so two sibling paths that
+/// share a root are not a cycle; threading one set through them cut every
+/// branch after the first, and which one survived was `HashSet` iteration
+/// order (#120). Branching only happens at a RHS the chase cannot select
+/// through, and every branch still shrinks the root set it may revisit.
 fn normalize_to_prop(
     path: &AccessPath,
     param: &Var,
     bindings: &HashMap<&str, Vec<&Expr>>,
-    seen: &mut HashSet<Var>,
-) -> Vec<AccessPath> {
+    seen: &HashSet<Var>,
+) -> Vec<NormPath> {
     if path.root == *param {
-        return vec![path.clone()];
+        return vec![NormPath {
+            path: path.clone(),
+            exact: true,
+        }];
     }
+    let mut seen = seen.clone();
     if !seen.insert(path.root.clone()) {
         return vec![];
     }
@@ -211,6 +252,7 @@ fn normalize_to_prop(
     let [single] = rhss.as_slice() else {
         return vec![];
     };
+    // A member chain: splice this path's segments onto it and keep going.
     if let Some(base) = as_member_chain(single) {
         let combined = AccessPath {
             root: base.root,
@@ -220,15 +262,50 @@ fn normalize_to_prop(
                 .chain(path.segments.iter().cloned())
                 .collect(),
         };
-        return normalize_to_prop(&combined, param, bindings, seen);
+        return normalize_to_prop(&combined, param, bindings, &seen);
     }
-    let mut sub = HashSet::new();
-    collect_used_paths(single, &mut sub);
+    // An object literal the path selects a readable member of: `{ a: x }.a`
+    // *is* `x`, so the selector is consumed and the chase stays exact.
+    if let (Expr::ObjectLit { fields, .. }, Some(first)) = (single.peel_ts(), path.segments.first())
+        && let Some(member) = crate::ir::expr::object_member(fields, first)
+        && let Some(base) = as_member_chain(member)
+    {
+        let combined = AccessPath {
+            root: base.root,
+            segments: base
+                .segments
+                .into_iter()
+                .chain(path.segments[1..].iter().cloned())
+                .collect(),
+        };
+        return normalize_to_prop(&combined, param, bindings, &seen);
+    }
+    // Nothing to select through: widen to every path the RHS reads, dropping
+    // the outer segments. Inexact by construction.
+    let mut set = HashSet::new();
+    collect_used_paths(single, &mut set);
+    let mut sub: Vec<AccessPath> = set.into_iter().collect();
+    sub.sort_by_key(|p| p.to_string());
     let mut out = Vec::new();
     for p in sub {
-        out.extend(normalize_to_prop(&p, param, bindings, seen));
+        out.extend(
+            normalize_to_prop(&p, param, bindings, &seen)
+                .into_iter()
+                .map(|n| NormPath {
+                    path: n.path,
+                    exact: false,
+                }),
+        );
     }
-    out
+    dedup_norm(out)
+}
+
+/// Stable order, no duplicates — the relation's output must not depend on the
+/// order a `HashSet` happened to yield.
+fn dedup_norm(mut v: Vec<NormPath>) -> Vec<NormPath> {
+    v.sort_by_key(|n| (n.path.to_string(), !n.exact));
+    v.dedup_by(|a, b| a.path == b.path && a.exact == b.exact);
+    v
 }
 
 /// Prop paths read by a `useState` initializer, empty when it is prop-free.
@@ -238,7 +315,7 @@ fn seed_paths(init: &Expr, param: &Var, bindings: &HashMap<&str, Vec<&Expr>>) ->
     let mut seeds: Vec<SeedPath> = used
         .into_iter()
         .filter_map(|orig| {
-            let normalized = normalize_to_prop(&orig, param, bindings, &mut HashSet::new());
+            let normalized = normalize_to_prop(&orig, param, bindings, &HashSet::new());
             (!normalized.is_empty()).then_some(SeedPath { orig, normalized })
         })
         .collect();
@@ -256,16 +333,26 @@ fn deps_cover_seed(
     bindings: &HashMap<&str, Vec<&Expr>>,
 ) -> bool {
     let declared = dep_paths(deps);
+    // **Only exact normalizations may be credited, on either side.** Coverage
+    // is a must-claim that suppresses a finding; a widened path stands for a
+    // set of possibilities, and matching one of those against a widened seed
+    // path suppresses on a coincidence rather than on a proof (#120).
     let mut declared_norm: Vec<AccessPath> = Vec::new();
     for d in &declared {
-        declared_norm.extend(normalize_to_prop(d, param, bindings, &mut HashSet::new()));
+        declared_norm.extend(
+            normalize_to_prop(d, param, bindings, &HashSet::new())
+                .into_iter()
+                .filter(|n| n.exact)
+                .map(|n| n.path),
+        );
     }
     if path_covered(&seed.orig, &declared) {
         return true;
     }
     seed.normalized
         .iter()
-        .any(|n| path_covered(n, &declared_norm))
+        .filter(|n| n.exact)
+        .any(|n| path_covered(&n.path, &declared_norm))
 }
 
 /// `true` when an alias of the slot's setter is used anywhere outside a direct
@@ -341,5 +428,167 @@ impl AnalysisResult<StateValue> {
     /// The seed rows of one state slot, in relation order.
     pub fn seeds_of(&self, slot: HookLabel) -> impl Iterator<Item = &SlotSeed> {
         self.slot_seeds.iter().filter(move |s| s.slot == slot)
+    }
+}
+
+#[cfg(test)]
+mod chase_tests {
+    //! #120 — the binding chase, pinned directly. Both halves of the fix are
+    //! invisible end-to-end on most shapes, so they are gated here.
+
+    use super::*;
+    use crate::ir::expr::{BinOp, Prim};
+    use crate::ir::stmt::Stmt;
+    use crate::ir::types::ExprId;
+    use crate::test_support::single_block_cfg;
+
+    fn let_(var: &str, rhs: Expr) -> Stmt {
+        Stmt::Let {
+            var: var.to_string(),
+            rhs,
+            span: None,
+        }
+    }
+
+    fn field(obj: &str, f: &str) -> Expr {
+        Expr::FieldAccess {
+            obj: Box::new(Expr::Var(obj.to_string())),
+            field: f.to_string(),
+        }
+    }
+
+    fn path(root: &str, segs: &[&str]) -> AccessPath {
+        AccessPath {
+            root: root.to_string(),
+            segments: segs.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// `function C({ seed, other }) { const opts = { seed, other }; … }` —
+    /// the destructuring preamble plus the literal that re-packs it.
+    fn destructured_then_repacked() -> CFG {
+        single_block_cfg(vec![
+            let_("__obj", Expr::Var("__p0".to_string())),
+            let_("seed", field("__obj", "seed")),
+            let_("other", field("__obj", "other")),
+            let_(
+                "opts",
+                Expr::ObjectLit {
+                    id: ExprId(0),
+                    fields: vec![
+                        ("seed".to_string(), Expr::Var("seed".to_string())),
+                        ("other".to_string(), Expr::Var("other".to_string())),
+                    ],
+                },
+            ),
+        ])
+    }
+
+    fn chase(cfg: &CFG, p: AccessPath) -> Vec<(String, bool)> {
+        let bindings = local_bindings(cfg);
+        normalize_to_prop(&p, &"__p0".to_string(), &bindings, &HashSet::new())
+            .into_iter()
+            .map(|n| (n.path.to_string(), n.exact))
+            .collect()
+    }
+
+    #[test]
+    fn a_literal_member_resolves_to_that_member_alone() {
+        // Half 1. `{ seed, other }.seed` IS `seed` — the selector is consumed,
+        // so the chase stays exact and the sibling member is not a candidate.
+        let cfg = destructured_then_repacked();
+        assert_eq!(
+            chase(&cfg, path("opts", &["seed"])),
+            vec![("__p0.seed".to_string(), true)]
+        );
+        assert_eq!(
+            chase(&cfg, path("opts", &["other"])),
+            vec![("__p0.other".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn a_member_a_spread_may_have_overwritten_is_not_resolved() {
+        // `{ ...rest, seed }` is exact for `seed`; `{ seed, ...rest }` is not —
+        // the spread may carry its own `seed`. The chase widens instead.
+        let cfg = single_block_cfg(vec![
+            let_("__obj", Expr::Var("__p0".to_string())),
+            let_("seed", field("__obj", "seed")),
+            let_("rest", Expr::Var("__obj".to_string())),
+            let_(
+                "opts",
+                Expr::ObjectLit {
+                    id: ExprId(0),
+                    fields: vec![
+                        ("seed".to_string(), Expr::Var("seed".to_string())),
+                        (
+                            format!("{}0", crate::ir::expr::SPREAD_KEY_PREFIX),
+                            Expr::Var("rest".to_string()),
+                        ),
+                    ],
+                },
+            ),
+        ]);
+        let got = chase(&cfg, path("opts", &["seed"]));
+        assert!(
+            got.iter().all(|(_, exact)| !exact),
+            "a member behind a spread cannot be claimed exact: {got:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_branches_of_a_widened_chase_all_survive() {
+        // Half 2. `const key = seed + other` cannot be selected through, so the
+        // chase widens to both reads. Both go through the SAME `__obj` root:
+        // one shared cycle guard let the first branch consume it and killed
+        // every branch after, and which one ran first was `HashSet` order.
+        let mut cfg = destructured_then_repacked();
+        cfg.blocks.values_mut().next().unwrap().stmts.push(let_(
+            "key",
+            Expr::BinOp {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Var("seed".to_string())),
+                rhs: Box::new(Expr::Var("other".to_string())),
+            },
+        ));
+        assert_eq!(
+            chase(&cfg, path("key", &[])),
+            vec![
+                ("__p0.other".to_string(), false),
+                ("__p0.seed".to_string(), false),
+            ],
+            "both widened branches must survive, in a stable order"
+        );
+    }
+
+    #[test]
+    fn a_self_referential_binding_still_terminates() {
+        // The guard the per-branch clone must keep doing its job: `a = a.b`
+        // grows the path forever unless a repeated root stops the chase.
+        let cfg = single_block_cfg(vec![let_("a", field("a", "b"))]);
+        assert!(chase(&cfg, path("a", &[])).is_empty());
+    }
+
+    #[test]
+    fn a_plain_alias_chain_stays_exact() {
+        let cfg = single_block_cfg(vec![
+            let_("__obj", Expr::Var("__p0".to_string())),
+            let_("value", field("__obj", "value")),
+            let_("alias", Expr::Var("value".to_string())),
+        ]);
+        assert_eq!(
+            chase(&cfg, path("alias", &["deep"])),
+            vec![("__p0.value.deep".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn a_multi_write_binding_is_not_chased() {
+        let cfg = single_block_cfg(vec![
+            let_("__obj", Expr::Var("__p0".to_string())),
+            let_("v", field("__obj", "a")),
+            let_("v", Expr::Lit(Prim::Int(1))),
+        ]);
+        assert!(chase(&cfg, path("v", &[])).is_empty());
     }
 }

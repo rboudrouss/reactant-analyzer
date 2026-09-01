@@ -829,3 +829,89 @@ function Child({ value }) {
         "the render-time write is a sync path: {diags:?}"
     );
 }
+
+// ── #120: the binding chase through an object literal ─────────────────────────
+
+/// The shape that exposed the nondeterminism: a destructured props param, an
+/// object literal built from it, and a seed and a dep that select *different*
+/// members of that literal.
+///
+/// Two defects met here. The chase could not select through an `ObjectLit`, so
+/// it widened `opts.seed` to every path the literal reads — and its cycle guard
+/// keyed on the root var while the recursion was over paths, so the branches
+/// after the first died on the shared `__obj_*` root. What survived was one
+/// arbitrary member, picked by `HashSet` iteration order, on both the seed side
+/// and the dep side. When the two happened to pick the same member the dep
+/// "covered" the seed and the finding was suppressed.
+const OBJECT_LITERAL_CHASE: &str = r#"
+import { useState, useEffect } from 'react';
+function C({ seed, other }) {
+  const opts = { seed, other };
+  const [v, setV] = useState(opts.seed);
+  useEffect(() => { setV(opts.other); }, [opts.other]);
+  return <div>{v}</div>;
+}
+"#;
+
+#[test]
+fn a_dep_on_a_sibling_member_does_not_cover_the_seed() {
+    // `[opts.other]` re-runs when `other` moves, which says nothing about
+    // `seed`. Resolving both through the literal is what keeps them apart.
+    let diags = diags_for(OBJECT_LITERAL_CHASE, "C");
+    assert_eq!(
+        diags.len(),
+        1,
+        "a dep on a sibling member is not a sync: {diags:?}"
+    );
+    assert!(
+        diags[0].message.contains("`opts.seed`"),
+        "{}",
+        diags[0].message
+    );
+}
+
+#[test]
+fn repeated_analyses_of_an_object_literal_chase_agree() {
+    // The determinism gate `runs_are_deterministic` misses this path: it runs
+    // one flat component with no binding chase at all. Rust seeds each
+    // `HashMap`/`HashSet` differently, so a set-order dependence shows up
+    // between two analyses in ONE process — no need for fresh processes.
+    let render = |ds: &[reactant::rules::Diagnostic]| {
+        ds.iter()
+            .map(|d| format!("{}|{:?}|{}", d.rule, d.severity(), d.message))
+            .collect::<Vec<_>>()
+    };
+    let first = render(&diags_for(OBJECT_LITERAL_CHASE, "C"));
+    for i in 1..24 {
+        assert_eq!(
+            render(&diags_for(OBJECT_LITERAL_CHASE, "C")),
+            first,
+            "analysis {i} disagreed with the first"
+        );
+    }
+}
+
+#[test]
+fn a_dep_naming_the_same_prop_through_the_literal_still_syncs() {
+    // The other direction, and the reason resolving the member matters: the
+    // dep `[seed]` and the seed `opts.seed` are written differently and denote
+    // the same prop. Only selecting through the literal pairs them, and a
+    // chase that widened instead cannot claim the coverage — so this would
+    // fire on a component that does re-sync.
+    let diags = diags_for(
+        r#"
+import { useState, useEffect } from 'react';
+function C({ seed, other }) {
+  const opts = { seed, other };
+  const [v, setV] = useState(opts.seed);
+  useEffect(() => { setV(seed); }, [seed]);
+  return <div>{v}{other}</div>;
+}
+"#,
+        "C",
+    );
+    assert!(
+        diags.is_empty(),
+        "the effect re-runs when the seed prop moves: {diags:?}"
+    );
+}

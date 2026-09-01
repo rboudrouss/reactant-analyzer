@@ -30,3 +30,8 @@
 | [ADR-026](ADR-026-nextjs-projects.md) | Next.js projects — module directives + import graph in the IR, the `"use client"` server graph, Server Components analysed rather than skipped | Implemented |
 | [ADR-027](ADR-027-writer-relation-setter-provenance.md) | Slot-writer relation (region + may-phase), callee phase summaries, setter provenance, `must_direct_write`, catalogue re-based to 22 | Accepted |
 | [ADR-028](ADR-028-writers-per-site-updater-same-tick.md) | `writers` per-site rows (reversing the documented collapse), one shared updater column with two derived verdicts, the same-tick pair fact as a per-row boolean | Accepted |
+| [ADR-029](ADR-029-churn-cycles-anchor.md) | `churn_cycles` anchor over the program churn graph — a whole-program relation projected onto the anchored component | Accepted |
+| [ADR-030](ADR-030-owner-qualified-setter-rows.md) | Owner-qualified render-setter rows — a foreign row's label is resolved in the owner's component, never the reader's | Accepted |
+| [ADR-031](ADR-031-slot-seed-relation.md) | The `slot_seeds` relation — a fold promoted to the engine; the render half reads proven phase, not lexical region | Accepted |
+| [ADR-032](ADR-032-context-consumers-relation.md) | The `context_consumers` relation — an absence is only as good as the paths you can see (the two ancestry gates) | Accepted |
+| [ADR-033](ADR-033-binding-chase-exactness.md) | The binding chase carries an exactness bit and a per-branch cycle guard — a widened path may not support a must-claim (#120) | Accepted |

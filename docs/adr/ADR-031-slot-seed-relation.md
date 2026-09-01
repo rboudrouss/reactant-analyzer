@@ -51,9 +51,11 @@ and suppressing on ⊤ is the false negative this project does not trade.
 
 This was not reasoned out in advance. The first migration used `region`, and a
 before/after run over the fourteen corpora showed mantine losing one Warning —
-`use-provider-color-scheme`, a real freeze. The fix is one predicate; the
-regression test is pinned on the shape that reproduces it, and verified to fail
-without the fix.
+`use-provider-color-scheme`, a real freeze. That observation was made under the
+run-to-run flap of #120 and is not evidence any more; the decision does not rest
+on it. Suppressing on ⊤ is a false negative whatever the corpus does, the fix is
+one predicate, and the regression test is pinned on the shape that reproduces it
+and verified to fail without the fix.
 
 ### 4. Escape is a column, not a sync verdict
 
@@ -69,8 +71,10 @@ stayed home. `setter_escapes` is therefore its own boolean on the row.
 keeps everything the relation deliberately does not carry: the moving-feeder
 proof (`classify_motion` / `must_frozen_seed`), the Info strata (seed-once
 naming, a slot never written at all), and the #95 mount-coupling downgrade.
-Its output is unchanged — checked twice, by the full suite and by a
-before/after run over every corpus.
+Its output is *almost* unchanged: the suite passes and twelve of the fourteen
+corpora match, while mantine and twenty each lose one finding — one a false
+positive the relation was built to remove, one a true positive it should not
+have. See the corrected note under "Soundness arguments" below.
 
 `must_frozen_seed` is **not** exposed to Tier A. It certifies a motion proof
 this relation does not carry, and no shipped `must_*` guard binds a seed row,
@@ -95,14 +99,40 @@ and now has one home, beside the two binding *certificates* that strengthen it.
 - **Row multiplication is monotone.** A slot with three seeding props has three
   rows; the native rule folds them existentially exactly as it folded the
   in-place vector, so nothing that matched stops matching.
-- **The native output matched on all fourteen corpora**, verified by building
-  the pre-migration commit in a worktree and diffing the findings — but that was
-  ONE run per side, and the analyzer turned out not to be run-to-run
-  deterministic (#120: a true-positive `frozen-initial-state` finding on mantine
-  appears in roughly one run in six). The §3 defect and its fix stand on their
-  own regression test, which fails without the fix; the corpus comparison is
-  weaker evidence than this ADR first claimed, and #120 carries the obligation
-  to re-run it once the nondeterminism is fixed.
+- **CORRECTED: the native output did NOT match on all fourteen corpora.** The
+  original claim rested on one run per side, and the analyzer was not run-to-run
+  deterministic (#120), so the measure varied underneath the comparison. Re-run
+  properly — the flap lived in a chase this migration *moved unchanged*, so the
+  same three-line ordering patch on each side makes one run per side valid —
+  **twelve corpora are identical and two lose exactly one `frozen-initial-state`
+  finding each.** Both losses come from §2, and they land on opposite sides of
+  the ledger.
+
+  **twenty (1056 → 1055) is the design working.** `ProductHeroCursor` seeds
+  `coordinate` from the prop `home` and re-syncs it from an effect that declares
+  `home` — but through `moveTo(home)`, a `useCallback`. The scan this replaced
+  looked for a **direct** setter call in the effect body and found none, so it
+  reported a slot that is in fact re-synced. The writer relation resolves the
+  callback, the effect row appears, the deps cover the seed: one false positive
+  gone, and the reason the effect half had to stop scanning for itself.
+
+  **mantine (3165 → 3164) is a true positive lost**, by the same mechanism
+  turning up a second defect.
+  `useEffect(() => manager.subscribe(setColorScheme), …)` has no direct setter
+  call either, so it too gained an effect row — but here the deps-coverage test
+  that then ran hit the chase defect of
+  [ADR-033](ADR-033-binding-chase-exactness.md), which resolved both of its
+  sides to the same wrong prop. Suppression on a coincidence.
+
+  ADR-033 restores the mantine finding and leaves the twenty suppression in
+  place. But the row that made the mantine one reachable is a **may**-write —
+  `manager.subscribe` need not ever call what it was handed — and §2 lets a
+  may-write suppress once its deps cover the seed. That is the same
+  may-used-as-must hazard §3 names for the render half, unnoticed here for the
+  effect half. Filed as
+  [#121](https://github.com/rboudrouss/reactant-analyzer/issues/121) rather than
+  fixed in passing — it needs its own soundness argument, and every fix for it
+  only adds findings.
 
 ## Consequences
 
