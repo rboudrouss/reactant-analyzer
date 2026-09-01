@@ -2,7 +2,11 @@ use crate::rules::RuleCtx;
 use crate::{
     domains::{AbstractEnv, MemoStore, StateStore, StateValueTransfer, impls::StateValue},
     engine::HookKind,
-    ir::{expr::Expr, hooks::HookEntry, types::Symbol},
+    ir::{
+        expr::Expr,
+        hooks::{DepsList, HookEntry},
+        types::Symbol,
+    },
 };
 
 use crate::rules::{Diagnostic, Rule};
@@ -62,26 +66,20 @@ impl Rule for AlwaysUnstableDeps {
         let transfer = StateValueTransfer;
 
         for hook in &result.hooks {
-            let (label, deps_ref, kind, span) = match hook {
+            let (label, deps, kind, span) = match hook {
                 HookEntry::Effect {
-                    label,
-                    deps: Some(deps),
-                    span,
-                    ..
-                } => (*label, deps.as_slice(), HookKind::Effect, *span),
+                    label, deps, span, ..
+                } => (*label, deps, HookKind::Effect, *span),
                 HookEntry::Memo {
-                    label,
-                    deps: Some(deps),
-                    span,
-                    ..
-                } => (*label, deps.as_slice(), HookKind::Memo, *span),
+                    label, deps, span, ..
+                } => (*label, deps, HookKind::Memo, *span),
                 HookEntry::Callback {
-                    label,
-                    deps: Some(deps),
-                    span,
-                    ..
-                } => (*label, deps.as_slice(), HookKind::Callback, *span),
+                    label, deps, span, ..
+                } => (*label, deps, HookKind::Callback, *span),
                 _ => continue,
+            };
+            let Some(deps_ref) = deps.list().map(DepsList::as_slice) else {
+                continue;
             };
 
             if deps_ref.is_empty() {
@@ -178,7 +176,7 @@ fn fmt_indices(idx: &[usize]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::hooks::DepsList;
+    use crate::ir::hooks::{Arity, DepsArg, DepsList};
     use crate::{
         domains::StateValueTransfer,
         engine::{Config, ProgramAnalysisResult, analyze_component},
@@ -236,7 +234,7 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 0,
             body_cfg: empty_cfg(),
-            deps: Some(DepsList::exact(vec![Expr::ObjectLit {
+            deps: DepsArg::List(DepsList::exact(vec![Expr::ObjectLit {
                 id: ExprId(0),
                 fields: vec![],
             }])),
@@ -256,7 +254,7 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 0,
             body_cfg: empty_cfg(),
-            deps: Some(DepsList::exact(vec![Expr::FnLit {
+            deps: DepsArg::List(DepsList::exact(vec![Expr::FnLit {
                 id: ExprId(0),
                 params: vec![],
                 body_cfg: Arc::new(empty_cfg()),
@@ -275,7 +273,7 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 0,
             body_cfg: empty_cfg(),
-            deps: Some(DepsList::exact(vec![Expr::Lit(Prim::Int(42))])),
+            deps: DepsArg::List(DepsList::exact(vec![Expr::Lit(Prim::Int(42))])),
             span: None,
         }];
         let comp = component(hooks, vec![]);
@@ -293,7 +291,7 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 0,
             body_cfg: empty_cfg(),
-            deps: Some(DepsList::exact(vec![])),
+            deps: DepsArg::List(DepsList::exact(vec![])),
             span: None,
         }];
         let comp = component(hooks, vec![]);
@@ -311,7 +309,7 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 0,
             body_cfg: empty_cfg(),
-            deps: None,
+            deps: DepsArg::Absent,
             span: None,
         }];
         let comp = component(hooks, vec![]);
@@ -330,7 +328,7 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 0,
             body_cfg: empty_cfg(),
-            deps: Some(DepsList::exact(vec![
+            deps: DepsArg::List(DepsList::exact(vec![
                 Expr::ObjectLit {
                     id: ExprId(0),
                     fields: vec![],
@@ -356,7 +354,7 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 0,
             body_cfg: empty_cfg(),
-            deps: Some(DepsList::exact(vec![
+            deps: DepsArg::List(DepsList::exact(vec![
                 Expr::Lit(Prim::Int(42)),
                 Expr::Lit(Prim::Bool(true)),
             ])),
@@ -376,7 +374,7 @@ mod tests {
         let hooks = vec![HookEntry::Memo {
             label: 0,
             body_cfg: empty_cfg(),
-            deps: Some(DepsList::exact(vec![Expr::ObjectLit {
+            deps: DepsArg::List(DepsList::exact(vec![Expr::ObjectLit {
                 id: ExprId(0),
                 fields: vec![],
             }])),
@@ -451,10 +449,11 @@ mod tests {
             label: 0,
             body_cfg: empty_cfg(),
             params: vec![],
-            deps: Some(DepsList::exact(vec![Expr::ArrayLit {
+            deps: DepsArg::List(DepsList::exact(vec![Expr::ArrayLit {
                 id: ExprId(0),
                 elems: vec![],
-                exact: true,
+                arity: Arity::Exact(0),
+                spread_at: vec![],
             }])),
             span: None,
         }];

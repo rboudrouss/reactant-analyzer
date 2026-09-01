@@ -388,12 +388,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     HookEntry::Memo { label, deps, .. }
                     | HookEntry::Callback { label, deps, .. } => Some((
                         *label,
-                        transfer.recompute_memo(
-                            &comp_name,
-                            deps.as_ref(),
-                            &env_exit,
-                            &mut memo_ctx,
-                        ),
+                        transfer.recompute_memo(&comp_name, deps, &env_exit, &mut memo_ctx),
                     )),
                     _ => None,
                 })
@@ -1592,7 +1587,7 @@ fn strip_ts_annot(expr: &Expr) -> &Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::hooks::DepsList;
+    use crate::ir::hooks::{DepsArg, DepsList};
     use crate::{
         domains::{Interval, Stability, StateValue, StateValueTransfer},
         ir::{
@@ -1720,7 +1715,7 @@ mod tests {
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
-                deps: Some(DepsList::exact(vec![])),
+                deps: DepsArg::List(DepsList::exact(vec![])),
                 span: None,
             },
         ];
@@ -1782,7 +1777,7 @@ mod tests {
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
-                deps: Some(DepsList::exact(vec![])),
+                deps: DepsArg::List(DepsList::exact(vec![])),
                 span: None,
             },
         ];
@@ -1827,7 +1822,7 @@ mod tests {
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
-                deps: Some(DepsList::exact(vec![])),
+                deps: DepsArg::List(DepsList::exact(vec![])),
                 span: None,
             },
         ];
@@ -1846,7 +1841,7 @@ mod tests {
         let hooks = vec![HookEntry::Memo {
             label: 0,
             body_cfg: trivial_cfg(),
-            deps: Some(DepsList::exact(vec![Expr::Var("x".to_string())])),
+            deps: DepsArg::List(DepsList::exact(vec![Expr::Var("x".to_string())])),
             span: None,
         }];
         let render_stmts = vec![
@@ -1884,7 +1879,7 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 0,
             body_cfg: eff_cfg,
-            deps: Some(DepsList::exact(vec![])),
+            deps: DepsArg::List(DepsList::exact(vec![])),
             span: None,
         }];
         let comp = component(hooks, vec![]);
@@ -1983,7 +1978,7 @@ mod tests {
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
-                deps: Some(DepsList::exact(vec![Expr::StateVal(0)])),
+                deps: DepsArg::List(DepsList::exact(vec![Expr::StateVal(0)])),
                 span: None,
             },
         ];
@@ -2452,7 +2447,7 @@ mod tests {
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
-                deps: Some(DepsList::exact(vec![Expr::StateVal(0)])),
+                deps: DepsArg::List(DepsList::exact(vec![Expr::StateVal(0)])),
                 span: None,
             },
             HookEntry::Handler {
@@ -2590,7 +2585,7 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 0,
             body_cfg: eff_cfg,
-            deps: Some(DepsList::exact(vec![])),
+            deps: DepsArg::List(DepsList::exact(vec![])),
             span: None,
         }];
         let comp = component(hooks, vec![]);

@@ -7,7 +7,7 @@ use crate::{
     ir::{
         SourceRange,
         cfg::CFG,
-        hooks::HookEntry,
+        hooks::{Arity, HookEntry},
         types::{BlockId, HookLabel, Symbol, Var},
     },
 };
@@ -95,9 +95,9 @@ impl Rule for InfiniteLoop {
                 continue;
             };
 
-            // Mount-only: fires once, no loop. Only a list known empty says
-            // so — an elision-only array also lowers to zero elements.
-            if matches!(deps, Some(d) if d.is_empty() && d.exact) {
+            // Mount-only: fires once, no loop. Only an array the engine knows
+            // is empty says so.
+            if matches!(deps.list(), Some(d) if d.arity == Arity::Exact(0)) {
                 continue;
             }
             // A deps array gates the effect for good only when EVERY dep is
@@ -105,8 +105,10 @@ impl Rule for InfiniteLoop {
             // semantics). One stable dep among moving ones gates nothing, and
             // a ⊤/`Versioned` dep is never provably stable (ADR-021 §5: the
             // shipped ⊤ FN, plus its all-vs-any quantifier sibling).
-            if let Some(dep_exprs) = deps
-                && dep_exprs.exact
+            if let Some(dep_exprs) = deps.list()
+                // A ∀ that suppresses must range over the whole list: a
+                // flattened spread hides elements that may well move.
+                && dep_exprs.arity.exact().is_some()
                 && all_deps_provably_stable(dep_exprs.as_slice(), comp_result)
             {
                 continue;
@@ -126,7 +128,7 @@ impl Rule for InfiniteLoop {
                         continue; // write bounded → narrowing held the growth
                     }
 
-                    let deps_note = if deps.is_some() {
+                    let deps_note = if deps.is_declared() {
                         " (its deps do not provably gate it — the effect can re-run every render)"
                     } else {
                         ""
@@ -193,7 +195,7 @@ impl Rule for InfiniteLoop {
                         continue; // write is bounded → no divergence
                     }
 
-                    let deps_note = if deps.is_some() {
+                    let deps_note = if deps.is_declared() {
                         " (its deps do not provably gate it — the effect can re-run every render)"
                     } else {
                         ""
@@ -420,13 +422,16 @@ fn check_object_churn(
         let HookEntry::Effect {
             label: eff_label,
             body_cfg,
-            deps: Some(dep_exprs),
+            deps,
             ..
         } = hook
         else {
             continue;
         };
-        if dep_exprs.is_empty() && dep_exprs.exact {
+        let Some(dep_exprs) = deps.list() else {
+            continue;
+        };
+        if dep_exprs.arity == Arity::Exact(0) {
             continue; // mount-only
         }
 
@@ -595,7 +600,7 @@ fn check_object_churn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::hooks::DepsList;
+    use crate::ir::hooks::{DepsArg, DepsList};
     use crate::{
         domains::{StateValue, StateValueTransfer},
         engine::{AnalysisResult, Config, ProgramAnalysisResult, analyze_component},
@@ -661,7 +666,7 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 1,
             body_cfg: eff_cfg,
-            deps: None,
+            deps: DepsArg::Absent,
             span: None,
         }];
         let render_stmts = vec![Stmt::Let {
@@ -699,7 +704,7 @@ mod tests {
             vec![HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
-                deps: None,
+                deps: DepsArg::Absent,
                 span: None,
             }],
             vec![Stmt::Let {
@@ -735,7 +740,7 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 1,
             body_cfg: eff_cfg,
-            deps: None,
+            deps: DepsArg::Absent,
             span: None,
         }];
         let render_stmts = vec![Stmt::Let {
@@ -767,7 +772,7 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 1,
             body_cfg: eff_cfg,
-            deps: Some(DepsList::exact(vec![])),
+            deps: DepsArg::List(DepsList::exact(vec![])),
             span: None,
         }];
         let render_stmts = vec![Stmt::Let {
@@ -800,7 +805,7 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 1,
             body_cfg: eff_cfg,
-            deps: None,
+            deps: DepsArg::Absent,
             span: None,
         }];
         let render_stmts = vec![Stmt::Let {
@@ -845,7 +850,7 @@ mod tests {
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
-                deps: None,
+                deps: DepsArg::Absent,
                 span: None,
             },
         ];
@@ -911,7 +916,7 @@ mod tests {
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
-                deps: Some(DepsList::exact(vec![Expr::StateVal(0)])),
+                deps: DepsArg::List(DepsList::exact(vec![Expr::StateVal(0)])),
                 span: None,
             },
         ];
@@ -995,7 +1000,7 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 1,
             body_cfg: eff_cfg,
-            deps: None,
+            deps: DepsArg::Absent,
             span: None,
         }];
         let render_stmts = vec![Stmt::Let {
@@ -1017,7 +1022,7 @@ mod tests {
     fn component_with_effect_call(
         setter_name: &str,
         call_expr: Expr,
-        deps: Option<DepsList>,
+        deps: DepsArg,
     ) -> ComponentIR {
         let eff_cfg = crate::test_support::single_block_cfg(vec![
             Stmt::Let {
@@ -1098,7 +1103,7 @@ mod tests {
         let comp = component_with_effect_call(
             "setN",
             call,
-            Some(DepsList::exact(vec![Expr::StateVal(0)])),
+            DepsArg::List(DepsList::exact(vec![Expr::StateVal(0)])),
         );
         let result = analyze_component(
             comp,
@@ -1133,7 +1138,7 @@ mod tests {
                 incrementing_setter_cb("setN"),
             ],
         };
-        let comp = component_with_effect_call("setN", call, None);
+        let comp = component_with_effect_call("setN", call, DepsArg::Absent);
         let result = analyze_component(
             comp,
             &StateValueTransfer,
@@ -1161,7 +1166,7 @@ mod tests {
             fn_: Box::new(Expr::Var("myHelper".to_string())),
             args: vec![incrementing_setter_cb("setN")],
         };
-        let comp = component_with_effect_call("setN", call, None);
+        let comp = component_with_effect_call("setN", call, DepsArg::Absent);
         let result = analyze_component(
             comp,
             &StateValueTransfer,
@@ -1220,7 +1225,7 @@ mod tests {
             }),
             args: vec![cb],
         };
-        let comp = component_with_effect_call("setN", call, None);
+        let comp = component_with_effect_call("setN", call, DepsArg::Absent);
         let result = analyze_component(
             comp,
             &StateValueTransfer,
@@ -1328,7 +1333,7 @@ mod tests {
         let comp = component_with_effect_call(
             "setN",
             call,
-            Some(DepsList::exact(vec![Expr::StateVal(0)])),
+            DepsArg::List(DepsList::exact(vec![Expr::StateVal(0)])),
         );
         let result = analyze_component(
             comp,
@@ -1354,7 +1359,7 @@ mod tests {
     fn component_with_effect_stmts(
         setter_name: &str,
         stmts: Vec<Stmt>,
-        deps: Option<DepsList>,
+        deps: DepsArg,
     ) -> ComponentIR {
         let mut eff_blocks = std::collections::BTreeMap::new();
         let mut all_stmts = vec![Stmt::Let {
@@ -1451,7 +1456,7 @@ mod tests {
         let comp = component_with_effect_stmts(
             "setN",
             stmts,
-            Some(DepsList::exact(vec![Expr::StateVal(0)])),
+            DepsArg::List(DepsList::exact(vec![Expr::StateVal(0)])),
         );
         let result = analyze_component(
             comp,
@@ -1517,7 +1522,7 @@ mod tests {
         let comp = component_with_effect_stmts(
             "setN",
             stmts,
-            Some(DepsList::exact(vec![Expr::StateVal(0)])),
+            DepsArg::List(DepsList::exact(vec![Expr::StateVal(0)])),
         );
         let result = analyze_component(
             comp,
@@ -1595,7 +1600,7 @@ mod tests {
         let comp = component_with_effect_stmts(
             "setN",
             stmts,
-            Some(DepsList::exact(vec![Expr::StateVal(0)])),
+            DepsArg::List(DepsList::exact(vec![Expr::StateVal(0)])),
         );
         let result = analyze_component(
             comp,
@@ -1633,7 +1638,7 @@ mod tests {
             HookEntry::Effect {
                 label: 1,
                 body_cfg: setter_cfg("setN"),
-                deps: None,
+                deps: DepsArg::Absent,
                 span: None,
             },
             HookEntry::Handler {
@@ -1685,7 +1690,7 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 1,
             body_cfg: setter_cfg("setN"),
-            deps: None,
+            deps: DepsArg::Absent,
             span: None,
         }];
         let render_stmts = vec![

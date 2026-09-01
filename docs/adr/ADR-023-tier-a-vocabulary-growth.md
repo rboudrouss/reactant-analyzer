@@ -166,11 +166,14 @@ about one fact is worse than either reading. What ships:
 - **`every` folds its body over the elements.** ⊤-handling belongs to the body.
 - **Positive-only**: the validator rejects a negated form, the same posture as
   `writer_phases` (ADR-027 §1).
-- **An inexact or absent list fails the guard.** ∀ over a domain the engine
-  cannot enumerate is the vacuity hazard named above; the guard refuses rather
-  than answering from the elements it happens to have. This is the shipped
-  absent-⇒-fail discipline of the field guards, and it is the same rule the
-  `count` guard now follows for the same reason.
+- **A written array supplies a domain; an absent or unreadable argument does
+  not.** The fold ranges over the elements the engine can see, and one visible
+  violator refutes ∀ outright — a flattened `[...rows]` is quantified over its
+  source, which stands for what it holds. What the guard refuses is the case
+  with no observable element at all, where the vacuity hazard named above is
+  real: a claim about nothing is not a claim the engine may make. Refusing
+  every *truncated* list, as a first cut of this did, deleted findings instead
+  — the one direction the project does not trade.
 - **No Error authority.** `every` never touches the `proofs` vector, and a rule
   using it may not carry a `must_*` guard at all — a fold over may-classified
   elements cannot certify the row it selected. Severity being `pin ⊓ polarity`,

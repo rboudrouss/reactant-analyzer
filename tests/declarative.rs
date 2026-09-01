@@ -1978,29 +1978,89 @@ fn count_refuses_a_deps_list_whose_arity_the_ir_does_not_know() {
     );
     assert_eq!(exact.len(), 1, "a written `[a]` has arity 1: {exact:?}");
 
-    for deps_arg in ["[...rest]", "[a, ,]", "rest"] {
+    // An elision is still countable — `[a, ,]` declares two entries, so
+    // `equals 1` is refuted, not refused.
+    for (deps_arg, why) in [
+        (
+            "[a, ,]",
+            "an elision keeps the count exact, and two is not one",
+        ),
+        ("[a, b, ...rest]", "the lower bound already exceeds one"),
+        ("rest", "no written array at all"),
+    ] {
         let src = format!(
             r#"
-            function C({{ a, rest }}) {{
-                useEffect(() => {{ console.log(a, rest); }}, {deps_arg});
+            function C({{ a, b, rest }}) {{
+                useEffect(() => {{ console.log(a, b, rest); }}, {deps_arg});
                 return <div/>;
             }}
             "#
         );
         let got = run_pack(PACK, &src, &Options::new());
-        assert!(
-            got.is_empty(),
-            "`{deps_arg}` has no knowable arity, so `count` must refuse: {got:?}"
+        assert!(got.is_empty(), "`{deps_arg}`: {why}: {got:?}");
+    }
+
+    // …but an open-ended list that the bound does NOT refute must still pass.
+    // Refusing it deleted findings: `[a, …, g, ...rest]` provably exceeds any
+    // budget its visible elements already exceed.
+    let open = run_pack(
+        PACK,
+        r#"
+        function C({ a, rest }) {
+            useEffect(() => { console.log(a, rest); }, [a, ...rest]);
+            return <div/>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(
+        open.len(),
+        1,
+        "`[a, ...rest]` may hold exactly one dependency: {open:?}"
+    );
+}
+
+#[test]
+fn count_answers_what_a_lower_bound_can_still_prove() {
+    // The regression this pins: `guardrails/oversized-effect` went silent on
+    // every deps array containing a spread, because the guard refused instead
+    // of reading the bound the engine had all along.
+    const PACK: &str = r#"{"schemaVersion":1,"name":"t","rules":[
+        {"id":"too-many","docs":{"description":"d","why":"w","fix":"f"},
+         "severity":"warning",
+         "anchor":{"relation":"hook_calls","kind":"effect"},
+         "guards":[{"kind":"count","of":"anchor.deps","more_than":5}],
+         "message":"too many deps"}]}"#;
+
+    for (deps_arg, why) in [
+        (
+            "[a, b, c, d, e, f, g, ...rest]",
+            "seven visible already exceed five",
+        ),
+        (
+            "[a, , b, , c, , d, , e, , f]",
+            "eleven written entries exceed five",
+        ),
+    ] {
+        let src = format!(
+            r#"
+            function C({{ a, b, c, d, e, f, g, rest }}) {{
+                useEffect(() => {{ log(a, b, c, d, e, f, g, rest); }}, {deps_arg});
+                return <div/>;
+            }}
+            "#
         );
+        let got = run_pack(PACK, &src, &Options::new());
+        assert_eq!(got.len(), 1, "`{deps_arg}`: {why}: {got:?}");
     }
 }
 
 #[test]
-fn deps_declared_is_false_for_a_deps_argument_the_ir_cannot_read() {
-    // The shipped misreading: an unreadable deps argument was truncated to `[]`
-    // and then reported as an empty array that is definitely present, so
-    // `deps_declared: false` could never match one. A written `[]` still does
-    // declare a deps array — that half must not move.
+fn deps_declared_asks_whether_an_argument_was_passed_at_all() {
+    // The guard backs "this effect declares no dependency array — it re-runs
+    // after every render". Only an absent argument makes that true: one the
+    // engine cannot read still gates the hook, and a written `[]` obviously
+    // declares one.
     const PACK: &str = r#"{"schemaVersion":1,"name":"t","rules":[
         {"id":"no-deps","docs":{"description":"d","why":"w","fix":"f"},
          "severity":"warning",
@@ -2008,33 +2068,37 @@ fn deps_declared_is_false_for_a_deps_argument_the_ir_cannot_read() {
          "guards":[{"kind":"deps_declared","of":"anchor","eq":false}],
          "message":"no deps array"}]}"#;
 
-    let unreadable = run_pack(
+    let absent = run_pack(
         PACK,
         r#"
         function C({ rest }) {
-            useEffect(() => { console.log(rest); }, rest);
+            useEffect(() => { console.log(rest); });
             return <div/>;
         }
         "#,
         &Options::new(),
     );
-    assert_eq!(
-        unreadable.len(),
-        1,
-        "a deps argument the IR cannot read declares no deps array: {unreadable:?}"
-    );
+    assert_eq!(absent.len(), 1, "no argument at all: {absent:?}");
 
-    let written = run_pack(
-        PACK,
-        r#"
-        function C() {
-            useEffect(() => { console.log(1); }, []);
-            return <div/>;
-        }
-        "#,
-        &Options::new(),
-    );
-    assert!(written.is_empty(), "`[]` does declare deps: {written:?}");
+    for (deps_arg, why) in [
+        ("rest", "an unreadable argument still gates the effect"),
+        ("[]", "a written empty array declares deps"),
+        (
+            "[rest] as const",
+            "a TS-annotated literal is still a literal",
+        ),
+    ] {
+        let src = format!(
+            r#"
+            function C({{ rest }}) {{
+                useEffect(() => {{ console.log(rest); }}, {deps_arg});
+                return <div/>;
+            }}
+            "#
+        );
+        let got = run_pack(PACK, &src, &Options::new());
+        assert!(got.is_empty(), "`{deps_arg}`: {why}: {got:?}");
+    }
 }
 
 // ── `every`: may-typed ∀ over the deps edge (ADR-023 §4's amendment) ──────────
@@ -2131,11 +2195,21 @@ fn whether_top_satisfies_is_the_bodys_decision() {
 }
 
 #[test]
-fn every_refuses_a_deps_list_it_cannot_enumerate() {
-    // ∀ over a domain the engine cannot enumerate is the vacuity hazard §4
-    // names. Both an inexact list and an absent one fail the guard (#104's
-    // `exact` bit is what makes the distinction visible at all).
-    for deps_arg in ["[...rest]", "[ref, ,]", "rest"] {
+fn every_needs_a_written_array_but_folds_over_what_it_can_see() {
+    // ∀ over a domain with no observable element is the vacuity hazard §4
+    // names — an absent or unreadable argument supplies none, so the guard
+    // refuses. A written array supplies elements even when a spread hides part
+    // of it, and one visible violator refutes ∀ outright.
+    for (deps_arg, why) in [
+        (
+            "rest",
+            "an unreadable argument yields no element to quantify over",
+        ),
+        (
+            "[...rest]",
+            "the spread's source is a ⊤ prop, which is not stable",
+        ),
+    ] {
         let src = format!(
             r#"
             function C({{ rest }}) {{
@@ -2146,11 +2220,24 @@ fn every_refuses_a_deps_list_it_cannot_enumerate() {
             "#
         );
         let got = run_pack(EVERY_PACK, &src, &Options::new());
-        assert!(
-            got.is_empty(),
-            "`{deps_arg}` is not a list the engine can quantify over: {got:?}"
-        );
+        assert!(got.is_empty(), "`{deps_arg}`: {why}: {got:?}");
     }
+
+    // An elision hides an entry whose value is `undefined` — stable — so the
+    // quantifier holds over what was written, and refusing it would have been
+    // a finding thrown away.
+    let elided = run_pack(
+        EVERY_PACK,
+        r#"
+        function C() {
+            const ref = useRef(null);
+            useEffect(() => { sync(ref.current); }, [ref, ,]);
+            return <div/>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(elided.len(), 1, "`[ref, ,]` is all stable: {elided:?}");
 }
 
 #[test]

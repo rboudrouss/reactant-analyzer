@@ -9,7 +9,7 @@ use crate::{
         cfg::CFG,
         expr::Expr,
         free_vars::{AccessPath, compute_free_paths, dep_paths, path_covered},
-        hooks::HookEntry,
+        hooks::{Arity, HookEntry},
         types::{HookLabel, Symbol, Var},
     },
 };
@@ -198,14 +198,12 @@ impl Rule for StaleClosure {
         let comp_result = result.components.get(component)?;
         let render_fns = collect_fn_bindings(&comp_result.render_cfg);
         let applicable = comp_result.hooks.iter().any(|h| {
-            let HookEntry::Effect {
-                body_cfg,
-                deps: Some(_),
-                ..
-            } = h
-            else {
+            let HookEntry::Effect { body_cfg, deps, .. } = h else {
                 return false;
             };
+            if !deps.is_declared() {
+                return false;
+            }
             let mut fn_bodies = collect_fn_bindings(body_cfg);
             for (k, v) in &render_fns {
                 fn_bodies.entry(k.clone()).or_insert_with(|| Arc::clone(v));
@@ -252,17 +250,26 @@ impl Rule for StaleClosure {
             let HookEntry::Effect {
                 label: eff_label,
                 body_cfg,
-                deps: Some(dep_exprs),
+                deps,
                 span: eff_span,
             } = hook
             else {
-                // No deps array: the effect re-runs every render, every
-                // registration gets a fresh capture (the *old* one leaking is
-                // a cleanup problem, not a staleness one).
                 continue;
             };
-            let declared = dep_paths(dep_exprs.as_slice());
-            let mount_only = dep_exprs.is_empty();
+            // No deps array: the effect re-runs every render, every
+            // registration gets a fresh capture (the *old* one leaking is a
+            // cleanup problem, not a staleness one). A deps argument the
+            // engine cannot read is NOT that case — the effect is gated, so it
+            // is checked with nothing covered.
+            if !deps.is_declared() {
+                continue;
+            }
+            // The coverage view, not every visible element: a flattened
+            // spread covers its contents, never its own identity.
+            let declared = deps
+                .list()
+                .map_or_else(Vec::new, |l| dep_paths(&l.covering()));
+            let mount_only = matches!(deps.list(), Some(l) if l.arity == Arity::Exact(0));
 
             let mut fn_bodies = collect_fn_bindings(body_cfg);
             for (k, v) in &render_fns {

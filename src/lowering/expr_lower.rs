@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::ir::{
     cfg::{BasicBlock, CFG, EdgeKind, Terminator},
     expr::{BinOp as IrBinOp, Expr, Prim, SPREAD_KEY_PREFIX, SummaryValue, UnaryOp as IrUnaryOp},
+    hooks::Arity,
     stmt::{MemberKey, Stmt},
 };
 
@@ -391,10 +392,13 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         Expression::ArrayExpression(arr) => {
             let id = builder.next_expr_id();
             let mut elems: Vec<Expr> = vec![];
-            // Cleared by anything that makes `elems` stop standing one-for-one
-            // for the source elements. Consumers that count (`count`, `every`)
-            // must refuse such a list; consumers that only read it are fine.
-            let mut exact = true;
+            // Counted separately from `elems`: an elision contributes an entry
+            // the lowering cannot represent, and a spread contributes an
+            // unknown number under one element. Only the latter makes the
+            // length a lower bound.
+            let mut entries = 0usize;
+            let mut open_ended = false;
+            let mut spread_at: Vec<usize> = vec![];
             for el in &arr.elements {
                 match el {
                     // `[...items]` holds at least what `items` holds. Index
@@ -402,19 +406,33 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                     // keeping the source as an element claims nothing false
                     // and keeps its reads and setters visible.
                     ArrayExpressionElement::SpreadElement(sp) => {
+                        spread_at.push(elems.len());
                         elems.push(lower_expr(&sp.argument, builder));
-                        exact = false;
+                        open_ended = true;
                     }
-                    ArrayExpressionElement::Elision(_) => {
-                        exact = false;
-                    }
+                    ArrayExpressionElement::Elision(_) => entries += 1,
                     other => match other.as_expression() {
-                        Some(e) => elems.push(lower_expr(e, builder)),
-                        None => exact = false,
+                        Some(e) => {
+                            elems.push(lower_expr(e, builder));
+                            entries += 1;
+                        }
+                        // Not reachable today (the three arms are total), but a
+                        // new element kind must widen the bound, not the count.
+                        None => open_ended = true,
                     },
                 }
             }
-            Expr::ArrayLit { id, elems, exact }
+            let arity = if open_ended {
+                Arity::AtLeast(entries)
+            } else {
+                Arity::Exact(entries)
+            };
+            Expr::ArrayLit {
+                id,
+                elems,
+                arity,
+                spread_at,
+            }
         }
 
         // ── Functions ─────────────────────────────────────────────────────────
@@ -757,11 +775,12 @@ fn lower_jsx_element(jsx: &JSXElement, builder: &mut BlockBuilder) -> Expr {
                 "children".to_string(),
                 Expr::ArrayLit {
                     id,
-                    elems: children,
                     // Synthetic container, not a written array literal: it
-                    // stands for the children the walk kept, so it makes no
-                    // arity claim about anything in the source.
-                    exact: false,
+                    // stands for the children the walk kept, so it claims only
+                    // a lower bound on anything in the source.
+                    arity: Arity::AtLeast(children.len()),
+                    elems: children,
+                    spread_at: vec![],
                 },
             ));
         }

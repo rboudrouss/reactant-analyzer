@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::ir::{
     cfg::CFG,
+    hooks::Arity,
     source_range::SourceRange,
     types::{ExprId, HookLabel, Symbol, Var},
 };
@@ -90,15 +91,18 @@ pub enum Expr {
     ArrayLit {
         id: ExprId,
         elems: Vec<Expr>,
-        /// `false` when lowering could not keep the source array element for
-        /// element: a `SpreadElement` is flattened into its source (one element
-        /// standing for however many it holds) and an elision is dropped
-        /// entirely. `elems` still over-approximates what the array *reads*, so
-        /// value analyses are unaffected — but its **length** is no longer the
-        /// source array's length, and nothing downstream can recover the
-        /// difference. This is the last point where it is knowable, which is
-        /// why the bit is recorded here rather than derived later.
-        exact: bool,
+        /// How long the *source* array is, which `elems.len()` stops telling
+        /// once lowering flattens a `SpreadElement` into its source (one
+        /// element standing for however many it holds) or drops an elision
+        /// (no element at all). An elision still leaves the length countable,
+        /// so only a spread makes it a lower bound. This is the last point
+        /// where any of it is knowable, which is why it is recorded here
+        /// rather than derived later.
+        arity: Arity,
+        /// Positions in `elems` that came from a spread. Such an element is a
+        /// *container* of entries, not an entry: a reader that treats it as
+        /// one claims the array holds `rows` where it holds `rows[0], …`.
+        spread_at: Vec<usize>,
     },
     FnLit {
         id: ExprId,
@@ -329,6 +333,16 @@ impl Expr {
         let mut e = self;
         while let Expr::TSAnnotated(inner) = e {
             e = inner;
+        }
+        e
+    }
+
+    /// [`Expr::peel_ts`] for an owned value — for the callers that destructure
+    /// the peeled expression rather than borrowing it.
+    pub fn peel_ts_owned(self) -> Expr {
+        let mut e = self;
+        while let Expr::TSAnnotated(inner) = e {
+            e = *inner;
         }
         e
     }

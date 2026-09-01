@@ -3,7 +3,12 @@ use std::collections::HashMap;
 
 use crate::{
     domains::{AbstractDomain, AbstractEnv, BoolVal, MemoStore, StateStore, StateValue},
-    ir::{expr::Expr, hooks::HookEntry, stmt::Stmt, types::HookLabel},
+    ir::{
+        expr::Expr,
+        hooks::{Arity, HookEntry},
+        stmt::Stmt,
+        types::HookLabel,
+    },
 };
 
 use crate::rules::{
@@ -86,13 +91,13 @@ impl Rule for UnnecessaryRerender {
             let HookEntry::Effect {
                 label: eff_label,
                 body_cfg,
-                deps: Some(deps),
+                deps,
                 ..
             } = hook
             else {
                 continue;
             };
-            if !deps.is_empty() {
+            if deps.list().map(|l| l.arity) != Some(Arity::Exact(0)) {
                 continue; // only mount-only effects (deps = [])
             }
             let eff_span = result.effect_info.get(eff_label).and_then(|i| i.span);
@@ -195,7 +200,7 @@ impl Rule for UnnecessaryRerender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::hooks::DepsList;
+    use crate::ir::hooks::{DepsArg, DepsList};
     use crate::{
         domains::StateValueTransfer,
         engine::{Config, ProgramAnalysisResult, analyze_component},
@@ -219,7 +224,7 @@ mod tests {
         crate::test_support::single_block_cfg(stmts)
     }
 
-    fn component_with(init: Expr, effect_stmts: Vec<Stmt>, deps: Option<DepsList>) -> ComponentIR {
+    fn component_with(init: Expr, effect_stmts: Vec<Stmt>, deps: DepsArg) -> ComponentIR {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
@@ -270,7 +275,7 @@ mod tests {
         let comp = component_with(
             Expr::Lit(Prim::String("light".into())),
             eff_stmts,
-            Some(DepsList::exact(vec![])),
+            DepsArg::List(DepsList::exact(vec![])),
         );
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         let diags = UnnecessaryRerender.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
@@ -300,7 +305,7 @@ mod tests {
         let comp = component_with(
             Expr::Lit(Prim::String("light".into())),
             eff_stmts,
-            Some(DepsList::exact(vec![])),
+            DepsArg::List(DepsList::exact(vec![])),
         );
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         let diags = UnnecessaryRerender.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
@@ -321,7 +326,7 @@ mod tests {
         let comp = component_with(
             Expr::Lit(Prim::String("light".into())),
             eff_stmts,
-            Some(DepsList::exact(vec![])),
+            DepsArg::List(DepsList::exact(vec![])),
         );
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(
@@ -333,7 +338,7 @@ mod tests {
 
     #[test]
     fn non_mount_effect_no_warning() {
-        // deps: None = runs every render not a mount-only effect
+        // deps: DepsArg::Absent = runs every render not a mount-only effect
         let eff_stmts = vec![Stmt::ExprStmt(
             Expr::Call {
                 fn_: Box::new(Expr::Var("setX".to_string())),
@@ -341,7 +346,11 @@ mod tests {
             },
             None,
         )];
-        let comp = component_with(Expr::Lit(Prim::String("light".into())), eff_stmts, None);
+        let comp = component_with(
+            Expr::Lit(Prim::String("light".into())),
+            eff_stmts,
+            DepsArg::Absent,
+        );
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(
             UnnecessaryRerender
@@ -365,7 +374,7 @@ mod tests {
         let comp = component_with(
             Expr::Lit(Prim::Bool(false)),
             eff_stmts,
-            Some(DepsList::exact(vec![])),
+            DepsArg::List(DepsList::exact(vec![])),
         );
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         let diags = UnnecessaryRerender.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
@@ -396,7 +405,7 @@ mod tests {
         let comp = component_with(
             Expr::Lit(Prim::Bool(true)),
             eff_stmts,
-            Some(DepsList::exact(vec![])),
+            DepsArg::List(DepsList::exact(vec![])),
         );
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         let diags = UnnecessaryRerender.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
@@ -421,7 +430,7 @@ mod tests {
         let comp = component_with(
             Expr::Lit(Prim::Int(0)),
             eff_stmts,
-            Some(DepsList::exact(vec![])),
+            DepsArg::List(DepsList::exact(vec![])),
         );
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(

@@ -198,6 +198,7 @@ impl Rule for ServerComponentHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::hooks::DepsArg;
     use crate::ir::{Expr, Prim};
 
     fn prov(origin: &str, react: bool, specifier: Option<&str>) -> HookProvenance {
@@ -217,7 +218,7 @@ mod tests {
             label: 0,
             name: name.to_string(),
             args: vec![],
-            deps: None,
+            deps: DepsArg::Absent,
             binding: None,
             import_source: import_source.map(str::to_string),
             resolved_file: None,

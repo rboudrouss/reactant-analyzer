@@ -270,6 +270,8 @@ fn collect_callees_in_expr(expr: &Expr, out: &mut Vec<Symbol>) {
 mod tests {
 
     use super::*;
+
+    use crate::ir::hooks::DepsArg;
     use crate::ir::{cfg::CFG, expr::Expr, hook_ir::HookIR};
 
     fn cfg_calling(callees: &[&str]) -> CFG {
@@ -358,7 +360,7 @@ mod tests {
             label: 0,
             name: "useData".to_string(),
             args: vec![],
-            deps: None,
+            deps: DepsArg::Absent,
             binding: None,
             import_source: None,
             resolved_file: Some(PathBuf::from("/lib/b.ts")),

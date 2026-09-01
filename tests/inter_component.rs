@@ -23,7 +23,7 @@ use reactant::{
         cfg::{BasicBlock, CFG, Terminator},
         component::ComponentIR,
         expr::{Expr, Prim},
-        hooks::{DepsList, HookEntry},
+        hooks::{DepsArg, DepsList, HookEntry},
         stmt::Stmt,
         types::ExprId,
     },
@@ -236,7 +236,7 @@ fn setter_prop_propagates_to_shared_state() {
             hooks: vec![HookEntry::Effect {
                 label: 0,
                 body_cfg: eff_body,
-                deps: Some(DepsList::exact(vec![])),
+                deps: DepsArg::List(DepsList::exact(vec![])),
                 span: None,
             }],
             module_consts: Default::default(),
@@ -588,7 +588,7 @@ fn prop_drilling_direct_ir() {
             hooks: vec![HookEntry::Effect {
                 label: 0,
                 body_cfg: eff_body,
-                deps: Some(DepsList::exact(vec![])),
+                deps: DepsArg::List(DepsList::exact(vec![])),
                 span: None,
             }],
             module_consts: Default::default(),

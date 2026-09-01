@@ -10,7 +10,7 @@ use crate::{
         cfg::{CFG, Terminator},
         expr::Expr,
         free_vars::AccessPath,
-        hooks::{DepsList, HookEntry},
+        hooks::{DepsArg, DepsList, HookEntry},
         types::{BlockId, HookLabel, Symbol, Var},
     },
 };
@@ -103,37 +103,64 @@ pub struct EffectInfo {
     /// member-chain granular (`x.a`, not just `x`) so `missing-deps` matches
     /// a dep against the exact field used (TODO.md F1b).
     pub free_paths: HashSet<AccessPath>,
-    /// Deps array as the IR could read it — `None` when the caller passed no
-    /// deps argument, or one that is not an array literal. One field rather
-    /// than a list plus a present-flag: the two could disagree, and the reading
-    /// they used to disagree about (an unreadable argument shown as an empty
-    /// array that is definitely present) was the wrong one in both directions.
-    pub deps: Option<DepsList>,
+    /// Deps argument as the IR could read it — see [`DepsArg`], whose three
+    /// states are three different facts. One field rather than a list plus a
+    /// present-flag: the two could disagree, and the reading they used to
+    /// disagree about (an unreadable argument shown as an empty array that is
+    /// definitely present) was wrong in both directions.
+    pub deps: DepsArg,
     /// Source location of the hook call site, if available.
     pub span: Option<SourceRange>,
 }
 
 impl EffectInfo {
-    /// `true` when the caller wrote a deps array the IR could read — including
-    /// `[]`. `false` when the argument is absent *or* unreadable: a rule asking
-    /// "did they declare deps?" gets an answer only when the engine has one.
+    /// `true` when the caller passed a deps argument at all — a written `[]`,
+    /// and also one the engine could not read. Only the absent argument makes
+    /// a hook re-run on every render, and that is the question this answers.
     pub fn has_deps_array(&self) -> bool {
-        self.deps.is_some()
+        self.deps.is_declared()
     }
 
-    /// The deps entries the IR can see, in declared order; empty when there is
-    /// no readable deps array. Enumerating these is sound whatever `exact`
-    /// says — each entry over-approximates what it stands for. Counting them
-    /// is not: use [`EffectInfo::deps_arity`].
+    /// `true` when the hook is gated by a deps list the engine cannot see one
+    /// element of. Such a hook can go stale exactly like one with an
+    /// incomplete array, so a rule must check it with *nothing* covered rather
+    /// than skip it.
+    pub fn deps_are_opaque(&self) -> bool {
+        matches!(self.deps, DepsArg::Opaque)
+    }
+
+    /// Every deps element the IR can see, in declared order; empty when there
+    /// is no readable list. Use it to make a rule **fire** — each element
+    /// over-approximates what it stands for, so a truncated list is safe here.
+    /// To make a rule *stop*, use [`EffectInfo::covering_deps`] instead.
     pub fn declared_deps(&self) -> &[Expr] {
-        self.deps.as_ref().map_or(&[], DepsList::as_slice)
+        self.deps.list().map_or(&[], DepsList::as_slice)
     }
 
-    /// The number of declared dependencies, and `None` when the engine does not
-    /// know it: no readable deps array, or one whose lowering dropped or
-    /// flattened an element (`[...rest]`, `[a, , b]`).
+    /// The entries that actually cover a read — [`DepsList::covering`], and
+    /// empty when no list was written. This is what a suppression must ask
+    /// for: a flattened `[...rows]` declares `rows[0], rows[1], …` and never
+    /// `rows`, so crediting the source would silence a stale capture. The
+    /// elements written beside the spread still cover their own reads.
+    pub fn covering_deps(&self) -> std::borrow::Cow<'_, [Expr]> {
+        self.deps
+            .list()
+            .map_or(std::borrow::Cow::Borrowed(&[][..]), DepsList::covering)
+    }
+
+    /// How many dependencies the source array declares, when the engine knows.
+    /// `None` for an absent or unreadable argument — neither has an arity to
+    /// compare against. An elision keeps the arity exact; only a spread leaves
+    /// a lower bound, which [`EffectInfo::deps_at_least`] carries.
     pub fn deps_arity(&self) -> Option<usize> {
-        self.deps.as_ref().filter(|d| d.exact).map(DepsList::len)
+        self.deps.list().and_then(|l| l.arity.exact())
+    }
+
+    /// The guaranteed lower bound on the declared arity, when a list was
+    /// written. Always available for a list, and what lets an open-ended one
+    /// still refute an arity claim instead of refusing every one.
+    pub fn deps_at_least(&self) -> Option<usize> {
+        self.deps.list().map(|l| l.arity.at_least())
     }
 }
 

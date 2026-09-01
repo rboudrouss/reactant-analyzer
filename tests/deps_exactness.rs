@@ -91,10 +91,9 @@ fn an_empty_literal_deps_array_is_exact_and_zero() {
 }
 
 #[test]
-fn a_spread_makes_the_deps_array_inexact_but_still_declared() {
+fn a_spread_leaves_the_arity_open_and_covers_nothing() {
     // `[...rest]` IS a deps array — the caller wrote one — but lowering keeps
-    // the spread's *source* as one element standing for however many it holds,
-    // so the length is no longer the source array's.
+    // the spread's *source* as one element standing for however many it holds.
     let r = analyze(&effect_body("[...rest]"));
     let info = only(&r, HookKind::Effect);
     assert!(
@@ -104,38 +103,86 @@ fn a_spread_makes_the_deps_array_inexact_but_still_declared() {
     assert_eq!(
         info.deps_arity(),
         None,
-        "its arity is not knowable after the spread is flattened"
+        "its arity is not knowable once the spread is flattened"
     );
     assert_eq!(
-        info.declared_deps().len(),
-        1,
-        "the source stays enumerable — only counting it is refused"
+        info.deps_at_least(),
+        Some(0),
+        "but the lower bound is, and it is what still refutes an arity claim"
+    );
+    assert_eq!(info.declared_deps().len(), 1, "the source stays enumerable");
+    assert!(
+        info.covering_deps().is_empty(),
+        "`[...rows]` declares `rows[0], …` and never `rows`, so it covers nothing"
     );
 }
 
 #[test]
-fn an_elision_makes_the_deps_array_inexact() {
+fn a_partial_spread_keeps_the_visible_elements_as_a_lower_bound() {
+    let r = analyze(&effect_body("[a, b, ...rest]"));
+    let info = only(&r, HookKind::Effect);
+    assert_eq!(info.deps_arity(), None);
+    assert_eq!(info.deps_at_least(), Some(2), "`a` and `b` are guaranteed");
+    assert_eq!(
+        info.covering_deps().len(),
+        2,
+        "the two written elements still cover their own reads — only the \
+         spread's source is refused"
+    );
+}
+
+#[test]
+fn a_ts_annotated_deps_array_is_still_an_array() {
+    // `[n] as const` is an array literal to everyone except a bare pattern
+    // match. Reading it as opaque put "re-runs after every render" on a hook
+    // that declares its deps.
+    let r = analyze(&effect_body("[a] as const"));
+    let info = only(&r, HookKind::Effect);
+    assert!(info.has_deps_array());
+    assert!(!info.deps_are_opaque());
+    assert_eq!(info.deps_arity(), Some(1));
+}
+
+#[test]
+fn an_elision_keeps_the_arity_exact_but_hides_an_element() {
+    // The distinction the first cut of this got wrong: an elision drops an
+    // element from `elems`, but the source array's length is still perfectly
+    // countable at lowering. Only a spread leaves the count open.
     let r = analyze(&effect_body("[a, , b]"));
     let info = only(&r, HookKind::Effect);
     assert!(info.has_deps_array());
+    assert_eq!(info.deps_arity(), Some(3), "three entries were written");
     assert_eq!(
-        info.deps_arity(),
-        None,
-        "the elided slot is dropped, so `elems.len()` undercounts"
+        info.declared_deps().len(),
+        2,
+        "one of them is not an element"
+    );
+    assert_eq!(
+        info.covering_deps().len(),
+        2,
+        "the entry it dropped is `undefined`, which covers nothing either way"
     );
 }
 
 #[test]
-fn a_non_literal_deps_argument_is_no_deps_array_at_all() {
-    // The reading this replaces: `deps` truncated to `[]`, reported present.
+fn a_non_literal_deps_argument_is_opaque_but_still_declared() {
+    // Three states, not two. The caller *did* pass a deps argument, so the
+    // hook is gated — reading it as absent would say "re-runs after every
+    // render" about a hook that does not, and skip every deps check on it.
+    // What the engine lacks is the elements, not the argument.
     let r = analyze(&effect_body("deps"));
     let info = only(&r, HookKind::Effect);
     assert!(
-        !info.has_deps_array(),
-        "a deps argument the IR cannot read is not an empty deps array"
+        info.has_deps_array(),
+        "an unreadable argument is still a declared deps array"
     );
+    assert!(info.deps_are_opaque());
     assert_eq!(info.deps_arity(), None);
     assert!(info.declared_deps().is_empty());
+    assert!(
+        info.covering_deps().is_empty(),
+        "nothing is covered by a list nobody can see"
+    );
 }
 
 #[test]
@@ -154,9 +201,9 @@ fn an_absent_deps_argument_is_no_deps_array() {
 // ── The shipped Memo/Callback false negative ──────────────────────────────────
 
 #[test]
-fn a_memo_whose_deps_argument_is_a_variable_declares_no_deps_array() {
+fn a_memo_whose_deps_argument_is_a_variable_is_opaque() {
     // `collect_effect_info` hardcoded `has_deps_array: true` for every Memo
-    // row, so the `deps_declared` guard could not distinguish this from `[]`.
+    // row, so nothing could distinguish this from `[]`.
     let src = r#"
         function C({ deps }) {
             const v = useMemo(() => ({}), deps);
@@ -167,13 +214,15 @@ fn a_memo_whose_deps_argument_is_a_variable_declares_no_deps_array() {
     let r = analyze(src);
     let info = only(&r, HookKind::Memo);
     assert!(
-        !info.has_deps_array(),
-        "a memo whose deps argument is unreadable must not report one"
+        info.deps_are_opaque(),
+        "a memo whose deps argument is unreadable is gated by a list nobody sees"
     );
+    assert!(info.declared_deps().is_empty());
+    assert_eq!(info.deps_arity(), None);
 }
 
 #[test]
-fn a_callback_whose_deps_argument_is_a_variable_declares_no_deps_array() {
+fn a_callback_whose_deps_argument_is_a_variable_is_opaque() {
     let src = r#"
         function C({ deps }) {
             const f = useCallback(() => {}, deps);
@@ -182,7 +231,8 @@ fn a_callback_whose_deps_argument_is_a_variable_declares_no_deps_array() {
     "#;
     let r = analyze(src);
     let info = only(&r, HookKind::Callback);
-    assert!(!info.has_deps_array());
+    assert!(info.deps_are_opaque());
+    assert!(info.declared_deps().is_empty());
 }
 
 #[test]

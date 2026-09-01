@@ -41,7 +41,7 @@ use crate::{
     engine::ProgramAnalysisResult,
     ir::{
         SourceRange,
-        hooks::HookEntry,
+        hooks::{Arity, HookEntry},
         types::{HookLabel, Symbol},
     },
 };
@@ -138,12 +138,12 @@ pub(in crate::rules) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec
             else {
                 continue;
             };
-            // Mount-only effects fire once: no loop. A `[]` the IR only
-            // *thinks* is empty (an elision-only array) proves no such thing.
-            if matches!(deps, Some(d) if d.is_empty() && d.exact) {
+            // Mount-only effects fire once: no loop — but only an array the
+            // engine knows is empty says so.
+            if matches!(deps.list(), Some(d) if d.arity == Arity::Exact(0)) {
                 continue;
             }
-            let (exact_local, versioned) = match deps {
+            let (exact_local, versioned) = match deps.list() {
                 None => (HashSet::new(), HashSet::new()),
                 Some(d) => classify_effect_deps(d.as_slice(), comp_result, &state_vals, &memo_vals),
             };
@@ -168,7 +168,10 @@ pub(in crate::rules) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec
                 body_cfg,
                 state_vals: state_vals.clone(),
                 effect_label: *label,
-                no_deps: deps.is_none(),
+                // An unreadable deps argument gates the effect by a list the
+                // engine cannot use, so it is read the same way as no list at
+                // all: the self-edge stays, which is the fire-more direction.
+                no_deps: deps.list().is_none(),
                 exact_local,
                 versioned,
                 calls,

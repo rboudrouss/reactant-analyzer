@@ -13,7 +13,7 @@
 use std::collections::HashSet;
 
 use crate::ir::SourceRange;
-use crate::ir::hooks::HookEntry;
+use crate::ir::hooks::{Arity, HookEntry};
 use crate::ir::types::HookLabel;
 use crate::rules::api::diagnostic::Diagnostic;
 use crate::rules::api::query::{
@@ -391,21 +391,41 @@ impl TierARule {
             // does not have zero dependencies, it has an unknown number of
             // them, so the guard refuses rather than answering from a length
             // that is not the source array's.
+            // An arity guard needs a written array to count. There is none
+            // when the caller passed no deps argument, or one the engine
+            // cannot read — that is knowledge, not ignorance, and
+            // `deps_declared` is the guard that asks about it.
             ResolvedGuard::Count(cmp) => {
-                match cand
+                let Some(arity) = cand
                     .row()
                     .and_then(|r| r.effect)
-                    .and_then(|i| i.deps_arity())
-                {
-                    Some(len) => {
-                        let len = len as u64;
+                    .and_then(|i| i.deps.list())
+                    .map(|l| l.arity)
+                else {
+                    return false;
+                };
+                match arity {
+                    Arity::Exact(m) => {
+                        let m = m as u64;
                         match cmp {
-                            CountCmp::MoreThan(n) => len > *n,
-                            CountCmp::LessThan(n) => len < *n,
-                            CountCmp::Equals(n) => len == *n,
+                            CountCmp::MoreThan(n) => m > *n,
+                            CountCmp::LessThan(n) => m < *n,
+                            CountCmp::Equals(n) => m == *n,
                         }
                     }
-                    None => false,
+                    // A flattened spread leaves only a lower bound, so the
+                    // guard answers what that bound *refutes* and passes
+                    // otherwise. Refusing outright deleted findings: the arity
+                    // of `[a, …, g, ...rest]` provably exceeds any budget its
+                    // visible elements already exceed.
+                    Arity::AtLeast(m) => {
+                        let m = m as u64;
+                        match cmp {
+                            CountCmp::MoreThan(_) => true,
+                            CountCmp::LessThan(n) => m < *n,
+                            CountCmp::Equals(n) => m <= *n,
+                        }
+                    }
                 }
             }
             ResolvedGuard::DepsDeclared { eq } => {
@@ -438,11 +458,13 @@ impl TierARule {
                 let Some(row) = cand.row() else {
                     unreachable!("validated: `every` quantifies over a deps-bearing anchor")
                 };
-                // Quantifying needs a domain. An absent deps array, or one
-                // whose lowering flattened a spread or dropped an elision, is
-                // not a list of known elements — the guard refuses rather than
-                // answering from the ones it happens to have (ADR-023 §4).
-                if row.effect.and_then(|i| i.deps_arity()).is_none() {
+                // Quantifying needs a domain. A written array supplies one
+                // even when a spread hides part of it — the fold then ranges
+                // over the elements the engine can see and refutes ∀ as soon
+                // as one of them violates. An absent or unreadable argument
+                // supplies no element at all, and a claim about nothing is not
+                // a claim the engine may make.
+                if row.effect.and_then(|i| i.deps.list()).is_none() {
                     return false;
                 }
                 // `proofs` is deliberately not threaded in: a may-typed

@@ -5,7 +5,7 @@ use super::import_resolution::HookOrigin;
 use crate::ir::{
     cfg::{BasicBlock, CFG, Terminator},
     expr::{Expr, MarkerVal, Prim},
-    hooks::{DepsList, HookEntry, HookProvenance},
+    hooks::{DepsArg, HookEntry, HookProvenance},
     source_range::SourceRange,
     stmt::{MemberKey, Stmt},
     types::{BlockId, HookLabel},
@@ -595,7 +595,7 @@ fn make_hook_entry(
             label,
             name: name.to_string(),
             args: it.collect(),
-            deps: None,
+            deps: DepsArg::Absent,
             binding: None,
             import_source: call.import_source(),
             resolved_file: call.resolved_file.clone(),
@@ -609,7 +609,7 @@ fn make_hook_entry(
         }
         "useEffect" => {
             let body_cfg = hook_body_cfg(it.next());
-            let deps = it.next().and_then(DepsList::from_expr);
+            let deps = it.next().map_or(DepsArg::Absent, DepsArg::from_expr);
             Some(HookEntry::Effect {
                 label,
                 body_cfg,
@@ -619,7 +619,7 @@ fn make_hook_entry(
         }
         "useMemo" => {
             let body_cfg = hook_body_cfg(it.next());
-            let deps = it.next().and_then(DepsList::from_expr);
+            let deps = it.next().map_or(DepsArg::Absent, DepsArg::from_expr);
             Some(HookEntry::Memo {
                 label,
                 body_cfg,
@@ -637,7 +637,7 @@ fn make_hook_entry(
                 }) => (params, unwrap_body(body_cfg)),
                 other => (vec![], hook_body_cfg(other)),
             };
-            let deps = it.next().and_then(DepsList::from_expr);
+            let deps = it.next().map_or(DepsArg::Absent, DepsArg::from_expr);
             Some(HookEntry::Callback {
                 label,
                 body_cfg,
@@ -657,7 +657,7 @@ fn make_hook_entry(
         }
         "useLayoutEffect" | "useInsertionEffect" => {
             let body_cfg = hook_body_cfg(it.next());
-            let deps = it.next().and_then(DepsList::from_expr);
+            let deps = it.next().map_or(DepsArg::Absent, DepsArg::from_expr);
             Some(HookEntry::Effect {
                 label,
                 body_cfg,
@@ -673,7 +673,7 @@ fn make_hook_entry(
                 label,
                 name: name.to_string(),
                 args,
-                deps: None,
+                deps: DepsArg::Absent,
                 binding: None,
                 import_source: call.import_source(),
                 resolved_file: None,
@@ -813,13 +813,19 @@ fn rewrite_expr(expr: Expr, state_temps: &HashMap<String, HookLabel>) -> Expr {
                 .map(|a| rewrite_expr(a, state_temps))
                 .collect(),
         },
-        Expr::ArrayLit { id, elems, exact } => Expr::ArrayLit {
+        Expr::ArrayLit {
+            id,
+            elems,
+            arity,
+            spread_at,
+        } => Expr::ArrayLit {
             id,
             elems: elems
                 .into_iter()
                 .map(|e| rewrite_expr(e, state_temps))
                 .collect(),
-            exact,
+            arity,
+            spread_at,
         },
         Expr::ObjectLit { id, fields } => Expr::ObjectLit {
             id,
@@ -975,7 +981,7 @@ mod tests {
         );
         assert_eq!(hooks.len(), 1);
         assert!(
-            matches!(&hooks[0], HookEntry::Effect { label: 0, deps: Some(deps), .. } if deps.len() == 1)
+            matches!(&hooks[0], HookEntry::Effect { label: 0, deps: DepsArg::List(deps), .. } if deps.len() == 1)
         );
         // useEffect leaves a call-site marker in the entry block
         assert!(
@@ -994,7 +1000,7 @@ mod tests {
             &hooks[0],
             HookEntry::Effect {
                 label: 0,
-                deps: None,
+                deps: DepsArg::Absent,
                 ..
             }
         ));
@@ -1010,7 +1016,7 @@ mod tests {
         assert_eq!(hooks.len(), 1);
         assert!(matches!(
             &hooks[0],
-            HookEntry::Memo { label: 0, deps: Some(deps), .. } if deps.len() == 1
+            HookEntry::Memo { label: 0, deps: DepsArg::List(deps), .. } if deps.len() == 1
         ));
         let stmts = entry_stmts(&cfg);
         assert!(matches!(find_let_rhs(stmts, "v"), Some(Expr::MemoVal(0))));

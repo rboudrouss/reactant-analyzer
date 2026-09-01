@@ -323,12 +323,13 @@ pub enum Guard {
     /// Positive-only — there is no negated form, and `not every` is just the
     /// existential a `forEach` already writes.
     ///
-    /// The list must be one the engine read exactly. An absent deps array, or
-    /// one whose lowering flattened a spread or dropped an elision, fails the
-    /// guard rather than quantifying over a domain it cannot enumerate — the
-    /// vacuity hazard §4 names, and the same absent-⇒-fail discipline `count`
-    /// follows. A list that is *known* empty quantifies vacuously true; pair
-    /// with `count` when a rule needs at least one element.
+    /// Quantifying needs a domain. A **written** array supplies one even when
+    /// a spread hides part of it — the fold ranges over the elements the
+    /// engine can see, and one visible violator refutes ∀ outright. An absent
+    /// or unreadable deps argument supplies no element at all, and a claim
+    /// about nothing is not a claim the engine may make, so the guard fails
+    /// there. A list that is known empty quantifies vacuously true; pair with
+    /// `count` when a rule needs at least one element.
     ///
     /// Never mints a proof: a `must_*` guard anywhere inside a rule that uses
     /// `every` is rejected at load time, so an `every`-selected finding cannot
@@ -343,8 +344,17 @@ pub enum Guard {
         r#as: String,
         guards: Vec<Guard>,
     },
-    /// Cardinality of `anchor.<edge>` (only `anchor.deps` in v1). Exactly
-    /// one comparator.
+    /// Cardinality of `anchor.<edge>` (only `anchor.deps` in v1). Exactly one
+    /// comparator.
+    ///
+    /// An elision keeps the count exact — `[a, , b]` declares three entries,
+    /// even though lowering can only show two. A spread leaves a lower bound
+    /// instead, and the guard then answers what that bound **refutes**,
+    /// passing otherwise: `[a, …, g, ...rest]` provably holds more than five.
+    /// Refusing an open-ended list outright would delete findings, which is
+    /// the one direction this project does not trade. With no written array at
+    /// all there is nothing to count and the guard fails — `deps_declared` is
+    /// the guard that asks whether one was passed.
     Count {
         of: String,
         #[serde(default)]

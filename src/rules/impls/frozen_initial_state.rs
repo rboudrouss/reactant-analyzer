@@ -8,7 +8,7 @@ use crate::{
         cfg::CFG,
         expr::Expr,
         free_vars::{AccessPath, collect_used_paths, dep_paths, path_covered},
-        hooks::HookEntry,
+        hooks::{DepsArg, HookEntry},
         types::{HookLabel, Var},
     },
 };
@@ -313,10 +313,16 @@ impl Rule for FrozenInitialState {
                     return false;
                 }
                 match deps {
-                    None => true, // re-runs every render
-                    Some(deps) => seeds
+                    DepsArg::Absent => true, // re-runs every render
+                    // Gated by a list the engine cannot read: it proves no
+                    // sync, so it must not suppress one.
+                    DepsArg::Opaque => false,
+                    // A flattened spread declares its elements, not its
+                    // source, so crediting the source as covering the seed
+                    // would suppress on a coverage nobody wrote.
+                    DepsArg::List(deps) => seeds
                         .iter()
-                        .any(|s| deps_cover_seed(deps.as_slice(), s, &comp.param, &bindings)),
+                        .any(|s| deps_cover_seed(&deps.covering(), s, &comp.param, &bindings)),
                 }
             });
             if synced {

@@ -150,13 +150,12 @@ pub trait Transfer {
     /// the normal path (`MemoVal`/heap reads resolve against the current
     /// fixpoint state instead of a fabricated empty store).
     ///
-    /// `deps` is `None` when the hook declares no readable deps array. That is
-    /// not the same as `Some([])`: an empty array pins the memo forever, while
-    /// an unreadable one bounds nothing, so the two must not share an answer.
+    /// A deps argument the engine could not read bounds nothing: it must not
+    /// share an answer with a written `[]`, which pins the memo forever.
     fn recompute_memo(
         &self,
         component: &crate::ir::types::Symbol,
-        deps: Option<&crate::ir::hooks::DepsList>,
+        deps: &crate::ir::hooks::DepsArg,
         env: &AbstractEnv<Self::Domain>,
         ctx: &mut context::AnalysisCtx<Self::Domain>,
     ) -> Self::Domain;

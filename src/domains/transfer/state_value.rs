@@ -11,7 +11,7 @@ use crate::{
     },
     ir::{
         expr::{BinOp, Expr, MarkerVal, Prim, UnaryOp},
-        hooks::DepsList,
+        hooks::{Arity, DepsArg},
         stmt::Stmt,
         types::{ExprId, Symbol},
     },
@@ -54,7 +54,7 @@ impl Transfer for StateValueTransfer {
     fn recompute_memo(
         &self,
         component: &Symbol,
-        deps: Option<&DepsList>,
+        deps: &DepsArg,
         env: &AbstractEnv<StateValue>,
         ctx: &mut AnalysisCtx<StateValue>,
     ) -> StateValue {
@@ -62,17 +62,16 @@ impl Transfer for StateValueTransfer {
         // equally never recompute — ⊤. `Stable` here would be a *must* claim
         // about a list the IR never saw, which is how `useMemo(fn, deps)` used
         // to read as pinned forever.
-        let Some(deps) = deps else {
+        let Some(deps) = deps.list() else {
             return StateValue::reference(Stability::Unknown);
         };
+        if deps.arity == Arity::Exact(0) {
+            // `[]` pins the memo — but only an array *known* to be empty.
+            return StateValue::reference(Stability::Stable);
+        }
         if deps.is_empty() {
-            // `[]` pins the memo — but only a list that is *known* empty. An
-            // elision-only array (`[, ]`) also lowers to zero elements.
-            return StateValue::reference(if deps.exact {
-                Stability::Stable
-            } else {
-                Stability::Unknown
-            });
+            // Every entry is a spread whose source the fold cannot reach.
+            return StateValue::reference(Stability::Unknown);
         }
         let stability = deps.as_slice().iter().fold(Stability::Bottom, |acc, dep| {
             // Structural projection (ADR-017): a dep that IS a state slot
@@ -2086,7 +2085,8 @@ mod tests {
                         args: vec![Expr::ArrayLit {
                             id: crate::ir::types::ExprId(0),
                             elems: vec![Expr::Var("p1".to_string())],
-                            exact: true,
+                            arity: Arity::Exact(1),
+                            spread_at: vec![],
                         }],
                     }),
                     field: "then".to_string(),

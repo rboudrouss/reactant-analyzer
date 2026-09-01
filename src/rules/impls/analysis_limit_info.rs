@@ -111,6 +111,31 @@ impl Rule for AnalysisLimitInfo {
             }
         }
 
+        // A deps argument the engine could not read (`useMemo(fn, deps)`). The
+        // hook is gated by a list of which not one element is visible, so
+        // every deps-based rule is running blind on it — and `registry.rs`
+        // keys the suspension of "verified:" assurances off this Info, which
+        // is how a component stops publishing a universal over a hook nobody
+        // could check.
+        if let Some(comp_result) = result.components.get(component) {
+            for info in comp_result.effect_info.values() {
+                if !info.deps_are_opaque() {
+                    continue;
+                }
+                let mut d = Diagnostic::info(
+                    "analysis-limit",
+                    "the deps argument here is not a written array, so its entries \
+                     cannot be enumerated — deps checks run with nothing declared \
+                     (FP possible, and FN on whatever the list does gate)",
+                )
+                .with_label(info.label);
+                if let Some(span) = info.span {
+                    d = d.with_range(span);
+                }
+                diags.push(d);
+            }
+        }
+
         diags
     }
 }

@@ -41,49 +41,185 @@ pub struct HookProvenance {
     pub span: Option<SourceRange>,
 }
 
-/// A dependency array as the IR was able to read it.
+/// How many entries a written deps array has.
 ///
-/// `None` in place of a `DepsList` means *no deps array was seen* — either the
-/// argument is absent (`useEffect(fn)`) or it is not an array literal
-/// (`useMemo(fn, deps)`, a variable). Those two are alike where it counts: the
-/// engine cannot enumerate the dependencies, so it must not pretend to. The
-/// truncation this replaces — folding an unreadable argument to `[]` — read as
-/// "an empty deps array is present", which is the strongest possible claim
-/// about a list nobody could see.
-///
-/// `exact` carries [`Expr::ArrayLit`]'s own bit: `false` once a spread was
-/// flattened or an elision dropped, so `elems.len()` is no longer the source
-/// array's length. Enumerating the elements stays sound either way (each one
-/// over-approximates what it stands for); *counting* or *quantifying* over them
-/// does not, which is why every arity guard fails closed on `exact: false`.
-#[derive(Debug, Clone)]
-pub struct DepsList {
-    pub elems: Vec<Expr>,
-    pub exact: bool,
+/// Elisions and spreads are not the same kind of ignorance, and collapsing them
+/// cost real findings. An elision drops an element from `elems` but the source
+/// array's length is still perfectly countable at lowering (`[a, , b]` has
+/// three entries), so the arity stays **exact**. Only a spread is open-ended:
+/// `[a, ...rest]` holds one entry plus however many `rest` does, which is a
+/// lower bound and nothing more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arity {
+    /// The source array holds exactly this many entries.
+    Exact(usize),
+    /// The source array holds at least this many; a spread supplies the rest.
+    AtLeast(usize),
 }
 
-impl DepsList {
-    /// A deps list whose elements are known one-for-one — what every literal
-    /// `[a, b]` and every hand-built IR fixture produces.
-    pub fn exact(elems: Vec<Expr>) -> Self {
-        DepsList { elems, exact: true }
-    }
-
-    /// The deps list of an array-literal argument; anything else is `None`.
-    pub fn from_expr(expr: Expr) -> Option<Self> {
-        match expr {
-            Expr::ArrayLit { elems, exact, .. } => Some(DepsList { elems, exact }),
-            _ => None,
+impl Arity {
+    /// The count when it is known, `None` when a spread left it open.
+    pub fn exact(self) -> Option<usize> {
+        match self {
+            Arity::Exact(n) => Some(n),
+            Arity::AtLeast(_) => None,
         }
     }
 
-    /// Rewrite every element in place, keeping `exact` — the IR-to-IR passes
-    /// (remap, splice) substitute expressions without changing what the source
-    /// array held.
+    /// The guaranteed lower bound — always available, and what lets an
+    /// open-ended list still *refute* an arity claim.
+    pub fn at_least(self) -> usize {
+        match self {
+            Arity::Exact(n) | Arity::AtLeast(n) => n,
+        }
+    }
+
+    /// Could the source array hold exactly `n` entries? `false` only when the
+    /// bound refutes it — an open-ended list may still grow to any count above
+    /// its own.
+    pub fn may_be(self, n: usize) -> bool {
+        match self {
+            Arity::Exact(m) => m == n,
+            Arity::AtLeast(m) => m <= n,
+        }
+    }
+}
+
+/// The deps argument of a hook call, as the IR could read it.
+///
+/// The three states are three different facts, and folding any two of them
+/// together has cost findings in both directions:
+///
+/// - [`DepsArg::Absent`] — no argument at all. The hook re-runs on every
+///   render, so nothing it captures can go stale.
+/// - [`DepsArg::Opaque`] — an argument the IR cannot read (`useMemo(fn, deps)`).
+///   The hook **is** gated by a list, so its captures can go stale exactly like
+///   a declared-but-incomplete array; the engine simply cannot see one element
+///   of it. Reading this as `Absent` skips the hook; reading it as an empty
+///   list claims it declares nothing. Both are wrong, in opposite directions.
+/// - [`DepsArg::List`] — a written array literal, with whatever the lowering
+///   could keep of it.
+#[derive(Debug, Clone)]
+pub enum DepsArg {
+    Absent,
+    Opaque,
+    List(DepsList),
+}
+
+impl DepsArg {
+    /// The deps argument of `expr`: a written array literal becomes a list,
+    /// anything else is opaque. TS annotations are peeled first — `[a] as const`
+    /// is an array literal to everyone except a bare pattern match.
+    pub fn from_expr(expr: Expr) -> Self {
+        match expr.peel_ts_owned() {
+            Expr::ArrayLit {
+                elems,
+                arity,
+                spread_at,
+                ..
+            } => DepsArg::List(DepsList {
+                elems,
+                arity,
+                spread_at,
+            }),
+            _ => DepsArg::Opaque,
+        }
+    }
+
+    /// The written list, when there is one to read.
+    pub fn list(&self) -> Option<&DepsList> {
+        match self {
+            DepsArg::List(l) => Some(l),
+            DepsArg::Absent | DepsArg::Opaque => None,
+        }
+    }
+
+    /// `true` unless the caller passed no deps argument at all. An unreadable
+    /// argument still declares a deps array — the caller wrote one, and saying
+    /// otherwise puts "this effect re-runs after every render" on a gated hook.
+    pub fn is_declared(&self) -> bool {
+        !matches!(self, DepsArg::Absent)
+    }
+
+    pub fn map_exprs(self, f: impl FnMut(Expr) -> Expr) -> Self {
+        match self {
+            DepsArg::List(l) => DepsArg::List(l.map_exprs(f)),
+            other => other,
+        }
+    }
+}
+
+/// A written dependency array, with whatever lowering could keep of it.
+///
+/// `elems` holds the elements the IR can see: an elision contributes none, and
+/// a spread contributes its *source* as one element standing for however many
+/// it holds. `arity` says how long the source array actually is.
+///
+/// Enumerating `elems` is sound whenever the enumeration makes a rule **fire** —
+/// each element over-approximates what it stands for. It is NOT sound when the
+/// enumeration makes a rule *stop*: crediting `[...rows]` as declaring `rows`
+/// suppresses a stale-capture finding React itself would report, because React
+/// compares `rows[0], rows[1], …` and never `rows`.
+#[derive(Debug, Clone)]
+pub struct DepsList {
+    pub elems: Vec<Expr>,
+    pub arity: Arity,
+    /// Positions in `elems` that came from a spread — see
+    /// [`DepsList::covering`], which is the reason the field exists.
+    pub spread_at: Vec<usize>,
+}
+
+impl DepsList {
+    /// A list whose elements are known one-for-one — every literal `[a, b]`,
+    /// and every hand-built IR fixture.
+    pub fn exact(elems: Vec<Expr>) -> Self {
+        let n = elems.len();
+        DepsList {
+            elems,
+            arity: Arity::Exact(n),
+            spread_at: vec![],
+        }
+    }
+
+    /// The entries that actually **cover** a read — every visible element
+    /// except a spread's source.
+    ///
+    /// This is the line between the two ways a rule uses a deps list. Reading
+    /// `elems` to make a rule *fire* is sound however the list was truncated,
+    /// because each element over-approximates what it stands for. Reading it
+    /// to make a rule *stop* is not: React compares `rows[0], rows[1], …` and
+    /// never `rows`, so crediting a flattened `[...rows]` as declaring `rows`
+    /// suppresses a stale capture React itself reports. The elements written
+    /// beside the spread still cover their own reads, which is why this
+    /// filters rather than refusing the whole list.
+    pub fn covering(&self) -> std::borrow::Cow<'_, [Expr]> {
+        if self.spread_at.is_empty() {
+            return std::borrow::Cow::Borrowed(&self.elems);
+        }
+        std::borrow::Cow::Owned(
+            self.elems
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !self.spread_at.contains(i))
+                .map(|(_, e)| e.clone())
+                .collect(),
+        )
+    }
+
+    /// Every source entry is an element we can see — no spread flattened, no
+    /// elision dropped. What a reader needs before it may treat `elems` as the
+    /// whole list rather than a sample of it.
+    pub fn is_whole(&self) -> bool {
+        self.arity == Arity::Exact(self.elems.len())
+    }
+
+    /// Rewrite every element, keeping the arity — the IR-to-IR passes (remap,
+    /// splice) substitute expressions without changing what the source held.
     pub fn map_exprs(self, f: impl FnMut(Expr) -> Expr) -> Self {
         DepsList {
             elems: self.elems.into_iter().map(f).collect(),
-            exact: self.exact,
+            arity: self.arity,
+            spread_at: self.spread_at,
         }
     }
 
@@ -110,7 +246,7 @@ pub enum HookEntry {
     Effect {
         label: HookLabel,
         body_cfg: CFG,
-        deps: Option<DepsList>,
+        deps: DepsArg,
         span: Option<SourceRange>,
     },
     Memo {
@@ -119,7 +255,7 @@ pub enum HookEntry {
         /// `None` when the deps argument is absent or unreadable. React makes
         /// the argument mandatory in practice, but the IR must not invent an
         /// empty list for one it could not parse.
-        deps: Option<DepsList>,
+        deps: DepsArg,
         span: Option<SourceRange>,
     },
     Callback {
@@ -132,7 +268,7 @@ pub enum HookEntry {
         /// component-scope `options`).
         params: Vec<Var>,
         /// See [`HookEntry::Memo`]'s `deps`.
-        deps: Option<DepsList>,
+        deps: DepsArg,
         span: Option<SourceRange>,
     },
     Ref {
@@ -144,7 +280,7 @@ pub enum HookEntry {
         label: HookLabel,
         name: Symbol,
         args: Vec<Expr>,
-        deps: Option<DepsList>,
+        deps: DepsArg,
         /// Variable in the caller's render CFG that receives the hook's return value.
         binding: Option<Var>,
         /// NPM package the hook was imported from, if determinable at parse

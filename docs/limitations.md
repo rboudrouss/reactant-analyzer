@@ -156,12 +156,15 @@ call-site arguments, read at the call's own block — ADR-023 §2's own escape,
 since the bind-once rule answers Unknown for exactly the case §2 warns about;
 the setter-argument position stays gated, [#67](https://github.com/rboudrouss/reactant-analyzer/issues/67))
 **→ 14/22** (2026-09-01, [#104](https://github.com/rboudrouss/reactant-analyzer/issues/104) +
-[#113](https://github.com/rboudrouss/reactant-analyzer/issues/113): deps lists carry an `exact` bit, which
-discharges ADR-023 §4's own gate and lets the `every` quantifier ship — it
-refuses a list the IR could not read exactly, and leaves ⊤-handling to the
-body's name list rather than folding it into the quantifier, so the two
-quantifiers of a verdict guard agree; `guardrails/inert-single-dep` quantifies
-instead of pinning its arity, which closes [#69](https://github.com/rboudrouss/reactant-analyzer/issues/69)).
+[#113](https://github.com/rboudrouss/reactant-analyzer/issues/113): deps arguments carry a real arity and a
+three-state reading — absent, opaque, written — which discharges ADR-023 §4's
+own gate and lets the `every` quantifier ship. ⊤-handling stays with the body's
+name list rather than being folded into the quantifier, so the two quantifiers
+of a verdict guard agree; `guardrails/inert-single-dep` quantifies instead of
+pinning its arity, which closes [#69](https://github.com/rboudrouss/reactant-analyzer/issues/69). The discipline the
+arity buys is one sentence: a reader may enumerate a truncated deps list to
+make a rule **fire**, never to make one *stop*, and it may answer an arity
+question only from what the bound settles.)
 Run
 `cargo test --test catalogue -- --nocapture` for the full blocked-entry report. What still blocks,
 in decreasing leverage: prop, provider-value and setter-argument positions carry no expression

@@ -261,7 +261,7 @@ fn check_setter_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::hooks::DepsList;
+    use crate::ir::hooks::{DepsArg, DepsList};
     use crate::{
         domains::{
             Stability, StateValue,
@@ -494,7 +494,7 @@ mod tests {
             hooks: vec![HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
-                deps: Some(DepsList::exact(vec![])),
+                deps: DepsArg::List(DepsList::exact(vec![])),
                 span: None,
             }],
             ..crate::test_support::analysis_result(render_cfg)

@@ -510,16 +510,18 @@ fn catalogue() -> Vec<Entry> {
                     "import { useEffect, useRef, useState } from \"react\";\nfunction C() {\n  const box = useRef(null);\n  const [n, setN] = useState(0);\n  useEffect(() => { search(box.current, n); }, [box, n]);\n  return <button onClick={() => setN(n + 1)}>x</button>;\n}",
                 ),
                 weakened: Some(
-                    "exact literal deps lists only — an absent or truncated list (`[...rest]`, \
-                     an elision) fails the quantifier rather than quantifying over a domain \
-                     the IR cannot enumerate (#104). Whether ⊤ counts is the body's name \
-                     list, not the quantifier's: with `is: [\"stable\"]` a dep the engine \
-                     cannot classify (a root component's prop, an unresolved hook's return) \
-                     fails it, so the class is silent there — a precision limit, not a \
-                     missed claim, since \"can never re-run\" is exactly what those deps \
-                     leave unproven; `is: [\"stable\", \"unknown\"]` buys the may reading \
-                     at the cost of firing on every ⊤-keyed effect. Never Certified: a rule \
-                     using `every` may not carry a `must_*`, so the class caps at Warning",
+                    "written deps arrays only — an absent or unreadable argument supplies no \
+                     element to quantify over, so the quantifier fails there and an \
+                     `analysis-limit` Info marks the hook instead (#104). A spread is folded \
+                     over its source, which is sound but coarse: a stable source means stable \
+                     contents, an unclassifiable one refutes the ∀. Whether ⊤ counts is the \
+                     body's name list, not the quantifier's: with `is: [\"stable\"]` a dep \
+                     the engine cannot classify (a root component's prop, an unresolved \
+                     hook's return) fails it, so the class is silent there — a precision \
+                     limit, not a missed claim, since \"can never re-run\" is exactly what \
+                     those deps leave unproven; `is: [\"stable\", \"unknown\"]` buys the \
+                     may reading at the cost of firing on every ⊤-keyed effect. Never \
+                     Certified: a rule using `every` may not carry a `must_*`",
                 ),
             },
         },

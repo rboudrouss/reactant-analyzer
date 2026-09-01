@@ -1,7 +1,11 @@
 use crate::rules::RuleCtx;
 use std::collections::HashSet;
 
-use crate::ir::{expr::Expr, hooks::HookEntry, types::Var};
+use crate::ir::{
+    expr::Expr,
+    hooks::{DepsArg, HookEntry},
+    types::Var,
+};
 
 use crate::rules::{
     Diagnostic, MustResult, Rule, all_setter_labels, collect_setter_calls,
@@ -60,7 +64,7 @@ impl Rule for DerivedState {
             let HookEntry::Effect {
                 label: eff_label,
                 body_cfg,
-                deps: Some(deps),
+                deps: DepsArg::List(deps),
                 span,
                 ..
             } = hook
@@ -68,10 +72,12 @@ impl Rule for DerivedState {
                 continue;
             };
 
-            // Dep array must be exactly 1 state variable — and be *known* to
-            // hold one: a list whose lowering dropped or flattened an element
-            // has no arity to test against.
-            if deps.len() != 1 || !deps.exact {
+            // Dep array must be exactly 1 state variable: one visible element,
+            // and an arity that does not refute there being only one. An
+            // elision refutes it (`[a, ,]` declares two); a flattened spread
+            // cannot, so `[...tags]` stays in — withholding the finding there
+            // would be the false-negative direction.
+            if deps.len() != 1 || !deps.arity.may_be(1) {
                 continue;
             }
             let dep_var = match &deps.as_slice()[0] {
