@@ -68,11 +68,13 @@ impl Rule for DerivedState {
                 continue;
             };
 
-            // Dep array must be exactly 1 state variable.
-            if deps.len() != 1 {
+            // Dep array must be exactly 1 state variable — and be *known* to
+            // hold one: a list whose lowering dropped or flattened an element
+            // has no arity to test against.
+            if deps.len() != 1 || !deps.exact {
                 continue;
             }
-            let dep_var = match &deps[0] {
+            let dep_var = match &deps.as_slice()[0] {
                 Expr::Var(v) if state_var_names.contains(v) => v.clone(),
                 _ => continue,
             };

@@ -33,7 +33,7 @@ impl Rule for MissingDeps {
         result
             .components
             .get(component)
-            .is_some_and(|c| c.effect_info.values().any(|e| e.has_deps_array))
+            .is_some_and(|c| c.effect_info.values().any(|e| e.has_deps_array()))
             .then_some(crate::rules::SafeCheck {
                 rule: Self::NAME,
                 message: "every effect declares the variables it reads",
@@ -47,12 +47,12 @@ impl Rule for MissingDeps {
         let mut diags = Vec::new();
 
         for (label, info) in &result.effect_info {
-            if !info.has_deps_array {
+            if !info.has_deps_array() {
                 // no deps array → runs every render → no stale capture
                 continue;
             }
 
-            let declared: Vec<AccessPath> = dep_paths(&info.declared_deps);
+            let declared: Vec<AccessPath> = dep_paths(info.declared_deps());
 
             for path in &info.free_paths {
                 if path_covered(path, &declared) {
@@ -179,6 +179,7 @@ mod tests {
         ir::{
             cfg::CFG,
             expr::{Expr, Prim},
+            hooks::DepsList,
             types::{BlockId, HookLabel},
         },
         rules::Rule,
@@ -233,8 +234,7 @@ mod tests {
                 label: 0,
                 kind: HookKind::Effect,
                 free_paths: fp(&["n"]),
-                declared_deps: vec![Expr::Lit(Prim::Bool(true))],
-                has_deps_array: true,
+                deps: Some(DepsList::exact(vec![Expr::Lit(Prim::Bool(true))])),
                 span: None,
             },
         );
@@ -259,8 +259,7 @@ mod tests {
                 label: 0,
                 kind: HookKind::Effect,
                 free_paths: fp(&["setN"]),
-                declared_deps: vec![Expr::Lit(Prim::Unit)],
-                has_deps_array: true,
+                deps: Some(DepsList::exact(vec![Expr::Lit(Prim::Unit)])),
                 span: None,
             },
         );
@@ -287,8 +286,7 @@ mod tests {
                 label: 0,
                 kind: HookKind::Effect,
                 free_paths: fp(&["n"]),
-                declared_deps: vec![Expr::Var("n".to_string())],
-                has_deps_array: true,
+                deps: Some(DepsList::exact(vec![Expr::Var("n".to_string())])),
                 span: None,
             },
         );
@@ -320,11 +318,10 @@ mod tests {
                     root: "memo".to_string(),
                     segments: vec!["content".to_string()],
                 }]),
-                declared_deps: vec![Expr::FieldAccess {
+                deps: Some(DepsList::exact(vec![Expr::FieldAccess {
                     obj: Box::new(Expr::Var("memo".to_string())),
                     field: "content".to_string(),
-                }],
-                has_deps_array: true,
+                }])),
                 span: None,
             },
         );
@@ -357,11 +354,10 @@ mod tests {
                     root: "memo".to_string(),
                     segments: vec!["a".to_string()],
                 }]),
-                declared_deps: vec![Expr::FieldAccess {
+                deps: Some(DepsList::exact(vec![Expr::FieldAccess {
                     obj: Box::new(Expr::Var("memo".to_string())),
                     field: "b".to_string(),
-                }],
-                has_deps_array: true,
+                }])),
                 span: None,
             },
         );
@@ -391,8 +387,7 @@ mod tests {
                     root: "memo".to_string(),
                     segments: vec!["a".to_string()],
                 }]),
-                declared_deps: vec![Expr::Var("memo".to_string())],
-                has_deps_array: true,
+                deps: Some(DepsList::exact(vec![Expr::Var("memo".to_string())])),
                 span: None,
             },
         );
@@ -421,11 +416,10 @@ mod tests {
                 label: 0,
                 kind: HookKind::Effect,
                 free_paths: fp(&["other"]),
-                declared_deps: vec![Expr::FieldAccess {
+                deps: Some(DepsList::exact(vec![Expr::FieldAccess {
                     obj: Box::new(Expr::Var("memo".to_string())),
                     field: "content".to_string(),
-                }],
-                has_deps_array: true,
+                }])),
                 span: None,
             },
         );
@@ -453,8 +447,7 @@ mod tests {
                 label: 0,
                 kind: HookKind::Effect,
                 free_paths: fp(&["n"]),
-                declared_deps: vec![],
-                has_deps_array: false,
+                deps: None,
                 span: None,
             },
         );
@@ -484,8 +477,7 @@ mod tests {
                 label: 0,
                 kind: HookKind::Effect,
                 free_paths: fp(&["n"]),
-                declared_deps: vec![],
-                has_deps_array: true,
+                deps: Some(DepsList::exact(vec![])),
                 span: None,
             },
         );
@@ -514,8 +506,7 @@ mod tests {
                 label: 0,
                 kind: HookKind::Effect,
                 free_paths: fp(&["x"]),
-                declared_deps: vec![Expr::Lit(Prim::Unit)],
-                has_deps_array: true,
+                deps: Some(DepsList::exact(vec![Expr::Lit(Prim::Unit)])),
                 span: None,
             },
         );
@@ -538,8 +529,7 @@ mod tests {
                 label: 0,
                 kind: HookKind::Callback,
                 free_paths: fp(&["n"]),
-                declared_deps: vec![],
-                has_deps_array: true,
+                deps: Some(DepsList::exact(vec![])),
                 span: None,
             },
         );
@@ -569,8 +559,7 @@ mod tests {
                 label: 0,
                 kind: HookKind::Memo,
                 free_paths: fp(&["n"]),
-                declared_deps: vec![],
-                has_deps_array: true,
+                deps: Some(DepsList::exact(vec![])),
                 span: None,
             },
         );
@@ -599,8 +588,7 @@ mod tests {
                 label: 0,
                 kind: HookKind::Callback,
                 free_paths: fp(&["n"]),
-                declared_deps: vec![Expr::Var("n".to_string())],
-                has_deps_array: true,
+                deps: Some(DepsList::exact(vec![Expr::Var("n".to_string())])),
                 span: None,
             },
         );
@@ -627,8 +615,7 @@ mod tests {
                 label: 0,
                 kind: HookKind::Effect,
                 free_paths: fp(&["fetch"]),
-                declared_deps: vec![Expr::Lit(Prim::Unit)],
-                has_deps_array: true,
+                deps: Some(DepsList::exact(vec![Expr::Lit(Prim::Unit)])),
                 span: None,
             },
         );

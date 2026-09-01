@@ -388,12 +388,13 @@ fn rename_vars_expr(expr: Expr, ren: &HashMap<Var, Var>) -> Expr {
                 .map(|(k, v)| (k, rename_vars_expr(v, ren)))
                 .collect(),
         },
-        Expr::ArrayLit { id, elems } => Expr::ArrayLit {
+        Expr::ArrayLit { id, elems, exact } => Expr::ArrayLit {
             id,
             elems: elems
                 .into_iter()
                 .map(|e| rename_vars_expr(e, ren))
                 .collect(),
+            exact,
         },
         Expr::FieldAccess { obj, field } => Expr::FieldAccess {
             obj: Box::new(rename_vars_expr(*obj, ren)),
@@ -482,7 +483,7 @@ pub fn rename_hook_entry(entry: HookEntry, ren: &HashMap<Var, Var>) -> HookEntry
         } => HookEntry::Effect {
             label,
             body_cfg: rename_vars_cfg(body_cfg, ren),
-            deps: deps.map(|v| v.into_iter().map(|e| rename_vars_expr(e, ren)).collect()),
+            deps: deps.map(|d| d.map_exprs(|e| rename_vars_expr(e, ren))),
             span,
         },
         HookEntry::Memo {
@@ -493,7 +494,7 @@ pub fn rename_hook_entry(entry: HookEntry, ren: &HashMap<Var, Var>) -> HookEntry
         } => HookEntry::Memo {
             label,
             body_cfg: rename_vars_cfg(body_cfg, ren),
-            deps: deps.into_iter().map(|e| rename_vars_expr(e, ren)).collect(),
+            deps: deps.map(|d| d.map_exprs(|e| rename_vars_expr(e, ren))),
             span,
         },
         HookEntry::Callback {
@@ -510,7 +511,7 @@ pub fn rename_hook_entry(entry: HookEntry, ren: &HashMap<Var, Var>) -> HookEntry
                 label,
                 body_cfg: rename_vars_cfg(body_cfg, &inner),
                 params,
-                deps: deps.into_iter().map(|e| rename_vars_expr(e, ren)).collect(),
+                deps: deps.map(|d| d.map_exprs(|e| rename_vars_expr(e, ren))),
                 span,
             }
         }
@@ -538,7 +539,7 @@ pub fn rename_hook_entry(entry: HookEntry, ren: &HashMap<Var, Var>) -> HookEntry
             label,
             name,
             args: args.into_iter().map(|e| rename_vars_expr(e, ren)).collect(),
-            deps: deps.map(|v| v.into_iter().map(|e| rename_vars_expr(e, ren)).collect()),
+            deps: deps.map(|d| d.map_exprs(|e| rename_vars_expr(e, ren))),
             binding,
             import_source,
             resolved_file,
@@ -584,12 +585,13 @@ pub fn subst_vars_expr(expr: Expr, subst: &HashMap<Var, Expr>) -> Expr {
                 .map(|(k, v)| (k, subst_vars_expr(v, subst)))
                 .collect(),
         },
-        Expr::ArrayLit { id, elems } => Expr::ArrayLit {
+        Expr::ArrayLit { id, elems, exact } => Expr::ArrayLit {
             id,
             elems: elems
                 .into_iter()
                 .map(|e| subst_vars_expr(e, subst))
                 .collect(),
+            exact,
         },
         Expr::FieldAccess { obj, field } => Expr::FieldAccess {
             obj: Box::new(subst_vars_expr(*obj, subst)),

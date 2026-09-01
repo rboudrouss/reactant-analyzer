@@ -261,7 +261,7 @@ impl Rule for StaleClosure {
                 // a cleanup problem, not a staleness one).
                 continue;
             };
-            let declared = dep_paths(dep_exprs);
+            let declared = dep_paths(dep_exprs.as_slice());
             let mount_only = dep_exprs.is_empty();
 
             let mut fn_bodies = collect_fn_bindings(body_cfg);

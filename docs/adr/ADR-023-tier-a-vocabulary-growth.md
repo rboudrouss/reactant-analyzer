@@ -136,6 +136,40 @@ it is guard-tree composition with no quantifier hazard, and it is the natural
 occasion to collapse `exec.rs`'s two duplicated guard matches into one recursive
 `eval_guard`.
 
+#### Amendment (2026-09-01): the condition is discharged; `every` ships
+
+The gate this section set — "gated on making truncation representable in the
+IR" — is now met. `Expr::ArrayLit` carries an `exact` bit, set at lowering while
+the distinction still exists and cleared by a flattened spread or a dropped
+elision, and a deps argument that is not an array literal yields no deps list at
+all instead of the `[]` this section names. That bit **is** the representation
+the gate asked for: the second refusal reason no longer holds, because a pack
+author now has the signal that distinguishes "zero deps" from "deps I could not
+see".
+
+The first reason — ⊤ folding to "violates" — was never an argument against ∀,
+only against the naive one. It is answered by the semantics this section
+already blessed, which ship verbatim as the contract of the `every` guard:
+
+- **"No element *definitely* violates"**, so a ⊤ element satisfies. Suppressing
+  on a may-fact stays forbidden.
+- **Typed may**, and **positive-only**: the validator rejects a negated form,
+  the same posture as `writer_phases` (ADR-027 §1).
+- **An inexact or absent list fails the guard.** ∀ over a domain the engine
+  cannot enumerate is the vacuity hazard named above; the guard refuses rather
+  than answering from the elements it happens to have. This is the shipped
+  absent-⇒-fail discipline of the field guards, and it is the same rule the
+  `count` guard now follows for the same reason.
+- **Structurally excluded from the `proofs` vector** in `exec.rs`'s recursive
+  `eval_guard`, so no `every`-guarded rule can mint `Certified`. Severity being
+  `pin ⊓ polarity`, such findings cap at Warning by construction (ADR-021: no
+  Error authority from an untrusted frontend).
+
+What this replaces is the arity pin. `count equals 1` was the workaround this
+section named, and per-N copies of a rule are exactly the per-rule hack the
+project forbids; `guardrails/inert-single-dep` quantifies instead of pinning.
+Disjunction remains a separate, unaffected track.
+
 ### 5. Starlark is rejected; the community authoring path is JS/TS compiled to Tier-A JSON
 
 **This supersedes ADR-022 §7.** That section chose Starlark for Tier B and

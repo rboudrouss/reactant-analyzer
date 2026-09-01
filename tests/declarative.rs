@@ -1951,3 +1951,88 @@ fn identity_is_not_a_deps_entry_fact() {
     ));
     assert!(e.message.contains("identity"), "{e}");
 }
+
+#[test]
+fn count_refuses_a_deps_list_whose_arity_the_ir_does_not_know() {
+    // An arity guard needs an arity. Lowering flattens `[...rest]` into its
+    // source and drops elisions, so `elems.len()` stops being the source
+    // array's length — and a deps argument that is not an array literal has no
+    // length at all. In all three the guard fails rather than answering from a
+    // number it cannot stand behind (#104).
+    const PACK: &str = r#"{"schemaVersion":1,"name":"t","rules":[
+        {"id":"one-dep","docs":{"description":"d","why":"w","fix":"f"},
+         "severity":"warning",
+         "anchor":{"relation":"hook_calls","kind":"effect"},
+         "guards":[{"kind":"count","of":"anchor.deps","equals":1}],
+         "message":"exactly one dep"}]}"#;
+
+    let exact = run_pack(
+        PACK,
+        r#"
+        function C({ a }) {
+            useEffect(() => { console.log(a); }, [a]);
+            return <div/>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(exact.len(), 1, "a written `[a]` has arity 1: {exact:?}");
+
+    for deps_arg in ["[...rest]", "[a, ,]", "rest"] {
+        let src = format!(
+            r#"
+            function C({{ a, rest }}) {{
+                useEffect(() => {{ console.log(a, rest); }}, {deps_arg});
+                return <div/>;
+            }}
+            "#
+        );
+        let got = run_pack(PACK, &src, &Options::new());
+        assert!(
+            got.is_empty(),
+            "`{deps_arg}` has no knowable arity, so `count` must refuse: {got:?}"
+        );
+    }
+}
+
+#[test]
+fn deps_declared_is_false_for_a_deps_argument_the_ir_cannot_read() {
+    // The shipped misreading: an unreadable deps argument was truncated to `[]`
+    // and then reported as an empty array that is definitely present, so
+    // `deps_declared: false` could never match one. A written `[]` still does
+    // declare a deps array — that half must not move.
+    const PACK: &str = r#"{"schemaVersion":1,"name":"t","rules":[
+        {"id":"no-deps","docs":{"description":"d","why":"w","fix":"f"},
+         "severity":"warning",
+         "anchor":{"relation":"hook_calls","kind":"effect"},
+         "guards":[{"kind":"deps_declared","of":"anchor","eq":false}],
+         "message":"no deps array"}]}"#;
+
+    let unreadable = run_pack(
+        PACK,
+        r#"
+        function C({ rest }) {
+            useEffect(() => { console.log(rest); }, rest);
+            return <div/>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert_eq!(
+        unreadable.len(),
+        1,
+        "a deps argument the IR cannot read declares no deps array: {unreadable:?}"
+    );
+
+    let written = run_pack(
+        PACK,
+        r#"
+        function C() {
+            useEffect(() => { console.log(1); }, []);
+            return <div/>;
+        }
+        "#,
+        &Options::new(),
+    );
+    assert!(written.is_empty(), "`[]` does declare deps: {written:?}");
+}

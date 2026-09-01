@@ -149,10 +149,14 @@ pub trait Transfer {
     /// `ctx` carries the real analysis stores so a dep can be evaluated through
     /// the normal path (`MemoVal`/heap reads resolve against the current
     /// fixpoint state instead of a fabricated empty store).
+    ///
+    /// `deps` is `None` when the hook declares no readable deps array. That is
+    /// not the same as `Some([])`: an empty array pins the memo forever, while
+    /// an unreadable one bounds nothing, so the two must not share an answer.
     fn recompute_memo(
         &self,
         component: &crate::ir::types::Symbol,
-        deps: &[Expr],
+        deps: Option<&crate::ir::hooks::DepsList>,
         env: &AbstractEnv<Self::Domain>,
         ctx: &mut context::AnalysisCtx<Self::Domain>,
     ) -> Self::Domain;

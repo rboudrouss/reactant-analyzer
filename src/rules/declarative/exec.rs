@@ -386,21 +386,32 @@ impl TierARule {
                 };
                 e.writer_phase_includes(row.info.label, includes)
             }
+            // An arity guard needs an arity. A hook with no readable deps
+            // array — or one whose lowering dropped or flattened an element —
+            // does not have zero dependencies, it has an unknown number of
+            // them, so the guard refuses rather than answering from a length
+            // that is not the source array's.
             ResolvedGuard::Count(cmp) => {
-                let len = cand
+                match cand
                     .row()
                     .and_then(|r| r.effect)
-                    .map_or(0, |i| i.declared_deps.len()) as u64;
-                match cmp {
-                    CountCmp::MoreThan(n) => len > *n,
-                    CountCmp::LessThan(n) => len < *n,
-                    CountCmp::Equals(n) => len == *n,
+                    .and_then(|i| i.deps_arity())
+                {
+                    Some(len) => {
+                        let len = len as u64;
+                        match cmp {
+                            CountCmp::MoreThan(n) => len > *n,
+                            CountCmp::LessThan(n) => len < *n,
+                            CountCmp::Equals(n) => len == *n,
+                        }
+                    }
+                    None => false,
                 }
             }
             ResolvedGuard::DepsDeclared { eq } => {
                 cand.row()
                     .and_then(|r| r.effect)
-                    .is_some_and(|i| i.has_deps_array)
+                    .is_some_and(|i| i.has_deps_array())
                     == *eq
             }
             ResolvedGuard::Must { kind, els, .. } => match (self.certify(e, cand, *kind), els) {

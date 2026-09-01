@@ -90,6 +90,15 @@ pub enum Expr {
     ArrayLit {
         id: ExprId,
         elems: Vec<Expr>,
+        /// `false` when lowering could not keep the source array element for
+        /// element: a `SpreadElement` is flattened into its source (one element
+        /// standing for however many it holds) and an elision is dropped
+        /// entirely. `elems` still over-approximates what the array *reads*, so
+        /// value analyses are unaffected — but its **length** is no longer the
+        /// source array's length, and nothing downstream can recover the
+        /// difference. This is the last point where it is knowable, which is
+        /// why the bit is recorded here rather than derived later.
+        exact: bool,
     },
     FnLit {
         id: ExprId,

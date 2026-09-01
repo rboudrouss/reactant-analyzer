@@ -11,6 +11,7 @@ use crate::{
     },
     ir::{
         expr::{BinOp, Expr, MarkerVal, Prim, UnaryOp},
+        hooks::DepsList,
         stmt::Stmt,
         types::{ExprId, Symbol},
     },
@@ -53,14 +54,27 @@ impl Transfer for StateValueTransfer {
     fn recompute_memo(
         &self,
         component: &Symbol,
-        deps: &[Expr],
+        deps: Option<&DepsList>,
         env: &AbstractEnv<StateValue>,
         ctx: &mut AnalysisCtx<StateValue>,
     ) -> StateValue {
+        // No readable deps array: the memo may recompute on any render and may
+        // equally never recompute — ⊤. `Stable` here would be a *must* claim
+        // about a list the IR never saw, which is how `useMemo(fn, deps)` used
+        // to read as pinned forever.
+        let Some(deps) = deps else {
+            return StateValue::reference(Stability::Unknown);
+        };
         if deps.is_empty() {
-            return StateValue::reference(Stability::Stable);
+            // `[]` pins the memo — but only a list that is *known* empty. An
+            // elision-only array (`[, ]`) also lowers to zero elements.
+            return StateValue::reference(if deps.exact {
+                Stability::Stable
+            } else {
+                Stability::Unknown
+            });
         }
-        let stability = deps.iter().fold(Stability::Bottom, |acc, dep| {
+        let stability = deps.as_slice().iter().fold(Stability::Bottom, |acc, dep| {
             // Structural projection (ADR-017): a dep that IS a state slot
             // versions the memo by that slot regardless of the slot's kind —
             // it changes only at the slot's setter events, `Versioned({l})`.
@@ -2072,6 +2086,7 @@ mod tests {
                         args: vec![Expr::ArrayLit {
                             id: crate::ir::types::ExprId(0),
                             elems: vec![Expr::Var("p1".to_string())],
+                            exact: true,
                         }],
                     }),
                     field: "then".to_string(),

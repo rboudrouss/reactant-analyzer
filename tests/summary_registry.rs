@@ -218,9 +218,9 @@ fn unresolved_custom_hook_return_is_not_provably_stable() {
     let effect = comp
         .effect_info
         .values()
-        .find(|e| !e.declared_deps.is_empty())
+        .find(|e| !e.declared_deps().is_empty())
         .expect("the effect declares a dep");
-    let dep = &effect.declared_deps[0];
+    let dep = &effect.declared_deps()[0];
     let name = "C".to_string();
     let ctx = RuleCtx::new(&result, &name);
 
@@ -405,12 +405,12 @@ fn an_unmodelled_react_hook_return_is_not_provably_stable() {
     let effect = comp
         .effect_info
         .values()
-        .find(|e| !e.declared_deps.is_empty())
+        .find(|e| !e.declared_deps().is_empty())
         .expect("the effect declares a dep");
     let name = "C".to_string();
     let ctx = RuleCtx::new(&result, &name);
     assert_eq!(
-        ctx.stability_verdict(&effect.declared_deps[0]),
+        ctx.stability_verdict(&effect.declared_deps()[0]),
         StabilityVerdict::Unknown,
         "a context value is not provably stable — the engine has no model for it"
     );

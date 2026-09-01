@@ -43,7 +43,11 @@ impl Rule for AlwaysUnstableDeps {
         result
             .components
             .get(component)
-            .is_some_and(|c| c.effect_info.values().any(|e| !e.declared_deps.is_empty()))
+            .is_some_and(|c| {
+                c.effect_info
+                    .values()
+                    .any(|e| !e.declared_deps().is_empty())
+            })
             .then_some(crate::rules::SafeCheck {
                 rule: Self::NAME,
                 message: "no deps array is defeated by an always-fresh reference",
@@ -66,10 +70,16 @@ impl Rule for AlwaysUnstableDeps {
                     ..
                 } => (*label, deps.as_slice(), HookKind::Effect, *span),
                 HookEntry::Memo {
-                    label, deps, span, ..
+                    label,
+                    deps: Some(deps),
+                    span,
+                    ..
                 } => (*label, deps.as_slice(), HookKind::Memo, *span),
                 HookEntry::Callback {
-                    label, deps, span, ..
+                    label,
+                    deps: Some(deps),
+                    span,
+                    ..
                 } => (*label, deps.as_slice(), HookKind::Callback, *span),
                 _ => continue,
             };
@@ -168,6 +178,7 @@ fn fmt_indices(idx: &[usize]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::hooks::DepsList;
     use crate::{
         domains::StateValueTransfer,
         engine::{Config, ProgramAnalysisResult, analyze_component},
@@ -225,10 +236,10 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 0,
             body_cfg: empty_cfg(),
-            deps: Some(vec![Expr::ObjectLit {
+            deps: Some(DepsList::exact(vec![Expr::ObjectLit {
                 id: ExprId(0),
                 fields: vec![],
-            }]),
+            }])),
             span: None,
         }];
         let comp = component(hooks, vec![]);
@@ -245,11 +256,11 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 0,
             body_cfg: empty_cfg(),
-            deps: Some(vec![Expr::FnLit {
+            deps: Some(DepsList::exact(vec![Expr::FnLit {
                 id: ExprId(0),
                 params: vec![],
                 body_cfg: Arc::new(empty_cfg()),
-            }]),
+            }])),
             span: None,
         }];
         let comp = component(hooks, vec![]);
@@ -264,7 +275,7 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 0,
             body_cfg: empty_cfg(),
-            deps: Some(vec![Expr::Lit(Prim::Int(42))]),
+            deps: Some(DepsList::exact(vec![Expr::Lit(Prim::Int(42))])),
             span: None,
         }];
         let comp = component(hooks, vec![]);
@@ -282,7 +293,7 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 0,
             body_cfg: empty_cfg(),
-            deps: Some(vec![]),
+            deps: Some(DepsList::exact(vec![])),
             span: None,
         }];
         let comp = component(hooks, vec![]);
@@ -319,13 +330,13 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 0,
             body_cfg: empty_cfg(),
-            deps: Some(vec![
+            deps: Some(DepsList::exact(vec![
                 Expr::ObjectLit {
                     id: ExprId(0),
                     fields: vec![],
                 },
                 Expr::Lit(Prim::Int(42)),
-            ]),
+            ])),
             span: None,
         }];
         let comp = component(hooks, vec![]);
@@ -345,7 +356,10 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 0,
             body_cfg: empty_cfg(),
-            deps: Some(vec![Expr::Lit(Prim::Int(42)), Expr::Lit(Prim::Bool(true))]),
+            deps: Some(DepsList::exact(vec![
+                Expr::Lit(Prim::Int(42)),
+                Expr::Lit(Prim::Bool(true)),
+            ])),
             span: None,
         }];
         let comp = component(hooks, vec![]);
@@ -362,10 +376,10 @@ mod tests {
         let hooks = vec![HookEntry::Memo {
             label: 0,
             body_cfg: empty_cfg(),
-            deps: vec![Expr::ObjectLit {
+            deps: Some(DepsList::exact(vec![Expr::ObjectLit {
                 id: ExprId(0),
                 fields: vec![],
-            }],
+            }])),
             span: None,
         }];
         let comp = component(hooks, vec![]);
@@ -437,10 +451,11 @@ mod tests {
             label: 0,
             body_cfg: empty_cfg(),
             params: vec![],
-            deps: vec![Expr::ArrayLit {
+            deps: Some(DepsList::exact(vec![Expr::ArrayLit {
                 id: ExprId(0),
                 elems: vec![],
-            }],
+                exact: true,
+            }])),
             span: None,
         }];
         let comp = component(hooks, vec![]);

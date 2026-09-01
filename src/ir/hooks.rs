@@ -41,6 +41,65 @@ pub struct HookProvenance {
     pub span: Option<SourceRange>,
 }
 
+/// A dependency array as the IR was able to read it.
+///
+/// `None` in place of a `DepsList` means *no deps array was seen* — either the
+/// argument is absent (`useEffect(fn)`) or it is not an array literal
+/// (`useMemo(fn, deps)`, a variable). Those two are alike where it counts: the
+/// engine cannot enumerate the dependencies, so it must not pretend to. The
+/// truncation this replaces — folding an unreadable argument to `[]` — read as
+/// "an empty deps array is present", which is the strongest possible claim
+/// about a list nobody could see.
+///
+/// `exact` carries [`Expr::ArrayLit`]'s own bit: `false` once a spread was
+/// flattened or an elision dropped, so `elems.len()` is no longer the source
+/// array's length. Enumerating the elements stays sound either way (each one
+/// over-approximates what it stands for); *counting* or *quantifying* over them
+/// does not, which is why every arity guard fails closed on `exact: false`.
+#[derive(Debug, Clone)]
+pub struct DepsList {
+    pub elems: Vec<Expr>,
+    pub exact: bool,
+}
+
+impl DepsList {
+    /// A deps list whose elements are known one-for-one — what every literal
+    /// `[a, b]` and every hand-built IR fixture produces.
+    pub fn exact(elems: Vec<Expr>) -> Self {
+        DepsList { elems, exact: true }
+    }
+
+    /// The deps list of an array-literal argument; anything else is `None`.
+    pub fn from_expr(expr: Expr) -> Option<Self> {
+        match expr {
+            Expr::ArrayLit { elems, exact, .. } => Some(DepsList { elems, exact }),
+            _ => None,
+        }
+    }
+
+    /// Rewrite every element in place, keeping `exact` — the IR-to-IR passes
+    /// (remap, splice) substitute expressions without changing what the source
+    /// array held.
+    pub fn map_exprs(self, f: impl FnMut(Expr) -> Expr) -> Self {
+        DepsList {
+            elems: self.elems.into_iter().map(f).collect(),
+            exact: self.exact,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[Expr] {
+        &self.elems
+    }
+
+    pub fn len(&self) -> usize {
+        self.elems.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.elems.is_empty()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum HookEntry {
     State {
@@ -51,13 +110,16 @@ pub enum HookEntry {
     Effect {
         label: HookLabel,
         body_cfg: CFG,
-        deps: Option<Vec<Expr>>,
+        deps: Option<DepsList>,
         span: Option<SourceRange>,
     },
     Memo {
         label: HookLabel,
         body_cfg: CFG,
-        deps: Vec<Expr>,
+        /// `None` when the deps argument is absent or unreadable. React makes
+        /// the argument mandatory in practice, but the IR must not invent an
+        /// empty list for one it could not parse.
+        deps: Option<DepsList>,
         span: Option<SourceRange>,
     },
     Callback {
@@ -69,7 +131,8 @@ pub enum HookEntry {
         /// of any same-named outer binding (`(options) => …` shadowing a
         /// component-scope `options`).
         params: Vec<Var>,
-        deps: Vec<Expr>,
+        /// See [`HookEntry::Memo`]'s `deps`.
+        deps: Option<DepsList>,
         span: Option<SourceRange>,
     },
     Ref {
@@ -81,7 +144,7 @@ pub enum HookEntry {
         label: HookLabel,
         name: Symbol,
         args: Vec<Expr>,
-        deps: Option<Vec<Expr>>,
+        deps: Option<DepsList>,
         /// Variable in the caller's render CFG that receives the hook's return value.
         binding: Option<Var>,
         /// NPM package the hook was imported from, if determinable at parse

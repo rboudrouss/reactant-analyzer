@@ -74,8 +74,8 @@ Filtering guards, where the finding stays capped at Warning:
 | `writer_phases` | MAY existential over a state anchor's slot writers: passes when some write of the slot may run in one of the named phases. A ⊤ (`unknown`) write satisfies every query — suppressing on a may-fact would be a false negative. Positive-only, no negated form | `includes`, non-empty, from `render`, `effect`, `memo`, `callback`, `handler`, `deferred` (timer/microtask/promise continuation — proved outside every React phase), `cleanup` (an effect's returned function), `unknown` |
 | `name` | Source name of the resolved entity, meaning a custom hook's own name or the variable a state, memo, callback or ref binds | Exactly one of `one_of` or `prefix` |
 | `source` | Import specifier of a custom hook, such as `@chakra-ui/react`, which bans a whole dependency. A local or relatively-imported hook has none, and an absent value fails the guard instead of passing it | Exactly one of `one_of` or `prefix` |
-| `count` | Cardinality of `anchor.deps` | Exactly one of `equals`, `more_than` or `less_than` |
-| `deps_declared` | Does the anchor declare a deps array at all | `eq: true/false` |
+| `count` | Cardinality of `anchor.deps`. Fails when the engine does not know it: no readable deps array, or one whose lowering flattened a spread (`[...rest]`) or dropped an elision (`[a, , b]`), so the length is no longer the source array's. An unknown list does not have zero deps | Exactly one of `equals`, `more_than` or `less_than` |
+| `deps_declared` | Does the anchor declare a deps array at all. A written `[]` counts; an argument the engine cannot read (a variable) does not | `eq: true/false` |
 | `any_of` | Disjunction. The only way to write "X or Y" without duplicating the rule | `guards: [...]` |
 
 Certifying guards, the `must_*` family. When the engine answers "proved on

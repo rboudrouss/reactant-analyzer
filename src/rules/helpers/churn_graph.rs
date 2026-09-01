@@ -138,13 +138,14 @@ pub(in crate::rules) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec
             else {
                 continue;
             };
-            // Mount-only effects fire once: no loop.
-            if matches!(deps, Some(d) if d.is_empty()) {
+            // Mount-only effects fire once: no loop. A `[]` the IR only
+            // *thinks* is empty (an elision-only array) proves no such thing.
+            if matches!(deps, Some(d) if d.is_empty() && d.exact) {
                 continue;
             }
             let (exact_local, versioned) = match deps {
                 None => (HashSet::new(), HashSet::new()),
-                Some(d) => classify_effect_deps(d, comp_result, &state_vals, &memo_vals),
+                Some(d) => classify_effect_deps(d.as_slice(), comp_result, &state_vals, &memo_vals),
             };
             let mut calls = Vec::new();
             collect_churn_calls(

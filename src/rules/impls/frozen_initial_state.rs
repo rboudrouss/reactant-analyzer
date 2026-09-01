@@ -316,7 +316,7 @@ impl Rule for FrozenInitialState {
                     None => true, // re-runs every render
                     Some(deps) => seeds
                         .iter()
-                        .any(|s| deps_cover_seed(deps, s, &comp.param, &bindings)),
+                        .any(|s| deps_cover_seed(deps.as_slice(), s, &comp.param, &bindings)),
                 }
             });
             if synced {

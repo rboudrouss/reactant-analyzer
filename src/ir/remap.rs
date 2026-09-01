@@ -41,9 +41,10 @@ pub fn remap_expr(expr: Expr, offset: HookLabel) -> Expr {
                 .map(|(k, v)| (k, remap_expr(v, offset)))
                 .collect(),
         },
-        Expr::ArrayLit { id, elems } => Expr::ArrayLit {
+        Expr::ArrayLit { id, elems, exact } => Expr::ArrayLit {
             id,
             elems: elems.into_iter().map(|e| remap_expr(e, offset)).collect(),
+            exact,
         },
 
         Expr::FieldAccess { obj, field } => Expr::FieldAccess {
@@ -201,7 +202,7 @@ fn remap_hook_entry(entry: HookEntry, offset: HookLabel) -> HookEntry {
         } => HookEntry::Effect {
             label: label + offset,
             body_cfg: remap_cfg(body_cfg, offset),
-            deps: deps.map(|v| v.into_iter().map(|e| remap_expr(e, offset)).collect()),
+            deps: deps.map(|d| d.map_exprs(|e| remap_expr(e, offset))),
             span,
         },
         HookEntry::Memo {
@@ -212,7 +213,7 @@ fn remap_hook_entry(entry: HookEntry, offset: HookLabel) -> HookEntry {
         } => HookEntry::Memo {
             label: label + offset,
             body_cfg: remap_cfg(body_cfg, offset),
-            deps: deps.into_iter().map(|e| remap_expr(e, offset)).collect(),
+            deps: deps.map(|d| d.map_exprs(|e| remap_expr(e, offset))),
             span,
         },
         HookEntry::Callback {
@@ -225,7 +226,7 @@ fn remap_hook_entry(entry: HookEntry, offset: HookLabel) -> HookEntry {
             label: label + offset,
             body_cfg: remap_cfg(body_cfg, offset),
             params,
-            deps: deps.into_iter().map(|e| remap_expr(e, offset)).collect(),
+            deps: deps.map(|d| d.map_exprs(|e| remap_expr(e, offset))),
             span,
         },
         HookEntry::Ref { label, init, span } => HookEntry::Ref {
@@ -246,7 +247,7 @@ fn remap_hook_entry(entry: HookEntry, offset: HookLabel) -> HookEntry {
             label: label + offset,
             name,
             args: args.into_iter().map(|e| remap_expr(e, offset)).collect(),
-            deps: deps.map(|v| v.into_iter().map(|e| remap_expr(e, offset)).collect()),
+            deps: deps.map(|d| d.map_exprs(|e| remap_expr(e, offset))),
             binding,
             import_source,
             resolved_file,

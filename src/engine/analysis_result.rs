@@ -10,7 +10,7 @@ use crate::{
         cfg::{CFG, Terminator},
         expr::Expr,
         free_vars::AccessPath,
-        hooks::HookEntry,
+        hooks::{DepsList, HookEntry},
         types::{BlockId, HookLabel, Symbol, Var},
     },
 };
@@ -103,14 +103,38 @@ pub struct EffectInfo {
     /// member-chain granular (`x.a`, not just `x`) so `missing-deps` matches
     /// a dep against the exact field used (TODO.md F1b).
     pub free_paths: HashSet<AccessPath>,
-    /// Deps array as declared by the caller (`[]` = empty, `None` = absent).
-    pub declared_deps: Vec<Expr>,
-    /// `true` when caller wrote an explicit deps array (even `[]`).
-    /// `false` when no deps argument was passed (`deps: None`).
-    /// Always `true` for Memo/Callback (their deps array is mandatory).
-    pub has_deps_array: bool,
+    /// Deps array as the IR could read it — `None` when the caller passed no
+    /// deps argument, or one that is not an array literal. One field rather
+    /// than a list plus a present-flag: the two could disagree, and the reading
+    /// they used to disagree about (an unreadable argument shown as an empty
+    /// array that is definitely present) was the wrong one in both directions.
+    pub deps: Option<DepsList>,
     /// Source location of the hook call site, if available.
     pub span: Option<SourceRange>,
+}
+
+impl EffectInfo {
+    /// `true` when the caller wrote a deps array the IR could read — including
+    /// `[]`. `false` when the argument is absent *or* unreadable: a rule asking
+    /// "did they declare deps?" gets an answer only when the engine has one.
+    pub fn has_deps_array(&self) -> bool {
+        self.deps.is_some()
+    }
+
+    /// The deps entries the IR can see, in declared order; empty when there is
+    /// no readable deps array. Enumerating these is sound whatever `exact`
+    /// says — each entry over-approximates what it stands for. Counting them
+    /// is not: use [`EffectInfo::deps_arity`].
+    pub fn declared_deps(&self) -> &[Expr] {
+        self.deps.as_ref().map_or(&[], DepsList::as_slice)
+    }
+
+    /// The number of declared dependencies, and `None` when the engine does not
+    /// know it: no readable deps array, or one whose lowering dropped or
+    /// flattened an element (`[...rest]`, `[a, , b]`).
+    pub fn deps_arity(&self) -> Option<usize> {
+        self.deps.as_ref().filter(|d| d.exact).map(DepsList::len)
+    }
 }
 
 #[derive(Debug, Clone)]

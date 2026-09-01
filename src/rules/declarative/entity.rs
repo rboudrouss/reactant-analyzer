@@ -238,15 +238,17 @@ impl<'a> EntityCtx<'a> {
         self.sorted_setters(collect_setter_calls(body, &self.setter_vars, 2))
     }
 
-    /// `deps`: declared deps-array entries, in declared order. An effect
-    /// with no deps array yields an empty list (`has_deps_array` tells them
-    /// apart, via the `deps_declared` guard).
+    /// `deps`: declared deps-array entries, in declared order. An effect with
+    /// no readable deps array yields an empty list (the `deps_declared` guard
+    /// tells that apart from a written `[]`), and so does one whose entries the
+    /// lowering could not keep one-for-one — enumerating what is there stays
+    /// sound, only counting it does not (the `count` guard refuses).
     pub fn deps(&self, row: &HookRow<'a>) -> Vec<DepEntity<'a>> {
         let Some(effect) = row.effect else {
             return vec![];
         };
         effect
-            .declared_deps
+            .declared_deps()
             .iter()
             .enumerate()
             .map(|(index, expr)| DepEntity {

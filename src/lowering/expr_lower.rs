@@ -391,6 +391,10 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         Expression::ArrayExpression(arr) => {
             let id = builder.next_expr_id();
             let mut elems: Vec<Expr> = vec![];
+            // Cleared by anything that makes `elems` stop standing one-for-one
+            // for the source elements. Consumers that count (`count`, `every`)
+            // must refuse such a list; consumers that only read it are fine.
+            let mut exact = true;
             for el in &arr.elements {
                 match el {
                     // `[...items]` holds at least what `items` holds. Index
@@ -399,16 +403,18 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                     // and keeps its reads and setters visible.
                     ArrayExpressionElement::SpreadElement(sp) => {
                         elems.push(lower_expr(&sp.argument, builder));
+                        exact = false;
                     }
-                    ArrayExpressionElement::Elision(_) => {}
-                    other => {
-                        if let Some(e) = other.as_expression() {
-                            elems.push(lower_expr(e, builder));
-                        }
+                    ArrayExpressionElement::Elision(_) => {
+                        exact = false;
                     }
+                    other => match other.as_expression() {
+                        Some(e) => elems.push(lower_expr(e, builder)),
+                        None => exact = false,
+                    },
                 }
             }
-            Expr::ArrayLit { id, elems }
+            Expr::ArrayLit { id, elems, exact }
         }
 
         // ── Functions ─────────────────────────────────────────────────────────
@@ -752,6 +758,10 @@ fn lower_jsx_element(jsx: &JSXElement, builder: &mut BlockBuilder) -> Expr {
                 Expr::ArrayLit {
                     id,
                     elems: children,
+                    // Synthetic container, not a written array literal: it
+                    // stands for the children the walk kept, so it makes no
+                    // arity claim about anything in the source.
+                    exact: false,
                 },
             ));
         }

@@ -388,7 +388,12 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     HookEntry::Memo { label, deps, .. }
                     | HookEntry::Callback { label, deps, .. } => Some((
                         *label,
-                        transfer.recompute_memo(&comp_name, deps, &env_exit, &mut memo_ctx),
+                        transfer.recompute_memo(
+                            &comp_name,
+                            deps.as_ref(),
+                            &env_exit,
+                            &mut memo_ctx,
+                        ),
                     )),
                     _ => None,
                 })
@@ -1243,8 +1248,7 @@ fn collect_effect_info(hooks: &[HookEntry]) -> HashMap<HookLabel, EffectInfo> {
                     label: *label,
                     kind: HookKind::Effect,
                     free_paths: compute_free_paths(body_cfg),
-                    has_deps_array: deps.is_some(),
-                    declared_deps: deps.clone().unwrap_or_default(),
+                    deps: deps.clone(),
                     span: *span,
                 },
             )),
@@ -1259,8 +1263,7 @@ fn collect_effect_info(hooks: &[HookEntry]) -> HashMap<HookLabel, EffectInfo> {
                     label: *label,
                     kind: HookKind::Memo,
                     free_paths: compute_free_paths(body_cfg),
-                    has_deps_array: true,
-                    declared_deps: deps.clone(),
+                    deps: deps.clone(),
                     span: *span,
                 },
             )),
@@ -1282,8 +1285,7 @@ fn collect_effect_info(hooks: &[HookEntry]) -> HashMap<HookLabel, EffectInfo> {
                         fp.retain(|p| !params.contains(&p.root));
                         fp
                     },
-                    has_deps_array: true,
-                    declared_deps: deps.clone(),
+                    deps: deps.clone(),
                     span: *span,
                 },
             )),
@@ -1590,6 +1592,7 @@ fn strip_ts_annot(expr: &Expr) -> &Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::hooks::DepsList;
     use crate::{
         domains::{Interval, Stability, StateValue, StateValueTransfer},
         ir::{
@@ -1717,7 +1720,7 @@ mod tests {
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
-                deps: Some(vec![]),
+                deps: Some(DepsList::exact(vec![])),
                 span: None,
             },
         ];
@@ -1779,7 +1782,7 @@ mod tests {
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
-                deps: Some(vec![]),
+                deps: Some(DepsList::exact(vec![])),
                 span: None,
             },
         ];
@@ -1824,7 +1827,7 @@ mod tests {
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
-                deps: Some(vec![]),
+                deps: Some(DepsList::exact(vec![])),
                 span: None,
             },
         ];
@@ -1843,7 +1846,7 @@ mod tests {
         let hooks = vec![HookEntry::Memo {
             label: 0,
             body_cfg: trivial_cfg(),
-            deps: vec![Expr::Var("x".to_string())],
+            deps: Some(DepsList::exact(vec![Expr::Var("x".to_string())])),
             span: None,
         }];
         let render_stmts = vec![
@@ -1881,7 +1884,7 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 0,
             body_cfg: eff_cfg,
-            deps: Some(vec![]),
+            deps: Some(DepsList::exact(vec![])),
             span: None,
         }];
         let comp = component(hooks, vec![]);
@@ -1980,7 +1983,7 @@ mod tests {
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
-                deps: Some(vec![Expr::StateVal(0)]),
+                deps: Some(DepsList::exact(vec![Expr::StateVal(0)])),
                 span: None,
             },
         ];
@@ -2449,7 +2452,7 @@ mod tests {
             HookEntry::Effect {
                 label: 1,
                 body_cfg: eff_cfg,
-                deps: Some(vec![Expr::StateVal(0)]),
+                deps: Some(DepsList::exact(vec![Expr::StateVal(0)])),
                 span: None,
             },
             HookEntry::Handler {
@@ -2587,7 +2590,7 @@ mod tests {
         let hooks = vec![HookEntry::Effect {
             label: 0,
             body_cfg: eff_cfg,
-            deps: Some(vec![]),
+            deps: Some(DepsList::exact(vec![])),
             span: None,
         }];
         let comp = component(hooks, vec![]);

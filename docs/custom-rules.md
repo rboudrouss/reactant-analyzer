@@ -165,8 +165,8 @@ Guards filtrants (le finding reste plafonné Warning) :
 | `writer_phases` | Existentiel MAY sur les écrivains du slot d'une ancre `state` : passe si une écriture du slot *peut* tourner dans une des phases nommées. Une écriture ⊤ (`unknown`) satisfait toute requête — supprimer un finding sur un may-fait serait un faux négatif. Positif seulement, pas de forme niée. | `includes`, liste non vide parmi `render`, `effect`, `memo`, `callback`, `handler`, `deferred` (timer/microtask/continuation de promesse — prouvé hors de toute phase React), `cleanup` (fonction retournée d'un effect), `unknown`. |
 | `name` | Nom source de l'entité résolue : nom d'un hook custom, variable liée par un state/memo/callback/ref, ou — sur `hook_origins` — le nom d'origine du hook résolu. | Exactement un de `one_of` (liste) / `prefix`. |
 | `source` | Spécificateur d'import d'un hook custom ou d'une ligne `hook_origins` (`@chakra-ui/react`), pour bannir une dépendance entière. Un hook local ou importé relativement n'a pas de `source` : valeur absente, guard échoué. Jamais « passe par défaut ». | Exactement un de `one_of` / `prefix`. |
-| `count` | Cardinalité de `anchor.deps`. | Exactement un de `equals` / `more_than` / `less_than`. |
-| `deps_declared` | L'ancre déclare-t-elle un deps array du tout ? | `eq: true/false`. |
+| `count` | Cardinalité de `anchor.deps`. Le guard **échoue** quand le moteur ne connaît pas cette cardinalité : pas de deps array lisible, ou un array dont le lowering a aplati un spread (`[...rest]`) ou supprimé une élision (`[a, , b]`) — la longueur n'est alors plus celle du source. Une liste inconnue n'a pas zéro dépendance. | Exactement un de `equals` / `more_than` / `less_than`. |
+| `deps_declared` | L'ancre déclare-t-elle un deps array du tout ? `[]` compte comme déclaré ; un argument que le moteur ne sait pas lire (une variable) ne compte pas. | `eq: true/false`. |
 | `any_of` | Disjonction : passe si au moins un des guards imbriqués passe. Seule façon d'écrire « X ou Y » sans dupliquer la règle. | `guards: [...]`. |
 
 Guards certifiants (`must_*`) : quand le moteur répond « prouvé sur tous
