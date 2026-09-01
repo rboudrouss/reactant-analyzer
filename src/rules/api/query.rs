@@ -666,7 +666,8 @@ pub struct DirectWrite {
     pub slot: HookLabel,
 }
 
-/// `All` iff the writer row's provenance is [`WriteProvenance::Direct`]
+/// `All` iff the writer row's provenance is
+/// [`Direct`](crate::engine::setters::WriteProvenance::Direct)
 /// (ADR-027 §5). The certainty is per-row and structural: splice regions are
 /// recorded exhaustively at the single splice primitive
 /// (`splice_callee_into_cfg` returns the range, and every caller records the

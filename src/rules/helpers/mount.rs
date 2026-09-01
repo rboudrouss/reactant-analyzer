@@ -15,7 +15,7 @@
 //! stringifies to a constant — so every verdict here downgrades a finding and
 //! none deletes one: soundness first, the corpus FP clusters land on `Info`.
 //!
-//! [`MountIndex`] is the program-level reverse index (component → its JSX call
+//! `MountIndex` is the program-level reverse index (component → its JSX call
 //! sites) those verdicts are read from; it is built once per program by
 //! [`crate::rules::api::cache::ProgramCache`], never inside a `check`.
 
