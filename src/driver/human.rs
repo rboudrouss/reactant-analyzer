@@ -8,6 +8,7 @@ use std::path::Path;
 use crate::ir::{FileTable, SourceRange};
 use crate::rules::Severity;
 
+use super::locations::LocationIndex;
 use super::palette::Palette;
 use super::report::{CheckReport, ComponentReport};
 
@@ -87,9 +88,14 @@ pub fn render(
         return out;
     }
 
+    // A finding's identity is its source location, not the component that
+    // inlined it (#129): each distinct location is printed once, under the
+    // first component that reaches it, and says how many share it.
+    let locations = LocationIndex::build(&report.components);
     let mut hidden_clean = 0usize;
+    let mut hidden_repeat = 0usize;
 
-    for comp in &report.components {
+    for (ci, comp) in report.components.iter().enumerate() {
         // A trivial component (no hooks, no findings) is never worth a line.
         if comp.diagnostics.is_empty() && comp.hook_count == 0 {
             continue;
@@ -115,12 +121,26 @@ pub fn render(
             continue;
         }
 
+        // Every finding here was already printed under an earlier component:
+        // the component is not clean, but it adds no line the reader has not
+        // read. The `--info` assurances are its own, so it stays when they
+        // would otherwise be lost.
+        if locations.all_repeats(ci)
+            && !(info && (!comp.safe_checks.is_empty() || comp.suspended_safe_checks > 0))
+        {
+            hidden_repeat += 1;
+            continue;
+        }
+
         let _ = writeln!(
             out,
             "  {}{}{}  ({} hooks){}",
             p.bold, comp.name, p.reset, comp.hook_count, file_suffix
         );
-        for d in &comp.diagnostics {
+        for (di, d) in comp.diagnostics.iter().enumerate() {
+            let Some(consumers) = locations.consumers(ci, di) else {
+                continue;
+            };
             let (sev_color, sev_tag) = match d.severity() {
                 Severity::Error => (p.red, "error"),
                 Severity::Warning => (p.yellow, "warn "),
@@ -142,11 +162,33 @@ pub fn render(
                     format!("  {}{}{}", p.dim, at, p.reset)
                 })
                 .unwrap_or_default();
+            // The multiplicity is honest — a hook inlined into 87 components
+            // genuinely produces the finding 87 times — so it is reported as
+            // a count rather than as 87 lines.
+            let shared = match consumers.len() {
+                1 => String::new(),
+                n => format!("  {}[in {} components]{}", p.dim, n, p.reset),
+            };
             let _ = writeln!(
                 out,
-                "    {}{}{}  {}{}{}{}  {}",
-                sev_color, sev_tag, p.reset, d.rule, label_info, var_info, range_info, d.message
+                "    {}{}{}  {}{}{}{}  {}{}",
+                sev_color,
+                sev_tag,
+                p.reset,
+                d.rule,
+                label_info,
+                var_info,
+                range_info,
+                d.message,
+                shared
             );
+            if trace && consumers.len() > 1 {
+                let names: Vec<&str> = consumers
+                    .iter()
+                    .map(|&c| report.components[c].name.as_str())
+                    .collect();
+                let _ = writeln!(out, "       {}in: {}{}", p.dim, names.join(", "), p.reset);
+            }
             if trace {
                 // Depth gate (ADR-019): pathological chains stay bounded.
                 const MAX_STEPS: usize = 8;
@@ -188,6 +230,15 @@ pub fn render(
         render_safe_checks(&mut out, comp, info, &p);
     }
 
+    if hidden_repeat > 0 {
+        let _ = writeln!(
+            out,
+            "{}   {} component(s) hidden — every finding in them is a source line already \
+             reported above{}",
+            p.dim, hidden_repeat, p.reset
+        );
+    }
+
     if hidden_clean > 0 && !show_clean {
         let _ = writeln!(
             out,
@@ -197,7 +248,7 @@ pub fn render(
     }
 
     let _ = writeln!(out);
-    if report.errors == 0 && report.warnings == 0 {
+    if locations.errors == 0 && locations.warnings == 0 {
         let _ = writeln!(
             out,
             "{}✓  {} file(s) no issues found.{}",
@@ -205,18 +256,28 @@ pub fn render(
         );
     } else {
         let parts: Vec<String> = [
-            (report.errors > 0).then(|| format!("{} error(s)", report.errors)),
-            (report.warnings > 0).then(|| format!("{} warning(s)", report.warnings)),
+            (locations.errors > 0).then(|| format!("{} error(s)", locations.errors)),
+            (locations.warnings > 0).then(|| format!("{} warning(s)", locations.warnings)),
         ]
         .into_iter()
         .flatten()
         .collect();
+        // The counts are of distinct source locations; the attribution tail
+        // says how many component rows they collapsed, and appears only when
+        // the two differ.
+        let attributions = report.errors + report.warnings;
+        let collapsed = if attributions > locations.errors + locations.warnings {
+            format!(" — {attributions} component attribution(s)")
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             out,
-            "{}⚠  {} across {} file(s).{}",
+            "{}⚠  {} across {} file(s){}.{}",
             p.yellow,
             parts.join(", "),
             report.files_analyzed,
+            collapsed,
             p.reset
         );
     }

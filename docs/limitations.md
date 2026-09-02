@@ -109,11 +109,15 @@ Every entry here is Warning-or-below by construction: an FP never carries an Err
 
 ## Reading the output
 
-- **A finding inside a shared hook is reported once per consuming component.** The rows are honest —
-  each carries its own `component` and points at the hook's line — but nothing groups them on the way
-  out, so a hook used by 87 components produces 87 identical lines. Across the corpus **6,322 reported
-  findings resolve to 1,170 distinct source locations**, and the effect is worst on the codebases that
-  factor their hooks best. Count distinct locations, not rows, when comparing runs
+- **A finding inside a shared hook is produced once per consuming component, and reported once.** The
+  rows are honest — each carries its own `component` and points at the hook's line — so a hook used by
+  87 components genuinely produces the finding 87 times. Across the corpus **6,322 produced findings
+  resolve to 1,170 distinct source locations**, and the effect is worst on the codebases that factor
+  their hooks best. The human report groups by `(rule, file, line, col, message)`: it prints each
+  location once with `[in 87 components]`, names the consumers under `--trace`, hides the components
+  that add no new line, and counts locations in the summary with the row total as a
+  `— N component attribution(s)` tail. **The JSON keeps one row per component** (schema v2 is
+  unchanged), and `--fail-on` reads the row counts, so nothing about which findings exist changed
   [#129](https://github.com/rboudrouss/reactant-analyzer/issues/129).
 
 ## Cross-file limits

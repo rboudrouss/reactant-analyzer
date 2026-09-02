@@ -11,6 +11,7 @@
 
 mod human;
 mod json;
+mod locations;
 pub mod palette;
 mod report;
 
