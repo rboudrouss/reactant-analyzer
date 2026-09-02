@@ -1,0 +1,59 @@
+{
+  "$schema": "../../docs/schemas/pack.schema.json",
+  "schemaVersion": 1,
+  "name": "community-state",
+  "rules": [
+    {
+      "id": "same-tick-slot-collapse",
+      "docs": {
+        "description": "a state slot is written more than once in one tick with a value-form argument",
+        "why": "Two value-form writes of the same slot in one tick are both computed from the render-time snapshot, so the second overwrites the first instead of building on it: `setQty(qty + 1); setQty(qty + 1)` adds one, not two. Three limits are worth knowing before acting. The `same_tick` walk is a reachability over-approximation, so two writes on mutually exclusive branches of one handler still match. It does not split on suspension points, so writes separated by an `await` match too (there the intermediate value does render — that is a different smell, an unobservable phase, and usually benign). And `updater` only answers \"not a proven function literal\", never \"this argument reads the slot\", because setter-argument positions carry no expression verdict.",
+        "fix": "Use the functional updater for every write that builds on the current value — `setQty(q => q + 1)` — or collapse the writes into a single call with the final value.",
+        "example": "const addPair = () => { setQty(qty + 1); setQty(qty + 1); }  // adds one"
+      },
+      "severity": "warning",
+      "anchor": { "relation": "hook_calls", "kind": "state" },
+      "forEach": { "edge": "writers", "as": "w" },
+      "guards": [
+        { "kind": "same_tick", "of": "w" },
+        { "kind": "updater", "of": "w", "is": ["unknown"] }
+      ],
+      "message": "{w.setter} writes {w.slot} in `{w.region}` alongside another write of the same slot in the same tick, and its argument is not a proven functional updater — the writes collapse onto one snapshot"
+    },
+    {
+      "id": "effect-mirrors-render-value",
+      "docs": {
+        "description": "an effect exists only to write a state slot it does not itself depend on, on every path",
+        "why": "An effect whose whole job is `setX(<something built from props and other state>)`, keyed on those inputs, stores derived data in state. The first paint shows the initializer, the effect then forces a second render with the real value, so the user sees a flash and every upstream change costs two renders. The built-in `derived-state` rule only recognises state-mirrors-state; this rule also reaches the prop-derived case. Because the vocabulary cannot ask whether the slot has a *non*-effect writer, a slot that is also edited by a handler (seeded editable state, a legitimate pattern) still matches — check the slot's other writers before acting.",
+        "fix": "Delete the slot and compute the value during render (`const full = `${first} ${last}``), wrapping it in `useMemo` only if it is genuinely expensive.",
+        "example": "useEffect(() => { setFull(`${first} ${last}`) }, [first, last])"
+      },
+      "severity": "warning",
+      "anchor": { "relation": "hook_calls", "kind": "effect" },
+      "forEach": { "edge": "body_setter_calls", "as": "w" },
+      "guards": [
+        { "kind": "count", "of": "anchor.deps", "more_than": 0 },
+        { "kind": "in_deps", "of": "w", "negate": true },
+        { "kind": "must_setter_on_all_paths", "of": "w", "else": "drop" }
+      ],
+      "message": "this effect writes {w.slot} on every path from inputs it declares as deps — derive the value during render instead of mirroring it into state"
+    },
+    {
+      "id": "unguarded-one-shot-async-write",
+      "docs": {
+        "description": "a re-runnable effect starts a one-shot async continuation and returns no cleanup",
+        "why": "An effect with a non-empty deps array runs again whenever a dep moves, so two continuations can be in flight at once. Without a cleanup nothing invalidates the older one, and whichever response lands last wins — the results list shows matches for a query the user already replaced. The same write also lands after unmount. The built-in `missing-cleanup` rule deliberately skips one-shot registrars (`.then`, `setTimeout`), so this shape has no native cover. `registers` is a registrar-name match, not a proof the callee is the host primitive.",
+        "fix": "Return a cleanup that invalidates the continuation: flip a captured `let current = true` flag and test it before writing, or abort with an `AbortController` whose signal is passed to the request.",
+        "example": "useEffect(() => { fetch(`/api?q=${q}`).then(r => r.json()).then(setRows) }, [q])"
+      },
+      "severity": "warning",
+      "anchor": { "relation": "hook_calls", "kind": "effect" },
+      "guards": [
+        { "kind": "count", "of": "anchor.deps", "more_than": 0 },
+        { "kind": "registers", "of": "anchor", "firing": ["once"] },
+        { "kind": "cleanup", "of": "anchor", "is": ["absent"] }
+      ],
+      "message": "this effect re-runs on its deps and starts a one-shot async callback with no cleanup — an older response can resolve last and overwrite the newer one"
+    }
+  ]
+}

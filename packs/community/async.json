@@ -1,0 +1,105 @@
+{
+  "$schema": "../../docs/schemas/pack.schema.json",
+  "schemaVersion": 1,
+  "name": "community-async",
+  "rules": [
+    {
+      "id": "async-effect-without-teardown",
+      "docs": {
+        "description": "an effect schedules a one-shot continuation (`.then`, `setTimeout`, `queueMicrotask`, `requestAnimationFrame`) and returns no teardown",
+        "why": "The continuation runs after the effect instance is gone. An effect that returns nothing has nowhere to flip a liveness flag and nowhere to abort the request, so the callback is structurally unable to know the tree was torn down: it will still call its setters, still touch `ref.current`, still fire its toasts and its `scrollIntoView` for a screen the user has already left, and it keeps the whole component closure (and the response body) alive until it settles. Under StrictMode the discarded first instance does all of that twice.",
+        "fix": "Return a cleanup and check it after every suspension point — `let alive = true; …; if (!alive) return;` with `return () => { alive = false }` — or pass an `AbortController.signal` to the request and `abort()` it from the cleanup.",
+        "example": "useEffect(() => { fetch(url).then(r => r.json()).then(setData); }, [url])  // no cleanup"
+      },
+      "severity": "warning",
+      "anchor": { "relation": "hook_calls", "kind": "effect" },
+      "guards": [
+        { "kind": "registers", "of": "anchor", "firing": ["once"] },
+        { "kind": "cleanup", "of": "anchor", "is": ["absent"] }
+      ],
+      "message": "this effect schedules a one-shot continuation and returns no teardown — nothing can tell the continuation the component is gone"
+    },
+    {
+      "id": "state-written-from-async-continuation",
+      "docs": {
+        "description": "a state slot is written from a callback the engine proved runs outside every React phase (a promise continuation or a timer)",
+        "why": "A write that lands in a `.then`, a `setTimeout` or a subscription tick happens at a moment no render, effect or handler owns. Two consequences follow, and neither is visible in the effect's own text. The write can land after teardown, which is the classic \"setState on an unmounted component\". And when the request's inputs vary across effect instances, a slow first response lands *after* a fast second one and overwrites newer state with older data — the search box that shows results for a query the input no longer contains. Reviewing the slot means checking that something discriminates between instances: a per-effect-instance flag closed over by that instance's cleanup, a monotonic ticket compared after the await, or an `AbortController` aborted by the cleanup. This is deliberately an inventory, not a defect claim, which is why it is pinned `info`: the engine can prove the write runs outside every React phase, but it has no vocabulary for whether a guard dominates it, so a correct interval counter is reported alongside a genuine race.",
+        "fix": "Discriminate the response, do not merely guard for unmount. Capture a ticket on entry (`const seq = ++seqRef.current`) and drop the response when `seq !== seqRef.current`, or abort the previous request from the effect's cleanup. A shared `mountedRef` is not a discriminator: it stays true for both requests. If the slot is written by a timer that has no ordering hazard, turn the rule off for that component.",
+        "example": "useEffect(() => { fetch(`/s?q=${q}`).then(r => r.json()).then(setHits); }, [q])"
+      },
+      "severity": "info",
+      "anchor": { "relation": "hook_calls", "kind": "state" },
+      "guards": [
+        { "kind": "writer_phases", "of": "anchor", "includes": ["deferred"] }
+      ],
+      "message": "{anchor.name} is written from a promise continuation or a timer — check that something discriminates a late response from a newer one"
+    },
+    {
+      "id": "listener-registered-without-matching-teardown",
+      "docs": {
+        "description": "an effect registers a repeating callback and its cleanup does not take that same listener binding back",
+        "why": "The registration is repeating, so it survives the effect instance and re-arms on every re-run. When the cleanup removes a *different* value — a fresh wrapper (`debounce(handleResize, 100)` allocates a new function at the registration site), or nothing at all — the listener is never removed. After ten route visits, ten handlers run per event, each pinning a whole component closure, and the stale ones write into state the component no longer has. Nothing throws; it is only ever found by profiling. The engine pairs a registration with a teardown that names the *same listener binding*, which is why the default `registrars` list holds only listener-valued registrars: `setInterval` is excluded because `clearInterval(id)` receives a handle rather than the callback, so it can never pair. Two safe shapes still fire and are known false positives: a teardown that renames the listener (`const t = h; …removeEventListener(e, t)`) and the returned-unsubscribe idiom (`const unsub = store.subscribe(fn); return () => unsub()`).",
+        "fix": "Bind the value once and pass that same binding to both calls: `const h = debounce(handleResize, 100); el.addEventListener('resize', h); return () => el.removeEventListener('resize', h)`. Mirror the `capture` flag too — a mismatched `capture` fails removal even with identical identity.",
+        "example": "window.addEventListener('resize', debounce(onResize, 100));\nreturn () => window.removeEventListener('resize', onResize);  // different value"
+      },
+      "severity": "warning",
+      "params": {
+        "registrars": {
+          "type": "string[]",
+          "default": ["addEventListener", "on", "addListener", "subscribe"]
+        }
+      },
+      "anchor": { "relation": "registrations" },
+      "guards": [
+        { "kind": "name", "of": "anchor", "one_of": { "$param": "registrars" } },
+        { "kind": "teardown", "of": "anchor", "is": ["none-seen"] }
+      ],
+      "message": "{anchor.name} registers a {anchor.firing} callback and no cleanup was seen taking that same binding back"
+    },
+    {
+      "id": "same-tick-double-write",
+      "docs": {
+        "description": "a state slot is written twice in one tick and neither write is a proven functional updater",
+        "why": "Both calls in one handler or effect body see the same render-time snapshot, so React applies them to the same base value and the last one wins. `setF({ ...f, archived: true }); setF({ ...f, mine: true })` loses `archived`: the user toggles two filters and only the second sticks. The same shape sends the pre-update snapshot to a server, so `api.save(items)` persists the list without the item just added and the bug gets blamed on the backend.",
+        "fix": "Write once with everything the tick changed, or use the functional updater so each call receives the pending value: `setF(f => ({ ...f, archived: true })); setF(f => ({ ...f, mine: true }))`.",
+        "example": "setF({ ...f, archived: true });\nsetF({ ...f, mine: true });  // recomputed from the same snapshot"
+      },
+      "severity": "warning",
+      "anchor": { "relation": "hook_calls", "kind": "state" },
+      "forEach": { "edge": "writers", "as": "w" },
+      "guards": [
+        { "kind": "same_tick", "of": "w" },
+        { "kind": "updater", "of": "w", "is": ["unknown"] }
+      ],
+      "message": "{w.setter} writes {w.slot} in {w.region} where another write of the same slot can run in the same tick, and this one is not a proven functional updater"
+    },
+    {
+      "id": "store-selector-returns-fresh-reference",
+      "docs": {
+        "description": "a selector handed to an external-store hook returns a freshly allocated object or array on every call",
+        "why": "The subscription compares successive snapshots by reference. A selector that builds `{ items: s.items, total: s.total }` is never reference-equal to its previous result, so the component re-renders on every store action anywhere in the app. Under `useSyncExternalStore` React notices the snapshot never settles and either logs \"The result of getSnapshot should be cached to avoid an infinite loop\" or spins in a render loop that locks the tab.",
+        "fix": "Select one value per call (`const items = useStore(s => s.items)`), install an equality comparator (zustand's `useShallow`, redux's `shallowEqual`), or memoize the producer with `createSelector` so equal inputs return the identical reference.",
+        "example": "const { items, total } = useStore(s => ({ items: s.items, total: s.total }))"
+      },
+      "severity": "warning",
+      "params": {
+        "storeHooks": {
+          "type": "string[]",
+          "default": [
+            "useStore",
+            "useSelector",
+            "useSyncExternalStore",
+            "useStoreWithEqualityFn"
+          ]
+        }
+      },
+      "anchor": { "relation": "hook_calls", "kind": "custom" },
+      "forEach": { "edge": "args", "as": "sel" },
+      "guards": [
+        { "kind": "name", "of": "anchor", "one_of": { "$param": "storeHooks" } },
+        { "kind": "returns", "of": "sel", "is": ["fresh-reference"] }
+      ],
+      "message": "the selector passed to {anchor.name} returns {sel.returns} — the store compares snapshots by reference, so this re-renders on every store action"
+    }
+  ]
+}

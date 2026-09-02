@@ -1,0 +1,62 @@
+{
+  "$schema": "../../docs/schemas/pack.schema.json",
+  "schemaVersion": 1,
+  "name": "community-render",
+  "rules": [
+    {
+      "id": "unstable-prop-to-child",
+      "docs": {
+        "description": "a child component element is handed a prop that is a new reference on every render",
+        "why": "A prop allocated in the parent's render body — an object literal, an array literal, an inline arrow — is a different reference on every render of the parent. That costs nothing on a host element, but on a child *component* it defeats every identity check downstream: a `React.memo` comparison can never bail out, and the value poisons any dependency array the child lists it in. reactant cannot see through the `React.memo` wrapper (#64), so this rule reports the unstable reference and leaves the memo question to review — the fact it certifies is the freshness, not the waste.",
+        "fix": "Hoist the value out of the render body, wrap it in `useMemo`/`useCallback`, or pass the primitive parts instead of a wrapper object. Note that `children` is a fresh element tree on every render by construction and is reported here too — the `jsx_props` relation carries no guard on the prop's name, so the rule cannot skip it. Keep this at `info` until that guard exists.",
+        "example": "<Row onPick={(id) => select(id)} cfg={{ dense: true }} />"
+      },
+      "severity": "info",
+      "anchor": { "relation": "jsx_props" },
+      "guards": [
+        { "kind": "identity", "of": "anchor", "is": ["fresh-every-render"] }
+      ],
+      "message": "{anchor.name} is given {anchor.prop} as a {anchor.identity} value — every identity check on that prop downstream (a memo comparison, a deps array) is guaranteed to miss"
+    },
+    {
+      "id": "unstable-dep-on-registering-effect",
+      "docs": {
+        "description": "an effect that registers something outliving it lists a dependency that is a new reference every render",
+        "why": "The dependency never compares equal, so the effect tears down and re-runs on every render of the component. When the body only writes `document.title` that is waste; when it opens a socket, starts an interval or fires a request, it is a resource leak or a traffic multiplier — one registration per render, forever. The unstable dependency is often a prop the parent allocates inline, so the fix belongs in the caller, not here.",
+        "fix": "Depend on the primitive fields the effect actually reads (`[query.topic, query.limit]`), or make the caller stabilise the value with `useMemo` before passing it.",
+        "example": "useEffect(() => { fetchFeed(query).then(setItems) }, [query])  // query allocated by the parent"
+      },
+      "severity": "warning",
+      "anchor": { "relation": "hook_calls", "kind": "effect" },
+      "forEach": { "edge": "deps", "as": "dep" },
+      "guards": [
+        { "kind": "registers", "of": "anchor", "firing": ["repeating", "once"] },
+        { "kind": "stability", "of": "dep", "is": ["per-render"] }
+      ],
+      "message": "this effect registers something that outlives it, and its dependency {dep.path} is {dep.stability} — the registration is torn down and redone on every render"
+    },
+    {
+      "id": "store-snapshot-fresh-reference",
+      "docs": {
+        "description": "a function argument of useSyncExternalStore returns a freshly allocated reference",
+        "why": "React calls `getSnapshot` after every render and compares the result with `Object.is`. A snapshot function that returns `[]`, `{}`, or the result of `.map`/`.filter`/`.slice`/a spread hands back a new reference every call, so the store always looks changed: React re-renders, calls the snapshot again, and loops. React's own development warning for this is \"The result of getSnapshot should be cached to avoid an infinite loop\"; in production it is a pinned core.",
+        "fix": "Return a reference the store caches until it actually mutates, hoist the empty case to a module constant (`const EMPTY = []`), and do the derivation in a `useMemo` keyed on the snapshot instead of inside it.",
+        "example": "useSyncExternalStore(sub, () => store.items.filter(i => i.qty > 0), () => [])"
+      },
+      "severity": "warning",
+      "params": {
+        "hooks": {
+          "type": "string[]",
+          "default": ["useSyncExternalStore", "useSyncExternalStoreWithSelector"]
+        }
+      },
+      "anchor": { "relation": "hook_calls", "kind": "custom" },
+      "forEach": { "edge": "args", "as": "arg" },
+      "guards": [
+        { "kind": "name", "of": "anchor", "one_of": { "$param": "hooks" } },
+        { "kind": "returns", "of": "arg", "is": ["fresh-reference"] }
+      ],
+      "message": "{anchor.name} is passed a function that returns {arg.returns} — `Object.is` sees a changed snapshot after every render, which is the documented infinite-loop shape"
+    }
+  ]
+}

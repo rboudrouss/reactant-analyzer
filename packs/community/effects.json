@@ -1,0 +1,85 @@
+{
+  "$schema": "../../docs/schemas/pack.schema.json",
+  "schemaVersion": 1,
+  "name": "community-effects",
+  "rules": [
+    {
+      "id": "listener-never-taken-back",
+      "docs": {
+        "description": "an effect registers a listener that no cleanup releases with the same binding",
+        "why": "`removeEventListener` and friends compare the listener by reference. A cleanup that passes a freshly-built function — `throttle(onScroll, 100)` evaluated a second time, an inline arrow, a `.bind()` — silently removes nothing, and so does an effect with no cleanup at all. Every re-run then adds another live listener that keeps the render it captured alive. The engine reports `none-seen` when it cannot see a teardown holding the *same* binding, which is the fact that matters: matching the teardown function's *name* would certify the very bug this rule exists to catch.",
+        "fix": "Bind the listener to a `const` inside the setup, register that name, and pass the same name to the teardown. If the listener is wrapped (`throttle`, `debounce`, `.bind`), wrap once into the binding — never inline the wrapper at both ends.",
+        "example": "window.addEventListener('scroll', throttle(onScroll, 100));\nreturn () => window.removeEventListener('scroll', throttle(onScroll, 100));  // different function"
+      },
+      "severity": "warning",
+      "params": {
+        "registrars": {
+          "type": "string[]",
+          "default": ["addEventListener", "addListener", "on", "subscribe", "observe"]
+        }
+      },
+      "anchor": { "relation": "registrations" },
+      "guards": [
+        { "kind": "name", "of": "anchor", "one_of": { "$param": "registrars" } },
+        { "kind": "teardown", "of": "anchor", "is": ["none-seen"] }
+      ],
+      "message": "{anchor.name} registers a {anchor.firing} listener ({anchor.identity}) and no cleanup releases that same binding"
+    },
+    {
+      "id": "unreleased-repeating-registration",
+      "docs": {
+        "description": "an effect registers a repeating callback and returns no teardown on any path",
+        "why": "A repeating registration (`setInterval`, `addEventListener`, `subscribe`) outlives the effect run that created it. With no teardown at all, every re-run — every deps change, every remount, and the StrictMode double-invoke — stacks another live registration, and the old ones keep firing against a component the user has navigated away from. Only the total absence of a teardown is provable here: an effect that returns a cleanup on *some* paths reads as `present` and is not flagged.",
+        "fix": "Return a function from the setup that undoes the registration, on every path that performed one. If the registration is conditional, hoist the condition above it (`if (!enabled) return;`) so the acquiring path always has a matching teardown.",
+        "example": "useEffect(() => { setInterval(tick, 1000); }, [tz])  // never cleared"
+      },
+      "severity": "warning",
+      "anchor": { "relation": "hook_calls", "kind": "effect" },
+      "guards": [
+        { "kind": "registers", "of": "anchor", "firing": ["repeating"] },
+        { "kind": "cleanup", "of": "anchor", "is": ["absent"] }
+      ],
+      "message": "this effect registers a repeating callback and returns no teardown on any path"
+    },
+    {
+      "id": "uncancelled-one-shot-continuation",
+      "docs": {
+        "description": "an effect schedules a one-shot continuation (`.then`, `setTimeout`) and returns no teardown that could cancel it",
+        "why": "A continuation scheduled by the setup runs after the effect has already been torn down — the user navigated away, or the deps changed and a newer run is in flight. With no cleanup, this run has nothing that can flip a cancellation token or abort a signal, so the late continuation writes state for a mount nobody sees, and two overlapping runs can both write the same slot with whichever response lands last winning. The built-in `missing-cleanup` deliberately skips one-shot registrars, so this shape is otherwise unreported.",
+        "fix": "Return a cleanup from the setup and have the continuation consult it: a `let cancelled = false` declared *inside the setup* (one per run, unlike a `useRef`, which is one per mount and cannot tell run k from run k+1), or an `AbortController` whose signal is passed to the request and aborted by the cleanup.",
+        "example": "useEffect(() => { fetch(url).then(r => r.json()).then(setData); }, [url])"
+      },
+      "severity": "warning",
+      "anchor": { "relation": "hook_calls", "kind": "effect" },
+      "guards": [
+        { "kind": "registers", "of": "anchor", "firing": ["once"] },
+        { "kind": "cleanup", "of": "anchor", "is": ["absent"] }
+      ],
+      "message": "this effect schedules a one-shot continuation and returns no teardown — nothing can cancel it when the effect re-runs or unmounts"
+    },
+    {
+      "id": "state-only-effect-link",
+      "docs": {
+        "description": "an effect whose only inputs are state slots writes another state slot and touches nothing external",
+        "why": "This is one link of a cascading effect chain: a prop change updates slot A, an effect turns A into B, another turns B into C. Each link costs an extra commit, and between commits the browser paints a frame where A is already new and B still describes the previous data — the summary flashes the old number. The built-in `derived-state` catches the links whose right-hand side is call-free; this rule extends to links that call a helper (`setTotals(computeTotals(rows))`), which `derived-state` lets through.",
+        "fix": "Compute the value during render — `const totals = computeTotals(rows)` — or `useMemo` it if it is expensive, and delete the state slot. Do this from the end of the chain backwards; each removal usually exposes the next.",
+        "example": "useEffect(() => { setTotals(computeTotals(rows)); }, [rows])"
+      },
+      "severity": "warning",
+      "anchor": { "relation": "hook_calls", "kind": "effect" },
+      "forEach": { "edge": "body_setter_calls", "as": "setter" },
+      "guards": [
+        { "kind": "cleanup", "of": "anchor", "is": ["absent"] },
+        { "kind": "count", "of": "anchor.deps", "more_than": 0 },
+        {
+          "kind": "every",
+          "of": "anchor.deps",
+          "as": "dep",
+          "guards": [{ "kind": "stability", "of": "dep", "is": ["versioned"] }]
+        },
+        { "kind": "in_deps", "of": "setter", "negate": true }
+      ],
+      "message": "this effect only turns state into state — it writes {setter.slot} from deps that are all state slots, costing an extra commit"
+    }
+  ]
+}
