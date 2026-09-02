@@ -38,3 +38,4 @@
 | [ADR-034](ADR-034-registration-relation.md) | The registration relation and one registrar table — the phase summary ADR-027 §2 promised, the registration↔teardown pairing fact, and a teardown that no longer reads as an invocation (#111) | Accepted |
 | [ADR-035](ADR-035-await-phase-boundary.md) | The `await` phase boundary — a block split on an `Await` edge, and the IIFE whose body the writer walk never entered (#117) | Accepted |
 | [ADR-036](ADR-036-call-relation.md) | The call relation — a body's non-hook calls as the setter walk's second output, with the phase it ran them in (#126) | Accepted |
+| [ADR-037](ADR-037-slot-read-relation.md) | The slot-read relation — the write side's mirror image, region and phase, on the same walk (#127) | Accepted |

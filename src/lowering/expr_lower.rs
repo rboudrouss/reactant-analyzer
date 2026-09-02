@@ -1,4 +1,3 @@
-
 use crate::ir::source_range::SourceRange;
 use oxc_ast::ast::*;
 use oxc_span::GetSpan;

@@ -114,3 +114,26 @@ et les issues `enhancement` + `area/tier-a` du tracker :
 - Vendre « écrivez vos règles sémantiques » tant que l'expressivité mesurée
   reste à 3/21 — les étapes 4-6 d'abord.
 - Toute re-mesure corpus non automatisée.
+
+## 2026-09-02 (soir) — la campagne à l'envers : construire ce qui manquait
+
+Après l'audit et le triage à l'aveugle, trois chantiers, tous vérifiés corpus
+`+0 -0` sur les quatorze dépôts :
+
+- **#129** — le rapport humain groupe par localisation source. chakra-ui 122 → 22,
+  mantine 3165 → 359. Le JSON garde une ligne par composant.
+- **#126 / #125** — la relation `calls` (ADR-036) : ce qu'un corps *fait*, au-delà
+  de ses setters, comme second canal de la marche des setters. Plus `render_calls`,
+  le quantificateur `none` (l'existentielle niée), les éléments hôtes dans
+  `jsx_props` et la garde `prop`.
+- **#127** — la relation `reads` (ADR-037) : l'image miroir de `writers`, région
+  et phase, sur la même marche.
+
+Re-mesure des 60 scénarios : **8 EXPRESSIBLE (contre 1), 20 INEXPRESSIBLE
+(contre 27)** — `docs/campaign/triage-2026-09-02-wave2.md`, avec
+`packs/community/wave2.json` et ses paires de fixtures comme preuve exécutable.
+
+Prochaines marches, par valeur décroissante : une ancre `elements` avec une
+arête `props` (débloque S-ASYNC-9, S-RENDER-3, S-RENDER-9) ; les valeurs
+d'arguments (#67) ; une requête de dominance ; et **#130**, le faux négatif du
+relevé d'écritures qu'a révélé ce travail.

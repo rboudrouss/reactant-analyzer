@@ -28,5 +28,8 @@ pub use program_result::{AnalysisStats, CallSite, ComponentCallGraph, ProgramAna
 pub use registrations::{Firing, Pairing, Registrar, Registration, Timing};
 pub use root_detector::RootStrategy;
 pub use seeds::{SeedSync, SlotSeed};
-pub use setters::{BodyCall, SlotWriter, WriterPhase, WriterRegion, collect_body_calls};
+pub use setters::{
+    BodyCall, SlotRead, SlotWriter, WriterPhase, WriterRegion, collect_body_calls,
+    collect_slot_reads,
+};
 pub use symbol_graph::{SymbolGraph, SymbolKind, SymbolNode};

@@ -17,7 +17,7 @@ Numbers like #67 below are issues on the analyzer's tracker, at
 | `name` | Namespace. Rules are addressed `<name>/<id>` |
 | `receiver` | The root binding a `calls` row's member call was made on (`socket` in `socket.join(r)`) — the other half of a callee: `name` says which method ran, this says whose. A bare call has no receiver and fails the guard, positive-only like every name filter | exactly one of `one_of` / `prefix` |
 | `prop` | The prop name of a `jsx_props` row (`value`, `key`, `children`, `onChange`). The relation always carried the field; without this a rule could not skip `children` — fresh on every wrapper — nor scope itself to one prop | exactly one of `one_of` / `prefix` |
-| `phase` | Where a `calls` row runs, a total mirror of the writer lattice — `render` / `effect` / `memo` / `callback` / `handler` / `deferred` / `cleanup` / `unknown`. Positive-only: the fact is may-typed, `unknown` means the call may run in any phase, and a negated form would let a rule suppress a finding on a ⊤ row | `is`, non-empty |
+| `phase` | Where a `calls` (#126) or `reads` (#127) row runs, a total mirror of the writer lattice — `render` / `effect` / `memo` / `callback` / `handler` / `deferred` / `cleanup` / `unknown`. Positive-only: the fact is may-typed, `unknown` means the call may run in any phase, and a negated form would let a rule suppress a finding on a ⊤ row | `is`, non-empty |
 | `rules` | The rule list |
 | `$schema` | Optional, editor autocomplete only |
 
@@ -61,6 +61,7 @@ a resolved hook loses its `custom` row to inlining. Identity rules go on
 | `body_setter_calls` | effect, and any hook with a body | Setter calls in the body, alias-resolved |
 | `args` | `custom` hook | Call-site arguments. Accepts `returns`, not `stability` |
 | `writers` | `state` hook | Writers of the anchor's slot: one row per (region, alias-resolved setter var, sync-vs-nested), spliced wrappers included. `{w.region}` is the lexical body (exact); `{w.phase}` a MAY verdict (`unknown` = any phase) |
+| `reads` | `state` hook | Read sites of the anchor's slot (#127): one row per read, over the same regions `writers` covers. `{r.region}` is the lexical body (exact); `{r.phase}` the same MAY verdict, so a read in a `.then` continuation or a cleanup is distinguishable from one in the render body; `{r.name}` the binding the site wrote, which may be an alias. No `setter` and no `via` — those are write-provenance facts. A read the walk never entered (a closure nothing calls, past the depth cap) contributes no row, so an ABSENCE of rows is not a proof the slot is unread: `none` over this edge over-reports rather than losing a finding |
 | `calls` | effect, memo, callback, handler | Every **named non-hook call** in the body (#126): `name` is the callee (the method, for a member call), `receiver` the root binding a member call was made on, `phase` the phase the walk ran it in — the writer lattice, so a call in a `.then`, past an `await`, or in the returned cleanup is distinguishable from one in the body. A callee that resolves to neither a name nor a member (an IIFE, an array element) produces no row. A `name` guard on the bound row is **mandatory**, at the top level and not inside `any_of`: the relation is the only unbounded one. Warning ceiling — no `must_*` accepts the sort. Argument values are out of scope (#67) |
 | `seeds` | Prop seeds of a `state` anchor's slot (#106): one row per prop path the `useState` initializer reads. `{s.path}` is the path as written; the `seed_sync` guard says whether anything visibly re-syncs the slot when that prop moves. A slot whose initializer reads no prop has no rows — that is knowledge, not a filter |
 
@@ -149,6 +150,7 @@ lists the fields the entity actually carries.
 | Dep (`deps`) | `path`, `stability` |
 | Seed (`seeds`) | `path` (the prop path as written at the seed site) |
 | Call (`calls`, `render_calls`) | `name` (the callee, or the method of a member call), `receiver` (the root binding of a member call; `no receiver` for a bare one), `phase` (MAY verdict, `unknown` = ⊤) |
+| Read (`reads`) | `slot`, `name` (the binding read), `region` (lexical body, exact), `phase` (MAY verdict, `unknown` = ⊤) |
 | Argument (`args`) | `returns` |
 
 ## A second example, with params

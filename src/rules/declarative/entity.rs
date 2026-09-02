@@ -109,6 +109,8 @@ pub(crate) enum EntityVal<'a, 'b> {
     Registration(&'a crate::engine::registrations::Registration),
     /// One non-hook call site in a body (#126).
     Call(&'b crate::engine::BodyCall),
+    /// One read site of a state slot (#127).
+    Read(&'b crate::engine::SlotRead),
 }
 
 // ── Per-component index ───────────────────────────────────────────────────────
@@ -135,6 +137,14 @@ pub(crate) struct EntityCtx<'a> {
     /// `ComponentSetter`-valued props (#107), resolved on first use by the
     /// ownership-aware enumeration.
     cross_setters: OnceCell<HashMap<Var, (Symbol, HookLabel)>>,
+    /// The slot → readers relation (#127), computed on first use: unlike the
+    /// writers, it is not needed by any native rule, so a component no pack
+    /// asks about never walks for it.
+    slot_reads: OnceCell<Vec<crate::engine::SlotRead>>,
+    /// Body calls per hook (#126), all bodies at once on first use. A rule
+    /// that navigates `calls` and then asks `none of anchor.calls` would
+    /// otherwise walk the body once per row — quadratic in the body's size.
+    body_calls: OnceCell<HashMap<HookLabel, Vec<crate::engine::BodyCall>>>,
 }
 
 impl<'a> EntityCtx<'a> {
@@ -155,6 +165,8 @@ impl<'a> EntityCtx<'a> {
             conditional: OnceCell::new(),
             provenance: OnceCell::new(),
             cross_setters: OnceCell::new(),
+            slot_reads: OnceCell::new(),
+            body_calls: OnceCell::new(),
         }
     }
 
@@ -369,11 +381,29 @@ impl<'a> EntityCtx<'a> {
     /// The same depth budget the `body_setter_calls` edge uses, and the same
     /// walk — the phase of a call in a `.then`, past an `await`, or in the
     /// effect's returned cleanup is the walk's answer, not a second one.
-    pub fn body_calls(&self, row: &HookRow<'a>) -> Vec<crate::engine::BodyCall> {
-        let Some(body) = row.entry.and_then(|e| e.body_cfg()) else {
-            return vec![];
-        };
-        crate::engine::collect_body_calls(body, region_of(row), 2)
+    pub fn body_calls(&self, row: &HookRow<'a>) -> &[crate::engine::BodyCall] {
+        self.body_calls
+            .get_or_init(|| {
+                self.comp
+                    .hook_calls
+                    .iter()
+                    .filter_map(|info| {
+                        let entry = self.comp.hooks.iter().find(|h| h.label() == info.label)?;
+                        let body = entry.body_cfg()?;
+                        let row = HookRow {
+                            info,
+                            entry: Some(entry),
+                            effect: None,
+                        };
+                        Some((
+                            info.label,
+                            crate::engine::collect_body_calls(body, region_of(&row), 2),
+                        ))
+                    })
+                    .collect()
+            })
+            .get(&row.info.label)
+            .map_or(&[][..], Vec::as_slice)
     }
 
     /// `render_calls`: non-hook call sites in the render body (#126).
@@ -409,6 +439,18 @@ impl<'a> EntityCtx<'a> {
                 let root = &d.path.as_ref()?.root;
                 self.state_names.get(root).copied()
             })
+            .collect()
+    }
+
+    /// `reads`: the anchor slot's read sites (#127), in the relation's own
+    /// deterministic order.
+    pub fn reads(&self, row: &HookRow<'a>) -> Vec<&crate::engine::SlotRead> {
+        self.slot_reads
+            .get_or_init(|| {
+                crate::engine::collect_slot_reads(&self.comp.render_cfg, &self.comp.hooks)
+            })
+            .iter()
+            .filter(|r| r.slot == row.info.label)
             .collect()
     }
 
@@ -516,7 +558,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Seed(_)
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
-                | EntityVal::Call(_) => None,
+                | EntityVal::Call(_)
+                | EntityVal::Read(_) => None,
             },
             Field::Name => match v {
                 // A custom hook is called by its own name; every other kind is
@@ -546,6 +589,9 @@ impl<'a> EntityCtx<'a> {
                 // that wants `socket.join` writes two guards and one that
                 // wants any `.join` writes one.
                 EntityVal::Call(c) => Some(c.name.clone()),
+                // A read row is named by the binding it went through — the
+                // slot's own name, or the alias the site actually wrote.
+                EntityVal::Read(r) => Some(crate::ir::source_name(&r.name).to_string()),
                 EntityVal::Setter(_)
                 | EntityVal::Dep(_)
                 | EntityVal::Arg(_)
@@ -557,6 +603,7 @@ impl<'a> EntityCtx<'a> {
             // call, which is an absence and so fails a guard rather than
             // matching an empty string.
             Field::Receiver => match v {
+                EntityVal::Read(_) => None,
                 EntityVal::Call(c) => c.receiver.clone(),
                 EntityVal::Hook(_)
                 | EntityVal::Setter(_)
@@ -590,9 +637,11 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Seed(_)
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
-                | EntityVal::Call(_) => None,
+                | EntityVal::Call(_)
+                | EntityVal::Read(_) => None,
             },
             Field::Slot => match v {
+                EntityVal::Read(r) => self.slot_source_name(r.slot),
                 EntityVal::Setter(s) => self.setter_slot_name(s),
                 EntityVal::Writer(w) => self.slot_source_name(w.slot),
                 EntityVal::Hook(_)
@@ -620,7 +669,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Seed(_)
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
-                | EntityVal::Call(_) => None,
+                | EntityVal::Call(_)
+                | EntityVal::Read(_) => None,
             },
             // A seed row IS a prop path, and so is a deps entry.
             Field::Path => match v {
@@ -636,7 +686,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Cycle(_)
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
-                | EntityVal::Call(_) => None,
+                | EntityVal::Call(_)
+                | EntityVal::Read(_) => None,
             },
             Field::Stability => match v {
                 EntityVal::Dep(d) => Some(verdict_word(self.dep_verdict(d)).to_string()),
@@ -651,7 +702,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Seed(_)
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
-                | EntityVal::Call(_) => None,
+                | EntityVal::Call(_)
+                | EntityVal::Read(_) => None,
             },
             Field::Returns => match v {
                 EntityVal::Arg(a) => Some(returns_word(self.arg_verdict(a)).to_string()),
@@ -666,9 +718,11 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Seed(_)
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
-                | EntityVal::Call(_) => None,
+                | EntityVal::Call(_)
+                | EntityVal::Read(_) => None,
             },
             Field::Region => match v {
+                EntityVal::Read(r) => Some(r.region.word().to_string()),
                 EntityVal::Writer(w) => Some(w.region.word().to_string()),
                 EntityVal::Hook(_)
                 | EntityVal::Setter(_)
@@ -686,6 +740,7 @@ impl<'a> EntityCtx<'a> {
             Field::Phase => match v {
                 EntityVal::Writer(w) => Some(phase_word(w.phase).to_string()),
                 EntityVal::Call(c) => Some(phase_word(c.phase).to_string()),
+                EntityVal::Read(r) => Some(phase_word(r.phase).to_string()),
                 EntityVal::Hook(_)
                 | EntityVal::Setter(_)
                 | EntityVal::Dep(_)
@@ -719,9 +774,11 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Seed(_)
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
-                | EntityVal::Call(_) => None,
+                | EntityVal::Call(_)
+                | EntityVal::Read(_) => None,
             },
             Field::Identity => match v {
+                EntityVal::Read(_) => None,
                 EntityVal::Call(_) => None,
                 EntityVal::Provider(p) => Some(identity_word(p.identity).to_string()),
                 EntityVal::JsxProp(j) => Some(identity_word(j.identity).to_string()),
@@ -753,7 +810,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Seed(_)
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
-                | EntityVal::Call(_) => None,
+                | EntityVal::Call(_)
+                | EntityVal::Read(_) => None,
             },
             Field::Cleanup => match v {
                 EntityVal::Hook(row) => Some(cleanup_word(self.cleanup(row)).to_string()),
@@ -768,7 +826,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Seed(_)
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
-                | EntityVal::Call(_) => None,
+                | EntityVal::Call(_)
+                | EntityVal::Read(_) => None,
             },
             // Which component owns the slot the row writes: this one for a
             // local setter, the parent for a `ComponentSetter`-valued prop.
@@ -789,7 +848,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Seed(_)
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
-                | EntityVal::Call(_) => None,
+                | EntityVal::Call(_)
+                | EntityVal::Read(_) => None,
             },
             // The loop path: node names are already qualified and quoted by
             // the shared `node_display`, so this one is rendered bare.
@@ -806,9 +866,11 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Seed(_)
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
-                | EntityVal::Call(_) => None,
+                | EntityVal::Call(_)
+                | EntityVal::Read(_) => None,
             },
             Field::Firing => match v {
+                EntityVal::Read(_) => None,
                 EntityVal::Call(_) => None,
                 EntityVal::Registration(r) => Some(
                     match r.firing {
@@ -959,6 +1021,7 @@ fn anonymous(v: &EntityVal<'_, '_>) -> String {
         EntityVal::Provider(p) => format!("`{}.Provider`", crate::ir::source_name(p.context)),
         EntityVal::JsxProp(j) => format!("`{}` of `<{}>`", j.prop, j.element),
         EntityVal::Cycle(c) => format!("the loop through effect #{}", c.effect),
+        EntityVal::Read(r) => format!("`{}`", crate::ir::source_name(&r.name)),
         EntityVal::Call(c) => match &c.receiver {
             Some(r) => format!("`{}.{}()`", r, c.name),
             None => format!("`{}()`", c.name),

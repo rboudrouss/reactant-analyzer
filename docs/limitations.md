@@ -141,6 +141,25 @@ discovered files [#60](https://github.com/rboudrouss/reactant-analyzer/issues/60
 `resolver::ScopedResolver` routes by the importing file, `resolver::ChainResolver`
 tries several in order — see [docs/plugins.md](plugins.md).)
 
+## What a pack can name in a body (#126, #127)
+
+Two relations landed on 2026-09-02 and are worth knowing before writing a rule:
+`calls` (every non-hook call in an effect/memo/callback/handler body, with its
+callee, receiver and phase; `render_calls` for the render body) and `reads`
+(every read site of a state slot, with its region and phase). Both are
+**may**-relations: the callee is a resolved binding, never a proof of which host
+primitive runs, and a read the walk could not enter leaves no row.
+
+The quantifier `none` reads their absence — *acquires a resource and releases
+none*, *no render-phase read of this slot* — and errs towards firing, because a
+relation that under-enumerates makes it pass. Neither relation can mint an
+Error.
+
+What they still do not give: argument values (#67), so an acquire cannot be
+matched to the release of the *same* resource; an element-scoped quantifier over
+`jsx_props`, so "a host element with a `value` prop and no `onChange`" is
+unwritable; and any ordering or dominance query between two rows.
+
 ## Writing declarative packs (Tier A)
 
 A `kind: "custom"` anchor used to be blind to every hook the engine resolved, silently disabling

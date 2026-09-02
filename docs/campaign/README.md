@@ -64,6 +64,15 @@ positives, recorded in their own `docs.why`. `tests/community_packs.rs` pins
 that they all still load and validate, which is what keeps them honest as the
 vocabulary moves.
 
+## The re-triage
+
+[`triage-2026-09-02-wave2.md`](triage-2026-09-02-wave2.md) re-measures the 60
+against the vocabulary after #126 and #127. Seven scenarios flipped to
+EXPRESSIBLE (1 → 8), so 24 of the 60 are now reachable by a rule somebody can
+write. The rules that flipped them are in
+[`packs/community/wave2.json`](../../packs/community/wave2.json), each run on
+its own scenario's fixture pair.
+
 ## What has moved since
 
 The triages are dated evidence and are **not** updated as the vocabulary

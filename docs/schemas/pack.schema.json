@@ -224,6 +224,11 @@
           "const": "calls"
         },
         {
+          "description": "Readers of a state-hook anchor's slot (#127, ADR-037): one row per read\nsite, over the same regions the `writers` edge enumerates. `{r.region}`\nis the lexical body — exact; `{r.phase}` is the same MAY verdict, so a\nread in a `.then` continuation or a cleanup is distinguishable from one\nin the render body.\n\nA read the walk never entered — inside a closure nothing calls, past the\ndepth cap — contributes no row, so the ABSENCE of rows is not a proof\nthat the slot is unread. `none` over this edge reads as \"no read the\nanalysis could see\", and over-reports rather than losing a finding.",
+          "type": "string",
+          "const": "reads"
+        },
+        {
           "description": "Prop seeds of a state-hook anchor's slot (#106, ADR-031): one row per\nprop path the `useState` initializer reads. `{s.path}` is the path as\nwritten; the `seed_sync` guard reads whether anything visibly re-syncs\nthe slot when that prop moves.\n\nA slot whose initializer reads no prop has no rows, so a rule on this\nedge is silent on it by construction — that is knowledge, not a filter.",
           "type": "string",
           "const": "seeds"
@@ -501,7 +506,7 @@
           ]
         },
         {
-          "description": "Execution phase of a `calls` row (#126) — a total mirror of\n[`PhaseName`], ⊤ included, so a rule that wants \"provably deferred\"\nsays `is: [\"deferred\"]` and one that will accept ⊤ names it.\n\nPositive-only, because the fact is may-typed: `unknown` means the call\nmay run in any phase, and a negated form would let a rule suppress a\nfinding on a ⊤ row.",
+          "description": "Execution phase of a `calls` (#126) or `reads` (#127) row — a total\nmirror of [`PhaseName`], ⊤ included, so a rule that wants \"provably\ndeferred\" says `is: [\"deferred\"]` and one that will accept ⊤ names it.\n\nPositive-only, because the fact is may-typed: `unknown` means the call\nmay run in any phase, and a negated form would let a rule suppress a\nfinding on a ⊤ row.",
           "type": "object",
           "properties": {
             "is": {

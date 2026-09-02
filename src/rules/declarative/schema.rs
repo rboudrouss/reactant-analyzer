@@ -265,6 +265,17 @@ pub enum EdgeName {
     /// A `name` guard on the bound row is therefore **mandatory** — a rule
     /// that fires on "some call" fires on all of them.
     Calls,
+    /// Readers of a state-hook anchor's slot (#127, ADR-037): one row per read
+    /// site, over the same regions the `writers` edge enumerates. `{r.region}`
+    /// is the lexical body — exact; `{r.phase}` is the same MAY verdict, so a
+    /// read in a `.then` continuation or a cleanup is distinguishable from one
+    /// in the render body.
+    ///
+    /// A read the walk never entered — inside a closure nothing calls, past the
+    /// depth cap — contributes no row, so the ABSENCE of rows is not a proof
+    /// that the slot is unread. `none` over this edge reads as "no read the
+    /// analysis could see", and over-reports rather than losing a finding.
+    Reads,
     /// Prop seeds of a state-hook anchor's slot (#106, ADR-031): one row per
     /// prop path the `useState` initializer reads. `{s.path}` is the path as
     /// written; the `seed_sync` guard reads whether anything visibly re-syncs
@@ -348,9 +359,9 @@ pub enum Guard {
         #[serde(default)]
         prefix: Option<PVal<String>>,
     },
-    /// Execution phase of a `calls` row (#126) — a total mirror of
-    /// [`PhaseName`], ⊤ included, so a rule that wants "provably deferred"
-    /// says `is: ["deferred"]` and one that will accept ⊤ names it.
+    /// Execution phase of a `calls` (#126) or `reads` (#127) row — a total
+    /// mirror of [`PhaseName`], ⊤ included, so a rule that wants "provably
+    /// deferred" says `is: ["deferred"]` and one that will accept ⊤ names it.
     ///
     /// Positive-only, because the fact is may-typed: `unknown` means the call
     /// may run in any phase, and a negated form would let a rule suppress a

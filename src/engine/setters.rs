@@ -102,6 +102,7 @@ pub fn collect_setter_calls_with_extra(
         callback_bodies: &HashMap::new(),
         certified_fns: &certified,
         collect_calls: false,
+        read_vars: &NO_VARS,
     };
     walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None);
     let mut found = found.setters;
@@ -185,6 +186,7 @@ pub(crate) fn collect_write_sites(
         callback_bodies,
         certified_fns: &certified,
         collect_calls: false,
+        read_vars: &NO_VARS,
     };
     walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None);
     found
@@ -1064,9 +1066,27 @@ struct SetterWalk<'a> {
     /// consumers: a body with 200 calls would otherwise pay for 200 rows
     /// nobody reads, on a walk the rule pass runs once per component per rule.
     collect_calls: bool,
+    /// Bindings whose *reads* to record (#127) — the slot-value names and
+    /// their aliases. Empty for every consumer that does not ask, and the walk
+    /// then does no sub-expression traversal at all.
+    read_vars: &'a HashSet<Var>,
 }
 
+/// No bindings to record reads for — the walk then skips the sub-expression
+/// traversal entirely, which is what every setter consumer wants.
+static NO_VARS: std::sync::LazyLock<HashSet<Var>> = std::sync::LazyLock::new(HashSet::new);
+
 impl SetterWalk<'_> {
+    fn collect_reads(&self) -> bool {
+        !self.read_vars.is_empty()
+    }
+
+    /// Does either sub-expression channel want the traversal? Off for every
+    /// setter consumer, which is the hot path.
+    fn scanning(&self) -> bool {
+        self.collect_calls || self.collect_reads()
+    }
+
     /// Does this callee run its function argument once per element?
     fn is_sync_hof(&self, fn_: &Expr) -> bool {
         matches!(fn_, Expr::FieldAccess { field, .. } if SYNC_HOF_METHODS.contains(&field.as_str()))
@@ -1141,6 +1161,7 @@ pub(crate) enum WalkClass {
 struct Found {
     setters: Vec<FoundSite>,
     calls: Vec<FoundCall>,
+    reads: Vec<FoundRead>,
 }
 
 impl Found {
@@ -1171,7 +1192,21 @@ impl Found {
                 ..call
             });
         }
+        for read in inner.reads {
+            let sync = read.class == WalkClass::Sync;
+            self.reads.push(FoundRead {
+                class: if sync { mode } else { read.class },
+                ..read
+            });
+        }
     }
+}
+
+/// One raw read site of a tracked binding the walk saw (#127).
+struct FoundRead {
+    var: Var,
+    class: WalkClass,
+    span: Option<SourceRange>,
 }
 
 /// One raw non-setter call site the walk saw (#126).
@@ -1355,6 +1390,44 @@ impl<'a> SetterWalk<'a> {
         self.walking.remove(&key);
     }
 
+    /// Record this ONE node on the sub-expression channels (#126, #127) — the
+    /// traversal itself is [`Self::expr`], which visits every node exactly
+    /// once and runs the call machinery on each `Call` it passes.
+    ///
+    /// The setter machinery only ever looks at a `Call` in statement position
+    /// and at its function-valued arguments, which is all a setter relation
+    /// needs. A call and a read can sit anywhere — inside a JSX prop, a
+    /// ternary, another call's argument — so these two channels drive the
+    /// deeper traversal, and only when a consumer asks for them.
+    fn scan_node(
+        &mut self,
+        expr: &Expr,
+        span: Option<SourceRange>,
+        found: &mut Found,
+        mode: WalkClass,
+    ) {
+        match expr.peel_ts() {
+            Expr::Var(v) if self.collect_reads() && self.read_vars.contains(v.as_str()) => {
+                found.reads.push(FoundRead {
+                    var: v.clone(),
+                    class: mode,
+                    span,
+                });
+            }
+            Expr::Call { fn_, .. } if self.collect_calls => {
+                if let Some((name, receiver)) = callee_name(fn_) {
+                    found.calls.push(FoundCall {
+                        name,
+                        receiver,
+                        class: mode,
+                        span,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn stmt(
         &mut self,
@@ -1375,6 +1448,16 @@ impl<'a> SetterWalk<'a> {
             Stmt::Assign { rhs, span, .. } => (rhs, *span),
             Stmt::MemberWrite { rhs, span, .. } => (rhs, *span),
         };
+        // `state.items.push(x)` reads `state`: the receiver of a member write
+        // is the one read position the rhs does not carry.
+        if self.scanning()
+            && let Stmt::MemberWrite { obj, key, span, .. } = stmt
+        {
+            self.expr(obj, *span, block_id, depth, found, mode, at_root, prov);
+            if let crate::ir::stmt::MemberKey::Index(idx) = key {
+                self.expr(idx, *span, block_id, depth, found, mode, at_root, prov);
+            }
+        }
         self.expr(expr, span, block_id, depth, found, mode, at_root, prov);
     }
 
@@ -1390,21 +1473,36 @@ impl<'a> SetterWalk<'a> {
         at_root: bool,
         prov: Option<BlockId>,
     ) {
-        if let Expr::Call { fn_, args } = expr {
-            // #126: every call the walk passes, with the phase class it is
-            // passing it in. Recorded before the teardown early-return below,
-            // which is a rule about *descending* a callback argument and says
-            // nothing about whether the call itself happened.
-            if self.collect_calls
-                && let Some((name, receiver)) = callee_name(fn_)
-            {
-                found.calls.push(FoundCall {
-                    name,
-                    receiver,
-                    class: mode,
-                    span: stmt_span,
-                });
+        // The two sub-expression channels turn `expr` into a real traversal:
+        // this node, then every child except a `FnLit` — those are entered by
+        // the call machinery below, which is the only place that knows what
+        // class the function runs in. Every node is visited exactly once, so
+        // a `Call` nested in a JSX prop or another call's argument gets the
+        // machinery too.
+        if self.scanning() {
+            self.scan_node(expr, stmt_span, found, mode);
+            // A JSX element is the innermost thing with a position: a call in
+            // a prop sits under a `Return` terminator, which carries no
+            // statement span, so without this the row has no location at all.
+            let stmt_span = match expr.peel_ts() {
+                Expr::CompApp { span: Some(s), .. } | Expr::NativeElem { span: Some(s), .. } => {
+                    Some(*s)
+                }
+                _ => stmt_span,
+            };
+            let mut children: Vec<&Expr> = Vec::new();
+            expr.for_each_child(&mut |c| {
+                if !matches!(c.peel_ts(), Expr::FnLit { .. }) {
+                    children.push(c);
+                }
+            });
+            for child in children {
+                self.expr(
+                    child, stmt_span, block_id, depth, found, mode, at_root, prov,
+                );
             }
+        }
+        if let Expr::Call { fn_, args } = expr {
             if let Expr::Var(name) = fn_.as_ref() {
                 if self.setter_vars.contains(name) {
                     found.setters.push(FoundSite {
@@ -1544,6 +1642,114 @@ pub struct BodyCall {
     pub span: Option<SourceRange>,
 }
 
+/// One read site of a state slot (#127, ADR-037).
+///
+/// The write-side mirror image of [`SlotWriter`], and deliberately the same
+/// two columns: `region` is the lexical body — exact — and `phase` is the MAY
+/// verdict the walk assigned, so a read inside a `.then` continuation or an
+/// effect's cleanup is distinguishable from one in the render body.
+#[derive(Debug, Clone)]
+pub struct SlotRead {
+    pub slot: HookLabel,
+    /// The binding the read went through: the slot's own name, or an alias.
+    pub name: Var,
+    pub region: WriterRegion,
+    pub phase: WriterPhase,
+    pub span: Option<SourceRange>,
+}
+
+/// The slot → readers relation (#127): one row per read site, over the same
+/// regions [`collect_slot_writers`] enumerates.
+///
+/// A read inside a nested function is recorded when the walk *enters* that
+/// function, with the class it entered in — never by crossing a `FnLit` from
+/// the outside, where the class would be ⊤ and the row a duplicate. A closure
+/// the walk never enters therefore contributes no row: this is a relation over
+/// the reads the analysis can *see*, which is why nothing may read the absence
+/// of a row as a proof that the slot is unread.
+pub fn collect_slot_reads(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<SlotRead> {
+    // The naming table for slots: the value binding of every `useState`, plus
+    // the aliases of it, exactly as the writer relation resolves setters.
+    let mut labels = resolve_setter_aliases(render_cfg, &state_val_labels(render_cfg));
+    for cfg in hooks.iter().filter_map(|h| h.body_cfg()) {
+        for (var, label) in resolve_setter_aliases(cfg, &state_val_labels(render_cfg)) {
+            labels.entry(var).or_insert(label);
+        }
+    }
+    let vars: HashSet<Var> = labels.keys().cloned().collect();
+    if vars.is_empty() {
+        return vec![];
+    }
+    let mut out: Vec<SlotRead> = Vec::new();
+    let push = |region: WriterRegion, cfg: &CFG, out: &mut Vec<SlotRead>| {
+        let fn_bindings = collect_fn_bindings(cfg);
+        let certified = certified_fn_names(cfg, &fn_bindings);
+        let no_shadow = HashSet::new();
+        let mut found = Found::default();
+        let mut walk = SetterWalk {
+            setter_vars: &NO_VARS,
+            fn_bindings: &fn_bindings,
+            walking: HashSet::new(),
+            root: cfg as *const CFG as usize,
+            effect_body: matches!(region, WriterRegion::Effect(_)),
+            shadowed: &no_shadow,
+            repeating: false,
+            callback_bodies: &HashMap::new(),
+            certified_fns: &certified,
+            collect_calls: false,
+            read_vars: &vars,
+        };
+        walk.cfg(cfg, 2, &mut found, WalkClass::Sync, None);
+        for r in found.reads {
+            let Some(&slot) = labels.get(&r.var) else {
+                continue;
+            };
+            out.push(SlotRead {
+                slot,
+                name: r.var,
+                region,
+                phase: class_phase(r.class, region),
+                span: r.span,
+            });
+        }
+    };
+    push(WriterRegion::Render, render_cfg, &mut out);
+    for hook in hooks {
+        let (region, body) = match hook {
+            HookEntry::Effect {
+                label, body_cfg, ..
+            } => (WriterRegion::Effect(*label), body_cfg),
+            HookEntry::Memo {
+                label, body_cfg, ..
+            } => (WriterRegion::Memo(*label), body_cfg),
+            HookEntry::Callback {
+                label, body_cfg, ..
+            } => (WriterRegion::Callback(*label), body_cfg),
+            HookEntry::Handler {
+                label, body_cfg, ..
+            } => (WriterRegion::Handler(*label), body_cfg),
+            _ => continue,
+        };
+        push(region, body, &mut out);
+    }
+    // `phase` is part of the identity, not just the payload: the walk reaches
+    // one site in more than one context — a callback passed to a timer and the
+    // same body reached as a cleanup — and an expression-bodied arrow carries
+    // no statement span to tell those apart by position.
+    let key = |r: &SlotRead| {
+        (
+            r.slot,
+            r.span.map(|s| (s.file, s.line, s.col)),
+            r.region,
+            r.phase,
+            r.name.clone(),
+        )
+    };
+    out.sort_by_key(&key);
+    out.dedup_by(|a, b| key(a) == key(b));
+    out
+}
+
 /// Every named call site in one body, with the phase the walk ran it in.
 ///
 /// The second consumer of the setter walk (ADR-036): the phase classification,
@@ -1568,6 +1774,7 @@ pub fn collect_body_calls(cfg: &CFG, region: WriterRegion, max_depth: usize) -> 
         callback_bodies: &HashMap::new(),
         certified_fns: &certified,
         collect_calls: true,
+        read_vars: &NO_VARS,
     };
     walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None);
     let mut rows: Vec<BodyCall> = found

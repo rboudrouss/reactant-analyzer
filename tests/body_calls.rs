@@ -257,7 +257,8 @@ fn the_edge_and_the_phase_guard_are_typed() {
         "message":"m"}]}"#,
     );
     assert!(
-        e.message.contains("guard `phase` applies to a `calls` row"),
+        e.message
+            .contains("guard `phase` applies to a `calls` or `reads` row"),
         "{e}"
     );
 }
@@ -429,4 +430,111 @@ fn none_is_typed_against_the_anchor() {
         "message":"m"}]}"#,
     );
     assert!(e.message.contains("spelled `anchor.<edge>`"), "{e}");
+}
+
+// ── #127: the `reads` edge ───────────────────────────────────────────────────
+
+const READS: &str = r#"{"schemaVersion":1,"name":"p","rules":[{
+    "id":"probe","docs":{"description":"d","why":"w","fix":"f"},
+    "severity":"info","anchor":{"relation":"hook_calls","kind":"state"},
+    "forEach":{"edge":"reads","as":"r"},
+    "guards":[{"kind":"phase","of":"r","is":[
+        "render","effect","memo","callback","handler","deferred","cleanup","unknown"]}],
+    "message":"{r.slot}|{r.region}|{r.phase}"}]}"#;
+
+fn reads(src: &str) -> Vec<String> {
+    let mut rows: Vec<String> = run_pack(READS, src)
+        .into_iter()
+        .map(|d| d.message.replace('`', ""))
+        .collect();
+    rows.sort();
+    rows.dedup();
+    rows
+}
+
+/// Everything about a slot used to be write-side. A read carries the lexical
+/// region it sits in and the phase the walk ran it in.
+#[test]
+fn a_slot_read_carries_its_region_and_phase() {
+    let rows = reads(
+        r#"
+        import { useState, useEffect } from "react";
+        export function C() {
+          const [count, setCount] = useState(0);
+          useEffect(() => {
+            log(count);
+            setTimeout(() => report(count), 10);
+            return () => flush(count);
+          }, [count]);
+          return <div onClick={() => send(count)}>{count}</div>;
+        }
+        "#,
+    );
+    assert!(
+        rows.contains(&"count|render|render".to_string()),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&"count|effect|effect".to_string()),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&"count|effect|deferred".to_string()),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&"count|effect|cleanup".to_string()),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&"count|handler|handler".to_string()),
+        "{rows:?}"
+    );
+}
+
+/// The write-only slot: a `none` over `reads` is the shape #127 exists for.
+#[test]
+fn none_over_reads_finds_a_slot_nothing_visibly_reads() {
+    let pack = r#"{"schemaVersion":1,"name":"p","rules":[{
+        "id":"write-only","docs":{"description":"d","why":"w","fix":"f"},
+        "severity":"warning","anchor":{"relation":"hook_calls","kind":"state"},
+        "guards":[{"kind":"none","of":"anchor.reads","as":"r","guards":[
+            {"kind":"phase","of":"r","is":[
+                "render","effect","memo","callback","handler","deferred","cleanup","unknown"]}]}],
+        "message":"state {anchor.name} is written but nothing reads it"}]}"#;
+    let write_only = r#"
+        import { useState, useEffect } from "react";
+        export function C() {
+          const [y, setY] = useState(0);
+          useEffect(() => { const h = () => setY(window.scrollY); return h; }, []);
+          return <div />;
+        }
+        "#;
+    let read_once = r#"
+        import { useState, useEffect } from "react";
+        export function C() {
+          const [y, setY] = useState(0);
+          useEffect(() => { const h = () => setY(window.scrollY); return h; }, []);
+          return <div>{y}</div>;
+        }
+        "#;
+    assert_eq!(run_pack(pack, write_only).len(), 1);
+    assert!(run_pack(pack, read_once).is_empty());
+}
+
+/// The edge is a state-anchor fact, like `writers` and `seeds`.
+#[test]
+fn the_reads_edge_needs_a_state_anchor() {
+    let e = load_err(
+        r#"{"schemaVersion":1,"name":"p","rules":[{
+        "id":"r","docs":{"description":"d","why":"w","fix":"f"},
+        "severity":"warning","anchor":{"relation":"hook_calls","kind":"effect"},
+        "forEach":{"edge":"reads","as":"r"},
+        "guards":[{"kind":"phase","of":"r","is":["effect"]}],
+        "message":"m"}]}"#,
+    );
+    assert!(
+        e.message.contains("edge `reads` needs a state-hook anchor"),
+        "{e}"
+    );
 }

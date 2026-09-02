@@ -91,6 +91,8 @@ pub(crate) enum Sort {
     Registration,
     /// One non-hook call site in a body (#126).
     Call,
+    /// One read site of a state-hook anchor's slot (#127).
+    Read,
 }
 
 impl Sort {
@@ -111,6 +113,7 @@ impl Sort {
             Sort::ContextConsumer => "a context consumer site".into(),
             Sort::Registration => "a callback registration".into(),
             Sort::Call => "a call site".into(),
+            Sort::Read => "a slot read".into(),
         }
     }
 }
@@ -213,6 +216,19 @@ fn edge_element_sort(edge: EdgeName, anchor_sort: Sort, path: &str) -> Result<So
                 ));
             }
             Sort::Writer
+        }
+        EdgeName::Reads => {
+            if !matches!(anchor_sort, Sort::Hook(Some(HookKindFilter::State))) {
+                return Err(PackError::new(
+                    path.to_string(),
+                    format!(
+                        "edge `reads` needs a state-hook anchor (the slot whose readers it \
+                         enumerates), but the anchor binds {}",
+                        anchor_sort.describe()
+                    ),
+                ));
+            }
+            Sort::Read
         }
         EdgeName::Seeds => {
             if !matches!(anchor_sort, Sort::Hook(Some(HookKindFilter::State))) {
@@ -498,6 +514,7 @@ impl Field {
     pub(crate) fn admits(self, sort: Sort) -> bool {
         match self {
             Field::Kind => match sort {
+                Sort::Read => false,
                 Sort::Call => false,
                 // A JSX row's kind is which sort of element carries the prop:
                 // a resolved component application, or a host element.
@@ -519,6 +536,7 @@ impl Field {
             // Effects and handlers are the two kinds with nothing to call them;
             // an any-kind anchor is admitted and falls back per row.
             Field::Name => match sort {
+                Sort::Read => true,
                 Sort::Call => true,
                 Sort::Hook(None) => true,
                 Sort::Hook(Some(k)) => match k {
@@ -556,6 +574,7 @@ impl Field {
             // `join`). Only a call row has one; a bare call answers nothing,
             // which is an absent field, not a false one.
             Field::Receiver => match sort {
+                Sort::Read => false,
                 Sort::Call => true,
                 Sort::Hook(_)
                 | Sort::SetterRender
@@ -573,6 +592,7 @@ impl Field {
             },
             // The import specifier is recorded on custom hook rows only.
             Field::Source => match sort {
+                Sort::Read => false,
                 Sort::Call => false,
                 Sort::Hook(Some(HookKindFilter::Custom)) => true,
                 // The raw import specifier, recorded for every resolved call —
@@ -594,7 +614,23 @@ impl Field {
             },
             // A writer row is setter-shaped: it names the slot it writes and
             // the setter variable at the call site.
-            Field::Slot | Field::Setter => match sort {
+            // A read row names the slot it reads; it has no setter.
+            Field::Setter => match sort {
+                Sort::Read | Sort::Call => false,
+                Sort::SetterRender | Sort::SetterBody | Sort::Writer => true,
+                Sort::Hook(_)
+                | Sort::Dep
+                | Sort::Arg
+                | Sort::HookOrigin
+                | Sort::Provider
+                | Sort::JsxProp
+                | Sort::ChurnCycle
+                | Sort::Seed
+                | Sort::ContextConsumer
+                | Sort::Registration => false,
+            },
+            Field::Slot => match sort {
+                Sort::Read => true,
                 Sort::Call => false,
                 Sort::SetterRender | Sort::SetterBody | Sort::Writer => true,
                 Sort::Hook(_)
@@ -616,6 +652,7 @@ impl Field {
             // reading it for a seed would be the program-point error ADR-023
             // §2 refuses.
             Field::Path => match sort {
+                Sort::Read => false,
                 Sort::Call => false,
                 Sort::Dep | Sort::Seed => true,
                 Sort::Hook(_)
@@ -631,6 +668,7 @@ impl Field {
                 | Sort::Registration => false,
             },
             Field::Stability => match sort {
+                Sort::Read => false,
                 Sort::Call => false,
                 Sort::Dep => true,
                 Sort::Hook(_)
@@ -647,6 +685,7 @@ impl Field {
                 | Sort::Registration => false,
             },
             Field::Returns => match sort {
+                Sort::Read => false,
                 Sort::Call => false,
                 Sort::Arg => true,
                 Sort::Hook(_)
@@ -668,6 +707,7 @@ impl Field {
             // `region` and `via` are writer-provenance facts about a *slot*,
             // which a call has none of.
             Field::Phase => match sort {
+                Sort::Read => true,
                 Sort::Writer | Sort::Call => true,
                 Sort::Hook(_)
                 | Sort::SetterRender
@@ -682,7 +722,26 @@ impl Field {
                 | Sort::ContextConsumer
                 | Sort::Registration => false,
             },
-            Field::Region | Field::Via => match sort {
+            // A read row sits in a lexical region like a write does, but it
+            // came through no wrapper chain: `via` is a write-provenance fact.
+            Field::Via => match sort {
+                Sort::Read | Sort::Call => false,
+                Sort::Writer => true,
+                Sort::Hook(_)
+                | Sort::SetterRender
+                | Sort::SetterBody
+                | Sort::Dep
+                | Sort::Arg
+                | Sort::HookOrigin
+                | Sort::Provider
+                | Sort::JsxProp
+                | Sort::ChurnCycle
+                | Sort::Seed
+                | Sort::ContextConsumer
+                | Sort::Registration => false,
+            },
+            Field::Region => match sort {
+                Sort::Read => true,
                 Sort::Call => false,
                 Sort::Writer => true,
                 Sort::Hook(_)
@@ -704,6 +763,7 @@ impl Field {
             // is the deps fact, and reading identity there would be the same
             // program-point error §2 refuses for the reverse direction.
             Field::Identity => match sort {
+                Sort::Read => false,
                 Sort::Call => false,
                 Sort::Provider | Sort::JsxProp | Sort::Arg | Sort::Registration => true,
                 Sort::Hook(_)
@@ -717,6 +777,7 @@ impl Field {
                 | Sort::ContextConsumer => false,
             },
             Field::Prop => match sort {
+                Sort::Read => false,
                 Sort::Call => false,
                 Sort::JsxProp => true,
                 Sort::Hook(_)
@@ -736,6 +797,7 @@ impl Field {
             // returned function for effects and nothing else, so the field is
             // total only on a kind-pinned effect anchor.
             Field::Cleanup => match sort {
+                Sort::Read => false,
                 Sort::Call => false,
                 Sort::Hook(Some(HookKindFilter::Effect)) => true,
                 Sort::Hook(_)
@@ -759,6 +821,7 @@ impl Field {
             // How the registration re-fires: `repeating` keeps going until
             // torn down, `once` does not. Total on a registration row.
             Field::Firing => match sort {
+                Sort::Read => false,
                 Sort::Call => false,
                 Sort::Registration => true,
                 Sort::Hook(_)
@@ -775,6 +838,7 @@ impl Field {
                 | Sort::ContextConsumer => false,
             },
             Field::Owner => match sort {
+                Sort::Read => false,
                 Sort::Call => false,
                 Sort::SetterRender => true,
                 Sort::Hook(_)
@@ -793,6 +857,7 @@ impl Field {
             // The loop path, already node-qualified by owning component. Only
             // a cycle row has one; no other sort could invent it.
             Field::Cycle => match sort {
+                Sort::Read => false,
                 Sort::Call => false,
                 Sort::ChurnCycle => true,
                 Sort::Hook(_)
@@ -1537,11 +1602,12 @@ fn validate_guard(
         }
         Guard::Phase { of, is } => {
             let (of, sort) = cx.resolve_of(of, g_path)?;
-            if sort != Sort::Call {
+            if !matches!(sort, Sort::Call | Sort::Read) {
                 return Err(PackError::new(
                     format!("{g_path}.of"),
                     format!(
-                        "guard `phase` applies to a `calls` row, but the subject binds {}",
+                        "guard `phase` applies to a `calls` or `reads` row, but the subject \
+                         binds {}",
                         sort.describe()
                     ),
                 ));
@@ -2199,6 +2265,7 @@ fn edge_by_token(token: &str) -> Option<EdgeName> {
         "args" => EdgeName::Args,
         "writers" => EdgeName::Writers,
         "seeds" => EdgeName::Seeds,
+        "reads" => EdgeName::Reads,
         "calls" => EdgeName::Calls,
         _ => return None,
     })

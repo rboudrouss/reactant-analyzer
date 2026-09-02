@@ -70,6 +70,8 @@ enum Bound<'a, 'b> {
     Seed(&'a crate::engine::SlotSeed),
     /// One non-hook call site in the anchor's body (#126).
     Call(&'b crate::engine::BodyCall),
+    /// One read site of the anchor slot (#127).
+    Read(&'b crate::engine::SlotRead),
 }
 
 /// One candidate under evaluation: whatever the anchor bound, plus the
@@ -151,6 +153,7 @@ impl<'a, 'b> Candidate<'a, 'b> {
                 Bound::Writer(w) => EntityVal::Writer(w),
                 Bound::Seed(s) => EntityVal::Seed(s),
                 Bound::Call(c) => EntityVal::Call(c),
+                Bound::Read(r) => EntityVal::Read(r),
             },
         }
     }
@@ -180,6 +183,7 @@ impl<'a, 'b> Candidate<'a, 'b> {
                 // A call row's own site, not the hook's: the whole point of
                 // the relation is to point at the call.
                 Some(Bound::Call(c)) => c.span.or(row.info.span),
+                Some(Bound::Read(r)) => r.span.or(row.info.span),
                 Some(Bound::Dep(_) | Bound::Arg(_) | Bound::Seed(_)) | None => row.info.span,
             },
             Candidate::RenderSetter(s) => s.span,
@@ -241,7 +245,7 @@ impl Rule for TierARule {
                                     &e,
                                     &Candidate::Hook {
                                         row: &row,
-                                        bound: Some(Bound::Call(&call)),
+                                        bound: Some(Bound::Call(call)),
                                     },
                                     &mut out,
                                 );
@@ -254,6 +258,18 @@ impl Rule for TierARule {
                                     &Candidate::Hook {
                                         row: &row,
                                         bound: Some(Bound::Arg(&arg)),
+                                    },
+                                    &mut out,
+                                );
+                            }
+                        }
+                        Some(EdgeName::Reads) => {
+                            for read in e.reads(&row) {
+                                self.eval(
+                                    &e,
+                                    &Candidate::Hook {
+                                        row: &row,
+                                        bound: Some(Bound::Read(read)),
                                     },
                                     &mut out,
                                 );
@@ -388,7 +404,8 @@ impl TierARule {
                     | Bound::Arg(_)
                     | Bound::Writer(_)
                     | Bound::Seed(_)
-                    | Bound::Call(_),
+                    | Bound::Call(_)
+                    | Bound::Read(_),
                 )
                 | None => {
                     unreachable!("validated: `stability` binds a deps entry")
@@ -401,7 +418,8 @@ impl TierARule {
                     | Bound::Dep(_)
                     | Bound::Writer(_)
                     | Bound::Seed(_)
-                    | Bound::Call(_),
+                    | Bound::Call(_)
+                    | Bound::Read(_),
                 )
                 | None => {
                     unreachable!("validated: `returns` binds a call-site argument")
@@ -481,10 +499,12 @@ impl TierARule {
                 names.contains(&e.updater_purity(&w.updater))
             }
             ResolvedGuard::Phase { of, names } => {
-                let EntityVal::Call(c) = cand.entity_at(*of) else {
-                    unreachable!("validated: `phase` binds a calls row")
+                let phase = match cand.entity_at(*of) {
+                    EntityVal::Call(c) => c.phase,
+                    EntityVal::Read(r) => r.phase,
+                    _ => unreachable!("validated: `phase` binds a calls or reads row"),
                 };
-                names.contains(&phase_name(c.phase))
+                names.contains(&phase_name(phase))
             }
             ResolvedGuard::Provider { of, names } => {
                 let EntityVal::Consumer(c) = cand.entity_at(*of) else {
@@ -666,6 +686,7 @@ impl TierARule {
                     EdgeName::Writers => e.writers(row).iter().any(|w| hit(Bound::Writer(w))),
                     EdgeName::Seeds => e.seeds(row).iter().any(|s| hit(Bound::Seed(s))),
                     EdgeName::Calls => e.body_calls(row).iter().any(|c| hit(Bound::Call(c))),
+                    EdgeName::Reads => e.reads(row).iter().any(|r| hit(Bound::Read(r))),
                 };
                 !any
             }

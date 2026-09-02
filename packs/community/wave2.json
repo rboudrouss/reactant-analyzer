@@ -1,0 +1,143 @@
+{
+  "$schema": "../../docs/schemas/pack.schema.json",
+  "schemaVersion": 1,
+  "name": "community-wave2",
+  "rules": [
+    {
+      "id": "layout-read-in-passive-effect",
+      "docs": {
+        "description": "a passive effect measures layout, which reads back a frame the user has already seen",
+        "why": "`getBoundingClientRect` and friends force the browser to flush pending style and layout. Done in `useEffect`, that happens *after* the browser has painted, so a state write derived from the measurement shows the user one frame at the old position and then jumps. `useLayoutEffect` runs before paint, which is why the same code there is correct — the fix is the hook, not the measurement.",
+        "fix": "Move the measurement, and the write it feeds, into `useLayoutEffect`. If the value is only used for analytics or logging, keep `useEffect` and do not write state from it.",
+        "example": "useEffect(() => { setTop(ref.current.getBoundingClientRect().top); }, []);"
+      },
+      "severity": "warning",
+      "params": {
+        "layoutReads": {
+          "type": "string[]",
+          "default": ["getBoundingClientRect", "getClientRects", "getComputedStyle", "scrollIntoView"]
+        }
+      },
+      "anchor": { "relation": "hook_calls", "kind": "effect" },
+      "forEach": { "edge": "calls", "as": "c" },
+      "guards": [
+        { "kind": "origin", "of": "anchor", "hook": ["useEffect"] },
+        { "kind": "name", "of": "c", "one_of": { "$param": "layoutReads" } },
+        { "kind": "phase", "of": "c", "is": ["effect"] }
+      ],
+      "message": "this passive effect calls {c.name} — layout measured after paint, so anything derived from it shows one stale frame"
+    },
+    {
+      "id": "acquired-resource-not-released",
+      "docs": {
+        "description": "an effect acquires a resource and no call in it gives the resource back",
+        "why": "`observer.observe`, `URL.createObjectURL`, `getUserMedia` and `socket.join` each hand out something the browser or the server keeps until it is told otherwise. None of them is a callback registration, so `missing-cleanup` never looks at them — and it goes silent entirely as soon as the effect returns *any* cleanup, however unrelated. The rule below asks the narrower, checkable question: does any call in this effect, cleanup included, undo the acquisition?",
+        "fix": "Return a cleanup that calls the matching release — `disconnect`/`unobserve`, `revokeObjectURL`, `track.stop()`, `leave` — for every acquisition the setup performed.",
+        "example": "useEffect(() => { const ro = new ResizeObserver(cb); ro.observe(el); }, []);  // never disconnected"
+      },
+      "severity": "warning",
+      "params": {
+        "acquire": { "type": "string[]", "default": ["observe", "createObjectURL", "join", "lock", "acquire"] },
+        "release": {
+          "type": "string[]",
+          "default": ["disconnect", "unobserve", "revokeObjectURL", "leave", "unlock", "release", "stop", "abort", "close"]
+        }
+      },
+      "anchor": { "relation": "hook_calls", "kind": "effect" },
+      "forEach": { "edge": "calls", "as": "c" },
+      "guards": [
+        { "kind": "name", "of": "c", "one_of": { "$param": "acquire" } },
+        { "kind": "phase", "of": "c", "is": ["effect"] },
+        {
+          "kind": "none",
+          "of": "anchor.calls",
+          "as": "r",
+          "guards": [{ "kind": "name", "of": "r", "one_of": { "$param": "release" } }]
+        }
+      ],
+      "message": "this effect calls {c.name} and nothing in it gives that back — no release call appears anywhere in the effect or its cleanup"
+    },
+    {
+      "id": "navigation-during-render",
+      "docs": {
+        "description": "the render body performs an imperative navigation",
+        "why": "Rendering must be a pure function of props and state. A `router.push` in the body runs during render — twice under StrictMode, and again on every re-render that reaches the same branch — so the history stack grows, the navigation can fire while React is still committing, and a concurrent render that React throws away has already had its side effect.",
+        "fix": "Navigate from an effect, or return a declarative redirect element. A guard clause that renders `null` and navigates in `useEffect` is the usual shape.",
+        "example": "function Page({ user }) { if (!user) router.push('/login'); return <App/>; }"
+      },
+      "severity": "warning",
+      "params": {
+        "methods": { "type": "string[]", "default": ["push", "replace", "back", "forward", "navigate"] },
+        "receivers": { "type": "string[]", "default": ["router", "history", "navigation"] }
+      },
+      "anchor": { "relation": "render_calls" },
+      "guards": [
+        { "kind": "name", "of": "anchor", "one_of": { "$param": "methods" } },
+        { "kind": "receiver", "of": "anchor", "one_of": { "$param": "receivers" } },
+        { "kind": "phase", "of": "anchor", "is": ["render"] }
+      ],
+      "message": "{anchor.receiver}.{anchor.name} runs during render — move it into an effect or return a redirect element"
+    },
+    {
+      "id": "expensive-work-in-render-body",
+      "docs": {
+        "description": "the render body runs a known-expensive call on every render",
+        "why": "A `JSON.parse` of a large payload, a `sort` of a long list, a `new Intl.*` formatter: each runs on every render, including the ones caused by an unrelated state change, and each is invisible in a profile until the list is big. The identity cost is separate and worse — a fresh array from `sort` defeats every memo below it.",
+        "fix": "Wrap it in `useMemo` keyed on the inputs it actually reads, or hoist it out of the component if the inputs are module-level.",
+        "example": "function Table({ rowsJson }) { const rows = JSON.parse(rowsJson); … }"
+      },
+      "severity": "warning",
+      "params": {
+        "expensive": { "type": "string[]", "default": ["parse", "stringify", "sort", "reverse"] }
+      },
+      "anchor": { "relation": "render_calls" },
+      "guards": [
+        { "kind": "name", "of": "anchor", "one_of": { "$param": "expensive" } },
+        { "kind": "phase", "of": "anchor", "is": ["render"] }
+      ],
+      "message": "{anchor.name} runs in the render body on every render — wrap it in useMemo keyed on its inputs"
+    },
+    {
+      "id": "freshly-minted-value-in-render",
+      "docs": {
+        "description": "the render body mints a brand-new identifier or timestamp on every render",
+        "why": "`crypto.randomUUID()`, `Math.random()` and `Date.now()` in a render body produce a different value every render. Used as a list `key` that remounts the whole row — losing focus, scroll, input state and every child effect — and used as a prop it defeats memoization the same way a fresh object would. The engine has no value-provenance verdict (#127's neighbour), so this names the mint sites rather than tracing where the value lands: a component that mints one and uses it only for a log message is reported too.",
+        "fix": "Key rows by a stable id from the data. If an id genuinely does not exist, mint it once where the data is created — not during render.",
+        "example": "items.map(it => <Row key={crypto.randomUUID()} item={it} />)"
+      },
+      "severity": "warning",
+      "params": {
+        "minters": { "type": "string[]", "default": ["randomUUID", "random", "now", "uuid", "nanoid"] }
+      },
+      "anchor": { "relation": "render_calls" },
+      "guards": [
+        { "kind": "name", "of": "anchor", "one_of": { "$param": "minters" } },
+        { "kind": "phase", "of": "anchor", "is": ["render"] }
+      ],
+      "message": "{anchor.name} mints a new value on every render — as a key or a prop that remounts or re-renders everything below it"
+    },
+    {
+      "id": "state-never-read-during-render",
+      "docs": {
+        "description": "a state slot no render-phase read ever consumes",
+        "why": "A slot that no render-phase read consumes is a pure re-render generator: every write commits a new render that produces the same output. The classic is a `scrollY` or `mousePosition` slot kept for a feature that was removed, still driven at event rate. Two weakenings to know. The verdict is an ABSENCE — a read the walk could not enter (a closure nothing calls, a read past the depth cap) leaves no row — so this over-reports and never certifies. And a render-phase read is not proof the value reaches the *output*: a slot read during render and then dropped still silences the rule, because there is no reachability verdict yet (#127's second half).",
+        "fix": "Delete the slot, or move the value into a `useRef` if something outside the render still needs it.",
+        "example": "const [scrollY, setScrollY] = useState(0);  // setScrollY on every scroll, scrollY never rendered"
+      },
+      "severity": "warning",
+      "anchor": { "relation": "hook_calls", "kind": "state" },
+      "guards": [
+        { "kind": "writer_phases", "of": "anchor", "includes": ["render", "effect", "memo", "callback", "handler", "deferred", "cleanup", "unknown"] },
+        {
+          "kind": "none",
+          "of": "anchor.reads",
+          "as": "r",
+          "guards": [
+            { "kind": "phase", "of": "r", "is": ["render", "memo", "unknown"] }
+          ]
+        }
+      ],
+      "message": "state {anchor.name} is written but no render-phase read of it is visible — every write costs a render that changes nothing"
+    }
+  ]
+}
