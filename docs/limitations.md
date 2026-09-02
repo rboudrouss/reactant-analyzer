@@ -121,10 +121,15 @@ Every entry here is Warning-or-below by construction: an FP never carries an Err
   `[JSON.stringify(options)]` does not declare a read of `options`, since `options` can move while
   its serialization stands still
   [ADR-042](adr/ADR-042-a-dep-that-is-the-read.md).
-- **An alias hides which members a body touches**: `const condition = performanceCondition` records a
-  read of the whole aliased object, so a dep naming one of its members does not cover it. The binding
-  chase follows aliases, the free-variable walk does not rewrite the paths it records. ~5 corpus
-  locations [#89](https://github.com/rboudrouss/reactant-analyzer/issues/89).
+- **A rename is resolved, a computation is not**: `const c = cond` (and the destructuring preamble
+  `const { viewport } = ctx`) is a rename, so the body's reads through it are recorded as reads of
+  `cond.…`. An alias formed by a call (`const c = identity(x)`) or across a function boundary still
+  reads the whole object, and a member dep will not cover it
+  [ADR-044](adr/ADR-044-a-rename-is-not-a-read.md).
+- **A finding names the object when the deps name nothing about it**: three undeclared members of
+  `settings` are one finding saying `settings`, not three. Where the deps do name members of a root,
+  the uncovered ones are listed one by one
+  [ADR-044](adr/ADR-044-a-rename-is-not-a-read.md).
 - **`setter-in-render`** warns when a setter reaches a callee with no timing summary
   (`<form onSubmit={handleSubmit(onSubmit)}>`, `composeEventHandlers(a, cb)`): ⊤ includes the render
   pass, so the row is sound and the wording says so — it never claims the setter was called in the

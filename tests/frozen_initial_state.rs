@@ -1000,3 +1000,32 @@ function C({ url, load }) {
         "the effect re-runs on `url` and its continuation writes the slot: {diags:?}"
     );
 }
+
+/// Several members of one object seeding the same slot must be named by the
+/// handle they share, not by whichever member the walk saw first. `const input
+/// = action.settings.input` used to be one seed of the whole object; resolving
+/// the rename makes it a dozen member seeds of the same thing (ADR-044).
+#[test]
+fn many_member_seeds_are_named_by_the_handle_they_share() {
+    let src = r#"
+        function Form({ action }) {
+            const [formData, setFormData] = useState(() => {
+                const input = action.settings.input;
+                return { title: input.title, body: input.body, cc: input.cc };
+            });
+            return <input value={formData.title} onChange={(e) => setFormData(e)} />;
+        }
+    "#;
+    let diags = diags_for(src, "Form");
+    let msgs: Vec<&str> = diags
+        .iter()
+        .filter(|d| d.rule.as_ref() == "frozen-initial-state")
+        .map(|d| d.message.as_ref())
+        .collect();
+    assert_eq!(msgs.len(), 1, "one finding for the slot: {diags:?}");
+    assert!(
+        msgs[0].contains("`action.settings.input`"),
+        "must name the shared handle, not one member: {}",
+        msgs[0]
+    );
+}

@@ -118,7 +118,7 @@ impl Rule for FrozenInitialState {
             // proven = (seed path, certified moving feeder) — the proof is
             // minted by `classify_motion` at the point of knowledge (ADR-021).
             let mut proven: Option<(String, Certified<MovingFeeder>)> = None;
-            let mut unproven_path: Option<String> = None;
+            let mut unproven: Option<crate::ir::free_vars::AccessPath> = None;
             let mut all_seed_named = true;
             // Prop names the moving seeds arrive through — what the call sites
             // must re-seed for the freeze to be unobservable. `None` once a
@@ -158,12 +158,17 @@ impl Rule for FrozenInitialState {
                     Motion::Unproven => {
                         all_seed_named &= is_seed_named(&seed.path);
                         note_moving(seed, &mut moving_props);
-                        if unproven_path.is_none() {
-                            unproven_path = Some(seed.path.to_string());
-                        }
+                        // Several members of one object can seed the same
+                        // slot (`const input = action.settings.input`, then a
+                        // dozen reads of it): name the handle they share.
+                        unproven = Some(match &unproven {
+                            Some(prev) => prev.common_prefix(&seed.path),
+                            None => seed.path.clone(),
+                        });
                     }
                 }
             }
+            let unproven_path = unproven.map(|p| p.to_string());
             if proven.is_none() && unproven_path.is_none() {
                 continue; // every seeding prop provably never changes
             }

@@ -183,9 +183,18 @@ Re-mesure des 60 scénarios : **8 EXPRESSIBLE (contre 1), 20 INEXPRESSIBLE
   8 retirées, aucune ajoutée** — les 24 annoncées étaient un comptage sur une
   base plus étroite.
 
-  Reste de #89 : l'alias (`const c = x` enregistre tout `x` au lieu des
-  membres que le corps touche) — ~5 emplacements. La chasse suit les alias, la
-  marche des variables libres ne réécrit pas les chemins qu'elle enregistre.
+- **ADR-044** — la dernière forme de #89, et **l'issue est close**. Un
+  renommage n'est pas une lecture : la marche saute le membre droit d'un `let`
+  qui lie un nom, une seule fois, à une chaîne de membres, et réécrit les
+  chemins enracinés sur ce nom. La forme qui compte n'est pas l'alias explicite
+  mais la **déstructuration** — `const { viewport } = ctx` s'abaisse en
+  `__obj = ctx; viewport = __obj.viewport`, donc une lecture du contexte entier
+  précédait chaque tableau `[ctx.viewport, ctx.offset]`. Corollaire de
+  présentation : quand le tableau de deps ne nomme rien sous une racine, le
+  constat porte sur l'objet, pas sur chacun des huit membres que le corps
+  touche ; et plusieurs membres d'un même objet qui amorcent le même slot sont
+  nommés par la poignée qu'ils partagent. Corpus : **1 394 → 1 359 emplacements
+  (5 119 → 4 985 lignes)**, 8 sites de hook éteints, **aucun site n'en gagne**.
 
 Prochaines marches, par valeur décroissante : les valeurs d'arguments (#67) ;
 une requête de dominance ; les résumés d'écosystème (#94), seule façon de

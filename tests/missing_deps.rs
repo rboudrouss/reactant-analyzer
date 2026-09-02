@@ -595,3 +595,143 @@ fn a_callback_over_state_reached_through_a_container_still_fires() {
          mount-time value"
     );
 }
+
+/// #89 §2 — a rename is not a read. `const c = cond` used to record a read of
+/// the whole object, which no member dep could cover, drowning the three
+/// members the body actually touches through `c` (dub's
+/// `use-add-edit-bounty-form.ts`).
+#[test]
+fn an_alias_reads_the_members_the_body_touches() {
+    assert_eq!(
+        missing_deps_hits(
+            r#"
+            import { useMemo } from "react";
+            function C({ cond }) {
+              const err = useMemo(() => {
+                const c = cond;
+                if (!c.attribute) return "attribute";
+                if (!c.value) return "value";
+                return null;
+              }, [cond.attribute, cond.value]);
+              return <div>{err}</div>;
+            }
+            "#,
+        ),
+        0,
+        "the body reads `cond.attribute` and `cond.value`, both declared"
+    );
+}
+
+/// And the bare use it must not swallow: passing the alias on reads the whole
+/// object, so the whole object is what the deps have to declare.
+#[test]
+fn an_alias_used_bare_still_reads_the_whole_object() {
+    assert_eq!(
+        missing_deps_hits(
+            r#"
+            import { useMemo } from "react";
+            function C({ cond }) {
+              const err = useMemo(() => {
+                const c = cond;
+                if (!c.attribute) return "attribute";
+                return JSON.stringify(c);
+              }, [cond.attribute]);
+              return <div>{err}</div>;
+            }
+            "#,
+        ),
+        1,
+        "`c` escapes whole, so the read is of whole `cond`"
+    );
+}
+
+/// A right-hand side that computes is not a rename: its reads happen where
+/// they are written, and skipping the statement would lose them.
+#[test]
+fn a_computed_binding_is_not_an_alias() {
+    assert_eq!(
+        missing_deps_hits(
+            r#"
+            import { useMemo } from "react";
+            function C({ cond, pick }) {
+              const err = useMemo(() => {
+                const c = pick(cond);
+                return c.attribute;
+              }, [cond.attribute]);
+              return <div>{err}</div>;
+            }
+            "#,
+        ),
+        2,
+        "`pick(cond)` reads whole `cond`, and `pick` itself is undeclared"
+    );
+}
+
+/// The idiom the alias resolution really pays for: a destructuring preamble
+/// lowers to `__obj = ctx; viewport = __obj.viewport`, so the whole context was
+/// recorded as read and the member deps beside it covered nothing (mantine's
+/// ScrollArea, three effects).
+#[test]
+fn a_destructured_member_is_covered_by_a_member_dep() {
+    assert_eq!(
+        missing_deps_hits(
+            r#"
+            import { useEffect } from "react";
+            function C({ ctx }) {
+              useEffect(() => {
+                const { viewport } = ctx;
+                if (viewport) {
+                  viewport.scrollTo(0, ctx.offset);
+                }
+              }, [ctx.viewport, ctx.offset]);
+              return <div />;
+            }
+            "#,
+        ),
+        0,
+        "the effect reads `ctx.viewport` and `ctx.offset`, both declared"
+    );
+}
+
+/// When the deps declare nothing about an object, the finding is about the
+/// object. Naming every member the body touches is the same advice spread over
+/// N rows.
+#[test]
+fn uncovered_members_of_an_undeclared_object_report_it_once() {
+    assert_eq!(
+        missing_deps_hits(
+            r#"
+            import { useEffect } from "react";
+            function C({ settings }) {
+              useEffect(() => {
+                render(settings.halftone.variant, settings.material, settings.lighting);
+              }, []);
+              return <div />;
+            }
+            "#,
+        ),
+        1,
+        "three undeclared members of `settings`, one finding naming `settings`"
+    );
+}
+
+/// And where the deps DO name members of a root, the uncovered ones are named
+/// one by one — that is where the fix is per-member.
+#[test]
+fn uncovered_members_beside_a_declared_one_are_named_individually() {
+    assert_eq!(
+        missing_deps_hits(
+            r#"
+            import { useEffect } from "react";
+            function C({ settings }) {
+              useEffect(() => {
+                render(settings.halftone, settings.material, settings.lighting);
+              }, [settings.halftone]);
+              return <div />;
+            }
+            "#,
+        ),
+        2,
+        "`settings.material` and `settings.lighting`, each its own finding"
+    );
+}

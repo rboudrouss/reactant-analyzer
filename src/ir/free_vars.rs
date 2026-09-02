@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::ir::{cfg::CFG, expr::Expr, stmt::Stmt, types::Var};
@@ -16,7 +16,7 @@ use crate::ir::{cfg::CFG, expr::Expr, stmt::Stmt, types::Var};
 /// `x.a[i].b` → `{root: x, segments: [a]}` — "touches all of `x.a`", coverable
 /// by a whole-`x` or whole-`x.a` dep but not by `x.a.b`. On the *dep* side such
 /// an access declares nothing (see [`dep_paths`]).
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct AccessPath {
     pub root: Var,
     pub segments: Vec<String>,
@@ -28,6 +28,25 @@ impl AccessPath {
         Self {
             root,
             segments: Vec::new(),
+        }
+    }
+
+    /// The longest path this and `other` share, or `self` when their roots
+    /// differ. What to name when several reads seed or feed the same thing:
+    /// the handle they have in common, not whichever one the walk saw first.
+    pub fn common_prefix(&self, other: &AccessPath) -> AccessPath {
+        if self.root != other.root {
+            return self.clone();
+        }
+        let n = self
+            .segments
+            .iter()
+            .zip(&other.segments)
+            .take_while(|(a, b)| a == b)
+            .count();
+        AccessPath {
+            root: self.root.clone(),
+            segments: self.segments[..n].to_vec(),
         }
     }
 
@@ -90,8 +109,10 @@ pub fn compute_free_vars(cfg: &CFG) -> HashSet<Var> {
 /// Compute free access *paths* of a CFG (see [`AccessPath`]): every read,
 /// refined to the member chain actually touched, minus locally-defined roots.
 ///
-/// The root-variable set matches [`compute_free_vars`] exactly; this only adds
-/// the field-chain suffix so `missing-deps` can distinguish `x.a` from `x.b`.
+/// Adds the field-chain suffix so `missing-deps` can distinguish `x.a` from
+/// `x.b`, and resolves the body's own renames. The root set is therefore a
+/// *subset* of [`compute_free_vars`]: a name aliased but never used is a read
+/// that never happens.
 pub fn compute_free_paths(cfg: &CFG) -> HashSet<AccessPath> {
     compute_free_paths_pinned(cfg, &[])
 }
@@ -130,11 +151,90 @@ pub fn free_paths_and_pinned(
 fn compute_free_paths_pinned(cfg: &CFG, pinned: &[Expr]) -> HashSet<AccessPath> {
     let keys: HashSet<String> = pinned.iter().filter_map(pure_key).collect();
     let mut used: HashSet<AccessPath> = HashSet::new();
-    cfg.for_each_expr(&mut |e| collect_paths(e, &keys, &mut used));
-
-    subtract_local_definitions(cfg, &mut used);
+    collect_body_paths(cfg, &keys, &mut used);
     used
 }
+
+/// Every path a body reads, resolved against its own local names: an aliasing
+/// `let` is skipped (a rename is not a read), paths rooted at an alias are
+/// rewritten to what it names, and what is still rooted at a name this body
+/// binds is dropped — bound, not free.
+///
+/// One function for the body and for every nested `FnLit`, because a closure
+/// renames things exactly as its enclosing body does.
+fn collect_body_paths(cfg: &CFG, pinned: &HashSet<String>, out: &mut HashSet<AccessPath>) {
+    let aliases = local_aliases(cfg);
+    let mut used: HashSet<AccessPath> = HashSet::new();
+    cfg.for_each_expr_where(
+        &|s| !matches!(s, Stmt::Let { var, .. } if aliases.contains_key(var)),
+        &mut |e| collect_paths(e, pinned, &mut used),
+    );
+    resolve_aliases(&aliases, &mut used);
+    subtract_local_definitions(cfg, &mut used);
+    out.extend(used);
+}
+
+/// Names this body declares exactly once, as a rename of a member chain:
+/// `const condition = performanceCondition`. Nothing else qualifies — a name
+/// bound twice is not a rename, and a right-hand side that is anything but a
+/// plain chain (a call, an index, an object literal) is a computation whose
+/// reads have to be recorded where they happen.
+fn local_aliases(cfg: &CFG) -> HashMap<Var, AccessPath> {
+    let mut counts: HashMap<&Var, usize> = HashMap::new();
+    let mut candidates: HashMap<Var, AccessPath> = HashMap::new();
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            let (Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. }) = stmt else {
+                continue;
+            };
+            *counts.entry(var).or_default() += 1;
+            if !matches!(stmt, Stmt::Let { .. }) {
+                continue;
+            }
+            let mut side = Vec::new();
+            // `!opaque` already implies `side` is empty (only a dynamic index
+            // pushes one), but the walk skips this statement wholesale, so an
+            // off-chain sub-expression here would be a read lost outright.
+            if let Some((root, segments, false)) = extract_path(rhs, &mut side)
+                && side.is_empty()
+            {
+                candidates.insert(var.clone(), AccessPath { root, segments });
+            }
+        }
+    }
+    candidates.retain(|v, _| counts.get(v) == Some(&1));
+    candidates
+}
+
+/// Rewrite every path rooted at a local alias to the path it renames,
+/// `condition.attribute` → `performanceCondition.attribute`, repeatedly for a
+/// chain of them. The bound only stops a cycle; a real chain is one or two.
+fn resolve_aliases(aliases: &HashMap<Var, AccessPath>, used: &mut HashSet<AccessPath>) {
+    if aliases.is_empty() {
+        return;
+    }
+    *used = used
+        .drain()
+        .map(|mut p| {
+            for _ in 0..MAX_ALIAS_HOPS {
+                let Some(target) = aliases.get(&p.root) else {
+                    break;
+                };
+                let mut segments = target.segments.clone();
+                segments.append(&mut p.segments);
+                p = AccessPath {
+                    root: target.root.clone(),
+                    segments,
+                };
+            }
+            p
+        })
+        .collect();
+}
+
+/// Alias hops the rewrite will follow. A real chain is one or two; the bound
+/// only stops a cycle, and a path left rooted at a local is dropped anyway.
+const MAX_ALIAS_HOPS: usize = 8;
 
 /// Drop the paths rooted at a name this body binds: locally-defined roots are
 /// bound, not free (matches [`compute_free_vars`]).
@@ -242,8 +342,7 @@ fn collect_paths(expr: &Expr, pinned: &HashSet<String>, out: &mut HashSet<Access
             params, body_cfg, ..
         } => {
             let mut inner: HashSet<AccessPath> = HashSet::new();
-            body_cfg.for_each_expr(&mut |e| collect_paths(e, pinned, &mut inner));
-            subtract_local_definitions(body_cfg, &mut inner);
+            collect_body_paths(body_cfg, pinned, &mut inner);
             out.extend(inner.into_iter().filter(|p| !params.contains(&p.root)));
         }
         // Everything else: structural descent via the canonical child walker.

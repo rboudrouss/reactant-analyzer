@@ -64,8 +64,24 @@ impl CFG {
     /// terminator expressions. Companion of [`crate::ir::expr::Expr::for_each_child`]
     /// for walkers that scan whole bodies. Blocks are visited in id order.
     pub fn for_each_expr<'a>(&'a self, f: &mut impl FnMut(&'a crate::ir::expr::Expr)) {
+        self.for_each_expr_where(&|_| true, f);
+    }
+
+    /// [`Self::for_each_expr`], visiting only the statements `keep` selects.
+    /// The terminator is always visited — a block only has one, and it is
+    /// never a binding.
+    ///
+    /// The free-path walk uses this to skip an aliasing `let`: `const c = x.a`
+    /// renames a read rather than performing one, and recording the whole of
+    /// `x.a` there would drown the members the body actually touches through
+    /// `c`.
+    pub fn for_each_expr_where<'a>(
+        &'a self,
+        keep: &impl Fn(&crate::ir::stmt::Stmt) -> bool,
+        f: &mut impl FnMut(&'a crate::ir::expr::Expr),
+    ) {
         for block in self.blocks.values() {
-            for stmt in &block.stmts {
+            for stmt in block.stmts.iter().filter(|s| keep(s)) {
                 match stmt {
                     crate::ir::stmt::Stmt::Let { rhs, .. }
                     | crate::ir::stmt::Stmt::Assign { rhs, .. } => f(rhs),

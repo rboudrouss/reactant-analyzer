@@ -1,9 +1,12 @@
 use crate::rules::RuleCtx;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use crate::{
     domains::{impls::StateValue, stores::AbstractEnv},
-    ir::free_vars::{AccessPath, compute_free_vars, dep_paths, path_covered},
+    ir::{
+        free_vars::{AccessPath, compute_free_vars, dep_paths, path_covered},
+        types::Var,
+    },
 };
 
 use crate::ir::bindings::ClosureBinding;
@@ -58,6 +61,16 @@ impl Rule for MissingDeps {
             // rather than `rows` itself.
             let declared: Vec<AccessPath> = dep_paths(&info.covering_deps());
 
+            // The deps array names nothing rooted here → nothing about that
+            // object was declared, and the finding is about the object, not
+            // about each member the body happens to touch. `settings` reads
+            // better than eight rows naming `settings.halftone`,
+            // `settings.material.surface`, … and it is the same advice. Where
+            // the deps DO name members of a root, the uncovered ones are named
+            // one by one: that is where the fix is per-member.
+            let declared_roots: HashSet<&Var> = declared.iter().map(|d| &d.root).collect();
+            let mut reported: BTreeSet<AccessPath> = BTreeSet::new();
+
             for path in &info.free_paths {
                 if path_covered(path, &declared) || info.deps_pinned.contains(path) {
                     continue;
@@ -72,10 +85,20 @@ impl Rule for MissingDeps {
                 // The root's value is the fallback for a path the heap cannot
                 // resolve — `eval_field_access` degrades such a read to ⊤, so
                 // this only ever removes findings (issue #88).
-                let val = env_exit.lookup(&path.root);
-                if !val.is_stable()
+                if !env_exit.lookup(&path.root).is_stable()
                     && !member_is_stable(path, &env_exit, result)
                     && !closure_is_behaviorally_stable(path, result, &env_exit, &mut HashSet::new())
+                {
+                    reported.insert(if declared_roots.contains(&path.root) {
+                        path.clone()
+                    } else {
+                        AccessPath::root(path.root.clone())
+                    });
+                }
+            }
+
+            for path in reported {
+                let val = env_exit.lookup(&path.root);
                 {
                     let mut d = Diagnostic::warn(
                         "missing-deps",
