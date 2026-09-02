@@ -15,15 +15,44 @@
       "params": {
         "layoutReads": {
           "type": "string[]",
-          "default": ["getBoundingClientRect", "getClientRects", "getComputedStyle", "scrollIntoView"]
+          "default": [
+            "getBoundingClientRect",
+            "getClientRects",
+            "getComputedStyle",
+            "scrollIntoView"
+          ]
         }
       },
-      "anchor": { "relation": "hook_calls", "kind": "effect" },
-      "forEach": { "edge": "calls", "as": "c" },
+      "anchor": {
+        "relation": "hook_calls",
+        "kind": "effect"
+      },
+      "forEach": {
+        "edge": "calls",
+        "as": "c"
+      },
       "guards": [
-        { "kind": "origin", "of": "anchor", "hook": ["useEffect"] },
-        { "kind": "name", "of": "c", "one_of": { "$param": "layoutReads" } },
-        { "kind": "phase", "of": "c", "is": ["effect"] }
+        {
+          "kind": "origin",
+          "of": "anchor",
+          "hook": [
+            "useEffect"
+          ]
+        },
+        {
+          "kind": "name",
+          "of": "c",
+          "one_of": {
+            "$param": "layoutReads"
+          }
+        },
+        {
+          "kind": "phase",
+          "of": "c",
+          "is": [
+            "effect"
+          ]
+        }
       ],
       "message": "this passive effect calls {c.name} — layout measured after paint, so anything derived from it shows one stale frame"
     },
@@ -31,28 +60,72 @@
       "id": "acquired-resource-not-released",
       "docs": {
         "description": "an effect acquires a resource and no call in it gives the resource back",
-        "why": "`observer.observe`, `URL.createObjectURL`, `getUserMedia` and `socket.join` each hand out something the browser or the server keeps until it is told otherwise. None of them is a callback registration, so `missing-cleanup` never looks at them — and it goes silent entirely as soon as the effect returns *any* cleanup, however unrelated. The rule below asks the narrower, checkable question: does any call in this effect, cleanup included, undo the acquisition?",
+        "why": "`observer.observe`, `URL.createObjectURL`, `getUserMedia` and `socket.join` each hand out something the browser or the server keeps until it is told otherwise. None of them is a callback registration, so `missing-cleanup` never looks at them — and it goes silent entirely as soon as the effect returns *any* cleanup, however unrelated. The rule below asks the narrower, checkable question: does any call in this effect, cleanup included, undo the acquisition? Measured on the 34,730-file corpus: with `join` in this list every single hit was `Array.prototype.join`, so a name that is also an ordinary array method belongs in the sibling rule below, behind a `receiver` guard.",
         "fix": "Return a cleanup that calls the matching release — `disconnect`/`unobserve`, `revokeObjectURL`, `track.stop()`, `leave` — for every acquisition the setup performed.",
         "example": "useEffect(() => { const ro = new ResizeObserver(cb); ro.observe(el); }, []);  // never disconnected"
       },
       "severity": "warning",
       "params": {
-        "acquire": { "type": "string[]", "default": ["observe", "createObjectURL", "join", "lock", "acquire"] },
+        "acquire": {
+          "type": "string[]",
+          "default": [
+            "observe",
+            "createObjectURL",
+            "lock",
+            "acquire"
+          ]
+        },
         "release": {
           "type": "string[]",
-          "default": ["disconnect", "unobserve", "revokeObjectURL", "leave", "unlock", "release", "stop", "abort", "close"]
+          "default": [
+            "disconnect",
+            "unobserve",
+            "revokeObjectURL",
+            "leave",
+            "unlock",
+            "release",
+            "stop",
+            "abort",
+            "close"
+          ]
         }
       },
-      "anchor": { "relation": "hook_calls", "kind": "effect" },
-      "forEach": { "edge": "calls", "as": "c" },
+      "anchor": {
+        "relation": "hook_calls",
+        "kind": "effect"
+      },
+      "forEach": {
+        "edge": "calls",
+        "as": "c"
+      },
       "guards": [
-        { "kind": "name", "of": "c", "one_of": { "$param": "acquire" } },
-        { "kind": "phase", "of": "c", "is": ["effect"] },
+        {
+          "kind": "name",
+          "of": "c",
+          "one_of": {
+            "$param": "acquire"
+          }
+        },
+        {
+          "kind": "phase",
+          "of": "c",
+          "is": [
+            "effect"
+          ]
+        },
         {
           "kind": "none",
           "of": "anchor.calls",
           "as": "r",
-          "guards": [{ "kind": "name", "of": "r", "one_of": { "$param": "release" } }]
+          "guards": [
+            {
+              "kind": "name",
+              "of": "r",
+              "one_of": {
+                "$param": "release"
+              }
+            }
+          ]
         }
       ],
       "message": "this effect calls {c.name} and nothing in it gives that back — no release call appears anywhere in the effect or its cleanup"
@@ -67,14 +140,50 @@
       },
       "severity": "warning",
       "params": {
-        "methods": { "type": "string[]", "default": ["push", "replace", "back", "forward", "navigate"] },
-        "receivers": { "type": "string[]", "default": ["router", "history", "navigation"] }
+        "methods": {
+          "type": "string[]",
+          "default": [
+            "push",
+            "replace",
+            "back",
+            "forward",
+            "navigate"
+          ]
+        },
+        "receivers": {
+          "type": "string[]",
+          "default": [
+            "router",
+            "history",
+            "navigation"
+          ]
+        }
       },
-      "anchor": { "relation": "render_calls" },
+      "anchor": {
+        "relation": "render_calls"
+      },
       "guards": [
-        { "kind": "name", "of": "anchor", "one_of": { "$param": "methods" } },
-        { "kind": "receiver", "of": "anchor", "one_of": { "$param": "receivers" } },
-        { "kind": "phase", "of": "anchor", "is": ["render"] }
+        {
+          "kind": "name",
+          "of": "anchor",
+          "one_of": {
+            "$param": "methods"
+          }
+        },
+        {
+          "kind": "receiver",
+          "of": "anchor",
+          "one_of": {
+            "$param": "receivers"
+          }
+        },
+        {
+          "kind": "phase",
+          "of": "anchor",
+          "is": [
+            "render"
+          ]
+        }
       ],
       "message": "{anchor.receiver}.{anchor.name} runs during render — move it into an effect or return a redirect element"
     },
@@ -88,12 +197,34 @@
       },
       "severity": "warning",
       "params": {
-        "expensive": { "type": "string[]", "default": ["parse", "stringify", "sort", "reverse"] }
+        "expensive": {
+          "type": "string[]",
+          "default": [
+            "parse",
+            "stringify",
+            "sort",
+            "reverse"
+          ]
+        }
       },
-      "anchor": { "relation": "render_calls" },
+      "anchor": {
+        "relation": "render_calls"
+      },
       "guards": [
-        { "kind": "name", "of": "anchor", "one_of": { "$param": "expensive" } },
-        { "kind": "phase", "of": "anchor", "is": ["render"] }
+        {
+          "kind": "name",
+          "of": "anchor",
+          "one_of": {
+            "$param": "expensive"
+          }
+        },
+        {
+          "kind": "phase",
+          "of": "anchor",
+          "is": [
+            "render"
+          ]
+        }
       ],
       "message": "{anchor.name} runs in the render body on every render — wrap it in useMemo keyed on its inputs"
     },
@@ -107,12 +238,35 @@
       },
       "severity": "warning",
       "params": {
-        "minters": { "type": "string[]", "default": ["randomUUID", "random", "now", "uuid", "nanoid"] }
+        "minters": {
+          "type": "string[]",
+          "default": [
+            "randomUUID",
+            "random",
+            "now",
+            "uuid",
+            "nanoid"
+          ]
+        }
       },
-      "anchor": { "relation": "render_calls" },
+      "anchor": {
+        "relation": "render_calls"
+      },
       "guards": [
-        { "kind": "name", "of": "anchor", "one_of": { "$param": "minters" } },
-        { "kind": "phase", "of": "anchor", "is": ["render"] }
+        {
+          "kind": "name",
+          "of": "anchor",
+          "one_of": {
+            "$param": "minters"
+          }
+        },
+        {
+          "kind": "phase",
+          "of": "anchor",
+          "is": [
+            "render"
+          ]
+        }
       ],
       "message": "{anchor.name} mints a new value on every render — as a key or a prop that remounts or re-renders everything below it"
     },
@@ -125,19 +279,190 @@
         "example": "const [scrollY, setScrollY] = useState(0);  // setScrollY on every scroll, scrollY never rendered"
       },
       "severity": "warning",
-      "anchor": { "relation": "hook_calls", "kind": "state" },
+      "anchor": {
+        "relation": "hook_calls",
+        "kind": "state"
+      },
       "guards": [
-        { "kind": "writer_phases", "of": "anchor", "includes": ["render", "effect", "memo", "callback", "handler", "deferred", "cleanup", "unknown"] },
+        {
+          "kind": "writer_phases",
+          "of": "anchor",
+          "includes": [
+            "render",
+            "effect",
+            "memo",
+            "callback",
+            "handler",
+            "deferred",
+            "cleanup",
+            "unknown"
+          ]
+        },
         {
           "kind": "none",
           "of": "anchor.reads",
           "as": "r",
           "guards": [
-            { "kind": "phase", "of": "r", "is": ["render", "memo", "unknown"] }
+            {
+              "kind": "phase",
+              "of": "r",
+              "is": [
+                "render",
+                "memo",
+                "unknown"
+              ]
+            }
           ]
         }
       ],
       "message": "state {anchor.name} is written but no render-phase read of it is visible — every write costs a render that changes nothing"
+    },
+    {
+      "id": "controlled-input-without-a-writer",
+      "docs": {
+        "description": "a host input is driven by a value prop with no change handler on the same element",
+        "why": "React calls an `<input value={x}/>` with no `onChange` a controlled input that can never change: every keystroke is reverted to `x` on the next render, and the user sees a field that refuses to type. React itself warns at runtime; catching it statically is cheaper. `readOnly` and `disabled` are the two legitimate spellings, and neither is visible to this rule — name them in `writers` if your codebase uses them. Measured on the 34,730-file corpus: every hit was `<input type=\"hidden\" value={…}/>`, which needs no handler. Excluding it needs the *value* of the `type` prop, and the relation carries prop names only (#67) — so this rule is a demonstration that the shape is now expressible, not a rule to enable as it stands.",
+        "fix": "Add an `onChange` that writes the slot `value` reads, or make the input uncontrolled with `defaultValue`.",
+        "example": "<input value={name} />  // no onChange: the field cannot be typed into"
+      },
+      "severity": "warning",
+      "params": {
+        "tags": {
+          "type": "string[]",
+          "default": [
+            "input",
+            "textarea",
+            "select"
+          ]
+        },
+        "writers": {
+          "type": "string[]",
+          "default": [
+            "onChange",
+            "onInput",
+            "readOnly",
+            "disabled",
+            "defaultValue"
+          ]
+        }
+      },
+      "anchor": {
+        "relation": "elements",
+        "elements": "host"
+      },
+      "forEach": {
+        "edge": "props",
+        "as": "p"
+      },
+      "guards": [
+        {
+          "kind": "name",
+          "of": "anchor",
+          "one_of": {
+            "$param": "tags"
+          }
+        },
+        {
+          "kind": "prop",
+          "of": "p",
+          "one_of": [
+            "value",
+            "checked"
+          ]
+        },
+        {
+          "kind": "none",
+          "of": "anchor.props",
+          "as": "q",
+          "guards": [
+            {
+              "kind": "prop",
+              "of": "q",
+              "one_of": {
+                "$param": "writers"
+              }
+            }
+          ]
+        }
+      ],
+      "message": "<{anchor.name}> is driven by {p.prop} with nothing on the same element that can change it"
+    },
+    {
+      "id": "channel-joined-without-leaving",
+      "docs": {
+        "description": "an effect joins a channel or room and nothing in it leaves",
+        "why": "`socket.join(room)` is an acquisition the server keeps until told otherwise: an effect that re-runs on a room change joins the new room while still a member of the old one, and a component that unmounts stays joined. It is not a callback registration, so `missing-cleanup` never looks at it. The name is scoped by `receiver` on purpose — `Array.prototype.join` is the same word, and on the corpus every unscoped hit was an array join.",
+        "fix": "Return a cleanup that leaves what the setup joined, keyed on the same room.",
+        "example": "useEffect(() => { socket.join(room); }, [socket, room]);  // never leaves"
+      },
+      "severity": "warning",
+      "params": {
+        "receivers": {
+          "type": "string[]",
+          "default": [
+            "socket",
+            "channel",
+            "room",
+            "connection",
+            "client"
+          ]
+        },
+        "release": {
+          "type": "string[]",
+          "default": [
+            "leave",
+            "unsubscribe",
+            "disconnect",
+            "close"
+          ]
+        }
+      },
+      "anchor": {
+        "relation": "hook_calls",
+        "kind": "effect"
+      },
+      "forEach": {
+        "edge": "calls",
+        "as": "c"
+      },
+      "guards": [
+        {
+          "kind": "name",
+          "of": "c",
+          "one_of": [
+            "join"
+          ]
+        },
+        {
+          "kind": "receiver",
+          "of": "c",
+          "one_of": {
+            "$param": "receivers"
+          }
+        },
+        {
+          "kind": "phase",
+          "of": "c",
+          "is": [
+            "effect"
+          ]
+        },
+        {
+          "kind": "none",
+          "of": "anchor.calls",
+          "as": "r",
+          "guards": [
+            {
+              "kind": "name",
+              "of": "r",
+              "one_of": {
+                "$param": "release"
+              }
+            }
+          ]
+        }
+      ],
+      "message": "this effect calls {c.receiver}.join and nothing in it leaves"
     }
   ]
 }

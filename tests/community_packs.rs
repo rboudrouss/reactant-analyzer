@@ -24,7 +24,7 @@ const PACKS: &[(&str, &str, usize)] = &[
     // The second wave (#126/#127): the scenarios the `calls`, `reads`, `none`
     // and host-element additions made expressible. Same status as the first —
     // evidence, not first-party rules.
-    ("wave2", include_str!("../packs/community/wave2.json"), 6),
+    ("wave2", include_str!("../packs/community/wave2.json"), 8),
 ];
 
 #[test]

@@ -137,6 +137,29 @@
           ]
         },
         {
+          "description": "One element the render body builds (#126): the anchor `jsx_props`\ncould not be, because a rule about a prop's *absence* — `<input\nvalue={v}/>` with no `onChange` — needs the element as the subject and\nits props as an edge.\n\n`name` is the component name or the host tag, `kind` says which.\n`elements` narrows the enumeration exactly as it does on `jsx_props`,\nand defaults to `component` for the same reason.",
+          "type": "object",
+          "properties": {
+            "elements": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ElementsName"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "relation": {
+              "type": "string",
+              "const": "elements"
+            }
+          },
+          "required": [
+            "relation"
+          ]
+        },
+        {
           "description": "One render-loop cycle of the program's churn graph, seen from the\neffect of THIS component that carries one of its edges (#108,\nADR-029). Edge-less: `cycle` renders the loop as `a → b → a`, and the\n`cycle` guard filters on the two exact folds the graph already\ncomputed — whether the loop spans components, and whether every step\nis a must-step.\n\nA row's identity is the carrying edge's write site (ADR-024), so a\ncycle whose carrying edge has no span produces none. No `must_*` guard\naccepts this sort, so an Error is not reachable through the anchor.",
           "type": "object",
           "properties": {
@@ -222,6 +245,11 @@
           "description": "Non-hook call sites in the anchor's body CFG (#126, ADR-036): one row\nper call the setter walk passes, carrying the callee `name`, the\n`receiver` root of a member call, and the `phase` it runs in — the same\nlattice the writer rows use, so a call in a `.then`, after an `await`,\nor in the effect's returned cleanup is distinguishable from one in the\nbody.\n\nUnbounded, unlike every other relation: it enumerates *every* call.\nA `name` guard on the bound row is therefore **mandatory** — a rule\nthat fires on \"some call\" fires on all of them.",
           "type": "string",
           "const": "calls"
+        },
+        {
+          "description": "Props of an `elements` anchor's element (#126): the same rows\n`jsx_props` enumerates, grouped under the element that carries them, so\n`none` can ask whether one is missing.",
+          "type": "string",
+          "const": "props"
         },
         {
           "description": "Readers of a state-hook anchor's slot (#127, ADR-037): one row per read\nsite, over the same regions the `writers` edge enumerates. `{r.region}`\nis the lexical body — exact; `{r.phase}` is the same MAY verdict, so a\nread in a `.then` continuation or a cleanup is distinguishable from one\nin the render body.\n\nA read the walk never entered — inside a closure nothing calls, past the\ndepth cap — contributes no row, so the ABSENCE of rows is not a proof\nthat the slot is unread. `none` over this edge reads as \"no read the\nanalysis could see\", and over-reports rather than losing a finding.",

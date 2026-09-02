@@ -103,6 +103,12 @@ enum Candidate<'a, 'b> {
     /// must-guard accepts its sort: the callee is a resolved binding, never a
     /// proof of which host primitive runs.
     RenderCall(&'b crate::engine::BodyCall),
+    /// One element the render body builds (#126), optionally navigated to one
+    /// of its props. No must-guard accepts either sort.
+    Element {
+        site: &'b crate::rules::helpers::jsx::JsxElementSite<'a>,
+        prop: Option<&'b JsxPropSite<'a>>,
+    },
 }
 
 impl<'a, 'b> Candidate<'a, 'b> {
@@ -116,7 +122,8 @@ impl<'a, 'b> Candidate<'a, 'b> {
             | Candidate::Cycle(_)
             | Candidate::Consumer(_)
             | Candidate::Registration(_)
-            | Candidate::RenderCall(_) => None,
+            | Candidate::RenderCall(_)
+            | Candidate::Element { .. } => None,
         }
     }
 
@@ -130,7 +137,8 @@ impl<'a, 'b> Candidate<'a, 'b> {
             | Candidate::Cycle(_)
             | Candidate::Consumer(_)
             | Candidate::Registration(_)
-            | Candidate::RenderCall(_) => None,
+            | Candidate::RenderCall(_)
+            | Candidate::Element { .. } => None,
         }
     }
 
@@ -146,6 +154,10 @@ impl<'a, 'b> Candidate<'a, 'b> {
             (BindRef::Anchor, Candidate::Registration(r)) => EntityVal::Registration(r),
             (BindRef::Anchor, Candidate::Consumer(c)) => EntityVal::Consumer(c),
             (BindRef::Anchor, Candidate::RenderCall(c)) => EntityVal::Call(c),
+            (BindRef::Anchor, Candidate::Element { site, .. }) => EntityVal::Element(site),
+            (BindRef::Bound, Candidate::Element { prop, .. }) => {
+                EntityVal::JsxProp(prop.expect("validated: binding exists"))
+            }
             (BindRef::Bound, _) => match self.bound().expect("validated: binding exists") {
                 Bound::Setter(s) => EntityVal::Setter(s),
                 Bound::Dep(d) => EntityVal::Dep(d),
@@ -164,7 +176,10 @@ impl<'a, 'b> Candidate<'a, 'b> {
             Candidate::Hook { row, .. } => Some(row.info.label),
             Candidate::RenderSetter(s) => s.slot,
             Candidate::Origin(p) => Some(p.label),
-            Candidate::Provider(_) | Candidate::JsxProp(_) | Candidate::RenderCall(_) => None,
+            Candidate::Provider(_)
+            | Candidate::JsxProp(_)
+            | Candidate::RenderCall(_)
+            | Candidate::Element { .. } => None,
             // The carrying effect: the finding is about that effect's write.
             Candidate::Cycle(c) => Some(c.effect),
             Candidate::Consumer(c) => Some(c.label),
@@ -199,6 +214,7 @@ impl<'a, 'b> Candidate<'a, 'b> {
             Candidate::Consumer(c) => c.span,
             Candidate::Registration(r) => r.span,
             Candidate::RenderCall(c) => c.span,
+            Candidate::Element { site, prop } => prop.and_then(|p| p.span).or(site.span),
         }
     }
 }
@@ -263,6 +279,8 @@ impl Rule for TierARule {
                                 );
                             }
                         }
+                        // Validated: `props` needs an `elements` anchor.
+                        Some(EdgeName::Props) => {}
                         Some(EdgeName::Reads) => {
                             for read in e.reads(&row) {
                                 self.eval(
@@ -329,6 +347,32 @@ impl Rule for TierARule {
             ResolvedAnchor::RenderCalls => {
                 for call in e.render_call_rows() {
                     self.eval(&e, &Candidate::RenderCall(&call), &mut out);
+                }
+            }
+            ResolvedAnchor::Elements { elements } => {
+                for site in e.jsx_element_rows(elements) {
+                    match self.def.for_each {
+                        Some(EdgeName::Props) => {
+                            for prop in &site.props {
+                                self.eval(
+                                    &e,
+                                    &Candidate::Element {
+                                        site: &site,
+                                        prop: Some(prop),
+                                    },
+                                    &mut out,
+                                );
+                            }
+                        }
+                        _ => self.eval(
+                            &e,
+                            &Candidate::Element {
+                                site: &site,
+                                prop: None,
+                            },
+                            &mut out,
+                        ),
+                    }
                 }
             }
             ResolvedAnchor::JsxProps { elements } => {
@@ -661,6 +705,25 @@ impl TierARule {
                 }
                 passed
             }
+            // `none` over an element's props: the anchor is not a hook row, so
+            // this is its own arm rather than a case of the one below.
+            ResolvedGuard::NoneOf {
+                edge: EdgeName::Props,
+                body,
+            } => {
+                let Candidate::Element { site, .. } = cand else {
+                    unreachable!("validated: `props` binds an `elements` anchor")
+                };
+                let mut scratch: Vec<Proof> = Vec::new();
+                !site.props.iter().any(|prop| {
+                    let elem = Candidate::Element {
+                        site,
+                        prop: Some(prop),
+                    };
+                    body.iter()
+                        .all(|g| self.eval_guard(e, &elem, g, &mut scratch))
+                })
+            }
             ResolvedGuard::NoneOf { edge, body } => {
                 let Some(row) = cand.row() else {
                     unreachable!("validated: `none` quantifies over an anchor's edge")
@@ -687,6 +750,7 @@ impl TierARule {
                     EdgeName::Seeds => e.seeds(row).iter().any(|s| hit(Bound::Seed(s))),
                     EdgeName::Calls => e.body_calls(row).iter().any(|c| hit(Bound::Call(c))),
                     EdgeName::Reads => e.reads(row).iter().any(|r| hit(Bound::Read(r))),
+                    EdgeName::Props => unreachable!("handled above"),
                 };
                 !any
             }
@@ -761,7 +825,8 @@ impl TierARule {
                     | Candidate::Cycle(_)
                     | Candidate::Consumer(_)
                     | Candidate::Registration(_)
-                    | Candidate::RenderCall(_) => {
+                    | Candidate::RenderCall(_)
+                    | Candidate::Element { .. } => {
                         unreachable!("validated: `must_dominates_all_exits` binds a render setter")
                     }
                 };

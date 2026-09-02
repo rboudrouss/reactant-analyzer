@@ -48,6 +48,18 @@ pub(crate) enum ValueIdentity {
     Unknown,
 }
 
+/// One element the render body builds, with its props (#126).
+///
+/// The same relation `jsx_props` flattens: `collect_jsx_prop_sites` is this
+/// function plus a flatten, so the two can never disagree about which elements
+/// exist or what a prop's identity is.
+pub(crate) struct JsxElementSite<'a> {
+    pub name: &'a str,
+    pub host: bool,
+    pub span: Option<SourceRange>,
+    pub props: Vec<JsxPropSite<'a>>,
+}
+
 /// One prop of one element in the render body.
 pub(crate) struct JsxPropSite<'a> {
     /// The element's component name (`Row`, `TabsContext.Provider`) or, for a
@@ -63,6 +75,12 @@ pub(crate) struct JsxPropSite<'a> {
     pub identity: ValueIdentity,
     /// Span of the element's opening tag.
     pub span: Option<SourceRange>,
+    /// Where this row sits in the flat `jsx_props` enumeration: block, top-level
+    /// expression, nesting (0 = written in the body, 1 = built in a list
+    /// callback), and the ordinal within that. Kept on the row so grouping by
+    /// element and flattening back both produce the order the relation has
+    /// always had.
+    order: (BlockId, usize, u8, usize),
 }
 
 /// Which elements a caller wants enumerated (#125).
@@ -104,66 +122,89 @@ pub(crate) fn collect_jsx_prop_sites(
     comp: &AnalysisResult<StateValue>,
     kinds: ElementKinds,
 ) -> Vec<JsxPropSite<'_>> {
+    let mut rows: Vec<JsxPropSite<'_>> = collect_jsx_elements(comp, kinds)
+        .into_iter()
+        .flat_map(|e| e.props)
+        .collect();
+    rows.sort_by_key(|r| r.order);
+    rows
+}
+
+/// Every element of the requested kinds the render body builds, each with its
+/// own props (#126) — the shape a rule needs to ask about a prop's *absence*
+/// (`<input value={v}/>` with no `onChange`), which the flat enumeration
+/// cannot express.
+pub(crate) fn collect_jsx_elements(
+    comp: &AnalysisResult<StateValue>,
+    kinds: ElementKinds,
+) -> Vec<JsxElementSite<'_>> {
     let cfg = &comp.render_cfg;
     let bindings = local_bindings(cfg);
-    // `(block, expr index, nesting, sequence)`. Top-level rows keep nesting 0
-    // and their field ordinal, so their relative order is exactly what it was
-    // before list rows existed; rows from a callback sort after them, in
-    // traversal order.
-    let mut found: Vec<((BlockId, usize, u8, usize), JsxPropSite<'_>)> = Vec::new();
+    let mut out: Vec<JsxElementSite<'_>> = Vec::new();
     for (block_id, exprs) in top_level_exprs(cfg) {
         let env = comp.block_states.get(&block_id);
         for (idx, expr) in exprs.into_iter().enumerate() {
-            each_element(expr, &mut |element, host, props, span| {
+            each_element(expr, &mut |name, host, props, span| {
                 if !kinds.admits(host) {
                     return;
                 }
                 let Expr::ObjectLit { fields, .. } = props else {
                     return;
                 };
-                for (ord, (prop, value)) in fields.iter().enumerate() {
-                    found.push((
-                        (block_id, idx, 0, ord),
-                        JsxPropSite {
-                            element,
+                out.push(JsxElementSite {
+                    name,
+                    host,
+                    span,
+                    props: fields
+                        .iter()
+                        .enumerate()
+                        .map(|(ord, (prop, value))| JsxPropSite {
+                            element: name,
                             host,
                             prop,
                             identity: site_identity(Some(value), env, &bindings, comp),
                             span,
-                        },
-                    ));
-                }
+                            order: (block_id, idx, 0, ord),
+                        })
+                        .collect(),
+                });
             });
             // Elements the render body builds inside a callback it runs
             // synchronously — `items.map(it => <Row … />)` (#125). Lists are
             // where per-row identity actually costs something, and the relation
             // saw none of it.
             let mut seq = 0usize;
-            each_list_element(expr, LIST_DEPTH, &mut |element, host, props, span| {
+            each_list_element(expr, LIST_DEPTH, &mut |name, host, props, span| {
                 if !kinds.admits(host) {
                     return;
                 }
                 let Expr::ObjectLit { fields, .. } = props else {
                     return;
                 };
-                for (prop, value) in fields.iter() {
-                    found.push((
-                        (block_id, idx, 1, seq),
-                        JsxPropSite {
-                            element,
-                            host,
-                            prop,
-                            identity: literal_identity(value),
-                            span,
-                        },
-                    ));
-                    seq += 1;
-                }
+                out.push(JsxElementSite {
+                    name,
+                    host,
+                    span,
+                    props: fields
+                        .iter()
+                        .map(|(prop, value)| {
+                            let order = (block_id, idx, 1, seq);
+                            seq += 1;
+                            JsxPropSite {
+                                element: name,
+                                host,
+                                prop,
+                                identity: literal_identity(value),
+                                span,
+                                order,
+                            }
+                        })
+                        .collect(),
+                });
             });
         }
     }
-    found.sort_by_key(|a| a.0);
-    found.into_iter().map(|(_, site)| site).collect()
+    out
 }
 
 /// How many nested render-time callbacks to descend. Two covers

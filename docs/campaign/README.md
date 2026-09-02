@@ -67,11 +67,13 @@ vocabulary moves.
 ## The re-triage
 
 [`triage-2026-09-02-wave2.md`](triage-2026-09-02-wave2.md) re-measures the 60
-against the vocabulary after #126 and #127. Seven scenarios flipped to
-EXPRESSIBLE (1 → 8), so 24 of the 60 are now reachable by a rule somebody can
+against the vocabulary after #126 and #127. Eight scenarios flipped to
+EXPRESSIBLE (1 → 9), so 25 of the 60 are now reachable by a rule somebody can
 write. The rules that flipped them are in
 [`packs/community/wave2.json`](../../packs/community/wave2.json), each run on
-its own scenario's fixture pair.
+its own scenario's fixture pair — committed under
+`tests/fixtures/community_wave2/` and asserted on every test run — and then over
+the whole corpus, with the false positives triaged in the same file.
 
 ## What has moved since
 

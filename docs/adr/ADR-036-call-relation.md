@@ -132,6 +132,20 @@ rule could not skip `children` — fresh on every wrapper — nor scope itself t
 `value`, `key` or a handler. It is `text_guard(Field::Prop, …)`: the same
 matcher `name` and `source` already are, over a field the relation already had.
 
+### 10. The element becomes an anchor, so an absence can be asked about (#126)
+
+§8 made host elements reachable and §9 gave `prop` a guard, and the corpus
+immediately showed what was still missing: `<input value={v}/>` with no
+`onChange` — the one shape a `jsx_props` rule cannot state, because `none`
+ranges over an *edge*, and `jsx_props` is an edge-less anchor whose rows are
+already flattened away from the element that carries them.
+
+So the element becomes the subject: an `elements` anchor (same `elements`
+filter, same default) with a `props` edge. `jsx_props` is unchanged — it is now
+literally `collect_jsx_elements` plus a flatten, re-sorted by the ordinal each
+row already carried, so the two shapes cannot disagree about which elements
+exist or what a prop's identity is, and the flat enumeration is bit-identical.
+
 ## Soundness arguments
 
 - **The setter relation is byte-identical.** The channel is off for every
@@ -149,10 +163,12 @@ matcher `name` and `source` already are, over a field the relation already had.
   `must_*` may appear inside it, and none may appear in the same rule.
 - **§8 changes no shipped pack's rows.** The default is the historical
   enumeration and the corpus is unchanged.
+- **§10's two shapes are one relation.** A test asserts the flat and grouped
+  enumerations agree row for row, so the grouping cannot drift.
 
 ## Consequences
 
-- Vocabulary: 9 anchors, 6 edges, 27 filtering guards, 5 `must_*`.
+- Vocabulary: 10 anchors, 8 edges, 27 filtering guards, 5 `must_*`.
 - `tests/body_calls.rs` pins the lattice, the receiver discrimination, the
   await placement, the mandatory guard (including the `any_of` hole), the two
   type errors, and the Warning ceiling.

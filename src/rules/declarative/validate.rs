@@ -93,6 +93,8 @@ pub(crate) enum Sort {
     Call,
     /// One read site of a state-hook anchor's slot (#127).
     Read,
+    /// One element the render body builds (#126).
+    Element,
 }
 
 impl Sort {
@@ -114,6 +116,7 @@ impl Sort {
             Sort::Registration => "a callback registration".into(),
             Sort::Call => "a call site".into(),
             Sort::Read => "a slot read".into(),
+            Sort::Element => "a JSX element".into(),
         }
     }
 }
@@ -216,6 +219,19 @@ fn edge_element_sort(edge: EdgeName, anchor_sort: Sort, path: &str) -> Result<So
                 ));
             }
             Sort::Writer
+        }
+        EdgeName::Props => {
+            if anchor_sort != Sort::Element {
+                return Err(PackError::new(
+                    path.to_string(),
+                    format!(
+                        "edge `props` needs an `elements` anchor (the element whose props \
+                         it enumerates), but the anchor binds {}",
+                        anchor_sort.describe()
+                    ),
+                ));
+            }
+            Sort::JsxProp
         }
         EdgeName::Reads => {
             if !matches!(anchor_sort, Sort::Hook(Some(HookKindFilter::State))) {
@@ -514,6 +530,7 @@ impl Field {
     pub(crate) fn admits(self, sort: Sort) -> bool {
         match self {
             Field::Kind => match sort {
+                Sort::Element => true,
                 Sort::Read => false,
                 Sort::Call => false,
                 // A JSX row's kind is which sort of element carries the prop:
@@ -536,6 +553,7 @@ impl Field {
             // Effects and handlers are the two kinds with nothing to call them;
             // an any-kind anchor is admitted and falls back per row.
             Field::Name => match sort {
+                Sort::Element => true,
                 Sort::Read => true,
                 Sort::Call => true,
                 Sort::Hook(None) => true,
@@ -574,6 +592,7 @@ impl Field {
             // `join`). Only a call row has one; a bare call answers nothing,
             // which is an absent field, not a false one.
             Field::Receiver => match sort {
+                Sort::Element => false,
                 Sort::Read => false,
                 Sort::Call => true,
                 Sort::Hook(_)
@@ -592,6 +611,7 @@ impl Field {
             },
             // The import specifier is recorded on custom hook rows only.
             Field::Source => match sort {
+                Sort::Element => false,
                 Sort::Read => false,
                 Sort::Call => false,
                 Sort::Hook(Some(HookKindFilter::Custom)) => true,
@@ -616,6 +636,7 @@ impl Field {
             // the setter variable at the call site.
             // A read row names the slot it reads; it has no setter.
             Field::Setter => match sort {
+                Sort::Element => false,
                 Sort::Read | Sort::Call => false,
                 Sort::SetterRender | Sort::SetterBody | Sort::Writer => true,
                 Sort::Hook(_)
@@ -630,6 +651,7 @@ impl Field {
                 | Sort::Registration => false,
             },
             Field::Slot => match sort {
+                Sort::Element => false,
                 Sort::Read => true,
                 Sort::Call => false,
                 Sort::SetterRender | Sort::SetterBody | Sort::Writer => true,
@@ -652,6 +674,7 @@ impl Field {
             // reading it for a seed would be the program-point error ADR-023
             // §2 refuses.
             Field::Path => match sort {
+                Sort::Element => false,
                 Sort::Read => false,
                 Sort::Call => false,
                 Sort::Dep | Sort::Seed => true,
@@ -668,6 +691,7 @@ impl Field {
                 | Sort::Registration => false,
             },
             Field::Stability => match sort {
+                Sort::Element => false,
                 Sort::Read => false,
                 Sort::Call => false,
                 Sort::Dep => true,
@@ -685,6 +709,7 @@ impl Field {
                 | Sort::Registration => false,
             },
             Field::Returns => match sort {
+                Sort::Element => false,
                 Sort::Read => false,
                 Sort::Call => false,
                 Sort::Arg => true,
@@ -707,6 +732,7 @@ impl Field {
             // `region` and `via` are writer-provenance facts about a *slot*,
             // which a call has none of.
             Field::Phase => match sort {
+                Sort::Element => false,
                 Sort::Read => true,
                 Sort::Writer | Sort::Call => true,
                 Sort::Hook(_)
@@ -725,6 +751,7 @@ impl Field {
             // A read row sits in a lexical region like a write does, but it
             // came through no wrapper chain: `via` is a write-provenance fact.
             Field::Via => match sort {
+                Sort::Element => false,
                 Sort::Read | Sort::Call => false,
                 Sort::Writer => true,
                 Sort::Hook(_)
@@ -741,6 +768,7 @@ impl Field {
                 | Sort::Registration => false,
             },
             Field::Region => match sort {
+                Sort::Element => false,
                 Sort::Read => true,
                 Sort::Call => false,
                 Sort::Writer => true,
@@ -763,6 +791,7 @@ impl Field {
             // is the deps fact, and reading identity there would be the same
             // program-point error §2 refuses for the reverse direction.
             Field::Identity => match sort {
+                Sort::Element => false,
                 Sort::Read => false,
                 Sort::Call => false,
                 Sort::Provider | Sort::JsxProp | Sort::Arg | Sort::Registration => true,
@@ -777,6 +806,7 @@ impl Field {
                 | Sort::ContextConsumer => false,
             },
             Field::Prop => match sort {
+                Sort::Element => false,
                 Sort::Read => false,
                 Sort::Call => false,
                 Sort::JsxProp => true,
@@ -797,6 +827,7 @@ impl Field {
             // returned function for effects and nothing else, so the field is
             // total only on a kind-pinned effect anchor.
             Field::Cleanup => match sort {
+                Sort::Element => false,
                 Sort::Read => false,
                 Sort::Call => false,
                 Sort::Hook(Some(HookKindFilter::Effect)) => true,
@@ -821,6 +852,7 @@ impl Field {
             // How the registration re-fires: `repeating` keeps going until
             // torn down, `once` does not. Total on a registration row.
             Field::Firing => match sort {
+                Sort::Element => false,
                 Sort::Read => false,
                 Sort::Call => false,
                 Sort::Registration => true,
@@ -838,6 +870,7 @@ impl Field {
                 | Sort::ContextConsumer => false,
             },
             Field::Owner => match sort {
+                Sort::Element => false,
                 Sort::Read => false,
                 Sort::Call => false,
                 Sort::SetterRender => true,
@@ -857,6 +890,7 @@ impl Field {
             // The loop path, already node-qualified by owning component. Only
             // a cycle row has one; no other sort could invent it.
             Field::Cycle => match sort {
+                Sort::Element => false,
                 Sort::Read => false,
                 Sort::Call => false,
                 Sort::ChurnCycle => true,
@@ -905,6 +939,10 @@ pub(crate) enum ResolvedAnchor {
     ContextConsumers,
     /// Non-hook call sites in the render body (#126).
     RenderCalls,
+    /// Elements the render body builds, of the selected kinds (#126).
+    Elements {
+        elements: crate::rules::helpers::jsx::ElementKinds,
+    },
     /// Callback registrations in this component's effect bodies (#111),
     /// optionally narrowed to one firing class.
     Registrations {
@@ -1196,7 +1234,7 @@ fn validate_rule(
         &raw_rule["anchor"],
         match def.anchor {
             Anchor::HookCalls { .. } => &["relation", "kind"],
-            Anchor::JsxProps { .. } => &["relation", "elements"],
+            Anchor::JsxProps { .. } | Anchor::Elements { .. } => &["relation", "elements"],
             Anchor::RenderSetterCalls
             | Anchor::HookOrigins
             | Anchor::ContextProviders
@@ -1227,6 +1265,12 @@ fn validate_rule(
         Anchor::ChurnCycles => (ResolvedAnchor::ChurnCycles, Sort::ChurnCycle),
         Anchor::ContextConsumers => (ResolvedAnchor::ContextConsumers, Sort::ContextConsumer),
         Anchor::RenderCalls => (ResolvedAnchor::RenderCalls, Sort::Call),
+        Anchor::Elements { elements } => (
+            ResolvedAnchor::Elements {
+                elements: element_kinds(*elements),
+            },
+            Sort::Element,
+        ),
         Anchor::Registrations { firing } => (
             ResolvedAnchor::Registrations { firing: *firing },
             Sort::Registration,
@@ -2266,6 +2310,7 @@ fn edge_by_token(token: &str) -> Option<EdgeName> {
         "writers" => EdgeName::Writers,
         "seeds" => EdgeName::Seeds,
         "reads" => EdgeName::Reads,
+        "props" => EdgeName::Props,
         "calls" => EdgeName::Calls,
         _ => return None,
     })

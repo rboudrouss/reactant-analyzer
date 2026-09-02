@@ -29,7 +29,9 @@ use crate::rules::api::query::{
 };
 use crate::rules::helpers::churn_graph::{CycleRow, collect_cycle_rows};
 use crate::rules::helpers::context_flow::{ConsumerRow, ProviderVerdict};
-use crate::rules::helpers::jsx::{JsxPropSite, collect_jsx_prop_sites, site_identity};
+use crate::rules::helpers::jsx::{
+    JsxElementSite, JsxPropSite, collect_jsx_elements, collect_jsx_prop_sites, site_identity,
+};
 use crate::rules::helpers::local_bindings;
 use crate::rules::helpers::providers::{ProviderSite, ValueIdentity, collect_provider_sites};
 use crate::rules::{
@@ -111,6 +113,8 @@ pub(crate) enum EntityVal<'a, 'b> {
     Call(&'b crate::engine::BodyCall),
     /// One read site of a state slot (#127).
     Read(&'b crate::engine::SlotRead),
+    /// One element the render body builds (#126).
+    Element(&'b JsxElementSite<'a>),
 }
 
 // ── Per-component index ───────────────────────────────────────────────────────
@@ -312,6 +316,15 @@ impl<'a> EntityCtx<'a> {
         kinds: crate::rules::helpers::jsx::ElementKinds,
     ) -> Vec<JsxPropSite<'a>> {
         collect_jsx_prop_sites(self.comp, kinds)
+    }
+
+    /// `elements` rows (#126): every element of the requested kinds the render
+    /// body builds, each carrying its own props.
+    pub fn jsx_element_rows(
+        &self,
+        kinds: crate::rules::helpers::jsx::ElementKinds,
+    ) -> Vec<JsxElementSite<'a>> {
+        collect_jsx_elements(self.comp, kinds)
     }
 
     /// `context_consumers` rows (#115): this component's `useContext` calls
@@ -548,6 +561,9 @@ impl<'a> EntityCtx<'a> {
                 EntityVal::JsxProp(j) => {
                     Some(if j.host { "host" } else { "component" }.to_string())
                 }
+                EntityVal::Element(e) => {
+                    Some(if e.host { "host" } else { "component" }.to_string())
+                }
                 EntityVal::Setter(_)
                 | EntityVal::Dep(_)
                 | EntityVal::Arg(_)
@@ -576,6 +592,7 @@ impl<'a> EntityCtx<'a> {
                 EntityVal::Origin(p) => Some(p.origin_hook.clone()),
                 EntityVal::Provider(p) => Some(crate::ir::source_name(p.context).to_string()),
                 EntityVal::JsxProp(j) => Some(j.element.to_string()),
+                EntityVal::Element(e) => Some(e.name.to_string()),
                 // The local binding the call reads the context through.
                 EntityVal::Consumer(c) => Some(crate::ir::source_name(&c.name).to_string()),
                 // A registration is named by its registrar — the table key,
@@ -603,7 +620,7 @@ impl<'a> EntityCtx<'a> {
             // call, which is an absence and so fails a guard rather than
             // matching an empty string.
             Field::Receiver => match v {
-                EntityVal::Read(_) => None,
+                EntityVal::Read(_) | EntityVal::Element(_) => None,
                 EntityVal::Call(c) => c.receiver.clone(),
                 EntityVal::Hook(_)
                 | EntityVal::Setter(_)
@@ -638,9 +655,11 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
                 | EntityVal::Call(_)
-                | EntityVal::Read(_) => None,
+                | EntityVal::Read(_)
+                | EntityVal::Element(_) => None,
             },
             Field::Slot => match v {
+                EntityVal::Element(_) => None,
                 EntityVal::Read(r) => self.slot_source_name(r.slot),
                 EntityVal::Setter(s) => self.setter_slot_name(s),
                 EntityVal::Writer(w) => self.slot_source_name(w.slot),
@@ -670,7 +689,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
                 | EntityVal::Call(_)
-                | EntityVal::Read(_) => None,
+                | EntityVal::Read(_)
+                | EntityVal::Element(_) => None,
             },
             // A seed row IS a prop path, and so is a deps entry.
             Field::Path => match v {
@@ -687,7 +707,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
                 | EntityVal::Call(_)
-                | EntityVal::Read(_) => None,
+                | EntityVal::Read(_)
+                | EntityVal::Element(_) => None,
             },
             Field::Stability => match v {
                 EntityVal::Dep(d) => Some(verdict_word(self.dep_verdict(d)).to_string()),
@@ -703,7 +724,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
                 | EntityVal::Call(_)
-                | EntityVal::Read(_) => None,
+                | EntityVal::Read(_)
+                | EntityVal::Element(_) => None,
             },
             Field::Returns => match v {
                 EntityVal::Arg(a) => Some(returns_word(self.arg_verdict(a)).to_string()),
@@ -719,9 +741,11 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
                 | EntityVal::Call(_)
-                | EntityVal::Read(_) => None,
+                | EntityVal::Read(_)
+                | EntityVal::Element(_) => None,
             },
             Field::Region => match v {
+                EntityVal::Element(_) => None,
                 EntityVal::Read(r) => Some(r.region.word().to_string()),
                 EntityVal::Writer(w) => Some(w.region.word().to_string()),
                 EntityVal::Hook(_)
@@ -738,6 +762,7 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Call(_) => None,
             },
             Field::Phase => match v {
+                EntityVal::Element(_) => None,
                 EntityVal::Writer(w) => Some(phase_word(w.phase).to_string()),
                 EntityVal::Call(c) => Some(phase_word(c.phase).to_string()),
                 EntityVal::Read(r) => Some(phase_word(r.phase).to_string()),
@@ -775,10 +800,11 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
                 | EntityVal::Call(_)
-                | EntityVal::Read(_) => None,
+                | EntityVal::Read(_)
+                | EntityVal::Element(_) => None,
             },
             Field::Identity => match v {
-                EntityVal::Read(_) => None,
+                EntityVal::Read(_) | EntityVal::Element(_) => None,
                 EntityVal::Call(_) => None,
                 EntityVal::Provider(p) => Some(identity_word(p.identity).to_string()),
                 EntityVal::JsxProp(j) => Some(identity_word(j.identity).to_string()),
@@ -811,7 +837,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
                 | EntityVal::Call(_)
-                | EntityVal::Read(_) => None,
+                | EntityVal::Read(_)
+                | EntityVal::Element(_) => None,
             },
             Field::Cleanup => match v {
                 EntityVal::Hook(row) => Some(cleanup_word(self.cleanup(row)).to_string()),
@@ -827,7 +854,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
                 | EntityVal::Call(_)
-                | EntityVal::Read(_) => None,
+                | EntityVal::Read(_)
+                | EntityVal::Element(_) => None,
             },
             // Which component owns the slot the row writes: this one for a
             // local setter, the parent for a `ComponentSetter`-valued prop.
@@ -849,7 +877,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
                 | EntityVal::Call(_)
-                | EntityVal::Read(_) => None,
+                | EntityVal::Read(_)
+                | EntityVal::Element(_) => None,
             },
             // The loop path: node names are already qualified and quoted by
             // the shared `node_display`, so this one is rendered bare.
@@ -867,10 +896,11 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Consumer(_)
                 | EntityVal::Registration(_)
                 | EntityVal::Call(_)
-                | EntityVal::Read(_) => None,
+                | EntityVal::Read(_)
+                | EntityVal::Element(_) => None,
             },
             Field::Firing => match v {
-                EntityVal::Read(_) => None,
+                EntityVal::Read(_) | EntityVal::Element(_) => None,
                 EntityVal::Call(_) => None,
                 EntityVal::Registration(r) => Some(
                     match r.firing {
@@ -1022,6 +1052,7 @@ fn anonymous(v: &EntityVal<'_, '_>) -> String {
         EntityVal::JsxProp(j) => format!("`{}` of `<{}>`", j.prop, j.element),
         EntityVal::Cycle(c) => format!("the loop through effect #{}", c.effect),
         EntityVal::Read(r) => format!("`{}`", crate::ir::source_name(&r.name)),
+        EntityVal::Element(e) => format!("`<{}>`", e.name),
         EntityVal::Call(c) => match &c.receiver {
             Some(r) => format!("`{}.{}()`", r, c.name),
             None => format!("`{}()`", c.name),

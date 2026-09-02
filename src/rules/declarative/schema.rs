@@ -152,6 +152,18 @@ pub enum Anchor {
         #[serde(default)]
         elements: Option<ElementsName>,
     },
+    /// One element the render body builds (#126): the anchor `jsx_props`
+    /// could not be, because a rule about a prop's *absence* — `<input
+    /// value={v}/>` with no `onChange` — needs the element as the subject and
+    /// its props as an edge.
+    ///
+    /// `name` is the component name or the host tag, `kind` says which.
+    /// `elements` narrows the enumeration exactly as it does on `jsx_props`,
+    /// and defaults to `component` for the same reason.
+    Elements {
+        #[serde(default)]
+        elements: Option<ElementsName>,
+    },
     /// One render-loop cycle of the program's churn graph, seen from the
     /// effect of THIS component that carries one of its edges (#108,
     /// ADR-029). Edge-less: `cycle` renders the loop as `a → b → a`, and the
@@ -265,6 +277,10 @@ pub enum EdgeName {
     /// A `name` guard on the bound row is therefore **mandatory** — a rule
     /// that fires on "some call" fires on all of them.
     Calls,
+    /// Props of an `elements` anchor's element (#126): the same rows
+    /// `jsx_props` enumerates, grouped under the element that carries them, so
+    /// `none` can ask whether one is missing.
+    Props,
     /// Readers of a state-hook anchor's slot (#127, ADR-037): one row per read
     /// site, over the same regions the `writers` edge enumerates. `{r.region}`
     /// is the lexical body — exact; `{r.phase}` is the same MAY verdict, so a

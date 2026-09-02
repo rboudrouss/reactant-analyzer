@@ -538,3 +538,83 @@ fn the_reads_edge_needs_a_state_anchor() {
         "{e}"
     );
 }
+
+// ── #131: the `elements` anchor and its `props` edge ─────────────────────────
+
+/// The shape `jsx_props` could not express: a prop's ABSENCE on the element
+/// that carries its sibling.
+#[test]
+fn none_over_props_finds_a_controlled_input_with_no_writer() {
+    let pack = r#"{"schemaVersion":1,"name":"p","rules":[{
+        "id":"r","docs":{"description":"d","why":"w","fix":"f"},
+        "severity":"warning","anchor":{"relation":"elements","elements":"host"},
+        "forEach":{"edge":"props","as":"p"},
+        "guards":[{"kind":"name","of":"anchor","one_of":["input"]},
+                  {"kind":"prop","of":"p","one_of":["value"]},
+                  {"kind":"none","of":"anchor.props","as":"q","guards":[
+                      {"kind":"prop","of":"q","one_of":["onChange","readOnly"]}]}],
+        "message":"<{anchor.name}> {anchor.kind}: {p.prop} with no writer"}]}"#;
+    let stuck = r#"export function C({ name }) { return <input value={name} placeholder="n" />; }"#;
+    let ok =
+        r#"export function C({ name, set }) { return <input value={name} onChange={set} />; }"#;
+    let found = run_pack(pack, stuck);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].message.contains("host"), "{}", found[0].message);
+    assert!(run_pack(pack, ok).is_empty());
+}
+
+/// The `props` edge is an `elements` fact; nothing else carries it.
+#[test]
+fn the_props_edge_needs_an_elements_anchor() {
+    let e = load_err(
+        r#"{"schemaVersion":1,"name":"p","rules":[{
+        "id":"r","docs":{"description":"d","why":"w","fix":"f"},
+        "severity":"warning","anchor":{"relation":"jsx_props"},
+        "forEach":{"edge":"props","as":"p"},
+        "guards":[{"kind":"prop","of":"p","one_of":["value"]}],
+        "message":"m"}]}"#,
+    );
+    assert!(
+        e.message
+            .contains("edge `props` needs an `elements` anchor"),
+        "{e}"
+    );
+}
+
+/// Grouping by element must not change what the flat relation enumerates:
+/// `jsx_props` is `elements` plus a flatten, and its row order is the one it
+/// has always had.
+#[test]
+fn jsx_props_still_enumerates_what_it_always_did() {
+    let probe = |relation: &str, extra: &str| {
+        let pack = format!(
+            r#"{{"schemaVersion":1,"name":"p","rules":[{{
+            "id":"r","docs":{{"description":"d","why":"w","fix":"f"}},
+            "severity":"info","anchor":{{"relation":"{relation}"}}{extra},
+            "guards":[{{"kind":"prop","of":"{prop}","prefix":""}}],
+            "message":"{{anchor.name}}.{{{prop}.prop}}"}}]}}"#,
+            prop = if relation == "elements" {
+                "p"
+            } else {
+                "anchor"
+            },
+        );
+        run_pack(
+            &pack,
+            r#"export function C({ a, b }) {
+                 return <Outer x={a} y={b}><Inner z={a} /></Outer>;
+               }"#,
+        )
+        .into_iter()
+        .map(|d| d.message)
+        .collect::<Vec<_>>()
+    };
+    let flat = probe("jsx_props", "");
+    let grouped = probe("elements", r#","forEach":{"edge":"props","as":"p"}"#);
+    assert!(!flat.is_empty());
+    let mut a = flat.clone();
+    let mut b = grouped.clone();
+    a.sort();
+    b.sort();
+    assert_eq!(a, b, "the two shapes must enumerate the same rows");
+}
