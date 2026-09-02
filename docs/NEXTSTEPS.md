@@ -137,11 +137,19 @@ Après l'audit et le triage à l'aveugle, trois chantiers, tous vérifiés corpu
   prétend plus être un appel direct), et une composante ne se lit plus comme
   son propre parent quand son nom est salé.
 
+- **#131** — une liaison synthétique est synthétique, sa position ne l'est pas
+  (ADR-039) : les neuf sites où l'abaissement et le greffon fabriquaient une
+  instruction sans span, une marche qui cesse de jeter la position sur laquelle
+  elle se tient, et un constat qui prend la première position que nomme sa
+  chaîne de témoins. **82 lignes sans position sur 7 146 → 0** (9 sur 6 340 → 0
+  sans pack), jeu de résultats inchangé. Les six `JSON.stringify` de `commerce` nomment enfin le
+  fichier qui les contient, et #129 les regroupe en une ligne.
+
 Re-mesure des 60 scénarios : **8 EXPRESSIBLE (contre 1), 20 INEXPRESSIBLE
 (contre 27)** — `docs/campaign/triage-2026-09-02-wave2.md`, avec
 `packs/community/wave2.json` et ses paires de fixtures comme preuve exécutable.
 
 Prochaines marches, par valeur décroissante : les valeurs d'arguments (#67) ;
 une requête de dominance ; les résumés d'écosystème (#94), seule façon de
-réduire la classe ⊤ qu'ADR-038 §2 laisse en Warning ; les lignes sans span
-(#131) ; et la moitié atteignabilité de `reads` (#132).
+réduire la classe ⊤ qu'ADR-038 §2 laisse en Warning ; et la moitié
+atteignabilité de `reads` (#132).

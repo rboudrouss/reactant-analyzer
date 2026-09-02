@@ -126,7 +126,7 @@ pub fn collect_setter_calls_with_extra(
         collect_calls: false,
         read_vars: &NO_VARS,
     };
-    walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None);
+    walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None, None);
     let mut found = found.setters;
     // Collapse to the historical one-row-per-var shape, preferring the sync
     // site: its block id serves dominance, where any other class records
@@ -210,7 +210,7 @@ pub(crate) fn collect_write_sites(
         collect_calls: false,
         read_vars: &NO_VARS,
     };
-    walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None);
+    walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None, None);
     found
         .setters
         .into_iter()
@@ -1364,6 +1364,14 @@ impl<'a> SetterWalk<'a> {
     /// returns and reified listeners live. `prov` is the top-level block the
     /// walk descended from (`None` only at the root, where each block is its
     /// own provenance).
+    ///
+    /// `witness` is the innermost source position the walk has already passed
+    /// — the call site this body was entered from. A body's own statements
+    /// override it; what has no position of its own inherits it rather than
+    /// reporting none, which is how a concise-body arrow (`() => setN(1)`,
+    /// whose whole body is a `Return` terminator) came to produce rows with no
+    /// line at all (#131).
+    #[allow(clippy::too_many_arguments)]
     fn cfg(
         &mut self,
         cfg: &'a CFG,
@@ -1371,6 +1379,7 @@ impl<'a> SetterWalk<'a> {
         found: &mut Found,
         mode: WalkClass,
         prov: Option<BlockId>,
+        witness: Option<SourceRange>,
     ) {
         let key = cfg as *const CFG as usize;
         if !self.walking.insert(key) {
@@ -1410,7 +1419,9 @@ impl<'a> SetterWalk<'a> {
             self.repeating = outer_repeating || reach.reaches(bid, bid);
             if let Some(block) = cfg.blocks.get(&bid) {
                 for stmt in &block.stmts {
-                    self.stmt(stmt, block_id, depth, found, mode, at_root, prov_block);
+                    self.stmt(
+                        stmt, block_id, depth, found, mode, at_root, prov_block, witness,
+                    );
                 }
                 match &block.term {
                     Terminator::Return(expr) => {
@@ -1427,16 +1438,30 @@ impl<'a> SetterWalk<'a> {
                             if let Some(body) = body
                                 && depth > 0
                             {
-                                self.cfg(body, depth - 1, found, WalkClass::Cleanup, prov_block);
+                                self.cfg(
+                                    body,
+                                    depth - 1,
+                                    found,
+                                    WalkClass::Cleanup,
+                                    prov_block,
+                                    witness,
+                                );
                             }
                         }
                         self.expr(
-                            expr, None, block_id, depth, found, mode, at_root, prov_block,
+                            expr, witness, block_id, depth, found, mode, at_root, prov_block,
                         );
                     }
-                    Terminator::Branch { cond, .. } => {
+                    Terminator::Branch { cond, span, .. } => {
                         self.expr(
-                            cond, None, block_id, depth, found, mode, at_root, prov_block,
+                            cond,
+                            span.or(witness),
+                            block_id,
+                            depth,
+                            found,
+                            mode,
+                            at_root,
+                            prov_block,
                         );
                     }
                     _ => {}
@@ -1498,22 +1523,25 @@ impl<'a> SetterWalk<'a> {
         mode: WalkClass,
         at_root: bool,
         prov: Option<BlockId>,
+        witness: Option<SourceRange>,
     ) {
         // The containing statement's span is the witness for any call found
         // in its expression — rhs positions included (a quarter of corpus
         // setter calls sit in a Let/Assign rhs and used to report no range).
-        let (expr, span) = match stmt {
-            Stmt::ExprStmt(e, span) => (e, *span),
-            Stmt::Let { rhs, span, .. } => (rhs, *span),
-            Stmt::Assign { rhs, span, .. } => (rhs, *span),
-            Stmt::MemberWrite { rhs, span, .. } => (rhs, *span),
+        // A statement lowering or the splice synthesised may have none of its
+        // own; it then inherits the position the body was entered from,
+        // rather than handing every row inside it no line (#131).
+        let expr = match stmt {
+            Stmt::ExprStmt(e, _) => e,
+            Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } | Stmt::MemberWrite { rhs, .. } => rhs,
         };
+        let span = stmt.span().or(witness);
         // `state.items.push(x)` reads `state`: the receiver of a member write
         // is the one read position the rhs does not carry.
-        if let Stmt::MemberWrite { obj, key, span, .. } = stmt {
-            self.expr(obj, *span, block_id, depth, found, mode, at_root, prov);
+        if let Stmt::MemberWrite { obj, key, .. } = stmt {
+            self.expr(obj, span, block_id, depth, found, mode, at_root, prov);
             if let crate::ir::stmt::MemberKey::Index(idx) = key {
-                self.expr(idx, *span, block_id, depth, found, mode, at_root, prov);
+                self.expr(idx, span, block_id, depth, found, mode, at_root, prov);
             }
         }
         self.expr(expr, span, block_id, depth, found, mode, at_root, prov);
@@ -1585,7 +1613,14 @@ impl<'a> SetterWalk<'a> {
                     // helper's definition is only reachable from code that
                     // shares its region (salted names stay region-local).
                     let mut inner = Found::default();
-                    self.cfg(body, depth - 1, &mut inner, WalkClass::Sync, prov);
+                    self.cfg(
+                        body,
+                        depth - 1,
+                        &mut inner,
+                        WalkClass::Sync,
+                        prov,
+                        stmt_span,
+                    );
                     found.absorb(inner, mode, block_id, prov);
                 }
             }
@@ -1600,7 +1635,14 @@ impl<'a> SetterWalk<'a> {
                 && let Expr::FnLit { body_cfg, .. } = fn_.peel_ts()
             {
                 let mut inner = Found::default();
-                self.cfg(body_cfg, depth - 1, &mut inner, WalkClass::Sync, prov);
+                self.cfg(
+                    body_cfg,
+                    depth - 1,
+                    &mut inner,
+                    WalkClass::Sync,
+                    prov,
+                    stmt_span,
+                );
                 found.absorb(inner, mode, block_id, prov);
             }
             // The listener `FnLit` of an effect-top-level `addEventListener`
@@ -1634,14 +1676,14 @@ impl<'a> SetterWalk<'a> {
                 match arg {
                     // Inline FnLit arg descend body, costs one depth level.
                     Expr::FnLit { body_cfg, .. } if depth > 0 => {
-                        self.cfg(body_cfg, depth - 1, found, class, prov);
+                        self.cfg(body_cfg, depth - 1, found, class, prov, stmt_span);
                     }
                     // B5: variable arg name resolution, no depth cost — so this is
                     // the arm that can cycle (`const tick = t => raf(tick)`); the
                     // `walking` stack is what terminates it.
                     Expr::Var(name) => {
                         if let Some(body) = self.fn_bindings.get(name) {
-                            self.cfg(body, depth, found, class, prov);
+                            self.cfg(body, depth, found, class, prov, stmt_span);
                         }
                     }
                     _ => {}
@@ -1756,7 +1798,7 @@ pub fn collect_slot_reads(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<SlotRead
             collect_calls: false,
             read_vars: &vars,
         };
-        walk.cfg(cfg, 2, &mut found, WalkClass::Sync, None);
+        walk.cfg(cfg, 2, &mut found, WalkClass::Sync, None, None);
         for r in found.reads {
             let Some(&slot) = labels.get(&r.var) else {
                 continue;
@@ -1833,7 +1875,7 @@ pub fn collect_body_calls(cfg: &CFG, region: WriterRegion, max_depth: usize) -> 
         collect_calls: true,
         read_vars: &NO_VARS,
     };
-    walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None);
+    walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None, None);
     let mut rows: Vec<BodyCall> = found
         .calls
         .into_iter()

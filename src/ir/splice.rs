@@ -97,6 +97,13 @@ pub fn splice_callee_into_cfg(
     //    dropped, `post` moves to a fresh join block.
     let block = caller.blocks.get_mut(&block_id).unwrap();
     let mut post: Vec<Stmt> = block.stmts.split_off(stmt_idx);
+    // Everything the splice *synthesises* — the param bindings, and the
+    // assignment a callee `Return` becomes — executes here, at the call site,
+    // which is what inlining means. That is their position; without it they
+    // had none, and every finding a rule anchored on one reported no line
+    // (#131). The callee's own statements keep their own spans, so a finding
+    // inside the utility still names the utility.
+    let call_span = post.first().and_then(Stmt::span);
     if !post.is_empty() {
         post.remove(0); // the call statement itself
     }
@@ -120,7 +127,7 @@ pub fn splice_callee_into_cfg(
         .map(|(p, a)| Stmt::Let {
             var: p.clone(),
             rhs: a.clone(),
-            span: None,
+            span: call_span,
         })
         .collect();
 
@@ -151,7 +158,9 @@ pub fn splice_callee_into_cfg(
                     block.stmts.push(Stmt::Assign {
                         var: var.clone(),
                         rhs: ret,
-                        span: None,
+                        // `Terminator::Return` carries no span of its own, so
+                        // the call site is the only position available here.
+                        span: call_span,
                     });
                 }
                 return_blocks.push(*new_id);

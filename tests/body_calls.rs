@@ -618,3 +618,135 @@ fn jsx_props_still_enumerates_what_it_always_did() {
     b.sort();
     assert_eq!(a, b, "the two shapes must enumerate the same rows");
 }
+
+// ── #131: every row carries a position ────────────────────────────────────────
+
+/// The probe above, but reporting where each call was found rather than what it
+/// was. A row with no range renders with no line number, and `#129`'s location
+/// grouping cannot collapse it either.
+fn positions(src: &str) -> Vec<String> {
+    let mut rows: Vec<String> = run_pack(PROBE, src)
+        .into_iter()
+        .map(|d| {
+            let name = d.message.split('|').next().unwrap_or("?").replace('`', "");
+            match d.range {
+                Some(r) => format!("{name}@{}:{}", r.line, r.col),
+                None => format!("{name}@NONE"),
+            }
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// Where the corpus meets it: an async render body whose first statement is an
+/// `await`. The hoist is that block's *first* statement, so there is no earlier
+/// witness to inherit — the hoist must carry the awaited expression's own
+/// position. Six commerce components reported a `JSON.stringify` they do not
+/// contain, at no line at all, because it did not.
+const RENDER_PROBE: &str = r#"{"schemaVersion":1,"name":"p","rules":[{
+    "id":"probe","docs":{"description":"d","why":"w","fix":"f"},
+    "severity":"info","anchor":{"relation":"render_calls"},
+    "guards":[{"kind":"name","of":"anchor","prefix":""}],
+    "message":"{anchor.name}"}]}"#;
+
+#[test]
+fn a_call_under_an_await_carries_the_awaited_expressions_position() {
+    let mut rows: Vec<String> = run_pack(
+        RENDER_PROBE,
+        r#"
+        export async function C() {
+          const r = await fetch("/api", { body: JSON.stringify({ a: 1 }) });
+          return <div>{r}</div>;
+        }
+        "#,
+    )
+    .into_iter()
+    .map(|d| {
+        let name = d.message.replace('`', "");
+        match d.range {
+            Some(r) => format!("{name}@{}:{}", r.line, r.col),
+            None => format!("{name}@NONE"),
+        }
+    })
+    .collect();
+    rows.sort();
+    assert!(
+        rows.iter()
+            .any(|r| r.starts_with("stringify@") && !r.ends_with("NONE")),
+        "the `JSON.stringify` under the await must have a line: {rows:?}"
+    );
+}
+
+/// A ternary arm and a `||` right operand are each hoisted into a temp binding
+/// of their own block. Same rule: the binding is synthetic, the expression it
+/// binds is not.
+#[test]
+fn a_call_in_a_ternary_arm_or_a_logical_operand_carries_its_position() {
+    let rows = positions(
+        r#"
+        import { useEffect } from "react";
+        export function C({ flag, s, fallback }) {
+          useEffect(() => {
+            const a = flag ? JSON.parse(s) : null;
+            const b = fallback || JSON.stringify(a);
+            console.log(a, b);
+          }, [flag, s, fallback]);
+          return <div />;
+        }
+        "#,
+    );
+    // The arms sit on two different lines, and each row must name its own —
+    // not the enclosing `useEffect(` the walk would otherwise fall back to.
+    assert!(rows.contains(&"parse@5:29".to_string()), "{rows:?}");
+    assert!(rows.contains(&"stringify@6:34".to_string()), "{rows:?}");
+}
+
+/// A destructured prop's default is not modeled, but it *is* evaluated, so
+/// lowering emits it — and emitted it with no position, which is how three
+/// `dub` email templates reported a `Date.now()` at no line.
+#[test]
+fn a_call_in_a_destructured_props_default_carries_its_position() {
+    let mut rows: Vec<String> = run_pack(
+        RENDER_PROBE,
+        r#"
+        export function C({ msgs = [{ at: Date.now() }] }) {
+          return <div>{msgs.length}</div>;
+        }
+        "#,
+    )
+    .into_iter()
+    .map(|d| {
+        let name = d.message.replace('`', "");
+        match d.range {
+            Some(r) => format!("{name}@{}:{}", r.line, r.col),
+            None => format!("{name}@NONE"),
+        }
+    })
+    .collect();
+    rows.sort();
+    assert!(rows.contains(&"now@2:35".to_string()), "{rows:?}");
+}
+
+/// A concise-body arrow is a `Return` terminator and nothing else — no
+/// statement, so no span of its own. It inherits the position of the call site
+/// it was entered from.
+#[test]
+fn a_concise_body_arrow_inherits_the_position_it_was_entered_from() {
+    let rows = positions(
+        r#"
+        import { useEffect } from "react";
+        export function C({ items }) {
+          useEffect(() => {
+            items.forEach((i) => JSON.stringify(i));
+          }, [items]);
+          return <div />;
+        }
+        "#,
+    );
+    assert!(
+        rows.contains(&"stringify@5:12".to_string()),
+        "the arrow's only statement is its `Return`, so it has no span of its \
+         own — it inherits the `items.forEach(` call site: {rows:?}"
+    );
+}

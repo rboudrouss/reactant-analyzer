@@ -125,6 +125,16 @@ Every entry here is Warning-or-below by construction: an FP never carries an Err
   `— N component attribution(s)` tail. **The JSON keeps one row per component** (schema v2 is
   unchanged), and `--fail-on` reads the row counts, so nothing about which findings exist changed
   [#129](https://github.com/rboudrouss/reactant-analyzer/issues/129).
+- **Every finding carries a position.** It did not always: lowering and the CFG splice mint
+  statements the source did not write — an `await` hoist, a ternary arm's temp, a spliced parameter
+  binding, a callee `return` rewritten into an assignment — and each used to be minted with no span,
+  so **82 of 7,146 corpus findings (1.1%) rendered with no line number** and `#129` could not group
+  them. Each such statement binds a real source expression and now takes its position; what the
+  source cannot name (a callee `return`, which the IR gives no span) takes the call site's, because
+  that is where an inlined statement executes; and a finding with no position of its own takes the
+  first one its witness chain names. The share is now **0%** — with or without a pack loaded — and
+  the finding set is unchanged, only positions moved
+  [#131](https://github.com/rboudrouss/reactant-analyzer/issues/131).
 
 ## Cross-file limits
 

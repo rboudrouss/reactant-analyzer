@@ -584,10 +584,14 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
                 v @ (Expr::Var(_) | Expr::Lit(_)) => v,
                 v => {
                     let tmp = builder.fresh_temp();
+                    // The binding is synthetic, its position is not: everything
+                    // the walk finds under `await fetch(…)` takes its witness
+                    // from the statement it sits in, and a spanless hoist made
+                    // every such row report no line at all (#131).
                     builder.push_stmt(Stmt::Let {
                         var: tmp.clone(),
                         rhs: v,
-                        span: None,
+                        span: builder.span_at(aw.argument.span().start),
                     });
                     Expr::Var(tmp)
                 }
@@ -689,21 +693,23 @@ fn lower_ternary(cond: &ConditionalExpression, builder: &mut BlockBuilder) -> Ex
     builder.add_edge(bid, else_id, EdgeKind::IfFalse);
 
     builder.start_block(then_id);
+    let cons_span = builder.span_at(cond.consequent.span().start);
     let cons = lower_expr(&cond.consequent, builder);
     builder.push_stmt(Stmt::Let {
         var: tmp.clone(),
         rhs: cons,
-        span: None,
+        span: cons_span,
     });
     let t = builder.seal_with(Terminator::Jump(join_id));
     builder.add_edge(t, join_id, EdgeKind::Unconditional);
 
     builder.start_block(else_id);
+    let alt_span = builder.span_at(cond.alternate.span().start);
     let alt = lower_expr(&cond.alternate, builder);
     builder.push_stmt(Stmt::Let {
         var: tmp.clone(),
         rhs: alt,
-        span: None,
+        span: alt_span,
     });
     let e = builder.seal_with(Terminator::Jump(join_id));
     builder.add_edge(e, join_id, EdgeKind::Unconditional);
@@ -727,11 +733,12 @@ fn lower_ternary(cond: &ConditionalExpression, builder: &mut BlockBuilder) -> Ex
 /// Pre-declare + Assign: stability(__tN) = stability(a) ⊔ stability(b)
 fn lower_logical(log: &LogicalExpression, builder: &mut BlockBuilder) -> Expr {
     let tmp = builder.fresh_temp();
+    let span = builder.span_at(log.left.span().start);
     let left = lower_expr(&log.left, builder);
     builder.push_stmt(Stmt::Let {
         var: tmp.clone(),
         rhs: left,
-        span: None,
+        span,
     });
 
     let rhs_id = builder.new_block();
@@ -742,7 +749,6 @@ fn lower_logical(log: &LogicalExpression, builder: &mut BlockBuilder) -> Expr {
         LogicalOperator::Or | LogicalOperator::Coalesce => (join_id, rhs_id), // truthy → join (keep a); falsy → rhs
     };
 
-    let span = builder.span_at(log.left.span().start);
     let bid = builder.seal_with(Terminator::Branch {
         cond: Expr::Var(tmp.clone()),
         then_,
@@ -769,11 +775,12 @@ fn lower_logical(log: &LogicalExpression, builder: &mut BlockBuilder) -> Expr {
     );
 
     builder.start_block(rhs_id);
+    let right_span = builder.span_at(log.right.span().start);
     let right = lower_expr(&log.right, builder);
     builder.push_stmt(Stmt::Assign {
         var: tmp.clone(),
         rhs: right,
-        span: None,
+        span: right_span,
     });
     let r = builder.seal_with(Terminator::Jump(join_id));
     builder.add_edge(r, join_id, EdgeKind::Unconditional);
@@ -1056,9 +1063,10 @@ fn lower_assignment_target(
                     AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
                         // `({ a = fallback } = o)`: the default is not modeled,
                         // but it is still evaluated — keep its reads visible.
+                        let p_span = builder.span_at(p.span.start);
                         if let Some(init) = &p.init {
                             let d = lower_expr(init, builder);
-                            builder.push_stmt(Stmt::ExprStmt(d, None));
+                            builder.push_stmt(Stmt::ExprStmt(d, p_span));
                         }
                         builder.push_stmt(Stmt::Assign {
                             var: p.binding.name.to_string(),
@@ -1066,7 +1074,7 @@ fn lower_assignment_target(
                                 obj: Box::new(Expr::Var(temp.clone())),
                                 field: p.binding.name.to_string(),
                             },
-                            span: None,
+                            span: p_span,
                         });
                     }
                     AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {

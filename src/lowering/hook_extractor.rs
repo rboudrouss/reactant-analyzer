@@ -202,7 +202,7 @@ fn collect_handlers_in_expr(
         // resolve through `handler_body`, so module-level components passed
         // as props (`component={Page}`) never match. Non-function values
         // recurse for nested JSX (incl. `children`).
-        Expr::CompApp { props, .. } => {
+        Expr::CompApp { props, span, .. } => {
             if let Expr::ObjectLit { fields, .. } = props.as_ref() {
                 for (name, val) in fields {
                     if let Some(body_cfg) = handler_body(val, var_bodies) {
@@ -212,7 +212,10 @@ fn collect_handlers_in_expr(
                             label,
                             event: prop_to_event(name),
                             body_cfg,
-                            span: None,
+                            // `CompApp` carries no per-prop spans, unlike
+                            // `NativeElem`; the element's own position is the
+                            // nearest true one, and beats no position at all.
+                            span: *span,
                         });
                     } else {
                         collect_handlers_in_expr(val, var_bodies, found, next_label);

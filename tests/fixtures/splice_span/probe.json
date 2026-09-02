@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "name": "probe",
+  "rules": [
+    {
+      "id": "render-call",
+      "docs": {
+        "description": "every call in the render body",
+        "why": "the probe reports where the engine says the call is",
+        "fix": "n/a"
+      },
+      "severity": "info",
+      "anchor": { "relation": "render_calls" },
+      "guards": [{ "kind": "name", "of": "anchor", "prefix": "" }],
+      "message": "{anchor.name}"
+    }
+  ]
+}

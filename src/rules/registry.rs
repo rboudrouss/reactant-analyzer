@@ -231,7 +231,7 @@ impl RuleRegistry {
             {
                 safe_checks.push(sc);
             }
-            diags.extend(produced.into_iter().map(|d| self.clamped(d)));
+            diags.extend(produced.into_iter().map(located).map(|d| self.clamped(d)));
         }
 
         // A component where the analyzer admits it truncated (`analysis-limit`
@@ -314,6 +314,21 @@ impl RuleRegistry {
     }
 }
 
+/// A finding with no position of its own takes the first position its witness
+/// chain names.
+///
+/// The chain is the finding's evidence, and its first located step is where
+/// that evidence starts — a rule that threaded a span into a `Step` but never
+/// onto the diagnostic was withholding a position it already had. Applied here
+/// rather than in each rule, because "a finding renders somewhere" is a
+/// property of every finding (#131).
+fn located(mut d: Diagnostic) -> Diagnostic {
+    if d.range.is_none() {
+        d.range = d.notes.iter().find_map(|n| n.range);
+    }
+    d
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -339,6 +354,60 @@ mod tests {
 
     fn stub_doc(name: &str) -> RuleDoc {
         RuleDoc::new(name.to_string(), "s", "e", "x", "f")
+    }
+
+    /// #131: a finding whose only position sits on a witness step. Several
+    /// rules thread a span into the chain and never onto the diagnostic — the
+    /// row then renders with no line even though the position was in hand.
+    #[test]
+    fn a_finding_with_no_range_takes_its_first_witness_position() {
+        use crate::ir::{FileTable, SourceRange};
+        let file = FileTable::default().intern(std::path::Path::new("a.tsx"));
+        let here = SourceRange {
+            file,
+            line: 42,
+            col: 7,
+        };
+        let d = Diagnostic::warn(std::borrow::Cow::Borrowed("team/x"), "m").with_step(
+            crate::rules::Step::Write {
+                slot: 0,
+                value: crate::rules::ValueClass::SameAsCurrent,
+            },
+            None,
+            Some(here),
+            &crate::rules::api::witness::fallback_name,
+        );
+        assert_eq!(d.range, None, "the rule set no range of its own");
+        assert_eq!(located(d).range, Some(here));
+    }
+
+    /// …and a range the rule *did* set is never overwritten by a later step.
+    #[test]
+    fn a_finding_that_has_a_range_keeps_it() {
+        use crate::ir::{FileTable, SourceRange};
+        let file = FileTable::default().intern(std::path::Path::new("a.tsx"));
+        let own = SourceRange {
+            file,
+            line: 1,
+            col: 1,
+        };
+        let step = SourceRange {
+            file,
+            line: 99,
+            col: 9,
+        };
+        let d = Diagnostic::warn(std::borrow::Cow::Borrowed("team/x"), "m")
+            .with_range(own)
+            .with_step(
+                crate::rules::Step::Write {
+                    slot: 0,
+                    value: crate::rules::ValueClass::SameAsCurrent,
+                },
+                None,
+                Some(step),
+                &crate::rules::api::witness::fallback_name,
+            );
+        assert_eq!(located(d).range, Some(own));
     }
 
     #[test]

@@ -772,13 +772,17 @@ fn lower_binding_pattern(
                     arr: Box::new(Expr::Var(temp.clone())),
                     idx: Box::new(Expr::Lit(Prim::Int(i as i32))),
                 };
-                lower_binding_pattern(elem, elem_rhs, None, builder);
+                // Each sub-pattern sits somewhere; passing `None` here made a
+                // default's side effects report no line at all (#131).
+                let elem_span = builder.span_at(elem.span().start).or(span);
+                lower_binding_pattern(elem, elem_rhs, elem_span, builder);
             }
             // `const [a, ...rest] = xs`: bind `rest` to the source — the same
             // sound over-approximation the object pattern uses for its rest.
             // Leaving it unbound loses forwarded setters.
             if let Some(rest) = &arr.rest {
-                lower_binding_pattern(&rest.argument, Expr::Var(temp.clone()), None, builder);
+                let rest_span = builder.span_at(rest.span.start).or(span);
+                lower_binding_pattern(&rest.argument, Expr::Var(temp.clone()), rest_span, builder);
             }
         }
         BindingPattern::ObjectPattern(obj) => {
@@ -797,8 +801,9 @@ fn lower_binding_pattern(
                     // the property took the read of `k` with it.
                     other => {
                         if let Some(e) = other.as_expression() {
+                            let key_span = builder.span_at(e.span().start).or(span);
                             let key = lower_expr(e, builder);
-                            builder.push_stmt(Stmt::ExprStmt(key, None));
+                            builder.push_stmt(Stmt::ExprStmt(key, key_span));
                         }
                         None
                     }
@@ -810,7 +815,8 @@ fn lower_binding_pattern(
                     },
                     None => Expr::SummaryVal(crate::ir::expr::SummaryValue::Top),
                 };
-                lower_binding_pattern(&prop.value, field_rhs, None, builder);
+                let prop_span = builder.span_at(prop.span.start).or(span);
+                lower_binding_pattern(&prop.value, field_rhs, prop_span, builder);
             }
             // Rest element `{ a, ...rest }`: bind `rest` to the source object
             // itself — a sound over-approximation (rest has a subset of the
@@ -818,16 +824,18 @@ fn lower_binding_pattern(
             // in wrapper components (`({...props}) => <X {...props}/>`) and
             // loses forwarded setters (TODO.md F4).
             if let Some(rest) = &obj.rest {
-                lower_binding_pattern(&rest.argument, Expr::Var(temp.clone()), None, builder);
+                let rest_span = builder.span_at(rest.span.start).or(span);
+                lower_binding_pattern(&rest.argument, Expr::Var(temp.clone()), rest_span, builder);
             }
         }
         BindingPattern::AssignmentPattern(ap) => {
             // The default value is not modeled (the binding keeps `rhs`), but
             // it *is* evaluated when the source is undefined — emit it so its
             // reads and side effects survive (`{ cb = () => setX(1) }`).
+            let default_span = builder.span_at(ap.right.span().start).or(span);
             let default = lower_expr(&ap.right, builder);
-            builder.push_stmt(Stmt::ExprStmt(default, None));
-            lower_binding_pattern(&ap.left, rhs, span, builder);
+            builder.push_stmt(Stmt::ExprStmt(default, default_span));
+            lower_binding_pattern(&ap.left, rhs, span.or(default_span), builder);
         }
     }
 }
