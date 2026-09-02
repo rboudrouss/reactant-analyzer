@@ -88,7 +88,7 @@ pub fn collect_setter_calls_with_extra(
             .entry(k.clone())
             .or_insert_with(|| Arc::clone(v));
     }
-    let mut found: Found = Vec::new();
+    let mut found = Found::default();
     let empty = HashSet::new();
     let certified = certified_fn_names(cfg, &fn_bindings);
     let mut walk = SetterWalk {
@@ -101,8 +101,10 @@ pub fn collect_setter_calls_with_extra(
         repeating: false,
         callback_bodies: &HashMap::new(),
         certified_fns: &certified,
+        collect_calls: false,
     };
     walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None);
+    let mut found = found.setters;
     // Collapse to the historical one-row-per-var shape, preferring the sync
     // site: its block id serves dominance, where any other class records
     // `None`. The walk itself no longer collapses, so this is the one place
@@ -158,7 +160,7 @@ pub(crate) fn collect_write_sites(
     outer_fns: &HashMap<Var, Arc<CFG>>,
     callback_bodies: &HashMap<HookLabel, Arc<CFG>>,
 ) -> Vec<WriteSite> {
-    let mut found: Found = Vec::new();
+    let mut found = Found::default();
     let mut fn_bindings = collect_fn_bindings(cfg);
     let mut certified = certified_fn_names(cfg, &fn_bindings);
     let mut local_binders: HashSet<Var> = HashSet::new();
@@ -182,9 +184,11 @@ pub(crate) fn collect_write_sites(
         repeating: false,
         callback_bodies,
         certified_fns: &certified,
+        collect_calls: false,
     };
     walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None);
     found
+        .setters
         .into_iter()
         .map(|s| WriteSite {
             var: s.var,
@@ -1056,6 +1060,10 @@ struct SetterWalk<'a> {
     /// functional updater. `collect_fn_bindings` is not that bar: it keeps the
     /// last binding of a re-bound name.
     certified_fns: &'a HashSet<Var>,
+    /// Also record every non-setter call site (#126). Off for the setter
+    /// consumers: a body with 200 calls would otherwise pay for 200 rows
+    /// nobody reads, on a walk the rule pass runs once per component per rule.
+    collect_calls: bool,
 }
 
 impl SetterWalk<'_> {
@@ -1120,7 +1128,59 @@ pub(crate) enum WalkClass {
 /// relation is existential, so no query that matched before can stop matching.
 /// The one consumer that wants the old shape, `collect_setter_calls`, collapses
 /// explicitly at the end.
-type Found = Vec<FoundSite>;
+/// The two channels one walk fills: the setter call sites every consumer of
+/// this module has always read, and — only when [`SetterWalk::collect_calls`]
+/// asks for them — every other call site, for the `calls` relation (#126,
+/// ADR-036).
+///
+/// One walk, two consumers: the phase classification of §2, the local-helper
+/// and IIFE descent, the `await` split and the cleanup descent are the hard
+/// part, and a second walk that re-derived them would be a second thing to
+/// keep in step.
+#[derive(Default)]
+struct Found {
+    setters: Vec<FoundSite>,
+    calls: Vec<FoundCall>,
+}
+
+impl Found {
+    /// Splice in the rows of a body that runs AT a call site — a directly
+    /// called local helper (B6) or an IIFE. A row the inner walk classified
+    /// `Sync` runs at that site, so it takes the site's class and block id;
+    /// a row the helper deferred or nested keeps the class it earned.
+    fn absorb(
+        &mut self,
+        inner: Found,
+        mode: WalkClass,
+        block_id: Option<BlockId>,
+        prov: Option<BlockId>,
+    ) {
+        for site in inner.setters {
+            let sync = site.class == WalkClass::Sync;
+            self.setters.push(FoundSite {
+                class: if sync { mode } else { site.class },
+                block_id: if sync { block_id } else { None },
+                prov_block: prov,
+                ..site
+            });
+        }
+        for call in inner.calls {
+            let sync = call.class == WalkClass::Sync;
+            self.calls.push(FoundCall {
+                class: if sync { mode } else { call.class },
+                ..call
+            });
+        }
+    }
+}
+
+/// One raw non-setter call site the walk saw (#126).
+struct FoundCall {
+    name: String,
+    receiver: Option<String>,
+    class: WalkClass,
+    span: Option<SourceRange>,
+}
 
 /// One raw call site the walk saw.
 struct FoundSite {
@@ -1331,9 +1391,23 @@ impl<'a> SetterWalk<'a> {
         prov: Option<BlockId>,
     ) {
         if let Expr::Call { fn_, args } = expr {
+            // #126: every call the walk passes, with the phase class it is
+            // passing it in. Recorded before the teardown early-return below,
+            // which is a rule about *descending* a callback argument and says
+            // nothing about whether the call itself happened.
+            if self.collect_calls
+                && let Some((name, receiver)) = callee_name(fn_)
+            {
+                found.calls.push(FoundCall {
+                    name,
+                    receiver,
+                    class: mode,
+                    span: stmt_span,
+                });
+            }
             if let Expr::Var(name) = fn_.as_ref() {
                 if self.setter_vars.contains(name) {
-                    found.push(FoundSite {
+                    found.setters.push(FoundSite {
                         var: name.clone(),
                         class: mode,
                         span: stmt_span,
@@ -1352,20 +1426,12 @@ impl<'a> SetterWalk<'a> {
                 if depth > 0
                     && let Some(body) = self.fn_bindings.get(name)
                 {
-                    let mut inner = Found::new();
+                    // Inner rows' provenance is this call site: the local
+                    // helper's definition is only reachable from code that
+                    // shares its region (salted names stay region-local).
+                    let mut inner = Found::default();
                     self.cfg(body, depth - 1, &mut inner, WalkClass::Sync, prov);
-                    for site in inner {
-                        // Inner rows' provenance is this call site: the local
-                        // helper's definition is only reachable from code that
-                        // shares its region (salted names stay region-local).
-                        let sync = site.class == WalkClass::Sync;
-                        found.push(FoundSite {
-                            class: if sync { mode } else { site.class },
-                            block_id: if sync { block_id } else { None },
-                            prov_block: prov,
-                            ..site
-                        });
-                    }
+                    found.absorb(inner, mode, block_id, prov);
                 }
             }
             // An immediately-invoked function expression runs NOW, at this
@@ -1378,17 +1444,9 @@ impl<'a> SetterWalk<'a> {
             if depth > 0
                 && let Expr::FnLit { body_cfg, .. } = fn_.peel_ts()
             {
-                let mut inner = Found::new();
+                let mut inner = Found::default();
                 self.cfg(body_cfg, depth - 1, &mut inner, WalkClass::Sync, prov);
-                for site in inner {
-                    let sync = site.class == WalkClass::Sync;
-                    found.push(FoundSite {
-                        class: if sync { mode } else { site.class },
-                        block_id: if sync { block_id } else { None },
-                        prov_block: prov,
-                        ..site
-                    });
-                }
+                found.absorb(inner, mode, block_id, prov);
             }
             // The listener `FnLit` of an effect-top-level `addEventListener`
             // is exactly what `extract_subscriptions` reified as a Handler
@@ -1437,6 +1495,99 @@ impl<'a> SetterWalk<'a> {
             }
         }
     }
+}
+
+/// The callee of a call expression, as a pack can name it: the function name
+/// for a bare call, the method name plus the receiver's root binding for a
+/// member call.
+///
+/// The *root* is the receiver, not the whole path: `URL.createObjectURL(f)`
+/// and `socket.join(r)` are named by the binding a rule can recognise, and a
+/// deeper path (`this.props.socket.join`) still answers the outermost name it
+/// resolves to rather than a synthesised string. A callee that is neither —
+/// an immediately-invoked literal, an element of an array, a call of a call —
+/// has no name a pack could match and produces no row.
+fn callee_name(fn_: &Expr) -> Option<(String, Option<String>)> {
+    match fn_.peel_ts() {
+        Expr::Var(n) => Some((n.to_string(), None)),
+        Expr::FieldAccess { obj, field } => Some((field.to_string(), receiver_root(obj))),
+        _ => None,
+    }
+}
+
+/// The outermost plain binding a receiver expression roots in.
+fn receiver_root(obj: &Expr) -> Option<String> {
+    match obj.peel_ts() {
+        Expr::Var(n) => Some(n.to_string()),
+        Expr::FieldAccess { obj, .. } | Expr::IndexAccess { arr: obj, .. } => receiver_root(obj),
+        _ => None,
+    }
+}
+
+/// One non-hook call site in a body (#126, ADR-036).
+///
+/// The relation a pack reads through the `calls` edge. It is a **may**
+/// relation on two counts: the name is the callee as written and resolved to
+/// a binding, never a proof of which host primitive runs (the same footing as
+/// the registrar table, wontfix #42), and `phase` is the `WriterPhase` may
+/// verdict the writer rows already carry.
+#[derive(Debug, Clone)]
+pub struct BodyCall {
+    /// The function name, or the method name of a member call.
+    pub name: String,
+    /// The receiver's root binding for a member call; `None` for a bare call.
+    pub receiver: Option<String>,
+    /// Where the call runs, on the lattice the writer rows use. A call in the
+    /// effect's returned function is `Cleanup`; one after an `await` or inside
+    /// a `.then` is `Deferred`; one under an unresolved callee is `Unknown`.
+    pub phase: WriterPhase,
+    pub span: Option<SourceRange>,
+}
+
+/// Every named call site in one body, with the phase the walk ran it in.
+///
+/// The second consumer of the setter walk (ADR-036): the phase classification,
+/// the local-helper and IIFE descent, the `await` split and the cleanup
+/// descent are all the walk's, so the relation inherits them instead of
+/// re-deriving them. `region` is the lexical body — exact — and decides what
+/// a synchronous call's phase is called.
+pub fn collect_body_calls(cfg: &CFG, region: WriterRegion, max_depth: usize) -> Vec<BodyCall> {
+    let fn_bindings = collect_fn_bindings(cfg);
+    let certified = certified_fn_names(cfg, &fn_bindings);
+    let empty_vars = HashSet::new();
+    let empty_shadow = HashSet::new();
+    let mut found = Found::default();
+    let mut walk = SetterWalk {
+        setter_vars: &empty_vars,
+        fn_bindings: &fn_bindings,
+        walking: HashSet::new(),
+        root: cfg as *const CFG as usize,
+        effect_body: matches!(region, WriterRegion::Effect(_)),
+        shadowed: &empty_shadow,
+        repeating: false,
+        callback_bodies: &HashMap::new(),
+        certified_fns: &certified,
+        collect_calls: true,
+    };
+    walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None);
+    let mut rows: Vec<BodyCall> = found
+        .calls
+        .into_iter()
+        .map(|c| BodyCall {
+            name: c.name,
+            receiver: c.receiver,
+            phase: class_phase(c.class, region),
+            span: c.span,
+        })
+        .collect();
+    // Walk order is BFS over a block map, so it is already deterministic;
+    // sorting by position makes the row order match the source, which is what
+    // a reader of `--trace` expects.
+    rows.sort_by(|a, b| {
+        (a.span.map(|s| (s.file, s.line, s.col)), &a.name)
+            .cmp(&(b.span.map(|s| (s.file, s.line, s.col)), &b.name))
+    });
+    rows
 }
 
 /// State slots that *may* ever be written: their setter variable (or an

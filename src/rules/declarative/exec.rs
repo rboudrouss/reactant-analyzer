@@ -24,7 +24,7 @@ use crate::rules::{Rule, SetterCall};
 
 use super::entity::{
     ArgEntity, DepEntity, EntityCtx, EntityVal, HookRow, SetterEntity, cleanup_name, firing_name,
-    identity_name, provider_name, seed_sync_name, teardown_name, updater_name,
+    identity_name, phase_name, provider_name, seed_sync_name, teardown_name, updater_name,
 };
 use super::schema::{EdgeName, ElseBehavior, OwnershipName, SeverityPin};
 use super::validate::{
@@ -68,6 +68,8 @@ enum Bound<'a, 'b> {
     Arg(&'b ArgEntity),
     Writer(&'a crate::engine::SlotWriter),
     Seed(&'a crate::engine::SlotSeed),
+    /// One non-hook call site in the anchor's body (#126).
+    Call(&'b crate::engine::BodyCall),
 }
 
 /// One candidate under evaluation: whatever the anchor bound, plus the
@@ -95,6 +97,10 @@ enum Candidate<'a, 'b> {
     /// One callback registration in an effect body (#111) — edge-less, and no
     /// must-guard accepts its sort: the relation is a may-registration.
     Registration(&'a crate::engine::registrations::Registration),
+    /// One non-hook call site in the render body (#126) — edge-less, and no
+    /// must-guard accepts its sort: the callee is a resolved binding, never a
+    /// proof of which host primitive runs.
+    RenderCall(&'b crate::engine::BodyCall),
 }
 
 impl<'a, 'b> Candidate<'a, 'b> {
@@ -107,7 +113,8 @@ impl<'a, 'b> Candidate<'a, 'b> {
             | Candidate::JsxProp(_)
             | Candidate::Cycle(_)
             | Candidate::Consumer(_)
-            | Candidate::Registration(_) => None,
+            | Candidate::Registration(_)
+            | Candidate::RenderCall(_) => None,
         }
     }
 
@@ -120,7 +127,8 @@ impl<'a, 'b> Candidate<'a, 'b> {
             | Candidate::JsxProp(_)
             | Candidate::Cycle(_)
             | Candidate::Consumer(_)
-            | Candidate::Registration(_) => None,
+            | Candidate::Registration(_)
+            | Candidate::RenderCall(_) => None,
         }
     }
 
@@ -135,12 +143,14 @@ impl<'a, 'b> Candidate<'a, 'b> {
             (BindRef::Anchor, Candidate::Cycle(c)) => EntityVal::Cycle(c),
             (BindRef::Anchor, Candidate::Registration(r)) => EntityVal::Registration(r),
             (BindRef::Anchor, Candidate::Consumer(c)) => EntityVal::Consumer(c),
+            (BindRef::Anchor, Candidate::RenderCall(c)) => EntityVal::Call(c),
             (BindRef::Bound, _) => match self.bound().expect("validated: binding exists") {
                 Bound::Setter(s) => EntityVal::Setter(s),
                 Bound::Dep(d) => EntityVal::Dep(d),
                 Bound::Arg(a) => EntityVal::Arg(a),
                 Bound::Writer(w) => EntityVal::Writer(w),
                 Bound::Seed(s) => EntityVal::Seed(s),
+                Bound::Call(c) => EntityVal::Call(c),
             },
         }
     }
@@ -151,7 +161,7 @@ impl<'a, 'b> Candidate<'a, 'b> {
             Candidate::Hook { row, .. } => Some(row.info.label),
             Candidate::RenderSetter(s) => s.slot,
             Candidate::Origin(p) => Some(p.label),
-            Candidate::Provider(_) | Candidate::JsxProp(_) => None,
+            Candidate::Provider(_) | Candidate::JsxProp(_) | Candidate::RenderCall(_) => None,
             // The carrying effect: the finding is about that effect's write.
             Candidate::Cycle(c) => Some(c.effect),
             Candidate::Consumer(c) => Some(c.label),
@@ -167,6 +177,9 @@ impl<'a, 'b> Candidate<'a, 'b> {
             Candidate::Hook { row, bound } => match bound {
                 Some(Bound::Setter(s)) => s.span,
                 Some(Bound::Writer(w)) => w.span.or(row.info.span),
+                // A call row's own site, not the hook's: the whole point of
+                // the relation is to point at the call.
+                Some(Bound::Call(c)) => c.span.or(row.info.span),
                 Some(Bound::Dep(_) | Bound::Arg(_) | Bound::Seed(_)) | None => row.info.span,
             },
             Candidate::RenderSetter(s) => s.span,
@@ -181,6 +194,7 @@ impl<'a, 'b> Candidate<'a, 'b> {
             Candidate::Cycle(c) => Some(c.span),
             Candidate::Consumer(c) => c.span,
             Candidate::Registration(r) => r.span,
+            Candidate::RenderCall(c) => c.span,
         }
     }
 }
@@ -216,6 +230,18 @@ impl Rule for TierARule {
                                     &Candidate::Hook {
                                         row: &row,
                                         bound: Some(Bound::Setter(&setter)),
+                                    },
+                                    &mut out,
+                                );
+                            }
+                        }
+                        Some(EdgeName::Calls) => {
+                            for call in e.body_calls(&row) {
+                                self.eval(
+                                    &e,
+                                    &Candidate::Hook {
+                                        row: &row,
+                                        bound: Some(Bound::Call(&call)),
                                     },
                                     &mut out,
                                 );
@@ -284,8 +310,13 @@ impl Rule for TierARule {
                     self.eval(&e, &Candidate::Provider(&site), &mut out);
                 }
             }
-            ResolvedAnchor::JsxProps => {
-                for site in e.jsx_prop_rows() {
+            ResolvedAnchor::RenderCalls => {
+                for call in e.render_call_rows() {
+                    self.eval(&e, &Candidate::RenderCall(&call), &mut out);
+                }
+            }
+            ResolvedAnchor::JsxProps { elements } => {
+                for site in e.jsx_prop_rows(elements) {
                     self.eval(&e, &Candidate::JsxProp(&site), &mut out);
                 }
             }
@@ -352,14 +383,26 @@ impl TierARule {
         match guard {
             ResolvedGuard::Stability { names, negated, .. } => match cand.bound() {
                 Some(Bound::Dep(dep)) => names.contains(&e.dep_verdict(dep)) != *negated,
-                Some(Bound::Setter(_) | Bound::Arg(_) | Bound::Writer(_) | Bound::Seed(_))
+                Some(
+                    Bound::Setter(_)
+                    | Bound::Arg(_)
+                    | Bound::Writer(_)
+                    | Bound::Seed(_)
+                    | Bound::Call(_),
+                )
                 | None => {
                     unreachable!("validated: `stability` binds a deps entry")
                 }
             },
             ResolvedGuard::Returns { names, negated, .. } => match cand.bound() {
                 Some(Bound::Arg(arg)) => names.contains(&e.arg_verdict(arg)) != *negated,
-                Some(Bound::Setter(_) | Bound::Dep(_) | Bound::Writer(_) | Bound::Seed(_))
+                Some(
+                    Bound::Setter(_)
+                    | Bound::Dep(_)
+                    | Bound::Writer(_)
+                    | Bound::Seed(_)
+                    | Bound::Call(_),
+                )
                 | None => {
                     unreachable!("validated: `returns` binds a call-site argument")
                 }
@@ -436,6 +479,12 @@ impl TierARule {
                     unreachable!("validated: `updater_body` binds a writers row")
                 };
                 names.contains(&e.updater_purity(&w.updater))
+            }
+            ResolvedGuard::Phase { of, names } => {
+                let EntityVal::Call(c) = cand.entity_at(*of) else {
+                    unreachable!("validated: `phase` binds a calls row")
+                };
+                names.contains(&phase_name(c.phase))
             }
             ResolvedGuard::Provider { of, names } => {
                 let EntityVal::Consumer(c) = cand.entity_at(*of) else {
@@ -592,6 +641,34 @@ impl TierARule {
                 }
                 passed
             }
+            ResolvedGuard::NoneOf { edge, body } => {
+                let Some(row) = cand.row() else {
+                    unreachable!("validated: `none` quantifies over an anchor's edge")
+                };
+                // Same second lock as `every`: the validator refuses a
+                // `must_*` inside, so this scratch vector stays empty and no
+                // Error authority can leak out of a negated existential.
+                let mut scratch: Vec<Proof> = Vec::new();
+                let mut hit = |bound: Bound<'_, '_>| {
+                    let elem = Candidate::Hook {
+                        row,
+                        bound: Some(bound),
+                    };
+                    body.iter()
+                        .all(|g| self.eval_guard(e, &elem, g, &mut scratch))
+                };
+                let any = match edge {
+                    EdgeName::Deps => e.deps(row).iter().any(|d| hit(Bound::Dep(d))),
+                    EdgeName::BodySetterCalls => {
+                        e.body_setters(row).iter().any(|s| hit(Bound::Setter(s)))
+                    }
+                    EdgeName::Args => e.args(row).iter().any(|a| hit(Bound::Arg(a))),
+                    EdgeName::Writers => e.writers(row).iter().any(|w| hit(Bound::Writer(w))),
+                    EdgeName::Seeds => e.seeds(row).iter().any(|s| hit(Bound::Seed(s))),
+                    EdgeName::Calls => e.body_calls(row).iter().any(|c| hit(Bound::Call(c))),
+                };
+                !any
+            }
             ResolvedGuard::Every(body) => {
                 let Some(row) = cand.row() else {
                     unreachable!("validated: `every` quantifies over a deps-bearing anchor")
@@ -662,7 +739,8 @@ impl TierARule {
                     | Candidate::JsxProp(_)
                     | Candidate::Cycle(_)
                     | Candidate::Consumer(_)
-                    | Candidate::Registration(_) => {
+                    | Candidate::Registration(_)
+                    | Candidate::RenderCall(_) => {
                         unreachable!("validated: `must_dominates_all_exits` binds a render setter")
                     }
                 };

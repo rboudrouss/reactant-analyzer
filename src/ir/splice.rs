@@ -432,6 +432,7 @@ fn rename_vars_expr(expr: Expr, ren: &HashMap<Var, Var>) -> Expr {
             tag,
             props,
             children,
+            span,
             prop_spans,
         } => Expr::NativeElem {
             tag,
@@ -440,6 +441,7 @@ fn rename_vars_expr(expr: Expr, ren: &HashMap<Var, Var>) -> Expr {
                 .into_iter()
                 .map(|c| rename_vars_expr(c, ren))
                 .collect(),
+            span,
             prop_spans,
         },
         Expr::TSAnnotated(inner) => Expr::TSAnnotated(Box::new(rename_vars_expr(*inner, ren))),
@@ -638,6 +640,7 @@ pub fn subst_vars_expr(expr: Expr, subst: &HashMap<Var, Expr>) -> Expr {
             tag,
             props,
             children,
+            span,
             prop_spans,
         } => Expr::NativeElem {
             tag,
@@ -646,6 +649,7 @@ pub fn subst_vars_expr(expr: Expr, subst: &HashMap<Var, Expr>) -> Expr {
                 .into_iter()
                 .map(|c| subst_vars_expr(c, subst))
                 .collect(),
+            span,
             prop_spans,
         },
         Expr::TSAnnotated(inner) => Expr::TSAnnotated(Box::new(subst_vars_expr(*inner, subst))),

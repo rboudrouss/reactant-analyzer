@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ir::{
@@ -178,9 +177,15 @@ pub enum Expr {
         tag: Symbol,
         props: Box<Expr>,
         children: Vec<Expr>,
-        /// Spans of JSX event-handler props (`onX={fn}`), keyed by prop name.
-        /// Populated during lowering; consumed by `hook_extractor` to set `HookEntry::Handler.span`.
-        prop_spans: HashMap<String, Option<SourceRange>>,
+        /// Span of the element's opening tag — what a finding about the
+        /// element points at (#125), the same fact `CompApp` carries.
+        span: Option<SourceRange>,
+        /// Spans of JSX event-handler props (`onX={fn}`), by prop name.
+        /// Populated during lowering; consumed by `hook_extractor` to set
+        /// `HookEntry::Handler.span`. A list, not a map: an element has a
+        /// handful of handlers, `Expr` is the IR's hottest type, and a `HashMap`
+        /// header costs it twice what the whole payload does.
+        prop_spans: Vec<(Symbol, Option<SourceRange>)>,
     },
 
     // TypeScript annotation marker (`x as T`, `useState<T>(..)`). The declared

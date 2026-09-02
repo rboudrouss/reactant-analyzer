@@ -75,6 +75,19 @@
           ]
         },
         {
+          "description": "Non-hook call sites in the render body (#126, ADR-036) — the same\nrelation the `calls` edge exposes, anchored where there is no hook to\nhang an edge on. `router.push(…)` during render lives here.\n\nA `name` guard is mandatory, for the same reason it is on the edge.",
+          "type": "object",
+          "properties": {
+            "relation": {
+              "type": "string",
+              "const": "render_calls"
+            }
+          },
+          "required": [
+            "relation"
+          ]
+        },
+        {
           "description": "One `hook_provenance` row: every hook call whose identity the engine\nresolved, *surviving* custom-hook inlining (ADR-027 §7 — the #6 fix:\na resolved hook keeps no `hook_calls` row of kind `custom`, so\nidentity rules anchor here). `name` reads the origin hook's name,\n`source` its import specifier; the row carries no kind and no edges.",
           "type": "object",
           "properties": {
@@ -101,9 +114,19 @@
           ]
         },
         {
-          "description": "Every prop of every resolved component element in the render body\n(#71 step 2). Kind-less and edge-less; `name` is the element, `prop`\nthe prop's name, `identity` the value's identity verdict. Host\nelements (`<div/>`) produce no rows — lowering resolved them as\nsomething other than a component application.",
+          "description": "Every prop of every element the render body builds (#71 step 2, #125).\nEdge-less; `name` is the element, `prop` the prop's name, `identity`\nthe value's identity verdict, `kind` whether the element is a component\napplication or a host element.\n\n`elements` selects which kinds are enumerated and defaults to\n`component` — what the relation has always meant, and the only place a\nprop is compared by `Object.is` across a memo boundary. `host` binds\n`<input ref={r} value={v}/>` instead, and `any` binds both. It is an\nanchor option rather than a widening-by-guard because it changes which\nrows exist, and a shipped pack must keep binding the rows it always did\n(ADR-027 §2, the rule #107 followed).",
           "type": "object",
           "properties": {
+            "elements": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ElementsName"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "relation": {
               "type": "string",
               "const": "jsx_props"
@@ -196,9 +219,35 @@
           "const": "writers"
         },
         {
+          "description": "Non-hook call sites in the anchor's body CFG (#126, ADR-036): one row\nper call the setter walk passes, carrying the callee `name`, the\n`receiver` root of a member call, and the `phase` it runs in — the same\nlattice the writer rows use, so a call in a `.then`, after an `await`,\nor in the effect's returned cleanup is distinguishable from one in the\nbody.\n\nUnbounded, unlike every other relation: it enumerates *every* call.\nA `name` guard on the bound row is therefore **mandatory** — a rule\nthat fires on \"some call\" fires on all of them.",
+          "type": "string",
+          "const": "calls"
+        },
+        {
           "description": "Prop seeds of a state-hook anchor's slot (#106, ADR-031): one row per\nprop path the `useState` initializer reads. `{s.path}` is the path as\nwritten; the `seed_sync` guard reads whether anything visibly re-syncs\nthe slot when that prop moves.\n\nA slot whose initializer reads no prop has no rows, so a rule on this\nedge is silent on it by construction — that is knowledge, not a filter.",
           "type": "string",
           "const": "seeds"
+        }
+      ]
+    },
+    "ElementsName": {
+      "description": "Which elements a `jsx_props` anchor enumerates (#125).",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "any"
+          ]
+        },
+        {
+          "description": "Resolved component applications only — the default.",
+          "type": "string",
+          "const": "component"
+        },
+        {
+          "description": "Host elements only (`<div/>`, `<input/>`).",
+          "type": "string",
+          "const": "host"
         }
       ]
     },
@@ -384,6 +433,101 @@
             "kind": {
               "type": "string",
               "const": "name"
+            },
+            "of": {
+              "type": "string"
+            },
+            "one_of": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_Array_of_string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "prefix": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        },
+        {
+          "description": "Receiver filter on a `calls` row: the root binding a member call was\nmade on (`socket` in `socket.join(r)`). The other half of a callee —\n`name` says which method ran, this says whose. A bare call has no\nreceiver and fails the guard, positive-only like every name filter.\nExactly one of `one_of`/`prefix`.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "receiver"
+            },
+            "of": {
+              "type": "string"
+            },
+            "one_of": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_Array_of_string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "prefix": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PVal_string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        },
+        {
+          "description": "Execution phase of a `calls` row (#126) — a total mirror of\n[`PhaseName`], ⊤ included, so a rule that wants \"provably deferred\"\nsays `is: [\"deferred\"]` and one that will accept ⊤ names it.\n\nPositive-only, because the fact is may-typed: `unknown` means the call\nmay run in any phase, and a negated form would let a rule suppress a\nfinding on a ⊤ row.",
+          "type": "object",
+          "properties": {
+            "is": {
+              "$ref": "#/$defs/PVal_Array_of_PhaseName"
+            },
+            "kind": {
+              "type": "string",
+              "const": "phase"
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of",
+            "is"
+          ]
+        },
+        {
+          "description": "Prop-name filter on a `jsx_props` row (#125): `value`, `key`,\n`children`, `onChange`. The relation always carried the field; without\na guard on it a rule could not skip `children` (fresh on every wrapper)\nnor scope itself to one prop. Exactly one of `one_of`/`prefix`.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "prop"
             },
             "of": {
               "type": "string"
@@ -803,6 +947,36 @@
               "const": "every"
             },
             "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of",
+            "as",
+            "guards"
+          ]
+        },
+        {
+          "description": "Negated existential over an edge of the anchor (#126): passes when\n**no** row satisfies the nested guards.\n\nThe one thing the guard language could not say, and what the wish-list\nkept asking for: \"acquires a resource and releases none\", \"has a `value`\nprop and no `onChange`\", \"subscribes and never reads the current value\".\nA `forEach` is the existential; this is its negation, and neither can be\nwritten as the other.\n\n**The unsound direction is the safe one here.** Every relation it can\nquantify over may under-enumerate — a depth-capped walk, a callee it\ncould not resolve — and a missing row makes `none` pass, so the rule\nfires where it should not. That is a false positive, which this project\naccepts; the direction it never takes is losing a finding.\n\nNever mints a proof, exactly like `every`: a `must_*` anywhere in a rule\nthat uses it is rejected at load time.",
+          "type": "object",
+          "properties": {
+            "as": {
+              "description": "Name the row binds under inside `guards`, owned by the quantifier\nfor its own subtree and not visible in the message.",
+              "type": "string"
+            },
+            "guards": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Guard"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "none"
+            },
+            "of": {
+              "description": "`anchor.<edge>` — the same spelling `count` and `every` use, and\ntyped by the same table `forEach` navigation reads.",
               "type": "string"
             }
           },

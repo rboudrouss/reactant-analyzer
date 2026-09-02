@@ -48,10 +48,15 @@ pub(crate) enum ValueIdentity {
     Unknown,
 }
 
-/// One prop of one resolved component element in the render body.
+/// One prop of one element in the render body.
 pub(crate) struct JsxPropSite<'a> {
-    /// The element's component name (`Row`, `TabsContext.Provider`).
+    /// The element's component name (`Row`, `TabsContext.Provider`) or, for a
+    /// host element, its tag (`input`, `div`).
     pub element: &'a str,
+    /// The element is a host element, not a component application (#125).
+    /// Lowering decided which — this is a resolved fact, not a case check on
+    /// the tag's first letter.
+    pub host: bool,
     /// The prop's name (`style`, `onSelect`, `value`).
     pub prop: &'a str,
     /// Identity of the prop's value across renders.
@@ -60,16 +65,45 @@ pub(crate) struct JsxPropSite<'a> {
     pub span: Option<SourceRange>,
 }
 
-/// Every prop of every **resolved component element** in the render body, in a
-/// deterministic order (#71 step 2).
+/// Which elements a caller wants enumerated (#125).
 ///
-/// `Expr::CompApp` is the admissibility criterion, and it is a resolved-relation
-/// position rather than a syntactic one (ADR-023 §1): lowering decided this
-/// application is a component, so host elements (`<div style={{…}}/>`) produce
-/// no rows — their props are not compared by `Object.is` against a memo
-/// boundary. Which elements actually memoize is unknown here, so the relation
-/// states only the identity fact and leaves the element filter to the rule.
-pub(crate) fn collect_jsx_prop_sites(comp: &AnalysisResult<StateValue>) -> Vec<JsxPropSite<'_>> {
+/// `Component` is the default and what the relation always meant: `Expr::CompApp`
+/// is a *resolved* position (ADR-023 §1) — lowering decided the application is a
+/// component, and only there is a prop compared by `Object.is` across a memo
+/// boundary. Host elements carry the other half of the render surface —
+/// `<input ref={r} value={v}/>`, `style={{…}}` — and a rule about the DOM needs
+/// them, so a rule may ask.
+///
+/// It is an anchor option rather than a widening-by-guard because the choice
+/// changes *which rows exist*, and a shipped pack must keep binding exactly the
+/// rows it always did (ADR-027 §2, the same rule #107 followed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ElementKinds {
+    #[default]
+    Component,
+    Host,
+    Any,
+}
+
+impl ElementKinds {
+    fn admits(self, host: bool) -> bool {
+        match self {
+            ElementKinds::Component => !host,
+            ElementKinds::Host => host,
+            ElementKinds::Any => true,
+        }
+    }
+}
+
+/// Every prop of every element the render body builds, in a deterministic
+/// order (#71 step 2, #125), narrowed to the element kinds the rule asked for.
+///
+/// Which elements actually memoize is unknown here, so the relation states only
+/// the identity fact and leaves the element filter to the rule.
+pub(crate) fn collect_jsx_prop_sites(
+    comp: &AnalysisResult<StateValue>,
+    kinds: ElementKinds,
+) -> Vec<JsxPropSite<'_>> {
     let cfg = &comp.render_cfg;
     let bindings = local_bindings(cfg);
     // `(block, expr index, nesting, sequence)`. Top-level rows keep nesting 0
@@ -80,7 +114,10 @@ pub(crate) fn collect_jsx_prop_sites(comp: &AnalysisResult<StateValue>) -> Vec<J
     for (block_id, exprs) in top_level_exprs(cfg) {
         let env = comp.block_states.get(&block_id);
         for (idx, expr) in exprs.into_iter().enumerate() {
-            each_component_element(expr, &mut |element, props, span| {
+            each_element(expr, &mut |element, host, props, span| {
+                if !kinds.admits(host) {
+                    return;
+                }
                 let Expr::ObjectLit { fields, .. } = props else {
                     return;
                 };
@@ -89,6 +126,7 @@ pub(crate) fn collect_jsx_prop_sites(comp: &AnalysisResult<StateValue>) -> Vec<J
                         (block_id, idx, 0, ord),
                         JsxPropSite {
                             element,
+                            host,
                             prop,
                             identity: site_identity(Some(value), env, &bindings, comp),
                             span,
@@ -101,7 +139,10 @@ pub(crate) fn collect_jsx_prop_sites(comp: &AnalysisResult<StateValue>) -> Vec<J
             // where per-row identity actually costs something, and the relation
             // saw none of it.
             let mut seq = 0usize;
-            each_list_element(expr, LIST_DEPTH, &mut |element, props, span| {
+            each_list_element(expr, LIST_DEPTH, &mut |element, host, props, span| {
+                if !kinds.admits(host) {
+                    return;
+                }
                 let Expr::ObjectLit { fields, .. } = props else {
                     return;
                 };
@@ -110,6 +151,7 @@ pub(crate) fn collect_jsx_prop_sites(comp: &AnalysisResult<StateValue>) -> Vec<J
                         (block_id, idx, 1, seq),
                         JsxPropSite {
                             element,
+                            host,
                             prop,
                             identity: literal_identity(value),
                             span,
@@ -139,7 +181,7 @@ const LIST_DEPTH: usize = 2;
 fn each_list_element<'a>(
     expr: &'a Expr,
     depth: usize,
-    f: &mut impl FnMut(&'a str, &'a Expr, Option<SourceRange>),
+    f: &mut impl FnMut(&'a str, bool, &'a Expr, Option<SourceRange>),
 ) {
     if depth == 0 {
         return;
@@ -152,7 +194,7 @@ fn each_list_element<'a>(
             if let Expr::FnLit { body_cfg, .. } = arg.peel_ts() {
                 for (_, exprs) in top_level_exprs(body_cfg) {
                     for inner in exprs {
-                        each_component_element(inner, f);
+                        each_element(inner, f);
                         each_list_element(inner, depth - 1, f);
                     }
                 }
@@ -257,4 +299,21 @@ pub(crate) fn each_component_element<'a>(
         f(name, props, *span);
     }
     expr.for_each_child(&mut |child| each_component_element(child, f));
+}
+
+/// Every element in the tree, component or host, with a flag saying which
+/// (#125). Both carry their opening tag's span, so a finding about a host
+/// element points at the element and not at the enclosing hook.
+fn each_element<'a>(
+    expr: &'a Expr,
+    f: &mut impl FnMut(&'a str, bool, &'a Expr, Option<SourceRange>),
+) {
+    match expr {
+        Expr::CompApp { name, props, span } => f(name, false, props, *span),
+        Expr::NativeElem {
+            tag, props, span, ..
+        } => f(tag, true, props, *span),
+        _ => {}
+    }
+    expr.for_each_child(&mut |child| each_element(child, f));
 }

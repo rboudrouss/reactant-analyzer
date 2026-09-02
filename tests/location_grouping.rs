@@ -68,5 +68,9 @@ fn json_keeps_one_row_per_component() {
 #[test]
 fn findings_still_fail_the_build() {
     let out = reactant(&["check", FIXTURE, "--all-roots", "--fail-on", "warning"]);
-    assert_eq!(out.status.code(), Some(1), "grouping does not change --fail-on");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "grouping does not change --fail-on"
+    );
 }

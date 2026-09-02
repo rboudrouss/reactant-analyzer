@@ -83,6 +83,7 @@ pub fn remap_expr(expr: Expr, offset: HookLabel) -> Expr {
             tag,
             props,
             children,
+            span,
             prop_spans,
         } => Expr::NativeElem {
             tag,
@@ -91,6 +92,7 @@ pub fn remap_expr(expr: Expr, offset: HookLabel) -> Expr {
                 .into_iter()
                 .map(|c| remap_expr(c, offset))
                 .collect(),
+            span,
             prop_spans,
         },
         Expr::TSAnnotated(inner) => Expr::TSAnnotated(Box::new(remap_expr(*inner, offset))),

@@ -116,6 +116,12 @@ pub enum Anchor {
     },
     /// Alias-resolved setter calls in the render body.
     RenderSetterCalls,
+    /// Non-hook call sites in the render body (#126, ADR-036) — the same
+    /// relation the `calls` edge exposes, anchored where there is no hook to
+    /// hang an edge on. `router.push(…)` during render lives here.
+    ///
+    /// A `name` guard is mandatory, for the same reason it is on the edge.
+    RenderCalls,
     /// One `hook_provenance` row: every hook call whose identity the engine
     /// resolved, *surviving* custom-hook inlining (ADR-027 §7 — the #6 fix:
     /// a resolved hook keeps no `hook_calls` row of kind `custom`, so
@@ -130,12 +136,22 @@ pub enum Anchor {
     /// recomputations. Edge-less in v1; the any-prop generalisation rides
     /// this same relation later.
     ContextProviders,
-    /// Every prop of every resolved component element in the render body
-    /// (#71 step 2). Kind-less and edge-less; `name` is the element, `prop`
-    /// the prop's name, `identity` the value's identity verdict. Host
-    /// elements (`<div/>`) produce no rows — lowering resolved them as
-    /// something other than a component application.
-    JsxProps,
+    /// Every prop of every element the render body builds (#71 step 2, #125).
+    /// Edge-less; `name` is the element, `prop` the prop's name, `identity`
+    /// the value's identity verdict, `kind` whether the element is a component
+    /// application or a host element.
+    ///
+    /// `elements` selects which kinds are enumerated and defaults to
+    /// `component` — what the relation has always meant, and the only place a
+    /// prop is compared by `Object.is` across a memo boundary. `host` binds
+    /// `<input ref={r} value={v}/>` instead, and `any` binds both. It is an
+    /// anchor option rather than a widening-by-guard because it changes which
+    /// rows exist, and a shipped pack must keep binding the rows it always did
+    /// (ADR-027 §2, the rule #107 followed).
+    JsxProps {
+        #[serde(default)]
+        elements: Option<ElementsName>,
+    },
     /// One render-loop cycle of the program's churn graph, seen from the
     /// effect of THIS component that carries one of its edges (#108,
     /// ADR-029). Edge-less: `cycle` renders the loop as `a → b → a`, and the
@@ -182,6 +198,18 @@ pub enum Anchor {
     },
 }
 
+/// Which elements a `jsx_props` anchor enumerates (#125).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum ElementsName {
+    /// Resolved component applications only — the default.
+    Component,
+    /// Host elements only (`<div/>`, `<input/>`).
+    Host,
+    Any,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
 #[serde(rename_all = "lowercase")]
@@ -226,6 +254,17 @@ pub enum EdgeName {
     /// `{w.region}` is the lexical body — exact; `{w.phase}` is a MAY verdict,
     /// `unknown` = may run in any phase.
     Writers,
+    /// Non-hook call sites in the anchor's body CFG (#126, ADR-036): one row
+    /// per call the setter walk passes, carrying the callee `name`, the
+    /// `receiver` root of a member call, and the `phase` it runs in — the same
+    /// lattice the writer rows use, so a call in a `.then`, after an `await`,
+    /// or in the effect's returned cleanup is distinguishable from one in the
+    /// body.
+    ///
+    /// Unbounded, unlike every other relation: it enumerates *every* call.
+    /// A `name` guard on the bound row is therefore **mandatory** — a rule
+    /// that fires on "some call" fires on all of them.
+    Calls,
     /// Prop seeds of a state-hook anchor's slot (#106, ADR-031): one row per
     /// prop path the `useState` initializer reads. `{s.path}` is the path as
     /// written; the `seed_sync` guard reads whether anything visibly re-syncs
@@ -291,6 +330,40 @@ pub enum Guard {
     /// resolved entities, never text patterns over call syntax). Exactly one
     /// of `one_of`/`prefix`.
     Name {
+        of: String,
+        #[serde(default)]
+        one_of: Option<PVal<Vec<String>>>,
+        #[serde(default)]
+        prefix: Option<PVal<String>>,
+    },
+    /// Receiver filter on a `calls` row: the root binding a member call was
+    /// made on (`socket` in `socket.join(r)`). The other half of a callee —
+    /// `name` says which method ran, this says whose. A bare call has no
+    /// receiver and fails the guard, positive-only like every name filter.
+    /// Exactly one of `one_of`/`prefix`.
+    Receiver {
+        of: String,
+        #[serde(default)]
+        one_of: Option<PVal<Vec<String>>>,
+        #[serde(default)]
+        prefix: Option<PVal<String>>,
+    },
+    /// Execution phase of a `calls` row (#126) — a total mirror of
+    /// [`PhaseName`], ⊤ included, so a rule that wants "provably deferred"
+    /// says `is: ["deferred"]` and one that will accept ⊤ names it.
+    ///
+    /// Positive-only, because the fact is may-typed: `unknown` means the call
+    /// may run in any phase, and a negated form would let a rule suppress a
+    /// finding on a ⊤ row.
+    Phase {
+        of: String,
+        is: PVal<Vec<PhaseName>>,
+    },
+    /// Prop-name filter on a `jsx_props` row (#125): `value`, `key`,
+    /// `children`, `onChange`. The relation always carried the field; without
+    /// a guard on it a rule could not skip `children` (fresh on every wrapper)
+    /// nor scope itself to one prop. Exactly one of `one_of`/`prefix`.
+    Prop {
         of: String,
         #[serde(default)]
         one_of: Option<PVal<Vec<String>>>,
@@ -534,6 +607,34 @@ pub enum Guard {
         /// rule-level `forEach` binding uses, which the quantifier owns for
         /// its own subtree — so the outer binding is not visible inside, and
         /// this name is not visible in the message.
+        #[serde(rename = "as")]
+        r#as: String,
+        guards: Vec<Guard>,
+    },
+    /// Negated existential over an edge of the anchor (#126): passes when
+    /// **no** row satisfies the nested guards.
+    ///
+    /// The one thing the guard language could not say, and what the wish-list
+    /// kept asking for: "acquires a resource and releases none", "has a `value`
+    /// prop and no `onChange`", "subscribes and never reads the current value".
+    /// A `forEach` is the existential; this is its negation, and neither can be
+    /// written as the other.
+    ///
+    /// **The unsound direction is the safe one here.** Every relation it can
+    /// quantify over may under-enumerate — a depth-capped walk, a callee it
+    /// could not resolve — and a missing row makes `none` pass, so the rule
+    /// fires where it should not. That is a false positive, which this project
+    /// accepts; the direction it never takes is losing a finding.
+    ///
+    /// Never mints a proof, exactly like `every`: a `must_*` anywhere in a rule
+    /// that uses it is rejected at load time.
+    #[serde(rename = "none")]
+    NoneOf {
+        /// `anchor.<edge>` — the same spelling `count` and `every` use, and
+        /// typed by the same table `forEach` navigation reads.
+        of: String,
+        /// Name the row binds under inside `guards`, owned by the quantifier
+        /// for its own subtree and not visible in the message.
         #[serde(rename = "as")]
         r#as: String,
         guards: Vec<Guard>,

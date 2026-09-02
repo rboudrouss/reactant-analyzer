@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 
 use crate::ir::source_range::SourceRange;
 use oxc_ast::ast::*;
@@ -573,6 +572,27 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         // `return await f()` has nothing left to defer.
         Expression::AwaitExpression(aw) => {
             let value = lower_expr(&aw.argument, builder);
+            // The awaited expression is evaluated BEFORE the suspension:
+            // `await fetch(u)` calls `fetch` synchronously and only then
+            // yields. Returning it here would carry it into the enclosing
+            // statement, which the split moves into the post-await block — so
+            // the call would read as `deferred`, and `deferred` is a claim
+            // ("never inside a React phase"), not an over-approximation. Bind
+            // it on this side of the edge instead. A bare name or literal has
+            // nothing to evaluate, so it is passed through unchanged rather
+            // than given a binding no reader wants.
+            let value = match value {
+                v @ (Expr::Var(_) | Expr::Lit(_)) => v,
+                v => {
+                    let tmp = builder.fresh_temp();
+                    builder.push_stmt(Stmt::Let {
+                        var: tmp.clone(),
+                        rhs: v,
+                        span: None,
+                    });
+                    Expr::Var(tmp)
+                }
+            };
             builder.split_at_await();
             value
         }
@@ -807,19 +827,20 @@ fn lower_jsx_element(jsx: &JSXElement, builder: &mut BlockBuilder) -> Expr {
             tag: name,
             props: Box::new(props),
             children,
+            span: builder.span_at(jsx.opening_element.span.start),
             prop_spans,
         }
     }
 }
 
 /// Lower JSX attributes to an `ObjectLit`, collecting spans for `onX` props.
-/// Returns `(props_expr, prop_spans)` keyed by prop name.
+/// Returns `(props_expr, prop_spans)` by prop name.
 fn lower_jsx_props(
     attrs: &[JSXAttributeItem],
     builder: &mut BlockBuilder,
-) -> (Expr, HashMap<String, Option<SourceRange>>) {
+) -> (Expr, Vec<(String, Option<SourceRange>)>) {
     let id = builder.next_expr_id();
-    let mut prop_spans: HashMap<String, Option<SourceRange>> = HashMap::new();
+    let mut prop_spans: Vec<(String, Option<SourceRange>)> = Vec::new();
     let fields: Vec<(String, Expr)> = attrs
         .iter()
         .map(|attr| match attr {
@@ -833,7 +854,7 @@ fn lower_jsx_props(
                 // Capture span for event-handler props so hook_extractor can set
                 // HookEntry::Handler.span without needing the original Oxc AST.
                 if is_event_prop_key(&key) {
-                    prop_spans.insert(key.clone(), builder.span_at(a.span.start));
+                    prop_spans.push((key.clone(), builder.span_at(a.span.start)));
                 }
                 let val = match &a.value {
                     Some(JSXAttributeValue::StringLiteral(s)) => {
@@ -921,7 +942,8 @@ fn lower_jsx_fragment(frag: &JSXFragment, builder: &mut BlockBuilder) -> Expr {
         tag: "Fragment".to_string(),
         props: Box::new(Expr::ObjectLit { id, fields: vec![] }),
         children,
-        prop_spans: HashMap::new(),
+        span: builder.span_at(frag.span.start),
+        prop_spans: Vec::new(),
     }
 }
 

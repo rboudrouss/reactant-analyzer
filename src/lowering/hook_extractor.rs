@@ -179,7 +179,10 @@ fn collect_handlers_in_expr(
                                 label,
                                 event: prop_to_event(name),
                                 body_cfg,
-                                span: prop_spans.get(name).copied().flatten(),
+                                span: prop_spans
+                                    .iter()
+                                    .find(|(k, _)| k == name)
+                                    .and_then(|(_, s)| *s),
                             });
                         }
                     } else {
