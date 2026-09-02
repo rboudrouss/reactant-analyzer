@@ -44,6 +44,13 @@ returning `null` is not detected at all),
 evidence on [#4](https://github.com/rboudrouss/reactant-analyzer/issues/4) and
 [#117](https://github.com/rboudrouss/reactant-analyzer/issues/117).
 
+## The other half
+
+[`AUDIT.md`](AUDIT.md) is the measurement side of the same exercise: what the
+nineteen native rules actually do on 34,730 files, the severity split, and the
+finding that 81% of the reported output is one source line repeated once per
+consuming component ([#129](https://github.com/rboudrouss/reactant-analyzer/issues/129)).
+
 ## What is in here
 
 | file | contents |
