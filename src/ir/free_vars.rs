@@ -28,8 +28,20 @@ impl AccessPath {
     /// the normal expression evaluator instead of settling for the root's
     /// value.
     pub fn to_expr(&self) -> Expr {
+        self.prefix_expr(self.segments.len())
+    }
+
+    /// The `Expr` for the first `n` segments — `prefix_expr(0)` is the bare
+    /// root, `prefix_expr(segments.len())` the whole path.
+    ///
+    /// A read goes stale only if every handle it passes through can change:
+    /// `bag.ref.current` reaches a *stable* ref at `bag.ref`, so the copy of
+    /// `bag` a stale closure holds still reaches the same ref, and the read is
+    /// current. Asking only the root or only the whole path misses that.
+    pub fn prefix_expr(&self, n: usize) -> Expr {
         self.segments
             .iter()
+            .take(n)
             .fold(Expr::Var(self.root.clone()), |obj, seg| Expr::FieldAccess {
                 obj: Box::new(obj),
                 field: seg.clone(),

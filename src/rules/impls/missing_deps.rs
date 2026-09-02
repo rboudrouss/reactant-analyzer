@@ -117,7 +117,7 @@ impl Rule for MissingDeps {
     }
 }
 
-/// True when the member the path names is provably stable on its own — the
+/// True when some handle the path passes through is provably stable — the
 /// per-member map an `ObjectLit` records on the heap (issue #88). Bare roots
 /// (no segments) are left to the caller's `env_exit.lookup`: re-evaluating
 /// them here would answer the same thing.
@@ -126,10 +126,23 @@ fn member_is_stable(
     env_exit: &AbstractEnv<StateValue>,
     result: &crate::engine::AnalysisResult<StateValue>,
 ) -> bool {
-    !path.segments.is_empty()
-        && result
-            .eval_in(env_exit, &path.to_expr(), &mut result.heap.clone())
+    // Every prefix, not just the whole path. A read is stale only when every
+    // handle it passes through can change between renders: `bag.ref.current`
+    // reaches a stable ref at `bag.ref`, so the stale copy of `bag` a closure
+    // holds still reaches *that* ref and reads its current value. Stopping at
+    // the full path answers ⊤ for any `.current` tail (a ref cell is not
+    // heap-modelled), and stopping at the root is what the caller already did.
+    //
+    // Same direction as the root check it backs up: this only ever removes
+    // findings, and it removes them for the same reason the root check does —
+    // the capture is provably not stale (#88, and the 2,010 corpus rows where
+    // the container was fresh and the member was not).
+    let mut heap = result.heap.clone();
+    (1..=path.segments.len()).any(|n| {
+        result
+            .eval_in(env_exit, &path.prefix_expr(n), &mut heap)
             .is_stable()
+    })
 }
 
 /// Identity vs behavior (ADR-017 framing): this rule guards against *stale

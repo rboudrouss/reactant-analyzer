@@ -103,6 +103,12 @@ Every entry here is Warning-or-below by construction: an FP never carries an Err
 - **`frozen-initial-state`** still fires on a child remounted by machinery it cannot see — a dialog
   body unmounted by its library wrapper, a route that swaps the subtree
   [#95](https://github.com/rboudrouss/reactant-analyzer/issues/95).
+- **`missing-deps`** asks whether a capture can go *stale*, so a read through a handle that never
+  changes is silent even when the container around it does: `bag.ref.current` where `bag` is rebuilt
+  every render but `bag.ref` is a `useRef` reads the live value, and the rule says nothing. The
+  neighbouring shape still fires and should: a `useCallback` with a non-empty deps list *can* change
+  identity, so a `[]` closure over it can genuinely go stale
+  [ADR-040](adr/ADR-040-the-longest-stable-prefix.md).
 - **`setter-in-render`** warns when a setter reaches a callee with no timing summary
   (`<form onSubmit={handleSubmit(onSubmit)}>`, `composeEventHandlers(a, cb)`): ⊤ includes the render
   pass, so the row is sound and the wording says so — it never claims the setter was called in the

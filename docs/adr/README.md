@@ -41,3 +41,4 @@
 | [ADR-037](ADR-037-slot-read-relation.md) | The slot-read relation — the write side's mirror image, region and phase, on the same walk (#127) | Accepted |
 | [ADR-038](ADR-038-write-position-and-write-certainty.md) | A write is a write wherever it is written — the traversal gate dropped; phase read by the rule, `Deferred` split from ⊤, `must_write` before a certification, and one spelling for a component's identity (#130) | Accepted |
 | [ADR-039](ADR-039-a-synthetic-binding-is-synthetic-its-position-is-not.md) | A synthetic binding is synthetic, its position is not — the six spanless mint sites, the splice's call-site fallback, and a walk that stops discarding the position it is standing on (#131) | Accepted |
+| [ADR-040](ADR-040-the-longest-stable-prefix.md) | A read is stale only when every handle on its path can change — `missing-deps` asks every prefix, not just the root and the whole path (686 corpus findings, the residual of #88) | Accepted |

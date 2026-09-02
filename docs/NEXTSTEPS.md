@@ -149,6 +149,13 @@ Re-mesure des 60 scénarios : **8 EXPRESSIBLE (contre 1), 20 INEXPRESSIBLE
 (contre 27)** — `docs/campaign/triage-2026-09-02-wave2.md`, avec
 `packs/community/wave2.json` et ses paires de fixtures comme preuve exécutable.
 
+- **ADR-040** — une lecture n'est périmée que si *toutes* les poignées de son
+  chemin peuvent changer. `missing-deps` interrogeait la racine et le chemin
+  entier, jamais l'entre-deux : `bag.ref.current` où `bag` est reconstruit à
+  chaque rendu mais `bag.ref` est un `useRef` lit la valeur courante. Corpus :
+  **6 340 → 5 654, 686 retirées, aucune ajoutée** — 11 % de la sortie totale,
+  d'un seul tenant.
+
 Prochaines marches, par valeur décroissante : les valeurs d'arguments (#67) ;
 une requête de dominance ; les résumés d'écosystème (#94), seule façon de
 réduire la classe ⊤ qu'ADR-038 §2 laisse en Warning ; et la moitié

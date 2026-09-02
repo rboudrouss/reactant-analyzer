@@ -321,3 +321,69 @@ fn getter_member_still_fires() {
         "a getter member must not inherit its body's value"
     );
 }
+
+// ── The longest stable prefix ─────────────────────────────────────────────────
+
+/// A read goes stale only if *every* handle it passes through can change. The
+/// rule already exempted a stable root — `r.current` where `r = useRef(0)` is
+/// silent — but asked the whole path and nothing in between, so the same ref
+/// reached one hop in fired. 2,010 corpus rows were this shape.
+#[test]
+fn a_ref_reached_through_a_fresh_container_is_not_stale() {
+    assert_eq!(
+        missing_deps_hits(
+            r#"
+            import { useRef, useCallback } from "react";
+            function C() {
+              const r = useRef(0);
+              const bag = { r };
+              const cb = useCallback(() => { console.log(bag.r.current); }, []);
+              return <button onClick={cb} />;
+            }
+            "#,
+        ),
+        0,
+        "`bag` is fresh every render, but `bag.r` is the same ref every render — \
+         the stale copy of `bag` reaches that ref and reads its current value"
+    );
+}
+
+/// The bare-root case the prefix scan must not disturb.
+#[test]
+fn a_ref_read_directly_is_still_not_stale() {
+    assert_eq!(
+        missing_deps_hits(
+            r#"
+            import { useRef, useCallback } from "react";
+            function C() {
+              const r = useRef(0);
+              const cb = useCallback(() => { console.log(r.current); }, []);
+              return <button onClick={cb} />;
+            }
+            "#,
+        ),
+        0
+    );
+}
+
+/// And the case that must keep firing: no prefix is stable, so the capture can
+/// genuinely go stale.
+#[test]
+fn a_member_of_a_fresh_container_with_no_stable_prefix_still_fires() {
+    assert_eq!(
+        missing_deps_hits(
+            r#"
+            import { useState, useCallback } from "react";
+            function C({ step }) {
+              const [n, setN] = useState(0);
+              const bag = { n };
+              const cb = useCallback(() => { console.log(bag.n); }, []);
+              return <button onClick={() => { setN(n + step); cb(); }} />;
+            }
+            "#,
+        ),
+        1,
+        "`bag.n` reads state through a container rebuilt every render: nothing \
+         on the path is stable, and the closure keeps the old value"
+    );
+}
