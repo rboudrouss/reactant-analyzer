@@ -1659,7 +1659,7 @@ pub struct SlotRead {
 }
 
 /// The slot → readers relation (#127): one row per read site, over the same
-/// regions [`collect_slot_writers`] enumerates.
+/// regions `collect_slot_writers` enumerates.
 ///
 /// A read inside a nested function is recorded when the walk *enters* that
 /// function, with the class it entered in — never by crossing a `FnLit` from
