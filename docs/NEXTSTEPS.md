@@ -196,6 +196,27 @@ Re-mesure des 60 scénarios : **8 EXPRESSIBLE (contre 1), 20 INEXPRESSIBLE
   nommés par la poignée qu'ils partagent. Corpus : **1 394 → 1 359 emplacements
   (5 119 → 4 985 lignes)**, 8 sites de hook éteints, **aucun site n'en gagne**.
 
+- **ADR-045** — la famille compare-then-sync de #91. `converges_once_written`
+  prouvait par la *valeur* ; la forme du corpus est **relationnelle** : `x < y`
+  après `x := y` est faux pour tous x et y, un fait sur la relation entre les
+  deux qu'aucun domaine non relationnel ne représente. Les *orthographes*
+  disent ce que les valeurs ne peuvent pas : quand un côté de la comparaison
+  est un chemin enraciné sur le slot écrit et l'autre est, verbatim,
+  l'expression que l'écriture y range, les deux désignent la même valeur au
+  rendu suivant. Passe par un littéral objet (ADR-043) et par un renommage
+  (ADR-044) ; **exclut les appels**, parce qu'un appel ne garantit pas de
+  rendre deux fois la même chose, pas même deux fois dans un rendu. Corpus :
+  **1 359 → 1 343 emplacements**, 16 retirées, aucune ajoutée — dont
+  `CurrencyInput.tsx:139`, le motif « adjust state during render » documenté
+  par React.
+
+  Un triage préalable (consigné dans `docs/campaign/AUDIT.md`) a montré que les
+  deux grosses règles — `always-unstable-deps` (356) et `lazy-init` (212), soit
+  42 % de la sortie — **n'ont pas de faux positifs matériels** : chaque
+  dépendance tracée jusqu'à sa définition est bien une allocation fraîche, et la
+  règle exige une preuve (⊤ ne déclenche rien). Les FP restants sont dans les
+  petits amas.
+
 Prochaines marches, par valeur décroissante : les valeurs d'arguments (#67) ;
 une requête de dominance ; les résumés d'écosystème (#94), seule façon de
 réduire la classe ⊤ qu'ADR-038 §2 laisse en Warning ; et la moitié

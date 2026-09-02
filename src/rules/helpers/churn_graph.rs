@@ -199,6 +199,7 @@ pub(in crate::rules) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec
                     &f.state_vals,
                     call.node.1,
                     &reference_part(&call.written),
+                    call.written_expr.as_ref(),
                     f.comp_result,
                 )
             {

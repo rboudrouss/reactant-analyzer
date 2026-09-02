@@ -1675,3 +1675,113 @@ function A() {
         "unconditional render setter stays Error: {diags:?}"
     );
 }
+
+// ── ADR-045: a write that settles its own guard ──────────────────────────────
+
+/// React's documented "adjust state during render" idiom: the guard compares
+/// the slot against the very expression the write stores in it, so the two are
+/// equal on the next render and the branch is dead (twenty `CurrencyInput`).
+#[test]
+fn a_write_that_settles_its_own_guard_is_not_a_render_setter() {
+    let fired = rules_fired(
+        r#"
+        function C({ value, decimals }) {
+          const [scale, setScale] = useState(0);
+          const scaleForCurrentValue = getSafeScale(value, decimals);
+          if (scale < scaleForCurrentValue) { setScale(scaleForCurrentValue); }
+          return <div>{scale}</div>;
+        }
+        "#,
+    );
+    assert!(
+        !fired.iter().any(|r| r == "setter-in-render"),
+        "the guard cannot hold again once the slot holds what it compares against: {fired:?}"
+    );
+}
+
+/// The same claim one hop into an object literal: the guard reads a field of
+/// the slot, and the write puts the compared expression at that field (dub's
+/// `detailsSheetState.leadId`).
+#[test]
+fn a_settling_write_through_an_object_member_is_not_a_loop() {
+    let fired = rules_fired(
+        r#"
+        function C({ urlLeadId }) {
+          const [sheet, setSheet] = useState({ leadId: null, open: false });
+          useEffect(() => {
+            if (urlLeadId && urlLeadId !== sheet.leadId) {
+              setSheet({ leadId: urlLeadId, open: true });
+            }
+          }, [urlLeadId, sheet]);
+          return <div>{sheet.leadId}</div>;
+        }
+        "#,
+    );
+    assert!(
+        !fired.iter().any(|r| r == "infinite-loop"),
+        "`sheet.leadId` holds `urlLeadId` after the write: {fired:?}"
+    );
+}
+
+/// And through a rename, which is how the clamp shapes are written (dub's
+/// `const clamped = maxAllowedSubmissions`).
+#[test]
+fn a_settling_write_through_a_rename_is_not_a_loop() {
+    let fired = rules_fired(
+        r#"
+        function C({ max }) {
+          const [allowed, setAllowed] = useState(0);
+          useEffect(() => {
+            if (allowed > max) { const clamped = max; setAllowed(clamped); }
+          }, [allowed, max]);
+          return <div>{allowed}</div>;
+        }
+        "#,
+    );
+    assert!(
+        !fired.iter().any(|r| r == "infinite-loop"),
+        "`allowed > max` cannot hold again once `allowed` is `max`: {fired:?}"
+    );
+}
+
+/// The loop it must not swallow: the written value reads the slot, so each
+/// write flips the guard back on (dub's `setUseAsync(Boolean(g && !useAsync))`).
+#[test]
+fn a_write_derived_from_the_slot_still_loops() {
+    let fired = rules_fired(
+        r#"
+        function C({ groups }) {
+          const [useAsync, setUseAsync] = useState(false);
+          useEffect(() => {
+            setUseAsync(Boolean(groups && !useAsync));
+          }, [groups, useAsync]);
+          return <div>{String(useAsync)}</div>;
+        }
+        "#,
+    );
+    assert!(
+        fired.iter().any(|r| r == "infinite-loop"),
+        "`!useAsync` in the written value oscillates: {fired:?}"
+    );
+}
+
+/// A comparison the write does NOT settle: the guard tests one expression and
+/// the write stores another.
+#[test]
+fn a_write_of_something_else_still_fires() {
+    let fired = rules_fired(
+        r#"
+        function C({ a, b }) {
+          const [slot, setSlot] = useState(null);
+          useEffect(() => {
+            if (slot !== a) { setSlot(b); }
+          }, [slot, a, b]);
+          return <div>{slot}</div>;
+        }
+        "#,
+    );
+    assert!(
+        fired.iter().any(|r| r == "infinite-loop"),
+        "`slot !== a` says nothing about a write of `b`: {fired:?}"
+    );
+}

@@ -46,3 +46,4 @@
 | [ADR-042](ADR-042-a-dep-that-is-the-read.md) | A dep that *is* the read — a sub-expression named verbatim in the deps array pins the reads under it, and a lossy surrogate pins nothing (#89 §1) | Accepted |
 | [ADR-043](ADR-043-a-closure-reached-through-a-container.md) | A closure reached through a container is still a closure — the binding chase takes a path, and the two spellings become one reader (#89, the container half of ADR-041 §4) | Accepted |
 | [ADR-044](ADR-044-a-rename-is-not-a-read.md) | A rename is not a read — the free-path walk resolves a body's own aliases (destructuring above all), and a finding names the object when the deps say nothing about it (#89 §2) | Accepted |
+| [ADR-045](ADR-045-a-write-that-settles-its-own-guard.md) | A write that settles its own guard — a relational convergence proof over spellings, where the value domain cannot relate the two sides (#91) | Accepted |

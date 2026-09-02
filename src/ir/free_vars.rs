@@ -355,19 +355,42 @@ fn collect_paths(expr: &Expr, pinned: &HashSet<String>, out: &mut HashSet<Access
 /// or a body no spelling can compare (`FnLit`, object/array literals, JSX,
 /// hook markers): those are never the same read twice.
 fn pure_key(e: &Expr) -> Option<String> {
+    canonical_key(e, true)
+}
+
+/// A canonical spelling of a *call-free* pure read: variables, member chains,
+/// literals and the operators over them, and `None` for anything containing a
+/// call or a fresh allocation.
+///
+/// A claim of the form "these two spellings denote the same value" may not
+/// cross a call — a call is not guaranteed to return the same thing twice, not
+/// even twice within one render. ADR-042's pinning can cross one because there
+/// React's own `Object.is` on the dep value does the comparing; a claim the
+/// analyzer makes on its own cannot.
+pub fn call_free_key(e: &Expr) -> Option<String> {
+    canonical_key(e, false)
+}
+
+fn canonical_key(e: &Expr, calls: bool) -> Option<String> {
     Some(match e.peel_ts() {
         Expr::Lit(p) => format!("#{p:?}"),
         Expr::Var(v) => v.clone(),
-        Expr::FieldAccess { obj, field } => format!("{}.{field}", pure_key(obj)?),
-        Expr::IndexAccess { arr, idx } => format!("{}[{}]", pure_key(arr)?, pure_key(idx)?),
-        Expr::UnaryOp { op, arg } => format!("{op:?}({})", pure_key(arg)?),
-        Expr::BinOp { op, lhs, rhs } => {
-            format!("({} {op:?} {})", pure_key(lhs)?, pure_key(rhs)?)
-        }
-        Expr::Call { fn_, args } => {
-            let mut s = format!("{}(", pure_key(fn_)?);
+        Expr::FieldAccess { obj, field } => format!("{}.{field}", canonical_key(obj, calls)?),
+        Expr::IndexAccess { arr, idx } => format!(
+            "{}[{}]",
+            canonical_key(arr, calls)?,
+            canonical_key(idx, calls)?
+        ),
+        Expr::UnaryOp { op, arg } => format!("{op:?}({})", canonical_key(arg, calls)?),
+        Expr::BinOp { op, lhs, rhs } => format!(
+            "({} {op:?} {})",
+            canonical_key(lhs, calls)?,
+            canonical_key(rhs, calls)?
+        ),
+        Expr::Call { fn_, args } if calls => {
+            let mut s = format!("{}(", canonical_key(fn_, calls)?);
             for a in args {
-                s.push_str(&pure_key(a)?);
+                s.push_str(&canonical_key(a, calls)?);
                 s.push(',');
             }
             s.push(')');

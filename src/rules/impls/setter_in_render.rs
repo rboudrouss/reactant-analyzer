@@ -148,6 +148,7 @@ impl Rule for SetterInRender {
                         &state_vals,
                         label,
                         &eval_in_exit_env(arg, comp_result),
+                        Some(arg),
                         comp_result,
                     )
                 {

@@ -468,6 +468,7 @@ fn check_object_churn(
                     &state_vals,
                     state_label,
                     &reference_part(&call.written),
+                    call.written_expr.as_ref(),
                     comp_result,
                 )
             {

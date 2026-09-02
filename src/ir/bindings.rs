@@ -71,13 +71,13 @@ pub fn closure_binding_of<'c>(
     segments: &[String],
     cfg: &'c CFG,
 ) -> Option<ClosureBinding<'c>> {
-    let mut cur = chase_var(root, cfg)?;
+    let mut cur = binding_of(root, cfg)?;
     for seg in segments {
         let Expr::ObjectLit { fields, .. } = cur else {
             return None;
         };
         cur = match object_member(fields, seg)?.peel_ts() {
-            Expr::Var(v) => chase_var(v, cfg)?,
+            Expr::Var(v) => binding_of(v, cfg)?,
             e => e,
         };
     }
@@ -102,24 +102,27 @@ pub fn fn_binding_in<'c>(var: &str, cfg: &'c CFG) -> Option<(&'c [Var], &'c CFG)
     }
 }
 
-/// [`sole_binding_in`] followed through aliases: `{ bump }` records the member
-/// as `Var("bump")`, so a chase that stopped at the first right-hand side would
-/// see a name where the value is. The same propagation the interpreter does
-/// when it binds a right-hand side, and bounded because a certain binding chain
-/// is finite anyway.
-fn chase_var<'c>(var: &str, cfg: &'c CFG) -> Option<&'c Expr> {
+/// The value `var` names in `cfg`: its sole right-hand side, followed through
+/// any chain of renames. `{ bump }` records the member as `Var("bump")`, so a
+/// chase that stopped at the first right-hand side would see a name where the
+/// value is. The same propagation the interpreter does when it binds a
+/// right-hand side, and bounded because a certain binding chain is finite
+/// anyway.
+pub fn binding_of<'c>(var: &str, cfg: &'c CFG) -> Option<&'c Expr> {
     let mut cur = sole_binding_in(var, cfg)?;
     for _ in 0..MAX_ALIAS_HOPS {
-        let Expr::Var(next) = cur else {
-            return Some(cur);
+        let Expr::Var(next) = cur else { break };
+        let Some(deeper) = sole_binding_in(next, cfg) else {
+            break;
         };
-        cur = sole_binding_in(next, cfg)?;
+        cur = deeper;
     }
-    None
+    Some(cur)
 }
 
-/// Alias hops a chase will follow before giving up. A real chain is one or two
-/// (`{ bump }`, a destructuring preamble); the bound only stops a cycle.
+/// Alias hops a chase will follow. A real chain is one or two (`{ bump }`, a
+/// destructuring preamble); the bound only stops a cycle, and stopping leaves
+/// the name itself — which no caller mistakes for a value.
 const MAX_ALIAS_HOPS: usize = 8;
 
 /// The single right-hand side `var` is bound to in `cfg`, `None` when it is

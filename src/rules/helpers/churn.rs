@@ -22,6 +22,7 @@ use crate::{
         SourceRange,
         cfg::CFG,
         expr::Expr,
+        free_vars::call_free_key,
         stmt::Stmt,
         types::{BlockId, HookLabel, Symbol, Var},
     },
@@ -56,6 +57,11 @@ pub(in crate::rules) struct ChurnSetterCall {
     /// Abstract value being stored (fresh-reference approximation for
     /// functional updaters). Used for the convergence proof.
     pub(in crate::rules) written: crate::domains::StateValue,
+    /// The argument as written, when there is one. The abstract value above
+    /// cannot support a *relational* claim — "the slot now holds what the
+    /// guard compares it against" is about two expressions being the same
+    /// value, not about either one's value.
+    pub(in crate::rules) written_expr: Option<Expr>,
 }
 
 /// Classify effect deps against the component's own state slots:
@@ -284,6 +290,7 @@ fn churn_calls_in_expr(
                         block_id,
                         span,
                         written,
+                        written_expr: args.first().map(|a| a.peel_ts().clone()),
                     });
                 } else if depth > 0
                     && let Some(body) = fn_bindings.get(name)
@@ -358,15 +365,22 @@ fn churn_calls_in_expr(
 /// once `written` sits in state slot `label` — the set fires at most once.
 ///
 /// Walks the single-predecessor chain up from the call block collecting
-/// `(cond, taken)` branch constraints, rebinds every var aliasing the slot to
-/// `written`, and applies the engine's branch narrowing: if the guarded
-/// variable narrows to ⊥, the branch is dead in every later run.
+/// `(cond, taken)` branch constraints, then tries two proofs on each:
+///
+/// - **value** — rebind every var aliasing the slot to `written` and apply the
+///   engine's branch narrowing; if the guarded variable narrows to ⊥, the
+///   branch is dead in every later run.
+/// - **relational** — the guard compares the slot against the very expression
+///   the write stores there, so the two sides are equal next render whatever
+///   they evaluate to ([`write_settles_comparison`]). Needs the written
+///   *expression*, which is why `written_expr` sits beside `written`.
 pub(in crate::rules) fn converges_once_written(
     cfg: &CFG,
     call_block: BlockId,
     state_vals: &HashMap<Var, HookLabel>,
     label: HookLabel,
     written: &crate::domains::StateValue,
+    written_expr: Option<&Expr>,
     comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
 ) -> bool {
     use crate::ir::cfg::{EdgeKind, Terminator};
@@ -412,7 +426,23 @@ pub(in crate::rules) fn converges_once_written(
             env.extend(v.clone(), written.clone());
         }
     }
+    let slots: HashSet<&Var> = state_vals
+        .iter()
+        .filter(|(_, l)| **l == label)
+        .map(|(v, _)| v)
+        .collect();
+
     for (cond, taken) in conjuncts {
+        // Relational arm: the guard compares the slot against an expression
+        // the write puts *into* the slot, so the two sides are the same value
+        // on the next render whatever that value is. An interval domain cannot
+        // say that — `x < y` after `x := y` needs the two to be related, not
+        // bounded — but the spellings can.
+        if let Some(arg) = written_expr
+            && write_settles_comparison(cond, taken, &slots, arg, cfg)
+        {
+            return true;
+        }
         let narrowed = crate::engine::cfg_analyzer::narrow_env_for_branch(&env, cond, taken);
         if let Some(x) = guard_var(cond)
             && narrowed.lookup(x).is_bottom_value()
@@ -422,6 +452,97 @@ pub(in crate::rules) fn converges_once_written(
         env = narrowed;
     }
     false
+}
+
+/// Does the write make `cond` a constant that contradicts `taken`?
+///
+/// True when one side of the comparison is a path rooted at the written slot
+/// and the other is, verbatim, the expression the write stores at that path:
+/// `if (scale < scaleForCurrentValue) setScale(scaleForCurrentValue)`, and
+/// through an object literal, `if (s.leadId !== urlLeadId) setS({ leadId:
+/// urlLeadId, … })`. Both sides then denote the same value on the next render,
+/// so `<`, `>`, `!=` and `!==` are false and `==`, `===`, `<=`, `>=` are true.
+///
+/// Verbatim is checked with [`call_free_key`]: a call may not return the same
+/// thing twice, so a claim that two spellings are one value cannot cross one.
+fn write_settles_comparison(
+    cond: &Expr,
+    taken: bool,
+    slots: &HashSet<&Var>,
+    written_expr: &Expr,
+    cfg: &CFG,
+) -> bool {
+    use crate::ir::expr::BinOp::*;
+    let Expr::BinOp { op, lhs, rhs } = cond.peel_ts() else {
+        return false;
+    };
+    // Both sides denote the same value next render, so equality and the
+    // non-strict orders hold and the strict ones do not. `NaN` is the one
+    // value that breaks that, and it cannot bite: React bails out of a state
+    // update whose value is `Object.is`-equal to the current one, so a slot
+    // holding `NaN` re-written with `NaN` neither re-renders nor re-runs.
+    let settled = match op {
+        Eq | Leq | Geq => true,
+        Neq | Lt | Gt => false,
+        _ => return false,
+    };
+    if settled == taken {
+        return false; // the guard survives its own write; nothing proved
+    }
+    [(lhs, rhs), (rhs, lhs)].iter().any(|(side, other)| {
+        let Some(segs) = slot_path(side, slots) else {
+            return false;
+        };
+        let Some(at) = written_at(written_expr, &segs) else {
+            return false;
+        };
+        let keys = value_keys(at, cfg);
+        !keys.is_empty() && value_keys(other, cfg).iter().any(|k| keys.contains(k))
+    })
+}
+
+/// The spellings that denote this expression's value: itself, and — when it is
+/// a name the body renames — what it renames. Two expressions are the same
+/// value when these sets meet, which is what lets `setSlot(clamped)` answer a
+/// guard spelled `slot > max` and a guard spelled `slot < s` answer a write
+/// spelled `setSlot(s)` in the same mechanism.
+fn value_keys(e: &Expr, cfg: &CFG) -> Vec<String> {
+    let mut out: Vec<String> = call_free_key(e).into_iter().collect();
+    if let Expr::Var(v) = e.peel_ts()
+        && let Some(bound) = crate::ir::bindings::binding_of(v, cfg)
+        && let Some(k) = call_free_key(bound)
+    {
+        out.push(k);
+    }
+    out
+}
+
+/// The field chain `e` reads off a variable aliasing the written slot, or
+/// `None` when `e` is not rooted there.
+fn slot_path(e: &Expr, slots: &HashSet<&Var>) -> Option<Vec<String>> {
+    match e.peel_ts() {
+        Expr::Var(v) if slots.contains(v) => Some(Vec::new()),
+        Expr::FieldAccess { obj, field } => {
+            let mut segs = slot_path(obj, slots)?;
+            segs.push(field.clone());
+            Some(segs)
+        }
+        _ => None,
+    }
+}
+
+/// The sub-expression the written value places at `segments`: the argument
+/// itself for the bare slot, and one object-literal member per segment below
+/// it. What that sub-expression *denotes* is [`value_keys`]' business.
+fn written_at<'e>(written: &'e Expr, segments: &[String]) -> Option<&'e Expr> {
+    let mut cur = written.peel_ts();
+    for seg in segments {
+        let Expr::ObjectLit { fields, .. } = cur else {
+            return None;
+        };
+        cur = crate::ir::expr::object_member(fields, seg)?.peel_ts();
+    }
+    Some(cur)
 }
 
 /// Expand a guard `(cond, taken)` into the conjunction of operand facts it

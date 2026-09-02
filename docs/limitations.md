@@ -130,6 +130,12 @@ Every entry here is Warning-or-below by construction: an FP never carries an Err
   `settings` are one finding saying `settings`, not three. Where the deps do name members of a root,
   the uncovered ones are listed one by one
   [ADR-044](adr/ADR-044-a-rename-is-not-a-read.md).
+- **A guarded write converges when the guard and the write name the same expression**
+  (`if (scale < scaleForCurrentValue) setScale(scaleForCurrentValue)` — React's documented
+  adjust-during-render pattern), including one hop into an object literal and through a rename. Two
+  neighbouring shapes are NOT proved and still fire: a **disjunctive** guard (`if (!prev || prev !==
+  next)`), and **arithmetic** on the compared value (`setIndex(Math.max(0, plans.length - 1))` under
+  `index >= plans.length`) [ADR-045](adr/ADR-045-a-write-that-settles-its-own-guard.md).
 - **`setter-in-render`** warns when a setter reaches a callee with no timing summary
   (`<form onSubmit={handleSubmit(onSubmit)}>`, `composeEventHandlers(a, cb)`): ⊤ includes the render
   pass, so the row is sound and the wording says so — it never claims the setter was called in the

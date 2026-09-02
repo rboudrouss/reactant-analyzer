@@ -84,6 +84,36 @@ is worst on the codebases that factor their hooks best.
 **Every corpus number in this project's ADRs counts consumer attributions, not
 defects.** Filed as [#129](https://github.com/rboudrouss/reactant-analyzer/issues/129).
 
+## The two big rules were never FP-triaged. They hold up (2026-09-02)
+
+`always-unstable-deps` (356 locations) and `lazy-init` (212) are 42% of the
+output and had no issue against them, so the FP campaign that produced #86–#95
+had never looked at them. Sampled and read against source:
+
+**`always-unstable-deps` — accurate.** Every dep traced to its definition is a
+genuinely fresh allocation: `useNavigateApp` returns a bare arrow (no
+`useCallback`), `useToggleScrollWrapper` returns two, `useMetadataErrorHandler`
+returns one, `searchParamsObj` is `Object.fromEntries(searchParams)`, and
+excalidraw's `ColorInput` receives `onChange={(color) => …}` inline from its
+parent. The rule also **requires proof**: an unknown prop function (⊤) used as
+its own dep fires nothing, so the 356 are proven-fresh references, not
+unknowns. twenty (217) and dub (72) carry the pattern as real technical debt.
+
+**`lazy-init` — accurate, and concentrated in demos.** 146 of the 212 are
+`dayjs().format(…)` or `toDateString(new Date())` in mantine `.story.tsx` /
+`.demo.tsx` files. A bare literal initializer (`useState([1,2,3])`,
+`useState({x:1})`) correctly fires nothing, and `Math.random()` is correctly
+graded Info. The one gap is grading, not correctness: a pure builtin method on
+a primitive (`"x".toUpperCase()`, `reactId.replace(…)`, `new Set()`) is a
+Warning where the rule's own doc says cheap-and-pure should be Info — about six
+locations, not worth a campaign.
+
+**Conclusion.** The remaining false positives are in the small clusters, not the
+big two: `infinite-loop` (40 locations, 39 of them the object-churn arm) and
+`setter-in-render` (48, of which 32 are the ⊤ "no timing summary" class that
+[#94](https://github.com/rboudrouss/reactant-analyzer/issues/94) covers and that
+is sound by construction). Recorded so the sample is not re-run.
+
 ## What the engine admits it cannot see
 
 Behind `--info`, measured one commit earlier at `0c45de8` (so the two large
