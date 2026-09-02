@@ -118,11 +118,20 @@ pub(crate) fn collect_slot_seeds(
         // actually runs during render; a nested write is ⊤, and suppressing on
         // ⊤ is the false negative this project does not trade.
         let render_write = rows().any(|w| w.phase == WriterPhase::Render);
-        // The effect half stays LEXICAL, and deliberately: the question is
-        // "does this effect re-run and write the slot", so a write nested in a
-        // `.then` the effect kicks off still counts — the effect re-running is
-        // what re-runs it. That is also what the scan this replaced did.
+        // The effect half asks "does this effect re-run and write the slot",
+        // so it takes the lexical region — but only for rows whose PHASE says
+        // the effect is what runs the write (#121). ADR-031 §2 kept this half
+        // purely lexical on the argument that a write nested in a `.then` the
+        // effect kicks off still counts, because the effect re-running is what
+        // re-runs it. That argument covers `Deferred` and `Cleanup`, both of
+        // which the effect schedules. It does not cover a callback the effect
+        // merely *hands* to an opaque callee — `manager.subscribe(setColor)`
+        // is a ⊤-phase row, nothing establishes that the callee ever calls it,
+        // and suppressing on ⊤ is the false negative §3 already refuses for
+        // the render half. `Handler` is refused for the same reason a handler
+        // does not close a churn cycle: it needs an external event.
         let effects: Vec<HookLabel> = rows()
+            .filter(|w| effect_triggered(w.phase))
             .filter_map(|w| match w.region {
                 WriterRegion::Effect(l) => Some(l),
                 _ => None,
@@ -167,6 +176,20 @@ pub(crate) fn collect_slot_seeds(
 
     out.sort_by_key(|a| (a.slot, a.path.to_string()));
     out
+}
+
+/// Does this writer row's phase say the **effect** is what runs the write?
+///
+/// The three phases an effect schedules: its own body, a continuation it kicks
+/// off, and the cleanup it returns. `Handler` needs an external event and
+/// `Unknown` is ⊤ — a callback handed to an opaque callee, where nothing says
+/// the callee ever calls it. Neither may support the must-claim that a
+/// suppression is (#121).
+fn effect_triggered(p: WriterPhase) -> bool {
+    matches!(
+        p,
+        WriterPhase::Effect | WriterPhase::Deferred | WriterPhase::Cleanup
+    )
 }
 
 // ── The fold helpers (moved from `rules/impls/frozen_initial_state.rs`) ───────

@@ -915,3 +915,88 @@ function C({ seed, other }) {
         "the effect re-runs when the seed prop moves: {diags:?}"
     );
 }
+
+// ── #121: an effect *region* row is not a proof that the effect writes ───────
+
+/// The mantine shape, with the deps the real file does not quite have.
+///
+/// The effect hands `setColorScheme` to `manager.subscribe` and never calls it.
+/// The writer relation records the row — callback traversal resolves the setter
+/// inside the `useCallback` body — and that row is the right MAY answer. Read
+/// as a *must*, it deletes the finding: nothing establishes that
+/// `manager.subscribe` ever calls what it was handed.
+///
+/// The row's own phase says so: it is ⊤, because the callee is opaque. ADR-031
+/// §3 already refuses ⊤ for the render half; #121 is the same refusal for the
+/// effect half.
+#[test]
+fn a_setter_merely_handed_to_an_opaque_callee_does_not_count_as_a_re_sync() {
+    let diags = diags_for(
+        r#"
+import { useState, useEffect, useCallback } from 'react';
+function C({ manager, defaultColorScheme }) {
+  const [value, setValue] = useState(manager.get(defaultColorScheme));
+  const setColorScheme = useCallback((cs) => { setValue(cs); }, []);
+  useEffect(() => {
+    manager.subscribe(setColorScheme);
+    return manager.unsubscribe;
+  }, [defaultColorScheme]);
+  return <div>{value}</div>;
+}
+"#,
+        "C",
+    );
+    assert_eq!(
+        diags.len(),
+        1,
+        "the slot is seeded from `defaultColorScheme` and nothing PROVEN re-syncs it: {diags:?}"
+    );
+}
+
+/// The control. Called directly, the same setter through the same
+/// `useCallback` is a proven effect-phase write and does suppress — so the test
+/// above is about the handing-over, not about `useCallback`.
+#[test]
+fn the_same_setter_called_by_the_effect_still_counts_as_a_re_sync() {
+    let diags = diags_for(
+        r#"
+import { useState, useEffect, useCallback } from 'react';
+function C({ manager, defaultColorScheme }) {
+  const [value, setValue] = useState(manager.get(defaultColorScheme));
+  const setColorScheme = useCallback((cs) => { setValue(cs); }, []);
+  useEffect(() => {
+    setColorScheme(defaultColorScheme);
+  }, [defaultColorScheme]);
+  return <div>{value}</div>;
+}
+"#,
+        "C",
+    );
+    assert!(
+        diags.is_empty(),
+        "the effect calls the setter itself and re-runs when the prop moves: {diags:?}"
+    );
+}
+
+/// A continuation the effect kicks off is still the effect re-running, which is
+/// ADR-031 §2's argument and stays true — `Deferred` keeps suppressing.
+#[test]
+fn a_write_in_a_continuation_the_effect_starts_still_counts_as_a_re_sync() {
+    let diags = diags_for(
+        r#"
+import { useState, useEffect } from 'react';
+function C({ url, load }) {
+  const [value, setValue] = useState(url);
+  useEffect(() => {
+    load(url).then((r) => { setValue(r); });
+  }, [url, load]);
+  return <div>{value}</div>;
+}
+"#,
+        "C",
+    );
+    assert!(
+        diags.is_empty(),
+        "the effect re-runs on `url` and its continuation writes the slot: {diags:?}"
+    );
+}

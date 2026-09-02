@@ -41,6 +41,20 @@ that already answers is how two readings of one fact drift apart.
 the effect kicks off still counts, because the effect re-running is what
 re-runs it — and that is what the scan this replaced did.
 
+**Amended 2026-09-02 (#121): lexical region, but a proven phase.** "Stays
+lexical" was too broad by one case. The argument above covers what the effect
+*schedules* — its own body, a continuation it starts, the cleanup it returns —
+and those are the rows whose phase is `Effect`, `Deferred` or `Cleanup`. It does
+not cover a callback the effect merely *hands over*:
+`useEffect(() => manager.subscribe(setColorScheme), …)` produces an
+`Effect`-region row whose phase is ⊤, because nothing says the opaque callee
+ever calls what it was given. Reading that row as a sync deletes the finding on
+a coincidence, which is exactly the hazard §3 names for the render half and this
+section left open for the effect half. The fold now filters on
+`effect_triggered(phase)`; `Handler` is refused for the same reason a handler
+does not close a churn cycle. Three tests pin it, and the one that matters fails
+when the filter alone is removed.
+
 ### 3. The render half reads PHASE, not region — the defect this change found
 
 `region` is lexical. A callback literal handed to a call in the render body
@@ -126,13 +140,12 @@ and now has one home, beside the two binding *certificates* that strengthen it.
 
   ADR-033 restores the mantine finding and leaves the twenty suppression in
   place. But the row that made the mantine one reachable is a **may**-write —
-  `manager.subscribe` need not ever call what it was handed — and §2 lets a
-  may-write suppress once its deps cover the seed. That is the same
+  `manager.subscribe` need not ever call what it was handed — and §2 let a
+  may-write suppress once its deps covered the seed. That was the same
   may-used-as-must hazard §3 names for the render half, unnoticed here for the
   effect half. Filed as
   [#121](https://github.com/rboudrouss/reactant-analyzer/issues/121) rather than
-  fixed in passing — it needs its own soundness argument, and every fix for it
-  only adds findings.
+  fixed in passing, and closed the same day by the §2 amendment above.
 
 ## Consequences
 
