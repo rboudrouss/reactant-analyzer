@@ -118,7 +118,9 @@ pub const RULE_DOCS: &[RuleDoc] = &[
         "Calling a setter passed down as a prop during the render body schedules \
                       a parent re-render while the child is rendering. React errors with \
                       \"Cannot update a component while rendering a different component\", or \
-                      loops.",
+                      loops. Error needs two proofs: the call dominates every exit, and \
+                      calling the prop provably writes — a prop that only *carries* a \
+                      captured setter into a handler warns instead.",
         "function Child({ setTotal }) { setTotal(42); return <div/>; }",
         "Move the call into a `useEffect` or an event handler.",
     ),
@@ -247,7 +249,12 @@ pub const RULE_DOCS: &[RuleDoc] = &[
         "setState called during the render body",
         "Calling a setter while rendering schedules another render before this \
                       one commits. Unconditional call → guaranteed infinite loop (Error); \
-                      conditional call → loops whenever the condition holds (Warning).",
+                      conditional call → loops whenever the condition holds (Warning). \
+                      A third shape warns without claiming a call at all: the setter is \
+                      handed to a callee with no timing summary (`handleSubmit(onSubmit)`), \
+                      so the analyzer cannot rule out that it runs during render. A write a \
+                      known registrar defers (`setTimeout(() => setN(1))`) is proven not to \
+                      be a render write and is not reported here.",
         "function C() { const [n, setN] = useState(0); setN(1); return <div/>; }",
         "Move the call into a `useEffect` or an event handler. To derive a value, \
               compute it during render without state.",

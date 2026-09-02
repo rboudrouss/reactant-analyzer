@@ -116,11 +116,11 @@ pub(in crate::rules) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec
             .iter()
             .map(|(v, l)| (v.clone(), (comp.clone(), *l)))
             .collect();
-        for (v, (parent, l)) in
+        for (v, prop) in
             collect_component_setter_vars(cfg, &comp_result.block_states, &comp_result.heap)
         {
-            if parent != *comp {
-                setter_nodes.insert(v, (parent, l));
+            if prop.component != *comp {
+                setter_nodes.insert(v, (prop.component, prop.label));
             }
         }
         if setter_nodes.is_empty() {

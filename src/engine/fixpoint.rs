@@ -665,7 +665,7 @@ pub fn analyze_program(
 
     // Phase 1: analyze roots top-down (children inlined via eval_comp_app).
     for root_key in &roots {
-        if let Some(root_ir) = registry.get(root_key).cloned() {
+        if let Some(root_ir) = registry.ir_for(root_key) {
             let display = registry.display_name(root_key);
             let inter = InterCtx {
                 registry: &registry,
@@ -710,7 +710,7 @@ pub fn analyze_program(
         .collect();
     remaining_keys.sort();
     for key in remaining_keys {
-        if let Some(ir) = registry.get(&key).cloned() {
+        if let Some(ir) = registry.ir_for(&key) {
             let display = registry.display_name(&key);
             if results.borrow().contains_key(&display) {
                 continue;

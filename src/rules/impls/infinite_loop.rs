@@ -70,7 +70,7 @@ impl Rule for InfiniteLoop {
         let state_names = state_val_labels(&comp_result.render_cfg);
 
         // ComponentSetter props, excluding self-references.
-        let cs_vars: HashMap<Var, (Symbol, HookLabel)> =
+        let cs_vars: HashMap<Var, crate::engine::setters::SetterProp> =
             crate::rules::cross_component_setters(comp_result, component);
 
         let mut all_setter_vars: HashSet<Var> = local_setter_labels.keys().cloned().collect();
@@ -197,9 +197,10 @@ impl Rule for InfiniteLoop {
 
                     reported_effects.insert(*eff_label);
                     diags.push(diag);
-                } else if let Some((parent_comp, parent_label)) = cs_vars.get(&call.var) {
+                } else if let Some(prop) = cs_vars.get(&call.var) {
                     // ── Cross-component ────────────────────────────────────────
-                    let shared_write = result.shared_state.get(parent_comp, *parent_label);
+                    let (parent_comp, parent_label) = (&prop.component, prop.label);
+                    let shared_write = result.shared_state.get(parent_comp, parent_label);
                     if shared_write.is_bottom_value() {
                         continue; // setter not reached in semantic analysis
                     }

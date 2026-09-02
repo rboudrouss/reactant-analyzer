@@ -39,3 +39,4 @@
 | [ADR-035](ADR-035-await-phase-boundary.md) | The `await` phase boundary — a block split on an `Await` edge, and the IIFE whose body the writer walk never entered (#117) | Accepted |
 | [ADR-036](ADR-036-call-relation.md) | The call relation — a body's non-hook calls as the setter walk's second output, with the phase it ran them in (#126) | Accepted |
 | [ADR-037](ADR-037-slot-read-relation.md) | The slot-read relation — the write side's mirror image, region and phase, on the same walk (#127) | Accepted |
+| [ADR-038](ADR-038-write-position-and-write-certainty.md) | A write is a write wherever it is written — the traversal gate dropped; phase read by the rule, `Deferred` split from ⊤, `must_write` before a certification, and one spelling for a component's identity (#130) | Accepted |

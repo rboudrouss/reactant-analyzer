@@ -140,7 +140,7 @@ pub(crate) struct EntityCtx<'a> {
     provenance: OnceCell<HashMap<HookLabel, usize>>,
     /// `ComponentSetter`-valued props (#107), resolved on first use by the
     /// ownership-aware enumeration.
-    cross_setters: OnceCell<HashMap<Var, (Symbol, HookLabel)>>,
+    cross_setters: OnceCell<HashMap<Var, crate::engine::setters::SetterProp>>,
     /// The slot → readers relation (#127), computed on first use: unlike the
     /// writers, it is not needed by any native rule, so a component no pack
     /// asks about never walks for it.
@@ -220,7 +220,7 @@ impl<'a> EntityCtx<'a> {
     /// `var → (owning component, slot)` for every `ComponentSetter`-valued
     /// prop of this component — the engine resolution the native
     /// `setter-in-render` rule consumes, read once and shared (ADR-027 §1).
-    fn cross_setters(&self) -> &HashMap<Var, (Symbol, HookLabel)> {
+    fn cross_setters(&self) -> &HashMap<Var, crate::engine::setters::SetterProp> {
         self.cross_setters
             .get_or_init(|| cross_component_setters(self.comp, self.ctx.component()))
     }
@@ -987,7 +987,7 @@ impl<'a> EntityCtx<'a> {
     fn sorted_setters(
         &self,
         calls: Vec<SetterCall>,
-        cross: &HashMap<Var, (Symbol, HookLabel)>,
+        cross: &HashMap<Var, crate::engine::setters::SetterProp>,
     ) -> Vec<SetterEntity> {
         let mut setters: Vec<SetterEntity> = calls
             .into_iter()
@@ -998,7 +998,7 @@ impl<'a> EntityCtx<'a> {
                 let (slot, owner) = match self.setter_labels.get(&c.var) {
                     Some(&label) => (Some(label), None),
                     None => match cross.get(&c.var) {
-                        Some((comp, label)) => (Some(*label), Some(comp.clone())),
+                        Some(prop) => (Some(prop.label), Some(prop.component.clone())),
                         None => (None, None),
                     },
                 };

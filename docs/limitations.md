@@ -39,10 +39,11 @@ shapes, do not trust a clean result for it.**
 ## What reactant may miss (false negatives)
 
 - Hooks and callees it cannot reach: npm-package callees and utilities cut off by the inlining depth
-  [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19); utility calls in *expression* position
-  [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52); a setter nested deeper than four closures
+  [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19); utility *inlining* is still statement-position
+  only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52); a setter nested deeper than four closures
   [#45](https://github.com/rboudrouss/reactant-analyzer/issues/45) or called through an index or a returned function
-  [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46).
+  [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46). A setter *call* in any expression position —
+  `wrap(setN(1))`, a ternary arm, a JSX prop — is seen since #130; it is the callee's *inlining* that is not.
 - `useContext` is unmodelled — a context value reads ⊤. This is the single largest source of
   analysis limits (363 sites across the eight corpora) [#28](https://github.com/rboudrouss/reactant-analyzer/issues/28).
 - Seven React hooks are unmodelled and emit an Info rather than a summary: `useActionState`,
@@ -102,6 +103,11 @@ Every entry here is Warning-or-below by construction: an FP never carries an Err
 - **`frozen-initial-state`** still fires on a child remounted by machinery it cannot see — a dialog
   body unmounted by its library wrapper, a route that swaps the subtree
   [#95](https://github.com/rboudrouss/reactant-analyzer/issues/95).
+- **`setter-in-render`** warns when a setter reaches a callee with no timing summary
+  (`<form onSubmit={handleSubmit(onSubmit)}>`, `composeEventHandlers(a, cb)`): ⊤ includes the render
+  pass, so the row is sound and the wording says so — it never claims the setter was called in the
+  render body, and it never reaches Error. Narrowing it needs a summary for those callees
+  [#94](https://github.com/rboudrouss/reactant-analyzer/issues/94).
 - **The assurance channel** (`verified:` lines under `--info`) is withheld per component rather than
   per (limit kind, check), so an unanalysed *child* costs the parent guarantees about its own body
   [#31](https://github.com/rboudrouss/reactant-analyzer/issues/31). This affects `--info` output only — never a diagnostic,

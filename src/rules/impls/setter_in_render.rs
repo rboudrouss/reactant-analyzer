@@ -7,6 +7,7 @@ use crate::ir::{
     types::{BlockId, HookLabel, Var},
 };
 
+use crate::engine::setters::SetterCallPhase;
 use crate::rules::helpers::churn::{converges_once_written, eval_in_exit_env};
 use crate::rules::{
     Diagnostic, ExitDominance, MustResult, Rule, collect_setter_calls, resolve_setter_aliases,
@@ -84,7 +85,7 @@ impl Rule for SetterInRender {
                 .collect();
 
         // Cross-component setters: ComponentSetter-valued props, excluding self-references.
-        let cs_vars: HashMap<Var, (crate::ir::types::Symbol, crate::ir::types::HookLabel)> =
+        let cs_vars: HashMap<Var, crate::engine::setters::SetterProp> =
             crate::rules::cross_component_setters(comp_result, component);
 
         let mut all_setter_vars: HashSet<Var> = local_setter_info.keys().cloned().collect();
@@ -107,11 +108,32 @@ impl Rule for SetterInRender {
         collect_setter_calls(&comp_result.render_cfg, &all_setter_vars, 2)
             .into_iter()
             .filter_map(|call| {
-                // Unconditional call ⟹ a `Certified` proof — the only path to Error.
-                let proof = call.block_id.and_then(|bid| match exit_dom.certify(bid) {
-                    MustResult::All(c) => Some(c),
-                    _ => None,
-                });
+                // The walk classified when this write runs, and this rule is
+                // the question "during the render pass?". A `Handler` or
+                // `Deferred` row is a *proof* of no — a user event or a known
+                // deferring registrar stands between the render pass and the
+                // write — so it is not this rule's finding. `Unknown` is ⊤ and
+                // stays, because ⊤ includes the render pass and dropping it
+                // would be the false negative #130 is about.
+                if !call.class.may_run_in_body() {
+                    return None;
+                }
+                // Unconditional call ⟹ a `Certified` proof — the only path to
+                // Error, and it takes two musts. The phase must be `Sync`: a ⊤
+                // row is never certain, whatever block it sits in, because the
+                // proof would be about the block, not about the timing. And
+                // calling the variable must provably write: a local helper that
+                // only *carries* a captured setter into a JSX handler writes
+                // nothing when called, and dominance cannot upgrade a may.
+                let certain_write = call.class == SetterCallPhase::Sync
+                    && cs_vars.get(&call.var).is_none_or(|p| p.must_write);
+                let proof = certain_write
+                    .then_some(call.block_id)
+                    .flatten()
+                    .and_then(|bid| match exit_dom.certify(bid) {
+                        MustResult::All(c) => Some(c),
+                        _ => None,
+                    });
 
                 // Sanctioned adjust-during-render idiom: conditional local call
                 // whose guards die once the written value is in the slot —
@@ -141,34 +163,54 @@ impl Rule for SetterInRender {
                 ) = if let Some(&(label, _)) = local_setter_info.get(&call.var) {
                     (
                         "setter-in-render",
-                        format!(
-                            "setter `{}` called directly in the render body, \
-                             move this call into a useEffect or an event handler",
-                            crate::ir::source_name(&call.var)
-                        ),
+                        if call.class == SetterCallPhase::Sync {
+                            format!(
+                                "setter `{}` called directly in the render body, \
+                                 move this call into a useEffect or an event handler",
+                                crate::ir::source_name(&call.var)
+                            )
+                        } else {
+                            unknown_phase_message(&call.var)
+                        },
                         Some(label),
                         None,
                     )
-                } else if let Some((parent_comp, _parent_label)) = cs_vars.get(&call.var) {
+                } else if let Some(prop) = cs_vars.get(&call.var) {
+                    let parent_comp = &prop.component;
                     (
                         "cross-setter-in-render",
-                        format!(
-                            "prop `{}` (a state setter of parent `{}`) called during render of `{}` \
-                             triggers parent re-render on every render",
-                            crate::ir::source_name(&call.var),
-                            parent_comp,
-                            component
-                        ),
+                        if call.class == SetterCallPhase::Sync {
+                            format!(
+                                "prop `{}` (a state setter of parent `{}`) called during render \
+                                 of `{}` triggers parent re-render on every render",
+                                crate::ir::source_name(&call.var),
+                                parent_comp,
+                                component
+                            )
+                        } else {
+                            format!(
+                                "prop `{}` (a state setter of parent `{}`) is handed to a callee \
+                                 with no timing summary — if that callee runs it during render, \
+                                 `{}` re-renders its parent on every render",
+                                crate::ir::source_name(&call.var),
+                                parent_comp,
+                                component
+                            )
+                        },
                         None,
                         Some(call.var.clone()),
                     )
                 } else {
                     (
                         "setter-in-render",
-                        format!(
-                            "setter `{}` called in the render body",
-                            crate::ir::source_name(&call.var)
-                        ),
+                        if call.class == SetterCallPhase::Sync {
+                            format!(
+                                "setter `{}` called in the render body",
+                                crate::ir::source_name(&call.var)
+                            )
+                        } else {
+                            unknown_phase_message(&call.var)
+                        },
                         None,
                         None,
                     )
@@ -201,6 +243,19 @@ impl Rule for SetterInRender {
             })
             .collect()
     }
+}
+
+/// The `Unknown`-phase wording. A ⊤ row is not a call in the render body: the
+/// setter reached a callee the analyzer has no summary for (`handleSubmit(cb)`,
+/// `composeEventHandlers(a, cb)`), so every phase is possible and the render
+/// pass is one of them. Saying "called directly in the render body" of that row
+/// would state as fact the one thing the walk could not establish.
+fn unknown_phase_message(var: &Var) -> String {
+    format!(
+        "setter `{}` is handed to a callee with no timing summary — if that callee \
+         runs it during render, this re-renders on every render",
+        crate::ir::source_name(var)
+    )
 }
 
 /// First argument of the top-level `setter(arg)` call in block `bid`, if any.

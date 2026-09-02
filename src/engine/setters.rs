@@ -42,6 +42,13 @@ pub struct SetterCall {
 
 /// The externally-visible half of the walk's phase classification. A subset:
 /// only the distinction consumers of the collapsed row are allowed to make.
+///
+/// `Deferred` and `Unknown` were one variant (`Other`) until #130, and the
+/// collapse cost a consumer the one thing it needs: `Deferred` is a *proof*
+/// that the write does not happen in the body's own pass — a known registrar
+/// took the callback — while `Unknown` is ⊤, and ⊤ includes the body's pass.
+/// A rule that must not report a proven-deferred write, but must still report
+/// a ⊤ one, could not tell them apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetterCallPhase {
     /// Runs when the enclosing body runs.
@@ -49,8 +56,22 @@ pub enum SetterCallPhase {
     /// Runs only on an external event — a registered DOM listener, a reified
     /// JSX handler. A user event stands between the body and this write.
     Handler,
-    /// Anything else: deferred, in a cleanup, or unclassified (⊤).
-    Other,
+    /// A later tick of the same mount: a known deferring registrar took the
+    /// callback (`setTimeout`, `queueMicrotask`), or it is an effect cleanup.
+    /// Proven *not* to run in the enclosing body's own pass.
+    Deferred,
+    /// ⊤ — the callee that received the callback has no summary, so every
+    /// phase is possible, the enclosing body's own pass included.
+    Unknown,
+}
+
+impl SetterCallPhase {
+    /// Can this write run during the pass of the body it was found in? True
+    /// for `Sync` (it does) and `Unknown` (⊤, so it may); false for the two
+    /// classes the walk proved otherwise.
+    pub fn may_run_in_body(self) -> bool {
+        matches!(self, SetterCallPhase::Sync | SetterCallPhase::Unknown)
+    }
 }
 
 impl From<WalkClass> for SetterCallPhase {
@@ -58,7 +79,8 @@ impl From<WalkClass> for SetterCallPhase {
         match c {
             WalkClass::Sync => SetterCallPhase::Sync,
             WalkClass::Handler => SetterCallPhase::Handler,
-            _ => SetterCallPhase::Other,
+            WalkClass::Deferred | WalkClass::Cleanup => SetterCallPhase::Deferred,
+            WalkClass::Unknown => SetterCallPhase::Unknown,
         }
     }
 }
@@ -203,11 +225,28 @@ pub(crate) fn collect_write_sites(
         .collect()
 }
 
+/// One variable that denotes a state setter, and how surely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SetterProp {
+    /// The component that owns the slot.
+    pub component: Symbol,
+    pub label: HookLabel,
+    /// Calling the variable provably writes the slot — a must.
+    ///
+    /// True when the variable *is* the setter, and when it is a closure whose
+    /// own body calls the setter it captured (`reset={() => setCount(0)}`).
+    /// False when the capture is only carried: `renderFileTree`, a local render
+    /// helper closing over an `onFileClick` prop it merely puts inside a JSX
+    /// handler, writes nothing when called. Both are still writes for a *may*
+    /// reader — ⊤ over what the callee does — but only a must may be certified.
+    pub must_write: bool,
+}
+
 /// Collect variables in `cfg` whose abstract value at any block exit is
 /// `ComponentSetter { component, label }`, or whose Loc in the heap points to a
 /// FnLit that captures a ComponentSetter (e.g. `() => setCount(0)` passed as prop).
 ///
-/// Returns `var → (component, label)`.
+/// Returns `var` → [`SetterProp`].
 ///
 /// Used by cross-component rules to find props that are parent setters.
 ///
@@ -221,7 +260,7 @@ pub(crate) fn collect_component_setter_vars(
     cfg: &CFG,
     block_states: &HashMap<BlockId, AbstractEnv<StateValue>>,
     heap: &Heap,
-) -> HashMap<Var, (Symbol, HookLabel)> {
+) -> HashMap<Var, SetterProp> {
     let mut var_names: HashSet<Var> = HashSet::new();
     for block in cfg.blocks.values() {
         for stmt in &block.stmts {
@@ -237,7 +276,7 @@ pub(crate) fn collect_component_setter_vars(
     let mut var_names: Vec<Var> = var_names.into_iter().collect();
     var_names.sort();
 
-    let mut result: HashMap<Var, (Symbol, HookLabel)> = HashMap::new();
+    let mut result: HashMap<Var, SetterProp> = HashMap::new();
     for env in cfg.blocks.keys().filter_map(|b| block_states.get(b)) {
         for var in &var_names {
             if result.contains_key(var) {
@@ -245,7 +284,14 @@ pub(crate) fn collect_component_setter_vars(
             }
             // Direct component-setter value (exact setter slot).
             if let Some((component, label)) = env.lookup(var).as_setter() {
-                result.insert(var.clone(), (component.clone(), *label));
+                result.insert(
+                    var.clone(),
+                    SetterProp {
+                        component: component.clone(),
+                        label: *label,
+                        must_write: true,
+                    },
+                );
                 continue;
             }
             // Loc pointing to a FnLit that captures a ComponentSetter
@@ -256,12 +302,22 @@ pub(crate) fn collect_component_setter_vars(
                 let mut ids: Vec<_> = ids.iter().copied().collect();
                 ids.sort();
                 for id in ids {
-                    if let Some(HeapValue::Fn { captured, .. }) = heap.get(id) {
+                    if let Some(HeapValue::Fn {
+                        captured, body_cfg, ..
+                    }) = heap.get(id)
+                    {
                         let mut caps: Vec<_> = captured.iter().collect();
                         caps.sort_by_key(|(k, _)| *k);
-                        for (_, val) in caps {
+                        for (name, val) in caps {
                             if let Some((component, label)) = val.as_setter() {
-                                result.insert(var.clone(), (component.clone(), *label));
+                                result.insert(
+                                    var.clone(),
+                                    SetterProp {
+                                        component: component.clone(),
+                                        label: *label,
+                                        must_write: body_writes(body_cfg, name),
+                                    },
+                                );
                                 break;
                             }
                         }
@@ -276,6 +332,19 @@ pub(crate) fn collect_component_setter_vars(
     result
 }
 
+/// Does calling this function body write `setter`, in the body's own pass?
+///
+/// The distinction a capture alone cannot make: `() => setCount(0)` calls what
+/// it captured, `(nodes) => nodes.map(n => <b onClick={() => onFileClick(n)}/>)`
+/// only hands it on. The walk already answers exactly this question, so ask it
+/// rather than guess from the shape of the binding.
+fn body_writes(body_cfg: &CFG, setter: &Symbol) -> bool {
+    let vars: HashSet<Var> = std::iter::once(setter.clone()).collect();
+    collect_setter_calls(body_cfg, &vars, 2)
+        .iter()
+        .any(|c| c.class == SetterCallPhase::Sync)
+}
+
 /// Cross-component setter props: the [`collect_component_setter_vars`] result
 /// restricted to setters owned by a component *other* than `component`. A
 /// component passing its own setter down as a prop is not a cross-component
@@ -285,10 +354,10 @@ pub(crate) fn collect_component_setter_vars(
 pub(crate) fn cross_component_setters(
     comp: &AnalysisResult<StateValue>,
     component: &Symbol,
-) -> HashMap<Var, (Symbol, HookLabel)> {
+) -> HashMap<Var, SetterProp> {
     collect_component_setter_vars(&comp.render_cfg, &comp.block_states, &comp.heap)
         .into_iter()
-        .filter(|(_, (parent_comp, _))| parent_comp != component)
+        .filter(|(_, prop)| prop.component != *component)
         .collect()
 }
 
@@ -1067,24 +1136,17 @@ struct SetterWalk<'a> {
     /// nobody reads, on a walk the rule pass runs once per component per rule.
     collect_calls: bool,
     /// Bindings whose *reads* to record (#127) — the slot-value names and
-    /// their aliases. Empty for every consumer that does not ask, and the walk
-    /// then does no sub-expression traversal at all.
+    /// their aliases. Empty for every consumer that does not ask; the
+    /// traversal still runs, it just records nothing on this channel.
     read_vars: &'a HashSet<Var>,
 }
 
-/// No bindings to record reads for — the walk then skips the sub-expression
-/// traversal entirely, which is what every setter consumer wants.
+/// No bindings to record reads for — every setter consumer.
 static NO_VARS: std::sync::LazyLock<HashSet<Var>> = std::sync::LazyLock::new(HashSet::new);
 
 impl SetterWalk<'_> {
     fn collect_reads(&self) -> bool {
         !self.read_vars.is_empty()
-    }
-
-    /// Does either sub-expression channel want the traversal? Off for every
-    /// setter consumer, which is the hot path.
-    fn scanning(&self) -> bool {
-        self.collect_calls || self.collect_reads()
     }
 
     /// Does this callee run its function argument once per element?
@@ -1390,15 +1452,13 @@ impl<'a> SetterWalk<'a> {
         self.walking.remove(&key);
     }
 
-    /// Record this ONE node on the sub-expression channels (#126, #127) — the
+    /// Record this ONE node on the call and read channels (#126, #127) — the
     /// traversal itself is [`Self::expr`], which visits every node exactly
     /// once and runs the call machinery on each `Call` it passes.
     ///
-    /// The setter machinery only ever looks at a `Call` in statement position
-    /// and at its function-valued arguments, which is all a setter relation
-    /// needs. A call and a read can sit anywhere — inside a JSX prop, a
-    /// ternary, another call's argument — so these two channels drive the
-    /// deeper traversal, and only when a consumer asks for them.
+    /// Both channels are off unless a consumer asked for them. The traversal
+    /// runs either way: the setter channel needs it too, because a write can
+    /// sit anywhere a call can (#130).
     fn scan_node(
         &mut self,
         expr: &Expr,
@@ -1450,9 +1510,7 @@ impl<'a> SetterWalk<'a> {
         };
         // `state.items.push(x)` reads `state`: the receiver of a member write
         // is the one read position the rhs does not carry.
-        if self.scanning()
-            && let Stmt::MemberWrite { obj, key, span, .. } = stmt
-        {
+        if let Stmt::MemberWrite { obj, key, span, .. } = stmt {
             self.expr(obj, *span, block_id, depth, found, mode, at_root, prov);
             if let crate::ir::stmt::MemberKey::Index(idx) = key {
                 self.expr(idx, *span, block_id, depth, found, mode, at_root, prov);
@@ -1473,34 +1531,33 @@ impl<'a> SetterWalk<'a> {
         at_root: bool,
         prov: Option<BlockId>,
     ) {
-        // The two sub-expression channels turn `expr` into a real traversal:
-        // this node, then every child except a `FnLit` — those are entered by
-        // the call machinery below, which is the only place that knows what
-        // class the function runs in. Every node is visited exactly once, so
-        // a `Call` nested in a JSX prop or another call's argument gets the
-        // machinery too.
-        if self.scanning() {
-            self.scan_node(expr, stmt_span, found, mode);
-            // A JSX element is the innermost thing with a position: a call in
-            // a prop sits under a `Return` terminator, which carries no
-            // statement span, so without this the row has no location at all.
-            let stmt_span = match expr.peel_ts() {
-                Expr::CompApp { span: Some(s), .. } | Expr::NativeElem { span: Some(s), .. } => {
-                    Some(*s)
-                }
-                _ => stmt_span,
-            };
-            let mut children: Vec<&Expr> = Vec::new();
-            expr.for_each_child(&mut |c| {
-                if !matches!(c.peel_ts(), Expr::FnLit { .. }) {
-                    children.push(c);
-                }
-            });
-            for child in children {
-                self.expr(
-                    child, stmt_span, block_id, depth, found, mode, at_root, prov,
-                );
+        // `expr` is a real traversal: this node, then every child except a
+        // `FnLit` — those are entered by the call machinery below, which is
+        // the only place that knows what class the function runs in. Every
+        // node is visited exactly once, so a `Call` nested in a JSX prop, a
+        // ternary arm or another call's argument gets the machinery too, on
+        // all three channels: a write is a write wherever it is written
+        // (#130), and a call and a read can sit anywhere (#126, #127).
+        self.scan_node(expr, stmt_span, found, mode);
+        // A JSX element is the innermost thing with a position: a call in a
+        // prop sits under a `Return` terminator, which carries no statement
+        // span, so without this the row has no location at all.
+        let stmt_span = match expr.peel_ts() {
+            Expr::CompApp { span: Some(s), .. } | Expr::NativeElem { span: Some(s), .. } => {
+                Some(*s)
             }
+            _ => stmt_span,
+        };
+        let mut children: Vec<&Expr> = Vec::new();
+        expr.for_each_child(&mut |c| {
+            if !matches!(c.peel_ts(), Expr::FnLit { .. }) {
+                children.push(c);
+            }
+        });
+        for child in children {
+            self.expr(
+                child, stmt_span, block_id, depth, found, mode, at_root, prov,
+            );
         }
         if let Expr::Call { fn_, args } = expr {
             if let Expr::Var(name) = fn_.as_ref() {

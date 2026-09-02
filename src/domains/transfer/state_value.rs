@@ -450,18 +450,11 @@ fn eval_comp_app(
         return StateValue::reference(Stability::Stable);
     };
 
-    // Recursion guard
-    if inter.is_recursive(name) {
-        let mut stats = inter.stats.borrow_mut();
-        stats.recursion_cutoffs += 1;
-        stats
-            .recursive_component_refs
-            .insert((inter.component_name.clone(), name.clone()));
-        return StateValue::reference(Stability::Stable);
-    }
-
-    // Registry lookup
-    let Some(child_ir) = inter.registry.get_by_name(name).cloned() else {
+    // Registry lookup. The child is named the way the program result keys it
+    // (`ComponentRegistry::ir_for`), so the call stack, the call graph, the
+    // cache and the results map all speak one spelling — the JSX callee name
+    // is only how the child was *written*, not who it is.
+    let Some(child_key) = inter.registry.key_by_name(name) else {
         inter
             .stats
             .borrow_mut()
@@ -476,6 +469,24 @@ fn eval_comp_app(
         havoc_setter_props(props_expr, env, ctx);
         return StateValue::reference(Stability::Stable);
     };
+    let child = inter.registry.display_name(&child_key);
+
+    // Recursion guard — before the IR clone, which is not free.
+    if inter.is_recursive(&child) {
+        let mut stats = inter.stats.borrow_mut();
+        stats.recursion_cutoffs += 1;
+        stats
+            .recursive_component_refs
+            .insert((inter.component_name.clone(), child.clone()));
+        return StateValue::reference(Stability::Stable);
+    }
+    // Unreachable — `key_by_name` just resolved it — but an unknown child may
+    // invoke any setter it received, so the fallback is the unknown-child one,
+    // never a silent skip.
+    let Some(child_ir) = inter.registry.ir_for(&child_key) else {
+        havoc_setter_props(props_expr, env, ctx);
+        return StateValue::reference(Stability::Stable);
+    };
 
     // Evaluate props → abstract map (EnvVals, preserving heap Locs for FnLit props)
     let abstract_props_full = eval_props_map(props_expr, env, ctx);
@@ -487,9 +498,14 @@ fn eval_comp_app(
         .collect();
 
     // Cache lookup (strict equality)
-    if inter.cache.borrow().lookup(name, &abstract_props).is_some() {
+    if inter
+        .cache
+        .borrow()
+        .lookup(&child, &abstract_props)
+        .is_some()
+    {
         inter.stats.borrow_mut().cache_hits += 1;
-        record_call_site(inter, name.clone(), abstract_props, None);
+        record_call_site(inter, child.clone(), abstract_props, None);
         return StateValue::reference(Stability::Stable);
     }
     inter.stats.borrow_mut().cache_misses += 1;
@@ -513,7 +529,7 @@ fn eval_comp_app(
     child_env.extend_loc(child_ir.param.clone(), props_id);
 
     // Create child inter context and analyze
-    let child_inter = inter.child(name.clone());
+    let child_inter = inter.child(child.clone());
     let analyze_child = inter.analyze_child;
     let child_result = analyze_child(&child_ir, child_env, initial_heap, &child_inter);
 
@@ -521,12 +537,12 @@ fn eval_comp_app(
     inter
         .results
         .borrow_mut()
-        .insert(name.clone(), child_result.clone());
+        .insert(child.clone(), child_result.clone());
     inter
         .cache
         .borrow_mut()
-        .insert(name.clone(), abstract_props.clone(), child_result);
-    record_call_site(inter, name.clone(), abstract_props, None);
+        .insert(child.clone(), abstract_props.clone(), child_result);
+    record_call_site(inter, child.clone(), abstract_props, None);
 
     StateValue::reference(Stability::Stable)
 }
