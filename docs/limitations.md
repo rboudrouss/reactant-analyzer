@@ -107,6 +107,15 @@ Every entry here is Warning-or-below by construction: an FP never carries an Err
   [#31](https://github.com/rboudrouss/reactant-analyzer/issues/31). This affects `--info` output only — never a diagnostic,
   never the exit code.
 
+## Reading the output
+
+- **A finding inside a shared hook is reported once per consuming component.** The rows are honest —
+  each carries its own `component` and points at the hook's line — but nothing groups them on the way
+  out, so a hook used by 87 components produces 87 identical lines. Across the corpus **6,322 reported
+  findings resolve to 1,170 distinct source locations**, and the effect is worst on the codebases that
+  factor their hooks best. Count distinct locations, not rows, when comparing runs
+  [#129](https://github.com/rboudrouss/reactant-analyzer/issues/129).
+
 ## Cross-file limits
 
 Aliases declared only in `vite.config.*` / `next.config.*` or in `jsconfig.json`

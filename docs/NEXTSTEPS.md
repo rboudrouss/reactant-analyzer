@@ -39,6 +39,19 @@
 **✅ FAIT (2026-08-26)** — les quatre items sont livrés, voir l'historique git
 et les issues `enhancement` + `area/tier-a` du tracker :
 
+> **Mise à jour 2026-09-02 — la courbe est arrivée au bout.** Le catalogue est à
+> **21/22** (#116) ; la seule entrée encore bloquée, `nullable-return-unguarded`,
+> est exclue par décision (#101). Les chiffres « 3/21 → 5/21 » ci-dessous sont
+> ceux de l'époque et restent tels quels : l'historique complet de la courbe est
+> dans [limitations.md](limitations.md).
+>
+> La question suivante n'est plus « combien du catalogue » mais « combien de ce
+> qu'on nous demanderait » : 60 scénarios écrits à l'aveugle donnent **1
+> exprimable, 16 déjà natifs, 16 partiels, 27 hors de portée**
+> ([docs/campaign/](campaign/README.md), #128). Les deux relations qui débloquent
+> le plus sont #126 (les appels non-hook d'un corps) et #127 (les *lectures*
+> d'un slot).
+
 4. ~~**Étape 1 ADR-023 : provenance des hooks**~~ — `HookOrigin` fail-closed,
    littéral `"react"` avant le resolver, spécificateur brut retenu ;
    `hook_provenance` (`label → origin hook, source, direct|inlined`) survit à
