@@ -3509,3 +3509,70 @@ fn a_dep_with_no_path_renders_as_the_expression_it_is() {
         "no positions in any message: {msgs:?}"
     );
 }
+
+// ── #125: `jsx_props` sees the elements a list builds ───────────────────────
+
+const JSX_ROWS_PACK: &str = r#"{"schemaVersion":1,"name":"t","rules":[
+    {"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+     "anchor":{"relation":"jsx_props"},
+     "message":"{anchor.name}.{anchor.prop} = {anchor.identity}"}]}"#;
+
+fn jsx_rows(src: &str) -> Vec<String> {
+    let mut v: Vec<String> = run_pack(JSX_ROWS_PACK, src, &Options::new())
+        .into_iter()
+        .map(|d| d.message)
+        .collect();
+    v.sort();
+    v
+}
+
+/// Lists are where per-row identity actually costs something, and the relation
+/// enumerated none of it: an element built inside `.map` produced no rows at
+/// all. The inline object is fresh on every evaluation of the callback, which
+/// is answerable without an env — the callback body is not a CFG the fixpoint
+/// analysed, so `site_identity`'s question cannot be asked there.
+#[test]
+fn an_element_built_in_a_list_callback_gets_rows() {
+    let src = r#"
+        function Row({ style, label }) { return <div style={style}>{label}</div>; }
+        function C({ items }) {
+            return <ul>{items.map((it) => <Row style={{ a: 1 }} label={it.name} />)}</ul>;
+        }
+    "#;
+    assert_eq!(
+        jsx_rows(src),
+        vec![
+            "`Row`.`label` = unknown".to_string(),
+            "`Row`.`style` = fresh-every-render".to_string(),
+        ]
+    );
+}
+
+/// The discrimination is structural: a sync-HOF *argument* is run by the render
+/// body, a `FnLit` in JSX prop position is an event handler and the element it
+/// builds is not rendered by this render.
+#[test]
+fn an_element_built_in_an_event_handler_gets_none() {
+    let src = r#"
+        function Row({ style }) { return <div style={style}/>; }
+        function C({ render }) {
+            return <ul onClick={() => render(<Row style={{ a: 1 }} />)} />;
+        }
+    "#;
+    assert!(jsx_rows(src).is_empty(), "{:?}", jsx_rows(src));
+}
+
+/// Nested lists — a grouped table — reach two levels down.
+#[test]
+fn a_nested_list_callback_is_reached() {
+    let src = r#"
+        function Cell({ style }) { return <td style={style}/>; }
+        function C({ groups }) {
+            return <table>{groups.map((g) => g.rows.map((r) => <Cell style={{ w: r.w }} />))}</table>;
+        }
+    "#;
+    assert_eq!(
+        jsx_rows(src),
+        vec!["`Cell`.`style` = fresh-every-render".to_string()]
+    );
+}

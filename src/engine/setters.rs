@@ -1147,7 +1147,12 @@ struct FoundSite {
 
 /// `Array.prototype` HOFs that call their function argument synchronously —
 /// the argument runs in the ENCLOSING phase.
-const SYNC_HOF_METHODS: &[&str] = &[
+///
+/// Two readers: the setter walk's phase classification, and the JSX relations,
+/// which descend a render-body callback only when this table says the render
+/// body is what runs it (#125). One list, so a name added for one reader is
+/// added for both.
+pub(crate) const SYNC_HOF_METHODS: &[&str] = &[
     "map",
     "forEach",
     "filter",

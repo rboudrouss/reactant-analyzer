@@ -64,6 +64,22 @@ positives, recorded in their own `docs.why`. `tests/community_packs.rs` pins
 that they all still load and validate, which is what keeps them honest as the
 vocabulary moves.
 
+## What has moved since
+
+The triages are dated evidence and are **not** updated as the vocabulary
+changes — a gap list rewritten after the fact stops being a measurement. Two
+things they record have since been fixed, and are worth knowing when reading
+them:
+
+- The async triage had to drop `setInterval` from one rule's registrar list
+  because `clearInterval(id)` could never pair with a listener binding. That is
+  [#124](https://github.com/rboudrouss/reactant-analyzer/issues/124), fixed: the
+  pairing fact now knows handle-valued and disposer-valued teardowns, and
+  `{ once: true }`.
+- The effects triage found that `registrations` and `writers` do not see through
+  an `async` IIFE. That is [#117](https://github.com/rboudrouss/reactant-analyzer/issues/117),
+  fixed: `await` splits the block and the walk descends an IIFE body.
+
 ## Reading the triages
 
 A verdict of PARTIAL is the interesting one. It means the vocabulary could

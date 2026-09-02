@@ -12,6 +12,16 @@
 //! prop only when `n` changes, which is exactly the *fixed* shape — firing
 //! there would be a false positive. Effect and handler bodies never hand
 //! elements to the renderer at all.
+//!
+//! **"Render body" includes the callbacks the render body runs** (#125).
+//! `items.map(it => <Row style={{…}}/>)` builds its elements on every render,
+//! and lists are where per-row identity actually costs something — the
+//! relation enumerated none of it. The admissible callbacks are the ones
+//! `SYNC_HOF_METHODS` already names as running in the enclosing phase, and the
+//! discrimination against a handler is structural: a sync-HOF *argument*, never
+//! an object field. Inside such a callback there is no analysed env, so the
+//! identity question is answered syntactically — an allocation written at the
+//! site is fresh however the callback is reached, and everything else is ⊤.
 
 use std::collections::HashMap;
 
@@ -62,7 +72,11 @@ pub(crate) struct JsxPropSite<'a> {
 pub(crate) fn collect_jsx_prop_sites(comp: &AnalysisResult<StateValue>) -> Vec<JsxPropSite<'_>> {
     let cfg = &comp.render_cfg;
     let bindings = local_bindings(cfg);
-    let mut found: Vec<((BlockId, usize, usize), JsxPropSite<'_>)> = Vec::new();
+    // `(block, expr index, nesting, sequence)`. Top-level rows keep nesting 0
+    // and their field ordinal, so their relative order is exactly what it was
+    // before list rows existed; rows from a callback sort after them, in
+    // traversal order.
+    let mut found: Vec<((BlockId, usize, u8, usize), JsxPropSite<'_>)> = Vec::new();
     for (block_id, exprs) in top_level_exprs(cfg) {
         let env = comp.block_states.get(&block_id);
         for (idx, expr) in exprs.into_iter().enumerate() {
@@ -72,7 +86,7 @@ pub(crate) fn collect_jsx_prop_sites(comp: &AnalysisResult<StateValue>) -> Vec<J
                 };
                 for (ord, (prop, value)) in fields.iter().enumerate() {
                     found.push((
-                        (block_id, idx, ord),
+                        (block_id, idx, 0, ord),
                         JsxPropSite {
                             element,
                             prop,
@@ -82,10 +96,89 @@ pub(crate) fn collect_jsx_prop_sites(comp: &AnalysisResult<StateValue>) -> Vec<J
                     ));
                 }
             });
+            // Elements the render body builds inside a callback it runs
+            // synchronously — `items.map(it => <Row … />)` (#125). Lists are
+            // where per-row identity actually costs something, and the relation
+            // saw none of it.
+            let mut seq = 0usize;
+            each_list_element(expr, LIST_DEPTH, &mut |element, props, span| {
+                let Expr::ObjectLit { fields, .. } = props else {
+                    return;
+                };
+                for (prop, value) in fields.iter() {
+                    found.push((
+                        (block_id, idx, 1, seq),
+                        JsxPropSite {
+                            element,
+                            prop,
+                            identity: literal_identity(value),
+                            span,
+                        },
+                    ));
+                    seq += 1;
+                }
+            });
         }
     }
     found.sort_by_key(|a| a.0);
     found.into_iter().map(|(_, site)| site).collect()
+}
+
+/// How many nested render-time callbacks to descend. Two covers
+/// `groups.map(g => g.rows.map(r => <Row/>))`, which is where real tables live.
+const LIST_DEPTH: usize = 2;
+
+/// Component elements built inside a callback the **render body runs
+/// synchronously** — the `Array.prototype` HOFs of
+/// [`crate::engine::setters::SYNC_HOF_METHODS`], the one table that already
+/// says which callbacks run in the enclosing phase (#125).
+///
+/// Deliberately not any callback: a `FnLit` in JSX prop position is an event
+/// handler, and an element it builds is not rendered by this render. The
+/// discrimination is structural — a sync-HOF *argument*, never an object field.
+fn each_list_element<'a>(
+    expr: &'a Expr,
+    depth: usize,
+    f: &mut impl FnMut(&'a str, &'a Expr, Option<SourceRange>),
+) {
+    if depth == 0 {
+        return;
+    }
+    if let Expr::Call { fn_, args } = expr
+        && matches!(fn_.peel_ts(), Expr::FieldAccess { field, .. }
+            if crate::engine::setters::SYNC_HOF_METHODS.contains(&field.as_str()))
+    {
+        for arg in args {
+            if let Expr::FnLit { body_cfg, .. } = arg.peel_ts() {
+                for (_, exprs) in top_level_exprs(body_cfg) {
+                    for inner in exprs {
+                        each_component_element(inner, f);
+                        each_list_element(inner, depth - 1, f);
+                    }
+                }
+            }
+        }
+    }
+    expr.for_each_child(&mut |child| each_list_element(child, depth, f));
+}
+
+/// The identity of a prop value **without an environment to read**.
+///
+/// A callback body is not a CFG the fixpoint analysed, so there is no exit env
+/// at that program point and [`site_identity`]'s question cannot be asked. What
+/// can be answered without one is the syntactic half, and it is the half that
+/// matters here: an allocation *written at the site* mints a new reference
+/// every time the callback runs, whatever the surrounding values are. Anything
+/// else is `Unknown` — the may side, never actionable.
+fn literal_identity(value: &Expr) -> ValueIdentity {
+    match value.peel_ts() {
+        Expr::ObjectLit { .. }
+        | Expr::ArrayLit { .. }
+        | Expr::FnLit { .. }
+        | Expr::CompApp { .. }
+        | Expr::NativeElem { .. } => ValueIdentity::FreshEveryRender,
+        _ => ValueIdentity::Unknown,
+    }
 }
 
 /// Is the expression a fresh reference at *this* site, on every render?
