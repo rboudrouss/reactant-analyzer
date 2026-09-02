@@ -361,16 +361,19 @@ fn pair(row: &Registration, cleanups: &Cleanups, fns: &HashMap<Var, Arc<CFG>>) -
         // absence of evidence.
         return Pairing::Unpaired;
     }
-    let Expr::Var(listener) = row.callback.peel_ts() else {
-        // An inline literal is a fresh listener no teardown can name, and an
-        // unresolvable expression is one we cannot compare — both leave the
-        // pairing unproven rather than refuted.
-        return Pairing::Unknown;
-    };
+    // An effect that returns nothing on any path takes nothing back, whatever
+    // shape the listener has. This is decided before the listener is looked at
+    // at all — it is the one case where the absence is total.
     let bodies = match cleanups {
         Cleanups::None => return Pairing::Unpaired,
         Cleanups::Opaque => return Pairing::Unknown,
         Cleanups::Bodies(b) => b,
+    };
+    let Expr::Var(listener) = row.callback.peel_ts() else {
+        // An inline literal is a fresh listener no teardown can name, and an
+        // unresolvable expression is one we cannot compare — with a cleanup
+        // present, both leave the pairing unproven rather than refuted.
+        return Pairing::Unknown;
     };
     if bodies
         .iter()

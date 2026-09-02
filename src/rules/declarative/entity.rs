@@ -105,6 +105,8 @@ pub(crate) enum EntityVal<'a, 'b> {
     Seed(&'a SlotSeed),
     /// One `useContext` call site with complete ancestry (#115).
     Consumer(&'b ConsumerRow),
+    /// One callback registration in an effect body (#111).
+    Registration(&'a crate::engine::registrations::Registration),
 }
 
 // ── Per-component index ───────────────────────────────────────────────────────
@@ -247,6 +249,46 @@ impl<'a> EntityCtx<'a> {
             &local_bindings(&self.comp.render_cfg),
             self.comp,
         )
+    }
+
+    /// `registrations` rows (#111): the engine relation, already computed at
+    /// convergence, filtered to nothing — every row belongs to this component.
+    pub fn registration_rows(&self) -> &'a [crate::engine::registrations::Registration] {
+        &self.comp.registrations
+    }
+
+    /// Is a registration's listener a fresh reference on every run of the
+    /// effect that registers it (#116)?
+    ///
+    /// An inline literal is fresh by construction — the allocation site is the
+    /// registration itself. A name goes through the same `site_identity`
+    /// reader the two JSX relations use, evaluated in the effect body's own
+    /// block env, so the bind-once rule answers Unknown for a name that could
+    /// mean two things. Anything else is Unknown, and Unknown never fires.
+    pub fn listener_identity(
+        &self,
+        row: &crate::engine::registrations::Registration,
+    ) -> ValueIdentity {
+        let Some(HookEntry::Effect { body_cfg, .. }) =
+            self.comp.hooks.iter().find(|h| h.label() == row.effect)
+        else {
+            return ValueIdentity::Unknown;
+        };
+        match row.callback.peel_ts() {
+            Expr::FnLit { .. } => ValueIdentity::FreshEveryRender,
+            Expr::Var(_) => site_identity(
+                Some(&row.callback),
+                row.block_id.and_then(|b| {
+                    self.comp
+                        .effect_block_states
+                        .get(&row.effect)
+                        .and_then(|blocks| blocks.get(&b))
+                }),
+                &local_bindings(body_cfg),
+                self.comp,
+            ),
+            _ => ValueIdentity::Unknown,
+        }
     }
 
     /// `jsx_props` rows: every prop of every resolved component element in the
@@ -450,7 +492,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
                 | EntityVal::Seed(_)
-                | EntityVal::Consumer(_) => None,
+                | EntityVal::Consumer(_)
+                | EntityVal::Registration(_) => None,
             },
             Field::Name => match v {
                 // A custom hook is called by its own name; every other kind is
@@ -469,6 +512,11 @@ impl<'a> EntityCtx<'a> {
                 EntityVal::JsxProp(j) => Some(j.element.to_string()),
                 // The local binding the call reads the context through.
                 EntityVal::Consumer(c) => Some(crate::ir::source_name(&c.name).to_string()),
+                // A registration is named by its registrar — the table key,
+                // matchable by a `name` guard. The receiver-qualified form
+                // (`socket.addEventListener`) stays internal to the native
+                // rules' messages: a pack cannot match what varies per site.
+                EntityVal::Registration(r) => Some(r.registrar.to_string()),
                 EntityVal::Setter(_)
                 | EntityVal::Dep(_)
                 | EntityVal::Arg(_)
@@ -493,7 +541,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
                 | EntityVal::Seed(_)
-                | EntityVal::Consumer(_) => None,
+                | EntityVal::Consumer(_)
+                | EntityVal::Registration(_) => None,
             },
             Field::Slot => match v {
                 EntityVal::Setter(s) => self.setter_slot_name(s),
@@ -506,7 +555,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
                 | EntityVal::Seed(_)
-                | EntityVal::Consumer(_) => None,
+                | EntityVal::Consumer(_)
+                | EntityVal::Registration(_) => None,
             },
             Field::Setter => match v {
                 EntityVal::Setter(s) => Some(crate::ir::source_name(&s.var).to_string()),
@@ -519,7 +569,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
                 | EntityVal::Seed(_)
-                | EntityVal::Consumer(_) => None,
+                | EntityVal::Consumer(_)
+                | EntityVal::Registration(_) => None,
             },
             // A seed row IS a prop path, and so is a deps entry.
             Field::Path => match v {
@@ -533,7 +584,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
-                | EntityVal::Consumer(_) => None,
+                | EntityVal::Consumer(_)
+                | EntityVal::Registration(_) => None,
             },
             Field::Stability => match v {
                 EntityVal::Dep(d) => Some(verdict_word(self.dep_verdict(d)).to_string()),
@@ -546,7 +598,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
                 | EntityVal::Seed(_)
-                | EntityVal::Consumer(_) => None,
+                | EntityVal::Consumer(_)
+                | EntityVal::Registration(_) => None,
             },
             Field::Returns => match v {
                 EntityVal::Arg(a) => Some(returns_word(self.arg_verdict(a)).to_string()),
@@ -559,7 +612,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
                 | EntityVal::Seed(_)
-                | EntityVal::Consumer(_) => None,
+                | EntityVal::Consumer(_)
+                | EntityVal::Registration(_) => None,
             },
             Field::Region => match v {
                 EntityVal::Writer(w) => Some(w.region.word().to_string()),
@@ -572,7 +626,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
                 | EntityVal::Seed(_)
-                | EntityVal::Consumer(_) => None,
+                | EntityVal::Consumer(_)
+                | EntityVal::Registration(_) => None,
             },
             Field::Phase => match v {
                 EntityVal::Writer(w) => Some(phase_word(w.phase).to_string()),
@@ -585,7 +640,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
                 | EntityVal::Seed(_)
-                | EntityVal::Consumer(_) => None,
+                | EntityVal::Consumer(_)
+                | EntityVal::Registration(_) => None,
             },
             Field::Via => match v {
                 EntityVal::Writer(w) => Some(match &w.via {
@@ -606,12 +662,18 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
                 | EntityVal::Seed(_)
-                | EntityVal::Consumer(_) => None,
+                | EntityVal::Consumer(_)
+                | EntityVal::Registration(_) => None,
             },
             Field::Identity => match v {
                 EntityVal::Provider(p) => Some(identity_word(p.identity).to_string()),
                 EntityVal::JsxProp(j) => Some(identity_word(j.identity).to_string()),
                 EntityVal::Arg(a) => Some(identity_word(self.arg_identity(a)).to_string()),
+                // The listener's verdict, through the same `site_identity`
+                // reader the two JSX relations use (#116).
+                EntityVal::Registration(r) => {
+                    Some(identity_word(self.listener_identity(r)).to_string())
+                }
                 EntityVal::Hook(_)
                 | EntityVal::Setter(_)
                 | EntityVal::Dep(_)
@@ -632,7 +694,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Provider(_)
                 | EntityVal::Cycle(_)
                 | EntityVal::Seed(_)
-                | EntityVal::Consumer(_) => None,
+                | EntityVal::Consumer(_)
+                | EntityVal::Registration(_) => None,
             },
             Field::Cleanup => match v {
                 EntityVal::Hook(row) => Some(cleanup_word(self.cleanup(row)).to_string()),
@@ -645,7 +708,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
                 | EntityVal::Seed(_)
-                | EntityVal::Consumer(_) => None,
+                | EntityVal::Consumer(_)
+                | EntityVal::Registration(_) => None,
             },
             // Which component owns the slot the row writes: this one for a
             // local setter, the parent for a `ComponentSetter`-valued prop.
@@ -664,7 +728,8 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::JsxProp(_)
                 | EntityVal::Cycle(_)
                 | EntityVal::Seed(_)
-                | EntityVal::Consumer(_) => None,
+                | EntityVal::Consumer(_)
+                | EntityVal::Registration(_) => None,
             },
             // The loop path: node names are already qualified and quoted by
             // the shared `node_display`, so this one is rendered bare.
@@ -678,6 +743,27 @@ impl<'a> EntityCtx<'a> {
                 | EntityVal::Writer(_)
                 | EntityVal::Provider(_)
                 | EntityVal::JsxProp(_)
+                | EntityVal::Seed(_)
+                | EntityVal::Consumer(_)
+                | EntityVal::Registration(_) => None,
+            },
+            Field::Firing => match v {
+                EntityVal::Registration(r) => Some(
+                    match r.firing {
+                        crate::engine::registrations::Firing::Repeating => "repeating",
+                        crate::engine::registrations::Firing::Once => "once",
+                    }
+                    .to_string(),
+                ),
+                EntityVal::Hook(_)
+                | EntityVal::Setter(_)
+                | EntityVal::Dep(_)
+                | EntityVal::Arg(_)
+                | EntityVal::Origin(_)
+                | EntityVal::Writer(_)
+                | EntityVal::Provider(_)
+                | EntityVal::JsxProp(_)
+                | EntityVal::Cycle(_)
                 | EntityVal::Seed(_)
                 | EntityVal::Consumer(_) => None,
             },
@@ -700,6 +786,7 @@ impl<'a> EntityCtx<'a> {
             | Field::Via
             | Field::Identity
             | Field::Cleanup
+            | Field::Firing
             | Field::Cycle => raw.unwrap_or_else(|| anonymous(v)),
             // Source identifiers are quoted, verdict words are not.
             Field::Name
@@ -794,6 +881,7 @@ fn anonymous(v: &EntityVal<'_, '_>) -> String {
         EntityVal::Cycle(c) => format!("the loop through effect #{}", c.effect),
         EntityVal::Seed(s) => format!("`{}`", s.path),
         EntityVal::Consumer(c) => format!("`{}`", crate::ir::source_name(&c.name)),
+        EntityVal::Registration(r) => format!("`{}`", r.display),
     }
 }
 
@@ -874,6 +962,27 @@ pub(crate) fn seed_sync_name(s: SeedSync) -> SeedSyncName {
     match s {
         SeedSync::Synced => SeedSyncName::Synced,
         SeedSync::NoneSeen => SeedSyncName::NoneSeen,
+    }
+}
+
+/// The `teardown` guard's mirror of the pairing fact (#111). Three engine
+/// values collapse to two schema names: the unresolvable case is an absence of
+/// evidence, and the vocabulary says so — `none-seen`, never `unpaired`.
+pub(crate) fn teardown_name(
+    p: crate::engine::registrations::Pairing,
+) -> super::schema::TeardownName {
+    match p {
+        crate::engine::registrations::Pairing::Paired => super::schema::TeardownName::Paired,
+        crate::engine::registrations::Pairing::Unpaired
+        | crate::engine::registrations::Pairing::Unknown => super::schema::TeardownName::NoneSeen,
+    }
+}
+
+/// Total mirror of a registration's firing class (#111).
+pub(crate) fn firing_name(f: crate::engine::registrations::Firing) -> super::schema::FiringName {
+    match f {
+        crate::engine::registrations::Firing::Repeating => super::schema::FiringName::Repeating,
+        crate::engine::registrations::Firing::Once => super::schema::FiringName::Once,
     }
 }
 

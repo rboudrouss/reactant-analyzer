@@ -159,6 +159,27 @@ pub enum Anchor {
     /// confident one. Edge-less; no `must_*` accepts the sort, so Error is
     /// unreachable.
     ContextConsumers,
+    /// One callback registration in an effect body (#111/#116, ADR-034): a
+    /// call that hands a callback to something outliving the effect. `name` is
+    /// the registrar (`setInterval`, `addEventListener`, `subscribe`, …),
+    /// `firing` whether it re-fires unboundedly, `listener` the site-identity
+    /// verdict of the callback.
+    ///
+    /// The relation is a **may**-registration: a match on the registrar name
+    /// table, never a proof that the callee is the host primitive. That is
+    /// wontfix #42's accepted-FP decision, now extended to the public
+    /// vocabulary — so the polarity is capped at may/Warning, no `must_*`
+    /// binds this sort, and Error is unreachable through the anchor.
+    /// Edge-less; the `teardown` guard carries the pairing fact.
+    ///
+    /// Optional `firing` narrows the enumeration the way `kind` does for
+    /// `hook_calls`: `repeating` selects the registrars that keep firing until
+    /// torn down, which is the only class where a missing teardown
+    /// accumulates. Absent = every row.
+    Registrations {
+        #[serde(default)]
+        firing: Option<FiringName>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -397,6 +418,33 @@ pub enum Guard {
         of: String,
         is: PVal<Vec<ProviderName>>,
     },
+    /// Whether anything visibly takes a `registrations` row back (#111): the
+    /// effect's cleanup calls the registrar's teardown holding the **same
+    /// listener binding**.
+    ///
+    /// MAY-typed in one direction, so positive-only, exactly like `seed_sync`.
+    /// `paired` is a claim made from a teardown that was read; `none-seen` is
+    /// the absence of one, and an unreadable cleanup or a listener that is not
+    /// a resolvable name both land there rather than being refuted. Matching
+    /// the teardown *name* alone would certify the very shape a
+    /// fresh-listener rule exists to catch, so the binding is the fact.
+    Teardown {
+        of: String,
+        is: PVal<Vec<TeardownName>>,
+    },
+    /// Does an `effect` anchor register a callback that outlives it (#111)?
+    ///
+    /// Existential MAY over the effect's registration rows, filtered by firing
+    /// class: `repeating` for the ones that keep firing until torn down
+    /// (`setInterval`, `addEventListener`, `subscribe`, `on`, `addListener`),
+    /// `once` for a timeout, a rAF or a promise continuation. Positive-only —
+    /// the relation is a name-table match, so "registers nothing" is not a
+    /// promise the engine keeps and there is no negated form to assert it
+    /// with.
+    Registers {
+        of: String,
+        firing: PVal<Vec<FiringName>>,
+    },
     /// Whether anything visibly re-syncs a `seeds` row's slot when that prop
     /// moves (#106): a render-time write, or an effect whose declared deps
     /// cover the seed path (or that declares none, so it re-runs every
@@ -612,6 +660,36 @@ pub enum ProviderName {
     ProviderSeen,
     /// None did, on the paths the analysis could complete.
     NoneOnAnalyzedPaths,
+}
+
+/// Total mirror of the registration↔teardown pairing verdict (#111).
+/// Two-valued in the schema although the engine's fact is three-valued: the
+/// unresolvable case folds into `none-seen`, which reads as an absence of
+/// evidence and never as a proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum TeardownName {
+    /// The effect's cleanup calls the registrar's teardown holding the same
+    /// listener binding.
+    Paired,
+    /// It does not, or the walk could not read the cleanup. Not a proof that
+    /// no teardown exists.
+    NoneSeen,
+}
+
+/// How a registration re-fires (#111). Two-valued and total: every row in the
+/// registrar table is one or the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum FiringName {
+    /// Keeps firing until torn down: a timer interval, an event listener, a
+    /// subscription.
+    Repeating,
+    /// Fires once, shortly after registration: a timeout, a rAF, a promise
+    /// continuation.
+    Once,
 }
 
 /// Total mirror of the seed-sync verdict (#106). Two-valued: `none-seen` is

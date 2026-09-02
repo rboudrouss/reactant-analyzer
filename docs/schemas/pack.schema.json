@@ -138,6 +138,29 @@
           "required": [
             "relation"
           ]
+        },
+        {
+          "description": "One callback registration in an effect body (#111/#116, ADR-034): a\ncall that hands a callback to something outliving the effect. `name` is\nthe registrar (`setInterval`, `addEventListener`, `subscribe`, …),\n`firing` whether it re-fires unboundedly, `listener` the site-identity\nverdict of the callback.\n\nThe relation is a **may**-registration: a match on the registrar name\ntable, never a proof that the callee is the host primitive. That is\nwontfix #42's accepted-FP decision, now extended to the public\nvocabulary — so the polarity is capped at may/Warning, no `must_*`\nbinds this sort, and Error is unreachable through the anchor.\nEdge-less; the `teardown` guard carries the pairing fact.\n\nOptional `firing` narrows the enumeration the way `kind` does for\n`hook_calls`: `repeating` selects the registrars that keep firing until\ntorn down, which is the only class where a missing teardown\naccumulates. Absent = every row.",
+          "type": "object",
+          "properties": {
+            "firing": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FiringName"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "relation": {
+              "type": "string",
+              "const": "registrations"
+            }
+          },
+          "required": [
+            "relation"
+          ]
         }
       ]
     },
@@ -185,6 +208,21 @@
       "enum": [
         "keep",
         "drop"
+      ]
+    },
+    "FiringName": {
+      "description": "How a registration re-fires (#111). Two-valued and total: every row in the\nregistrar table is one or the other.",
+      "oneOf": [
+        {
+          "description": "Keeps firing until torn down: a timer interval, an event listener, a\nsubscription.",
+          "type": "string",
+          "const": "repeating"
+        },
+        {
+          "description": "Fires once, shortly after registration: a timeout, a rAF, a promise\ncontinuation.",
+          "type": "string",
+          "const": "once"
+        }
       ]
     },
     "ForEach": {
@@ -626,6 +664,48 @@
           ]
         },
         {
+          "description": "Whether anything visibly takes a `registrations` row back (#111): the\neffect's cleanup calls the registrar's teardown holding the **same\nlistener binding**.\n\nMAY-typed in one direction, so positive-only, exactly like `seed_sync`.\n`paired` is a claim made from a teardown that was read; `none-seen` is\nthe absence of one, and an unreadable cleanup or a listener that is not\na resolvable name both land there rather than being refuted. Matching\nthe teardown *name* alone would certify the very shape a\nfresh-listener rule exists to catch, so the binding is the fact.",
+          "type": "object",
+          "properties": {
+            "is": {
+              "$ref": "#/$defs/PVal_Array_of_TeardownName"
+            },
+            "kind": {
+              "type": "string",
+              "const": "teardown"
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of",
+            "is"
+          ]
+        },
+        {
+          "description": "Does an `effect` anchor register a callback that outlives it (#111)?\n\nExistential MAY over the effect's registration rows, filtered by firing\nclass: `repeating` for the ones that keep firing until torn down\n(`setInterval`, `addEventListener`, `subscribe`, `on`, `addListener`),\n`once` for a timeout, a rAF or a promise continuation. Positive-only —\nthe relation is a name-table match, so \"registers nothing\" is not a\npromise the engine keeps and there is no negated form to assert it\nwith.",
+          "type": "object",
+          "properties": {
+            "firing": {
+              "$ref": "#/$defs/PVal_Array_of_FiringName"
+            },
+            "kind": {
+              "type": "string",
+              "const": "registers"
+            },
+            "of": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "of",
+            "firing"
+          ]
+        },
+        {
           "description": "Whether anything visibly re-syncs a `seeds` row's slot when that prop\nmoves (#106): a render-time write, or an effect whose declared deps\ncover the seed path (or that declares none, so it re-runs every\nrender).\n\nMAY-typed in one direction, and the guard is positive-only for exactly\nthat reason: `synced` is a claim the relation makes from a write it\nsaw, `none-seen` is the absence of one. A setter the component handed\nout could be called from anywhere, so \"no sync exists\" is not a promise\nthe engine keeps — which is why the name is `none-seen` and not\n`unsynced`.\n\nStructurally may-typed: no `must_*` guard binds a seed row, so a rule\nkeyed on this cannot reach Error. `must_frozen_seed` stays native and\nis deliberately not exposed — it certifies a motion proof this relation\ndoes not carry.",
           "type": "object",
           "properties": {
@@ -991,6 +1071,28 @@
         }
       ]
     },
+    "PVal_Array_of_FiringName": {
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FiringName"
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "$param": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "$param"
+          ]
+        }
+      ]
+    },
     "PVal_Array_of_IdentityName": {
       "oneOf": [
         {
@@ -1151,6 +1253,28 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/StabilityName"
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "$param": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "$param"
+          ]
+        }
+      ]
+    },
+    "PVal_Array_of_TeardownName": {
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TeardownName"
           }
         },
         {
@@ -1460,6 +1584,21 @@
         "versioned",
         "per-render",
         "unknown"
+      ]
+    },
+    "TeardownName": {
+      "description": "Total mirror of the registration↔teardown pairing verdict (#111).\nTwo-valued in the schema although the engine's fact is three-valued: the\nunresolvable case folds into `none-seen`, which reads as an absence of\nevidence and never as a proof.",
+      "oneOf": [
+        {
+          "description": "The effect's cleanup calls the registrar's teardown holding the same\nlistener binding.",
+          "type": "string",
+          "const": "paired"
+        },
+        {
+          "description": "It does not, or the walk could not read the cleanup. Not a proof that\nno teardown exists.",
+          "type": "string",
+          "const": "none-seen"
+        }
       ]
     },
     "UpdaterName": {

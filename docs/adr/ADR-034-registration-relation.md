@@ -115,3 +115,48 @@ nothing joins it without a registration to undo.
   `Repeating` only, so nothing there changes, and `stale-closure` gains a real
   registration shape it was blind to.
 - `rules::helpers::registrations` is deleted.
+
+## Amendment 2026-09-02 — the anchor, and the #42 decision extended (#116)
+
+### 6. The relation becomes public vocabulary, and that extends wontfix #42
+
+The `registrations` anchor exposes the rows to Tier A: `name` (the registrar,
+the table key rather than the receiver-qualified display — a pack cannot match
+what varies per site), `firing`, and `identity` for the listener. `teardown`
+carries the pairing fact, and `registers` puts an existential over an effect
+anchor's rows so the `missing-effect-cleanup` entry can finally say *repeating*.
+
+**The decision this records**: wontfix #42's registrar-name heuristic is now
+public vocabulary, not just the native rules' interior. The relation is a
+may-registration — a name-table match, never a proof the callee is the host
+primitive — so the polarity is capped at may/Warning, no `must_*` binds the
+sort, and Error is structurally unreachable through the anchor. #42 stays
+closed; its accepted-FP decision covers more surface than it did.
+
+### 7. The flip rule's subject is the pairing, not the identity
+
+`subscribe-with-fresh-listener` flips Blocked → Expressible on
+`identity is fresh-every-render` ∧ `teardown is none-seen`, over
+`firing: repeating` rows only.
+
+Identity alone was refuted, and the counterexample is the React documentation's
+own shape: `const h = () => …; el.addEventListener('x', h); return () =>
+el.removeEventListener('x', h)` has a listener that IS fresh on every effect
+run. A rule keyed on freshness fires on it with a factually false message. The
+pairing is what separates the two, which is why §3 exists at all.
+
+`firing: repeating` is the other half. Without it a `.then(() => …)` — a fresh
+callback, no teardown possible, `Unpaired` by §3 — would fire, and a promise
+continuation accumulates nothing.
+
+### Consequences of the amendment
+
+- `subscribe-with-fresh-listener` flips; the measure moves 20/22 → **21/22**,
+  the honest ceiling. The one entry left is `nullable-return-unguarded`,
+  excluded by design in #101.
+- `missing-effect-cleanup` loses its "no registration fact" weakening.
+- Recorded weakening on the flip: effect-body registrations only; a listener
+  reached through a prop, an import or a computed receiver reads Unknown and
+  never fires; a cleanup the walk cannot read folds to `none-seen` rather than
+  being credited; Warning, no must primitive.
+- The vocabulary is 23 filtering guards, 5 `must_*`, and 8 anchors.

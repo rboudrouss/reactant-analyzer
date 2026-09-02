@@ -23,8 +23,8 @@ use crate::rules::api::query::{
 use crate::rules::{Rule, SetterCall};
 
 use super::entity::{
-    ArgEntity, DepEntity, EntityCtx, EntityVal, HookRow, SetterEntity, cleanup_name, identity_name,
-    provider_name, seed_sync_name, updater_name,
+    ArgEntity, DepEntity, EntityCtx, EntityVal, HookRow, SetterEntity, cleanup_name, firing_name,
+    identity_name, provider_name, seed_sync_name, teardown_name, updater_name,
 };
 use super::schema::{EdgeName, ElseBehavior, OwnershipName, SeverityPin};
 use super::validate::{
@@ -92,6 +92,9 @@ enum Candidate<'a, 'b> {
     /// One `useContext` call site with complete ancestry (#115) — edge-less,
     /// and no must-guard accepts its sort.
     Consumer(&'a crate::rules::helpers::context_flow::ConsumerRow),
+    /// One callback registration in an effect body (#111) — edge-less, and no
+    /// must-guard accepts its sort: the relation is a may-registration.
+    Registration(&'a crate::engine::registrations::Registration),
 }
 
 impl<'a, 'b> Candidate<'a, 'b> {
@@ -103,7 +106,8 @@ impl<'a, 'b> Candidate<'a, 'b> {
             | Candidate::Provider(_)
             | Candidate::JsxProp(_)
             | Candidate::Cycle(_)
-            | Candidate::Consumer(_) => None,
+            | Candidate::Consumer(_)
+            | Candidate::Registration(_) => None,
         }
     }
 
@@ -115,7 +119,8 @@ impl<'a, 'b> Candidate<'a, 'b> {
             | Candidate::Provider(_)
             | Candidate::JsxProp(_)
             | Candidate::Cycle(_)
-            | Candidate::Consumer(_) => None,
+            | Candidate::Consumer(_)
+            | Candidate::Registration(_) => None,
         }
     }
 
@@ -128,6 +133,7 @@ impl<'a, 'b> Candidate<'a, 'b> {
             (BindRef::Anchor, Candidate::Provider(p)) => EntityVal::Provider(p),
             (BindRef::Anchor, Candidate::JsxProp(j)) => EntityVal::JsxProp(j),
             (BindRef::Anchor, Candidate::Cycle(c)) => EntityVal::Cycle(c),
+            (BindRef::Anchor, Candidate::Registration(r)) => EntityVal::Registration(r),
             (BindRef::Anchor, Candidate::Consumer(c)) => EntityVal::Consumer(c),
             (BindRef::Bound, _) => match self.bound().expect("validated: binding exists") {
                 Bound::Setter(s) => EntityVal::Setter(s),
@@ -149,6 +155,8 @@ impl<'a, 'b> Candidate<'a, 'b> {
             // The carrying effect: the finding is about that effect's write.
             Candidate::Cycle(c) => Some(c.effect),
             Candidate::Consumer(c) => Some(c.label),
+            // The registering effect: the finding is about that effect.
+            Candidate::Registration(r) => Some(r.effect),
         }
     }
 
@@ -172,6 +180,7 @@ impl<'a, 'b> Candidate<'a, 'b> {
             // edge produces no row at all.
             Candidate::Cycle(c) => Some(c.span),
             Candidate::Consumer(c) => c.span,
+            Candidate::Registration(r) => r.span,
         }
     }
 }
@@ -290,6 +299,15 @@ impl Rule for TierARule {
                     self.eval(&e, &Candidate::Consumer(row), &mut out);
                 }
             }
+            ResolvedAnchor::Registrations { firing } => {
+                for row in e
+                    .registration_rows()
+                    .iter()
+                    .filter(|r| firing.is_none_or(|f| f == firing_name(r.firing)))
+                {
+                    self.eval(&e, &Candidate::Registration(row), &mut out);
+                }
+            }
         }
         out
     }
@@ -389,7 +407,10 @@ impl TierARule {
                     EntityVal::Provider(p) => p.identity,
                     EntityVal::JsxProp(j) => j.identity,
                     EntityVal::Arg(a) => e.arg_identity(a),
-                    _ => unreachable!("validated: `identity` binds a JSX site or an argument"),
+                    EntityVal::Registration(r) => e.listener_identity(r),
+                    _ => unreachable!(
+                        "validated: `identity` binds a JSX site, an argument or a registration"
+                    ),
                 };
                 names.contains(&identity_name(identity)) != *negated
             }
@@ -427,6 +448,21 @@ impl TierARule {
                     unreachable!("validated: `seed_sync` binds a seeds row")
                 };
                 names.contains(&seed_sync_name(s.sync))
+            }
+            ResolvedGuard::Teardown { of, names } => {
+                let EntityVal::Registration(r) = cand.entity_at(*of) else {
+                    unreachable!("validated: `teardown` binds a registrations row")
+                };
+                names.contains(&teardown_name(r.pairing))
+            }
+            ResolvedGuard::Registers { of, firing } => {
+                let EntityVal::Hook(h) = cand.entity_at(*of) else {
+                    unreachable!("validated: `registers` binds an effect anchor")
+                };
+                e.registration_rows()
+                    .iter()
+                    .filter(|r| r.effect == h.info.label)
+                    .any(|r| firing.contains(&firing_name(r.firing)))
             }
             ResolvedGuard::SlotOwnership { of, names } => {
                 let EntityVal::Setter(s) = cand.entity_at(*of) else {
@@ -625,7 +661,8 @@ impl TierARule {
                     | Candidate::Provider(_)
                     | Candidate::JsxProp(_)
                     | Candidate::Cycle(_)
-                    | Candidate::Consumer(_) => {
+                    | Candidate::Consumer(_)
+                    | Candidate::Registration(_) => {
                         unreachable!("validated: `must_dominates_all_exits` binds a render setter")
                     }
                 };

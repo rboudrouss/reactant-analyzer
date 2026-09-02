@@ -360,21 +360,41 @@ const JSX_PROP_PACK: &str = r#"{
   }]
 }"#;
 
+const LISTENER_PACK: &str = r#"{
+  "schemaVersion": 1, "name": "cat-listener",
+  "rules": [{
+    "id": "fresh-listener-never-removed",
+    "docs": {
+      "description": "an effect registers a listener that is a new reference on every run, and nothing takes it back",
+      "why": "a repeating registration keyed on function identity accumulates: each effect run adds another listener the cleanup never removes, so after N runs the callback fires N times against state the component no longer has",
+      "fix": "return a cleanup that calls the matching teardown with the SAME binding the registration used"
+    },
+    "severity": "warning",
+    "anchor": { "relation": "registrations", "firing": "repeating" },
+    "guards": [
+      { "kind": "identity", "of": "anchor", "is": ["fresh-every-render"] },
+      { "kind": "teardown", "of": "anchor", "is": ["none-seen"] }
+    ],
+    "message": "this effect registers a fresh listener with `{anchor.name}` and no teardown holds the same binding"
+  }]
+}"#;
+
 const CLEANUP_PACK: &str = r#"{
   "schemaVersion": 1, "name": "cat-cleanup",
   "rules": [{
-    "id": "effect-without-teardown",
+    "id": "repeating-registration-without-teardown",
     "docs": {
-      "description": "an effect registers work and returns no teardown",
+      "description": "an effect starts something that keeps firing and returns no teardown",
       "why": "the registration outlives the component — a leak, and a write after unmount",
       "fix": "return a cleanup function that undoes the registration"
     },
     "severity": "warning",
     "anchor": { "relation": "hook_calls", "kind": "effect" },
     "guards": [
-      { "kind": "cleanup", "of": "anchor", "is": ["absent"] }
+      { "kind": "cleanup", "of": "anchor", "is": ["absent"] },
+      { "kind": "registers", "of": "anchor", "firing": ["repeating"] }
     ],
-    "message": "this effect's teardown is {anchor.cleanup}"
+    "message": "this effect registers repeating work and its teardown is {anchor.cleanup}"
   }]
 }"#;
 
@@ -712,9 +732,26 @@ fn catalogue() -> Vec<Entry> {
         },
         Entry {
             id: "subscribe-with-fresh-listener",
-            status: Status::Blocked {
-                class: "expression-position",
-                missing: "call-site entities for non-hook calls (only hook rows carry args)",
+            status: Status::Expressible {
+                pack_json: LISTENER_PACK,
+                rule: "cat-listener/fresh-listener-never-removed",
+                fires_on: Fixture::Single(
+                    "import { useEffect } from \"react\";\nfunction C({ onPing }) {\n  useEffect(() => {\n    const h = () => { onPing(); };\n    window.addEventListener(\"resize\", h);\n  }, [onPing]);\n  return <div/>;\n}",
+                ),
+                silent_on: Fixture::Single(
+                    "import { useEffect } from \"react\";\nfunction C({ onPing }) {\n  useEffect(() => {\n    const h = () => { onPing(); };\n    window.addEventListener(\"resize\", h);\n    return () => { window.removeEventListener(\"resize\", h); };\n  }, [onPing]);\n  return <div/>;\n}",
+                ),
+                weakened: Some(
+                    "the subject is the PAIRING fact, not listener identity alone: the \
+                     canonical React-docs conformant pattern registers a listener that IS \
+                     fresh per effect run, and an identity-only rule fires on it with a \
+                     factually false message. Effect-body registrations only; a listener \
+                     reached through a prop, an import or a computed receiver reads Unknown \
+                     and never fires, and a cleanup the walk cannot read folds to `none-seen` \
+                     rather than being credited. The relation is a may-registration — a \
+                     registrar-name match, wontfix #42's accepted-FP decision extended to the \
+                     public vocabulary — so Warning, and no must primitive binds the sort",
+                ),
             },
         },
         Entry {
@@ -832,7 +869,7 @@ fn catalogue() -> Vec<Entry> {
             id: "missing-effect-cleanup",
             status: Status::Expressible {
                 pack_json: CLEANUP_PACK,
-                rule: "cat-cleanup/effect-without-teardown",
+                rule: "cat-cleanup/repeating-registration-without-teardown",
                 fires_on: Fixture::Single(
                     "import { useEffect } from \"react\";\nfunction C({ ms }) {\n  useEffect(() => { setInterval(() => { console.log(1); }, ms); }, [ms]);\n  return <div/>;\n}",
                 ),
@@ -840,12 +877,12 @@ fn catalogue() -> Vec<Entry> {
                     "import { useEffect } from \"react\";\nfunction C({ ms }) {\n  useEffect(() => {\n    const id = setInterval(() => { console.log(1); }, ms);\n    return () => { clearInterval(id); };\n  }, [ms]);\n  return <div/>;\n}",
                 ),
                 weakened: Some(
-                    "no registration fact yet: the guard says only `this effect returns no \
-                     teardown`, so the pack rule cannot restrict to repeating registrars the \
-                     way the NATIVE missing-cleanup rule does — teams must scope it (by hook \
-                     `origin`, say) or keep the native rule. The `registers` guard shipping \
-                     with the registrations anchor (#116) un-weakens it. `unknown` folds to \
-                     the may side, so an unclassifiable return never reads as an absence",
+                    "the `registers` guard restricts the rule to repeating registrars, so the \
+                     wave-0 \"no registration fact\" weakening is gone (#116) — but the \
+                     relation behind it is a may-registration, a registrar-name match rather \
+                     than a proof (wontfix #42, extended to the public vocabulary), and it \
+                     sees effect bodies only. `unknown` folds to the may side, so an \
+                     unclassifiable return never reads as an absence",
                 ),
             },
         },
@@ -1043,7 +1080,7 @@ fn catalogue() -> Vec<Entry> {
 /// after the single-binding certificate resolved Var-bound selectors (#103) →
 /// 13/22 after the `identity` verdict reached call-site arguments (#112).
 /// Flip an entry (rule + fixtures), then update this constant.
-const EXPRESSIBLE_NOW: usize = 20;
+const EXPRESSIBLE_NOW: usize = 21;
 
 #[test]
 fn catalogue_is_pinned_at_22_entries() {

@@ -208,13 +208,31 @@ call-graph edges, and an unreached component reads as a caller-less root — so 
 row exists only where the whole closure is inter-analyzed AND no unreached
 component syntactically mentions it. Both gates have a test that fails when
 that gate alone is removed.)
+**→ 21/22** (2026-09-02, [#111](https://github.com/rboudrouss/reactant-analyzer/issues/111) +
+[#116](https://github.com/rboudrouss/reactant-analyzer/issues/116), ADR-034: the
+`registrations` relation — one registrar table where three readers had two
+drifting whitelists, plus the registration↔teardown pairing fact — and the
+`registrations` anchor over it. The flip's subject is the **pairing**, not
+listener identity: the React documentation's own conformant shape registers a
+listener that IS fresh on every effect run, so an identity-only rule fires on it
+with a factually false message. The same wave discharges ADR-027 §2's
+unimplemented phase summary and closes the #93 FP, and it records the decision
+that wontfix [#42](https://github.com/rboudrouss/reactant-analyzer/issues/42)'s
+registrar-name heuristic now extends to the public vocabulary: a
+may-registration, Warning ceiling, no must primitive on these rows.)
+
+**This is the honest ceiling.** The one entry still Blocked,
+`nullable-return-unguarded`, is excluded by design
+([#101](https://github.com/rboudrouss/reactant-analyzer/issues/101)) — it needs guard dominance
+over nullable returns, which is a type-flow question rather than a hook-semantics one.
+
 Run
-`cargo test --test catalogue -- --nocapture` for the full blocked-entry report. What still blocks,
-in decreasing leverage: prop, provider-value and setter-argument positions carry no expression
-verdict [#67](https://github.com/rboudrouss/reactant-analyzer/issues/67); Tier A is single-anchor, though three
-wave-4/5 entries turned out not to need a second one — a whole-program relation
-projects onto the anchored component [#68](https://github.com/rboudrouss/reactant-analyzer/issues/68); the `writers` relation
-collapses two same-slot writes in one body into one row, so same-tick
+`cargo test --test catalogue -- --nocapture` for the full blocked-entry report. What still bounds
+the vocabulary, in decreasing leverage: prop, provider-value and setter-argument positions carry no
+expression verdict [#67](https://github.com/rboudrouss/reactant-analyzer/issues/67); Tier A is
+single-anchor, though four wave-4/5 entries turned out not to need a second one — a whole-program
+relation projects onto the anchored component [#68](https://github.com/rboudrouss/reactant-analyzer/issues/68);
+the `writers` relation collapses two same-slot writes in one body into one row, so same-tick
 multi-write classes stay out of reach [#105](https://github.com/rboudrouss/reactant-analyzer/issues/105).
 
 ## Out of scope

@@ -3333,3 +3333,148 @@ fn no_must_guard_binds_a_seed_row_so_error_is_unreachable() {
         );
     }
 }
+
+// ── `registrations` anchor and its guards (#116, ADR-034 §6-§7) ──────────────
+
+#[test]
+fn rejects_registers_on_a_non_effect_anchor() {
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},
+            "severity":"warning","anchor":{"relation":"hook_calls","kind":"state"},
+            "guards":[{"kind":"registers","of":"anchor","firing":["repeating"]}],
+            "message":"m"}"#,
+    ));
+    assert_eq!(e.path, "rules[0].guards[0].of");
+    assert!(
+        e.message.contains("applies to an `effect` hook anchor"),
+        "{e}"
+    );
+}
+
+#[test]
+fn rejects_teardown_on_a_non_registration_subject() {
+    let e = load_err(&one_rule(
+        r#"{"id":"r","docs":{"description":"d","why":"w","fix":"f"},
+            "severity":"warning","anchor":{"relation":"hook_calls","kind":"effect"},
+            "guards":[{"kind":"teardown","of":"anchor","is":["paired"]}],
+            "message":"m"}"#,
+    ));
+    assert_eq!(e.path, "rules[0].guards[0].of");
+    assert!(
+        e.message.contains("applies to a `registrations` row"),
+        "{e}"
+    );
+}
+
+/// The anchor's `firing` filter narrows what the sort enumerates, the way
+/// `kind` does for `hook_calls`. Without it a promise continuation — a fresh
+/// callback nothing can take back — reads exactly like an accumulating
+/// listener.
+#[test]
+fn the_firing_filter_separates_a_promise_continuation_from_a_listener() {
+    let pack = |firing: &str| {
+        format!(
+            r#"{{"schemaVersion":1,"name":"t","rules":[
+            {{"id":"r","docs":{{"description":"d","why":"w","fix":"f"}},"severity":"warning",
+             "anchor":{{"relation":"registrations","firing":"{firing}"}},
+             "message":"registered {{anchor.name}} ({{anchor.firing}})"}}]}}"#
+        )
+    };
+    let src = r#"
+        import { useEffect } from "react";
+        function C({ load, onPing }) {
+            useEffect(() => {
+                load().then(() => { onPing(); });
+                window.addEventListener("resize", () => { onPing(); });
+            }, [load, onPing]);
+            return <div/>;
+        }
+    "#;
+    let repeating = run_pack(&pack("repeating"), src, &Options::new());
+    assert_eq!(repeating.len(), 1, "{repeating:?}");
+    assert!(
+        repeating[0].message.contains("addEventListener"),
+        "{:?}",
+        repeating[0].message
+    );
+    let once = run_pack(&pack("once"), src, &Options::new());
+    assert_eq!(once.len(), 1, "{once:?}");
+    assert!(once[0].message.contains("then"), "{:?}", once[0].message);
+}
+
+/// The pairing fact is the flip rule's subject, and this is why: the
+/// conformant pattern's listener is fresh too. A rule keyed on identity alone
+/// fires on both; adding `teardown` separates them.
+#[test]
+fn identity_alone_does_not_separate_the_conformant_listener_from_the_leaking_one() {
+    let leaking = r#"
+        import { useEffect } from "react";
+        function C({ onPing }) {
+            useEffect(() => {
+                const h = () => { onPing(); };
+                window.addEventListener("resize", h);
+            }, [onPing]);
+            return <div/>;
+        }
+    "#;
+    let conformant = r#"
+        import { useEffect } from "react";
+        function C({ onPing }) {
+            useEffect(() => {
+                const h = () => { onPing(); };
+                window.addEventListener("resize", h);
+                return () => { window.removeEventListener("resize", h); };
+            }, [onPing]);
+            return <div/>;
+        }
+    "#;
+    let identity_only = r#"{"schemaVersion":1,"name":"t","rules":[
+        {"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+         "anchor":{"relation":"registrations","firing":"repeating"},
+         "guards":[{"kind":"identity","of":"anchor","is":["fresh-every-render"]}],
+         "message":"fresh listener"}]}"#;
+    assert_eq!(run_pack(identity_only, leaking, &Options::new()).len(), 1);
+    assert_eq!(
+        run_pack(identity_only, conformant, &Options::new()).len(),
+        1,
+        "identity alone cannot tell them apart — that is the refutation"
+    );
+
+    let with_pairing = r#"{"schemaVersion":1,"name":"t","rules":[
+        {"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+         "anchor":{"relation":"registrations","firing":"repeating"},
+         "guards":[{"kind":"identity","of":"anchor","is":["fresh-every-render"]},
+                   {"kind":"teardown","of":"anchor","is":["none-seen"]}],
+         "message":"fresh listener, no teardown"}]}"#;
+    assert_eq!(run_pack(with_pairing, leaking, &Options::new()).len(), 1);
+    assert!(run_pack(with_pairing, conformant, &Options::new()).is_empty());
+}
+
+/// The `registers` guard un-weakens the missing-effect-cleanup entry: a
+/// promise chain in an effect with no cleanup is not a leak, and the rule can
+/// finally say so.
+#[test]
+fn registers_restricts_the_cleanup_rule_to_repeating_registrars() {
+    let pack = r#"{"schemaVersion":1,"name":"t","rules":[
+        {"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+         "anchor":{"relation":"hook_calls","kind":"effect"},
+         "guards":[{"kind":"cleanup","of":"anchor","is":["absent"]},
+                   {"kind":"registers","of":"anchor","firing":["repeating"]}],
+         "message":"repeating registration, no teardown"}]}"#;
+    let interval = r#"
+        import { useEffect } from "react";
+        function C({ ms }) {
+            useEffect(() => { setInterval(() => { console.log(1); }, ms); }, [ms]);
+            return <div/>;
+        }
+    "#;
+    let promise = r#"
+        import { useEffect } from "react";
+        function C({ load }) {
+            useEffect(() => { load().then(() => { console.log(1); }); }, [load]);
+            return <div/>;
+        }
+    "#;
+    assert_eq!(run_pack(pack, interval, &Options::new()).len(), 1);
+    assert!(run_pack(pack, promise, &Options::new()).is_empty());
+}
