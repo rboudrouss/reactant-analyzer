@@ -546,3 +546,52 @@ fn a_pinned_read_is_still_a_capture_for_a_consumer() {
         "`read` closes over `n` even though its own deps pin the call it feeds"
     );
 }
+
+/// ADR-041 §4 asked the behavioral question of a bare name. A closure is just
+/// as often reached through the container a custom hook returned it in
+/// (mantine's `$errors.clearFieldError`), and the container's own freshness
+/// says nothing about what the member closes over.
+#[test]
+fn a_callback_reached_through_a_container_is_behaviorally_stable() {
+    assert_eq!(
+        missing_deps_hits(
+            r#"
+            import { useState, useRef, useCallback } from "react";
+            function C({ step }) {
+              const [n, setN] = useState(0);
+              const r = useRef(0);
+              const bump = useCallback(() => { r.current += 1; }, [n]);
+              const api = { bump };
+              const reset = useCallback(() => { api.bump(); }, []);
+              return <button onClick={() => { setN(n + step); reset(); }} />;
+            }
+            "#,
+        ),
+        0,
+        "`api` is a fresh object every render, but the member it holds closes \
+         over nothing that can change"
+    );
+}
+
+/// And the container case it must not swallow, for the same reason the bare
+/// one must not: the member closes over state.
+#[test]
+fn a_callback_over_state_reached_through_a_container_still_fires() {
+    assert_eq!(
+        missing_deps_hits(
+            r#"
+            import { useState, useCallback } from "react";
+            function C({ step }) {
+              const [n, setN] = useState(0);
+              const log = useCallback(() => { console.log(n); }, [n]);
+              const api = { log };
+              const run = useCallback(() => { api.log(); }, []);
+              return <button onClick={() => { setN(n + step); run(); }} />;
+            }
+            "#,
+        ),
+        1,
+        "`api.log` closes over `n`, so the copy `run` froze at mount logs the \
+         mount-time value"
+    );
+}

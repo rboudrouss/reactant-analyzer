@@ -170,9 +170,22 @@ Re-mesure des 60 scénarios : **8 EXPRESSIBLE (contre 1), 20 INEXPRESSIBLE
   emplacements distincts (5 654 → 5 511 attributions), 21 retirées, aucune
   ajoutée**, toutes vérifiées faux positifs.
 
-  Restent de #89 : l'alias (`const c = x` enregistre tout `x` au lieu des
-  membres que le corps touche) et le rappel atteint *par un conteneur*
-  (`$errors.clearFieldError`) — mesurés respectivement à ~5 et 24 emplacements.
+- **ADR-043** — la quatrième forme de #89 : la chasse aux liaisons prend un
+  *chemin*, pas un nom. Un nom nu est le cas de base ; chaque segment descend
+  dans le champ du seul `ObjectLit` auquel le préfixe est lié, en suivant les
+  alias (`{ bump }` enregistre le membre comme `Var("bump")`, exactement la
+  propagation que fait l'interpréteur). Un conteneur est la façon dont un hook
+  personnalisé rend un rappel : `useFormErrors()` de mantine renvoie cinq
+  `useCallback`, et son appelant lit `$errors.clearFieldError` treize fois. Les
+  deux lecteurs `fn_binding_in` / `callback_binding_in` n'en font plus qu'un,
+  `closure_binding_of`, qui répond aussi *laquelle* des deux orthographes.
+  Corpus : **1 402 → 1 394 emplacements distincts (5 511 → 5 119 attributions),
+  8 retirées, aucune ajoutée** — les 24 annoncées étaient un comptage sur une
+  base plus étroite.
+
+  Reste de #89 : l'alias (`const c = x` enregistre tout `x` au lieu des
+  membres que le corps touche) — ~5 emplacements. La chasse suit les alias, la
+  marche des variables libres ne réécrit pas les chemins qu'elle enregistre.
 
 Prochaines marches, par valeur décroissante : les valeurs d'arguments (#67) ;
 une requête de dominance ; les résumés d'écosystème (#94), seule façon de

@@ -3,14 +3,12 @@ use std::collections::HashSet;
 
 use crate::{
     domains::{impls::StateValue, stores::AbstractEnv},
-    ir::{
-        free_vars::{AccessPath, compute_free_vars, dep_paths, path_covered},
-        types::Var,
-    },
+    ir::free_vars::{AccessPath, compute_free_vars, dep_paths, path_covered},
 };
 
+use crate::ir::bindings::ClosureBinding;
 use crate::rules::helpers::ConvergedEval;
-use crate::rules::{Diagnostic, Rule, fn_lit_binding};
+use crate::rules::{Diagnostic, Rule};
 
 /// Fires when a `useEffect`, `useMemo`, or `useCallback` body captures a free
 /// variable that is not listed in the deps array and is not stable (stale-closure
@@ -77,12 +75,7 @@ impl Rule for MissingDeps {
                 let val = env_exit.lookup(&path.root);
                 if !val.is_stable()
                     && !member_is_stable(path, &env_exit, result)
-                    && !closure_is_behaviorally_stable(
-                        &path.root,
-                        result,
-                        &env_exit,
-                        &mut HashSet::new(),
-                    )
+                    && !closure_is_behaviorally_stable(path, result, &env_exit, &mut HashSet::new())
                 {
                     let mut d = Diagnostic::warn(
                         "missing-deps",
@@ -153,27 +146,27 @@ fn member_is_stable(
 /// Identity-based rules (`always-unstable-deps`, the `infinite-loop` churn
 /// arm) must keep reading PerRender — deps arrays compare by `Object.is`.
 fn closure_is_behaviorally_stable(
-    var: &str,
+    path: &AccessPath,
     result: &crate::engine::AnalysisResult<StateValue>,
     env_exit: &AbstractEnv<StateValue>,
-    seen: &mut HashSet<Var>,
+    seen: &mut HashSet<AccessPath>,
 ) -> bool {
-    if !seen.insert(var.to_string()) {
+    if !seen.insert(path.clone()) {
         // Cycle between closures: recursion only descends through captures
         // whose env value is non-stable *because* they are closures — a cycle
         // adds no new evidence of instability.
         return true;
     }
-    let Some(caps) = closure_captures(var, result) else {
+    let Some(caps) = closure_captures(path, result) else {
         return false;
     };
     for cap in caps {
         // Globals (fetch, console, …) are not in env_exit — same convention
         // as the main loop above.
-        if !env_exit.contains(&cap) {
+        if !env_exit.contains(&cap.root) {
             continue;
         }
-        if env_exit.lookup(&cap).is_stable() {
+        if env_exit.lookup(&cap.root).is_stable() {
             continue;
         }
         if !closure_is_behaviorally_stable(&cap, result, env_exit, seen) {
@@ -183,36 +176,32 @@ fn closure_is_behaviorally_stable(
     true
 }
 
-/// The values a function-valued binding closes over, for either spelling of
-/// one: a bare `FnLit`, or a `useCallback` whose body hook extraction lifted
-/// into the hook table. `useCallback` freezes its captures at deps-change
-/// time, but a frozen copy of a value that cannot change *is* that value — so
-/// the two spellings answer the same behavioral question, and only one of
-/// them used to be asked.
+/// The values the closure this path names closes over — for either spelling of
+/// one (a bare `FnLit`, or a `useCallback` hook extraction lifted into the hook
+/// table), and whether the path reaches it by name or through the container a
+/// custom hook returned it in. `useCallback` freezes its captures at
+/// deps-change time, but a frozen copy of a value that cannot change *is* that
+/// value, so both spellings answer the same behavioral question.
 fn closure_captures(
-    var: &str,
+    path: &AccessPath,
     result: &crate::engine::AnalysisResult<StateValue>,
-) -> Option<HashSet<Var>> {
-    let cfg = &result.render_cfg;
-    if let Some((params, body)) = fn_lit_binding(var, cfg) {
-        let mut caps = compute_free_vars(body);
-        for p in params {
-            caps.remove(p);
+) -> Option<HashSet<AccessPath>> {
+    match crate::ir::bindings::closure_binding_of(&path.root, &path.segments, &result.render_cfg)? {
+        ClosureBinding::Lit { params, body } => {
+            // Roots, not paths: `compute_free_paths` is the read-side walk and
+            // may name less than `compute_free_vars` does. Under-reporting a
+            // capture here would silence a genuine stale closure.
+            let mut caps = compute_free_vars(body);
+            for p in params {
+                caps.remove(p);
+            }
+            Some(caps.into_iter().map(AccessPath::root).collect())
         }
-        return Some(caps);
+        // `free_paths` of a Callback entry already subtracts the callback's own
+        // params (they shadow, they are not captured), and keeps its segments,
+        // so a capture held in a container resolves on the next hop down.
+        ClosureBinding::Callback(label) => Some(result.effect_info.get(&label)?.free_paths.clone()),
     }
-    // `free_paths` of a Callback entry already subtracts the callback's own
-    // params (they shadow, they are not captured).
-    let label = crate::ir::bindings::callback_binding_in(var, cfg)?;
-    Some(
-        result
-            .effect_info
-            .get(&label)?
-            .free_paths
-            .iter()
-            .map(|p| p.root.clone())
-            .collect(),
-    )
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

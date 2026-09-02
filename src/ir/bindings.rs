@@ -5,11 +5,12 @@
 //! when the name cannot mean something else at the call. The two levels here
 //! answer that at two strengths, and consumers pick the one their claim needs:
 //!
-//! - [`fn_binding_in`] — one binding, a function literal, within **one** body.
-//!   The `missing-deps` / `stale-closure` bar: enough to read a callback whose
-//!   binding sits beside its registration.
-//! - [`callback_binding_in`] — the same bar, for the `useCallback` spelling:
-//!   the body lives in the hook table, so this answers the label.
+//! - [`closure_binding_of`] — one binding, a closure, within **one** body,
+//!   naming which of its two spellings it is. The `missing-deps` /
+//!   `stale-closure` bar, and the only reader that takes a *path*: a closure a
+//!   custom hook handed back inside a container is the same binding one hop in.
+//! - [`fn_binding_in`] — that reader narrowed to a bare name and to the
+//!   literal spelling, for consumers that only handle one.
 //! - [`certified_fn_binding`] — the same, plus **no rebinding anywhere below**:
 //!   no `Let` and no `Assign` of that name in any nested function body. What a
 //!   consumer needs before it may *execute* the body and keep the result.
@@ -21,7 +22,7 @@ use std::collections::HashMap;
 
 use crate::ir::{
     cfg::CFG,
-    expr::Expr,
+    expr::{Expr, object_member},
     stmt::Stmt,
     types::{HookLabel, Var},
 };
@@ -45,31 +46,81 @@ pub fn local_bindings(cfg: &CFG) -> HashMap<&str, Vec<&Expr>> {
     map
 }
 
-/// The params and body of the unique `FnLit` bound to `var` in `cfg`, if any.
-/// Conditional or repeated re-binding bails out (`None`): the captured
-/// environment is no longer syntactically certain. Nested bodies are NOT
-/// scanned — see [`certified_fn_binding`] for the stronger reading.
-pub fn fn_binding_in<'c>(var: &str, cfg: &'c CFG) -> Option<(&'c [Var], &'c CFG)> {
-    match sole_binding_in(var, cfg)? {
+/// The two spellings a function-valued binding can have. Hook extraction
+/// rewrites `useCallback(fn, deps)` to `CallbackVal(label)` and lifts `fn` out
+/// of the render CFG, so the second spelling answers a label and a consumer
+/// that wants the body asks the hook table for it.
+pub enum ClosureBinding<'c> {
+    Lit { params: &'c [Var], body: &'c CFG },
+    Callback(HookLabel),
+}
+
+/// The unique closure the path `root.segments…` names in `cfg`, if any.
+///
+/// A bare name is the base case; each segment steps into the field of the sole
+/// `ObjectLit` the prefix is bound to. That step is the whole point: a custom
+/// hook that returns `{ clearFieldError }` hands its caller exactly the closure
+/// a bare `const clearFieldError = useCallback(…)` would have, and the question
+/// asked of it is the same one.
+///
+/// Conditional or repeated re-binding bails out (`None`) at every hop: the
+/// captured environment is no longer syntactically certain. Nested bodies are
+/// NOT scanned — see [`certified_fn_binding`] for the stronger reading.
+pub fn closure_binding_of<'c>(
+    root: &str,
+    segments: &[String],
+    cfg: &'c CFG,
+) -> Option<ClosureBinding<'c>> {
+    let mut cur = chase_var(root, cfg)?;
+    for seg in segments {
+        let Expr::ObjectLit { fields, .. } = cur else {
+            return None;
+        };
+        cur = match object_member(fields, seg)?.peel_ts() {
+            Expr::Var(v) => chase_var(v, cfg)?,
+            e => e,
+        };
+    }
+    match cur {
         Expr::FnLit {
             params, body_cfg, ..
-        } => Some((params, body_cfg)),
+        } => Some(ClosureBinding::Lit {
+            params,
+            body: body_cfg,
+        }),
+        Expr::CallbackVal(l) => Some(ClosureBinding::Callback(*l)),
         _ => None,
     }
 }
 
-/// The hook label of the unique `useCallback` bound to `var` in `cfg`.
-///
-/// The same question as [`fn_binding_in`], for the other spelling of a
-/// function-valued binding: hook extraction rewrites `useCallback(fn, deps)`
-/// to `CallbackVal(label)` and lifts `fn` out of the render CFG, so a
-/// consumer that wants the body asks the hook table for this label.
-pub fn callback_binding_in(var: &str, cfg: &CFG) -> Option<HookLabel> {
-    match sole_binding_in(var, cfg)? {
-        Expr::CallbackVal(l) => Some(*l),
-        _ => None,
+/// The params and body of the unique `FnLit` bound to `var` in `cfg`, if any —
+/// [`closure_binding_of`] for a bare name, narrowed to the literal spelling.
+pub fn fn_binding_in<'c>(var: &str, cfg: &'c CFG) -> Option<(&'c [Var], &'c CFG)> {
+    match closure_binding_of(var, &[], cfg)? {
+        ClosureBinding::Lit { params, body } => Some((params, body)),
+        ClosureBinding::Callback(_) => None,
     }
 }
+
+/// [`sole_binding_in`] followed through aliases: `{ bump }` records the member
+/// as `Var("bump")`, so a chase that stopped at the first right-hand side would
+/// see a name where the value is. The same propagation the interpreter does
+/// when it binds a right-hand side, and bounded because a certain binding chain
+/// is finite anyway.
+fn chase_var<'c>(var: &str, cfg: &'c CFG) -> Option<&'c Expr> {
+    let mut cur = sole_binding_in(var, cfg)?;
+    for _ in 0..MAX_ALIAS_HOPS {
+        let Expr::Var(next) = cur else {
+            return Some(cur);
+        };
+        cur = sole_binding_in(next, cfg)?;
+    }
+    None
+}
+
+/// Alias hops a chase will follow before giving up. A real chain is one or two
+/// (`{ bump }`, a destructuring preamble); the bound only stops a cycle.
+const MAX_ALIAS_HOPS: usize = 8;
 
 /// The single right-hand side `var` is bound to in `cfg`, `None` when it is
 /// bound zero times or more than once. Conditional or repeated re-binding is

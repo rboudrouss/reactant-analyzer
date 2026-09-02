@@ -23,6 +23,14 @@ pub struct AccessPath {
 }
 
 impl AccessPath {
+    /// The bare-root path for a variable — `x` with no segments.
+    pub fn root(root: Var) -> Self {
+        Self {
+            root,
+            segments: Vec::new(),
+        }
+    }
+
     /// The `Expr` this path reads: `Var(root)` wrapped in one `FieldAccess`
     /// per segment. Lets a rule evaluate the *member actually read* through
     /// the normal expression evaluator instead of settling for the root's

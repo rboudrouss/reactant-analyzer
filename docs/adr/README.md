@@ -44,3 +44,4 @@
 | [ADR-040](ADR-040-the-longest-stable-prefix.md) | A read is stale only when every handle on its path can change — `missing-deps` asks every prefix, not just the root and the whole path (686 corpus findings, the residual of #88) | Accepted |
 | [ADR-041](ADR-041-what-a-dynamic-index-hides-and-the-two-spellings-of-a-closure.md) | What a dynamic index hides, and the two spellings of a closure — a computed access keeps the chain above it, and behavioral stability resolves a `useCallback` (#89 §3/§4) | Accepted |
 | [ADR-042](ADR-042-a-dep-that-is-the-read.md) | A dep that *is* the read — a sub-expression named verbatim in the deps array pins the reads under it, and a lossy surrogate pins nothing (#89 §1) | Accepted |
+| [ADR-043](ADR-043-a-closure-reached-through-a-container.md) | A closure reached through a container is still a closure — the binding chase takes a path, and the two spellings become one reader (#89, the container half of ADR-041 §4) | Accepted |

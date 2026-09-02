@@ -121,10 +121,10 @@ Every entry here is Warning-or-below by construction: an FP never carries an Err
   `[JSON.stringify(options)]` does not declare a read of `options`, since `options` can move while
   its serialization stands still
   [ADR-042](adr/ADR-042-a-dep-that-is-the-read.md).
-- **A callback reached through a container** (`$errors.clearFieldError`) is not yet asked the
-  behavioral-stability question the bare name is asked: the path's root is an object, and resolving a
-  member back to the closure it names is a separate mechanism. 24 corpus locations wait on it
-  [#89](https://github.com/rboudrouss/reactant-analyzer/issues/89).
+- **An alias hides which members a body touches**: `const condition = performanceCondition` records a
+  read of the whole aliased object, so a dep naming one of its members does not cover it. The binding
+  chase follows aliases, the free-variable walk does not rewrite the paths it records. ~5 corpus
+  locations [#89](https://github.com/rboudrouss/reactant-analyzer/issues/89).
 - **`setter-in-render`** warns when a setter reaches a callee with no timing summary
   (`<form onSubmit={handleSubmit(onSubmit)}>`, `composeEventHandlers(a, cb)`): ⊤ includes the render
   pass, so the row is sound and the wording says so — it never claims the setter was called in the
