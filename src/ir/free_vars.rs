@@ -85,10 +85,52 @@ pub fn compute_free_vars(cfg: &CFG) -> HashSet<Var> {
 /// The root-variable set matches [`compute_free_vars`] exactly; this only adds
 /// the field-chain suffix so `missing-deps` can distinguish `x.a` from `x.b`.
 pub fn compute_free_paths(cfg: &CFG) -> HashSet<AccessPath> {
-    let mut used: HashSet<AccessPath> = HashSet::new();
-    cfg.for_each_expr(&mut |e| collect_used_paths(e, &mut used));
+    compute_free_paths_pinned(cfg, &[])
+}
 
-    // Locally-defined roots are bound, not free (matches `compute_free_vars`).
+/// The body's free paths, and the subset of them the deps array already
+/// **pins**: reads that occur *only* inside a sub-expression appearing
+/// verbatim in `deps`.
+///
+/// Such a sub-expression is compared by the deps array itself — the hook is
+/// recreated whenever its value changes, so the body's evaluation of it can
+/// never disagree with the current one. `useCallback(() => …
+/// searchParams.get("sort") …, [queryParams, searchParams.get("sort")])`
+/// reads nothing undeclared.
+///
+/// **Verbatim is the whole of the claim.** `[JSON.stringify(o)]` does not pin
+/// a bare `o`: a serialization is lossy, so `o` can move while the dep stands
+/// still, and crediting it would be a false negative.
+///
+/// The two sets are returned apart because they answer different questions.
+/// *This* hook cannot go stale on a pinned read; a **consumer** of the value
+/// this hook produces still holds one, so the capture set it reasons about is
+/// the full `free_paths`.
+pub fn free_paths_and_pinned(
+    cfg: &CFG,
+    deps: &[Expr],
+) -> (HashSet<AccessPath>, HashSet<AccessPath>) {
+    let all = compute_free_paths(cfg);
+    if deps.iter().filter_map(pure_key).next().is_none() {
+        return (all, HashSet::new());
+    }
+    let unpinned = compute_free_paths_pinned(cfg, deps);
+    let pinned = all.difference(&unpinned).cloned().collect();
+    (all, pinned)
+}
+
+fn compute_free_paths_pinned(cfg: &CFG, pinned: &[Expr]) -> HashSet<AccessPath> {
+    let keys: HashSet<String> = pinned.iter().filter_map(pure_key).collect();
+    let mut used: HashSet<AccessPath> = HashSet::new();
+    cfg.for_each_expr(&mut |e| collect_paths(e, &keys, &mut used));
+
+    subtract_local_definitions(cfg, &mut used);
+    used
+}
+
+/// Drop the paths rooted at a name this body binds: locally-defined roots are
+/// bound, not free (matches [`compute_free_vars`]).
+fn subtract_local_definitions(cfg: &CFG, used: &mut HashSet<AccessPath>) {
     let mut defined: HashSet<Var> = HashSet::new();
     for block in cfg.blocks.values() {
         for stmt in &block.stmts {
@@ -97,9 +139,7 @@ pub fn compute_free_paths(cfg: &CFG) -> HashSet<AccessPath> {
             }
         }
     }
-
     used.retain(|p| !defined.contains(&p.root));
-    used
 }
 
 /// Access paths *declared* by a deps array. A dep with a dynamic index
@@ -165,6 +205,16 @@ fn extract_path<'e>(e: &'e Expr, side: &mut Vec<&'e Expr>) -> Option<(Var, Vec<S
 /// Collect the access paths read by a single expression (the per-`Expr`
 /// kernel of [`compute_free_paths`]; no local-definition subtraction).
 pub fn collect_used_paths(expr: &Expr, out: &mut HashSet<AccessPath>) {
+    collect_paths(expr, &HashSet::new(), out);
+}
+
+/// The kernel of [`collect_used_paths`], carrying the set of deps-pinned
+/// canonical keys down the walk — into nested closures too, since a read is
+/// pinned wherever in the body it sits.
+fn collect_paths(expr: &Expr, pinned: &HashSet<String>, out: &mut HashSet<AccessPath>) {
+    if !pinned.is_empty() && pure_key(expr).is_some_and(|k| pinned.contains(&k)) {
+        return;
+    }
     match expr {
         // Member chains are read whole by `extract_path` (which peels
         // TSAnnotated and records the maximal chain), recursing only into the
@@ -175,7 +225,7 @@ pub fn collect_used_paths(expr: &Expr, out: &mut HashSet<AccessPath>) {
                 out.insert(AccessPath { root, segments });
             }
             for s in side {
-                collect_used_paths(s, out);
+                collect_paths(s, pinned, out);
             }
         }
         // `for_each_child` does not cross `FnLit`; the capture set is the
@@ -183,12 +233,41 @@ pub fn collect_used_paths(expr: &Expr, out: &mut HashSet<AccessPath>) {
         Expr::FnLit {
             params, body_cfg, ..
         } => {
-            let inner = compute_free_paths(body_cfg);
+            let mut inner: HashSet<AccessPath> = HashSet::new();
+            body_cfg.for_each_expr(&mut |e| collect_paths(e, pinned, &mut inner));
+            subtract_local_definitions(body_cfg, &mut inner);
             out.extend(inner.into_iter().filter(|p| !params.contains(&p.root)));
         }
         // Everything else: structural descent via the canonical child walker.
-        _ => expr.for_each_child(&mut |c| collect_used_paths(c, out)),
+        _ => expr.for_each_child(&mut |c| collect_paths(c, pinned, out)),
     }
+}
+
+/// A canonical spelling of a *pure read* — variables, member chains, operators
+/// and calls over them. `None` for anything whose value is a fresh allocation
+/// or a body no spelling can compare (`FnLit`, object/array literals, JSX,
+/// hook markers): those are never the same read twice.
+fn pure_key(e: &Expr) -> Option<String> {
+    Some(match e.peel_ts() {
+        Expr::Lit(p) => format!("#{p:?}"),
+        Expr::Var(v) => v.clone(),
+        Expr::FieldAccess { obj, field } => format!("{}.{field}", pure_key(obj)?),
+        Expr::IndexAccess { arr, idx } => format!("{}[{}]", pure_key(arr)?, pure_key(idx)?),
+        Expr::UnaryOp { op, arg } => format!("{op:?}({})", pure_key(arg)?),
+        Expr::BinOp { op, lhs, rhs } => {
+            format!("({} {op:?} {})", pure_key(lhs)?, pure_key(rhs)?)
+        }
+        Expr::Call { fn_, args } => {
+            let mut s = format!("{}(", pure_key(fn_)?);
+            for a in args {
+                s.push_str(&pure_key(a)?);
+                s.push(',');
+            }
+            s.push(')');
+            s
+        }
+        _ => return None,
+    })
 }
 
 pub fn collect_used_vars(expr: &Expr, out: &mut HashSet<Var>) {

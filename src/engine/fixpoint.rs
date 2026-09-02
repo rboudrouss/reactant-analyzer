@@ -11,7 +11,7 @@ use crate::{
         cfg::CFG,
         component::{ComponentIR, ModuleConstInit},
         expr::{Expr, SummaryValue},
-        free_vars::{compute_free_paths, compute_free_vars},
+        free_vars::{compute_free_vars, free_paths_and_pinned},
         hooks::HookEntry,
         stmt::Stmt,
         types::{BlockId, HookLabel, Var},
@@ -1267,53 +1267,64 @@ fn collect_effect_info(hooks: &[HookEntry]) -> HashMap<HookLabel, EffectInfo> {
                 body_cfg,
                 deps,
                 span,
-            } => Some((
-                *label,
-                EffectInfo {
-                    label: *label,
-                    kind: HookKind::Effect,
-                    free_paths: compute_free_paths(body_cfg),
-                    deps: deps.clone(),
-                    span: *span,
-                },
-            )),
+            } => {
+                let (free_paths, deps_pinned) = free_paths_and_pinned(body_cfg, &deps.covering());
+                Some((
+                    *label,
+                    EffectInfo {
+                        label: *label,
+                        kind: HookKind::Effect,
+                        free_paths,
+                        deps_pinned,
+                        deps: deps.clone(),
+                        span: *span,
+                    },
+                ))
+            }
             HookEntry::Memo {
                 label,
                 body_cfg,
                 deps,
                 span,
-            } => Some((
-                *label,
-                EffectInfo {
-                    label: *label,
-                    kind: HookKind::Memo,
-                    free_paths: compute_free_paths(body_cfg),
-                    deps: deps.clone(),
-                    span: *span,
-                },
-            )),
+            } => {
+                let (free_paths, deps_pinned) = free_paths_and_pinned(body_cfg, &deps.covering());
+                Some((
+                    *label,
+                    EffectInfo {
+                        label: *label,
+                        kind: HookKind::Memo,
+                        free_paths,
+                        deps_pinned,
+                        deps: deps.clone(),
+                        span: *span,
+                    },
+                ))
+            }
             HookEntry::Callback {
                 label,
                 body_cfg,
                 params,
                 deps,
                 span,
-            } => Some((
-                *label,
-                EffectInfo {
-                    label: *label,
-                    kind: HookKind::Callback,
-                    free_paths: {
-                        // The callback's own params are bound, not captured
-                        // (they shadow any same-named outer binding).
-                        let mut fp = compute_free_paths(body_cfg);
-                        fp.retain(|p| !params.contains(&p.root));
-                        fp
+            } => {
+                let (mut free_paths, mut deps_pinned) =
+                    free_paths_and_pinned(body_cfg, &deps.covering());
+                // The callback's own params are bound, not captured (they
+                // shadow any same-named outer binding).
+                free_paths.retain(|p| !params.contains(&p.root));
+                deps_pinned.retain(|p| !params.contains(&p.root));
+                Some((
+                    *label,
+                    EffectInfo {
+                        label: *label,
+                        kind: HookKind::Callback,
+                        free_paths,
+                        deps_pinned,
+                        deps: deps.clone(),
+                        span: *span,
                     },
-                    deps: deps.clone(),
-                    span: *span,
-                },
-            )),
+                ))
+            }
             _ => None,
         })
         .collect()

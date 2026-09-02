@@ -478,3 +478,71 @@ fn a_use_callback_over_state_still_fires() {
          mount-time value"
     );
 }
+
+/// #89 shape 1, the sound half — a dep that IS the read. The deps array
+/// compares `searchParams.get("sort")` itself, so the body's evaluation of
+/// that same expression can never disagree with the current one
+/// (dub `events-tabs.tsx:52`).
+#[test]
+fn a_dep_naming_the_call_verbatim_pins_it() {
+    assert_eq!(
+        missing_deps_hits(
+            r#"
+            import { useCallback } from "react";
+            function C({ searchParams, queryParams }) {
+              const onClick = useCallback(() => {
+                const sort = searchParams.get("sort");
+                queryParams({ del: sort });
+              }, [queryParams, searchParams.get("sort")]);
+              return <button onClick={onClick} />;
+            }
+            "#,
+        ),
+        0
+    );
+}
+
+/// The line the claim stops at: verbatim, and nothing looser. A serialization
+/// is lossy, so `options` can move while `JSON.stringify(options)` stands
+/// still — crediting it would be a false negative.
+#[test]
+fn a_lossy_surrogate_in_deps_does_not_pin_the_value() {
+    assert_eq!(
+        missing_deps_hits(
+            r#"
+            import { useEffect } from "react";
+            function C({ options, init }) {
+              useEffect(() => {
+                init(options);
+              }, [init, JSON.stringify(options)]);
+              return <div />;
+            }
+            "#,
+        ),
+        1,
+        "the effect reads `options` itself, which its stringification does not pin"
+    );
+}
+
+/// A dep pins the read for *this* hook only: a consumer of the value it
+/// produces still holds a closure over that read, so the capture set must keep
+/// it. (`a_use_callback_over_state_still_fires` is the same guard from the
+/// other side.)
+#[test]
+fn a_pinned_read_is_still_a_capture_for_a_consumer() {
+    assert_eq!(
+        missing_deps_hits(
+            r#"
+            import { useState, useCallback } from "react";
+            function C({ step, searchParams }) {
+              const [n, setN] = useState(0);
+              const read = useCallback(() => searchParams.get(n), [searchParams.get(n)]);
+              const run = useCallback(() => { read(); }, []);
+              return <button onClick={() => { setN(n + step); run(); }} />;
+            }
+            "#,
+        ),
+        1,
+        "`read` closes over `n` even though its own deps pin the call it feeds"
+    );
+}

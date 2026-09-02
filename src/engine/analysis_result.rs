@@ -103,6 +103,12 @@ pub struct EffectInfo {
     /// member-chain granular (`x.a`, not just `x`) so `missing-deps` matches
     /// a dep against the exact field used (TODO.md F1b).
     pub free_paths: HashSet<AccessPath>,
+    /// The subset of `free_paths` that occurs *only* inside a sub-expression
+    /// the deps array names verbatim — `searchParams.get` where the list holds
+    /// `searchParams.get("sort")`. Covered by construction, and kept apart from
+    /// `free_paths` because a consumer of this hook's value asks the other
+    /// question: what the closure *holds* still includes a pinned read.
+    pub deps_pinned: HashSet<AccessPath>,
     /// Deps argument as the IR could read it — see [`DepsArg`], whose three
     /// states are three different facts. One field rather than a list plus a
     /// present-flag: the two could disagree, and the reading they used to
@@ -143,9 +149,7 @@ impl EffectInfo {
     /// `rows`, so crediting the source would silence a stale capture. The
     /// elements written beside the spread still cover their own reads.
     pub fn covering_deps(&self) -> std::borrow::Cow<'_, [Expr]> {
-        self.deps
-            .list()
-            .map_or(std::borrow::Cow::Borrowed(&[][..]), DepsList::covering)
+        self.deps.covering()
     }
 
     /// How many dependencies the source array declares, when the engine knows.

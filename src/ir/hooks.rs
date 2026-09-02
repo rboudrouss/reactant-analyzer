@@ -126,6 +126,14 @@ impl DepsArg {
         }
     }
 
+    /// The entries that actually cover a read — [`DepsList::covering`], empty
+    /// when no list was written. What a *suppression* must ask for: a
+    /// flattened `[...rows]` declares `rows[0], rows[1], …`, never `rows`.
+    pub fn covering(&self) -> std::borrow::Cow<'_, [Expr]> {
+        self.list()
+            .map_or(std::borrow::Cow::Borrowed(&[][..]), DepsList::covering)
+    }
+
     /// The written list, when there is one to read.
     pub fn list(&self) -> Option<&DepsList> {
         match self {

@@ -115,6 +115,12 @@ Every entry here is Warning-or-below by construction: an FP never carries an Err
   covers it and a dep naming something below it does not. On the *dep* side a computed access still
   declares nothing — `[x.a[i]]` pins the element, not the container
   [ADR-041](adr/ADR-041-what-a-dynamic-index-hides-and-the-two-spellings-of-a-closure.md).
+- **A deps entry that is not a plain path** (`[searchParams.get("sort")]`,
+  `[excludedPayoutIds.join(",")]`) covers the reads that occur *only* inside it, because the deps
+  array compares that expression's value itself. A **lossy** surrogate covers nothing:
+  `[JSON.stringify(options)]` does not declare a read of `options`, since `options` can move while
+  its serialization stands still
+  [ADR-042](adr/ADR-042-a-dep-that-is-the-read.md).
 - **A callback reached through a container** (`$errors.clearFieldError`) is not yet asked the
   behavioral-stability question the bare name is asked: the path's root is an object, and resolving a
   member back to the closure it names is a separate mechanism. 24 corpus locations wait on it

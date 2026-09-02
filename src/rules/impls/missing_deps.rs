@@ -61,7 +61,7 @@ impl Rule for MissingDeps {
             let declared: Vec<AccessPath> = dep_paths(&info.covering_deps());
 
             for path in &info.free_paths {
-                if path_covered(path, &declared) {
+                if path_covered(path, &declared) || info.deps_pinned.contains(path) {
                     continue;
                 }
                 // Globals (fetch, console, …) are not in env_exit → skip.
@@ -280,6 +280,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Effect,
+                deps_pinned: HashSet::new(),
                 free_paths: fp(&["n"]),
                 deps: DepsArg::List(DepsList::exact(vec![Expr::Lit(Prim::Bool(true))])),
                 span: None,
@@ -305,6 +306,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Effect,
+                deps_pinned: HashSet::new(),
                 free_paths: fp(&["setN"]),
                 deps: DepsArg::List(DepsList::exact(vec![Expr::Lit(Prim::Unit)])),
                 span: None,
@@ -332,6 +334,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Effect,
+                deps_pinned: HashSet::new(),
                 free_paths: fp(&["n"]),
                 deps: DepsArg::List(DepsList::exact(vec![Expr::Var("n".to_string())])),
                 span: None,
@@ -361,6 +364,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Effect,
+                deps_pinned: HashSet::new(),
                 free_paths: HashSet::from([AccessPath {
                     root: "memo".to_string(),
                     segments: vec!["content".to_string()],
@@ -397,6 +401,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Effect,
+                deps_pinned: HashSet::new(),
                 free_paths: HashSet::from([AccessPath {
                     root: "memo".to_string(),
                     segments: vec!["a".to_string()],
@@ -430,6 +435,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Effect,
+                deps_pinned: HashSet::new(),
                 free_paths: HashSet::from([AccessPath {
                     root: "memo".to_string(),
                     segments: vec!["a".to_string()],
@@ -462,6 +468,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Effect,
+                deps_pinned: HashSet::new(),
                 free_paths: fp(&["other"]),
                 deps: DepsArg::List(DepsList::exact(vec![Expr::FieldAccess {
                     obj: Box::new(Expr::Var("memo".to_string())),
@@ -493,6 +500,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Effect,
+                deps_pinned: HashSet::new(),
                 free_paths: fp(&["n"]),
                 deps: DepsArg::Absent,
                 span: None,
@@ -523,6 +531,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Effect,
+                deps_pinned: HashSet::new(),
                 free_paths: fp(&["n"]),
                 deps: DepsArg::List(DepsList::exact(vec![])),
                 span: None,
@@ -552,6 +561,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Effect,
+                deps_pinned: HashSet::new(),
                 free_paths: fp(&["x"]),
                 deps: DepsArg::List(DepsList::exact(vec![Expr::Lit(Prim::Unit)])),
                 span: None,
@@ -575,6 +585,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Callback,
+                deps_pinned: HashSet::new(),
                 free_paths: fp(&["n"]),
                 deps: DepsArg::List(DepsList::exact(vec![])),
                 span: None,
@@ -605,6 +616,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Memo,
+                deps_pinned: HashSet::new(),
                 free_paths: fp(&["n"]),
                 deps: DepsArg::List(DepsList::exact(vec![])),
                 span: None,
@@ -634,6 +646,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Callback,
+                deps_pinned: HashSet::new(),
                 free_paths: fp(&["n"]),
                 deps: DepsArg::List(DepsList::exact(vec![Expr::Var("n".to_string())])),
                 span: None,
@@ -661,6 +674,7 @@ mod tests {
             EffectInfo {
                 label: 0,
                 kind: HookKind::Effect,
+                deps_pinned: HashSet::new(),
                 free_paths: fp(&["fetch"]),
                 deps: DepsArg::List(DepsList::exact(vec![Expr::Lit(Prim::Unit)])),
                 span: None,
