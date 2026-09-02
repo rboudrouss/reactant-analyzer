@@ -349,3 +349,92 @@ export function Parent() {
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(diags[0].rule, "cross-component-infinite-loop");
 }
+
+// ── #117: the await phase boundary, and the IIFE the effect awaits inside ────
+
+fn writer_phases(src: &str, component: &str) -> Vec<WriterPhase> {
+    let r = parse_and_analyze(src);
+    let mut v: Vec<WriterPhase> = comp(&r, component)
+        .slot_writers
+        .iter()
+        .map(|w| w.phase)
+        .collect();
+    v.sort_by_key(|p| format!("{p:?}"));
+    v
+}
+
+/// The canonical way to await inside an effect. Before #117 the write read as
+/// `effect` — synchronous — because lowering erased the `await` outright, and
+/// `sync_phase`'s "lexis = execution, provably" is false past one.
+#[test]
+fn a_write_after_an_await_classifies_deferred() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ url, load }) {
+  const [data, setData] = useState(null);
+  useEffect(() => {
+    (async () => { const r = await load(url); setData(r); })();
+  }, [url, load]);
+  return <div>{data}</div>;
+}
+"#;
+    assert_eq!(writer_phases(src, "C"), vec![WriterPhase::Deferred]);
+}
+
+/// …and it is the same answer the `.then` spelling of the same code already
+/// gave. The two spellings agreeing is the point of the split.
+#[test]
+fn the_then_spelling_of_the_same_write_agrees() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ url, load }) {
+  const [data, setData] = useState(null);
+  useEffect(() => { load(url).then((r) => setData(r)); }, [url, load]);
+  return <div>{data}</div>;
+}
+"#;
+    assert_eq!(writer_phases(src, "C"), vec![WriterPhase::Deferred]);
+}
+
+/// A write BEFORE the first await keeps its region's phase — the split defers
+/// what follows it, not the whole body.
+#[test]
+fn a_write_before_the_await_keeps_the_effect_phase() {
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ url, load }) {
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    (async () => { setBusy(true); await load(url); })();
+  }, [url, load]);
+  return <div>{busy}</div>;
+}
+"#;
+    assert_eq!(writer_phases(src, "C"), vec![WriterPhase::Effect]);
+}
+
+/// An immediately-invoked function expression runs at its call site, in the
+/// caller's phase. The walk descended a *named* local helper and not this one,
+/// so every write inside an IIFE was missing from the relation entirely — a
+/// false negative, and the reason the await split bought nothing on its own.
+#[test]
+fn an_iife_body_is_walked_like_a_named_helper() {
+    let iife = r#"
+import { useState, useEffect } from 'react';
+export function C({ url }) {
+  const [data, setData] = useState(null);
+  useEffect(() => { (() => { setData(url); })(); }, [url]);
+  return <div>{data}</div>;
+}
+"#;
+    let named = r#"
+import { useState, useEffect } from 'react';
+export function C({ url }) {
+  const [data, setData] = useState(null);
+  useEffect(() => { const go = () => { setData(url); }; go(); }, [url]);
+  return <div>{data}</div>;
+}
+"#;
+    assert_eq!(writer_phases(iife, "C"), vec![WriterPhase::Effect]);
+    assert_eq!(writer_phases(iife, "C"), writer_phases(named, "C"));
+}

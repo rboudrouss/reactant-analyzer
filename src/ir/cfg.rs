@@ -24,12 +24,18 @@ pub enum Terminator {
     Unreachable,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EdgeKind {
     Unconditional,
     IfTrue,
     IfFalse,
     Back,
+    /// The split at an `await` (#117, ADR-035). Control is the same — the edge
+    /// is unconditional — but the successor runs on a later turn of the event
+    /// loop, so `sync_phase`'s "lexis = execution, provably" stops holding
+    /// across it. Consumers ask [`CFG::post_await_blocks`] rather than reading
+    /// this variant directly.
+    Await,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +84,41 @@ impl CFG {
                 Terminator::Jump(_) | Terminator::Unreachable => {}
             }
         }
+    }
+
+    /// Blocks whose execution is separated from the entry by at least one
+    /// `await` in THIS body (#117).
+    ///
+    /// The reachable closure from every `Await` edge's target, so a loop whose
+    /// body awaits marks its own header — the second iteration does run after a
+    /// suspension. Empty for a body with no `await`, which is the common case
+    /// and costs one `edges` scan to find out.
+    ///
+    /// Nested function bodies are separate CFGs and answer for themselves: an
+    /// `await` in a callback does not defer the caller's later statements.
+    pub fn post_await_blocks(&self) -> std::collections::HashSet<BlockId> {
+        let mut out = std::collections::HashSet::new();
+        let seeds: Vec<BlockId> = self
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Await)
+            .map(|e| e.to)
+            .collect();
+        if seeds.is_empty() {
+            return out;
+        }
+        let mut queue: std::collections::VecDeque<BlockId> = seeds.into_iter().collect();
+        while let Some(b) = queue.pop_front() {
+            if !out.insert(b) {
+                continue;
+            }
+            for succ in self.successors(b) {
+                if !out.contains(&succ) {
+                    queue.push_back(succ);
+                }
+            }
+        }
+        out
     }
 
     /// Blocks reachable from [`Self::entry`] by following edges.

@@ -562,7 +562,20 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
             value
         }
         Expression::ClassExpression(class) => lower_class(class, builder),
-        Expression::AwaitExpression(aw) => lower_expr(&aw.argument, builder),
+        // `await` splits the block (#117, ADR-035). The value is still the
+        // awaited argument — nothing about the DATA flow changes — but the
+        // statement being lowered, and every statement after it, execute on a
+        // later turn of the event loop. Sealing here puts them in the successor,
+        // which is what lets the writer walk stamp them `deferred` instead of
+        // claiming, falsely, that lexis is execution.
+        //
+        // The split is skipped when the current block is already sealed: a
+        // `return await f()` has nothing left to defer.
+        Expression::AwaitExpression(aw) => {
+            let value = lower_expr(&aw.argument, builder);
+            builder.split_at_await();
+            value
+        }
         Expression::YieldExpression(y) => y
             .argument
             .as_ref()

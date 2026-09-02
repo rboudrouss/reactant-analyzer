@@ -35,9 +35,11 @@ An audit of the code against the records found, and this ADR relies on:
 - The splice-salt ↔ `InlineOrigin` correspondence is incidental, not an
   invariant: the origin is pushed before `splice_one_call`, which can
   early-return without consuming a salt (`fixpoint.rs:1362-1381`).
-- Lowering **erases `await`** (`expr_lower.rs:541` lowers `AwaitExpression`
-  to its argument), so a post-await continuation is not representable in the
-  IR today.
+- Lowering **erases `await`** (`expr_lower.rs` lowers `AwaitExpression` to its
+  argument), so a post-await continuation is not representable in the IR today.
+  **Discharged 2026-09-02 by [ADR-035](ADR-035-await-phase-boundary.md) (#117):**
+  the expression now splits the block across an `Await` edge, and the successor
+  classifies `Deferred`.
 - `expand_utility_calls` runs exactly once, **before**
   `expand_custom_hooks` (`fixpoint.rs:180-205`): a utility called inside a
   custom hook's body is never inlined.
@@ -106,6 +108,11 @@ bound to a literal in the same body takes the summary too.
 while lowering erases `await`. The gate is recorded for the #61/#62 rule
 proposals, same shape as ADR-023 §4's truncation gate — no phase summary may
 pretend to answer it meanwhile.
+
+**Gate discharged 2026-09-02 ([ADR-035](ADR-035-await-phase-boundary.md), #117).**
+Lowering splits the block at an `await`, so the fact is representable and the
+successor classifies `Deferred`. `sync_phase`'s "lexis = execution, provably" is
+true again.
 
 ### 3. Utility import resolution becomes fail-closed — prerequisite, not option
 
@@ -189,7 +196,8 @@ wrapper-enforcement story is the user demand that deferral was waiting for.
 
 ## Limitations
 
-- Post-await writes read as synchronous (IR gate, recorded for #61/#62).
+- ~~Post-await writes read as synchronous (IR gate, recorded for #61/#62).~~
+  Discharged 2026-09-02 by [ADR-035](ADR-035-await-phase-boundary.md).
 - Expression-position wrapper calls (#52) and utilities inside custom-hook
   bodies are invisible to the provenance relation; the tranche-0 measurement
   decides whether #52 is promoted to a prerequisite.

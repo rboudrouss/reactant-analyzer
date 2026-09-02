@@ -898,13 +898,13 @@ fn catalogue() -> Vec<Entry> {
                     "import { useState, useEffect } from \"react\";\nfunction C({ url }) {\n  const [data, setData] = useState(null);\n  useEffect(() => { setData(url); }, [url]);\n  return <div>{data}</div>;\n}",
                 ),
                 weakened: Some(
-                    "proven timer/microtask/promise-continuation writes only: a post-await \
-                     write still reads as sync (lowering erases `AwaitExpression` — the IR \
-                     gate recorded in ADR-027 §2, lifted by #117), ⊤-phase rows satisfy the \
-                     query, there is no cancellation-guard fact so an AbortController-guarded \
-                     write fires too, and `deferred` matches `then`/`catch`/`finally` by \
-                     method name, so a same-named method on a non-Promise receiver fires as \
-                     well — all FP-side. #62 (the native Tier-2 rule) is unaffected",
+                    "proven deferred writes: timers, microtasks, promise continuations, \
+                     and — since #117 — anything lexically after an `await` in the same \
+                     body. ⊤-phase rows satisfy the query, there is no cancellation-guard \
+                     fact so an AbortController-guarded write fires too, and `deferred` \
+                     matches `then`/`catch`/`finally` by method name, so a same-named method \
+                     on a non-Promise receiver fires as well — all FP-side. #62 (the native \
+                     Tier-2 rule) is unaffected",
                 ),
             },
         },
@@ -924,8 +924,9 @@ fn catalogue() -> Vec<Entry> {
                      deferred continuation are a genuine pair the relation cannot see at all, \
                      since a non-sync row carries no block to reason about; a write in \
                      another handler is correctly not a pair, being another tick; and a \
-                     post-await write still reads as sync (the IR gate recorded in ADR-027 \
-                     §2), so the async half of #61 is not covered. `functional` is \
+                     post-await write now classifies `deferred` (#117), which puts it in the \
+                     first case rather than the third — two writes in one continuation are \
+                     still a pair the relation cannot see. `functional` is \
                      claimed only for an inline `FnLit` or a variable bound exactly once to \
                      one, so a shape the walk cannot resolve fires — the may direction. A \
                      shape-functional updater that ignores its `prev` parameter and reads the \

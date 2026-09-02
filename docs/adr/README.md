@@ -36,3 +36,4 @@
 | [ADR-032](ADR-032-context-consumers-relation.md) | The `context_consumers` relation — an absence is only as good as the paths you can see (the two ancestry gates) | Accepted |
 | [ADR-033](ADR-033-binding-chase-exactness.md) | The binding chase carries an exactness bit and a per-branch cycle guard — a widened path may not support a must-claim (#120) | Accepted |
 | [ADR-034](ADR-034-registration-relation.md) | The registration relation and one registrar table — the phase summary ADR-027 §2 promised, the registration↔teardown pairing fact, and a teardown that no longer reads as an invocation (#111) | Accepted |
+| [ADR-035](ADR-035-await-phase-boundary.md) | The `await` phase boundary — a block split on an `Await` edge, and the IIFE whose body the writer walk never entered (#117) | Accepted |

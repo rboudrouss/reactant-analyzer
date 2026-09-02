@@ -508,6 +508,12 @@ impl WriterRegion {
 
     /// The phase of a write that runs synchronously in this region — there,
     /// lexis = execution, provably.
+    ///
+    /// That claim was false past an `await` until #117: lowering erased the
+    /// expression, so a post-await write kept its region's sync phase. The walk
+    /// now switches to `Deferred` on entering a post-await block
+    /// ([`CFG::post_await_blocks`]), so the callers of this function really do
+    /// run synchronously.
     fn sync_phase(self) -> WriterPhase {
         match self {
             WriterRegion::Render => WriterPhase::Render,
@@ -1213,12 +1219,25 @@ impl<'a> SetterWalk<'a> {
         // 0..N times per tick, whichever CFG the loop happens to live in — the
         // caller's, or a helper's the walk pulled in.
         let reach = Reachability::of(cfg);
+        // Blocks this body reaches only across an `await` (#117, ADR-035). A
+        // write there runs on a later turn of the event loop, so it is
+        // `Deferred` however the walk entered the body — the same summary a
+        // `.then` continuation gets, and for the same reason. Empty for a body
+        // with no `await`, which is one edge scan to establish.
+        let post_await = cfg.post_await_blocks();
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
         queue.push_back(cfg.entry);
         visited.insert(cfg.entry);
 
         while let Some(bid) = queue.pop_front() {
+            // Only a sync walk can be deferred by an await: a body already
+            // classified `Deferred`, `Handler` or ⊤ does not become more so.
+            let mode = if mode == WalkClass::Sync && post_await.contains(&bid) {
+                WalkClass::Deferred
+            } else {
+                mode
+            };
             let block_id = if mode == WalkClass::Sync {
                 Some(bid)
             } else {
@@ -1342,6 +1361,28 @@ impl<'a> SetterWalk<'a> {
                             ..site
                         });
                     }
+                }
+            }
+            // An immediately-invoked function expression runs NOW, at this
+            // call site, in this mode — `(async () => { … })()` is how an
+            // effect awaits, and it is the standard shape. The walk descended a
+            // *named* local helper (B6 above) and not this one, so every write
+            // inside an IIFE was invisible to the relation: a false negative,
+            // and the reason #117's await split bought nothing on the shape it
+            // was aimed at.
+            if depth > 0
+                && let Expr::FnLit { body_cfg, .. } = fn_.peel_ts()
+            {
+                let mut inner = Found::new();
+                self.cfg(body_cfg, depth - 1, &mut inner, WalkClass::Sync, prov);
+                for site in inner {
+                    let sync = site.class == WalkClass::Sync;
+                    found.push(FoundSite {
+                        class: if sync { mode } else { site.class },
+                        block_id: if sync { block_id } else { None },
+                        prov_block: prov,
+                        ..site
+                    });
                 }
             }
             // The listener `FnLit` of an effect-top-level `addEventListener`

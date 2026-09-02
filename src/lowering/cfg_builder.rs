@@ -130,6 +130,23 @@ impl BlockBuilder {
         self.terminated = false;
     }
 
+    /// Seal the current block and continue in a fresh one across an `Await`
+    /// edge (#117). Control is unconditional — dominance and reachability are
+    /// unchanged — but the successor is marked as running after a suspension.
+    ///
+    /// A no-op on an already-terminated block: a `return await f()` has no
+    /// successor to defer, and sealing twice would trip the builder's own
+    /// invariant.
+    pub(super) fn split_at_await(&mut self) {
+        if self.terminated {
+            return;
+        }
+        let next = self.new_block();
+        let from = self.seal_with(Terminator::Jump(next));
+        self.add_edge(from, next, EdgeKind::Await);
+        self.start_block(next);
+    }
+
     pub(super) fn add_edge(&mut self, from: BlockId, to: BlockId, kind: EdgeKind) {
         self.edges.push(Edge { from, to, kind });
     }

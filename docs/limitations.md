@@ -142,9 +142,9 @@ make wrapper-enforcement rules expressible; the catalogue is re-based to 22 —
 the new class joined WITH the vocabulary, so the /21 datapoints stay
 comparable) **→ 8/22** (the `context_providers` anchor + `identity` guard, #71)
 **→ 9/22** (2026-09-01, [#99](https://github.com/rboudrouss/reactant-analyzer/issues/99): no engine change — the deferred writer
-phase shipped with ADR-027 §2 already proves the weakened `async-set-state-race`,
-timer/microtask/promise continuations only, post-await writes still read as sync
-until [#117](https://github.com/rboudrouss/reactant-analyzer/issues/117))
+phase shipped with ADR-027 §2 already proves the weakened `async-set-state-race`;
+timer/microtask/promise continuations only at the time, with post-await writes
+reading as sync until [#117](https://github.com/rboudrouss/reactant-analyzer/issues/117) lifted the IR gate on 2026-09-02)
 **→ 12/22** (2026-09-01, wave 1: the `cleanup` guard
 [#100](https://github.com/rboudrouss/reactant-analyzer/issues/100), the `jsx_props` anchor generalizing the provider
 relation to every prop of every resolved element
