@@ -156,6 +156,24 @@ Re-mesure des 60 scénarios : **8 EXPRESSIBLE (contre 1), 20 INEXPRESSIBLE
   **6 340 → 5 654, 686 retirées, aucune ajoutée** — 11 % de la sortie totale,
   d'un seul tenant.
 
+- **ADR-041 / ADR-042** — trois des quatre formes de #89, chacune corrigée là où
+  l'information se perdait, jamais dans la règle. Un index calculé cache ce qui
+  est *sous* lui, pas la chaîne *au-dessus* (`theme.snackBar[v].color` lit tout
+  `theme.snackBar`, que le tableau de deps nomme). La stabilité
+  comportementale ne savait pas résoudre un `useCallback` : l'extraction de
+  hooks réécrit `useCallback(fn, deps)` en `CallbackVal(label)`, donc toute
+  liaison de ce genre était supposée périmable quoi qu'elle capture. Et une
+  sous-expression nommée **verbatim** dans les deps épingle les lectures
+  qu'elle contient — `[searchParams.get("sort")]` couvre le corps qui évalue la
+  même expression, tandis qu'un substitut *avec perte* (`[JSON.stringify(o)]`)
+  n'épingle rien, sous peine de faux négatif. Corpus : **1 423 → 1 402
+  emplacements distincts (5 654 → 5 511 attributions), 21 retirées, aucune
+  ajoutée**, toutes vérifiées faux positifs.
+
+  Restent de #89 : l'alias (`const c = x` enregistre tout `x` au lieu des
+  membres que le corps touche) et le rappel atteint *par un conteneur*
+  (`$errors.clearFieldError`) — mesurés respectivement à ~5 et 24 emplacements.
+
 Prochaines marches, par valeur décroissante : les valeurs d'arguments (#67) ;
 une requête de dominance ; les résumés d'écosystème (#94), seule façon de
 réduire la classe ⊤ qu'ADR-038 §2 laisse en Warning ; et la moitié
