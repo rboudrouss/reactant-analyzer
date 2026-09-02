@@ -2,6 +2,7 @@ pub mod cfg_builder;
 pub mod component_detector;
 mod detector;
 pub mod expr_lower;
+pub mod hook_call_detect;
 pub mod hook_detector;
 pub mod hook_extractor;
 pub mod import_resolution;

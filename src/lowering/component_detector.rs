@@ -2,6 +2,7 @@ use oxc_ast::ast::*;
 
 use super::Candidate;
 use super::detector::{self, Classify, FnItem};
+use super::hook_call_detect::body_calls_hook;
 use super::jsx_detect::body_returns_jsx;
 
 /// A React component function detected in the AST, ready for lowering.
@@ -62,7 +63,13 @@ fn is_component(name: &str, stmts: &[Statement], return_type: Option<&TSTypeAnno
     {
         return true;
     }
-    false
+    // Rule 4: it calls a React hook (#122). The Rules of Hooks read backwards
+    // — nothing but a component or a custom hook may call one, and rule 1 has
+    // already excluded custom hooks by name. This is what finds a component
+    // that returns `null` on every path: an analytics mount, a portal host, a
+    // keyboard-shortcut registrar. Those are exactly where lifecycle bugs live,
+    // and before this rule they were not lowered at all.
+    body_calls_hook(stmts)
 }
 
 // ── TypeScript annotation check ───────────────────────────────────────────────
@@ -236,6 +243,47 @@ mod tests {
     #[test]
     fn hook_excluded() {
         assert!(names("function useCount() { return <div/>; }").is_empty());
+    }
+
+    /// #122: a component that returns `null` on every path yields no JSX and
+    /// carries no TS annotation, so rules 2 and 3 both miss it. It calls hooks,
+    /// which nothing but a component or a custom hook may do — and rule 1 has
+    /// already excluded custom hooks by name.
+    #[test]
+    fn always_null_component_is_detected_by_its_hook_calls() {
+        assert_eq!(
+            names(
+                "function Beacon({ id }) { \
+                   const [n, setN] = useState(0); \
+                   useEffect(() => { track(id, n); }, [id, n]); \
+                   return null; \
+                 }"
+            ),
+            vec!["Beacon"]
+        );
+    }
+
+    /// The rule must not swallow ordinary helpers: calling something whose name
+    /// merely starts with `use` is not calling a hook, and holding a component
+    /// literal is not being one.
+    #[test]
+    fn rule_four_does_not_widen_past_real_hook_calls() {
+        assert!(names("function Helper() { return user(1); }").is_empty());
+        assert!(names("function Helper() { return usable(1); }").is_empty());
+        // A nested body is not this function's hook call.
+        assert!(
+            names("function Helper() { return () => { useState(0); }; }").is_empty(),
+            "a hook inside a nested closure must not make the outer function a component"
+        );
+    }
+
+    /// `React.useState(…)` and any namespace import of the same shape.
+    #[test]
+    fn a_namespaced_hook_call_counts() {
+        assert_eq!(
+            names("function Beacon() { React.useEffect(() => {}, []); return null; }"),
+            vec!["Beacon"]
+        );
     }
 
     #[test]
