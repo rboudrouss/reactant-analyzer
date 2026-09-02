@@ -61,6 +61,38 @@ Matching on the teardown name alone would certify exactly the bug
 [`Pairing::may_be_unpaired`] exposes: a rule that fires on a missing teardown
 fires on it, and no rule may read it as a proof of one.
 
+**Amended 2026-09-02 (#124): a teardown comes in three shapes, not one.**
+Comparing the listener binding was right for one of them and answered
+`none-seen` on correct code for the other two — three measured false positives
+on the corpus within hours of shipping:
+
+- **listener-valued** — `removeEventListener(t, h)`, `off(evt, h)`. The rule
+  above, unchanged.
+- **handle-valued** — `clearInterval(id)`. The teardown takes what the
+  registration *returned*, so a listener comparison can never succeed. A
+  `teardown_takes` column says which, and the row records the binding the call's
+  result was assigned to.
+- **disposer-valued** — `const u = store.subscribe(f); return () => u()`. Same
+  fact as the handle case; the difference is only whether the cleanup passes the
+  handle or invokes it. Available to every registrar that returns something, so
+  it is checked whatever the column says.
+
+Plus one registration that takes *itself* back: `addEventListener(t, h, { once:
+true })` needs no cleanup and no cleanup could name it, so the row is `Paired`
+outright. The boolean third argument is `capture`, not `once`, and does not
+count.
+
+`Paired` is the verdict that suppresses, so the disposer form is a **closed set
+of method names** (`unsubscribe`, `dispose`, `cancel`, `close`, `destroy`,
+`remove`, `off`, `abort`) rather than "any method called on the handle" —
+`s.emit('bye')` is not a teardown, and reading it as one would be the false
+negative the three-valued design exists to avoid.
+
+The `Unpaired`/`Unknown` split follows: the verdict is a claim only when there
+was something to compare. A handle-valued registration whose result is never
+bound, and a listener-valued one whose callback is an inline literal, both
+answer `Unknown`.
+
 ### 4. A handler-class write does not close a churn cycle
 
 `collect_setter_calls_with_extra` computed a `WalkClass` per site and then threw

@@ -71,6 +71,19 @@ pub struct Registrar {
     /// Calls that undo this registration. Empty when the registration cannot
     /// be taken back (`queueMicrotask`, a promise continuation).
     pub teardown: &'static [&'static str],
+    /// What those calls are handed (#124). `clearInterval` takes the *handle*
+    /// the registration returned, `removeEventListener` takes the listener —
+    /// comparing the wrong one answers `none-seen` on correct code.
+    pub teardown_takes: TeardownArg,
+}
+
+/// Which value a teardown call identifies its registration by (#124).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeardownArg {
+    /// The callback itself: `removeEventListener(type, h)`, `off(evt, h)`.
+    Listener,
+    /// The value the registration returned: `clearInterval(id)`.
+    Handle,
 }
 
 /// The one registrar table. The former `REGISTRARS` in `rules::helpers` and the
@@ -85,6 +98,7 @@ pub const REGISTRARS: &[Registrar] = &[
         method_only: false,
         timing: Timing::Deferred,
         teardown: &["clearInterval"],
+        teardown_takes: TeardownArg::Handle,
     },
     Registrar {
         name: "addEventListener",
@@ -93,6 +107,7 @@ pub const REGISTRARS: &[Registrar] = &[
         method_only: false,
         timing: Timing::Handler,
         teardown: &["removeEventListener"],
+        teardown_takes: TeardownArg::Listener,
     },
     Registrar {
         name: "subscribe",
@@ -101,6 +116,7 @@ pub const REGISTRARS: &[Registrar] = &[
         method_only: true,
         timing: Timing::Unknown,
         teardown: &["unsubscribe"],
+        teardown_takes: TeardownArg::Listener,
     },
     Registrar {
         name: "on",
@@ -109,6 +125,7 @@ pub const REGISTRARS: &[Registrar] = &[
         method_only: true,
         timing: Timing::Unknown,
         teardown: &["off", "removeListener"],
+        teardown_takes: TeardownArg::Listener,
     },
     Registrar {
         name: "addListener",
@@ -117,6 +134,7 @@ pub const REGISTRARS: &[Registrar] = &[
         method_only: true,
         timing: Timing::Unknown,
         teardown: &["removeListener"],
+        teardown_takes: TeardownArg::Listener,
     },
     Registrar {
         name: "setTimeout",
@@ -125,6 +143,7 @@ pub const REGISTRARS: &[Registrar] = &[
         method_only: false,
         timing: Timing::Deferred,
         teardown: &["clearTimeout"],
+        teardown_takes: TeardownArg::Handle,
     },
     Registrar {
         name: "setImmediate",
@@ -133,6 +152,7 @@ pub const REGISTRARS: &[Registrar] = &[
         method_only: false,
         timing: Timing::Deferred,
         teardown: &["clearImmediate"],
+        teardown_takes: TeardownArg::Handle,
     },
     Registrar {
         name: "requestAnimationFrame",
@@ -141,6 +161,7 @@ pub const REGISTRARS: &[Registrar] = &[
         method_only: false,
         timing: Timing::Deferred,
         teardown: &["cancelAnimationFrame"],
+        teardown_takes: TeardownArg::Handle,
     },
     Registrar {
         name: "requestIdleCallback",
@@ -149,6 +170,7 @@ pub const REGISTRARS: &[Registrar] = &[
         method_only: false,
         timing: Timing::Deferred,
         teardown: &["cancelIdleCallback"],
+        teardown_takes: TeardownArg::Handle,
     },
     Registrar {
         name: "queueMicrotask",
@@ -157,6 +179,7 @@ pub const REGISTRARS: &[Registrar] = &[
         method_only: false,
         timing: Timing::Deferred,
         teardown: &[],
+        teardown_takes: TeardownArg::Handle,
     },
     Registrar {
         name: "then",
@@ -165,6 +188,7 @@ pub const REGISTRARS: &[Registrar] = &[
         method_only: true,
         timing: Timing::Deferred,
         teardown: &[],
+        teardown_takes: TeardownArg::Handle,
     },
     Registrar {
         name: "catch",
@@ -173,6 +197,7 @@ pub const REGISTRARS: &[Registrar] = &[
         method_only: true,
         timing: Timing::Deferred,
         teardown: &[],
+        teardown_takes: TeardownArg::Handle,
     },
     Registrar {
         name: "finally",
@@ -181,6 +206,7 @@ pub const REGISTRARS: &[Registrar] = &[
         method_only: true,
         timing: Timing::Deferred,
         teardown: &[],
+        teardown_takes: TeardownArg::Handle,
     },
 ];
 
@@ -223,6 +249,15 @@ pub struct Registration {
     /// The callback argument as written. Cloning an `FnLit` bumps an `Arc`:
     /// the body is not copied.
     pub callback: Expr,
+    /// The binding the registration's **return value** was assigned to, when
+    /// the call sits in a `let`. `clearInterval(id)` names this, not the
+    /// callback, and so does the returned-disposer idiom `const u = …; u()`
+    /// (#124).
+    pub handle: Option<Var>,
+    /// The registration takes itself back: `addEventListener(t, h, { once:
+    /// true })` removes its own listener after one dispatch, so no teardown is
+    /// needed or possible.
+    pub self_removing: bool,
     /// Top-level block of the effect body carrying the registration; `None`
     /// when nested in another callback (then never must-reached).
     pub block_id: Option<BlockId>,
@@ -361,28 +396,122 @@ fn pair(row: &Registration, cleanups: &Cleanups, fns: &HashMap<Var, Arc<CFG>>) -
         // absence of evidence.
         return Pairing::Unpaired;
     }
+    // A registration that takes itself back needs no cleanup at all, and no
+    // cleanup could name it (#124).
+    if row.self_removing {
+        return Pairing::Paired;
+    }
     // An effect that returns nothing on any path takes nothing back, whatever
-    // shape the listener has. This is decided before the listener is looked at
-    // at all — it is the one case where the absence is total.
+    // shape the listener has. This is decided before anything else is looked at
+    // — it is the one case where the absence is total.
     let bodies = match cleanups {
         Cleanups::None => return Pairing::Unpaired,
         Cleanups::Opaque => return Pairing::Unknown,
         Cleanups::Bodies(b) => b,
     };
-    let Expr::Var(listener) = row.callback.peel_ts() else {
-        // An inline literal is a fresh listener no teardown can name, and an
-        // unresolvable expression is one we cannot compare — with a cleanup
-        // present, both leave the pairing unproven rather than refuted.
-        return Pairing::Unknown;
-    };
-    if bodies
-        .iter()
-        .any(|c| tears_down(c, reg.teardown, listener, fns, 2))
+
+    // Three teardown shapes, and reading the wrong one answers `none-seen` on
+    // correct code (#124):
+    //
+    //   handle-valued   `const id = setInterval(f, ms)` / `clearInterval(id)`
+    //   disposer-valued `const u = s.subscribe(f)`      / `u()`
+    //   listener-valued `el.addEventListener(t, h)`     / `removeEventListener(t, h)`
+    //
+    // The first two are the same fact — what the registration *returned* — and
+    // apply whatever the registrar's own column says, because the disposer
+    // idiom is available to every registrar that returns something.
+    if let Some(handle) = &row.handle
+        && bodies
+            .iter()
+            .any(|c| releases_handle(c, reg.teardown, handle, fns, 2) || invokes(c, handle, fns, 2))
     {
-        Pairing::Paired
-    } else {
-        Pairing::Unpaired
+        return Pairing::Paired;
     }
+
+    // The listener-valued shape needs a listener that is a name to compare.
+    if reg.teardown_takes == TeardownArg::Listener
+        && let Expr::Var(listener) = row.callback.peel_ts()
+        && bodies
+            .iter()
+            .any(|c| tears_down(c, reg.teardown, listener, fns, 2))
+    {
+        return Pairing::Paired;
+    }
+
+    // Nothing matched. Whether that is a claim depends on whether there was
+    // anything to compare: a handle-valued registration whose result is not
+    // bound, or a listener-valued one whose callback is an inline literal, was
+    // never comparable in the first place.
+    let comparable = row.handle.is_some()
+        || (reg.teardown_takes == TeardownArg::Listener
+            && matches!(row.callback.peel_ts(), Expr::Var(_)));
+    if comparable {
+        Pairing::Unpaired
+    } else {
+        Pairing::Unknown
+    }
+}
+
+/// Is there a `teardown(handle)` call in this cleanup body — the handle-valued
+/// shape, `clearInterval(id)`?
+fn releases_handle(
+    cfg: &CFG,
+    names: &[&'static str],
+    handle: &Var,
+    fns: &HashMap<Var, Arc<CFG>>,
+    depth: usize,
+) -> bool {
+    tears_down(cfg, names, handle, fns, depth)
+}
+
+/// Is the handle itself *called* in this cleanup body — the returned-disposer
+/// idiom, `const u = s.subscribe(f); return () => u()`?
+fn invokes(cfg: &CFG, handle: &Var, fns: &HashMap<Var, Arc<CFG>>, depth: usize) -> bool {
+    let mut hit = false;
+    cfg.for_each_expr(&mut |e| hit = hit || invokes_in_expr(e, handle, fns, depth));
+    hit
+}
+
+/// Method names that dispose of a handle. `u.unsubscribe()` counts;
+/// `s.emit('bye')` does not — and `Paired` is the one verdict that suppresses,
+/// so the set is closed rather than "any method called on the handle".
+const DISPOSERS: &[&str] = &[
+    "unsubscribe",
+    "dispose",
+    "cancel",
+    "close",
+    "destroy",
+    "remove",
+    "off",
+    "abort",
+];
+
+fn invokes_in_expr(expr: &Expr, handle: &Var, fns: &HashMap<Var, Arc<CFG>>, depth: usize) -> bool {
+    if let Expr::Call { fn_, .. } = expr {
+        match fn_.peel_ts() {
+            // `u()`, and `u.unsubscribe()` — a disposer object counts too, but
+            // only for a name that disposes.
+            Expr::Var(n) if n == handle => return true,
+            Expr::FieldAccess { obj, field }
+                if matches!(obj.peel_ts(), Expr::Var(n) if n == handle)
+                    && DISPOSERS.contains(&field.as_str()) =>
+            {
+                return true;
+            }
+            Expr::Var(n) => {
+                if depth > 0
+                    && let Some(body) = fns.get(n)
+                    && invokes(body, handle, fns, depth - 1)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut hit = false;
+    expr.for_each_child(&mut |c| hit = hit || invokes_in_expr(c, handle, fns, depth));
+    hit
 }
 
 /// Is there a `teardown(…, listener, …)` call in this cleanup body?
@@ -433,6 +562,20 @@ fn teardown_in_expr(
     hit
 }
 
+/// `addEventListener(type, listener, { once: true })` removes its own listener
+/// after one dispatch, so there is nothing for a cleanup to take back (#124).
+/// The boolean third argument is `capture`, not `once`, and does not count.
+fn is_self_removing(reg: &Registrar, args: &[Expr]) -> bool {
+    reg.name == "addEventListener"
+        && args.get(2).is_some_and(|o| match o.peel_ts() {
+            Expr::ObjectLit { fields, .. } => matches!(
+                crate::ir::expr::object_member(fields, "once").map(Expr::peel_ts),
+                Some(Expr::Lit(crate::ir::expr::Prim::Bool(true)))
+            ),
+            _ => false,
+        })
+}
+
 // ── The scan ──────────────────────────────────────────────────────────────────
 
 /// Scan a CFG for callback registrations. `fixed_block`:
@@ -451,17 +594,22 @@ fn scan_cfg(
     for (&bid, block) in &cfg.blocks {
         let block_id = fixed_block.unwrap_or(Some(bid));
         for stmt in &block.stmts {
-            let (expr, span) = match stmt {
-                Stmt::ExprStmt(e, span) => (e, *span),
-                Stmt::Let { rhs, span, .. }
-                | Stmt::Assign { rhs, span, .. }
-                | Stmt::MemberWrite { rhs, span, .. } => (rhs, *span),
+            // `const id = setInterval(…)` binds the handle the teardown will
+            // name (#124). Only the outermost expression of the `let` is the
+            // registration whose result this binds — a nested one further in
+            // is somebody else's value.
+            let (expr, span, handle) = match stmt {
+                Stmt::ExprStmt(e, span) => (e, *span, None),
+                Stmt::Let { var, rhs, span } | Stmt::Assign { var, rhs, span } => {
+                    (rhs, *span, Some(var.clone()))
+                }
+                Stmt::MemberWrite { rhs, span, .. } => (rhs, *span, None),
             };
-            scan_expr(expr, span, block_id, fns, depth, effect, out);
+            scan_expr(expr, span, block_id, fns, depth, effect, handle, out);
         }
         match &block.term {
             Terminator::Return(e) | Terminator::Branch { cond: e, .. } => {
-                scan_expr(e, None, block_id, fns, depth, effect, out);
+                scan_expr(e, None, block_id, fns, depth, effect, None, out);
             }
             _ => {}
         }
@@ -476,6 +624,7 @@ fn scan_expr(
     fns: &HashMap<Var, Arc<CFG>>,
     depth: usize,
     effect: HookLabel,
+    handle: Option<Var>,
     out: &mut Vec<Registration>,
 ) {
     match expr {
@@ -490,6 +639,8 @@ fn scan_expr(
                     firing: reg.firing,
                     timing: reg.timing,
                     callback: cb.clone(),
+                    handle: handle.clone(),
+                    self_removing: is_self_removing(reg, args),
                     block_id,
                     span,
                     pairing: Pairing::Unknown,
@@ -506,18 +657,20 @@ fn scan_expr(
             // Descend: chained receivers (`p.then(a).then(b)`), callback
             // bodies (a registration inside another callback is never
             // must-reached), plain args.
-            scan_expr(fn_, span, block_id, fns, depth, effect, out);
+            scan_expr(fn_, span, block_id, fns, depth, effect, None, out);
             for arg in args {
                 match arg {
                     Expr::FnLit { body_cfg, .. } if depth > 0 => {
                         scan_cfg(body_cfg, fns, depth - 1, Some(None), effect, out);
                     }
-                    _ => scan_expr(arg, span, block_id, fns, depth, effect, out),
+                    _ => scan_expr(arg, span, block_id, fns, depth, effect, None, out),
                 }
             }
         }
         other => {
-            other.for_each_child(&mut |c| scan_expr(c, span, block_id, fns, depth, effect, out));
+            other.for_each_child(&mut |c| {
+                scan_expr(c, span, block_id, fns, depth, effect, None, out)
+            });
         }
     }
 }

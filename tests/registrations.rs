@@ -438,3 +438,109 @@ export function C({ url }) {
     assert_eq!(writer_phases(iife, "C"), vec![WriterPhase::Effect]);
     assert_eq!(writer_phases(iife, "C"), writer_phases(named, "C"));
 }
+
+// ── #124: the three teardown shapes ─────────────────────────────────────────
+
+/// The returned-disposer idiom. The registration hands back its own remover;
+/// the cleanup calls it and never mentions the listener.
+#[test]
+fn a_cleanup_calling_the_returned_disposer_is_paired() {
+    let src = r#"
+import { useEffect } from 'react';
+export function C({ store, onTick }) {
+  useEffect(() => {
+    const unsubscribe = store.subscribe(() => { onTick(); });
+    return () => unsubscribe();
+  }, [store, onTick]);
+  return <div/>;
+}
+"#;
+    assert_eq!(pairing_of(src), vec![("subscribe", Pairing::Paired)]);
+}
+
+/// A handle-valued teardown: `clearInterval` takes the id, never the callback,
+/// so comparing it against the listener binding could never succeed.
+#[test]
+fn clear_interval_pairs_on_the_handle_not_the_callback() {
+    let src = r#"
+import { useEffect } from 'react';
+export function C({ tick }) {
+  useEffect(() => {
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [tick]);
+  return <div/>;
+}
+"#;
+    assert_eq!(pairing_of(src), vec![("setInterval", Pairing::Paired)]);
+}
+
+/// `{ once: true }` makes the listener remove itself, so there is nothing for
+/// a cleanup to take back and no cleanup is needed.
+#[test]
+fn a_once_listener_needs_no_teardown() {
+    let src = r#"
+import { useEffect } from 'react';
+export function C({ onFocus }) {
+  useEffect(() => {
+    window.addEventListener('focus', () => { onFocus(); }, { once: true });
+  }, [onFocus]);
+  return <div/>;
+}
+"#;
+    assert_eq!(pairing_of(src), vec![("addEventListener", Pairing::Paired)]);
+}
+
+/// The boolean third argument is `capture`, not `once` — it must not be read
+/// as self-removing.
+#[test]
+fn the_capture_boolean_is_not_once() {
+    let src = r#"
+import { useEffect } from 'react';
+export function C({ onFocus }) {
+  useEffect(() => {
+    window.addEventListener('focus', () => { onFocus(); }, true);
+  }, [onFocus]);
+  return <div/>;
+}
+"#;
+    assert_eq!(
+        pairing_of(src),
+        vec![("addEventListener", Pairing::Unpaired)]
+    );
+}
+
+/// A handle-valued registration whose result is never bound has nothing to
+/// compare, so the verdict is the may side rather than a claim.
+#[test]
+fn an_unbound_interval_leaves_the_pairing_unknown() {
+    let src = r#"
+import { useEffect } from 'react';
+export function C({ tick }) {
+  useEffect(() => {
+    setInterval(tick, 1000);
+    return () => {};
+  }, [tick]);
+  return <div/>;
+}
+"#;
+    assert_eq!(pairing_of(src), vec![("setInterval", Pairing::Unknown)]);
+}
+
+/// The disposer form is a closed set of method names. `Paired` is the verdict
+/// that suppresses, so "any method called on the handle" would be a way to
+/// certify a teardown that is not one.
+#[test]
+fn an_arbitrary_method_on_the_handle_is_not_a_teardown() {
+    let src = r#"
+import { useEffect } from 'react';
+export function C({ socket, onMsg }) {
+  useEffect(() => {
+    const s = socket.on('msg', () => { onMsg(); });
+    return () => s.emit('bye');
+  }, [socket, onMsg]);
+  return <div/>;
+}
+"#;
+    assert_eq!(pairing_of(src), vec![("on", Pairing::Unpaired)]);
+}
