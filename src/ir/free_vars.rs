@@ -11,11 +11,11 @@ use crate::ir::{cfg::CFG, expr::Expr, stmt::Stmt, types::Var};
 /// with deps `[x.b]` is (correctly) reported while `use(x.b)` with `[x.b]`
 /// and `use(x.a)` with `[x]` are not.
 ///
-/// Dynamic member access (`x[i]`) cannot name the touched element, so it
-/// collapses to the bare root `{root: x, segments: []}` on the *use* side —
-/// "touches all of `x`", coverable only by a whole-`x` dep (never a false
-/// negative). On the *dep* side such an access declares nothing (see
-/// [`dep_paths`]).
+/// Dynamic member access (`x[i]`) cannot name the touched element, so on the
+/// *use* side the path stops at the last named handle above the index:
+/// `x.a[i].b` → `{root: x, segments: [a]}` — "touches all of `x.a`", coverable
+/// by a whole-`x` or whole-`x.a` dep but not by `x.a.b`. On the *dep* side such
+/// an access declares nothing (see [`dep_paths`]).
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct AccessPath {
     pub root: Var,
@@ -148,7 +148,12 @@ fn extract_path<'e>(e: &'e Expr, side: &mut Vec<&'e Expr>) -> Option<(Var, Vec<S
         }
         Expr::IndexAccess { arr, idx } => {
             side.push(idx);
-            extract_path(arr, side).map(|(root, _, _)| (root, Vec::new(), true))
+            // The chain *above* the index is still named. `theme.snackBar[v].color`
+            // reads an unknown member of `theme.snackBar`, so that prefix is the
+            // handle the read passes through, and a `[theme.snackBar]` dep covers
+            // it exactly as `[x.a]` already covers `x.a.b`. Only the segments
+            // *below* the index are lost — `opaque` stops the caller pushing more.
+            extract_path(arr, side).map(|(root, segs, _)| (root, segs, true))
         }
         other => {
             side.push(other);
@@ -329,6 +334,32 @@ mod tests {
         );
         assert!(
             free.contains(&path("i", &[])),
+            "index var is used: {free:?}"
+        );
+    }
+
+    #[test]
+    fn free_paths_dynamic_index_keeps_the_named_prefix() {
+        // return theme.snackBar[v].color  →  reads all of theme.snackBar (the
+        // last named handle above the index) AND v — not the whole theme.
+        let cfg = single_return_cfg(field(
+            Expr::IndexAccess {
+                arr: Box::new(field(Expr::Var("theme".to_string()), "snackBar")),
+                idx: Box::new(Expr::Var("v".to_string())),
+            },
+            "color",
+        ));
+        let free = compute_free_paths(&cfg);
+        assert!(
+            free.contains(&path("theme", &["snackBar"])),
+            "the prefix above the index survives: {free:?}"
+        );
+        assert!(
+            !free.contains(&path("theme", &[])),
+            "and it is not widened back to the root: {free:?}"
+        );
+        assert!(
+            free.contains(&path("v", &[])),
             "index var is used: {free:?}"
         );
     }

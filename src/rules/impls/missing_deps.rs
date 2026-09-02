@@ -4,7 +4,6 @@ use std::collections::HashSet;
 use crate::{
     domains::{impls::StateValue, stores::AbstractEnv},
     ir::{
-        cfg::CFG,
         free_vars::{AccessPath, compute_free_vars, dep_paths, path_covered},
         types::Var,
     },
@@ -80,7 +79,7 @@ impl Rule for MissingDeps {
                     && !member_is_stable(path, &env_exit, result)
                     && !closure_is_behaviorally_stable(
                         &path.root,
-                        &result.render_cfg,
+                        result,
                         &env_exit,
                         &mut HashSet::new(),
                     )
@@ -155,7 +154,7 @@ fn member_is_stable(
 /// arm) must keep reading PerRender — deps arrays compare by `Object.is`.
 fn closure_is_behaviorally_stable(
     var: &str,
-    cfg: &CFG,
+    result: &crate::engine::AnalysisResult<StateValue>,
     env_exit: &AbstractEnv<StateValue>,
     seen: &mut HashSet<Var>,
 ) -> bool {
@@ -165,13 +164,9 @@ fn closure_is_behaviorally_stable(
         // adds no new evidence of instability.
         return true;
     }
-    let Some((params, body)) = fn_lit_binding(var, cfg) else {
+    let Some(caps) = closure_captures(var, result) else {
         return false;
     };
-    let mut caps = compute_free_vars(body);
-    for p in params {
-        caps.remove(p);
-    }
     for cap in caps {
         // Globals (fetch, console, …) are not in env_exit — same convention
         // as the main loop above.
@@ -181,11 +176,43 @@ fn closure_is_behaviorally_stable(
         if env_exit.lookup(&cap).is_stable() {
             continue;
         }
-        if !closure_is_behaviorally_stable(&cap, cfg, env_exit, seen) {
+        if !closure_is_behaviorally_stable(&cap, result, env_exit, seen) {
             return false;
         }
     }
     true
+}
+
+/// The values a function-valued binding closes over, for either spelling of
+/// one: a bare `FnLit`, or a `useCallback` whose body hook extraction lifted
+/// into the hook table. `useCallback` freezes its captures at deps-change
+/// time, but a frozen copy of a value that cannot change *is* that value — so
+/// the two spellings answer the same behavioral question, and only one of
+/// them used to be asked.
+fn closure_captures(
+    var: &str,
+    result: &crate::engine::AnalysisResult<StateValue>,
+) -> Option<HashSet<Var>> {
+    let cfg = &result.render_cfg;
+    if let Some((params, body)) = fn_lit_binding(var, cfg) {
+        let mut caps = compute_free_vars(body);
+        for p in params {
+            caps.remove(p);
+        }
+        return Some(caps);
+    }
+    // `free_paths` of a Callback entry already subtracts the callback's own
+    // params (they shadow, they are not captured).
+    let label = crate::ir::bindings::callback_binding_in(var, cfg)?;
+    Some(
+        result
+            .effect_info
+            .get(&label)?
+            .free_paths
+            .iter()
+            .map(|p| p.root.clone())
+            .collect(),
+    )
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -106,9 +106,19 @@ Every entry here is Warning-or-below by construction: an FP never carries an Err
 - **`missing-deps`** asks whether a capture can go *stale*, so a read through a handle that never
   changes is silent even when the container around it does: `bag.ref.current` where `bag` is rebuilt
   every render but `bag.ref` is a `useRef` reads the live value, and the rule says nothing. The
-  neighbouring shape still fires and should: a `useCallback` with a non-empty deps list *can* change
-  identity, so a `[]` closure over it can genuinely go stale
-  [ADR-040](adr/ADR-040-the-longest-stable-prefix.md).
+  neighbouring shape still fires and should: a `useCallback` whose own captures can change is a
+  genuinely different function each time it is recreated, so a `[]` closure over it holds a stale one
+  [ADR-040](adr/ADR-040-the-longest-stable-prefix.md),
+  [ADR-041](adr/ADR-041-what-a-dynamic-index-hides-and-the-two-spellings-of-a-closure.md).
+- **A computed member access** (`theme.snackBar[variant].color`) hides the segments below the index
+  but not the chain above it: the read is recorded as `theme.snackBar`, so a dep naming that handle
+  covers it and a dep naming something below it does not. On the *dep* side a computed access still
+  declares nothing — `[x.a[i]]` pins the element, not the container
+  [ADR-041](adr/ADR-041-what-a-dynamic-index-hides-and-the-two-spellings-of-a-closure.md).
+- **A callback reached through a container** (`$errors.clearFieldError`) is not yet asked the
+  behavioral-stability question the bare name is asked: the path's root is an object, and resolving a
+  member back to the closure it names is a separate mechanism. 24 corpus locations wait on it
+  [#89](https://github.com/rboudrouss/reactant-analyzer/issues/89).
 - **`setter-in-render`** warns when a setter reaches a callee with no timing summary
   (`<form onSubmit={handleSubmit(onSubmit)}>`, `composeEventHandlers(a, cb)`): ⊤ includes the render
   pass, so the row is sound and the wording says so — it never claims the setter was called in the

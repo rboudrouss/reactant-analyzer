@@ -387,3 +387,94 @@ fn a_member_of_a_fresh_container_with_no_stable_prefix_still_fires() {
          on the path is stable, and the closure keeps the old value"
     );
 }
+
+/// #89 shape 3 — a dynamic index used to erase the whole chain above it, so a
+/// deps array that names the exact container it indexes could never cover the
+/// read (twenty `SnackBar.tsx:163`).
+#[test]
+fn a_dep_naming_the_indexed_container_covers_the_read() {
+    assert_eq!(
+        missing_deps_hits(
+            r#"
+            import { useMemo } from "react";
+            function C({ theme, variant }) {
+              const icon = useMemo(
+                () => theme.snackBar[variant].color,
+                [variant, theme.snackBar]
+              );
+              return <div>{icon}</div>;
+            }
+            "#,
+        ),
+        0,
+        "`theme.snackBar[v].color` reads all of `theme.snackBar`, which the \
+         deps array names — the unknown element below it changes nothing"
+    );
+}
+
+/// The other side of the same change: the segments *below* the index are lost,
+/// so a dep naming one of them proves nothing and the read stays reported.
+#[test]
+fn a_dep_below_the_index_does_not_cover_the_read() {
+    assert_eq!(
+        missing_deps_hits(
+            r#"
+            import { useMemo } from "react";
+            function C({ theme, variant }) {
+              const icon = useMemo(
+                () => theme.snackBar[variant].color,
+                [variant, theme.snackBar.color]
+              );
+              return <div>{icon}</div>;
+            }
+            "#,
+        ),
+        1
+    );
+}
+
+/// #89 shape 4 — behavioral stability could not see through `useCallback`,
+/// so every callback-valued binding was assumed stale-able whatever it
+/// captured (mantine `use-form-errors.ts:44`).
+#[test]
+fn a_use_callback_over_stable_values_is_behaviorally_stable() {
+    assert_eq!(
+        missing_deps_hits(
+            r#"
+            import { useState, useRef, useCallback } from "react";
+            function C({ step }) {
+              const [n, setN] = useState(0);
+              const r = useRef(0);
+              const bump = useCallback(() => { r.current += 1; }, [n]);
+              const reset = useCallback(() => { bump(); }, []);
+              return <button onClick={() => { setN(n + step); reset(); }} />;
+            }
+            "#,
+        ),
+        0,
+        "`bump` is recreated whenever `n` moves, but every value it closes \
+         over is stable, so the copy `reset` froze at mount behaves identically"
+    );
+}
+
+/// And the case it must not swallow: the callback closes over state, so a
+/// stale copy of it reads a stale value.
+#[test]
+fn a_use_callback_over_state_still_fires() {
+    assert_eq!(
+        missing_deps_hits(
+            r#"
+            import { useState, useCallback } from "react";
+            function C({ step }) {
+              const [n, setN] = useState(0);
+              const log = useCallback(() => { console.log(n); }, [n]);
+              const run = useCallback(() => { log(); }, []);
+              return <button onClick={() => { setN(n + step); run(); }} />;
+            }
+            "#,
+        ),
+        1,
+        "`log` closes over `n`, so the copy `run` froze at mount logs the \
+         mount-time value"
+    );
+}

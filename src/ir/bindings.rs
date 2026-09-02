@@ -8,6 +8,8 @@
 //! - [`fn_binding_in`] — one binding, a function literal, within **one** body.
 //!   The `missing-deps` / `stale-closure` bar: enough to read a callback whose
 //!   binding sits beside its registration.
+//! - [`callback_binding_in`] — the same bar, for the `useCallback` spelling:
+//!   the body lives in the hook table, so this answers the label.
 //! - [`certified_fn_binding`] — the same, plus **no rebinding anywhere below**:
 //!   no `Let` and no `Assign` of that name in any nested function body. What a
 //!   consumer needs before it may *execute* the body and keep the result.
@@ -17,7 +19,12 @@
 
 use std::collections::HashMap;
 
-use crate::ir::{cfg::CFG, expr::Expr, stmt::Stmt, types::Var};
+use crate::ir::{
+    cfg::CFG,
+    expr::Expr,
+    stmt::Stmt,
+    types::{HookLabel, Var},
+};
 
 /// Every `let`/assignment right-hand side in `cfg`, by name — the bindings a
 /// chase can follow. Nested `FnLit` bodies are deliberately not descended: a
@@ -43,7 +50,33 @@ pub fn local_bindings(cfg: &CFG) -> HashMap<&str, Vec<&Expr>> {
 /// environment is no longer syntactically certain. Nested bodies are NOT
 /// scanned — see [`certified_fn_binding`] for the stronger reading.
 pub fn fn_binding_in<'c>(var: &str, cfg: &'c CFG) -> Option<(&'c [Var], &'c CFG)> {
-    let mut found: Option<(&[Var], &CFG)> = None;
+    match sole_binding_in(var, cfg)? {
+        Expr::FnLit {
+            params, body_cfg, ..
+        } => Some((params, body_cfg)),
+        _ => None,
+    }
+}
+
+/// The hook label of the unique `useCallback` bound to `var` in `cfg`.
+///
+/// The same question as [`fn_binding_in`], for the other spelling of a
+/// function-valued binding: hook extraction rewrites `useCallback(fn, deps)`
+/// to `CallbackVal(label)` and lifts `fn` out of the render CFG, so a
+/// consumer that wants the body asks the hook table for this label.
+pub fn callback_binding_in(var: &str, cfg: &CFG) -> Option<HookLabel> {
+    match sole_binding_in(var, cfg)? {
+        Expr::CallbackVal(l) => Some(*l),
+        _ => None,
+    }
+}
+
+/// The single right-hand side `var` is bound to in `cfg`, `None` when it is
+/// bound zero times or more than once. Conditional or repeated re-binding is
+/// not "some value we haven't found" — it is a name whose captured environment
+/// is no longer syntactically certain, so the readers above fail closed.
+fn sole_binding_in<'c>(var: &str, cfg: &'c CFG) -> Option<&'c Expr> {
+    let mut found: Option<&Expr> = None;
     for block in cfg.blocks.values() {
         for stmt in &block.stmts {
             let (Stmt::Let { var: v, rhs, .. } | Stmt::Assign { var: v, rhs, .. }) = stmt else {
@@ -52,12 +85,10 @@ pub fn fn_binding_in<'c>(var: &str, cfg: &'c CFG) -> Option<(&'c [Var], &'c CFG)
             if v != var {
                 continue;
             }
-            match rhs.peel_ts() {
-                Expr::FnLit {
-                    params, body_cfg, ..
-                } if found.is_none() => found = Some((params, body_cfg)),
-                _ => return None,
+            if found.is_some() {
+                return None;
             }
+            found = Some(rhs.peel_ts());
         }
     }
     found
