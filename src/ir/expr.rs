@@ -291,6 +291,47 @@ impl Expr {
         None
     }
 
+    /// A short, source-shaped description for a diagnostic message: what the
+    /// reader can look for in their own file.
+    ///
+    /// Not a printer and not a round-trip — it names the expression, it does
+    /// not reproduce it. The point is that a message can say *which* dependency
+    /// it means without quoting a position, because a position in `elems` stops
+    /// being a position in the source array the moment lowering drops an
+    /// elision or flattens a spread (#118).
+    ///
+    /// Roots read through [`crate::ir::source_name`], so a spliced capture's
+    /// internal `#salt` never reaches the user.
+    pub fn describe(&self) -> String {
+        match self.peel_ts() {
+            Expr::Var(v) => crate::ir::source_name(v).to_string(),
+            Expr::FieldAccess { obj, field } => format!("{}.{field}", obj.describe()),
+            Expr::IndexAccess { arr, .. } => format!("{}[…]", arr.describe()),
+            Expr::Call { fn_, .. } => format!("{}(…)", fn_.describe()),
+            Expr::ObjectLit { .. } => "{…}".to_string(),
+            Expr::ArrayLit { .. } => "[…]".to_string(),
+            Expr::FnLit { .. } => "() => …".to_string(),
+            Expr::Lit(Prim::String(v)) => format!("\"{v}\""),
+            Expr::Lit(Prim::Int(v)) => v.to_string(),
+            Expr::Lit(Prim::Float(v)) => v.to_string(),
+            Expr::Lit(Prim::Bool(v)) => v.to_string(),
+            Expr::Lit(Prim::Null) => "null".to_string(),
+            Expr::Lit(Prim::Unit) => "undefined".to_string(),
+            // Naming the operands would be longer than the source. What the
+            // reader needs is that the dependency is computed, not which
+            // operator computed it.
+            Expr::BinOp { .. } | Expr::UnaryOp { .. } => "a computed value".to_string(),
+            Expr::CompApp { name, .. } => format!("<{name}/>"),
+            Expr::NativeElem { tag, .. } => format!("<{tag}/>"),
+            // A hook value has a binding name the caller knows and this type
+            // does not; the label keeps the message unambiguous meanwhile.
+            Expr::StateVal(l) | Expr::MemoVal(l) | Expr::CallbackVal(l) => format!("hook #{l}"),
+            Expr::StateSetter(l) => format!("the setter of hook #{l}"),
+            Expr::HookMarker(l, _) => format!("hook #{l}"),
+            Expr::SummaryVal(_) | Expr::TSAnnotated(_) => "an unmodelled value".to_string(),
+        }
+    }
+
     pub fn for_each_child<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
         match self {
             Expr::Lit(_)

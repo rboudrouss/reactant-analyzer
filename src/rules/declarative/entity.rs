@@ -73,7 +73,6 @@ pub(crate) struct SetterEntity {
 
 /// One declared deps-array entry.
 pub(crate) struct DepEntity<'a> {
-    pub index: usize,
     pub expr: &'a Expr,
     pub path: Option<AccessPath>,
 }
@@ -371,9 +370,7 @@ impl<'a> EntityCtx<'a> {
         effect
             .declared_deps()
             .iter()
-            .enumerate()
-            .map(|(index, expr)| DepEntity {
-                index,
+            .map(|expr| DepEntity {
                 expr,
                 path: dep_paths(std::slice::from_ref(expr)).into_iter().next(),
             })
@@ -872,7 +869,10 @@ fn anonymous(v: &EntityVal<'_, '_>) -> String {
             Some(label) => format!("state #{label}"),
             None => format!("`{}`", crate::ir::source_name(&s.var)),
         },
-        EntityVal::Dep(d) => format!("dep #{}", d.index),
+        // The dependency as written, never its position: an index into `elems`
+        // stops being an index into the source array once lowering drops an
+        // elision or flattens a spread (#118).
+        EntityVal::Dep(d) => format!("`{}`", d.expr.describe()),
         EntityVal::Arg(a) => format!("argument #{}", a.index),
         EntityVal::Origin(p) => format!("`{}`", p.origin_hook),
         EntityVal::Writer(w) => format!("`{}`", crate::ir::source_name(&w.setter)),

@@ -86,10 +86,9 @@ impl Rule for AlwaysUnstableDeps {
                 continue;
             }
 
-            let unstable_idx: Vec<usize> = deps_ref
+            let unstable: Vec<&Expr> = deps_ref
                 .iter()
-                .enumerate()
-                .filter(|(_, dep)| {
+                .filter(|dep| {
                     eval_dep_is_unstable(
                         &result.component,
                         dep,
@@ -99,10 +98,9 @@ impl Rule for AlwaysUnstableDeps {
                         &transfer,
                     )
                 })
-                .map(|(i, _)| i)
                 .collect();
 
-            if unstable_idx.is_empty() {
+            if unstable.is_empty() {
                 continue;
             }
 
@@ -110,11 +108,10 @@ impl Rule for AlwaysUnstableDeps {
             let mut d = Diagnostic::warn(
                 "always-unstable-deps",
                 format!(
-                    "this {word} has unstable dep(s) at index {idx} \
-                     a new reference every render — `Object.is` always differs, \
-                     so the {word} re-runs on every render regardless of the \
-                     other deps",
-                    idx = fmt_indices(&unstable_idx),
+                    "this {word} depends on {what} — a new reference every \
+                     render, so `Object.is` always differs and the {word} \
+                     re-runs on every render regardless of the other deps",
+                    what = fmt_deps(&unstable),
                 ),
             )
             .with_label(label);
@@ -124,10 +121,10 @@ impl Rule for AlwaysUnstableDeps {
             // Witness (ADR-019): where each unstable dep's identity comes
             // from — the binding it flows through, and the call/resolution
             // that mints a fresh reference.
-            for i in &unstable_idx {
+            for dep in &unstable {
                 d = d.with_notes(crate::rules::api::witness::chase_value(
                     &result.render_cfg,
-                    &deps_ref[*i],
+                    dep,
                     &program.function_registry,
                     &result.file,
                 ));
@@ -163,12 +160,20 @@ fn eval_dep_is_unstable(
     val.is_unstable_reference_only()
 }
 
-/// Render dep indices as `0`, `0, 2`, etc.
-fn fmt_indices(idx: &[usize]) -> String {
-    idx.iter()
-        .map(usize::to_string)
-        .collect::<Vec<_>>()
-        .join(", ")
+/// Name the offending dependencies, never their positions (#118).
+///
+/// A position in `elems` stops being a position in the source array the moment
+/// lowering drops an elision or flattens a spread, so `[a, , { k: 1 }]` used to
+/// report "index 1" for an object the author wrote third. The expression is
+/// what the reader can actually find.
+fn fmt_deps(deps: &[&Expr]) -> String {
+    let mut names: Vec<String> = deps.iter().map(|d| format!("`{}`", d.describe())).collect();
+    names.dedup();
+    match names.as_slice() {
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        [] => "nothing".to_string(),
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -341,9 +346,17 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         let diags = AlwaysUnstableDeps.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
         assert_eq!(diags.len(), 1, "one unstable ref dep must fire");
+        // The message names the dependency, not its position: an index into
+        // `elems` stops being an index into the source array once lowering
+        // drops an elision or flattens a spread (#118).
         assert!(
-            diags[0].message.contains("index 0"),
-            "message should point at dep 0: {}",
+            diags[0].message.contains("`{…}`"),
+            "message should name the object literal: {}",
+            diags[0].message
+        );
+        assert!(
+            !diags[0].message.contains("index"),
+            "no positions in the message: {}",
             diags[0].message
         );
     }

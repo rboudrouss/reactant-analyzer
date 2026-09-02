@@ -3478,3 +3478,34 @@ fn registers_restricts_the_cleanup_rule_to_repeating_registrars() {
     assert_eq!(run_pack(pack, interval, &Options::new()).len(), 1);
     assert!(run_pack(pack, promise, &Options::new()).is_empty());
 }
+
+/// #118: a dep's anonymous form names the expression, not a position. An index
+/// into `elems` stops being an index into the source array the moment lowering
+/// drops an elision or flattens a spread, and the rendered form is the only
+/// thing a reader can match against their own file.
+#[test]
+fn a_dep_with_no_path_renders_as_the_expression_it_is() {
+    let pack = r#"{"schemaVersion":1,"name":"t","rules":[
+        {"id":"r","docs":{"description":"d","why":"w","fix":"f"},"severity":"warning",
+         "anchor":{"relation":"hook_calls","kind":"effect"},
+         "forEach":{"edge":"deps","as":"d"},
+         "message":"dep {d.path}"}]}"#;
+    let src = r#"
+        import { useEffect } from "react";
+        function C({ a }) {
+            useEffect(() => { console.log(a); }, [a, , { k: 1 }, run(a)]);
+            return <div/>;
+        }
+    "#;
+    let msgs: Vec<String> = run_pack(pack, src, &Options::new())
+        .into_iter()
+        .map(|d| d.message)
+        .collect();
+    assert!(msgs.contains(&"dep `a`".to_string()), "{msgs:?}");
+    assert!(msgs.contains(&"dep `{…}`".to_string()), "{msgs:?}");
+    assert!(msgs.contains(&"dep `run(…)`".to_string()), "{msgs:?}");
+    assert!(
+        msgs.iter().all(|m| !m.contains('#')),
+        "no positions in any message: {msgs:?}"
+    );
+}
