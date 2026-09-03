@@ -19,7 +19,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::{
-    domains::{Stability, StateValue, stores::Heap},
+    domains::{Stability, StateValue},
     engine::{AnalysisResult, DominatorTree, HookKind, ProgramAnalysisResult, compute_dominators},
     ir::{
         SourceRange,
@@ -364,7 +364,7 @@ pub struct ConditionalHookCall {
 impl<'a> RuleCtx<'a> {
     fn eval_exit(&self, expr: &Expr) -> StateValue {
         let exit_env = self.comp.exit_env();
-        self.comp.eval_in(&exit_env, expr, &mut Heap::new())
+        self.comp.eval_in(&exit_env, expr)
     }
 
     /// Total stability classifier for `expr` in the render-exit env (ADR-021 §3).

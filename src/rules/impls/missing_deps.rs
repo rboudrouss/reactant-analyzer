@@ -152,12 +152,8 @@ fn member_is_stable(
     // findings, and it removes them for the same reason the root check does —
     // the capture is provably not stale (#88, and the 2,010 corpus rows where
     // the container was fresh and the member was not).
-    let mut heap = result.heap.clone();
-    (1..=path.segments.len()).any(|n| {
-        result
-            .eval_in(env_exit, &path.prefix_expr(n), &mut heap)
-            .is_stable()
-    })
+    let mut eval = result.evaluator();
+    (1..=path.segments.len()).any(|n| eval.at(env_exit, &path.prefix_expr(n)).is_stable())
 }
 
 /// Identity vs behavior (ADR-017 framing): this rule guards against *stale

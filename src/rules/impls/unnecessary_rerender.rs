@@ -134,7 +134,7 @@ impl Rule for UnnecessaryRerender {
                         .first()
                         .map(|a| {
                             use crate::rules::ConvergedEval;
-                            result.eval_in(&empty_env, a, &mut crate::domains::Heap::new())
+                            result.eval_in(&empty_env, a)
                         })
                         .unwrap_or(StateValue::top());
 

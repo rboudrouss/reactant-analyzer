@@ -64,6 +64,9 @@ impl Rule for AlwaysUnstableDeps {
         let env_exit = result.exit_env();
         let mut diags = Vec::new();
         let transfer = StateValueTransfer;
+        // One scratch heap for the whole component, not one per dep — see
+        // [`crate::rules::helpers::Eval`].
+        let mut scratch = result.heap.clone();
 
         for hook in &result.hooks {
             let (label, deps, kind, span) = match hook {
@@ -95,6 +98,7 @@ impl Rule for AlwaysUnstableDeps {
                         &env_exit,
                         &result.state_store,
                         &result.memo_store,
+                        &mut scratch,
                         &transfer,
                     )
                 })
@@ -142,18 +146,18 @@ fn eval_dep_is_unstable(
     env: &AbstractEnv<StateValue>,
     state: &StateStore<StateValue>,
     memo: &MemoStore<StateValue>,
+    // The component's *converged* heap, not an empty one — a member dep
+    // (`obj.f`, `form.onSubmit`) only resolves through the heap, and an empty
+    // seed answers ⊤, which this rule reads as silence (#135). The decomposed
+    // bundle survives here only because the unit tests below build one; every
+    // caller with an `AnalysisResult` gets the same seed from
+    // [`crate::rules::ConvergedEval::eval_in`].
+    heap: &mut crate::domains::Heap,
     // Retained for the test-facing signature; the shared eval core builds its
     // own (zero-size) transfer.
     _transfer: &StateValueTransfer,
 ) -> bool {
-    let val = crate::rules::eval_in_stores(
-        dep,
-        env,
-        component,
-        state,
-        memo,
-        &mut crate::domains::Heap::new(),
-    );
+    let val = crate::rules::eval_in_stores(dep, env, component, state, memo, heap);
     // Only a freshly-allocated reference breaks `Object.is` every render.
     // Primitives (Number/Bool/Str) are value-compared — never flagged here, even
     // for wide intervals. `Top` (precision lost) stays silent to avoid FPs.
@@ -429,6 +433,7 @@ mod tests {
                 &env,
                 &state,
                 &memo,
+                &mut crate::domains::Heap::new(),
                 &StateValueTransfer
             ),
             "wide numeric state dep must not count as unstable"
@@ -451,6 +456,7 @@ mod tests {
             &env,
             &state,
             &memo,
+            &mut crate::domains::Heap::new(),
             &StateValueTransfer
         ));
     }

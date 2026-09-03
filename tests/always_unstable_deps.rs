@@ -329,3 +329,41 @@ fn always_unstable_deps_fixture() {
     let h = hits(&src);
     assert_eq!(h, 4, "always_unstable_deps.tsx: expected 4 hits");
 }
+
+// ── A member dep resolves through the converged heap ─────────────────────────
+
+/// A dep that reads a *member* holding a fresh function only resolves through
+/// the component's converged heap. Seeded with an empty one, the read degraded
+/// to ⊤ and the rule went silent — a false negative on exactly the shape it
+/// exists to catch.
+#[test]
+fn a_member_dep_holding_a_fresh_function_fires() {
+    let h = hits(
+        r#"
+        import { useEffect } from "react";
+        function C() {
+            const obj = { f: () => {} };
+            useEffect(() => {}, [obj.f]);
+            return <div/>;
+        }
+        "#,
+    );
+    assert_eq!(h, 1, "`obj.f` is a fresh reference every render");
+}
+
+/// The other side: a member holding a primitive is value-compared, and the
+/// converged heap must not turn that into a finding.
+#[test]
+fn a_member_dep_holding_a_primitive_stays_silent() {
+    let h = hits(
+        r#"
+        import { useEffect } from "react";
+        function C() {
+            const obj = { n: 1 };
+            useEffect(() => {}, [obj.n]);
+            return <div/>;
+        }
+        "#,
+    );
+    assert_eq!(h, 0, "a number member is compared by value");
+}

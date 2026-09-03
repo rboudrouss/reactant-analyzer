@@ -332,5 +332,5 @@ fn eval_with_heap(expr: &Expr, comp: &AnalysisResult<StateValue>) -> StateValue 
     // than degrading to ⊤. The heap choice is exactly what distinguishes this
     // wrapper — it must stay comp-seeded here.
     use crate::rules::ConvergedEval;
-    comp.eval_in(&comp.exit_env(), expr, &mut comp.heap.clone())
+    comp.eval_in(&comp.exit_env(), expr)
 }

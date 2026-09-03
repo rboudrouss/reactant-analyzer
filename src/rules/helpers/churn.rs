@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::{
-    domains::{AbstractDomain, impls::Stability, stores::Heap},
+    domains::{AbstractDomain, impls::Stability},
     ir::{
         SourceRange,
         cfg::CFG,
@@ -239,7 +239,7 @@ pub(in crate::rules) fn eval_in_exit_env(
     comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
 ) -> crate::domains::StateValue {
     use super::ConvergedEval;
-    comp_result.eval_in(&comp_result.exit_env(), expr, &mut Heap::new())
+    comp_result.eval_in(&comp_result.exit_env(), expr)
 }
 
 /// Must the argument of a setter call store a fresh reference?

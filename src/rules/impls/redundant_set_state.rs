@@ -43,6 +43,9 @@ impl Rule for RedundantSetState {
         let (result, component) = (ctx.program(), ctx.component());
         let result = &result.components[component];
         let mut diags = Vec::new();
+        // One scratch heap for the whole component — see
+        // [`crate::rules::helpers::Eval`].
+        let mut scratch = result.heap.clone();
 
         // ── Render body ───────────────────────────────────────────────────────
         for (&block_id, block) in &result.render_cfg.blocks {
@@ -56,6 +59,7 @@ impl Rule for RedundantSetState {
                 env,
                 &result.state_store,
                 &result.memo_store,
+                &mut scratch,
                 &mut diags,
                 &HashSet::new(),
             );
@@ -78,6 +82,7 @@ impl Rule for RedundantSetState {
                     &env_exit,
                     &result.state_store,
                     &result.memo_store,
+                    &mut scratch,
                     &mut diags,
                 );
                 if let Some(r) = result.effect_info.get(eff_label).and_then(|i| i.span) {
@@ -102,9 +107,10 @@ fn check_cfg_for_redundant_sets(
     env: &AbstractEnv<StateValue>,
     state: &StateStore<StateValue>,
     memo: &MemoStore<StateValue>,
+    heap: &mut crate::domains::Heap,
     diags: &mut Vec<Diagnostic>,
 ) {
-    let skip_labels = collect_transition_setters(component, cfg, env, state, memo);
+    let skip_labels = collect_transition_setters(component, cfg, env, state, memo, heap);
     for block in cfg.blocks.values() {
         check_setter_calls(
             component,
@@ -112,6 +118,7 @@ fn check_cfg_for_redundant_sets(
             env,
             state,
             memo,
+            heap,
             diags,
             &skip_labels,
         );
@@ -125,11 +132,12 @@ fn collect_transition_setters(
     env: &AbstractEnv<StateValue>,
     state: &StateStore<StateValue>,
     memo: &MemoStore<StateValue>,
+    heap: &mut crate::domains::Heap,
 ) -> HashSet<HookLabel> {
     // per label: (first seen arg value, has seen a different value)
     let mut tracker: HashMap<HookLabel, (StateValue, bool)> = HashMap::new();
     cfg.for_each_expr(&mut |e| {
-        collect_setter_vals_in_expr(component, e, env, state, memo, &mut tracker)
+        collect_setter_vals_in_expr(component, e, env, state, memo, heap, &mut tracker)
     });
     tracker
         .into_iter()
@@ -144,6 +152,7 @@ fn collect_setter_vals_in_expr(
     env: &AbstractEnv<StateValue>,
     state: &StateStore<StateValue>,
     memo: &MemoStore<StateValue>,
+    heap: &mut crate::domains::Heap,
     tracker: &mut HashMap<HookLabel, (StateValue, bool)>,
 ) {
     match expr {
@@ -153,16 +162,7 @@ fn collect_setter_vals_in_expr(
             {
                 let arg_val = args
                     .first()
-                    .map(|a| {
-                        crate::rules::eval_in_stores(
-                            a,
-                            env,
-                            component,
-                            state,
-                            memo,
-                            &mut crate::domains::Heap::new(),
-                        )
-                    })
+                    .map(|a| crate::rules::eval_in_stores(a, env, component, state, memo, heap))
                     .unwrap_or(StateValue::top());
                 match tracker.entry(label) {
                     std::collections::hash_map::Entry::Vacant(e) => {
@@ -176,17 +176,17 @@ fn collect_setter_vals_in_expr(
                 }
             }
             expr.for_each_child(&mut |c| {
-                collect_setter_vals_in_expr(component, c, env, state, memo, tracker)
+                collect_setter_vals_in_expr(component, c, env, state, memo, heap, tracker)
             });
         }
         Expr::FnLit { body_cfg, .. } => {
             body_cfg.for_each_expr(&mut |e| {
-                collect_setter_vals_in_expr(component, e, env, state, memo, tracker)
+                collect_setter_vals_in_expr(component, e, env, state, memo, heap, tracker)
             });
         }
         other => {
             other.for_each_child(&mut |c| {
-                collect_setter_vals_in_expr(component, c, env, state, memo, tracker)
+                collect_setter_vals_in_expr(component, c, env, state, memo, heap, tracker)
             });
         }
     }
@@ -200,6 +200,7 @@ fn check_setter_calls(
     env: &AbstractEnv<StateValue>,
     state: &StateStore<StateValue>,
     memo: &MemoStore<StateValue>,
+    heap: &mut crate::domains::Heap,
     diags: &mut Vec<Diagnostic>,
     skip_labels: &HashSet<HookLabel>,
 ) {
@@ -214,16 +215,7 @@ fn check_setter_calls(
 
             let arg_val = args
                 .first()
-                .map(|a| {
-                    crate::rules::eval_in_stores(
-                        a,
-                        env,
-                        component,
-                        state,
-                        memo,
-                        &mut crate::domains::Heap::new(),
-                    )
-                })
+                .map(|a| crate::rules::eval_in_stores(a, env, component, state, memo, heap))
                 .unwrap_or(StateValue::top());
 
             let current_val = state.get(label);

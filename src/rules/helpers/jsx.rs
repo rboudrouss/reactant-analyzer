@@ -289,7 +289,7 @@ pub(crate) fn site_identity(
     }
     // The converged heap, not an empty one: it resolves a props-rooted
     // `FieldAccess` instead of degrading it to ⊤.
-    let val = comp.eval_in(env, value, &mut comp.heap.clone());
+    let val = comp.eval_in(env, value);
     if val.is_unstable_reference_only() {
         ValueIdentity::FreshEveryRender
     } else {

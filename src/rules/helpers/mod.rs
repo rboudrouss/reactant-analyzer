@@ -213,32 +213,61 @@ pub(crate) fn eval_in_stores(
     )
 }
 
-/// Evaluate an expression against a component's *converged* stores.
+/// Evaluate an expression against a component's *converged* stores — heap
+/// included.
 ///
 /// The convenience layer over [`eval_in_stores`] for the common case where the
-/// state store, memo store and component name all come from one
-/// [`AnalysisResult`]: it binds those three and leaves `env` and `heap` — the
-/// two things that genuinely vary per call site — as explicit parameters.
-///
-/// The `heap` seed stays a caller argument on purpose: an empty
-/// [`Heap::new()`] and the component's converged `heap.clone()` are NOT
-/// interchangeable (the converged heap resolves a props-rooted `FieldAccess`
-/// instead of degrading to ⊤), so each site keeps its own choice.
-/// [`eval_in_stores`] remains the primitive for the mount-time site, which
-/// evaluates against *empty* stores rather than a converged result.
+/// state store, memo store, heap and component name all come from one
+/// [`AnalysisResult`]. The heap **used** to be a caller argument, on the theory
+/// that an empty and a converged seed were two legitimate choices; four of the
+/// six call sites chose the empty one and were wrong for it (#135). A member
+/// read (`obj.f`, `form.onSubmit`) only resolves through the heap, so an empty
+/// seed silently answers ⊤ — and ⊤ is the silent side of every predicate the
+/// rules build on a value. One converged answer here is the whole fix: a site
+/// that genuinely evaluates against *empty* stores calls [`eval_in_stores`]
+/// directly, and that bundle has no converged half to be inconsistent with.
 pub(crate) trait ConvergedEval {
-    fn eval_in(&self, env: &AbstractEnv<StateValue>, expr: &Expr, heap: &mut Heap) -> StateValue;
+    /// A reusable evaluator holding one scratch heap. Use this wherever more
+    /// than one expression is probed — a loop over deps, over a path's
+    /// prefixes — so the clone happens once instead of once per call.
+    fn evaluator(&self) -> Eval<'_>;
+
+    /// One-shot probe. Same answer as [`Self::evaluator`], one clone.
+    fn eval_in(&self, env: &AbstractEnv<StateValue>, expr: &Expr) -> StateValue {
+        self.evaluator().at(env, expr)
+    }
 }
 
 impl ConvergedEval for AnalysisResult<StateValue> {
-    fn eval_in(&self, env: &AbstractEnv<StateValue>, expr: &Expr, heap: &mut Heap) -> StateValue {
+    fn evaluator(&self) -> Eval<'_> {
+        Eval {
+            result: self,
+            heap: self.heap.clone(),
+        }
+    }
+}
+
+/// A scratch evaluator over one component's converged stores.
+///
+/// It owns the throwaway heap because evaluation *writes* to one — an
+/// `ObjectLit` in the probed expression mints an entry — so the converged heap
+/// must not be evaluated through directly. Reuse across calls is safe and is
+/// the point: an `ExprId` names one allocation site (#134), so re-probing a
+/// site rewrites its own entry and two different sites never collide.
+pub(crate) struct Eval<'a> {
+    result: &'a AnalysisResult<StateValue>,
+    heap: Heap,
+}
+
+impl Eval<'_> {
+    pub(crate) fn at(&mut self, env: &AbstractEnv<StateValue>, expr: &Expr) -> StateValue {
         eval_in_stores(
             expr,
             env,
-            &self.component,
-            &self.state_store,
-            &self.memo_store,
-            heap,
+            &self.result.component,
+            &self.result.state_store,
+            &self.result.memo_store,
+            &mut self.heap,
         )
     }
 }
@@ -262,8 +291,9 @@ pub(in crate::rules) fn all_deps_provably_stable(
     result: &AnalysisResult<StateValue>,
 ) -> bool {
     let exit_env = result.exit_env();
+    let mut eval = result.evaluator();
     deps.iter().all(|dep| {
-        let val = result.eval_in(&exit_env, dep, &mut Heap::new());
+        let val = eval.at(&exit_env, dep);
         query::stability_verdict_of(&val).is_stable()
     })
 }
