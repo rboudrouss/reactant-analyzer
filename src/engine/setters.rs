@@ -1373,7 +1373,7 @@ fn wrapper_callees(render_cfg: &CFG) -> HashSet<String> {
             {
                 let names: Vec<Symbol> = members
                     .iter()
-                    .filter(|(_, v)| *v == SummaryValue::StableWrapper)
+                    .filter(|(_, v)| matches!(v, SummaryValue::Wrapper { .. }))
                     .map(|(k, _)| k.clone())
                     .collect();
                 if !names.is_empty() {

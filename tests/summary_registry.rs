@@ -730,3 +730,91 @@ fn a_non_wrapper_member_does_not_defer_its_argument() {
         "only `handleSubmit` carries the wrapper contract: {fired:?}"
     );
 }
+
+// ── `@mantine/form` — a wrapper that is not stable ───────────────────────────
+
+/// `form.onSubmit(cb)` returns the submit handler; `cb` runs on submit.
+#[test]
+fn a_mantine_submit_wrapper_does_not_run_during_render() {
+    let fired = rules_fired(
+        r#"
+        import { useForm } from "@mantine/form";
+        function C() {
+          const [loading, setLoading] = useState(false);
+          const form = useForm();
+          const handleSubmit = (values) => { setLoading(true); };
+          return <form onSubmit={form.onSubmit(handleSubmit)} />;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        !fired.iter().any(|r| r == "setter-in-render"),
+        "`onSubmit` returns the handler, it does not call `handleSubmit`: {fired:?}"
+    );
+}
+
+/// The timing claim must not smuggle in a stability claim. Mantine builds
+/// `onSubmit` as a plain arrow, so it *is* a fresh reference every render —
+/// crediting it with `handleSubmit`'s stability would be a false negative.
+#[test]
+fn a_mantine_wrapper_is_not_credited_with_stability() {
+    let result = parse_and_analyze_with_config(
+        r#"
+        import { useForm } from "@mantine/form";
+        function C() {
+          const { onSubmit } = useForm();
+          useEffect(() => { console.log("x"); }, [onSubmit]);
+          return <form />;
+        }
+        "#,
+        common_config(),
+    );
+    let diags = diags_for(&result, "C");
+    assert!(
+        diags.iter().any(|d| d.rule == "always-unstable-deps"),
+        "a per-render wrapper as sole dep is a proven re-fire: {diags:?}"
+    );
+}
+
+/// The other half of the same split: a *stable* wrapper stays stable.
+#[test]
+fn a_react_hook_form_wrapper_is_still_stable() {
+    let result = parse_and_analyze_with_config(
+        r#"
+        import { useForm } from "react-hook-form";
+        function C() {
+          const { handleSubmit } = useForm();
+          useEffect(() => { console.log("x"); }, [handleSubmit]);
+          return <form />;
+        }
+        "#,
+        common_config(),
+    );
+    let diags = diags_for(&result, "C");
+    assert!(
+        !diags.iter().any(|d| d.rule == "always-unstable-deps"),
+        "`handleSubmit` is `useCallback`-backed: {diags:?}"
+    );
+}
+
+/// An unlisted mantine member is ⊤, not a wrapper.
+#[test]
+fn an_unlisted_mantine_member_does_not_defer_its_argument() {
+    let fired = rules_fired(
+        r#"
+        import { useForm } from "@mantine/form";
+        function C() {
+          const [loading, setLoading] = useState(false);
+          const form = useForm();
+          form.watch("name", (values) => { setLoading(true); });
+          return <form />;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        fired.iter().any(|r| r == "setter-in-render"),
+        "only `onSubmit` carries the wrapper contract: {fired:?}"
+    );
+}

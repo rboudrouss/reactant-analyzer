@@ -257,14 +257,16 @@ pub enum SummaryValue {
     StableRef,
     /// Hook returns a reference-unstable value (new object/array every render).
     UnstableRef,
-    /// A stable function that **wraps** its own function argument rather than
-    /// running it: `form.handleSubmit(onSubmit)` returns an event handler and
-    /// calls `onSubmit` only when that handler fires.
+    /// A function that **wraps** its own function argument rather than running
+    /// it: `form.handleSubmit(onSubmit)` returns an event handler and calls
+    /// `onSubmit` only when that handler fires.
     ///
-    /// Stable like [`Self::StableRef`] for every value question — the extra
-    /// variant records the *timing* half, which is a different claim about a
-    /// different thing and so cannot ride on the value.
-    StableWrapper,
+    /// `stable` is the wrapper's *own* identity across renders, which is a
+    /// separate claim about a separate thing: react-hook-form's `handleSubmit`
+    /// is `useCallback`-backed, `@mantine/form`'s `onSubmit` is a fresh arrow
+    /// every render, and both wrap. Riding the timing on the value would make
+    /// the mantine entry claim a stability nobody promised.
+    Wrapper { stable: bool },
     /// Hook returns an object whose *named* members carry their own summaries.
     ///
     /// The contract libraries actually publish is per member, not per object:

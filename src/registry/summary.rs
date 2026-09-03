@@ -89,6 +89,10 @@ impl SummaryRegistry {
         for (pkg, hook) in [("swr", "useSWR"), ("swr", "useSWRConfig")] {
             r.register_for_package(pkg, Box::new(ShapeSummary(hook, SWR_MEMBERS)));
         }
+        r.register_for_package(
+            "@mantine/form",
+            Box::new(ShapeSummary("useForm", MANTINE_FORM_MEMBERS)),
+        );
         // Known, and nothing more. `useDebouncedCallback` is documented to
         // return a memoized callback, but the corpus offers one site to check
         // it against — not enough to write down a stability claim, and a claim
@@ -206,7 +210,7 @@ const REACT_HOOK_FORM_MEMBERS: &[(&str, SummaryValue)] = &[
     ("reset", SummaryValue::StableRef),
     ("trigger", SummaryValue::StableRef),
     // `handleSubmit(cb)` returns an event handler; it does not call `cb`.
-    ("handleSubmit", SummaryValue::StableWrapper),
+    ("handleSubmit", SummaryValue::Wrapper { stable: true }),
     ("watch", SummaryValue::StableRef),
     ("control", SummaryValue::StableRef),
 ];
@@ -221,6 +225,19 @@ const NEXT_ROUTER_MEMBERS: &[(&str, SummaryValue)] = &[
     ("back", SummaryValue::StableRef),
     ("forward", SummaryValue::StableRef),
 ];
+
+/// `@mantine/form`'s `useForm()`. One entry, and it is a timing claim, not a
+/// stability one: `onSubmit` is built as `(handler) => (event) => …`, a fresh
+/// arrow on every render, so the wrapper is `stable: false`.
+///
+/// Nothing else is listed, and nothing else should be: mantine's members are
+/// `useCallback`s over deps that are not themselves stable — `setValues` over
+/// `[onValuesChange]` (a user callback, usually an inline arrow), `getValues`
+/// over `[refValues.current]` — which is not a documented identity guarantee.
+/// Unlisted members stay ⊤, the honest answer. The context hooks
+/// `createFormContext()` builds are user-named and cannot be keyed here at all.
+const MANTINE_FORM_MEMBERS: &[(&str, SummaryValue)] =
+    &[("onSubmit", SummaryValue::Wrapper { stable: false })];
 
 /// SWR. `mutate` is bound to the key and stable; `data`, `error` and
 /// `isLoading` are the whole point of the hook changing, so they stay ⊤.
