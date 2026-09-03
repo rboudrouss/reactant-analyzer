@@ -872,10 +872,13 @@ mod tests {
             .body
             .iter()
             .find_map(|s| match s {
-                Statement::FunctionDeclaration(f) => f
-                    .body
-                    .as_ref()
-                    .map(|b| build_cfg(b, &crate::ir::SourceMap::empty())),
+                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| {
+                    build_cfg(
+                        b,
+                        &crate::ir::SourceMap::empty(),
+                        &crate::lowering::cfg_builder::ExprIds::default(),
+                    )
+                }),
                 _ => None,
             })
             .expect("no function found");
@@ -1158,10 +1161,13 @@ mod tests {
             .body
             .iter()
             .find_map(|s| match s {
-                Statement::FunctionDeclaration(f) => f
-                    .body
-                    .as_ref()
-                    .map(|b| build_cfg(b, &crate::ir::SourceMap::empty())),
+                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| {
+                    build_cfg(
+                        b,
+                        &crate::ir::SourceMap::empty(),
+                        &crate::lowering::cfg_builder::ExprIds::default(),
+                    )
+                }),
                 _ => None,
             })
             .expect("no function found");
@@ -1306,7 +1312,9 @@ mod tests {
             .body
             .iter()
             .find_map(|s| match s {
-                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| build_cfg(b, &smap)),
+                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| {
+                    build_cfg(b, &smap, &crate::lowering::cfg_builder::ExprIds::default())
+                }),
                 _ => None,
             })
             .expect("no function found");
@@ -1339,10 +1347,13 @@ mod tests {
             .body
             .iter()
             .find_map(|s| match s {
-                Statement::FunctionDeclaration(f) => f
-                    .body
-                    .as_ref()
-                    .map(|b| build_cfg(b, &crate::ir::SourceMap::empty())),
+                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| {
+                    build_cfg(
+                        b,
+                        &crate::ir::SourceMap::empty(),
+                        &crate::lowering::cfg_builder::ExprIds::default(),
+                    )
+                }),
                 _ => None,
             })
             .expect("no function found");
@@ -1509,10 +1520,13 @@ mod tests {
             .body
             .iter()
             .find_map(|s| match s {
-                Statement::FunctionDeclaration(f) => f
-                    .body
-                    .as_ref()
-                    .map(|b| build_cfg(b, &crate::ir::SourceMap::empty())),
+                Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| {
+                    build_cfg(
+                        b,
+                        &crate::ir::SourceMap::empty(),
+                        &crate::lowering::cfg_builder::ExprIds::default(),
+                    )
+                }),
                 _ => None,
             })
             .expect("no function found");

@@ -76,7 +76,8 @@ pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
             ClassElement::MethodDefinition(m) => {
                 computed_key(&m.key, builder);
                 if let Some(body) = m.value.body.as_deref() {
-                    let (params, body_cfg) = build_fn_body_cfg(&m.value.params, body, &smap);
+                    let ids = builder.expr_ids().clone();
+                    let (params, body_cfg) = build_fn_body_cfg(&m.value.params, body, &smap, &ids);
                     let fn_id = builder.next_expr_id();
                     fields.push((
                         synthetic_key(builder, "[method]"),
@@ -111,12 +112,13 @@ pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
             // expression would.
             ClassElement::StaticBlock(b) => {
                 let fn_id = builder.next_expr_id();
+                let ids = builder.expr_ids().clone();
                 fields.push((
                     synthetic_key(builder, "[static]"),
                     Expr::FnLit {
                         id: fn_id,
                         params: vec![],
-                        body_cfg: Arc::new(build_stmts_cfg(&b.body, &smap)),
+                        body_cfg: Arc::new(build_stmts_cfg(&b.body, &smap, &ids)),
                     },
                 ));
             }
@@ -437,12 +439,13 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         Expression::ArrowFunctionExpression(arrow) => {
             let id = builder.next_expr_id();
             let smap = builder.smap.clone();
+            let ids = builder.expr_ids().clone();
             // Concise body (`x => expr`) carries an implicit return; block body
             // (`x => { ... }`) lowers like any function body.
             let (params, body_cfg) = if arrow.expression {
-                build_expr_fn_body_cfg(&arrow.params, &arrow.body, &smap)
+                build_expr_fn_body_cfg(&arrow.params, &arrow.body, &smap, &ids)
             } else {
-                build_fn_body_cfg(&arrow.params, &arrow.body, &smap)
+                build_fn_body_cfg(&arrow.params, &arrow.body, &smap, &ids)
             };
             Expr::FnLit {
                 id,
@@ -453,8 +456,9 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         Expression::FunctionExpression(func) => {
             let id = builder.next_expr_id();
             let smap = builder.smap.clone();
+            let ids = builder.expr_ids().clone();
             let (params, body_cfg) = if let Some(body) = func.body.as_deref() {
-                build_fn_body_cfg(&func.params, body, &smap)
+                build_fn_body_cfg(&func.params, body, &smap, &ids)
             } else {
                 (vec![], empty_cfg())
             };
@@ -1231,10 +1235,13 @@ mod tests {
             ret.diagnostics
         );
         let func = ret.program.body.iter().find_map(|s| match s {
-            Statement::FunctionDeclaration(f) => f
-                .body
-                .as_ref()
-                .map(|b| build_cfg(b, &crate::ir::SourceMap::empty())),
+            Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| {
+                build_cfg(
+                    b,
+                    &crate::ir::SourceMap::empty(),
+                    &crate::lowering::cfg_builder::ExprIds::default(),
+                )
+            }),
             _ => None,
         });
         func.expect("no function found")

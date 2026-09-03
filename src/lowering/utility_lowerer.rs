@@ -10,7 +10,10 @@ use oxc_ast::ast::Program;
 
 use crate::{
     ir::{FileTable, FunctionIR, SourceMap},
-    lowering::{cfg_builder::build_fn_body_cfg, utility_detector::detect_utilities},
+    lowering::{
+        cfg_builder::{ExprIds, build_fn_body_cfg},
+        utility_detector::detect_utilities,
+    },
     resolver::{DefaultImportResolver, ImportResolver},
 };
 
@@ -43,10 +46,13 @@ pub fn lower_utilities_with_resolver(
     _resolver: &dyn ImportResolver,
 ) -> Vec<FunctionIR> {
     let smap = SourceMap::new(source, files.intern(file));
+    // One allocation-site counter per file — see `ExprIds` (#134).
+    let expr_ids = ExprIds::default();
     detect_utilities(program)
         .into_iter()
         .map(|candidate| {
-            let (params, body_cfg) = build_fn_body_cfg(candidate.params, candidate.body, &smap);
+            let (params, body_cfg) =
+                build_fn_body_cfg(candidate.params, candidate.body, &smap, &expr_ids);
             FunctionIR {
                 file: file.to_path_buf(),
                 name: candidate.name,

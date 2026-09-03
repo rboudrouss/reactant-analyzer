@@ -1,4 +1,6 @@
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use oxc_ast::ast::*;
 use oxc_span::GetSpan;
@@ -14,6 +16,31 @@ use crate::{
     lowering::expr_lower::{assign_target_ident, empty_cfg, lower_expr},
 };
 
+// ── Allocation-site ids ───────────────────────────────────────────────────────
+
+/// The counter behind [`ExprId`], shared by every body lowered from one file.
+///
+/// `ExprId` keys the abstract heap, and **one component's heap holds the
+/// allocation sites of its render body, of every nested function body, and of
+/// every callee spliced into it**. A counter per `BlockBuilder` numbered all of
+/// them from zero, so two unrelated objects shared a heap entry and the later
+/// one silently answered member reads of the earlier — a false negative when
+/// the impostor was the more stable of the two (#134).
+///
+/// Cloning shares the counter, which is how it reaches a nested body without
+/// changing what a builder owns. One counter per file; the splice gives an
+/// inlined callee its own range (see [`crate::ir::Offsets`]).
+#[derive(Debug, Clone, Default)]
+pub struct ExprIds(Rc<Cell<usize>>);
+
+impl ExprIds {
+    fn next(&self) -> ExprId {
+        let id = self.0.get();
+        self.0.set(id + 1);
+        ExprId(id)
+    }
+}
+
 // ── BlockBuilder ──────────────────────────────────────────────────────────────
 
 pub(super) struct BlockBuilder {
@@ -24,7 +51,8 @@ pub(super) struct BlockBuilder {
     current_stmts: Vec<Stmt>,
     terminated: bool,
     temp_counter: usize,
-    expr_counter: usize,
+    /// Shared with every other builder of this file — see [`ExprIds`].
+    expr_ids: ExprIds,
     /// Enclosing breakables, innermost last. A `switch` is breakable but not
     /// continuable, so `continue_to` is `None` there.
     loop_stack: Vec<LoopFrame>,
@@ -42,7 +70,7 @@ struct LoopFrame {
 }
 
 impl BlockBuilder {
-    pub(super) fn new_with_smap(smap: &SourceMap) -> Self {
+    pub(super) fn new_with_smap(smap: &SourceMap, expr_ids: &ExprIds) -> Self {
         Self {
             blocks: BTreeMap::new(),
             edges: Vec::new(),
@@ -51,7 +79,7 @@ impl BlockBuilder {
             current_stmts: Vec::new(),
             terminated: false,
             temp_counter: 0,
-            expr_counter: 0,
+            expr_ids: expr_ids.clone(),
             loop_stack: Vec::new(),
             pending_label: None,
             smap: smap.clone(),
@@ -103,9 +131,12 @@ impl BlockBuilder {
     }
 
     pub(super) fn next_expr_id(&mut self) -> ExprId {
-        let id = self.expr_counter;
-        self.expr_counter += 1;
-        ExprId(id)
+        self.expr_ids.next()
+    }
+
+    /// The id counter this builder shares, to hand to a nested body's builder.
+    pub(super) fn expr_ids(&self) -> &ExprIds {
+        &self.expr_ids
     }
 
     pub(super) fn push_stmt(&mut self, stmt: Stmt) {
@@ -197,14 +228,14 @@ impl BlockBuilder {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-pub fn build_cfg(body: &FunctionBody, smap: &SourceMap) -> CFG {
-    build_stmts_cfg(&body.statements, smap)
+pub fn build_cfg(body: &FunctionBody, smap: &SourceMap, ids: &ExprIds) -> CFG {
+    build_stmts_cfg(&body.statements, smap, ids)
 }
 
 /// [`build_cfg`] for a bare statement list — a class `static { … }` block,
 /// which has no `FunctionBody` wrapper.
-pub fn build_stmts_cfg(stmts: &[Statement], smap: &SourceMap) -> CFG {
-    let mut builder = BlockBuilder::new_with_smap(smap);
+pub fn build_stmts_cfg(stmts: &[Statement], smap: &SourceMap, ids: &ExprIds) -> CFG {
+    let mut builder = BlockBuilder::new_with_smap(smap, ids);
     builder.start_block(0);
     lower_stmts(stmts, &mut builder);
     builder.into_cfg(0)
@@ -366,8 +397,9 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
         Statement::FunctionDeclaration(func) => {
             if let Some(id) = &func.id {
                 let smap = builder.smap.clone();
+                let ids = builder.expr_ids().clone();
                 let (params, body_cfg) = if let Some(body) = func.body.as_deref() {
-                    build_fn_body_cfg(&func.params, body, &smap)
+                    build_fn_body_cfg(&func.params, body, &smap, &ids)
                 } else {
                     (vec![], empty_cfg())
                 };
@@ -867,8 +899,9 @@ pub fn build_fn_body_cfg(
     params: &FormalParameters,
     body: &FunctionBody,
     smap: &SourceMap,
+    ids: &ExprIds,
 ) -> (Vec<String>, CFG) {
-    let mut builder = BlockBuilder::new_with_smap(smap);
+    let mut builder = BlockBuilder::new_with_smap(smap, ids);
     builder.start_block(0);
     let param_names = inject_param_preamble(params, &mut builder);
     lower_stmts(&body.statements, &mut builder);
@@ -880,8 +913,9 @@ pub fn build_expr_fn_body_cfg(
     params: &FormalParameters,
     body: &FunctionBody,
     smap: &SourceMap,
+    ids: &ExprIds,
 ) -> (Vec<String>, CFG) {
-    let mut builder = BlockBuilder::new_with_smap(smap);
+    let mut builder = BlockBuilder::new_with_smap(smap, ids);
     builder.start_block(0);
     let param_names = inject_param_preamble(params, &mut builder);
     if let Some(Statement::ExpressionStatement(es)) = body.statements.first() {
@@ -916,9 +950,10 @@ mod tests {
             .body
             .iter()
             .find_map(|s| match s {
-                Statement::FunctionDeclaration(f) => {
-                    f.body.as_ref().map(|b| build_cfg(b, &SourceMap::empty()))
-                }
+                Statement::FunctionDeclaration(f) => f
+                    .body
+                    .as_ref()
+                    .map(|b| build_cfg(b, &SourceMap::empty(), &ExprIds::default())),
                 _ => None,
             })
             .expect("function body")

@@ -12,6 +12,7 @@ pub mod utility_detector;
 pub mod utility_lowerer;
 
 pub use crate::ir::{FileId, FileTable, SourceMap, compute_line_starts, offset_to_range};
+use cfg_builder::ExprIds;
 pub use cfg_builder::{build_cfg, build_fn_body_cfg};
 pub use component_detector::{ComponentCandidate, detect_components};
 pub use hook_detector::{HookCandidate, detect_custom_hooks};
@@ -290,6 +291,8 @@ pub fn lower_custom_hooks_with_resolver(
     resolver: &dyn ImportResolver,
 ) -> Vec<HookIR> {
     let smap = SourceMap::new(source, files.intern(file));
+    // One allocation-site counter per file — see `ExprIds` (#134).
+    let expr_ids = ExprIds::default();
     let origins = build_hook_origins(program, file, resolver);
     let react_ns = build_react_ns(program);
     let candidates = detect_custom_hooks(program);
@@ -303,7 +306,8 @@ pub fn lower_custom_hooks_with_resolver(
     candidates
         .into_iter()
         .map(|candidate| {
-            let (params, mut body_cfg) = build_fn_body_cfg(candidate.params, candidate.body, &smap);
+            let (params, mut body_cfg) =
+                build_fn_body_cfg(candidate.params, candidate.body, &smap, &expr_ids);
             let (mut hooks, hook_provenance, mut next_label) =
                 extract_hooks(&mut body_cfg, &imports);
             extract_handlers(&body_cfg, &mut hooks, &mut next_label);
@@ -349,6 +353,8 @@ pub fn lower_program_with_resolver(
     resolver: &dyn ImportResolver,
 ) -> Vec<ComponentIR> {
     let smap = SourceMap::new(source, files.intern(file));
+    // One allocation-site counter per file — see `ExprIds` (#134).
+    let expr_ids = ExprIds::default();
     let origins = build_hook_origins(program, file, resolver);
     let react_ns = build_react_ns(program);
     let module_consts = Arc::new(collect_module_consts(program, &react_ns, file));
@@ -366,7 +372,7 @@ pub fn lower_program_with_resolver(
         .into_iter()
         .map(|candidate| {
             let (param_names, mut render_cfg) =
-                build_fn_body_cfg(candidate.params, candidate.body, &smap);
+                build_fn_body_cfg(candidate.params, candidate.body, &smap, &expr_ids);
             let (mut hooks, hook_provenance, mut next_label) =
                 extract_hooks(&mut render_cfg, &imports);
             extract_handlers(&render_cfg, &mut hooks, &mut next_label);

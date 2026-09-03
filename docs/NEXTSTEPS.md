@@ -176,6 +176,29 @@ dépendance tracée jusqu'à sa définition est bien une allocation fraîche, et
 règle exige une preuve (⊤ ne déclenche rien). Les FP restants sont dans les
 petits amas.
 
+### #134 — l'identité d'un site d'allocation (2026-09-03)
+
+Trouvé en dimensionnant #94. `ExprId` est la clef du tas, mais son compteur
+repartait de zéro dans chaque `BlockBuilder` — un par corps de fonction — et le
+greffon décalait les `HookLabel` sans toucher aux `ExprId`. Le corps de rendu
+d'un composant, chacun de ses callbacks et chaque appelé inliné numérotaient
+donc leurs allocations depuis zéro **dans un seul tas** : le dernier écrasait
+l'entrée et répondait aux lectures de membres du premier. Un effet qui construit
+`{ inner: unRef }` faisait **disparaître** une closure périmée ailleurs dans le
+composant — un faux négatif, la direction interdite.
+
+Corrigé aux deux endroits où l'identité est frappée : un compteur par fichier
+(`ExprIds`, partagé par tous les builders) et un décalage par greffe
+(`Offsets { labels, ids }`, monotone par composant — le *même* appelé inliné
+deux fois fait deux sites d'allocation).
+
+Corpus : **1 340 → 1 348 emplacements, 14 ajoutés, 6 retirés**, durée inchangée.
+Le sens compte plus que le nombre : les ajouts sont des constats que les
+collisions taisaient (`useCompleteTask.ts:10` dépend de `updateOneRecord`, une
+flèche sans `useCallback` — la mémoïsation était bien défaite), et les retraits
+sont la famille `$errors.<membre>` de mantine, qui se résout enfin comme le
+disait le journal de précision.
+
 Prochaines marches, par valeur décroissante : les valeurs d'arguments (#67) ;
 une requête de dominance ; les résumés d'écosystème (#94), seule façon de
 réduire la classe ⊤ qu'ADR-038 §2 laisse en Warning ; et la moitié

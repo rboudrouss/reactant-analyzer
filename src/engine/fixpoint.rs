@@ -174,9 +174,8 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // Spliced-callee block ranges per CFG (ADR-027 §4): what decides whether
     // a write site is caller-authored or wrapper-mediated.
     let mut inline_regions = crate::engine::setters::InlineRegions::default();
-    // Monotonic salt shared by every splice in this component so alpha-renamed
-    // callee locals (`name#salt`) never collide across utility and hook splices.
-    let mut splice_salt: u32 = 0;
+    // The identity supplies every splice in this component draws from.
+    let mut splice_salt = SpliceIds::for_component(&render_cfg, &hooks);
 
     // Utility-function inlining. Runs before `expand_custom_hooks` so utility
     // bodies containing hook calls become visible to the hook expansion pass.
@@ -752,6 +751,54 @@ pub fn analyze_program(
 /// existing labels).  Nested custom hooks are expanded recursively via the `while`
 /// loop; the recursion guard prevents infinite expansion.
 ///
+/// The identity supplies every splice in one component draws from: a salt that
+/// alpha-renames the callee's locals, and a cursor over allocation-site ids.
+///
+/// Both are monotonic for the same reason — the caller and the callee number
+/// their own things from zero, and a graft has to land somewhere neither of
+/// them already occupies. The salt has always been here; the id cursor is what
+/// stops a callee's `ObjectLit` from sharing a heap entry with the caller's,
+/// and stops the *same* callee inlined twice from being one allocation site
+/// (#134).
+pub(crate) struct SpliceIds {
+    salt: u32,
+    next_alloc: usize,
+}
+
+impl SpliceIds {
+    fn for_component(render_cfg: &CFG, hooks: &[HookEntry]) -> Self {
+        SpliceIds {
+            salt: 0,
+            next_alloc: alloc_span(render_cfg, hooks),
+        }
+    }
+
+    /// The salt and allocation-id offset for one graft `span` ids wide,
+    /// advancing both supplies past it.
+    fn take(&mut self, span: usize) -> (u32, usize) {
+        let salt = self.salt;
+        self.salt += 1;
+        let ids = self.next_alloc;
+        self.next_alloc += span;
+        (salt, ids)
+    }
+}
+
+/// The allocation-id width of a body together with the hook table grafted
+/// alongside it — they are numbered from one file counter, so they share a
+/// range and must be shifted by one offset.
+fn alloc_span(cfg: &CFG, hooks: &[HookEntry]) -> usize {
+    std::iter::once(crate::ir::alloc_id_span(cfg))
+        .chain(
+            hooks
+                .iter()
+                .filter_map(HookEntry::body_cfg)
+                .map(crate::ir::alloc_id_span),
+        )
+        .max()
+        .unwrap_or(0)
+}
+
 /// Guard strategy: a local `expanding` set tracks every hook name whose entries
 /// have been inserted into `hooks` in this call.  Once a name is in the set, any
 /// further `Custom` entry with that name is skipped (cut to ⊤).  This is correct
@@ -764,7 +811,7 @@ fn expand_custom_hooks(
     inter: Option<&InterCtx<'_>>,
     origins: &mut Vec<crate::engine::InlineOrigin>,
     regions: &mut crate::engine::setters::InlineRegions,
-    salt: &mut u32,
+    salt: &mut SpliceIds,
 ) {
     let Some(inter) = inter else { return };
     let Some(reg) = inter.hook_registry else {
@@ -857,11 +904,14 @@ fn expand_custom_hooks(
         // One alpha-rename map for this expansion, shared by the body splice and
         // by every sub-hook body that captures a render-scope local — otherwise
         // an effect capturing `x` would desync from the body's renamed `x`.
-        let s = *salt;
-        *salt += 1;
+        let (s, id_offset) = salt.take(alloc_span(&hook_ir.body_cfg, &hook_ir.hooks));
+        let off = crate::ir::Offsets {
+            labels: offset,
+            ids: id_offset,
+        };
         let rename = crate::ir::callee_rename_map(&hook_ir.body_cfg, &hook_ir.params, s);
 
-        let remapped: Vec<HookEntry> = remap_hooks(hook_ir.hooks.clone(), offset)
+        let remapped: Vec<HookEntry> = remap_hooks(hook_ir.hooks.clone(), off)
             .into_iter()
             .map(|h| {
                 let h = match h {
@@ -880,7 +930,7 @@ fn expand_custom_hooks(
         // binding), binding the return to the caller variable. Fixes the
         // multi-block-body FN (only the entry block used to survive) and the
         // destructuring rebind (the return is now actually bound).
-        let body = remap_cfg(hook_ir.body_cfg.clone(), offset);
+        let body = remap_cfg(hook_ir.body_cfg.clone(), off);
         if let Some((block_id, stmt_idx, bound_var)) = find_hook_marker(render_cfg, custom_label) {
             let range = crate::ir::splice_callee_into_cfg(
                 render_cfg,
@@ -1375,9 +1425,9 @@ struct InlineCtx<'a> {
     caller_file: &'a std::path::Path,
     max_depth: usize,
     origins: &'a mut Vec<crate::engine::InlineOrigin>,
-    /// Monotonic across every splice in the component, so alpha-renamed callee
-    /// locals (`name#salt`) cannot collide.
-    salt: &'a mut u32,
+    /// Monotonic across every splice in the component: alpha-rename salt plus
+    /// the allocation-id cursor.
+    salt: &'a mut SpliceIds,
     /// Set once the budget cut a call off anywhere. The caller turns it into
     /// the `analysis-limit` Info: a *silent* truncation is what lets a
     /// component publish assurances over code that was never read.
@@ -1395,7 +1445,7 @@ fn expand_utility_calls(
     max_depth: usize,
     origins: &mut Vec<crate::engine::InlineOrigin>,
     regions: &mut crate::engine::setters::InlineRegions,
-    salt: &mut u32,
+    salt: &mut SpliceIds,
 ) -> bool {
     if registry.is_empty() {
         return false;
@@ -1575,7 +1625,7 @@ fn splice_one_call(
     stmt_idx: usize,
     registry: &FunctionRegistry,
     caller_file: &std::path::Path,
-    salt: &mut u32,
+    salt: &mut SpliceIds,
 ) -> Option<(
     std::ops::Range<BlockId>,
     crate::ir::types::Symbol,
@@ -1596,15 +1646,21 @@ fn splice_one_call(
     let name = utility_call_target(&call_stmt)?;
     let utility = resolve_utility(registry, caller_file, &name)?.clone();
 
-    let s = *salt;
-    *salt += 1;
+    let (s, id_offset) = salt.take(alloc_span(&utility.body_cfg, &[]));
     let rename = crate::ir::callee_rename_map(&utility.body_cfg, &utility.params, s);
+    let body = crate::ir::remap_cfg(
+        utility.body_cfg,
+        crate::ir::Offsets {
+            labels: 0,
+            ids: id_offset,
+        },
+    );
     let range = crate::ir::splice_callee_into_cfg(
         cfg,
         block_id,
         stmt_idx,
         crate::ir::Splice {
-            callee: utility.body_cfg,
+            callee: body,
             params: &utility.params,
             args: &call_args,
             bound_var: bound_var.as_ref(),
