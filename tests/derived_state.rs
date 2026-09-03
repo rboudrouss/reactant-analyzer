@@ -311,3 +311,61 @@ fn conditional_body_partial_no_fire() {
         "partial conditional (setter only on one branch) must not fire"
     );
 }
+
+// ── #92 — the writer scan reads the shared relation ──────────────────────────
+
+/// A handler bound to a JSX prop also writes the slot, so the effect is not
+/// the only writer and the value is not merely derived. The old scan looked at
+/// the render body and the other effect bodies, and a `useCallback` is neither.
+#[test]
+fn a_handler_writer_is_a_writer() {
+    let hits = derived_state_hits(
+        r#"
+        import { useState, useEffect, useCallback } from "react";
+        function C() {
+            const [tab, setTab] = useState(0);
+            const [selected, setSelected] = useState([]);
+            useEffect(() => { setSelected([]); }, [tab]);
+            const onToggle = useCallback((x) => { setSelected(x); }, []);
+            return <div onClick={onToggle}>{tab}</div>;
+        }
+        "#,
+    );
+    assert_eq!(hits, 0, "`onToggle` writes the slot too");
+}
+
+/// Same question one hop further out: the setter leaves the component, so
+/// something we cannot see may write the slot.
+#[test]
+fn an_escaped_setter_is_a_writer_we_cannot_see() {
+    let hits = derived_state_hits(
+        r#"
+        import { useState, useEffect } from "react";
+        function C({ register }) {
+            const [tab, setTab] = useState(0);
+            const [selected, setSelected] = useState([]);
+            useEffect(() => { setSelected([]); }, [tab]);
+            register(setSelected);
+            return <div>{tab}</div>;
+        }
+        "#,
+    );
+    assert_eq!(hits, 0, "`setSelected` escaped through `register`");
+}
+
+/// The control: with no other writer anywhere, the finding still fires.
+#[test]
+fn a_lone_effect_writer_still_fires() {
+    let hits = derived_state_hits(
+        r#"
+        import { useState, useEffect } from "react";
+        function C() {
+            const [tab, setTab] = useState(0);
+            const [selected, setSelected] = useState([]);
+            useEffect(() => { setSelected([]); }, [tab]);
+            return <div>{tab}</div>;
+        }
+        "#,
+    );
+    assert_eq!(hits, 1, "nothing else writes the slot");
+}

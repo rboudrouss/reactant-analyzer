@@ -28,7 +28,7 @@ use crate::ir::{
     types::{HookLabel, Var},
 };
 
-use super::setters::{SlotWriter, WriterPhase, WriterRegion};
+use super::setters::{SlotWriter, WriterPhase, WriterRegion, setter_escapes};
 use super::{AnalysisResult, EffectInfo};
 
 /// Whether anything visibly re-syncs a prop-seeded slot when the prop moves.
@@ -376,75 +376,6 @@ fn deps_cover_seed(
         .iter()
         .filter(|n| n.exact)
         .any(|n| path_covered(&n.path, &declared_norm))
-}
-
-/// `true` when an alias of the slot's setter is used anywhere outside a direct
-/// call or a pure alias binding — passed as a prop, stored in an object,
-/// handed to an opaque call. An escaped setter means something we cannot see
-/// may sync the slot, so the no-sync claim loses certainty.
-fn setter_escapes(render_cfg: &CFG, hooks: &[HookEntry], aliases: &HashSet<Var>) -> bool {
-    fn in_expr(e: &Expr, aliases: &HashSet<Var>) -> bool {
-        match e {
-            Expr::Var(v) => aliases.contains(v),
-            Expr::Call { fn_, args } => {
-                let callee_is_alias = matches!(fn_.peel_ts(), Expr::Var(v) if aliases.contains(v));
-                (!callee_is_alias && in_expr(fn_, aliases))
-                    || args.iter().any(|a| in_expr(a, aliases))
-            }
-            Expr::FnLit {
-                params, body_cfg, ..
-            } => {
-                // Params shadow same-named outer bindings inside the body.
-                let inner: HashSet<Var> = aliases
-                    .iter()
-                    .filter(|a| !params.contains(a))
-                    .cloned()
-                    .collect();
-                !inner.is_empty() && in_cfg(body_cfg, &inner)
-            }
-            other => {
-                let mut found = false;
-                other.for_each_child(&mut |c| found = found || in_expr(c, aliases));
-                found
-            }
-        }
-    }
-    fn in_cfg(cfg: &CFG, aliases: &HashSet<Var>) -> bool {
-        use crate::ir::{cfg::Terminator, stmt::Stmt};
-        cfg.blocks.values().any(|block| {
-            block.stmts.iter().any(|stmt| match stmt {
-                // `let s2 = s1` where both sides are known aliases is the
-                // alias chain itself, not an escape.
-                Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } => match rhs.peel_ts() {
-                    Expr::Var(v) if aliases.contains(v) => !aliases.contains(var),
-                    _ => in_expr(rhs, aliases),
-                },
-                Stmt::MemberWrite { obj, key, rhs, .. } => {
-                    in_expr(obj, aliases)
-                        || matches!(key, crate::ir::stmt::MemberKey::Index(i) if in_expr(i, aliases))
-                        || in_expr(rhs, aliases)
-                }
-                Stmt::ExprStmt(e, _) => in_expr(e, aliases),
-            }) || match &block.term {
-                Terminator::Return(e) | Terminator::Branch { cond: e, .. } => in_expr(e, aliases),
-                _ => false,
-            }
-        })
-    }
-    let cfgs = std::iter::once(render_cfg).chain(hooks.iter().filter_map(|h| h.body_cfg()));
-    for cfg in cfgs {
-        if in_cfg(cfg, aliases) {
-            return true;
-        }
-    }
-    // Custom-hook args and state/ref initializers can smuggle the setter too.
-    hooks.iter().any(|h| match h {
-        HookEntry::Custom { args, .. } => args.iter().any(|a| in_expr(a, aliases)),
-        HookEntry::State { init, .. } | HookEntry::Ref { init, .. } => {
-            !matches!(init.peel_ts(), Expr::StateSetter(_)) && in_expr(init, aliases)
-        }
-        _ => false,
-    })
 }
 
 impl AnalysisResult<StateValue> {

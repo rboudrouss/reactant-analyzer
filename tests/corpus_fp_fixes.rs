@@ -1913,3 +1913,48 @@ fn a_member_write_that_keeps_its_guard_true_still_loops() {
         "`leadId` stays truthy, so the guard holds again: {fired:?}"
     );
 }
+
+// ── #92 — a slot's writers are read off the shared relation ──────────────────
+
+/// `redundant-set-state` claims the slot already holds what this write stores.
+/// A handler bound to JSX writes it too, so the claim is not ours to make —
+/// and a `useCallback` body is neither the render CFG nor another effect, the
+/// only two places the old scan looked.
+#[test]
+fn a_handler_writer_defeats_the_redundant_claim() {
+    let fired = rules_fired(
+        r#"
+        import { useState, useEffect, useCallback } from "react";
+        function C() {
+          const [msg, setMsg] = useState(null);
+          useEffect(() => { setMsg(null); }, []);
+          const onBlur = useCallback(() => { setMsg("taken"); }, []);
+          return <input onBlur={onBlur} />;
+        }
+        "#,
+    );
+    assert!(
+        !fired.iter().any(|r| r == "redundant-set-state"),
+        "`onBlur` writes the slot too: {fired:?}"
+    );
+}
+
+/// The setter left the component, so something we cannot see may write it.
+#[test]
+fn an_escaped_setter_defeats_the_redundant_claim() {
+    let fired = rules_fired(
+        r#"
+        import { useState, useEffect } from "react";
+        function C({ expose }) {
+          const [msg, setMsg] = useState(null);
+          useEffect(() => { setMsg(null); }, []);
+          expose(setMsg);
+          return <div>{msg}</div>;
+        }
+        "#,
+    );
+    assert!(
+        !fired.iter().any(|r| r == "redundant-set-state"),
+        "`setMsg` escaped through `expose`: {fired:?}"
+    );
+}

@@ -1,6 +1,7 @@
 use crate::rules::RuleCtx;
 use std::collections::{HashMap, HashSet};
 
+use crate::engine::setters::WriterRegion;
 use crate::{
     domains::{AbstractDomain, AbstractEnv, MemoStore, StateStore, StateValue},
     ir::{
@@ -47,6 +48,40 @@ impl Rule for RedundantSetState {
         // [`crate::rules::helpers::Eval`].
         let mut scratch = result.heap.clone();
 
+        // Slots whose value this rule has no standing to talk about (#92).
+        //
+        // "The state already holds this" is a claim about what the slot
+        // contains when the write runs, and it is only ours to make when this
+        // write is the whole story. Two things end that: a writer in another
+        // region — a JSX-bound handler, a `useCallback` body, a `.then()`
+        // continuation the effect kicked off — and a setter that left the
+        // component at all, after which something we cannot see may write it.
+        //
+        // Both are may-facts used to *withhold*, so over-approximating costs a
+        // warning instead of inventing one.
+        let contested: HashSet<HookLabel> = {
+            let mut regions: HashMap<HookLabel, WriterRegion> = HashMap::new();
+            let mut multi: HashSet<HookLabel> = HashSet::new();
+            for w in &result.slot_writers {
+                match regions.entry(w.slot) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(w.region);
+                    }
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        if *e.get() != w.region {
+                            multi.insert(w.slot);
+                        }
+                    }
+                }
+            }
+            let escaping = result.escaping_slots();
+            regions
+                .keys()
+                .copied()
+                .filter(|s| multi.contains(s) || escaping.contains(s))
+                .collect()
+        };
+
         // ── Render body ───────────────────────────────────────────────────────
         for (&block_id, block) in &result.render_cfg.blocks {
             let env = match result.block_states.get(&block_id) {
@@ -60,6 +95,7 @@ impl Rule for RedundantSetState {
                 &result.state_store,
                 &result.memo_store,
                 &mut scratch,
+                &contested,
                 &mut diags,
                 &HashSet::new(),
             );
@@ -83,6 +119,7 @@ impl Rule for RedundantSetState {
                     &result.state_store,
                     &result.memo_store,
                     &mut scratch,
+                    &contested,
                     &mut diags,
                 );
                 if let Some(r) = result.effect_info.get(eff_label).and_then(|i| i.span) {
@@ -101,6 +138,7 @@ impl Rule for RedundantSetState {
 
 /// Scan all blocks of `cfg` for redundant setter calls.
 /// Skips setters whose argument differs across calls (state-transition pattern).
+#[allow(clippy::too_many_arguments)]
 fn check_cfg_for_redundant_sets(
     component: &Symbol,
     cfg: &CFG,
@@ -108,6 +146,7 @@ fn check_cfg_for_redundant_sets(
     state: &StateStore<StateValue>,
     memo: &MemoStore<StateValue>,
     heap: &mut crate::domains::Heap,
+    contested: &HashSet<HookLabel>,
     diags: &mut Vec<Diagnostic>,
 ) {
     let skip_labels = collect_transition_setters(component, cfg, env, state, memo, heap);
@@ -119,6 +158,7 @@ fn check_cfg_for_redundant_sets(
             state,
             memo,
             heap,
+            contested,
             diags,
             &skip_labels,
         );
@@ -201,6 +241,7 @@ fn check_setter_calls(
     state: &StateStore<StateValue>,
     memo: &MemoStore<StateValue>,
     heap: &mut crate::domains::Heap,
+    contested: &HashSet<HookLabel>,
     diags: &mut Vec<Diagnostic>,
     skip_labels: &HashSet<HookLabel>,
 ) {
@@ -209,7 +250,7 @@ fn check_setter_calls(
             && let Expr::Var(name) = fn_.as_ref()
             && let Some(label) = env.setter_label(name)
         {
-            if skip_labels.contains(&label) {
+            if skip_labels.contains(&label) || contested.contains(&label) {
                 continue;
             }
 

@@ -2119,6 +2119,148 @@ pub(crate) fn may_written_slots(
         .collect()
 }
 
+// ── Escape analysis ───────────────────────────────────────────────────────────
+
+/// `true` when an alias of a slot's setter is used anywhere outside a direct
+/// call or a pure alias binding — passed as a prop, stored in an object,
+/// handed to an opaque call.
+///
+/// An escaped setter means something this component cannot see may write the
+/// slot, so **every** claim of the form "nothing else writes this" loses its
+/// certainty. It lived as a private column of `SlotSeed`, which is why only
+/// `frozen-initial-state` had it; `derived-state` and `redundant-set-state`
+/// make the same claim and simply missed the case (#92). One definition here,
+/// beside the writer relation that answers the other half of the question.
+pub fn setter_escapes(render_cfg: &CFG, hooks: &[HookEntry], aliases: &HashSet<Var>) -> bool {
+    fn in_expr(e: &Expr, aliases: &HashSet<Var>) -> bool {
+        match e {
+            Expr::Var(v) => aliases.contains(v),
+            Expr::Call { fn_, args } => {
+                let callee_is_alias = matches!(fn_.peel_ts(), Expr::Var(v) if aliases.contains(v));
+                (!callee_is_alias && in_expr(fn_, aliases))
+                    || args.iter().any(|a| in_expr(a, aliases))
+            }
+            Expr::FnLit {
+                params, body_cfg, ..
+            } => {
+                // Params shadow same-named outer bindings inside the body.
+                let inner: HashSet<Var> = aliases
+                    .iter()
+                    .filter(|a| !params.contains(a))
+                    .cloned()
+                    .collect();
+                !inner.is_empty() && in_cfg(body_cfg, &inner)
+            }
+            other => {
+                let mut found = false;
+                other.for_each_child(&mut |c| found = found || in_expr(c, aliases));
+                found
+            }
+        }
+    }
+    fn in_cfg(cfg: &CFG, aliases: &HashSet<Var>) -> bool {
+        use crate::ir::{cfg::Terminator, stmt::Stmt};
+        cfg.blocks.values().any(|block| {
+            block.stmts.iter().any(|stmt| match stmt {
+                // `let s2 = s1` where both sides are known aliases is the
+                // alias chain itself, not an escape.
+                Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } => match rhs.peel_ts() {
+                    Expr::Var(v) if aliases.contains(v) => !aliases.contains(var),
+                    _ => in_expr(rhs, aliases),
+                },
+                Stmt::MemberWrite { obj, key, rhs, .. } => {
+                    in_expr(obj, aliases)
+                        || matches!(key, crate::ir::stmt::MemberKey::Index(i) if in_expr(i, aliases))
+                        || in_expr(rhs, aliases)
+                }
+                Stmt::ExprStmt(e, _) => in_expr(e, aliases),
+            }) || match &block.term {
+                Terminator::Return(e) | Terminator::Branch { cond: e, .. } => in_expr(e, aliases),
+                _ => false,
+            }
+        })
+    }
+    let cfgs = std::iter::once(render_cfg).chain(hooks.iter().filter_map(|h| h.body_cfg()));
+    for cfg in cfgs {
+        if in_cfg(cfg, aliases) {
+            return true;
+        }
+    }
+    // Custom-hook args and state/ref initializers can smuggle the setter too.
+    hooks.iter().any(|h| match h {
+        HookEntry::Custom { args, .. } => args.iter().any(|a| in_expr(a, aliases)),
+        HookEntry::State { init, .. } | HookEntry::Ref { init, .. } => {
+            !matches!(init.peel_ts(), Expr::StateSetter(_)) && in_expr(init, aliases)
+        }
+        _ => false,
+    })
+}
+
+/// The setter aliases of one slot, from a `var -> label` map.
+fn aliases_of(setter_labels: &HashMap<Var, HookLabel>, slot: HookLabel) -> HashSet<Var> {
+    setter_labels
+        .iter()
+        .filter(|(_, l)| **l == slot)
+        .map(|(v, _)| v.clone())
+        .collect()
+}
+
+impl AnalysisResult<StateValue> {
+    /// `true` when anything other than `except` may write `slot`.
+    ///
+    /// Reads the writer relation, so it sees every region the relation
+    /// does — a handler bound to a JSX prop, a `useCallback` body, a write
+    /// inside a `.then()` continuation — none of which a scan of the render
+    /// CFG plus the other effect bodies can reach (#92).
+    ///
+    /// May-typed, and that is the safe direction here: both consumers use it
+    /// to *withhold* a finding, so an over-approximate writer costs a warning
+    /// rather than inventing one.
+    pub fn slot_written_outside(
+        &self,
+        slot: crate::ir::types::HookLabel,
+        except: crate::engine::setters::WriterRegion,
+    ) -> bool {
+        self.slot_writers
+            .iter()
+            .any(|w| w.slot == slot && w.region != except)
+    }
+
+    /// `true` when this slot's setter escapes the component — see
+    /// [`setter_escapes`]. Answers for any slot, not only the prop-seeded ones
+    /// `SlotSeed` covers.
+    ///
+    /// The alias set is closed over **every** body, exactly as
+    /// [`collect_slot_writers`] closes it. Building it from the render CFG
+    /// alone makes `const setter = setB` *inside* an effect read as an escape
+    /// rather than as the alias chain it is, because the escape walk's
+    /// chain exemption is `aliases.contains(var)`.
+    pub fn slot_setter_escapes(&self, slot: crate::ir::types::HookLabel) -> bool {
+        self.escaping_slots().contains(&slot)
+    }
+
+    /// Every slot whose setter escapes, in one pass.
+    ///
+    /// Closing the alias set walks every body, so asking per slot would redo
+    /// that walk once per slot. Callers that test more than one slot want this.
+    pub fn escaping_slots(&self) -> HashSet<crate::ir::types::HookLabel> {
+        let mut labels = setter_var_labels(&self.render_cfg);
+        for cfg in
+            std::iter::once(&self.render_cfg).chain(self.hooks.iter().filter_map(|h| h.body_cfg()))
+        {
+            labels = resolve_setter_aliases(cfg, &labels);
+        }
+        let slots: HashSet<HookLabel> = labels.values().copied().collect();
+        slots
+            .into_iter()
+            .filter(|s| {
+                let aliases = aliases_of(&labels, *s);
+                !aliases.is_empty() && setter_escapes(&self.render_cfg, &self.hooks, &aliases)
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

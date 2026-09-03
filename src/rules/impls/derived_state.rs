@@ -7,6 +7,7 @@ use crate::ir::{
     types::Var,
 };
 
+use crate::engine::setters::WriterRegion;
 use crate::rules::{
     Diagnostic, MustResult, Rule, all_setter_labels, collect_setter_calls,
     must_setter_on_all_paths, state_val_labels,
@@ -103,30 +104,26 @@ impl Rule for DerivedState {
                 continue;
             }
 
-            // The same setter must not be called in the render body.
-            if render_setters.contains(&setter_name) {
-                continue;
-            }
-
-            // The same setter must not appear in any other effect.
-            let called_in_other_effect = result.hooks.iter().any(|h| {
-                if let HookEntry::Effect {
-                    label: other_label,
-                    body_cfg: other_cfg,
-                    ..
-                } = h
-                {
-                    if other_label == eff_label {
-                        return false;
-                    }
-                    collect_setter_calls(other_cfg, &setter_vars, 1)
-                        .iter()
-                        .any(|c| c.var == setter_name)
-                } else {
-                    false
+            // Nothing else may write this slot — read off the shared writer
+            // relation, not off a scan of the render body plus the other
+            // effect bodies (#92). Those two places are not where the missed
+            // writers live: a handler bound to a JSX prop, a `useCallback`
+            // body, a write inside a `.then()` the effect kicked off. The
+            // relation already carries all of them, and every consumer that
+            // claims "no other writer" should ask the same question.
+            //
+            // And if the setter left the component at all, the claim is not
+            // ours to make: something we cannot see may write the slot.
+            if let Some(&slot) = setter_label.get(&setter_name) {
+                if result.slot_written_outside(slot, WriterRegion::Effect(*eff_label)) {
+                    continue;
                 }
-            });
-            if called_in_other_effect {
+                if result.slot_setter_escapes(slot) {
+                    continue;
+                }
+            } else if render_setters.contains(&setter_name) {
+                // No label for this name — fall back to the old render scan
+                // rather than claiming anything.
                 continue;
             }
 
