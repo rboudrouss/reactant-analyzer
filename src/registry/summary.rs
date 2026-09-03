@@ -89,6 +89,13 @@ impl SummaryRegistry {
         for (pkg, hook) in [("swr", "useSWR"), ("swr", "useSWRConfig")] {
             r.register_for_package(pkg, Box::new(ShapeSummary(hook, SWR_MEMBERS)));
         }
+        // Known, and nothing more. `useDebouncedCallback` is documented to
+        // return a memoized callback, but the corpus offers one site to check
+        // it against — not enough to write down a stability claim, and a claim
+        // is the direction that loses findings. Registering it as ⊤ records
+        // only that the hook is *known*, which is what separates a deliberate
+        // imprecision from `analysis-limit/unknown-hook`.
+        r.register_many_for_package("use-debounce", USE_DEBOUNCE_HOOKS);
         r
     }
 
@@ -262,6 +269,13 @@ const REACT_ROUTER_HOOKS: &[&str] = &[
     "useMatches",
     "useNavigationType",
     "useBeforeUnload",
+];
+
+/// `use-debounce`. Known, not modelled — see the note at the registration.
+const USE_DEBOUNCE_HOOKS: &[&str] = &[
+    "useDebouncedCallback",
+    "useDebounce",
+    "useThrottledCallback",
 ];
 
 /// Next.js App Router hooks (`next/navigation`). All client-only; all opaque
