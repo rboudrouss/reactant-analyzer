@@ -20,7 +20,18 @@ struct JsonReport<'a> {
     files_analyzed: usize,
     parse_errors: Vec<JsonParseError>,
     diagnostics: Vec<JsonDiagnostic<'a>>,
+    /// What the run knows it did not read. Non-empty means `summary.errors` and
+    /// `summary.warnings` are a lower bound, not a verdict (#9, #47).
+    blind_spots: Vec<JsonBlindSpot<'a>>,
     summary: JsonSummary,
+}
+
+#[derive(Serialize)]
+struct JsonBlindSpot<'a> {
+    /// `unresolved-aliases` | `unparsed-files` | `unread-imports`
+    kind: &'a str,
+    count: usize,
+    detail: &'a str,
 }
 
 #[derive(Serialize)]
@@ -244,6 +255,15 @@ pub fn render(report: &CheckReport, display: &dyn Fn(&Path) -> String) -> String
             })
             .collect(),
         diagnostics,
+        blind_spots: report
+            .blind_spots
+            .iter()
+            .map(|b| JsonBlindSpot {
+                kind: b.kind,
+                count: b.count,
+                detail: &b.detail,
+            })
+            .collect(),
         summary: JsonSummary {
             errors: report.errors,
             warnings: report.warnings,

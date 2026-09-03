@@ -61,6 +61,21 @@ for (const d of report.diagnostics ?? []) {
   console.log(`::${level[d.severity] ?? "notice"} ${props.join(",")}::${escData(msg)}`);
 }
 
+// What the run did not read. A blind spot is not a finding — it never touches
+// the exit code — but it means the counts below are a lower bound, and a job
+// summary reading "0 error(s), 0 warning(s)" over unread source is the one
+// thing this tool must not print silently.
+const blind = report.blind_spots ?? [];
+for (const b of blind) {
+  console.log(`::warning title=not analyzed::${escData(b.detail)}`);
+}
+const caveat = blind.length
+  ? `\n> **Not a clean bill** — parts of this run were not analyzed, so these ` +
+    `counts are a lower bound:\n` +
+    blind.map((b) => `> - ${b.detail}`).join("\n") +
+    "\n"
+  : "";
+
 const s = report.summary ?? {};
 const jsonPath = join(process.env.RUNNER_TEMP ?? ".", "reactant-report.json");
 writeFileSync(jsonPath, res.stdout);
@@ -69,7 +84,7 @@ if (process.env.GITHUB_OUTPUT) {
   appendFileSync(
     process.env.GITHUB_OUTPUT,
     `errors=${s.errors ?? 0}\nwarnings=${s.warnings ?? 0}\ninfos=${s.infos ?? 0}\n` +
-      `exit-code=${res.status}\njson=${jsonPath}\n`,
+      `exit-code=${res.status}\njson=${jsonPath}\nblind-spots=${blind.length}\n`,
   );
 }
 if (process.env.GITHUB_STEP_SUMMARY) {
@@ -77,12 +92,13 @@ if (process.env.GITHUB_STEP_SUMMARY) {
     process.env.GITHUB_STEP_SUMMARY,
     `### reactant\n\n${s.errors ?? 0} error(s), ${s.warnings ?? 0} warning(s) across ` +
       `${report.files_analyzed ?? 0} file(s), ${s.components_analyzed ?? 0} component(s) analyzed ` +
-      `(fail-on: ${failOn}).\n`,
+      `(fail-on: ${failOn}).\n${caveat}`,
   );
 }
 
 console.log(
   `reactant: ${s.errors ?? 0} error(s), ${s.warnings ?? 0} warning(s), ` +
-    `${s.infos ?? 0} info(s) — exit ${res.status}`,
+    `${s.infos ?? 0} info(s) — exit ${res.status}` +
+    (blind.length ? ` — ${blind.length} blind spot(s), counts are a lower bound` : ""),
 );
 process.exit(res.status);

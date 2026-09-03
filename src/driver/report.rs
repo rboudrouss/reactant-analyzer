@@ -8,6 +8,8 @@ use crate::ir::FileTable;
 use crate::resolver::ParseError;
 use crate::rules::{Diagnostic, SafeCheck};
 
+use super::blind_spots::BlindSpot;
+
 /// One component's report: display name, defining file, hook count, visible
 /// diagnostics.
 pub struct ComponentReport {
@@ -37,4 +39,8 @@ pub struct CheckReport {
     /// Resolves the `FileId` carried by every diagnostic/note span (ADR-019),
     /// so renderers can name the file a cross-file trace step points into.
     pub file_table: FileTable,
+    /// What this run knows it did not read. Non-empty forbids the clean bill:
+    /// "no issues found" is a claim about the code, and it may only be made
+    /// about code the analyzer actually read.
+    pub blind_spots: Vec<BlindSpot>,
 }

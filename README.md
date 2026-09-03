@@ -113,7 +113,7 @@ named beside them.
 
 A directory containing `vite.config.*` is analyzed with Vite conventions: sources are discovered under `src/`, and `@/*`-style aliases are loaded from tsconfig `paths`. The tsconfig is parsed as JSONC, and `extends` chains and project `references` are followed, so the standard Vite scaffold with `tsconfig.app.json` works out of the box. An aliased custom hook is then resolved and inlined cross-file exactly like a relative import.
 
-Aliases declared *only* in `vite.config.*` are not read, since that would require executing JS. The CLI warns when it finds no tsconfig `paths`, because unresolved imports are analysis blind spots and blind spots mean possible false negatives.
+Aliases declared *only* in `vite.config.*` are not read, since that would require executing JS. When no tsconfig `paths` are found, the run does not just warn — it **withholds the clean bill**: unresolved imports are analysis blind spots, blind spots mean possible false negatives, and a green tick over unread source would be the one lie this tool cannot afford. See [the last line](docs/usage.md#the-last-line-and-when-it-is-withheld).
 
 ## CI with the GitHub Action
 
@@ -128,16 +128,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rboudrouss/reactant-analyzer@v0.3.0
+      - id: check
+        uses: rboudrouss/reactant-analyzer@v0.3.0
         with:
-          path: src/
-          fail-on: error        # warnings annotate the PR but don't fail it
+          path: .                # the project root, so tsconfig aliases load
+          fail-on: error         # warnings annotate the PR but don't fail it
 ```
+
+Point `path` at the **project root**, not at `src/`: the root is where the
+`vite.config` / `next.config` marker and the tsconfig aliases are found, and a
+run whose aliases never loaded cannot see through an aliased import.
 
 Inputs: `path`, `fail-on` (`error|warning|never`), `config`, `version` (npm
 version to run), `args` (extra `reactant check` flags). Outputs: `errors`,
-`warnings`, `infos`, `exit-code`, and `json`, the path to the full JSON
-report (schema v2) for downstream steps. See [action.yml](action.yml).
+`warnings`, `infos`, `exit-code`, `json` (path to the full JSON report, schema
+v2) and `blind-spots` — how many things the run knows it did not read. That
+last one never affects the exit code; gate on it yourself if your project wants
+a run that reads everything or fails:
+
+```yaml
+      - if: steps.check.outputs.blind-spots != '0'
+        run: exit 1
+```
+
+See [action.yml](action.yml).
 
 ## Example
 
@@ -207,7 +221,9 @@ silent, a symptom disappearing is not evidence of anything. Reactant is sound
 the other way around: false positives are tolerated, false negatives are
 forbidden, and the places where it deliberately loses precision are themselves
 reported (`--info`). A clean report is a proof over a superset of behaviors,
-not a pattern that failed to match.
+not a pattern that failed to match — and it is only *issued* when the analyzer
+read everything it was pointed at. A run with source it could not open says so
+on its last line instead of ticking green.
 
 Use all three: eslint for lexical rules in the editor, the compiler for
 performance, reactant as the semantic gate in CI. Reactant is slower

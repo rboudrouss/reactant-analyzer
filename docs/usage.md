@@ -230,6 +230,10 @@ the path from an entry leaves that subtree unclassified.
       ]
     }
   ],
+  "blind_spots": [
+    { "kind": "unread-imports", "count": 3,
+      "detail": "3 imported file(s) resolved outside the analysed set ..." }
+  ],
   "summary": {
     "errors": 0, "warnings": 1, "infos": 0,
     "components_analyzed": 5, "exit_code": 1
@@ -270,6 +274,17 @@ Semantics:
   the file was dropped from the run (read error, or a parser panic leaving an
   empty program), so its findings are *missing*, not absent — a dropped file is
   also reported on stderr whatever the `--format`.
+- `blind_spots` is what the run knows it did not read. **Non-empty means
+  `summary.errors` and `summary.warnings` are a lower bound, not a verdict**:
+  the analyzer was pointed at source it never opened, so its silence about that
+  source is not evidence. Always present; empty on a run that read everything.
+  `kind` ∈ `unresolved-aliases` (the project's aliases could not be loaded, so
+  every aliased target is unlowered) | `unparsed-files` (files the parser
+  dropped) | `unread-imports` (imports that resolved to a real file discovery
+  never walked to — pass those paths on the command line). `count` aggregates
+  the occurrences, `detail` is the sentence the human renderer prints.
+  A blind spot is *not* a finding: it never changes the exit code (added in
+  v2 — a v2 consumer written before this field can ignore it).
 
 ## Reading the human output
 
@@ -287,6 +302,37 @@ component from there (ADR-013). Trace steps follow the same convention.
 
 On a component-name collision the name is disambiguated automatically
 (`Page@tests/fixtures/page_collision/users/page.tsx`).
+
+### The last line, and when it is withheld
+
+A run that read everything it was pointed at ends with the clean bill:
+
+```
+✓  37 file(s) no issues found.
+```
+
+A run that did **not** never prints it, because "no issues found" is a claim
+about the code and the analyzer may only make it about code it actually read:
+
+```
+⚠  37 file(s), no findings — but parts of this run were not analyzed,
+   so this is not a clean bill.
+   not analyzed:
+     • no tsconfig `paths` found — aliased imports (e.g. `@/...`) stay unresolved …
+     • 3 imported file(s) resolved outside the analysed set and were never read …
+```
+
+The same block prints under a run that *did* find things, where it says the
+counts are a lower bound. These are the `blind_spots` of the JSON schema, and
+they never change the exit code: a blind spot is not a finding. Fixing one
+usually means loading the project's aliases (see [Project kinds](#project-kinds))
+or naming the missing directory on the command line.
+
+Deliberately *not* listed here: `analysis-limit`, which is what the analyzer
+says about code it did read and abstracted soundly (an npm hook it models as
+⊤). It fires on essentially every run — 370 sites on a 209-file app, almost all
+of them third-party — and a caveat printed every time is a caveat nobody reads.
+It stays on the `--info` channel below.
 
 ### The assurance channel (`--info`)
 

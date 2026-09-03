@@ -50,6 +50,14 @@ outputs:
   exit-code:
     description: "CLI exit code: 0 clean, 1 findings at/above fail-on, 2 usage error."
     value: ${{ steps.check.outputs.exit-code }}
+  blind-spots:
+    description: >-
+      Number of things the run knows it did not read (unloadable aliases,
+      dropped files, imports resolved outside the analysed set). Non-zero
+      means `errors` and `warnings` are a lower bound, not a verdict. It never
+      affects the exit code — gate on it yourself if your project wants a run
+      that reads everything or fails.
+    value: ${{ steps.check.outputs.blind-spots }}
   json:
     description: Path to the full JSON report (schema v2, docs/usage.md).
     value: ${{ steps.check.outputs.json }}

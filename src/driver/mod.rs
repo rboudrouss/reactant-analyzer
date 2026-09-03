@@ -9,6 +9,7 @@
 //! writing and the process exit. The driver only reads through the
 //! [`FileSystem`] seam and returns buffered streams.
 
+mod blind_spots;
 mod human;
 mod json;
 mod locations;
@@ -27,6 +28,7 @@ use crate::resolver::{
 };
 use crate::rules::{Diagnostic, ProgramCache, RuleRegistry, SafeCheck, Severity};
 
+pub use blind_spots::BlindSpot;
 pub use palette::Palette;
 pub use report::{CheckReport, ComponentReport};
 
@@ -134,8 +136,12 @@ pub fn run_check(
         );
     }
     let ctx = project::build_context(&project_root, forced, fs.clone());
+    // Everything this run knows it did not read, gathered as it is discovered.
+    // A non-empty list is what stops the summary claiming a clean bill.
+    let mut blind: Vec<BlindSpot> = Vec::new();
     if let Some(warning) = &ctx.alias_warning {
         let _ = writeln!(err, "[warn] {warning}");
+        blind.push(BlindSpot::unresolved_aliases(warning));
     }
     if opts.verbose && ctx.kind != ProjectKind::Plain {
         let _ = writeln!(
@@ -186,12 +192,14 @@ pub fn run_check(
     // channel. A *dropped* file is not: everything it held is a silent false
     // negative, so it is reported whatever the format — stderr is a separate
     // stream, so stdout stays exactly one JSON document.
+    let mut dropped = 0usize;
     for e in &lowered.parse_errors {
         if e.analyzed {
             if opts.format == ReportFormat::Human {
                 let _ = writeln!(err, "[parse error] {}: {}", e.file.display(), e.message);
             }
         } else {
+            dropped += 1;
             let _ = writeln!(
                 err,
                 "[skipped] {}: {} — the file was not analyzed",
@@ -199,6 +207,29 @@ pub fn run_check(
                 e.message
             );
         }
+    }
+    if dropped > 0 {
+        blind.push(BlindSpot::unparsed_files(dropped));
+    }
+
+    // An import the resolver mapped to a real file that discovery never
+    // reached: the pipeline knew where the code was and did not read it (#9).
+    // Read off the resolved edges rather than re-resolving, so this cannot
+    // disagree with what lowering actually did.
+    let analysed: std::collections::HashSet<PathBuf> = files
+        .iter()
+        .map(|p| crate::resolver::normalize(p))
+        .collect();
+    let unread: std::collections::BTreeSet<&PathBuf> = lowered
+        .module_table
+        .paths()
+        .filter_map(|p| lowered.module_table.facts(p))
+        .flat_map(|f| f.imports.iter())
+        .filter(|dep| !analysed.contains(*dep))
+        .collect();
+    if !unread.is_empty() {
+        let examples: Vec<String> = unread.iter().take(3).map(|p| display(p)).collect();
+        blind.push(BlindSpot::unread_imports(&examples, unread.len()));
     }
 
     let strategy = if !opts.entry.is_empty() {
@@ -263,6 +294,7 @@ pub fn run_check(
             infos: 0,
             exit_code: EXIT_OK,
             file_table: lowered.file_table,
+            blind_spots: blind,
         };
         return CheckOutput {
             stdout: render(&report, opts, display),
@@ -374,6 +406,7 @@ pub fn run_check(
         infos,
         exit_code,
         file_table: program_result.file_table,
+        blind_spots: blind,
     };
     CheckOutput {
         stdout: render(&report, opts, display),

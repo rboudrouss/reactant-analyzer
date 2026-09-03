@@ -80,11 +80,25 @@ pub fn render(
     let mut out = String::new();
 
     if report.components.is_empty() {
-        let _ = writeln!(
-            out,
-            "{}✓  {} file(s) no components detected.{}",
-            p.green, report.files_analyzed, p.reset
-        );
+        // Same rule as the summary below: a green tick is a claim, and a run
+        // with a blind spot has not earned it. "No components" is the shape
+        // this failure takes when the aliases the components hid behind never
+        // loaded at all.
+        if report.blind_spots.is_empty() {
+            let _ = writeln!(
+                out,
+                "{}✓  {} file(s) no components detected.{}",
+                p.green, report.files_analyzed, p.reset
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "{}⚠  {} file(s), no components detected — and parts of this run were \
+                 not analyzed.{}",
+                p.yellow, report.files_analyzed, p.reset
+            );
+        }
+        render_blind_spots(&mut out, report, &p);
         return out;
     }
 
@@ -249,11 +263,23 @@ pub fn render(
 
     let _ = writeln!(out);
     if locations.errors == 0 && locations.warnings == 0 {
-        let _ = writeln!(
-            out,
-            "{}✓  {} file(s) no issues found.{}",
-            p.green, report.files_analyzed, p.reset
-        );
+        // Silence is only evidence when the analyzer read everything it needed
+        // (#9, #47). With a blind spot on record it did not, so the green tick
+        // — the one line a user reads — is withheld.
+        if report.blind_spots.is_empty() {
+            let _ = writeln!(
+                out,
+                "{}✓  {} file(s) no issues found.{}",
+                p.green, report.files_analyzed, p.reset
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "{}⚠  {} file(s), no findings — but parts of this run were not analyzed, \
+                 so this is not a clean bill.{}",
+                p.yellow, report.files_analyzed, p.reset
+            );
+        }
     } else {
         let parts: Vec<String> = [
             (locations.errors > 0).then(|| format!("{} error(s)", locations.errors)),
@@ -281,5 +307,19 @@ pub fn render(
             p.reset
         );
     }
+    render_blind_spots(&mut out, report, &p);
     out
+}
+
+/// What the run did not read, printed under every summary — with findings on
+/// the board it says the counts are a lower bound, which is worth the same
+/// sentence.
+fn render_blind_spots(out: &mut String, report: &CheckReport, p: &Palette) {
+    if report.blind_spots.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "{}   not analyzed:{}", p.dim, p.reset);
+    for spot in &report.blind_spots {
+        let _ = writeln!(out, "{}     • {}{}", p.dim, spot.detail, p.reset);
+    }
 }
