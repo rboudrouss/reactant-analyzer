@@ -364,7 +364,7 @@ fn pure_key(e: &Expr) -> Option<String> {
 ///
 /// A claim of the form "these two spellings denote the same value" may not
 /// cross a call — a call is not guaranteed to return the same thing twice, not
-/// even twice within one render. ADR-042's pinning can cross one because there
+/// even twice within one render. Deps *pinning* can cross one because there
 /// React's own `Object.is` on the dep value does the comparing; a claim the
 /// analyzer makes on its own cannot.
 pub fn call_free_key(e: &Expr) -> Option<String> {

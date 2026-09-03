@@ -101,7 +101,7 @@ Every entry here is Warning-or-below by construction: an FP never carries an Err
   multi-effect graph cannot: whether effect A's write into `y` changes a dep of effect B is a
   property of an edge *pair*, not of an edge. A direct spread — `setData({...data, slug})` — is
   likewise unproved, since `data` is the value captured at that render rather than the current
-  one [ADR-046](adr/ADR-046-a-member-is-not-the-slot.md).
+  one [precision-log](precision-log.md#2026-09-03--un-membre-nest-pas-le-slot).
 - **Deps declared as fields** (`[x?.locale]`) do not cover a truthiness test or a nullish default on
   the whole object — kept deliberately, since the warning is sound and eslint-aligned
   [#40](https://github.com/rboudrouss/reactant-analyzer/issues/40).
@@ -115,34 +115,33 @@ Every entry here is Warning-or-below by construction: an FP never carries an Err
   every render but `bag.ref` is a `useRef` reads the live value, and the rule says nothing. The
   neighbouring shape still fires and should: a `useCallback` whose own captures can change is a
   genuinely different function each time it is recreated, so a `[]` closure over it holds a stale one
-  [ADR-040](adr/ADR-040-the-longest-stable-prefix.md),
-  [ADR-041](adr/ADR-041-what-a-dynamic-index-hides-and-the-two-spellings-of-a-closure.md).
+  [precision-log](precision-log.md#2026-09-02--le-plus-long-préfixe-stable).
 - **A computed member access** (`theme.snackBar[variant].color`) hides the segments below the index
   but not the chain above it: the read is recorded as `theme.snackBar`, so a dep naming that handle
   covers it and a dep naming something below it does not. On the *dep* side a computed access still
   declares nothing — `[x.a[i]]` pins the element, not the container
-  [ADR-041](adr/ADR-041-what-a-dynamic-index-hides-and-the-two-spellings-of-a-closure.md).
+  [precision-log](precision-log.md#2026-09-02--un-index-dynamique-cache-ce-qui-est-dessous-pas-la-chaîne-au-dessus).
 - **A deps entry that is not a plain path** (`[searchParams.get("sort")]`,
   `[excludedPayoutIds.join(",")]`) covers the reads that occur *only* inside it, because the deps
   array compares that expression's value itself. A **lossy** surrogate covers nothing:
   `[JSON.stringify(options)]` does not declare a read of `options`, since `options` can move while
   its serialization stands still
-  [ADR-042](adr/ADR-042-a-dep-that-is-the-read.md).
+  [precision-log](precision-log.md#2026-09-02--une-dep-qui-est-la-lecture).
 - **A rename is resolved, a computation is not**: `const c = cond` (and the destructuring preamble
   `const { viewport } = ctx`) is a rename, so the body's reads through it are recorded as reads of
   `cond.…`. An alias formed by a call (`const c = identity(x)`) or across a function boundary still
   reads the whole object, and a member dep will not cover it
-  [ADR-044](adr/ADR-044-a-rename-is-not-a-read.md).
+  [precision-log](precision-log.md#2026-09-02--un-renommage-nest-pas-une-lecture).
 - **A finding names the object when the deps name nothing about it**: three undeclared members of
   `settings` are one finding saying `settings`, not three. Where the deps do name members of a root,
   the uncovered ones are listed one by one
-  [ADR-044](adr/ADR-044-a-rename-is-not-a-read.md).
+  [precision-log](precision-log.md#2026-09-02--un-renommage-nest-pas-une-lecture).
 - **A guarded write converges when the guard and the write name the same expression**
   (`if (scale < scaleForCurrentValue) setScale(scaleForCurrentValue)` — React's documented
   adjust-during-render pattern), including one hop into an object literal and through a rename. Two
   neighbouring shapes are NOT proved and still fire: a **disjunctive** guard (`if (!prev || prev !==
   next)`), and **arithmetic** on the compared value (`setIndex(Math.max(0, plans.length - 1))` under
-  `index >= plans.length`) [ADR-045](adr/ADR-045-a-write-that-settles-its-own-guard.md).
+  `index >= plans.length`) [precision-log](precision-log.md#2026-09-02--une-écriture-qui-tranche-sa-propre-garde).
 - **`setter-in-render`** warns when a setter reaches a callee with no timing summary
   (`<form onSubmit={handleSubmit(onSubmit)}>`, `composeEventHandlers(a, cb)`): ⊤ includes the render
   pass, so the row is sound and the wording says so — it never claims the setter was called in the

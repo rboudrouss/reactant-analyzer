@@ -1676,7 +1676,7 @@ function A() {
     );
 }
 
-// ── ADR-045: a write that settles its own guard ──────────────────────────────
+// ── #91 — a write that settles its own guard ─────────────────────────────────
 
 /// React's documented "adjust state during render" idiom: the guard compares
 /// the slot against the very expression the write stores in it, so the two are

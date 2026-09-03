@@ -1,0 +1,339 @@
+# Precision log
+
+Corrections de précision : une règle sur-signalait une forme, le moteur a été
+corrigé là où l'information se perdait, et le corpus l'a mesuré.
+
+**Ce n'est pas de l'architecture**, donc ce n'est pas dans [`adr/`](adr/). Un
+ADR enregistre une décision que le reste du système doit respecter — un domaine,
+une relation, un invariant, une alternative refusée. Une correction de précision
+enregistre une *mesure* : la forme, la revendication qui la tranche, le delta
+corpus. Une entrée ici, un message de commit, et une ligne dans
+[`limitations.md`](limitations.md) s'il reste une limite.
+
+Chaque revendication reste soumise aux invariants du projet : faux positifs
+tolérés, **faux négatifs interdits**. Toutes les entrées ci-dessous ne retirent
+que des emplacements et n'en ajoutent aucun.
+
+## Métrique
+
+La colonne comparable est le nombre d'**emplacements distincts**
+`(fichier, ligne, colonne, message)`. Le JSON garde une ligne par
+(finding, composant) — #129 ne regroupe qu'à l'affichage — donc le nombre de
+lignes dépend de la façon dont on compte et n'est pas une série propre d'une
+campagne à l'autre. La première entrée précède cette métrique et est citée en
+findings bruts.
+
+Corpus : `test-repo/`, 14 dépôts, 34 730 fichiers.
+
+| date | revendication | issue | emplacements |
+|---|---|---|---|
+| 2026-09-02 | le plus long préfixe stable | résidu de #88 | −686 findings (6 340 → 5 654) |
+| 2026-09-02 | un index dynamique cache ce qui est dessous, pas la chaîne au-dessus | #89 §3/§4 | 1 423 → 1 417 |
+| 2026-09-02 | une dep qui *est* la lecture | #89 §1 | 1 417 → 1 402 |
+| 2026-09-02 | une closure atteinte via un conteneur reste une closure | #89 | 1 402 → 1 394 |
+| 2026-09-02 | un renommage n'est pas une lecture | #89 §2 | 1 394 → 1 359 |
+| 2026-09-02 | une écriture qui tranche sa propre garde | #91 | 1 359 → 1 343 |
+| 2026-09-03 | un membre n'est pas le slot | #90 | 1 343 → 1 340 |
+
+---
+
+## 2026-09-02 — le plus long préfixe stable
+
+*Résidu de #88. Cadre : [ADR-017](adr/ADR-017-versioned-stability.md), identité
+contre comportement.*
+
+`missing-deps` demandait si une capture peut devenir **périmée** en regardant
+deux choses et rien entre les deux : la racine du chemin, et le chemin entier.
+
+```js
+const r = useRef(0);
+const bag = { r };
+useCallback(() => r.current,     []);   // silencieux : la racine est stable
+useCallback(() => bag.r.current, []);   // signalé : « `bag` est recréé »
+```
+
+**La revendication.** Une lecture n'est périmée que si *toutes* les poignées
+qu'elle traverse peuvent changer. `bag.r` est le même ref à chaque rendu, donc
+la copie périmée de `bag` atteint ce ref et lit sa valeur courante. Un seul
+préfixe stable clôt la question. Ce n'est pas une nouvelle exemption : c'est
+celle que la règle avait déjà pour la racine, qui s'arrêtait à une profondeur
+arbitraire. `Stability::Stable` est une must-claim — ni ⊤ ni ⊥ ne sont stables —
+donc aucun préfixe ne peut être dit stable par imprécision.
+
+**Corpus : −686 findings (6 340 → 5 654), aucun ajouté**, tous `missing-deps`,
+tous une seule forme (`$values.refValues.current`, un `useRef` atteint via un
+conteneur que `useFormValues` de mantine reconstruit à chaque rendu). 11 % de la
+sortie totale.
+
+Ce qui continue de tirer, à raison : `$values.setValues`, un `useCallback` avec
+une liste de deps **non vide**. Son identité change quand sa propre dep bouge,
+donc aucun préfixe n'est stable et la capture peut vraiment se périmer.
+
+---
+
+## 2026-09-02 — un index dynamique cache ce qui est dessous, pas la chaîne au-dessus
+
+*#89, formes 3 et 4.*
+
+`extract_path` réduisait *toute* chaîne de membres contenant un accès calculé à
+sa racine nue, donc `theme.snackBar[variant].color` s'enregistrait comme `theme`
+entier — que rien de moins qu'une dep `[theme]` ne peut couvrir.
+
+**La revendication.** `x.a[i].b` enregistre `x.a` : la dernière poignée nommée
+que la lecture traverse. C'est la revendication du préfixe stable de l'autre
+côté de la comparaison — la lecture est fraîche dès que `x.a` l'est, exactement
+comme une dep `[x.a]` couvre déjà une lecture `x.a.b`. Les segments *sous*
+l'index restent perdus, donc une dep `[x.a.b]` ne couvre pas `x.a[i].b` : le
+test de préfixe tombe du bon côté tout seul. Côté **dep**, rien ne change :
+`[x.a[i]]` ne déclare toujours rien, car une dep épingle l'élément et non le
+conteneur.
+
+La seconde forme — un `useCallback` est une closure, donc la question
+comportementale doit lui être posée aussi — est reprise et généralisée par
+l'entrée « une closure atteinte via un conteneur » plus bas.
+
+**Corpus : 1 423 → 1 417 emplacements, 6 retirés, aucun ajouté**, chacun relu à
+la source (memos `PagedMemoList.tsx:163`, next-shadcn `kanban.tsx:720` — qui
+porte un `eslint-disable` disant précisément cela — twenty `SnackBar.tsx:163`,
+mantine `use-form-errors.ts:44`).
+
+`extract_path` est partagé : `missing-deps`, `stale-closure`, l'aide au montage
+et le scan de seeds lisent tous un chemin de la même façon, et un chemin plus
+long est plus couvrable, jamais moins.
+
+---
+
+## 2026-09-02 — une dep qui *est* la lecture
+
+*#89 §1, sa moitié sound.*
+
+Tout ce qu'un corps calcule *à partir* d'une lecture est décomposé en les
+lectures sous-jacentes, donc une deps array qui déclare le calcul plutôt que ses
+entrées ne déclarait rien :
+
+```js
+useCallback(() => {
+  const sort = searchParams.get("sort");
+  queryParams({ del: sort });
+}, [queryParams, searchParams.get("sort")]);   // ← signalait `searchParams.get`
+```
+
+**La revendication.** Une sous-expression qui apparaît **verbatim** dans la deps
+array est épinglée par elle : React compare la valeur de cette expression, donc
+le hook est recréé dès qu'elle change et l'évaluation du corps ne peut pas
+diverger de la courante. Verbatim est toute la revendication, et c'est ce qui
+trace la ligne :
+
+- `[searchParams.get(urlParam)]` épingle `searchParams.get` **et** `urlParam` ;
+- `[JSON.stringify(o)]` n'épingle **rien** pour un corps qui lit `o` nu — une
+  sérialisation est lossy, `o` peut bouger sans bouger la dep, et créditer ça
+  serait un faux négatif ;
+- `excludedPayoutIds.length` continue de tirer à côté d'un
+  `excludedPayoutIds.join(",")` épinglé : une expression différente est une
+  lecture différente.
+
+**La séparation est la partie porteuse.** `EffectInfo` porte les deux ensembles.
+*Ce* hook ne peut pas se périmer sur une lecture épinglée, donc `missing-deps`
+la saute ; mais un **consommateur** de la valeur produite tient toujours une
+closure sur cette lecture, donc le contrôle de stabilité comportementale
+raisonne sur les `free_paths` complets. Les fusionner ferait passer
+`useCallback(() => log(n), [n])` pour une capture vide et tairait le
+consommateur périmé. Deux tests de régression tiennent la ligne des deux côtés.
+
+**Corpus : 1 417 → 1 402 emplacements, 15 retirés, aucun ajouté.** Coût : une
+seconde passe de chemins libres par hook dont les deps contiennent au moins une
+expression clefable — dans le bruit de mesure (dub 69,0 s → 70,8 s).
+
+---
+
+## 2026-09-02 — une closure atteinte via un conteneur reste une closure
+
+*#89, la moitié conteneur.*
+
+La question comportementale n'était posée que d'un **nom nu** :
+
+```js
+const bump = useCallback(() => { r.current += 1 }, [n]);
+const api  = { bump };
+useCallback(() => bump(),     []);   // silencieux
+useCallback(() => api.bump(), []);   // signalé
+```
+
+Un conteneur est la façon dont un custom hook rend une closure : le
+`useFormErrors()` de mantine renvoie cinq membres, chacun un `useCallback`.
+
+**La revendication.** La chasse aux liaisons prend un **chemin**, pas un nom.
+Un nom nu est le cas de base ; chaque segment entre dans le champ de l'unique
+`ObjectLit` auquel le préfixe est lié, en suivant les alias de variables
+(`{ bump }` enregistre le membre comme `Var("bump")`). La barre de certitude est
+inchangée et s'applique à **chaque saut** : un nom lié zéro ou plus d'une fois
+ne résout rien, ni un membre derrière un spread qui a pu l'écraser.
+
+Deux lecteurs deviennent un : `fn_binding_in` et `callback_binding_in` étaient
+la même chasse rétrécie à une orthographe chacune ; `closure_binding_of` répond
+aux deux et dit laquelle.
+
+**Corpus : 1 402 → 1 394 emplacements, 8 retirés, aucun ajouté**, tous
+`$errors.<membre>` dans `use-form.ts` de mantine, les quatre membres vérifiés à
+la main. Ces huit valent 392 attributions parce que `useForm` est consommé dans
+tout mantine.
+
+---
+
+## 2026-09-02 — un renommage n'est pas une lecture
+
+*#89 §2, la dernière des quatre formes — issue close.*
+
+La marche des chemins libres enregistrait chaque `Expr` rencontrée, donc une
+liaison qui ne fait que *nommer* comptait comme une lecture du tout :
+
+```js
+useMemo(() => {
+  const c = performanceCondition;      // ← enregistré : tout `performanceCondition`
+  if (!c.attribute) return "attribute";
+}, [performanceCondition?.attribute, performanceCondition?.value]);
+```
+
+**La forme qui paie n'est pas l'alias explicite mais le déstructurage**, que
+tout code React écrit : `const { viewport } = ctx` s'abaisse en
+`__obj = ctx; viewport = __obj.viewport`, donc une lecture du contexte entier
+précédait chaque `[ctx.viewport, ctx.offset]`.
+
+**La revendication.** La marche saute le membre droit d'un `let` qui lie un nom,
+exactement une fois, à une chaîne de membres simple, et réécrit les chemins
+enracinés sur ce nom vers ce qu'il renomme. Tout le reste reste une lecture : un
+nom lié deux fois n'est pas un renommage, et un membre droit qui *calcule* a des
+lectures à lui. Rien n'est perdu quand l'alias est utilisé en entier —
+`JSON.stringify(c)` enregistre `c` nu, que la réécriture retourne en
+`performanceCondition` nu.
+
+**Règle de nommage compagnon.** Raffiner `settings` en les huit membres qu'un
+corps touche est plus exact et moins lisible : huit lignes portant une seule
+instruction. Donc **quand la deps array ne nomme rien d'enraciné sur un objet,
+le finding nomme l'objet** ; là où elle nomme des membres, les non couverts sont
+listés un par un. Même choix une règle plus loin : plusieurs membres d'un objet
+qui seedent le même slot sont nommés par la poignée qu'ils partagent
+(`AccessPath::common_prefix`).
+
+**Corpus : 1 394 → 1 359 emplacements. Huit sites de hook s'éteignent sur les
+deux changements et aucun site n'en gagne** ; le reste du mouvement est le même
+finding renommé. Dix messages `frozen-initial-state` cessent de nommer un membre
+arbitraire ; neuf l'étaient déjà avant, résoudre les renommages a rendu
+l'arbitraire visible.
+
+**Invariant modifié.** L'ensemble de racines de `compute_free_paths` est
+désormais un **sous-ensemble** de celui de `compute_free_vars`, là où il
+coïncidait. `compute_free_vars` sur-approxime exprès : `missing-deps` le lit
+pour l'ensemble de captures d'un littéral de fonction, où sous-déclarer tairait
+une vraie closure périmée.
+
+---
+
+## 2026-09-02 — une écriture qui tranche sa propre garde
+
+*#91, la famille compare-then-sync.*
+
+`converges_once_written` prouvait qu'un effet ne tire qu'une fois par la
+*valeur* : lier le slot à la valeur écrite, rétrécir les gardes dominantes, voir
+si l'une tombe à ⊥. Ça prouve la forme fetch-once et rien d'autre, parce que la
+forme du corpus est **relationnelle** :
+
+```js
+if (scale < scaleForCurrentValue) { setScale(scaleForCurrentValue); }  // idiome de React
+if (internalDate !== date)        { setInternalDate(date); }
+```
+
+Aucun intervalle ne borne l'un ou l'autre côté. `x < y` après `x := y` est faux
+pour *tous* x et y, et c'est un fait sur la **relation** entre les deux, qu'aucun
+domaine non relationnel ne représente à aucune précision.
+
+**La revendication.** Les orthographes disent ce que les valeurs ne peuvent pas.
+Une garde est tranchée quand un côté est un chemin enraciné sur le slot écrit et
+l'autre est, verbatim, l'expression que l'écriture y range : les deux désignent
+la même valeur au rendu suivant, donc `<`, `>`, `!=`, `!==` sont faux et `==`,
+`===`, `<=`, `>=` vrais. Si ça contredit la polarité de la branche prise, la
+branche est morte.
+
+Trois mécanismes déjà en place la portent jusqu'aux formes réelles : la marche
+de membres (la closure via un conteneur), la chasse aux liaisons (le renommage),
+et l'orthographe canonique **moins les appels**.
+
+**Pourquoi les appels sont exclus.** La revendication est que deux orthographes
+désignent une valeur. Un appel ne le garantit pas, pas même deux fois dans un
+seul rendu — `f(x) !== f(x)` est un programme possible. L'épinglage d'une dep,
+lui, peut traverser un appel : là c'est l'`Object.is` de React qui compare. Un
+*nom* lié à un appel reste une bonne orthographe, parce que le nom est lié une
+fois. `NaN` est la seule valeur qui casserait les égalités et ne peut pas mordre :
+React abandonne une mise à jour `Object.is`-égale à la courante.
+
+**Corpus : 1 359 → 1 343 emplacements, 16 retirés, aucun ajouté** — 10
+`infinite-loop` (un quart de la sortie de la règle) et 6 `setter-in-render`,
+dont twenty `CurrencyInput.tsx:139`, le motif « adjust state during render »
+documenté par React.
+
+Ce qui tire encore exprès, et c'est pourquoi le bras est écrit comme une
+*relation* et non comme une heuristique : `setUseAsync(Boolean(groups && !useAsync))`
+lit le slot dans la valeur qu'il écrit, donc chaque écriture rallume la garde.
+Quatre composants dub, et l'analyseur a raison sur les quatre.
+
+**Non prouvé** (voir [`limitations.md`](limitations.md)) : une garde disjonctive
+(`if (!prev || prev !== next)`) — il faudrait que *chaque* disjoint tranche, une
+autre marche — et l'arithmétique sur la valeur comparée
+(`setIndex(Math.max(0, plans.length - 1))`), qui est le travail d'un solveur.
+
+---
+
+## 2026-09-03 — un membre n'est pas le slot
+
+*#90 — issue close.*
+
+Le bras self-churn d'`infinite-loop` raisonnait au grain du slot des deux côtés :
+toute écriture fraîche versionne l'objet entier, toute lecture compte comme
+lecture. Un effet qui touche des *membres différents* d'un même objet fermait
+donc un cycle impossible :
+
+```tsx
+// lit `.name`, écrit `.slug`
+useEffect(() => {
+  setData((prev) => ({ ...prev, slug: slugify(prev.name) }));
+}, [data.name, oAuthApp]);
+
+// la garde lit `.leadId`, l'écriture y range null
+} else if (!urlLeadId && sheet.leadId) {
+  setSheet({ leadId: null, open: false });
+}
+```
+
+**La revendication, côté deps.** React passe la valeur courante à un updater
+fonctionnel, donc `prev => ({ ...prev, k: v })` range la valeur de `prev` à tout
+membre que le littéral ne nomme pas. Une dep qui ne lit que ceux-là est
+`Object.is`-égale après l'écriture. C'est le geste de l'entrée précédente de
+l'autre côté de l'effet : le domaine de valeurs ne peut pas dire
+« `data.name` est inchangé » — le slot est une seule valeur abstraite — mais les
+deux orthographes le peuvent, parce que `prev` nomme la valeur même que la dep a
+lue.
+
+**La revendication, côté garde.** Un conjoint qui lit un membre du slot écrit est
+tranché par la valeur que l'écriture y range, restreinte truthy ou falsy selon
+la polarité de la branche. Le slot entier, lui, est un objet truthy dans les
+deux cas.
+
+**Quatre refus la gardent sound**, chacun parce qu'un membre que la marche ne
+voit pas peut être celui qui compte : le spread doit être premier et seul, et
+sourcé du paramètre de l'updater (`{...prev, slug, ...patch}` ne prouve rien) ;
+chaque autre clef doit être une qu'un `FieldAccess` pourrait demander (une clef
+synthétique *est* « un membre sous un nom inconnu ») ; la dep doit être une
+chaîne de membres, ce qui exclut le slot nu (`[data]` compare des références) ;
+et le bras de garde ne lit qu'un littéral, donc la réponse ne dépend jamais de
+l'environnement où un nom local serait résolu.
+
+**Corpus : 1 343 → 1 340 emplacements, 3 retirés, aucun ajouté**, tous
+`infinite-loop`, tous dans dub, tous relus à la source. Petit pour un vrai
+défaut : la forme demande un spread *fonctionnel* sous une dep *membre*, et hors
+dub ce corpus écrit des slots entiers. Les deux bras servent aussi
+`setter-in-render`, qui partage `converges_once_written`.
+
+**Non prouvé** : le graphe multi-effets, où « l'écriture de A change une dep de
+B » est une propriété d'une *paire* d'arêtes ; et le spread direct
+(`setData({...data, slug})`), où `data` est la valeur capturée au rendu et non
+la courante.

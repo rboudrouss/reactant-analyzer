@@ -1,5 +1,10 @@
 # ADRs — reactant-analyzer
 
+Une décision que le reste du système doit respecter : un domaine, une relation,
+un invariant, une alternative refusée. Les **corrections de précision** — une
+règle sur-signalait une forme, le moteur a été corrigé, le corpus l'a mesuré —
+ne sont pas des décisions et vivent dans [`../precision-log.md`](../precision-log.md).
+
 | ADR | Title | Status |
 |---|---|---|
 | [ADR-001](ADR-001-concrete-semantics.md) | React-tRace as concrete semantics | Accepted |
@@ -41,10 +46,3 @@
 | [ADR-037](ADR-037-slot-read-relation.md) | The slot-read relation — the write side's mirror image, region and phase, on the same walk (#127) | Accepted |
 | [ADR-038](ADR-038-write-position-and-write-certainty.md) | A write is a write wherever it is written — the traversal gate dropped; phase read by the rule, `Deferred` split from ⊤, `must_write` before a certification, and one spelling for a component's identity (#130) | Accepted |
 | [ADR-039](ADR-039-a-synthetic-binding-is-synthetic-its-position-is-not.md) | A synthetic binding is synthetic, its position is not — the six spanless mint sites, the splice's call-site fallback, and a walk that stops discarding the position it is standing on (#131) | Accepted |
-| [ADR-040](ADR-040-the-longest-stable-prefix.md) | A read is stale only when every handle on its path can change — `missing-deps` asks every prefix, not just the root and the whole path (686 corpus findings, the residual of #88) | Accepted |
-| [ADR-041](ADR-041-what-a-dynamic-index-hides-and-the-two-spellings-of-a-closure.md) | What a dynamic index hides, and the two spellings of a closure — a computed access keeps the chain above it, and behavioral stability resolves a `useCallback` (#89 §3/§4) | Accepted |
-| [ADR-042](ADR-042-a-dep-that-is-the-read.md) | A dep that *is* the read — a sub-expression named verbatim in the deps array pins the reads under it, and a lossy surrogate pins nothing (#89 §1) | Accepted |
-| [ADR-043](ADR-043-a-closure-reached-through-a-container.md) | A closure reached through a container is still a closure — the binding chase takes a path, and the two spellings become one reader (#89, the container half of ADR-041 §4) | Accepted |
-| [ADR-044](ADR-044-a-rename-is-not-a-read.md) | A rename is not a read — the free-path walk resolves a body's own aliases (destructuring above all), and a finding names the object when the deps say nothing about it (#89 §2) | Accepted |
-| [ADR-045](ADR-045-a-write-that-settles-its-own-guard.md) | A write that settles its own guard — a relational convergence proof over spellings, where the value domain cannot relate the two sides (#91) | Accepted |
-| [ADR-046](ADR-046-a-member-is-not-the-slot.md) | A member is not the slot — a spread update preserves what it does not name, and a guard on a member is answered by what the write puts there (#90) | Accepted |

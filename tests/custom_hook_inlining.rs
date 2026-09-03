@@ -366,9 +366,9 @@ fn stable_member_of_a_hook_returned_object_is_silent() {
 fn unstable_member_of_a_hook_returned_object_still_fires() {
     // Same shape, but the member closes over the hook's own state, so a stale
     // copy of it clears the wrong errors. Rebuilt-every-render is NOT enough on
-    // its own — the container hop now asks the behavioral question a bare name
-    // has been asked since ADR-041 §4, and an arrow over a `useState` setter
-    // alone answers it (ADR-043).
+    // its own — the container hop asks the behavioral question a bare name is
+    // already asked, and an arrow over a `useState` setter alone answers it
+    // (docs/precision-log.md, "une closure atteinte via un conteneur").
     let src = r#"
         function useFormErrors() {
             const [errors, setErrors] = useState({});

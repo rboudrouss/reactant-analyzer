@@ -547,7 +547,7 @@ fn a_pinned_read_is_still_a_capture_for_a_consumer() {
     );
 }
 
-/// ADR-041 §4 asked the behavioral question of a bare name. A closure is just
+/// The behavioral question used to be asked of a bare name only. A closure is just
 /// as often reached through the container a custom hook returned it in
 /// (mantine's `$errors.clearFieldError`), and the container's own freshness
 /// says nothing about what the member closes over.

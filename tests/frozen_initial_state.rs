@@ -1004,7 +1004,8 @@ function C({ url, load }) {
 /// Several members of one object seeding the same slot must be named by the
 /// handle they share, not by whichever member the walk saw first. `const input
 /// = action.settings.input` used to be one seed of the whole object; resolving
-/// the rename makes it a dozen member seeds of the same thing (ADR-044).
+/// the rename makes it a dozen member seeds of the same thing
+/// (docs/precision-log.md, "un renommage n'est pas une lecture").
 #[test]
 fn many_member_seeds_are_named_by_the_handle_they_share() {
     let src = r#"

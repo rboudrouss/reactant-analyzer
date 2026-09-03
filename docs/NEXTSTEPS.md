@@ -149,90 +149,32 @@ Re-mesure des 60 scénarios : **8 EXPRESSIBLE (contre 1), 20 INEXPRESSIBLE
 (contre 27)** — `docs/campaign/triage-2026-09-02-wave2.md`, avec
 `packs/community/wave2.json` et ses paires de fixtures comme preuve exécutable.
 
-- **ADR-040** — une lecture n'est périmée que si *toutes* les poignées de son
-  chemin peuvent changer. `missing-deps` interrogeait la racine et le chemin
-  entier, jamais l'entre-deux : `bag.ref.current` où `bag` est reconstruit à
-  chaque rendu mais `bag.ref` est un `useRef` lit la valeur courante. Corpus :
-  **6 340 → 5 654, 686 retirées, aucune ajoutée** — 11 % de la sortie totale,
-  d'un seul tenant.
+### La campagne de précision (2026-09-02 → 09-03)
 
-- **ADR-041 / ADR-042** — trois des quatre formes de #89, chacune corrigée là où
-  l'information se perdait, jamais dans la règle. Un index calculé cache ce qui
-  est *sous* lui, pas la chaîne *au-dessus* (`theme.snackBar[v].color` lit tout
-  `theme.snackBar`, que le tableau de deps nomme). La stabilité
-  comportementale ne savait pas résoudre un `useCallback` : l'extraction de
-  hooks réécrit `useCallback(fn, deps)` en `CallbackVal(label)`, donc toute
-  liaison de ce genre était supposée périmable quoi qu'elle capture. Et une
-  sous-expression nommée **verbatim** dans les deps épingle les lectures
-  qu'elle contient — `[searchParams.get("sort")]` couvre le corps qui évalue la
-  même expression, tandis qu'un substitut *avec perte* (`[JSON.stringify(o)]`)
-  n'épingle rien, sous peine de faux négatif. Corpus : **1 423 → 1 402
-  emplacements distincts (5 654 → 5 511 attributions), 21 retirées, aucune
-  ajoutée**, toutes vérifiées faux positifs.
+Sept corrections, issues #88 à #91, chacune faite là où l'information se
+perdait — abaissement, marche de chemins, chasse aux liaisons — jamais dans la
+règle. Le détail de chaque revendication, avec sa forme et son delta corpus, est
+dans **[docs/precision-log.md](precision-log.md)** ; ce ne sont pas des
+décisions d'architecture et elles ne sont pas dans `docs/adr/`.
 
-- **ADR-043** — la quatrième forme de #89 : la chasse aux liaisons prend un
-  *chemin*, pas un nom. Un nom nu est le cas de base ; chaque segment descend
-  dans le champ du seul `ObjectLit` auquel le préfixe est lié, en suivant les
-  alias (`{ bump }` enregistre le membre comme `Var("bump")`, exactement la
-  propagation que fait l'interpréteur). Un conteneur est la façon dont un hook
-  personnalisé rend un rappel : `useFormErrors()` de mantine renvoie cinq
-  `useCallback`, et son appelant lit `$errors.clearFieldError` treize fois. Les
-  deux lecteurs `fn_binding_in` / `callback_binding_in` n'en font plus qu'un,
-  `closure_binding_of`, qui répond aussi *laquelle* des deux orthographes.
-  Corpus : **1 402 → 1 394 emplacements distincts (5 511 → 5 119 attributions),
-  8 retirées, aucune ajoutée** — les 24 annoncées étaient un comptage sur une
-  base plus étroite.
+Cumul : **6 340 → 4 962 lignes**, et sur la métrique comparable des
+emplacements distincts **1 423 → 1 340**, aucune ajoutée, chaque retrait relu à
+la source. Les deux plus gros leviers : le plus long préfixe stable (−686
+findings à lui seul, 11 % de la sortie totale) et le renommage qui n'est pas une
+lecture (déstructuration). Les deux revendications les plus réutilisables : une
+sous-expression **verbatim** dans les deps épingle les lectures qu'elle
+contient, et une convergence peut être **relationnelle**, portée par les
+orthographes là où aucun domaine non relationnel ne relie les deux côtés.
 
-- **ADR-044** — la dernière forme de #89, et **l'issue est close**. Un
-  renommage n'est pas une lecture : la marche saute le membre droit d'un `let`
-  qui lie un nom, une seule fois, à une chaîne de membres, et réécrit les
-  chemins enracinés sur ce nom. La forme qui compte n'est pas l'alias explicite
-  mais la **déstructuration** — `const { viewport } = ctx` s'abaisse en
-  `__obj = ctx; viewport = __obj.viewport`, donc une lecture du contexte entier
-  précédait chaque tableau `[ctx.viewport, ctx.offset]`. Corollaire de
-  présentation : quand le tableau de deps ne nomme rien sous une racine, le
-  constat porte sur l'objet, pas sur chacun des huit membres que le corps
-  touche ; et plusieurs membres d'un même objet qui amorcent le même slot sont
-  nommés par la poignée qu'ils partagent. Corpus : **1 394 → 1 359 emplacements
-  (5 119 → 4 985 lignes)**, 8 sites de hook éteints, **aucun site n'en gagne**.
+#89, #90 et #91 (formes 1 et 3) sont closes ; #91 reste ouverte pour la garde
+disjonctive et l'arithmétique sur la valeur comparée.
 
-- **ADR-045** — la famille compare-then-sync de #91. `converges_once_written`
-  prouvait par la *valeur* ; la forme du corpus est **relationnelle** : `x < y`
-  après `x := y` est faux pour tous x et y, un fait sur la relation entre les
-  deux qu'aucun domaine non relationnel ne représente. Les *orthographes*
-  disent ce que les valeurs ne peuvent pas : quand un côté de la comparaison
-  est un chemin enraciné sur le slot écrit et l'autre est, verbatim,
-  l'expression que l'écriture y range, les deux désignent la même valeur au
-  rendu suivant. Passe par un littéral objet (ADR-043) et par un renommage
-  (ADR-044) ; **exclut les appels**, parce qu'un appel ne garantit pas de
-  rendre deux fois la même chose, pas même deux fois dans un rendu. Corpus :
-  **1 359 → 1 343 emplacements**, 16 retirées, aucune ajoutée — dont
-  `CurrencyInput.tsx:139`, le motif « adjust state during render » documenté
-  par React.
-
-  Un triage préalable (consigné dans `docs/campaign/AUDIT.md`) a montré que les
-  deux grosses règles — `always-unstable-deps` (356) et `lazy-init` (212), soit
-  42 % de la sortie — **n'ont pas de faux positifs matériels** : chaque
-  dépendance tracée jusqu'à sa définition est bien une allocation fraîche, et la
-  règle exige une preuve (⊤ ne déclenche rien). Les FP restants sont dans les
-  petits amas.
-
-- **ADR-046** — l'insensibilité aux champs de #90, **l'issue est close**. Le
-  bras self-churn raisonnait au grain du slot des deux côtés : toute écriture
-  fraîche versionne l'objet entier, toute lecture compte comme lecture. Deux
-  mécanismes lisent maintenant le membre que le programme lit. Côté deps :
-  React passe la valeur courante à un updater fonctionnel, donc
-  `prev => ({...prev, k: v})` range la valeur de `prev` à tout membre que le
-  littéral ne nomme pas — une dep qui ne lit que ceux-là est `Object.is`-égale
-  après l'écriture. Côté garde : un conjoint qui lit un membre du slot écrit
-  est tranché par la valeur que l'écriture y range, restreinte truthy ou falsy
-  selon la polarité de la branche — le slot entier, lui, est un objet truthy
-  dans les deux cas. Corpus : **1 343 → 1 340 emplacements**, 3 retirées,
-  aucune ajoutée, les trois relues à la source. Reste hors de portée : le
-  graphe multi-effets, où « l'écriture de A change une dep de B » est une
-  propriété d'une *paire* d'arêtes, et le spread direct
-  (`setData({...data, slug})`), où `data` est la valeur capturée au rendu et
-  non la courante.
+Un triage préalable (consigné dans `docs/campaign/AUDIT.md`) a montré que les
+deux grosses règles — `always-unstable-deps` (356) et `lazy-init` (212), soit
+42 % de la sortie — **n'ont pas de faux positifs matériels** : chaque
+dépendance tracée jusqu'à sa définition est bien une allocation fraîche, et la
+règle exige une preuve (⊤ ne déclenche rien). Les FP restants sont dans les
+petits amas.
 
 Prochaines marches, par valeur décroissante : les valeurs d'arguments (#67) ;
 une requête de dominance ; les résumés d'écosystème (#94), seule façon de
