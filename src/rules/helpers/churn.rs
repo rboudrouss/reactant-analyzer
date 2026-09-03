@@ -21,7 +21,7 @@ use crate::{
     ir::{
         SourceRange,
         cfg::CFG,
-        expr::Expr,
+        expr::{Expr, SPREAD_KEY_PREFIX},
         free_vars::call_free_key,
         stmt::Stmt,
         types::{BlockId, HookLabel, Symbol, Var},
@@ -104,6 +104,121 @@ pub(in crate::rules) fn classify_effect_deps(
         }
     }
     (exact, versioned)
+}
+
+/// Can a write of `written_expr` into `label` change any dep of this effect?
+///
+/// A functional update that spreads its own parameter — `prev => ({ ...prev,
+/// slug: f(prev) })` — stores `prev`'s value at every member the literal does
+/// not name, so a dep that reads only those members is `Object.is`-equal after
+/// the write and cannot re-trigger the effect (#90). Sound by default: a dep
+/// this walk cannot place under a preserved member answers `true`.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::rules) fn write_can_retrigger(
+    dep_exprs: &[Expr],
+    component: &Symbol,
+    label: HookLabel,
+    state_vals: &HashMap<Var, HookLabel>,
+    memo_vals: &HashMap<Var, HookLabel>,
+    written_expr: Option<&Expr>,
+    comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+) -> bool {
+    let Some(overwritten) = updater_overwrites(written_expr) else {
+        return true;
+    };
+    for dep in dep_exprs {
+        let (exact, versioned) = classify_effect_deps(
+            std::slice::from_ref(dep),
+            comp_result,
+            state_vals,
+            memo_vals,
+        );
+        let reacts =
+            exact.contains(&label) || versioned.iter().any(|(c, l)| *l == label && c == component);
+        if !reacts {
+            continue;
+        }
+        match slot_member(dep, label, state_vals) {
+            Some(m) if !overwritten.contains(&m) => {}
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// The members a functional update names explicitly, when it provably leaves
+/// every other member of its parameter untouched. `None` proves nothing.
+fn updater_overwrites(written_expr: Option<&Expr>) -> Option<HashSet<Symbol>> {
+    let Some(Expr::FnLit {
+        params, body_cfg, ..
+    }) = written_expr.map(Expr::peel_ts)
+    else {
+        return None;
+    };
+    let [prev] = params.as_slice() else {
+        return None;
+    };
+    let mut out = HashSet::new();
+    let mut returns = 0usize;
+    for block in body_cfg.blocks.values() {
+        let crate::ir::cfg::Terminator::Return(e) = &block.term else {
+            continue;
+        };
+        returns += 1;
+        out.extend(literal_overwrites(e.peel_ts(), prev)?);
+    }
+    (returns > 0).then_some(out)
+}
+
+/// `{ ...prev, a: x }` overwrites `{a}` and preserves every other member;
+/// `prev` itself overwrites nothing. Any other shape — a different spread
+/// source, a second spread, a key the lowering could not name — proves
+/// nothing, because a member it cannot see may be one the deps read.
+fn literal_overwrites(e: &Expr, prev: &Var) -> Option<HashSet<Symbol>> {
+    if matches!(e, Expr::Var(v) if v == prev) {
+        return Some(HashSet::new());
+    }
+    let Expr::ObjectLit { fields, .. } = e else {
+        return None;
+    };
+    let [(spread, src), rest @ ..] = fields.as_slice() else {
+        return None;
+    };
+    if !spread.starts_with(SPREAD_KEY_PREFIX) || !matches!(src.peel_ts(), Expr::Var(v) if v == prev)
+    {
+        return None;
+    }
+    rest.iter()
+        .map(|(k, _)| named_key(k).cloned())
+        .collect::<Option<HashSet<Symbol>>>()
+}
+
+/// A key a `FieldAccess` could actually ask for — every synthetic one (a
+/// further spread, a computed key, an accessor) answers `None`.
+fn named_key(key: &Symbol) -> Option<&Symbol> {
+    (!key.starts_with(SPREAD_KEY_PREFIX) && !key.starts_with('[')).then_some(key)
+}
+
+/// The first member a dep reads off state slot `label`: `data.name.first`
+/// answers `name`. `None` when the dep is not a plain member chain on that
+/// slot — the bare slot included, since every fresh write changes it.
+fn slot_member(
+    dep: &Expr,
+    label: HookLabel,
+    state_vals: &HashMap<Var, HookLabel>,
+) -> Option<Symbol> {
+    let mut cur = dep.peel_ts();
+    let mut first = None;
+    while let Expr::FieldAccess { obj, field } = cur {
+        first = Some(named_key(field)?.clone());
+        cur = obj.peel_ts();
+    }
+    let rooted = match cur {
+        Expr::StateVal(l) => *l == label,
+        Expr::Var(v) => state_vals.get(v) == Some(&label),
+        _ => false,
+    };
+    rooted.then_some(first).flatten()
 }
 
 /// Projection of a written value onto its reference slot — what a
@@ -443,6 +558,14 @@ pub(in crate::rules) fn converges_once_written(
         {
             return true;
         }
+        // Member arm: the guard tests a *member* of the slot, so the value
+        // written at that member answers it — the whole-slot lookup below
+        // cannot, since the slot is one abstract value (#90).
+        if let Some(arg) = written_expr
+            && write_settles_member_truth(cond, taken, &slots, arg, comp_result)
+        {
+            return true;
+        }
         let narrowed = crate::engine::cfg_analyzer::narrow_env_for_branch(&env, cond, taken);
         if let Some(x) = guard_var(cond)
             && narrowed.lookup(x).is_bottom_value()
@@ -528,6 +651,48 @@ fn slot_path(e: &Expr, slots: &HashSet<&Var>) -> Option<Vec<String>> {
             Some(segs)
         }
         _ => None,
+    }
+}
+
+/// Does the value written at a *member* of the slot contradict a guard that
+/// reads that member?
+///
+/// `if (!id && sheet.leadId) setSheet({ leadId: null, open: false })` reaches
+/// the write only while `sheet.leadId` is truthy, and leaves `null` there — so
+/// the guard cannot hold again. The whole-slot narrowing below cannot see that:
+/// the slot is one abstract value, and `{ leadId: null, … }` is a truthy
+/// reference.
+///
+/// Only a literal is read, so the answer never depends on which environment a
+/// body-local name would be looked up in.
+fn write_settles_member_truth(
+    cond: &Expr,
+    taken: bool,
+    slots: &HashSet<&Var>,
+    written_expr: &Expr,
+    comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
+) -> bool {
+    let (read, truthy) = match cond.peel_ts() {
+        Expr::UnaryOp {
+            op: crate::ir::expr::UnaryOp::Not,
+            arg,
+        } => (arg.peel_ts(), !taken),
+        e => (e, taken),
+    };
+    let Some(segs) = slot_path(read, slots).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let Some(at) = written_at(written_expr, &segs) else {
+        return false;
+    };
+    if !matches!(at, Expr::Lit(_)) {
+        return false;
+    }
+    let val = eval_in_exit_env(at, comp_result);
+    if truthy {
+        val.narrow_truthy().is_bottom_value()
+    } else {
+        val.narrow_falsy().is_bottom_value()
     }
 }
 

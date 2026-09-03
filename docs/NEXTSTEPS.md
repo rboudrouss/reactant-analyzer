@@ -217,6 +217,23 @@ Re-mesure des 60 scénarios : **8 EXPRESSIBLE (contre 1), 20 INEXPRESSIBLE
   règle exige une preuve (⊤ ne déclenche rien). Les FP restants sont dans les
   petits amas.
 
+- **ADR-046** — l'insensibilité aux champs de #90, **l'issue est close**. Le
+  bras self-churn raisonnait au grain du slot des deux côtés : toute écriture
+  fraîche versionne l'objet entier, toute lecture compte comme lecture. Deux
+  mécanismes lisent maintenant le membre que le programme lit. Côté deps :
+  React passe la valeur courante à un updater fonctionnel, donc
+  `prev => ({...prev, k: v})` range la valeur de `prev` à tout membre que le
+  littéral ne nomme pas — une dep qui ne lit que ceux-là est `Object.is`-égale
+  après l'écriture. Côté garde : un conjoint qui lit un membre du slot écrit
+  est tranché par la valeur que l'écriture y range, restreinte truthy ou falsy
+  selon la polarité de la branche — le slot entier, lui, est un objet truthy
+  dans les deux cas. Corpus : **1 343 → 1 340 emplacements**, 3 retirées,
+  aucune ajoutée, les trois relues à la source. Reste hors de portée : le
+  graphe multi-effets, où « l'écriture de A change une dep de B » est une
+  propriété d'une *paire* d'arêtes, et le spread direct
+  (`setData({...data, slug})`), où `data` est la valeur capturée au rendu et
+  non la courante.
+
 Prochaines marches, par valeur décroissante : les valeurs d'arguments (#67) ;
 une requête de dominance ; les résumés d'écosystème (#94), seule façon de
 réduire la classe ⊤ qu'ADR-038 §2 laisse en Warning ; et la moitié

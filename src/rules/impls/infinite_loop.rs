@@ -16,7 +16,7 @@ use crate::engine::setters::SetterCallPhase;
 use crate::rules::api::query::must_effect_cycle;
 use crate::rules::helpers::churn::{
     ChurnSetterCall, Freshness, classify_effect_deps, collect_churn_calls, converges_once_written,
-    reference_part,
+    reference_part, write_can_retrigger,
 };
 use crate::rules::helpers::churn_graph::{
     ChurnEdge, ChurnGraph, NodeNames, cycle_path, node_display,
@@ -478,6 +478,20 @@ fn check_object_churn(
             // paths — routed through the must-primitive that mints the proof.
             let (sev, churn_proof) =
                 if exact.contains(&state_label) || versioned.contains(&state_label) {
+                    // A functional update that spreads its own parameter leaves
+                    // every member it does not name `Object.is`-equal, so deps
+                    // reading only those cannot be re-triggered by it (#90).
+                    if !write_can_retrigger(
+                        dep_exprs.as_slice(),
+                        component,
+                        state_label,
+                        &state_vals,
+                        &memo_vals,
+                        call.written_expr.as_ref(),
+                        comp_result,
+                    ) {
+                        continue;
+                    }
                     let fresh_blocks: HashSet<BlockId> = calls
                         .iter()
                         .filter(|c| c.node == call.node && c.freshness == Freshness::Fresh)

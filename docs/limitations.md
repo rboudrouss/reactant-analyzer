@@ -95,6 +95,13 @@ Every entry here is Warning-or-below by construction: an FP never carries an Err
   [#38](https://github.com/rboudrouss/reactant-analyzer/issues/38).
 - **The churn graph** keeps a cycle edge on convergent multi-writer pairs
   [#39](https://github.com/rboudrouss/reactant-analyzer/issues/39).
+- **The churn graph is slot-granular where a program is member-granular.** The self-churn arm
+  reads the member (`[data.name]` is not re-triggered by `setData(prev => ({...prev, slug}))`,
+  and a guard on `sheet.leadId` is answered by the `null` the write puts there), but the
+  multi-effect graph cannot: whether effect A's write into `y` changes a dep of effect B is a
+  property of an edge *pair*, not of an edge. A direct spread — `setData({...data, slug})` — is
+  likewise unproved, since `data` is the value captured at that render rather than the current
+  one [ADR-046](adr/ADR-046-a-member-is-not-the-slot.md).
 - **Deps declared as fields** (`[x?.locale]`) do not cover a truthiness test or a nullish default on
   the whole object — kept deliberately, since the warning is sound and eslint-aligned
   [#40](https://github.com/rboudrouss/reactant-analyzer/issues/40).

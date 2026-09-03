@@ -1785,3 +1785,131 @@ fn a_write_of_something_else_still_fires() {
         "`slot !== a` says nothing about a write of `b`: {fired:?}"
     );
 }
+
+// ── #90 — a spread update preserves the member the deps read ──────────────────
+
+/// dub `add-edit-app-form.tsx:87`: keyed on `data.name`, writes only `.slug`.
+#[test]
+fn a_spread_update_does_not_retrigger_a_dep_on_another_member() {
+    let fired = rules_fired(
+        r#"
+        function C({ slugify }) {
+          const [data, setData] = useState({ name: "", slug: "" });
+          useEffect(() => {
+            setData((prev) => ({ ...prev, slug: slugify(prev.name) }));
+          }, [data.name]);
+          return <div>{data.slug}</div>;
+        }
+        "#,
+    );
+    assert!(
+        !fired.iter().any(|r| r == "infinite-loop"),
+        "`{{...prev, slug}}` leaves `.name` untouched: {fired:?}"
+    );
+}
+
+/// The write names the very member the deps read — still a loop.
+#[test]
+fn a_spread_update_that_writes_the_dep_member_still_loops() {
+    let fired = rules_fired(
+        r#"
+        function C({ slugify }) {
+          const [data, setData] = useState({ name: "", slug: "" });
+          useEffect(() => {
+            setData((prev) => ({ ...prev, name: slugify(prev.slug) }));
+          }, [data.name]);
+          return <div>{data.slug}</div>;
+        }
+        "#,
+    );
+    assert!(
+        fired.iter().any(|r| r == "infinite-loop"),
+        "`.name` is overwritten by a fresh call every run: {fired:?}"
+    );
+}
+
+/// The dep is the whole object: every spread update replaces the reference.
+#[test]
+fn a_spread_update_still_loops_on_a_whole_object_dep() {
+    let fired = rules_fired(
+        r#"
+        function C({ slugify }) {
+          const [data, setData] = useState({ name: "", slug: "" });
+          useEffect(() => {
+            setData((prev) => ({ ...prev, slug: slugify(prev.name) }));
+          }, [data]);
+          return <div>{data.slug}</div>;
+        }
+        "#,
+    );
+    assert!(
+        fired.iter().any(|r| r == "infinite-loop"),
+        "`{{...prev}}` is a fresh reference, and `[data]` compares references: {fired:?}"
+    );
+}
+
+/// A second spread can reintroduce any member, so the literal proves nothing.
+#[test]
+fn a_second_spread_proves_nothing_about_the_dep_member() {
+    let fired = rules_fired(
+        r#"
+        function C({ slugify, patch }) {
+          const [data, setData] = useState({ name: "", slug: "" });
+          useEffect(() => {
+            setData((prev) => ({ ...prev, slug: slugify(prev.name), ...patch }));
+          }, [data.name]);
+          return <div>{data.slug}</div>;
+        }
+        "#,
+    );
+    assert!(
+        fired.iter().any(|r| r == "infinite-loop"),
+        "`...patch` may carry `name`: {fired:?}"
+    );
+}
+
+/// dub `submitted-lead-table.tsx:204`: the branch is reached only while
+/// `sheet.leadId` is truthy and leaves `null` there.
+#[test]
+fn a_member_write_that_falsifies_its_own_guard_is_not_a_loop() {
+    let fired = rules_fired(
+        r#"
+        function C({ searchParams }) {
+          const [sheet, setSheet] = useState({ leadId: null, open: false });
+          useEffect(() => {
+            const urlLeadId = searchParams.get("leadId");
+            if (urlLeadId && urlLeadId !== sheet.leadId) {
+              setSheet({ leadId: urlLeadId, open: true });
+            } else if (!urlLeadId && sheet.leadId) {
+              setSheet({ leadId: null, open: false });
+            }
+          }, [searchParams, sheet.leadId]);
+          return <div>{sheet.leadId}</div>;
+        }
+        "#,
+    );
+    assert!(
+        !fired.iter().any(|r| r == "infinite-loop"),
+        "neither branch can hold again after its own write: {fired:?}"
+    );
+}
+
+/// The write leaves the member truthy, so the guard survives it.
+#[test]
+fn a_member_write_that_keeps_its_guard_true_still_loops() {
+    let fired = rules_fired(
+        r#"
+        function C() {
+          const [sheet, setSheet] = useState({ leadId: null });
+          useEffect(() => {
+            if (sheet.leadId) { setSheet({ leadId: "x" }); }
+          }, [sheet.leadId]);
+          return <div>{sheet.leadId}</div>;
+        }
+        "#,
+    );
+    assert!(
+        fired.iter().any(|r| r == "infinite-loop"),
+        "`leadId` stays truthy, so the guard holds again: {fired:?}"
+    );
+}

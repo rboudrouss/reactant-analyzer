@@ -47,3 +47,4 @@
 | [ADR-043](ADR-043-a-closure-reached-through-a-container.md) | A closure reached through a container is still a closure — the binding chase takes a path, and the two spellings become one reader (#89, the container half of ADR-041 §4) | Accepted |
 | [ADR-044](ADR-044-a-rename-is-not-a-read.md) | A rename is not a read — the free-path walk resolves a body's own aliases (destructuring above all), and a finding names the object when the deps say nothing about it (#89 §2) | Accepted |
 | [ADR-045](ADR-045-a-write-that-settles-its-own-guard.md) | A write that settles its own guard — a relational convergence proof over spellings, where the value domain cannot relate the two sides (#91) | Accepted |
+| [ADR-046](ADR-046-a-member-is-not-the-slot.md) | A member is not the slot — a spread update preserves what it does not name, and a guard on a member is answered by what the write puts there (#90) | Accepted |
