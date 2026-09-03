@@ -180,7 +180,7 @@ Les deux amas jamais triés l'ont été le 2026-09-03
 (`docs/campaign/triage-2026-09-03-untriaged-clusters.md`) :
 `unstable-context-value` (53) est **propre, 53/53 vrais positifs** — y compris
 le seul candidat FP, où la chasse inter-composants avait raison ;
-`frozen-initial-state` (79) porte **une famille de 14** (18 %), les composants
+`frozen-initial-state` (79) porte **une famille de 12** (15 %), les composants
 que l'appelant remonte toujours avec une `key`, écrite en
 [#136](https://github.com/rboudrouss/reactant-analyzer/issues/136). Les 65
 autres sont l'ambiguïté que le niveau Warning existe pour porter, et ne sont

@@ -14,7 +14,7 @@ triage files, this one is dated evidence and is not rewritten later.
 | cluster | locations | material FPs | outcome |
 |---|---:|---:|---|
 | `unstable-context-value` | 53 | **0** | clean |
-| `frozen-initial-state` | 79 | **14** (18 %) | one named family → [#136](https://github.com/rboudrouss/reactant-analyzer/issues/136) |
+| `frozen-initial-state` | 79 | **12** (15 %) | one named family → [#136](https://github.com/rboudrouss/reactant-analyzer/issues/136) |
 
 ## `unstable-context-value` — 53/53 true positives
 
@@ -49,7 +49,7 @@ irrelevant: one caller allocating is enough, and the may-side is the sound one.
 
 Nothing to fix here. Recorded so the cluster is not re-triaged.
 
-## `frozen-initial-state` — one FP family, 14 of 79
+## `frozen-initial-state` — one FP family, 12 of 79
 
 The family: state seeded from a prop, inside a component whose callers *always*
 render it with a `key` derived from the same thing the seed is.
@@ -73,6 +73,22 @@ more hop away in a shared hook, so a single-anchor intra-component rule cannot
 reach the deciding fact — the structural limit of
 [#68](https://github.com/rboudrouss/reactant-analyzer/issues/68). Written up as
 [#136](https://github.com/rboudrouss/reactant-analyzer/issues/136).
+
+**Counted first at 14, corrected to 12** by enumerating every render site
+instead of trusting the two switch statements that had been read. Two of the
+fourteen are not this family, and each shows something the criterion must say:
+
+- `WorkflowOutputSchemaBuilder` is rendered from two sites, **neither keyed** —
+  it does not come from the keyed switch at all, and its finding may be real.
+- `KeyValuePairInput` is keyed at all three sites, with `key={'keyValuePair'}` —
+  a **string literal**. A constant key never changes, so it never remounts; it
+  is the opposite of a reset. The first criterion, "every site passes a key",
+  would have suppressed this one for exactly the wrong reason.
+
+So the criterion is *every known site passes a key whose expression is not a
+constant*. And "every **known** site" carries its own caveat: `callers_of` sees
+only analysed components, which is what argues for an Info downgrade rather
+than silence.
 
 **The other 65 are not this**, and are not proposed for change. They are the
 genuinely ambiguous cases the Warning tier exists for: a settings form
