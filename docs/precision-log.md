@@ -39,6 +39,7 @@ Corpus : `test-repo/`, 14 dépôts, 34 730 fichiers.
 | 2026-09-03 | un membre n'est pas le slot | #90 | 1 343 → 1 340 |
 | 2026-09-03 | l'identité d'un site d'allocation | #134 | 1 340 → 1 348 (**+14**, voir NEXTSTEPS) |
 | 2026-09-03 | un contrat de bibliothèque porte sur les membres | #94 | 1 348 → 1 332 |
+| 2026-09-03 | un emballeur n'exécute pas son argument | #94 | 1 332 → 1 314 |
 
 ---
 
@@ -384,8 +385,55 @@ Les retraits « objet entier » (`form` dans un effet qui n'appelle que
 une copie périmée de `form` tient le même `reset`. La question de
 `missing-deps` est la péremption, pas la couverture eslint.
 
-**Non fait** : la moitié timing de #94. `<form onSubmit={form.handleSubmit(cb)}>`
-laisse 34 avertissements `setter-in-render` de classe ⊤. Ce n'est pas une
-question de valeur mais de *moment* — « cet appelé emballe son argument au lieu
-de l'exécuter » — donc cela relève de la table des registrars d'ADR-034, avec la
-provenance que ce changement vient de rendre disponible.
+La moitié timing suit ci-dessous : elle repose entièrement sur la provenance
+que ce changement rend disponible.
+
+---
+
+## 2026-09-03 — un emballeur n'exécute pas son argument
+
+*#94, la moitié « timing ».*
+
+`<form onSubmit={form.handleSubmit(onSubmit)}>` laissait 34 avertissements
+`setter-in-render` de classe ⊤. La marche voyait un appel opaque recevant une
+fonction qui écrit un state, et ⊤ inclut la passe de rendu — sain, et bruyant.
+
+**La revendication.** `handleSubmit(cb)` **renvoie** un gestionnaire ; il
+n'appelle pas `cb`. C'est une affirmation sur le *moment*, pas sur ce que vaut
+une valeur, donc elle voyage sur sa propre variante `SummaryValue::StableWrapper`
+plutôt que sur la valeur — cette dernière est identique à `StableRef`.
+
+**Ce qui en fait un contrat et non une supposition.** ADR-034 §2 est explicite :
+faire descendre une ligne de ⊤ vers `Handler` est la seule direction qui peut
+*perdre* un constat, donc elle n'est permise que là où le timing est un contrat.
+`handleSubmit` comme nom nu est une supposition ; `handleSubmit` comme membre
+d'une valeur rendue par `useForm()` importé de `react-hook-form` est un contrat.
+Cette provenance vient de l'entrée précédente : sans les formes, il n'y avait
+rien à quoi rattacher la revendication.
+
+**Le contrôle d'échappement est l'autre moitié de la soundness.** Le contrat dit
+que l'emballeur n'exécutera pas le rappel ; il ne dit rien de ce que le composant
+fait du gestionnaire qu'il reçoit. `const submit = handleSubmit(cb); submit();`
+exécute bien `cb` pendant le rendu, et l'avertissement ⊤ avait raison. Une
+orthographe est donc abandonnée quand un nom lié à son appel est lui-même appelé
+dans le corps parcouru, ou quand l'appel est invoqué sur place
+(`handleSubmit(cb)()`). Restreindre le contrôle au corps parcouru n'est pas un
+raccourci : un effet qui appelle `submit()` est une autre phase, ce qui est
+précisément la question.
+
+Un nom déstructuré se résout par la chasse aux liaisons partagée, dont la barre
+de certitude porte le dernier cas : un nom lié plus d'une fois — deux
+formulaires inlinés dans un même corps de rendu — ne résout rien, donc la marche
+ne peut pas dire de quel objet il s'agit et garde ⊤. C'est un refus, pas un
+oubli : une première version qui filtrait les `let` à la main l'aurait
+revendiqué à tort.
+
+**Corpus : 1 332 → 1 314 emplacements, 18 retirés, aucun ajouté** — 16
+`setter-in-render` et 2 `cross-setter-in-render`, tous relus à la source, dont
+`onSubmit={form.handleSubmit(onSubmit)}` dans shadcn-admin et le
+`const submit = handleSubmit(…)` de twenty, où `submit` ne va qu'en JSX.
+
+**Non couvert**, et laissé ⊤ : les 16 restants. Neuf sont le `form.onSubmit(cb)`
+et le `form.watch(path, cb)` de `@mantine/form` — une autre bibliothèque, sans
+table ; un est un hook local (`useTwoFactorAuthenticationForm`) ; les autres
+sont les noms liés deux fois ci-dessus.

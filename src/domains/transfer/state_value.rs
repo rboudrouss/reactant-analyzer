@@ -187,6 +187,9 @@ fn summary_value(sv: &crate::ir::expr::SummaryValue) -> StateValue {
         crate::ir::expr::SummaryValue::Top => StateValue::top(),
         crate::ir::expr::SummaryValue::StableRef => StateValue::reference(Stability::Stable),
         crate::ir::expr::SummaryValue::UnstableRef => StateValue::reference(Stability::PerRender),
+        // Value-wise a wrapper is just a stable function; what makes it a
+        // wrapper is when it runs its argument, which no value can say.
+        crate::ir::expr::SummaryValue::StableWrapper => StateValue::reference(Stability::Stable),
         // The container carries no claim — the members do, and they are read
         // off the heap by `eval_field_access`. Answering anything narrower
         // here would credit the object itself with a stability the library

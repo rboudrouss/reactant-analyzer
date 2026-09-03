@@ -614,3 +614,119 @@ fn two_calls_of_one_shaped_hook_are_two_objects() {
         "both forms resolve their own members: {fired:?}"
     );
 }
+
+// ── The timing half: a wrapper does not run its argument (#94) ────────────────
+//
+// `handleSubmit(cb)` returns an event handler; it does not call `cb`. That is a
+// claim about *when*, not about what a value is worth, so it rides on its own
+// `SummaryValue` variant and is read by the setter walk rather than by the
+// value domain.
+
+/// The corpus shape: the handler goes straight into JSX.
+#[test]
+fn a_wrapped_callback_does_not_run_during_render() {
+    let fired = rules_fired(
+        r#"
+        import { useForm } from "react-hook-form";
+        function C() {
+          const [loading, setLoading] = useState(false);
+          const form = useForm();
+          const onSubmit = (data) => { setLoading(true); };
+          return <form onSubmit={form.handleSubmit(onSubmit)} />;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        !fired.iter().any(|r| r == "setter-in-render"),
+        "`handleSubmit` returns the handler, it does not call `onSubmit`: {fired:?}"
+    );
+}
+
+/// Destructured, and the handler bound before it reaches JSX.
+#[test]
+fn a_wrapped_callback_bound_to_a_name_is_still_a_handler() {
+    let fired = rules_fired(
+        r#"
+        import { useForm } from "react-hook-form";
+        function C() {
+          const [loading, setLoading] = useState(false);
+          const { handleSubmit } = useForm();
+          const submit = handleSubmit((data) => { setLoading(true); });
+          return <form onSubmit={submit} />;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        !fired.iter().any(|r| r == "setter-in-render"),
+        "binding the handler does not invoke it: {fired:?}"
+    );
+}
+
+/// The escape, and the reason the claim needs a check of its own: the contract
+/// says the wrapper will not run the callback, not that this component will
+/// leave the handler alone.
+#[test]
+fn a_handler_invoked_during_render_still_fires() {
+    let fired = rules_fired(
+        r#"
+        import { useForm } from "react-hook-form";
+        function C() {
+          const [loading, setLoading] = useState(false);
+          const { handleSubmit } = useForm();
+          const submit = handleSubmit((data) => { setLoading(true); });
+          submit();
+          return <form />;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        fired.iter().any(|r| r == "setter-in-render"),
+        "calling the handler in render runs the callback in render: {fired:?}"
+    );
+}
+
+/// Invoked on the spot, with no name in between.
+#[test]
+fn a_handler_invoked_immediately_still_fires() {
+    let fired = rules_fired(
+        r#"
+        import { useForm } from "react-hook-form";
+        function C() {
+          const [loading, setLoading] = useState(false);
+          const { handleSubmit } = useForm();
+          handleSubmit((data) => { setLoading(true); })();
+          return <form />;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        fired.iter().any(|r| r == "setter-in-render"),
+        "`handleSubmit(cb)()` runs `cb` right here: {fired:?}"
+    );
+}
+
+/// A member with no wrapper contract keeps its argument at ⊤: `trigger` is
+/// stable, but nothing says when it runs what it is handed.
+#[test]
+fn a_non_wrapper_member_does_not_defer_its_argument() {
+    let fired = rules_fired(
+        r#"
+        import { useForm } from "react-hook-form";
+        function C() {
+          const [loading, setLoading] = useState(false);
+          const { trigger } = useForm();
+          trigger((data) => { setLoading(true); });
+          return <form />;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        fired.iter().any(|r| r == "setter-in-render"),
+        "only `handleSubmit` carries the wrapper contract: {fired:?}"
+    );
+}

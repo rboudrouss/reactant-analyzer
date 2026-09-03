@@ -198,7 +198,8 @@ const REACT_HOOK_FORM_MEMBERS: &[(&str, SummaryValue)] = &[
     ("resetField", SummaryValue::StableRef),
     ("reset", SummaryValue::StableRef),
     ("trigger", SummaryValue::StableRef),
-    ("handleSubmit", SummaryValue::StableRef),
+    // `handleSubmit(cb)` returns an event handler; it does not call `cb`.
+    ("handleSubmit", SummaryValue::StableWrapper),
     ("watch", SummaryValue::StableRef),
     ("control", SummaryValue::StableRef),
 ];

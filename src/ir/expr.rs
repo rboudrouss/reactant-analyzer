@@ -257,6 +257,14 @@ pub enum SummaryValue {
     StableRef,
     /// Hook returns a reference-unstable value (new object/array every render).
     UnstableRef,
+    /// A stable function that **wraps** its own function argument rather than
+    /// running it: `form.handleSubmit(onSubmit)` returns an event handler and
+    /// calls `onSubmit` only when that handler fires.
+    ///
+    /// Stable like [`Self::StableRef`] for every value question — the extra
+    /// variant records the *timing* half, which is a different claim about a
+    /// different thing and so cannot ride on the value.
+    StableWrapper,
     /// Hook returns an object whose *named* members carry their own summaries.
     ///
     /// The contract libraries actually publish is per member, not per object:

@@ -17,7 +17,7 @@ use crate::{
         SourceRange,
         cfg::{CFG, Terminator},
         expr::Expr,
-        free_vars::collect_used_vars,
+        free_vars::{call_free_key, collect_used_vars},
         hooks::HookEntry,
         stmt::Stmt,
         types::{BlockId, HookLabel, Symbol, Var},
@@ -112,6 +112,7 @@ pub fn collect_setter_calls_with_extra(
     }
     let mut found = Found::default();
     let empty = HashSet::new();
+    let wrappers = wrapper_callees(cfg);
     let certified = certified_fn_names(cfg, &fn_bindings);
     let mut walk = SetterWalk {
         setter_vars,
@@ -125,6 +126,7 @@ pub fn collect_setter_calls_with_extra(
         certified_fns: &certified,
         collect_calls: false,
         read_vars: &NO_VARS,
+        wrappers: &wrappers,
     };
     walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None, None);
     let mut found = found.setters;
@@ -184,6 +186,7 @@ pub(crate) fn collect_write_sites(
     callback_bodies: &HashMap<HookLabel, Arc<CFG>>,
 ) -> Vec<WriteSite> {
     let mut found = Found::default();
+    let wrappers = wrapper_callees(cfg);
     let mut fn_bindings = collect_fn_bindings(cfg);
     let mut certified = certified_fn_names(cfg, &fn_bindings);
     let mut local_binders: HashSet<Var> = HashSet::new();
@@ -209,6 +212,7 @@ pub(crate) fn collect_write_sites(
         certified_fns: &certified,
         collect_calls: false,
         read_vars: &NO_VARS,
+        wrappers: &wrappers,
     };
     walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None, None);
     found
@@ -1139,10 +1143,18 @@ struct SetterWalk<'a> {
     /// their aliases. Empty for every consumer that does not ask; the
     /// traversal still runs, it just records nothing on this channel.
     read_vars: &'a HashSet<Var>,
+    /// Callee spellings proven to wrap their function argument rather than run
+    /// it — see [`wrapper_callees`]. Empty for every consumer that does not
+    /// resolve summaries, which reads as "no wrapper is proven": ⊤, the
+    /// fire-more direction.
+    wrappers: &'a HashSet<String>,
 }
 
 /// No bindings to record reads for — every setter consumer.
 static NO_VARS: std::sync::LazyLock<HashSet<Var>> = std::sync::LazyLock::new(HashSet::new);
+
+/// No proven wrappers — every consumer that walks without resolving summaries.
+static NO_WRAPPERS: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
 
 impl SetterWalk<'_> {
     fn collect_reads(&self) -> bool {
@@ -1325,6 +1337,142 @@ pub(crate) const SYNC_HOF_METHODS: &[&str] = &[
     "sort",
 ];
 
+/// Callee spellings proven to be a **wrapper**: a library member that returns
+/// a handler around its function argument instead of running it
+/// (`form.handleSubmit(onSubmit)`).
+///
+/// Resolved here, once per component, because this is where a summary is still
+/// visible: the walk sees only a callee expression, and `handleSubmit` as a
+/// bare name is a guess where `handleSubmit` as a member of a `useForm()` from
+/// react-hook-form is a contract — the distinction ADR-034 §2 requires before
+/// narrowing anything off ⊤.
+///
+/// **The escape check is the other half of that soundness.** The contract says
+/// the wrapper does not run the callback; it says nothing about what this
+/// component does with the handler it gets back. A name bound to a wrapper
+/// call and then *called* in this body could run the callback during the
+/// render pass after all, so that spelling is dropped and its argument stays ⊤
+/// — which is where it was before.
+///
+/// A destructured name resolves through [`binding_of`](crate::ir::bindings::binding_of),
+/// whose certainty bar carries the last case: a name bound more than once
+/// (two forms inlined into one render body, say) resolves to nothing, so the
+/// walk cannot tell which object's member it is and keeps ⊤.
+fn wrapper_callees(render_cfg: &CFG) -> HashSet<String> {
+    use crate::ir::expr::{MarkerVal, SummaryValue};
+
+    // Objects bound to a summary shape, with the wrapper members they carry.
+    let mut shapes: HashMap<Var, Vec<Symbol>> = HashMap::new();
+    for block in render_cfg.blocks.values() {
+        for stmt in &block.stmts {
+            let Stmt::Let { var, rhs, .. } = stmt else {
+                continue;
+            };
+            if let Expr::HookMarker(_, MarkerVal::Summary(SummaryValue::Shape { members, .. })) =
+                rhs.peel_ts()
+            {
+                let names: Vec<Symbol> = members
+                    .iter()
+                    .filter(|(_, v)| *v == SummaryValue::StableWrapper)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                if !names.is_empty() {
+                    shapes.insert(var.clone(), names);
+                }
+            }
+        }
+    }
+    if shapes.is_empty() {
+        return HashSet::new();
+    }
+
+    // Every name this body calls, and every immediately-invoked call
+    // (`handleSubmit(cb)()`, whose callee is itself a call).
+    let mut called: HashSet<Var> = HashSet::new();
+    let mut invoked_on_the_spot: Vec<Expr> = Vec::new();
+    render_cfg.for_each_expr(&mut |e| {
+        let mut stack = vec![e];
+        while let Some(e) = stack.pop() {
+            if let Expr::Call { fn_, .. } = e {
+                match fn_.peel_ts() {
+                    Expr::Var(v) => {
+                        called.insert(v.clone());
+                    }
+                    Expr::Call { fn_: inner, .. } => invoked_on_the_spot.push((**inner).clone()),
+                    _ => {}
+                }
+            }
+            e.for_each_child(&mut |c| stack.push(c));
+        }
+    });
+
+    // The wrapper spellings this body actually uses. `form.handleSubmit` is a
+    // member read; a destructured `handleSubmit` is a *name*, and resolving it
+    // goes through the shared binding chase rather than a private pattern
+    // match — lowering can put a rename between the destructure and the read,
+    // and the chase is the reader that already follows one.
+    // Value: the shaped object, so the escape check below can disqualify every
+    // spelling of one object at once.
+    let mut keys: HashMap<String, Var> = HashMap::new();
+    for (obj, members) in &shapes {
+        for m in members {
+            let member = Expr::FieldAccess {
+                obj: Box::new(Expr::Var(obj.clone())),
+                field: m.clone(),
+            };
+            if let Some(k) = call_free_key(&member) {
+                keys.insert(k, obj.clone());
+            }
+        }
+    }
+    for name in &called {
+        let Some(Expr::FieldAccess { obj, field }) =
+            crate::ir::bindings::binding_of(name, render_cfg).map(Expr::peel_ts)
+        else {
+            continue;
+        };
+        let Expr::Var(o) = obj.peel_ts() else {
+            continue;
+        };
+        if shapes.get(o).is_some_and(|ms| ms.contains(field)) {
+            keys.insert(name.clone(), o.clone());
+        }
+    }
+
+    // Escape check: a name bound to a wrapper call and then called somewhere in
+    // this body runs the callback wherever *it* is called, so the wrapper
+    // proves nothing here.
+    let bodies = || std::iter::once(render_cfg);
+    let mut wrapped_into: HashSet<Var> = HashSet::new();
+    for callee in &invoked_on_the_spot {
+        if let Some(owner) = call_free_key(callee).and_then(|k| keys.get(&k)) {
+            wrapped_into.insert(owner.clone());
+        }
+    }
+    for cfg in bodies() {
+        for block in cfg.blocks.values() {
+            for stmt in &block.stmts {
+                let Stmt::Let { var, rhs, .. } = stmt else {
+                    continue;
+                };
+                let Expr::Call { fn_, .. } = rhs.peel_ts() else {
+                    continue;
+                };
+                if called.contains(var)
+                    && let Some(owner) = call_free_key(fn_).and_then(|k| keys.get(&k))
+                {
+                    wrapped_into.insert(owner.clone());
+                }
+            }
+        }
+    }
+
+    keys.into_iter()
+        .filter(|(_, owner)| !wrapped_into.contains(owner))
+        .map(|(k, _)| k)
+        .collect()
+}
+
 impl<'a> SetterWalk<'a> {
     /// What class a function argument of a call to `fn_` takes, given the
     /// current `mode`. `WalkClass::Unknown` = no summary — the argument is ⊤.
@@ -1351,6 +1499,14 @@ impl<'a> SetterWalk<'a> {
                     Timing::Unknown => WalkClass::Unknown,
                 };
             }
+        }
+        // A proven wrapper hands its callback to the handler it returns, so
+        // the callback does not run in this call's phase (#94). Proven is the
+        // operative word: `wrapper_callees` resolved the spelling through a
+        // library summary and checked this component never invokes the handler
+        // itself.
+        if call_free_key(fn_).is_some_and(|k| self.wrappers.contains(&k)) {
+            return WalkClass::Handler;
         }
         match fn_ {
             Expr::FieldAccess { field, .. } if SYNC_HOF_METHODS.contains(&field.as_str()) => mode,
@@ -1797,6 +1953,7 @@ pub fn collect_slot_reads(render_cfg: &CFG, hooks: &[HookEntry]) -> Vec<SlotRead
             certified_fns: &certified,
             collect_calls: false,
             read_vars: &vars,
+            wrappers: &NO_WRAPPERS,
         };
         walk.cfg(cfg, 2, &mut found, WalkClass::Sync, None, None);
         for r in found.reads {
@@ -1874,6 +2031,7 @@ pub fn collect_body_calls(cfg: &CFG, region: WriterRegion, max_depth: usize) -> 
         certified_fns: &certified,
         collect_calls: true,
         read_vars: &NO_VARS,
+        wrappers: &NO_WRAPPERS,
     };
     walk.cfg(cfg, max_depth, &mut found, WalkClass::Sync, None, None);
     let mut rows: Vec<BodyCall> = found

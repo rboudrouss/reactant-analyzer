@@ -148,9 +148,13 @@ Every entry here is Warning-or-below by construction: an FP never carries an Err
   firing. `formState`, `data` and `error` are excluded on purpose — they are what those hooks
   exist to change [precision-log](precision-log.md#2026-09-03--un-contrat-de-bibliothèque-porte-sur-les-membres).
 - **`setter-in-render`** warns when a setter reaches a callee with no timing summary
-  (`<form onSubmit={handleSubmit(onSubmit)}>`, `composeEventHandlers(a, cb)`): ⊤ includes the render
+  (`composeEventHandlers(a, cb)`, `@mantine/form`'s `form.onSubmit(cb)`): ⊤ includes the render
   pass, so the row is sound and the wording says so — it never claims the setter was called in the
-  render body, and it never reaches Error. Narrowing it needs a summary for those callees
+  render body, and it never reaches Error. react-hook-form's `handleSubmit` is narrowed because a
+  member of a `useForm()` return is a *contract*; a bare name would be a guess, and ADR-034 §2
+  allows narrowing off ⊤ only on the first. Three things keep it ⊤ deliberately: a library with no
+  table, a handler this body invokes itself, and a name bound more than once — two forms inlined
+  into one render body leave no way to say whose `handleSubmit` a call means
   [#94](https://github.com/rboudrouss/reactant-analyzer/issues/94).
 - **The assurance channel** (`verified:` lines under `--info`) is withheld per component rather than
   per (limit kind, check), so an unanalysed *child* costs the parent guarantees about its own body
