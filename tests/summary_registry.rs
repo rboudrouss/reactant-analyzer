@@ -484,3 +484,133 @@ fn effects_and_refs_stay_value_less() {
         "neither may degrade to ⊤: {markers:?}"
     );
 }
+
+// ── Per-member summaries (#94) ────────────────────────────────────────────────
+//
+// What these libraries publish is a contract per *member*: `useForm()` promises
+// `setValue` is the same function at every render and promises nothing about
+// `formState`. A flat summary could not say that, so every destructured member
+// read ⊤ and every one of them was reported missing from a deps array.
+
+fn common_config() -> Config {
+    Config {
+        summary_registry: SummaryRegistry::new_with_common(),
+        ..Config::default()
+    }
+}
+
+fn rules_fired(src: &str, component: &str) -> Vec<String> {
+    let result = parse_and_analyze_with_config(src, common_config());
+    diags_for(&result, component)
+        .into_iter()
+        .map(|d| d.rule.to_string())
+        .collect()
+}
+
+/// A destructured member with a published contract is not a missing dep.
+#[test]
+fn a_react_hook_form_member_is_stable() {
+    let fired = rules_fired(
+        r#"
+        import { useForm } from "react-hook-form";
+        function C({ id }) {
+          const { setValue } = useForm();
+          useEffect(() => { setValue("name", id); }, [id]);
+          return <div />;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        !fired.iter().any(|r| r == "missing-deps"),
+        "`setValue` keeps its identity for the life of the form: {fired:?}"
+    );
+}
+
+/// The boundary, and the reason the container stays ⊤: `formState` is a Proxy
+/// that changes as the form does, so it is deliberately not in the table and
+/// must still be reported.
+#[test]
+fn an_unlisted_member_is_still_a_missing_dep() {
+    let fired = rules_fired(
+        r#"
+        import { useForm } from "react-hook-form";
+        function C() {
+          const { formState } = useForm();
+          const cb = useCallback(() => formState.isDirty, []);
+          return <div onClick={cb} />;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        fired.iter().any(|r| r == "missing-deps"),
+        "nothing is promised about `formState`: {fired:?}"
+    );
+}
+
+/// Reached through the object rather than destructured — the same member map,
+/// read one hop in.
+#[test]
+fn a_next_router_method_is_stable_through_the_object() {
+    let fired = rules_fired(
+        r#"
+        import { useRouter } from "next/navigation";
+        function C({ id }) {
+          const router = useRouter();
+          useEffect(() => { router.refresh(); }, [id]);
+          return <div />;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        !fired.iter().any(|r| r == "missing-deps"),
+        "the App Router object and its methods are stable: {fired:?}"
+    );
+}
+
+/// SWR's `mutate` is bound to the key and stable; `data` is the whole point of
+/// the hook changing and stays ⊤.
+#[test]
+fn swr_mutate_is_stable_but_data_is_not() {
+    let fired = rules_fired(
+        r#"
+        import useSWR from "swr";
+        function C({ key }) {
+          const { data, mutate } = useSWR(key);
+          useEffect(() => { mutate(); }, [key]);
+          const cb = useCallback(() => data.value, []);
+          return <div onClick={cb} />;
+        }
+        "#,
+        "C",
+    );
+    assert_eq!(
+        fired.iter().filter(|r| *r == "missing-deps").count(),
+        1,
+        "`data` fires, `mutate` does not: {fired:?}"
+    );
+}
+
+/// A summary shape is one object per call site, so two forms in one component
+/// do not share a heap entry (#134).
+#[test]
+fn two_calls_of_one_shaped_hook_are_two_objects() {
+    let fired = rules_fired(
+        r#"
+        import { useForm } from "react-hook-form";
+        function C({ id }) {
+          const a = useForm();
+          const b = useForm();
+          useEffect(() => { a.setValue("x", id); b.setValue("y", id); }, [id]);
+          return <div />;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        !fired.iter().any(|r| r == "missing-deps"),
+        "both forms resolve their own members: {fired:?}"
+    );
+}

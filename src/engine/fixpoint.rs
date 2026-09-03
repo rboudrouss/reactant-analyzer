@@ -773,6 +773,14 @@ impl SpliceIds {
         }
     }
 
+    /// One allocation site, for something the source did not allocate — a
+    /// library hook's per-member summary shape (#94).
+    fn alloc_one(&mut self) -> crate::ir::types::ExprId {
+        let id = self.next_alloc;
+        self.next_alloc += 1;
+        crate::ir::types::ExprId(id)
+    }
+
     /// The salt and allocation-id offset for one graft `span` ids wide,
     /// advancing both supplies past it.
     fn take(&mut self, span: usize) -> (u32, usize) {
@@ -869,7 +877,24 @@ fn expand_custom_hooks(
                 .summary_registry
                 .get(&name, import_source.as_deref())
             {
-                let sv = summary.summarize(&[]);
+                // A per-member contract needs an allocation site of its own —
+                // one per call, so two `useForm()`s are two objects. Drawn
+                // from the component's splice cursor, the same supply a graft
+                // uses (#134).
+                let sv = if summary.members().is_empty() {
+                    state_value_to_summary_value(summary.summarize(&[]))
+                } else {
+                    SummaryValue::Shape {
+                        id: salt.alloc_one(),
+                        members: std::sync::Arc::new(
+                            summary
+                                .members()
+                                .iter()
+                                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                                .collect(),
+                        ),
+                    }
+                };
                 // Retag the call-site marker rather than replacing it, and keep
                 // the `HookEntry`. Both used to go: the binding became a bare
                 // `SummaryVal` and the entry was removed, which erased the
@@ -882,7 +907,7 @@ fn expand_custom_hooks(
                 // (`useTracking()`, no binding) and a call in a non-entry
                 // block, neither of which the binding-name search in the entry
                 // block could find.
-                retag_marker(render_cfg, custom_label, state_value_to_summary_value(sv));
+                retag_marker(render_cfg, custom_label, sv);
             }
             i += 1;
             continue;

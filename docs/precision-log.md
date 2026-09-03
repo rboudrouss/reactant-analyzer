@@ -11,8 +11,11 @@ corpus. Une entrée ici, un message de commit, et une ligne dans
 [`limitations.md`](limitations.md) s'il reste une limite.
 
 Chaque revendication reste soumise aux invariants du projet : faux positifs
-tolérés, **faux négatifs interdits**. Toutes les entrées ci-dessous ne retirent
-que des emplacements et n'en ajoutent aucun.
+tolérés, **faux négatifs interdits**. Les entrées de précision ne retirent que
+des emplacements et n'en ajoutent aucun ; la seule ligne du tableau qui en
+*ajoute* est #134, qui est une correction de soundness — les constats ajoutés
+sont ceux qu'un bug taisait, et son détail est dans
+[NEXTSTEPS](NEXTSTEPS.md#134--lidentité-dun-site-dallocation-2026-09-03).
 
 ## Métrique
 
@@ -34,6 +37,8 @@ Corpus : `test-repo/`, 14 dépôts, 34 730 fichiers.
 | 2026-09-02 | un renommage n'est pas une lecture | #89 §2 | 1 394 → 1 359 |
 | 2026-09-02 | une écriture qui tranche sa propre garde | #91 | 1 359 → 1 343 |
 | 2026-09-03 | un membre n'est pas le slot | #90 | 1 343 → 1 340 |
+| 2026-09-03 | l'identité d'un site d'allocation | #134 | 1 340 → 1 348 (**+14**, voir NEXTSTEPS) |
+| 2026-09-03 | un contrat de bibliothèque porte sur les membres | #94 | 1 348 → 1 332 |
 
 ---
 
@@ -337,3 +342,50 @@ dub ce corpus écrit des slots entiers. Les deux bras servent aussi
 B » est une propriété d'une *paire* d'arêtes ; et le spread direct
 (`setData({...data, slug})`), où `data` est la valeur capturée au rendu et non
 la courante.
+
+---
+
+## 2026-09-03 — un contrat de bibliothèque porte sur les membres
+
+*#94, la moitié « valeurs ». L'issue reste ouverte pour la moitié « timing ».*
+
+Un `SummaryValue` était plat — `Top | StableRef | UnstableRef` — donc
+`const { setValue } = useForm()` n'avait aucune réponse : le conteneur était ⊤,
+chaque membre déstructuré aussi, et chacun était signalé absent du tableau de
+deps.
+
+**La revendication.** Ce que ces bibliothèques publient est un contrat *par
+membre*, pas par objet : `useForm()` garantit que `setValue` est la même
+fonction à chaque rendu et ne garantit **rien** sur `formState`, qui est un
+Proxy qui change avec le formulaire. `SummaryValue::Shape { id, members }` porte
+exactement ça. Le conteneur reste ⊤ et un membre absent de la liste répond ⊤
+aussi — c'est ce qui empêche qu'un membre ajouté à une bibliothèque après
+l'écriture de la table hérite d'une stabilité que personne n'a promise.
+
+Le reste est la machinerie de #88 : `bind_rhs` enregistre la carte de membres
+comme un `HeapValue::Obj`, exactement comme pour un littéral objet, donc
+`const { setValue } = useForm()` — qui s'abaisse en
+`__obj = <marqueur>; setValue = __obj.setValue` — se résout par le tas comme
+`const { onClear } = bag`. Six lignes dans l'interpréteur, aucun nouveau chemin
+de résolution. L'`id` vient du curseur de greffe du composant (#134), donc deux
+`useForm()` dans un composant font deux objets.
+
+Tables livrées : react-hook-form `useForm` / `useFormContext` (14 membres),
+`useRouter` de l'App Router Next (6), `mutate` de SWR. Délibérément absents :
+`formState`, `data`, `error`.
+
+**Corpus : 1 348 → 1 332 emplacements, 16 retirés, aucun ajouté**, tous
+`missing-deps`, tous relus à la source. Deux d'entre eux — `login/page.tsx:26`
+et `register/page.tsx:25` d'ai-chatbot — portent le commentaire de l'application
+elle-même : `biome-ignore … router and updateSession are stable refs`.
+
+Les retraits « objet entier » (`form` dans un effet qui n'appelle que
+`form.reset`) sont la même revendication lue par le plus long préfixe stable :
+une copie périmée de `form` tient le même `reset`. La question de
+`missing-deps` est la péremption, pas la couverture eslint.
+
+**Non fait** : la moitié timing de #94. `<form onSubmit={form.handleSubmit(cb)}>`
+laisse 34 avertissements `setter-in-render` de classe ⊤. Ce n'est pas une
+question de valeur mais de *moment* — « cet appelé emballe son argument au lieu
+de l'exécuter » — donc cela relève de la table des registrars d'ADR-034, avec la
+provenance que ce changement vient de rendre disponible.

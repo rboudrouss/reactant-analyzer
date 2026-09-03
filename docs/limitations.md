@@ -142,6 +142,11 @@ Every entry here is Warning-or-below by construction: an FP never carries an Err
   neighbouring shapes are NOT proved and still fire: a **disjunctive** guard (`if (!prev || prev !==
   next)`), and **arithmetic** on the compared value (`setIndex(Math.max(0, plans.length - 1))` under
   `index >= plans.length`) [precision-log](precision-log.md#2026-09-02--une-écriture-qui-tranche-sa-propre-garde).
+- **A library hook's per-member contract is a table, not an inference.** `useForm()`,
+  `useRouter()` and SWR's `mutate` have their stable members listed by name; a member that is
+  not listed reads ⊤, so a library that adds one, or a library with no entry at all, keeps
+  firing. `formState`, `data` and `error` are excluded on purpose — they are what those hooks
+  exist to change [precision-log](precision-log.md#2026-09-03--un-contrat-de-bibliothèque-porte-sur-les-membres).
 - **`setter-in-render`** warns when a setter reaches a callee with no timing summary
   (`<form onSubmit={handleSubmit(onSubmit)}>`, `composeEventHandlers(a, cb)`): ⊤ includes the render
   pass, so the row is sound and the wording says so — it never claims the setter was called in the

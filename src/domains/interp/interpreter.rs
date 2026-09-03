@@ -9,7 +9,7 @@ use crate::{
     },
     ir::{
         cfg::{CFG, EdgeKind, Terminator},
-        expr::Expr,
+        expr::{Expr, MarkerVal, SummaryValue},
         stmt::{MemberKey, Stmt},
         types::{BlockId, Symbol},
     },
@@ -241,6 +241,26 @@ fn bind_rhs<T: Transfer>(
     if let Expr::ObjectLit { id, fields } = rhs {
         let members = obj_members(transfer, fields, env, ctx);
         ctx.heap.insert(*id, HeapValue::Obj(members));
+        env.extend_loc(var.to_string(), *id);
+    }
+    // A library hook whose contract is per member (`useForm()` promises
+    // `setValue` is the same function every render, and promises nothing about
+    // `formState`) reads as the same per-member map an object literal gets.
+    // The container stays ⊤; only the named members carry a claim, so a
+    // destructured `const { setValue } = useForm()` resolves through the heap
+    // exactly as `const { onClear } = bag` does.
+    if let Expr::HookMarker(_, MarkerVal::Summary(SummaryValue::Shape { id, members })) = rhs {
+        let fields = members
+            .iter()
+            .map(|(k, v)| {
+                let val = transfer
+                    .eval_expr(&Expr::SummaryVal(v.clone()), env, ctx)
+                    .as_state_value()
+                    .unwrap_or_else(StateValue::top);
+                (k.clone(), EnvVal::Val(val))
+            })
+            .collect();
+        ctx.heap.insert(*id, HeapValue::Obj(fields));
         env.extend_loc(var.to_string(), *id);
     }
     // Propagate heap locs for variable aliases (e.g. destructuring preamble:

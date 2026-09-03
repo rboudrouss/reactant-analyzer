@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::domains::{AbstractDomain, StateValue};
+use crate::ir::expr::SummaryValue;
 
 // ── HookSummary trait ─────────────────────────────────────────────────────────
 
@@ -13,6 +14,20 @@ pub trait HookSummary: Send + Sync {
     /// Default: `Top` (most conservative completely unknown).
     fn summarize(&self, _args: &[StateValue]) -> StateValue {
         StateValue::top()
+    }
+
+    /// Named members of the returned object that carry a contract of their own.
+    ///
+    /// This is the shape libraries actually publish: `useForm()` promises
+    /// `setValue` is the same function at every render and promises nothing
+    /// about `formState`. Everything not listed reads ⊤, so a member added to
+    /// a library after this table was written is never credited with a
+    /// stability nobody wrote down.
+    ///
+    /// Empty means the hook's return has no per-member contract, and
+    /// [`Self::summarize`] alone answers for it.
+    fn members(&self) -> &'static [(&'static str, SummaryValue)] {
+        &[]
     }
 }
 
@@ -55,6 +70,25 @@ impl SummaryRegistry {
         // `usePathname()` is typed `string`, and a primitive is compared by
         // value — so a `pathname` dep is never a per-render fresh reference.
         r.register_for_package("next/navigation", Box::new(StrTopSummary("usePathname")));
+
+        // Per-member contracts (#94). Registering the *shape* is what lets a
+        // destructured `const { setValue } = useForm()` resolve: the container
+        // stays ⊤ and each named member answers for itself.
+        for hook in ["useForm", "useFormContext"] {
+            r.register_for_package(
+                "react-hook-form",
+                Box::new(ShapeSummary(hook, REACT_HOOK_FORM_MEMBERS)),
+            );
+        }
+        for pkg in ["next/navigation", "next/router", "next/compat/router"] {
+            r.register_for_package(
+                pkg,
+                Box::new(ShapeSummary("useRouter", NEXT_ROUTER_MEMBERS)),
+            );
+        }
+        for (pkg, hook) in [("swr", "useSWR"), ("swr", "useSWRConfig")] {
+            r.register_for_package(pkg, Box::new(ShapeSummary(hook, SWR_MEMBERS)));
+        }
         r
     }
 
@@ -130,6 +164,59 @@ impl HookSummary for StrTopSummary {
         StateValue::str_top()
     }
 }
+
+/// A hook whose return object has a published per-member contract.
+///
+/// The container itself stays ⊤: what these libraries document is that certain
+/// *members* keep their identity, not that the object does.
+struct ShapeSummary(&'static str, &'static [(&'static str, SummaryValue)]);
+
+impl HookSummary for ShapeSummary {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn members(&self) -> &'static [(&'static str, SummaryValue)] {
+        self.1
+    }
+}
+
+/// react-hook-form's `useForm()` / `useFormContext()`.
+///
+/// The library documents these as stable for the lifetime of the form, which
+/// is why its own docs show them omitted from deps arrays. Deliberately
+/// absent: `formState` (a Proxy that changes as the form does), `watch`'s
+/// *result*, and anything else — all ⊤.
+const REACT_HOOK_FORM_MEMBERS: &[(&str, SummaryValue)] = &[
+    ("register", SummaryValue::StableRef),
+    ("unregister", SummaryValue::StableRef),
+    ("setValue", SummaryValue::StableRef),
+    ("getValues", SummaryValue::StableRef),
+    ("getFieldState", SummaryValue::StableRef),
+    ("setError", SummaryValue::StableRef),
+    ("clearErrors", SummaryValue::StableRef),
+    ("setFocus", SummaryValue::StableRef),
+    ("resetField", SummaryValue::StableRef),
+    ("reset", SummaryValue::StableRef),
+    ("trigger", SummaryValue::StableRef),
+    ("handleSubmit", SummaryValue::StableRef),
+    ("watch", SummaryValue::StableRef),
+    ("control", SummaryValue::StableRef),
+];
+
+/// Next.js App Router `useRouter()` — the router object and its methods are
+/// documented stable, and apps omit them from deps for exactly that reason.
+const NEXT_ROUTER_MEMBERS: &[(&str, SummaryValue)] = &[
+    ("push", SummaryValue::StableRef),
+    ("replace", SummaryValue::StableRef),
+    ("refresh", SummaryValue::StableRef),
+    ("prefetch", SummaryValue::StableRef),
+    ("back", SummaryValue::StableRef),
+    ("forward", SummaryValue::StableRef),
+];
+
+/// SWR. `mutate` is bound to the key and stable; `data`, `error` and
+/// `isLoading` are the whole point of the hook changing, so they stay ⊤.
+const SWR_MEMBERS: &[(&str, SummaryValue)] = &[("mutate", SummaryValue::StableRef)];
 
 // ── Known library hook lists ──────────────────────────────────────────────────
 

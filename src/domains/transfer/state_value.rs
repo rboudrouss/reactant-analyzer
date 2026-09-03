@@ -187,6 +187,11 @@ fn summary_value(sv: &crate::ir::expr::SummaryValue) -> StateValue {
         crate::ir::expr::SummaryValue::Top => StateValue::top(),
         crate::ir::expr::SummaryValue::StableRef => StateValue::reference(Stability::Stable),
         crate::ir::expr::SummaryValue::UnstableRef => StateValue::reference(Stability::PerRender),
+        // The container carries no claim — the members do, and they are read
+        // off the heap by `eval_field_access`. Answering anything narrower
+        // here would credit the object itself with a stability the library
+        // only promises per member.
+        crate::ir::expr::SummaryValue::Shape { .. } => StateValue::top(),
     }
 }
 

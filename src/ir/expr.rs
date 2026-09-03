@@ -257,6 +257,22 @@ pub enum SummaryValue {
     StableRef,
     /// Hook returns a reference-unstable value (new object/array every render).
     UnstableRef,
+    /// Hook returns an object whose *named* members carry their own summaries.
+    ///
+    /// The contract libraries actually publish is per member, not per object:
+    /// `useForm()` guarantees `setValue` and `reset` are the same function at
+    /// every render while `formState` is a Proxy that is not. So the container
+    /// stays ⊤ — a member the list does not name answers ⊤ too, which is what
+    /// keeps an unlisted member from being credited with a stability nobody
+    /// promised.
+    ///
+    /// `id` is the allocation site the members are recorded at, minted per call
+    /// site when the marker is retagged, so two calls of one hook are two
+    /// objects (#134).
+    Shape {
+        id: ExprId,
+        members: Arc<Vec<(Symbol, SummaryValue)>>,
+    },
 }
 
 impl Expr {
