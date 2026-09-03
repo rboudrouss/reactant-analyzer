@@ -2231,7 +2231,7 @@ impl AnalysisResult<StateValue> {
     /// `SlotSeed` covers.
     ///
     /// The alias set is closed over **every** body, exactly as
-    /// [`collect_slot_writers`] closes it. Building it from the render CFG
+    /// `collect_slot_writers` closes it. Building it from the render CFG
     /// alone makes `const setter = setB` *inside* an effect read as an escape
     /// rather than as the alias chain it is, because the escape walk's
     /// chain exemption is `aliases.contains(var)`.
