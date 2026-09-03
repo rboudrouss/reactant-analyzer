@@ -135,9 +135,10 @@ jobs:
           fail-on: error         # warnings annotate the PR but don't fail it
 ```
 
-Point `path` at the **project root**, not at `src/`: the root is where the
-`vite.config` / `next.config` marker and the tsconfig aliases are found, and a
-run whose aliases never loaded cannot see through an aliased import.
+Narrowing `path` to a subdirectory is fine — the marker and tsconfig are looked
+up in the ancestors too, so the project's aliases still load — but the run then
+sees only what you named, and says so: every import that resolves outside it is
+listed by name on the last line.
 
 Inputs: `path`, `fail-on` (`error|warning|never`), `config`, `version` (npm
 version to run), `args` (extra `reactant check` flags). Outputs: `errors`,

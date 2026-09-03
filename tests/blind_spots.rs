@@ -24,6 +24,10 @@ fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
 /// The control: a run with nothing unread still gets the green tick. Without
 /// this the fix could "pass" by never claiming a clean bill at all.
 #[test]
@@ -85,6 +89,46 @@ fn no_components_detected_also_withholds_the_tick() {
     assert!(s.contains("no components detected"), "{s}");
     assert!(!s.contains("✓"), "{s}");
     assert!(s.contains("not analyzed:"), "{s}");
+}
+
+// ── Pointing inside a project (#9, the aggravating half) ─────────────────────
+
+/// `reactant check <project>/src` used to detect Plain: no aliases loaded *and*
+/// no warning, because the warning hangs off the Vite/Next arms. The marker is
+/// now looked up in the ancestors, so the run is a Vite run and the alias state
+/// is reported either way.
+#[test]
+fn pointing_inside_a_project_still_loads_its_aliases() {
+    let out = reactant(&["tests/fixtures/vite_project/src", "--verbose"]);
+    assert!(stderr(&out).contains("vite project:"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("tsconfig aliases loaded"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// The forced-kind warning uses the same walk, so it cannot claim a marker is
+/// missing that the resolver went on to find one level up.
+#[test]
+fn forcing_a_kind_from_inside_the_project_does_not_warn() {
+    let out = reactant(&["--project", "vite", "tests/fixtures/vite_project/src"]);
+    assert!(
+        !stderr(&out).contains("--project vite:"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// …but a tree with no marker anywhere above it still says so.
+#[test]
+fn forcing_a_kind_on_an_unmarked_tree_still_warns() {
+    let out = reactant(&["--project", "vite", "tests/fixtures/cross_file_hook"]);
+    assert!(
+        stderr(&out).contains("no vite.config.* found"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 /// Machine consumers get the same fact, keyed, without scraping prose.

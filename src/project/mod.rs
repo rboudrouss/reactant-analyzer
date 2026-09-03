@@ -66,6 +66,32 @@ pub fn detect(root: &Path, fs: &dyn FileSystem) -> ProjectKind {
     }
 }
 
+/// The nearest ancestor of `from` (itself included) carrying a build-tool
+/// marker, with the kind it carries.
+///
+/// A project's conventions do not stop applying when you point at one of its
+/// subdirectories: `reactant check src/features` is still a run inside that
+/// Vite project, and its `@/...` imports still resolve through the tsconfig at
+/// the root. Detecting only at the given path made the *narrowest* invocation
+/// the blindest one — no aliases loaded, and no warning either, because the
+/// warning hangs off the Vite/Next arms ([#9]).
+///
+/// The empty path is probed rather than skipped: `Path::new("src").parent()` is
+/// `""`, which is the working directory, and `reactant check src` from a
+/// project root is the common case this exists for.
+///
+/// [#9]: https://github.com/rboudrouss/reactant-analyzer/issues/9
+pub fn locate(from: &Path, fs: &dyn FileSystem) -> Option<(ProjectKind, PathBuf)> {
+    let mut cur = Some(from);
+    while let Some(dir) = cur {
+        match detect(dir, fs) {
+            ProjectKind::Plain => cur = dir.parent(),
+            kind => return Some((kind, dir.to_path_buf())),
+        }
+    }
+    None
+}
+
 /// Narrow discovery to `<root>/src` when the Next.js router lives there.
 ///
 /// Next supports both layouts, and only one of them is ever populated: with
@@ -107,18 +133,37 @@ pub fn build_context(
     forced: Option<ProjectKind>,
     fs: Arc<dyn FileSystem>,
 ) -> ProjectContext {
-    let kind = forced.unwrap_or_else(|| detect(root, fs.as_ref()));
-    let discovery_root = match kind {
-        ProjectKind::Plain => root.to_path_buf(),
-        ProjectKind::Vite => {
-            let src = root.join("src");
-            if fs.is_dir(&src) {
-                src
-            } else {
-                root.to_path_buf()
+    // Where the build-tool marker and the tsconfig live — walked upward, so
+    // pointing at a subdirectory still resolves the project's aliases (#9).
+    // `--project` names the kind, not the place, so a forced kind reuses the
+    // located root when there is one and falls back to `root` when there is
+    // not: that is what keeps `--project vite` working on an unmarked tree.
+    let located = locate(root, fs.as_ref());
+    let config_root = located
+        .as_ref()
+        .map(|(_, r)| r.clone())
+        .unwrap_or_else(|| root.to_path_buf());
+    let kind = forced.unwrap_or_else(|| located.map_or(ProjectKind::Plain, |(k, _)| k));
+
+    // Discovery walks what the user named. Narrowing to `<root>/src` is a
+    // convenience for "analyse this project" and applies only when the path
+    // given *is* the project root: pointing inside is already a narrowing, and
+    // widening it back out would analyse files nobody asked for.
+    let discovery_root = if config_root == *root {
+        match kind {
+            ProjectKind::Plain => root.to_path_buf(),
+            ProjectKind::Vite => {
+                let src = root.join("src");
+                if fs.is_dir(&src) {
+                    src
+                } else {
+                    root.to_path_buf()
+                }
             }
+            ProjectKind::NextJs => next_discovery_root(root, fs.as_ref()),
         }
-        ProjectKind::NextJs => next_discovery_root(root, fs.as_ref()),
+    } else {
+        root.to_path_buf()
     };
     if kind == ProjectKind::Plain {
         return ProjectContext {
@@ -133,7 +178,7 @@ pub fn build_context(
         ProjectKind::NextJs => "next.config",
         _ => "vite.config",
     };
-    match load_tsconfig_paths(root, fs.as_ref()) {
+    match load_tsconfig_paths(&config_root, fs.as_ref()) {
         // A patternless entry means the config declared only `baseUrl`. That
         // resolves bare specifiers (`import "lib/api"`, the Next scaffold
         // without `paths`), so it is a real resolver — but no `@/*` alias
@@ -286,6 +331,82 @@ mod tests {
             std::sync::Arc::new(crate::resolver::OsFileSystem),
         );
         assert!(ctx.alias_warning.is_none());
+    }
+
+    // ── Pointing inside a project (#9) ────────────────────────────────────────
+
+    /// The marker one level up is still this run's marker. Before the upward
+    /// walk, `reactant check src/features` detected Plain: no aliases loaded
+    /// *and* no warning, so the narrowest invocation was the blindest one.
+    #[test]
+    fn a_subdirectory_is_still_inside_its_project() {
+        let tmp = Tmp::new("inside");
+        tmp.write("vite.config.ts", "");
+        tmp.write(
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@/*": ["./src/*"] } } }"#,
+        );
+        tmp.write("src/features/Panel.tsx", "");
+        let ctx = build_context(
+            &tmp.path().join("src/features"),
+            None,
+            std::sync::Arc::new(crate::resolver::OsFileSystem),
+        );
+        assert_eq!(ctx.kind, ProjectKind::Vite);
+        assert!(ctx.alias_warning.is_none(), "{:?}", ctx.alias_warning);
+    }
+
+    /// …and the aliases it loaded are the project's, resolving against the
+    /// project root rather than the directory that was named.
+    #[test]
+    fn an_alias_resolves_against_the_project_root() {
+        let tmp = Tmp::new("inside-resolve");
+        tmp.write("vite.config.ts", "");
+        tmp.write(
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@/*": ["./src/*"] } } }"#,
+        );
+        let target = tmp.write("src/hooks/useThing.ts", "");
+        let from = tmp.write("src/features/Panel.tsx", "");
+        let ctx = build_context(
+            &tmp.path().join("src/features"),
+            None,
+            std::sync::Arc::new(crate::resolver::OsFileSystem),
+        );
+        assert_eq!(
+            ctx.resolver.resolve(&from, "@/hooks/useThing"),
+            Some(crate::resolver::normalize(&target))
+        );
+    }
+
+    /// Discovery still walks exactly what was named. Widening back out to
+    /// `<project>/src` would analyse files nobody asked for.
+    #[test]
+    fn pointing_inside_does_not_widen_discovery() {
+        let tmp = Tmp::new("inside-narrow");
+        tmp.write("vite.config.ts", "");
+        tmp.write("src/features/Panel.tsx", "");
+        let given = tmp.path().join("src/features");
+        let ctx = build_context(
+            &given,
+            None,
+            std::sync::Arc::new(crate::resolver::OsFileSystem),
+        );
+        assert_eq!(ctx.discovery_root, given);
+    }
+
+    /// A tree with no marker anywhere above it is still Plain — the walk must
+    /// not invent a project out of the filesystem root.
+    #[test]
+    fn no_marker_anywhere_above_is_still_plain() {
+        let tmp = Tmp::new("inside-plain");
+        tmp.write("src/features/Panel.tsx", "");
+        let ctx = build_context(
+            &tmp.path().join("src/features"),
+            None,
+            std::sync::Arc::new(crate::resolver::OsFileSystem),
+        );
+        assert_eq!(ctx.kind, ProjectKind::Plain);
     }
 
     #[test]

@@ -130,10 +130,21 @@ there deliberately will not be (ADR-023 §4).
 
 ## Project kinds
 
-`check` inspects the first directory argument (default `.`) for marker
-files. Other path arguments are discovered as-is with the same resolver.
-Next.js is tested before Vite: a Next app may keep a `vite.config.*` for its
-test runner, and the router conventions are the ones that govern the sources.
+`check` looks for marker files at the first directory argument (default `.`)
+**and then at each of its ancestors**, stopping at the first one that has them.
+A project's conventions do not stop applying when you point at one of its
+subdirectories: `reactant check src/features` is still a run inside that Vite
+project, and its `@/...` imports still resolve through the tsconfig at the root.
+Other path arguments are discovered as-is with the same resolver. Next.js is
+tested before Vite: a Next app may keep a `vite.config.*` for its test runner,
+and the router conventions are the ones that govern the sources.
+
+Discovery still walks exactly the directories you named. The `<root>/src`
+narrowing below is a convenience for "analyse this project" and applies only
+when the path you gave *is* the project root — pointing inside is already a
+narrowing, and widening it back out would analyse files nobody asked for. The
+imports that then resolve outside what you named are reported as
+[blind spots](#the-last-line-and-when-it-is-withheld), by name.
 
 ### Next.js (`next.config.{ts,js,mjs,cjs,mts}` present)
 

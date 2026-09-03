@@ -34,7 +34,7 @@ shapes, do not trust a clean result for it.**
 | A concise arrow component/hook (`const C = () => <div/>`) | The component or hook disappears | [#5](https://github.com/rboudrouss/reactant-analyzer/issues/5) |
 | A pack rule anchored on `kind: "custom"` | Sees only hooks the engine could *not* resolve | [#6](https://github.com/rboudrouss/reactant-analyzer/issues/6) |
 | Two components with the same name | One finding reported twice, wrong body inlined, counts inflated | [#7](https://github.com/rboudrouss/reactant-analyzer/issues/7) |
-| An import alias pointing outside the discovery root | Resolved, then never read — the run now says so on its last line, but the code is still not analysed | [#9](https://github.com/rboudrouss/reactant-analyzer/issues/9) |
+| An import alias pointing outside the analysed set | Resolved, then never read — the run names the files on its last line, but the code is still not analysed | [#9](https://github.com/rboudrouss/reactant-analyzer/issues/9) |
 
 **How to tell.** Every shape above is a run that reads clean while a bug goes
 unseen, so the summary line is the thing to read. A run that read everything it

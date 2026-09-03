@@ -121,9 +121,11 @@ pub fn run_check(
         ProjectOverride::Plain => Some(ProjectKind::Plain),
     };
     // Forcing a build-tool kind whose marker file is absent is honored (the
-    // tsconfig aliases are usually still right) but said out loud.
+    // tsconfig aliases are usually still right) but said out loud. Uses the
+    // same upward walk `build_context` does, so the warning cannot claim a
+    // marker is missing that the resolver went on to find one level up.
     if let Some(kind @ (ProjectKind::Vite | ProjectKind::NextJs)) = forced
-        && project::detect(&project_root, fs.as_ref()) != kind
+        && project::locate(&project_root, fs.as_ref()).map(|(k, _)| k) != Some(kind)
     {
         let (flag, marker) = match kind {
             ProjectKind::NextJs => ("next", "next.config.*"),
