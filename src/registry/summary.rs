@@ -93,6 +93,16 @@ impl SummaryRegistry {
             "@mantine/form",
             Box::new(ShapeSummary("useForm", MANTINE_FORM_MEMBERS)),
         );
+        // jotai. The setter slot of `useAtom`'s tuple, and the setter
+        // `useSetAtom` returns outright — both documented stable for the
+        // lifetime of the atom, which is why jotai's own docs omit them from
+        // deps arrays. `useAtomValue` is the value and gets no claim.
+        r.register_for_package(
+            "jotai",
+            Box::new(ShapeSummary("useAtom", JOTAI_ATOM_MEMBERS)),
+        );
+        r.register_for_package("jotai", Box::new(StableRefSummary("useSetAtom")));
+        r.register_many_for_package("jotai", &["useAtomValue", "useStore"]);
         // Known, and nothing more. `useDebouncedCallback` is documented to
         // return a memoized callback, but the corpus offers one site to check
         // it against — not enough to write down a stability claim, and a claim
@@ -176,6 +186,18 @@ impl HookSummary for StrTopSummary {
     }
 }
 
+/// A hook whose return is a reference-stable value.
+struct StableRefSummary(&'static str);
+
+impl HookSummary for StableRefSummary {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn summarize(&self, _args: &[StateValue]) -> StateValue {
+        StateValue::reference(crate::domains::impls::Stability::Stable)
+    }
+}
+
 /// A hook whose return object has a published per-member contract.
 ///
 /// The container itself stays ⊤: what these libraries document is that certain
@@ -238,6 +260,17 @@ const NEXT_ROUTER_MEMBERS: &[(&str, SummaryValue)] = &[
 /// `createFormContext()` builds are user-named and cannot be keyed here at all.
 const MANTINE_FORM_MEMBERS: &[(&str, SummaryValue)] =
     &[("onSubmit", SummaryValue::Wrapper { stable: false })];
+
+/// jotai's `useAtom(atom)` → `[value, setValue]`.
+///
+/// A **tuple** contract, keyed by position: array destructuring lowers to an
+/// indexed read, so `"1"` names the setter slot the way `"setValue"` names a
+/// member (#37). Position `0` is the atom's value and is deliberately absent —
+/// changing is what an atom is for.
+///
+/// `useSetAtom` returns the setter directly and is a plain `StableRef` below;
+/// `useAtomValue` returns the value and stays ⊤.
+const JOTAI_ATOM_MEMBERS: &[(&str, SummaryValue)] = &[("1", SummaryValue::StableRef)];
 
 /// SWR. `mutate` is bound to the key and stable; `data`, `error` and
 /// `isLoading` are the whole point of the hook changing, so they stay ⊤.

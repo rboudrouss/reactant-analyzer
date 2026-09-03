@@ -818,3 +818,113 @@ fn an_unlisted_mantine_member_does_not_defer_its_argument() {
         "only `onSubmit` carries the wrapper contract: {fired:?}"
     );
 }
+
+// ── #37 — a tuple contract is keyed by position ──────────────────────────────
+
+/// jotai's `useAtom` returns `[value, setValue]`. Array destructuring lowers to
+/// an indexed read, so position `"1"` names the setter slot the way a member
+/// name does — and every indexed read used to be ⊤.
+#[test]
+fn a_jotai_setter_slot_is_stable() {
+    let fired = rules_fired(
+        r#"
+        import { useAtom } from "jotai";
+        const a = {};
+        function C() {
+          const [count, setCount] = useAtom(a);
+          useEffect(() => { setCount(1); }, []);
+          return <div>{count}</div>;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        !fired.iter().any(|r| r == "missing-deps"),
+        "the setter slot is stable: {fired:?}"
+    );
+}
+
+/// Position 0 is the atom's value, and changing is what an atom is for.
+#[test]
+fn a_jotai_value_slot_is_not_stable() {
+    let fired = rules_fired(
+        r#"
+        import { useAtom } from "jotai";
+        const a = {};
+        function C() {
+          const [count, setCount] = useAtom(a);
+          useEffect(() => { console.log(count); }, []);
+          return <div/>;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        fired.iter().any(|r| r == "missing-deps"),
+        "position 0 carries no claim: {fired:?}"
+    );
+}
+
+/// A position the table does not name answers ⊤, exactly as an unlisted member
+/// does.
+#[test]
+fn an_unlisted_tuple_position_is_top() {
+    let fired = rules_fired(
+        r#"
+        import { useAtom } from "jotai";
+        const a = {};
+        function C() {
+          const t = useAtom(a);
+          useEffect(() => { t[2](); }, []);
+          return <div/>;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        fired.iter().any(|r| r == "missing-deps"),
+        "nobody promised position 2: {fired:?}"
+    );
+}
+
+/// The indexed read is only a member read for a *constant* index. Which element
+/// `xs[i]` denotes is a different question, and stays ⊤.
+#[test]
+fn an_ordinary_array_element_is_still_top() {
+    let fired = rules_fired(
+        r#"
+        import { useState } from "react";
+        function C() {
+          const [x] = useState(() => [() => {}]);
+          useEffect(() => { x[0](); }, []);
+          return <div/>;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        fired.iter().any(|r| r == "missing-deps"),
+        "a plain array element carries no contract: {fired:?}"
+    );
+}
+
+/// `useSetAtom` hands back the setter directly.
+#[test]
+fn use_set_atom_is_stable() {
+    let fired = rules_fired(
+        r#"
+        import { useSetAtom } from "jotai";
+        const a = {};
+        function C() {
+          const setCount = useSetAtom(a);
+          useEffect(() => { setCount(1); }, []);
+          return <div/>;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        !fired.iter().any(|r| r == "missing-deps"),
+        "`useSetAtom` returns a stable setter: {fired:?}"
+    );
+}

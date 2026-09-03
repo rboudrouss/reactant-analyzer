@@ -172,7 +172,7 @@ fn eval_state_value(
         Expr::Call { .. } => StateValue::top(),
 
         Expr::FieldAccess { obj, field } => eval_field_access(obj, field, env, ctx),
-        Expr::IndexAccess { .. } => StateValue::top(),
+        Expr::IndexAccess { arr, idx } => eval_index_access(arr, idx, env, ctx),
 
         Expr::TSAnnotated(inner) => eval_state_value(inner, env, ctx),
 
@@ -590,6 +590,29 @@ fn eval_field_access(
     StateValue {
         reference: obj_val.versioned_reference().unwrap_or(Stability::Unknown),
         ..StateValue::top()
+    }
+}
+
+/// A **constant** index is a member read, and the heap answers it exactly as it
+/// answers a named one.
+///
+/// Array destructuring lowers to `IndexAccess` with a literal index — `const
+/// [value, setValue] = useAtom(a)` becomes `__arr[0]` / `__arr[1]` — so a
+/// tuple-returning hook's per-slot contract becomes reachable through the same
+/// per-member map a named member already uses (#37). Before this, every indexed
+/// read was ⊤, which is why jotai's setter looked unstable.
+///
+/// A non-constant index stays ⊤: which element `xs[i]` denotes is #76's
+/// question, not this one. A negative index is not a member either.
+fn eval_index_access(
+    arr: &Expr,
+    idx: &Expr,
+    env: &AbstractEnv<StateValue>,
+    ctx: &mut AnalysisCtx<StateValue>,
+) -> StateValue {
+    match idx.peel_ts() {
+        Expr::Lit(Prim::Int(i)) if *i >= 0 => eval_field_access(arr, &i.to_string(), env, ctx),
+        _ => StateValue::top(),
     }
 }
 
