@@ -336,6 +336,68 @@ pub(crate) fn collect_component_setter_vars(
     result
 }
 
+/// Does `var` still denote a component setter **at this call**?
+///
+/// [`collect_component_setter_vars`] is an existential over program points: it
+/// answers "somewhere in this body, `var` held a parent's setter". For a *call
+/// site* that is the wrong question, and the gap is not academic — a variable
+/// reassigned to a plain function before the call was still reported as a write
+/// into the parent's slot, at **Error** (#119):
+///
+/// ```jsx
+/// let f = () => {};
+/// if (cond) { f = onUpdate; }
+/// f = () => {};   // at the call below, `f` is definitely not the setter
+/// f();            // reported as a cross-component write anyway
+/// ```
+///
+/// **The abstract env cannot answer this.** At the call block of
+/// `if (cond) { f = onUpdate; } f();` the env holds the *join* of the arrow and
+/// the setter, and that join drops setter-ness — which is precisely why the
+/// existential map exists. So "the env says non-setter" is not a proof; it is
+/// what a lossy join looks like, and refuting on it deletes true findings.
+///
+/// What *is* a proof is local and syntactic: an assignment to `var`, in this
+/// same block, textually before the call, whose right-hand side is a function
+/// literal that mentions no setter. It dominates the call trivially, no
+/// dataflow needed, and it is the only shape this refutes.
+pub(crate) fn setter_reassigned_before_call(
+    block: &crate::ir::cfg::BasicBlock,
+    var: &Var,
+    call_span: Option<SourceRange>,
+    setter_vars: &HashSet<Var>,
+) -> bool {
+    let mut refuted = false;
+    for stmt in &block.stmts {
+        // Stop at the call itself: what happens after it cannot refute it.
+        if let Stmt::ExprStmt(_, span) = stmt
+            && call_span.is_some()
+            && *span == call_span
+        {
+            break;
+        }
+        let (Stmt::Assign { var: v, rhs, .. } | Stmt::Let { var: v, rhs, .. }) = stmt else {
+            continue;
+        };
+        if v != var {
+            continue;
+        }
+        // Only a function literal that mentions no setter refutes. Anything
+        // else — another setter, an opaque call, a name this walk cannot see
+        // through — puts the variable back to unknown, and unknown keeps the
+        // existential.
+        refuted = match rhs.peel_ts() {
+            Expr::FnLit { body_cfg, .. } => {
+                let mut used: HashSet<Var> = HashSet::new();
+                body_cfg.for_each_expr(&mut |e| collect_used_vars(e, &mut used));
+                setter_vars.iter().all(|s| !used.contains(s))
+            }
+            _ => false,
+        };
+    }
+    refuted
+}
+
 /// Does calling this function body write `setter`, in the body's own pass?
 ///
 /// The distinction a capture alone cannot make: `() => setCount(0)` calls what

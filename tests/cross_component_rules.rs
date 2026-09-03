@@ -373,3 +373,94 @@ fn recursive_component_emits_info() {
         "all analysis-limit diags must be Info"
     );
 }
+
+// ── #119 — the owner is read at the call site, not somewhere in the body ─────
+
+fn child_rules(src: &str) -> Vec<String> {
+    let result = parse_and_analyze(src);
+    let child = "Child".to_string();
+    assert!(result.components.contains_key(&child), "Child not analyzed");
+    SetterInRender
+        .check(&RuleCtx::new(&result, &child))
+        .into_iter()
+        .map(|d| d.rule.to_string())
+        .collect()
+}
+
+/// The existential over block envs said "somewhere in this body `f` held the
+/// parent's setter", and every call of `f` inherited that — including calls
+/// after `f` was reassigned to a plain function. That reached **Error**.
+#[test]
+fn a_reassigned_prop_is_not_a_cross_component_write() {
+    let r = child_rules(
+        r#"
+        import { useState } from "react";
+        function Child({ onUpdate, cond }) {
+          let f = () => {};
+          if (cond) { f = onUpdate; }
+          f = () => {};
+          f();
+          return <div/>;
+        }
+        export function Parent() {
+          const [n, setN] = useState(0);
+          return <Child onUpdate={setN} cond={true} />;
+        }
+        "#,
+    );
+    assert!(
+        !r.iter().any(|x| x == "cross-setter-in-render"),
+        "`f` is a plain arrow at the call: {r:?}"
+    );
+}
+
+/// The other side, and the reason the abstract env cannot answer this: at the
+/// call block the env holds the *join* of the arrow and the setter, and that
+/// join drops setter-ness. Refuting on the env would delete this true finding.
+#[test]
+fn a_conditionally_assigned_prop_still_fires() {
+    let r = child_rules(
+        r#"
+        import { useState } from "react";
+        function Child({ onUpdate, cond }) {
+          let f = () => {};
+          if (cond) { f = onUpdate; }
+          f();
+          return <div/>;
+        }
+        export function Parent() {
+          const [n, setN] = useState(0);
+          return <Child onUpdate={setN} cond={true} />;
+        }
+        "#,
+    );
+    assert!(
+        r.iter().any(|x| x == "cross-setter-in-render"),
+        "on the `cond` path this really does write the parent's slot: {r:?}"
+    );
+}
+
+/// A reassignment whose right-hand side *mentions* a setter refutes nothing.
+#[test]
+fn a_reassignment_that_still_reaches_the_setter_fires() {
+    let r = child_rules(
+        r#"
+        import { useState } from "react";
+        function Child({ onUpdate, cond }) {
+          let f = () => {};
+          if (cond) { f = onUpdate; }
+          f = () => { onUpdate(1); };
+          f();
+          return <div/>;
+        }
+        export function Parent() {
+          const [n, setN] = useState(0);
+          return <Child onUpdate={setN} cond={true} />;
+        }
+        "#,
+    );
+    assert!(
+        r.iter().any(|x| x == "cross-setter-in-render"),
+        "the new body calls the setter: {r:?}"
+    );
+}

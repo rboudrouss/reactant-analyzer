@@ -50,7 +50,7 @@ pub(crate) use helpers::setters::{
     state_val_labels,
 };
 pub(in crate::rules) use helpers::setters::{
-    collect_fn_bindings, cross_component_setters, may_written_slots,
+    collect_fn_bindings, cross_component_setters, may_written_slots, setter_reassigned_before_call,
 };
 pub(crate) use helpers::{
     ConvergedEval, arg_is_call_free, collect_callees, describe_value, eval_in_stores,

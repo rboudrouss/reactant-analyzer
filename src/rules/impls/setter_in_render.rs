@@ -118,6 +118,31 @@ impl Rule for SetterInRender {
                 if !call.class.may_run_in_body() {
                     return None;
                 }
+                // The cross-component map is an existential over program
+                // points; this call site is a program point (#119). Where the
+                // name is *only* a parent's setter by that existential — no
+                // local setter binds it — and this same block reassigns it to
+                // a function mentioning no setter before the call, there is no
+                // write here to report, and the row was reaching Error.
+                //
+                // Deliberately syntactic: the abstract env cannot answer this.
+                // At the call block of `if (c) { f = onUpdate; } f()` the env
+                // holds the join of the arrow and the setter, and that join
+                // drops setter-ness — so refuting on the env would delete the
+                // true finding along with the false one.
+                if cs_vars.contains_key(&call.var)
+                    && !local_setter_info.contains_key(&call.var)
+                    && let Some(bid) = call.block_id
+                    && let Some(block) = comp_result.render_cfg.blocks.get(&bid)
+                    && crate::rules::setter_reassigned_before_call(
+                        block,
+                        &call.var,
+                        call.span,
+                        &all_setter_vars,
+                    )
+                {
+                    return None;
+                }
                 // Unconditional call ⟹ a `Certified` proof — the only path to
                 // Error, and it takes two musts. The phase must be `Sync`: a ⊤
                 // row is never certain, whatever block it sits in, because the
