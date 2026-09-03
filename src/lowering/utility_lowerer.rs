@@ -10,10 +10,7 @@ use oxc_ast::ast::Program;
 
 use crate::{
     ir::{FileTable, FunctionIR, SourceMap},
-    lowering::{
-        cfg_builder::{ExprIds, build_fn_body_cfg},
-        utility_detector::detect_utilities,
-    },
+    lowering::{cfg_builder::ExprIds, utility_detector::detect_utilities},
     resolver::{DefaultImportResolver, ImportResolver},
 };
 
@@ -51,8 +48,7 @@ pub fn lower_utilities_with_resolver(
     detect_utilities(program)
         .into_iter()
         .map(|candidate| {
-            let (params, body_cfg) =
-                build_fn_body_cfg(candidate.params, candidate.body, &smap, &expr_ids);
+            let (params, body_cfg) = candidate.build_cfg(&smap, &expr_ids);
             FunctionIR {
                 file: file.to_path_buf(),
                 name: candidate.name,

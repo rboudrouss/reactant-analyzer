@@ -64,12 +64,39 @@ pub(crate) fn is_hook_name(name: &str) -> bool {
 /// A top-level function picked out by one of the detectors, ready for lowering:
 /// its binding name, parameter list, and body. Shared by the component, hook,
 /// and utility detectors — they differ in how they *classify* a function, not
-/// in this output shape (all three feed `build_fn_body_cfg(params, body)`).
+/// in this output shape (all three feed `Candidate::build_cfg`).
 #[derive(Debug)]
 pub struct Candidate<'a> {
     pub name: String,
     pub params: &'a FormalParameters<'a>,
     pub body: &'a FunctionBody<'a>,
+    /// `true` for a concise arrow (`x => expr`), whose body oxc stores as a
+    /// single `ExpressionStatement` indistinguishable from `x => { expr; }`.
+    /// The difference is the whole return value, so it has to travel with the
+    /// body: lowered as a statement, `const useThing = () => useState(0)`
+    /// returns unit, and every consumer of `useThing` is left with an
+    /// unresolvable hook (#5).
+    pub expression: bool,
+}
+
+impl Candidate<'_> {
+    /// Lower this candidate's body to a CFG, honouring a concise arrow's
+    /// implicit return.
+    ///
+    /// The single place that dispatch happens, so a new consumer of
+    /// [`Candidate`] cannot forget it — which is how the flag came to be
+    /// dropped in the first place.
+    pub(crate) fn build_cfg(
+        &self,
+        smap: &crate::ir::SourceMap,
+        ids: &cfg_builder::ExprIds,
+    ) -> (Vec<String>, crate::ir::cfg::CFG) {
+        if self.expression {
+            cfg_builder::build_expr_fn_body_cfg(self.params, self.body, smap, ids)
+        } else {
+            cfg_builder::build_fn_body_cfg(self.params, self.body, smap, ids)
+        }
+    }
 }
 
 /// Local names bound to the `react` module itself: `import React from
@@ -306,8 +333,7 @@ pub fn lower_custom_hooks_with_resolver(
     candidates
         .into_iter()
         .map(|candidate| {
-            let (params, mut body_cfg) =
-                build_fn_body_cfg(candidate.params, candidate.body, &smap, &expr_ids);
+            let (params, mut body_cfg) = candidate.build_cfg(&smap, &expr_ids);
             let (mut hooks, hook_provenance, mut next_label) =
                 extract_hooks(&mut body_cfg, &imports);
             extract_handlers(&body_cfg, &mut hooks, &mut next_label);
@@ -371,8 +397,7 @@ pub fn lower_program_with_resolver(
     detect_components(program)
         .into_iter()
         .map(|candidate| {
-            let (param_names, mut render_cfg) =
-                build_fn_body_cfg(candidate.params, candidate.body, &smap, &expr_ids);
+            let (param_names, mut render_cfg) = candidate.build_cfg(&smap, &expr_ids);
             let (mut hooks, hook_provenance, mut next_label) =
                 extract_hooks(&mut render_cfg, &imports);
             extract_handlers(&render_cfg, &mut hooks, &mut next_label);

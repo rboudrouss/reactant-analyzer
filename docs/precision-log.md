@@ -751,3 +751,65 @@ laissées telles quelles et marquées, plutôt que présentées comme contrôlé
 réconcilient pas. Un point d'arrivée se compte ; il ne se déduit jamais d'un
 delta. Automatiser cela dans la CI est
 [#15](https://github.com/rboudrouss/reactant-analyzer/issues/15).
+
+## #4 + #5 — un hook dans un terminateur, un corps concis (2026-09-04)
+
+`1 314 → 1 340` (+26 : 10 retirés, 36 ajoutés), mesuré avec
+[`corpus-diff.py`](../scripts/corpus-diff.py) sur les deux exécutions complètes.
+**La première entrée de ce journal dont le solde est positif** : les deux
+correctifs rendent visible du code qui ne l'était pas, donc ils ajoutent des
+constats plus qu'ils n'en retirent.
+
+### Pourquoi une seule entrée pour deux issues
+
+#5 seul est une **régression de soundness**, et il a failli être livré tel quel.
+`Candidate` perdait le drapeau `expression` de la flèche, donc un corps concis
+se lowerait en instruction et la fonction retournait `unit`. Le corriger route
+ces corps vers `Terminator::Return` — précisément l'angle mort de #4, puisque
+`extract_hooks` ne parcourt que `block.stmts`. Résultat mesuré sur
+`const useLocal = (x) => useMystery(x)` :
+
+| | avant | après #5 seul |
+|---|---|---|
+| `analysis-limit` | émis | **disparu** |
+| assurances | 4 suspendues | **4 délivrées** |
+
+Un « je ne sais pas » honnête devenu quatre garanties non acquises : la
+direction interdite. #4 devait passer devant.
+
+### Les retraits sont des FP, relus à la source
+
+Le plus instructif, `useStepBar.ts:45` de twenty, enchaîne trois correctifs :
+
+```ts
+export const useAtomState = (state) => { return useAtom(state.atom); };   // #4
+const setStep = useCallback(..., [setStepBarInternal]);
+useEffect(() => { setStep(initialStep); }, []);   // ← `setStep` manquant, disait-on
+```
+
+Le hoist de #4 extrait `useAtom`, le résumé jotai ajouté pour
+[#37](https://github.com/rboudrouss/reactant-analyzer/issues/37) prouve que
+l'élément 1 du tuple est stable, donc `setStep` est stable, donc son absence des
+deps est correcte. Le constat était un vrai faux positif.
+
+### Ce que les ajouts ne sont pas
+
+**Non triés.** 25 `missing-deps`, 9 `always-unstable-deps`, 2
+`redundant-set-state`. Deux ont été relus et sont vrais (`addCartItem` de
+commerce est bien une flèche fraîche à chaque rendu ; les `setValue` de
+react-hook-form sont bien stables). Les 34 autres ne sont pas caractérisés — ils
+sont dans la direction tolérée par l'invariant du projet, pas dans la direction
+interdite, et méritent une passe de triage comme les grappes de l'`AUDIT`.
+
+### Le coût connu : 25 constats sans position
+
+`Terminator::Return` ne porte pas de span, là où `Terminator::Branch` en porte
+un. Personne n'en avait besoin tant qu'aucun hook ne sortait d'un `return`. Le
+`Stmt::Let` synthétisé par le hoist hérite donc de `span: None`, et les constats
+ancrés dessus n'ont ni ligne ni colonne — 0 avant, 25 après, sur 8 941 lignes.
+
+Ce n'est pas un défaut créé ici mais un trou de l'IR **révélé** ici, et l'échange
+est favorable : ces hooks étaient auparavant *absents*, pas mal situés. Passer de
+« silencieusement manquant » à « signalé sans ligne » va dans le bon sens. La
+correction propre est un span sur `Terminator::Return`, 40 sites de compilation,
+suivie séparément.

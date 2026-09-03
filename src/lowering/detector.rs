@@ -21,6 +21,9 @@ pub(crate) struct FnItem<'a> {
     pub params: &'a FormalParameters<'a>,
     pub body: &'a FunctionBody<'a>,
     pub return_type: Option<&'a TSTypeAnnotation<'a>>,
+    /// `true` for a concise arrow body (`x => expr`) — see
+    /// [`Candidate::expression`](crate::lowering::Candidate::expression).
+    pub expression: bool,
 }
 
 /// Predicate deciding whether a walked function is a candidate of this kind.
@@ -124,6 +127,8 @@ pub(crate) fn consider_fn<'a>(
             params: &func.params,
             body,
             return_type: func.return_type.as_deref().or(extra_type_ann),
+            // A `function` never has a concise body.
+            expression: false,
         },
         classify,
         out,
@@ -145,6 +150,7 @@ pub(crate) fn consider_arrow<'a>(
             params: &arrow.params,
             body: &arrow.body,
             return_type: arrow.return_type.as_deref().or(extra_type_ann),
+            expression: arrow.expression,
         },
         classify,
         out,
@@ -157,6 +163,7 @@ fn push_if<'a>(item: FnItem<'a>, classify: Classify, out: &mut Vec<Candidate<'a>
             name: item.name.to_owned(),
             params: item.params,
             body: item.body,
+            expression: item.expression,
         });
     }
 }

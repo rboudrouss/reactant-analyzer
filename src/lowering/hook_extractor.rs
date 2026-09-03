@@ -277,6 +277,8 @@ pub fn extract_hooks(
 
     // Collected up front because the loop takes `&mut cfg.blocks` — the ids
     // already come out in order (`CFG::blocks` is a `BTreeMap`).
+    hoist_terminator_hooks(cfg, imports);
+
     let ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
 
     for id in ids {
@@ -299,6 +301,60 @@ pub fn extract_hooks(
     }
 
     (hooks, provenance, label)
+}
+
+/// Move a hook call out of a terminator and into a statement (#4).
+///
+/// The extractor below rewrites `block.stmts` and never looks at terminators,
+/// so a hook reached only through `return useThing()` or `if (useThing())`
+/// produced no [`HookEntry`] at all: the component reported zero hooks and
+/// every rule passed it in silence. Teaching the extractor to also walk
+/// terminators would mean duplicating its destructuring, labelling and
+/// marker-rewriting over a second position, so the CFG is normalised instead —
+/// the expression is bound to a temp in the block's statement list and the
+/// terminator reads that temp. What the extractor then sees is an ordinary
+/// `Let`, and nothing downstream has to know this happened.
+///
+/// Statements run before the terminator, so appending is the correct place.
+/// Only bodies that actually put a hook there are touched; the common CFG is
+/// returned unchanged.
+fn hoist_terminator_hooks(cfg: &mut CFG, imports: &ImportCtx<'_>) {
+    let ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
+    for id in ids {
+        let block = cfg.blocks.get_mut(&id).unwrap();
+        let (expr, span) = match &mut block.term {
+            Terminator::Return(e) => (e, None),
+            Terminator::Branch { cond, span, .. } => (cond, *span),
+            Terminator::Jump(_) | Terminator::Unreachable => continue,
+        };
+        if !contains_hook_call(expr, imports) {
+            continue;
+        }
+        let var = format!("__term_{id}");
+        let hoisted = std::mem::replace(expr, Expr::Var(var.clone()));
+        block.stmts.push(Stmt::Let {
+            var,
+            rhs: hoisted,
+            span,
+        });
+    }
+}
+
+/// Does this expression call a hook anywhere inside it?
+///
+/// Deliberately a *containment* test rather than "is a hook call": the whole
+/// expression is what gets hoisted, so `return cond ? useA() : useB()` moves as
+/// one piece and keeps its meaning. Conditional hook calls are the point of
+/// `conditional-hook`, and it cannot fire on a hook nobody extracted.
+fn contains_hook_call(expr: &Expr, imports: &ImportCtx<'_>) -> bool {
+    if let Expr::Call { fn_, .. } = expr
+        && imports.classify_callee(fn_).is_some()
+    {
+        return true;
+    }
+    let mut found = false;
+    expr.for_each_child(&mut |child| found |= contains_hook_call(child, imports));
+    found
 }
 
 fn process_stmt(

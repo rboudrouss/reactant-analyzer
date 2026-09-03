@@ -30,8 +30,8 @@ shapes, do not trust a clean result for it.**
 | Shape in your code | Effect | Issue |
 |---|---|---|
 | `try` whose body returns unconditionally | The whole `catch`/`finally` vanishes | [#2](https://github.com/rboudrouss/reactant-analyzer/issues/2) |
-| A hook called in `return` or in a branch condition | The component reports zero hooks | [#4](https://github.com/rboudrouss/reactant-analyzer/issues/4) |
-| A concise arrow component/hook (`const C = () => <div/>`) | The component or hook disappears | [#5](https://github.com/rboudrouss/reactant-analyzer/issues/5) |
+| A hook called inside *returned JSX* (`return <div>{useThing()}</div>`) | Hoisted out of the terminator but not classified, so it yields no hook entry | [#4](https://github.com/rboudrouss/reactant-analyzer/issues/4) |
+| A hook reached only through a `return` | Reported, but with no line or column — `Terminator::Return` carries no span | [#140](https://github.com/rboudrouss/reactant-analyzer/issues/140) |
 | A pack rule anchored on `kind: "custom"` | Sees only hooks the engine could *not* resolve | [#6](https://github.com/rboudrouss/reactant-analyzer/issues/6) |
 | Two components with the same name | One finding reported twice, wrong body inlined, counts inflated | [#7](https://github.com/rboudrouss/reactant-analyzer/issues/7) |
 | An import alias pointing outside the analysed set | Resolved, then never read — the run names the files on its last line, but the code is still not analysed | [#9](https://github.com/rboudrouss/reactant-analyzer/issues/9) |

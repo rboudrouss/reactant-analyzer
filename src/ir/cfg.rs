@@ -20,6 +20,12 @@ pub enum Terminator {
         /// synthetic branches and manual-IR tests).
         span: Option<crate::ir::SourceRange>,
     },
+    /// Unlike [`Terminator::Branch`], this carries no span: nothing needed the
+    /// position of a `return` until a hook could be extracted from one (#4),
+    /// and adding it now is a 40-site IR change tracked separately. The cost is
+    /// that a hook reached only through a return yields findings with no line
+    /// number — visible but unlocated, which is still strictly better than the
+    /// silence it replaced.
     Return(Expr),
     Unreachable,
 }
