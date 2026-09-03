@@ -148,14 +148,21 @@ Every entry here is Warning-or-below by construction: an FP never carries an Err
   firing. `formState`, `data` and `error` are excluded on purpose — they are what those hooks
   exist to change [precision-log](precision-log.md#2026-09-03--un-contrat-de-bibliothèque-porte-sur-les-membres).
 - **`setter-in-render`** warns when a setter reaches a callee with no timing summary
-  (`composeEventHandlers(a, cb)`, `@mantine/form`'s `form.onSubmit(cb)`): ⊤ includes the render
+  (`composeEventHandlers(a, cb)`, `@mantine/form`'s `form.watch(path, cb)`): ⊤ includes the render
   pass, so the row is sound and the wording says so — it never claims the setter was called in the
-  render body, and it never reaches Error. react-hook-form's `handleSubmit` is narrowed because a
-  member of a `useForm()` return is a *contract*; a bare name would be a guess, and ADR-034 §2
-  allows narrowing off ⊤ only on the first. Three things keep it ⊤ deliberately: a library with no
-  table, a handler this body invokes itself, and a name bound more than once — two forms inlined
-  into one render body leave no way to say whose `handleSubmit` a call means
-  [#94](https://github.com/rboudrouss/reactant-analyzer/issues/94).
+  render body, and it never reaches Error. react-hook-form's `handleSubmit` and `@mantine/form`'s
+  `onSubmit` are narrowed because a member of a `useForm()` return is a *contract*; a bare name
+  would be a guess, and ADR-034 §2 allows narrowing off ⊤ only on the first. Three things keep it ⊤
+  deliberately: a library with no table, a handler this body invokes itself, and a name bound more
+  than once — two forms inlined into one render body leave no way to say whose `handleSubmit` a call
+  means [#94](https://github.com/rboudrouss/reactant-analyzer/issues/94).
+- **Being a wrapper and being stable are two claims, and a table entry says them separately.**
+  react-hook-form's `handleSubmit` is `useCallback`-backed; `@mantine/form`'s `onSubmit` is
+  `(handler) => (event) => …`, rebuilt on every render. Both wrap, only one is stable, and the
+  mantine entry says so — a wrapper claim never buys a member a stability nobody promised
+  [precision-log](precision-log.md#2026-09-03--un-emballeur-nest-pas-forcément-stable).
+  The context hooks `@mantine/form`'s `createFormContext()` builds are user-named, so they cannot be
+  keyed by package + hook name and get no table at all.
 - **The assurance channel** (`verified:` lines under `--info`) is withheld per component rather than
   per (limit kind, check), so an unanalysed *child* costs the parent guarantees about its own body
   [#31](https://github.com/rboudrouss/reactant-analyzer/issues/31). This affects `--info` output only — never a diagnostic,

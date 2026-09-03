@@ -176,6 +176,16 @@ dépendance tracée jusqu'à sa définition est bien une allocation fraîche, et
 règle exige une preuve (⊤ ne déclenche rien). Les FP restants sont dans les
 petits amas.
 
+Les deux amas jamais triés l'ont été le 2026-09-03
+(`docs/campaign/triage-2026-09-03-untriaged-clusters.md`) :
+`unstable-context-value` (53) est **propre, 53/53 vrais positifs** — y compris
+le seul candidat FP, où la chasse inter-composants avait raison ;
+`frozen-initial-state` (79) porte **une famille de 14** (18 %), les composants
+que l'appelant remonte toujours avec une `key`, écrite en
+[#136](https://github.com/rboudrouss/reactant-analyzer/issues/136). Les 65
+autres sont l'ambiguïté que le niveau Warning existe pour porter, et ne sont
+pas proposés au changement.
+
 ### #134 — l'identité d'un site d'allocation (2026-09-03)
 
 Trouvé en dimensionnant #94. `ExprId` est la clef du tas, mais son compteur
@@ -192,14 +202,43 @@ Corrigé aux deux endroits où l'identité est frappée : un compteur par fichie
 (`Offsets { labels, ids }`, monotone par composant — le *même* appelé inliné
 deux fois fait deux sites d'allocation).
 
-Corpus : **1 340 → 1 348 emplacements, 14 ajoutés, 6 retirés**, durée inchangée.
-Le sens compte plus que le nombre : les ajouts sont des constats que les
-collisions taisaient (`useCompleteTask.ts:10` dépend de `updateOneRecord`, une
-flèche sans `useCallback` — la mémoïsation était bien défaite), et les retraits
-sont la famille `$errors.<membre>` de mantine, qui se résout enfin comme le
-disait le journal de précision.
+Corpus, **remesuré le 2026-09-03** : **1 345 → 1 334 emplacements, 26 retirés,
+15 ajoutés**, durée inchangée. (Inscrit d'abord `1 340 → 1 348, 14 ajoutés,
+6 retirés` : les ajouts étaient à peu près justes, les retraits comptés à 6 au
+lieu de 26 — vraisemblablement la seule famille relue à la main, prise pour le
+total. Le signe s'en trouvait inversé. Voir « Correction » dans le journal de
+précision.)
+
+Le sens compte plus que le nombre, et il est intact : les ajouts sont des
+constats que les collisions taisaient (`useCompleteTask.ts:10` dépend de
+`updateOneRecord`, une flèche sans `useCallback` — la mémoïsation était bien
+défaite), et les retraits sont la famille `$errors.<membre>` de mantine, qui se
+résout enfin. Qu'un bug d'identité corrige **dans les deux sens** est
+exactement ce qu'on attend : des lectures répondaient depuis le mauvais objet.
 
 Prochaines marches, par valeur décroissante : les valeurs d'arguments (#67) ;
 une requête de dominance ; les résumés d'écosystème (#94), seule façon de
 réduire la classe ⊤ qu'ADR-038 §2 laisse en Warning ; et la moitié
 atteignabilité de `reads` (#132).
+
+### La mesure elle-même (2026-09-03)
+
+En reprenant le corpus pour dimensionner la table `@mantine/form`, le binaire
+gelé de la dernière entrée du journal de précision a rendu **1 325**
+emplacements là où le journal en inscrivait 1 314. Vérification faite :
+l'analyse est **déterministe au bit près** — quatre exécutions sur un dépôt,
+deux sur le corpus entier, fichiers JSON identiques. L'écart n'est donc pas du
+bruit, c'est une erreur de comptage.
+
+Ce qui l'a produite : l'entrée a écrit son point d'arrivée en *soustrayant*
+18 retraits mesurés au point de départ, au lieu de compter la sortie d'après.
+Une soustraction ne vaut que si les **ajouts** ont été comptés aussi, et la
+colonne étant cumulative, une seule ligne fausse déplace toutes les suivantes.
+
+À faire, dans l'ordre : rebaser la colonne sur des mesures recomptées (les
+binaires gelés de la session existent, donc c'est mécanique, pas une
+reconstruction) ; puis automatiser le comptage pour que le point d'arrivée ne
+puisse plus être écrit à la main — c'est exactement ce que demande
+[#15](https://github.com/rboudrouss/reactant-analyzer/issues/15) (« No CI, and
+the corpus measure is not automated »), qui vient de gagner une raison
+concrète.

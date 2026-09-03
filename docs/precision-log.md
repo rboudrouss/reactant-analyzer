@@ -11,10 +11,12 @@ corpus. Une entrée ici, un message de commit, et une ligne dans
 [`limitations.md`](limitations.md) s'il reste une limite.
 
 Chaque revendication reste soumise aux invariants du projet : faux positifs
-tolérés, **faux négatifs interdits**. Les entrées de précision ne retirent que
-des emplacements et n'en ajoutent aucun ; la seule ligne du tableau qui en
-*ajoute* est #134, qui est une correction de soundness — les constats ajoutés
-sont ceux qu'un bug taisait, et son détail est dans
+tolérés, **faux négatifs interdits**. Une correction de précision ne retire que
+des emplacements ; une correction de *soundness* en ajoute, et les ajouts sont
+alors des constats qu'un bug taisait. #134 est la seule ligne des deux espèces
+à la fois — elle retire 26 emplacements et en ajoute 15, ce qui est exactement
+ce qu'on attend d'un bug d'identité : des lectures qui répondaient depuis le
+mauvais objet, dans les deux sens. Son détail est dans
 [NEXTSTEPS](NEXTSTEPS.md#134--lidentité-dun-site-dallocation-2026-09-03).
 
 ## Métrique
@@ -26,7 +28,29 @@ lignes dépend de la façon dont on compte et n'est pas une série propre d'une
 campagne à l'autre. La première entrée précède cette métrique et est citée en
 findings bruts.
 
-Corpus : `test-repo/`, 14 dépôts, 34 730 fichiers.
+Corpus : `test-repo/`, 14 dépôts, 34 747 fichiers (`files_analyzed`).
+
+**L'analyse est déterministe.** Quatre exécutions d'un binaire gelé sur un
+dépôt, et deux sur le corpus entier, donnent des fichiers JSON *identiques au
+bit près*. Un écart entre deux mesures est donc toujours un vrai changement de
+comportement ou une erreur de comptage — jamais du bruit.
+
+**Un point d'arrivée se compte ; les retraits aussi.** Les chiffres du
+2026-09-03 ont dû être remesurés, et l'erreur portait sur les deux bouts du
+calcul : des retraits comptés en relisant une famille à la main plutôt qu'en
+diffant, et un point d'arrivée déduit du delta au lieu d'être compté. La
+colonne étant cumulative, une seule ligne fausse déplace toutes les suivantes —
+et pour #134 le signe lui-même s'est inversé. Le compte rendu complet est en
+« Correction » à la fin.
+
+La règle qui en sort : [`corpus-diff.py`](../scripts/corpus-diff.py) sur deux
+exécutions, qui imprime toujours `avant / après / retirés / ajoutés` et sort en
+erreur si les trois ne se réconcilient pas. Ce qu'on a relu à la source n'est
+pas ce qui a changé ; les deux se disent, séparément.
+
+Les lignes du **2026-09-03** ont été remesurées (voir « Correction » en fin de
+document) ; celles du **2026-09-02** ne sont pas vérifiables, aucun binaire de
+cette session n'ayant survécu, et sont laissées telles quelles.
 
 | date | revendication | issue | emplacements |
 |---|---|---|---|
@@ -36,10 +60,14 @@ Corpus : `test-repo/`, 14 dépôts, 34 730 fichiers.
 | 2026-09-02 | une closure atteinte via un conteneur reste une closure | #89 | 1 402 → 1 394 |
 | 2026-09-02 | un renommage n'est pas une lecture | #89 §2 | 1 394 → 1 359 |
 | 2026-09-02 | une écriture qui tranche sa propre garde | #91 | 1 359 → 1 343 |
-| 2026-09-03 | un membre n'est pas le slot | #90 | 1 343 → 1 340 |
-| 2026-09-03 | l'identité d'un site d'allocation | #134 | 1 340 → 1 348 (**+14**, voir NEXTSTEPS) |
-| 2026-09-03 | un contrat de bibliothèque porte sur les membres | #94 | 1 348 → 1 332 |
-| 2026-09-03 | un emballeur n'exécute pas son argument | #94 | 1 332 → 1 314 |
+| 2026-09-03 | un membre n'est pas le slot | #90 | 1 348 → 1 345 |
+| 2026-09-03 | l'identité d'un site d'allocation | #134 | 1 345 → 1 334 (26 retirés, **15 ajoutés**) |
+| 2026-09-03 | un contrat de bibliothèque porte sur les membres | #94 | 1 334 → 1 326 |
+| 2026-09-03 | un emballeur n'exécute pas son argument | #94 | 1 326 → 1 325 |
+| 2026-09-03 | un emballeur n'est pas forcément stable | #94 | 1 325 → 1 325 (voir l'entrée) |
+| 2026-09-03 | une lecture de membre a besoin du tas convergé | #135 | 1 325 → 1 325 (voir l'entrée) |
+| 2026-09-03 | les écrivains d'un slot se lisent dans la relation | #92 | 1 325 → 1 314 |
+| 2026-09-03 | un contrat de tuple est indexé par position | #37 | 1 314 → 1 314 (voir l'entrée) |
 
 ---
 
@@ -402,6 +430,9 @@ fonction qui écrit un state, et ⊤ inclut la passe de rendu — sain, et bruya
 n'appelle pas `cb`. C'est une affirmation sur le *moment*, pas sur ce que vaut
 une valeur, donc elle voyage sur sa propre variante `SummaryValue::StableWrapper`
 plutôt que sur la valeur — cette dernière est identique à `StableRef`.
+(L'entrée du 2026-09-03 « un emballeur n'est pas forcément stable » a depuis
+scindé cette variante en `Wrapper { stable }` : la stabilité y était encore
+soudée au timing, ce que la phrase précédente prétendait justement éviter.)
 
 **Ce qui en fait un contrat et non une supposition.** ADR-034 §2 est explicite :
 faire descendre une ligne de ⊤ vers `Handler` est la seule direction qui peut
@@ -437,3 +468,286 @@ revendiqué à tort.
 et le `form.watch(path, cb)` de `@mantine/form` — une autre bibliothèque, sans
 table ; un est un hook local (`useTwoFactorAuthenticationForm`) ; les autres
 sont les noms liés deux fois ci-dessus.
+
+---
+
+## 2026-09-03 — un emballeur n'est pas forcément stable
+
+*Suite de #94. La table `@mantine/form`, et le défaut qu'elle a révélé.*
+
+Les neuf `setter-in-render` restants de l'entrée précédente étaient
+`<form onSubmit={form.onSubmit(handleSubmit)}>`. Même forme que
+`handleSubmit(cb)` chez react-hook-form, donc a priori une ligne de table à
+ajouter. Mais mantine construit `onSubmit` ainsi :
+
+```js
+const onSubmit = (handleSubmit, handleValidationFailure) => (event) => { … };
+```
+
+Une flèche nue dans le corps du hook : **une fonction neuve à chaque rendu.**
+`handleSubmit` chez react-hook-form est adossé à un `useCallback`. Les deux
+emballent, un seul est stable.
+
+**Le défaut.** `SummaryValue::StableWrapper` soudait les deux affirmations, et
+son propre commentaire disait pourtant que le timing « est une affirmation
+différente sur une chose différente et ne peut donc pas voyager sur la valeur ».
+Écrire l'entrée mantine avec cette variante aurait crédité `form.onSubmit` d'une
+stabilité que personne ne promet — un faux négatif pour toute liste de deps qui
+le contient. La variante devient `Wrapper { stable: bool }` : le type dit
+maintenant ce que le commentaire disait déjà.
+
+**La table.** Une seule ligne, `("onSubmit", Wrapper { stable: false })`. Rien
+d'autre n'est listé : les autres membres de mantine sont des `useCallback` sur
+des deps qui ne sont pas stables non plus (`setValues` sur `[onValuesChange]`,
+un rappel utilisateur ; `getValues` sur `[refValues.current]`), ce qui n'est pas
+une garantie d'identité documentée. Un membre non listé reste ⊤. Les hooks de
+contexte que produit `createFormContext()` portent un nom choisi par
+l'utilisateur et ne peuvent donc pas être indexés par (paquet, nom) du tout.
+
+**La preuve que la scission est réelle** : basculer `stable` à `true` fait
+rougir exactement le test de stabilité et aucun autre.
+
+**Corpus : 1 325 → 1 325, aucun changement** — et c'est le résultat, pas un
+échec de mesure. La table est correcte : sur un fichier isolé, et sur le
+sous-arbre `@docs/demos` analysé seul, elle retire les deux sites
+`form.onSubmit(handleSubmit)` et laisse exactement les trois
+`form.watch(path, cb)`, qui sont des abonnements et ne sont délibérément pas
+dans la table.
+
+Ce qui l'annule sur le corpus : `test-repo/mantine` contient
+`packages/@mantine/form/src/use-form.ts`. L'analyseur résout l'import vers cette
+source réelle et l'inline, et **une source inlinée prime sur un résumé de
+registre** — à raison. Il reste alors
+[#57](https://github.com/rboudrouss/reactant-analyzer/issues/57) : le `onSubmit`
+inliné renvoie un `FnLit` dont le site d'appel reste opaque, donc le timing
+redevient inconnu. Une bibliothèque dont la source se trouve dans l'arbre
+analysé est ainsi *moins* bien analysée qu'une consommée depuis `node_modules`,
+et aucune table ne peut contourner ça.
+
+---
+
+## 2026-09-03 — une lecture de membre a besoin du tas convergé
+
+*[#135](https://github.com/rboudrouss/reactant-analyzer/issues/135). Trouvé en
+testant l'entrée précédente — un faux négatif, donc la direction interdite.*
+
+`always-unstable-deps` évaluait chaque dep contre un `Heap::new()` frais. Une
+lecture de membre ne se résout qu'à travers le tas — `eval_field_access` suit le
+`Loc` jusqu'à `HeapValue::Obj` — donc avec une amorce vide elle répondait ⊤, et
+la règle lit ⊤ comme du silence, par construction et à raison.
+
+```jsx
+const obj = { f: () => {} };
+useEffect(() => {}, [obj.f]);   // silencieux : `obj.f` est neuf à chaque rendu
+```
+
+**Ce n'était pas une règle.** `ConvergedEval::eval_in` prenait le tas en
+argument, sur la théorie qu'une amorce vide et une amorce convergée étaient deux
+choix légitimes ; quatre de ses six appelants prenaient le vide.
+`redundant-set-state` et `unnecessary-rerender` se gardent sur `is_stable()`,
+que ⊤ échoue aussi — même famille, mêmes constats manqués.
+
+**Le correctif est central, pas par règle.** `eval_in` amorce désormais
+`self.heap.clone()` et le paramètre disparaît : il n'y a plus de choix par site
+à se tromper. Un site qui évalue vraiment contre des stores *vides* appelle la
+primitive `eval_in_stores`, et ce paquet-là n'a pas de moitié convergée avec
+laquelle être incohérent.
+
+**Pourquoi c'était invisible jusqu'ici.** Le tas convergé ne vaut la peine
+d'être lu que depuis peu : #88 a donné aux littéraux d'objet une carte par
+membre, et #134 a fait qu'un site d'allocation identifie *un* site d'allocation.
+Avant cela, une lecture de membre pouvait répondre depuis le mauvais objet.
+
+`is_unstable_reference_only()` est un prédicat de preuve : le changement ne peut
+que remplacer ⊤ par une valeur prouvée.
+
+**Corpus : 1 325 → 1 325, aucun changement** — 0 retiré, 0 ajouté, vérifié des
+deux côtés et pas seulement sur le total. Le faux négatif est réel (test unitaire
+et *gate-by-removal* : remettre `Heap::new()` fait rougir exactement le test de
+la dep-membre), il ne se produit simplement pas dans ces 14 dépôts. C'est un
+résultat, pas un échec : une correction de soundness se justifie par ce qu'elle
+rend impossible, pas par ce qu'elle déplace aujourd'hui.
+
+Durée inchangée : 827 s avant, 807 s après. La première version amorçait le tas
+convergé *à chaque appel* au lieu d'une fois par composant ; l'évaluateur
+[`Eval`](../src/rules/helpers/mod.rs) corrige cette forme, mais aucune des deux
+n'était mesurable (dub : 75 s / 74 s / 71 s).
+
+---
+
+## 2026-09-03 — les écrivains d'un slot se lisent dans la relation
+
+*[#92](https://github.com/rboudrouss/reactant-analyzer/issues/92).*
+
+`derived-state` et `redundant-set-state` affirment tous deux « rien d'autre
+n'écrit ce slot », et tous deux répondaient en parcourant deux endroits : le CFG
+de rendu, et les corps des *autres* effets. Ce ne sont pas les endroits où
+vivent les écrivains manqués — un gestionnaire lié à une prop JSX, un corps de
+`useCallback`, une écriture dans le `.then()` que l'effet a lancé.
+
+**La relation qui sait déjà** est sur `AnalysisResult`. `slot_writers` porte une
+région par ligne — `Render | Effect | Memo | Callback | Handler` — donc les
+trois classes que l'issue nomme y sont *déjà* enregistrées ; les deux règles ne
+posaient simplement pas la question. `slot_written_outside` la pose.
+
+**L'autre moitié**, `setter_escapes`, existait aussi — mais comme colonne privée
+de `SlotSeed`, calculée pour les seuls slots semés par une prop. D'où le fait
+que seule `frozen-initial-state` en disposait. Promue à côté de la relation,
+avec `escaping_slots()` qui répond pour n'importe quel slot : une fois le setter
+sorti du composant, l'affirmation n'est plus la nôtre à faire.
+
+Les deux faits sont *may*-typés, et c'est ici la bonne direction : les deux
+consommateurs s'en servent pour **retenir** un constat, donc sur-approximer
+coûte un avertissement au lieu d'en inventer un.
+
+**Deux erreurs en chemin, gardées ici parce qu'elles se reproduiraient.**
+Construire l'ensemble d'alias depuis le seul CFG de rendu fait lire
+`const setter = setB` *dans* un effet comme une évasion au lieu de la chaîne
+d'alias qu'elle est — l'exemption de la marche est `aliases.contains(var)`, donc
+l'ensemble doit être clos sur tous les corps, exactement comme le fait
+`collect_slot_writers`. Et interroger slot par slot re-parcourait chaque CFG une
+fois par slot.
+
+**Corpus : 1 325 → 1 314, 11 retirés, aucun ajouté**, tous relus à la source.
+`derived-state` 3 → 0, `redundant-set-state` 12 → 4. Ce sont les formes que
+l'issue prédisait, plus deux vérifiées à la main : dub `main-nav.tsx:59`, où
+`setIsOpen` est à la fois écrit par un gestionnaire et passé dans
+`SideNavContext.Provider`, et twenty `use-app-preview-experience.ts:40`, qui a
+quatre autres écrivains.
+
+---
+
+## 2026-09-03 — un contrat de tuple est indexé par position
+
+*[#37](https://github.com/rboudrouss/reactant-analyzer/issues/37).*
+
+`SummaryRegistry` ne rendait qu'**une** valeur par hook, donc un hook qui renvoie
+un tuple ne pouvait pas exposer de créneau stable. jotai
+`useAtom(a) → [value, setValue]` : `missing-deps` signalait `setValue`, que la
+bibliothèque documente pourtant comme stable. Dans le corpus, l'auteur
+d'excalidraw a désactivé exactement cet avertissement à la main
+(`app-jotai.ts:33`, `// eslint-disable-next-line react-hooks/exhaustive-deps`).
+
+**La cause était plus générale que la table.** Le moteur évaluait *toute*
+`IndexAccess` à ⊤, sans condition. La déstructuration de tableau se ramène à
+`__arr[0]` / `__arr[1]`, donc aucun contrat par position n'était atteignable,
+quelle que soit la table écrite.
+
+**La revendication.** Un index **constant** est une lecture de membre, et le tas
+y répond comme il répond à un membre nommé — c'est la même carte par membre que
+#88 a donnée aux littéraux d'objet et que #94 réutilise pour les résumés. Un
+index non constant reste ⊤ : ce que dénote `xs[i]` est la question de
+[#76](https://github.com/rboudrouss/reactant-analyzer/issues/76), pas celle-ci.
+
+Une fois cela fait, la table est une ligne : `("1", StableRef)`. La position 0
+est délibérément absente — changer est ce à quoi sert un atome.
+
+**Les trois directions négatives sont testées** : la position 0 tire toujours,
+une position que la table ne nomme pas tire toujours, et un élément de tableau
+ordinaire tire toujours.
+
+**Corpus : 1 314 → 1 314, aucun changement** — le troisième zéro de la journée,
+et pour une troisième raison. Le mécanisme est prouvé (test unitaire, plus un
+repro synthétique de la forme exacte d'excalidraw, qui tire avant et se tait
+après). Ce que le corpus n'atteint pas :
+
+- les deux seuls sites qui déstructurent `useAtom` sont dans
+  `excalidraw/excalidraw-app` — 37 fichiers, 18 composants analysés, **zéro
+  constat au total**, avec l'avertissement « no tsconfig `paths` found » : les
+  alias `@excalidraw/…` d'excalidraw sont déclarés dans la config vite, que
+  l'analyseur ne lit pas
+  ([#47](https://github.com/rboudrouss/reactant-analyzer/issues/47)) ;
+- novel n'utilise que `useAtomValue` et `useSetAtom` dans des composants qui ne
+  produisent rien de toute façon.
+
+La moitié générale — l'index constant — vaut indépendamment de jotai : c'est le
+seul chemin par lequel un contrat par position peut exister, et `useTransition`
+/ `useOptimistic` de React attendent la même mécanique
+([#27](https://github.com/rboudrouss/reactant-analyzer/issues/27)). Elles n'ont
+délibérément **pas** de table ici : je n'ai pas pu vérifier ce que React
+documente sur l'identité de `startTransition`, et le précédent `use-debounce`
+dit de ne pas écrire une revendication qu'on n'a pas vérifiée.
+
+---
+
+## Correction du tableau (2026-09-03)
+
+Les chiffres inscrits pour les lignes du 2026-09-03 **ne se reproduisent pas**.
+Ils ont été remesurés et remplacés. Cette section garde ce qui a été inscrit,
+ce qui a été mesuré, et ce qui reste inexpliqué — effacer l'écart en réécrivant
+la colonne ferait exactement ce que ce journal existe pour empêcher.
+
+### Ce qui est établi
+
+**L'analyse est déterministe.** Quatre exécutions d'un binaire gelé sur un
+dépôt, deux sur le corpus entier : fichiers JSON identiques au bit près.
+
+**Toutes les mesures de cette correction voient le même corpus** — 34 747
+fichiers, 14 016 composants, sur les huit exécutions. La chaîne est donc
+cohérente avec elle-même.
+
+**Le binaire de chaque étape a été identifié par sonde comportementale**, pas
+par horodatage : un cas `handleSubmit` pour la moitié timing, un cas
+`const { setValue } = useForm()` pour la moitié valeurs. Le premier étiquetage,
+fait aux horodatages, était faux — d'où une mesure inutile entre deux binaires
+qui portaient déjà tous deux la moitié timing.
+
+### Inscrit contre mesuré
+
+| étape | inscrit | mesuré |
+|---|---:|---:|
+| avant #90 | 1 343 | **1 348** |
+| #90 — un membre n'est pas le slot | 1 340 (−3) | **1 345 (−3)** — delta juste |
+| #134 — l'identité d'un site d'allocation | 1 348 (**+8** : 6 retirés, 14 ajoutés) | **1 334 (−11** : 26 retirés, 15 ajoutés) |
+| #94 — moitié valeurs | 1 332 (−16) | **1 326 (−8)** |
+| #94 — moitié timing | 1 314 (−18) | **1 325 (−1)** |
+
+### Ce qui reste inexpliqué
+
+Les **deltas** sont faux, pas seulement les points d'arrivée. L'hypothèse
+naturelle — des retraits comptés en lignes JSON pendant que les bornes étaient
+comptées en emplacements — a été testée et **ne tient pas** : lignes et
+emplacements donnent le même nombre (8 et 1). Aucune variante de clef de
+comptage ne reproduit les chiffres inscrits.
+
+Un indice sans conclusion : l'en-tête de ce document annonçait 34 730 fichiers,
+17 de moins que ce que rend aujourd'hui `files_analyzed`. Mais `test-repo/` ne
+contient rien de postérieur au 2026-09-02, donc rien ne permet d'affirmer que
+les exécutions d'alors voyaient un autre corpus.
+
+### Le motif que cela dessine
+
+Le delta de **#90 est exact** (−3 des deux côtés) : à ce moment-là la mesure
+était juste, et la colonne absolue portait déjà un écart de +5 hérité du
+2026-09-02. Ce qui s'est cassé ensuite est le comptage des **retraits** :
+
+- #134 : 15 ajouts mesurés contre 14 inscrits — presque juste. Mais 26 retraits
+  mesurés contre 6 inscrits, et l'entrée nomme précisément une famille (les
+  `$errors.<membre>` de mantine). L'explication qui colle : la famille relue à
+  la main a été prise pour le total. Le signe du delta s'en est trouvé inversé.
+- #94 : même forme, sans que les chiffres se reconstituent pour autant. Les
+  deux moitiés valent −9 emplacements ensemble, pas −34.
+
+Compter ce qu'on a relu n'est pas compter ce qui a changé. C'est la même erreur
+que celle du point d'arrivée soustrait, à l'autre bout du calcul.
+
+### Ce que cela ne remet pas en cause
+
+**La direction de chaque correction.** Chacune est tenue par un test de
+régression *gated* — désactiver le correctif fait rougir exactement ce test — et
+chaque retrait a été relu à la source. Ce qui était faux est la **taille**
+annoncée, pas le sens. Les deux moitiés de #94 valent −9 emplacements sur ce
+corpus, pas −34.
+
+### Les lignes du 2026-09-02
+
+Non vérifiables : aucun binaire de cette session n'a survécu. Elles sont
+laissées telles quelles et marquées, plutôt que présentées comme contrôlées.
+
+### La règle qui évite la récidive
+
+[`corpus-diff.py`](../scripts/corpus-diff.py) prend deux exécutions, imprime
+`avant / après / retirés / ajoutés`, et sort en erreur si les trois ne se
+réconcilient pas. Un point d'arrivée se compte ; il ne se déduit jamais d'un
+delta. Automatiser cela dans la CI est
+[#15](https://github.com/rboudrouss/reactant-analyzer/issues/15).
