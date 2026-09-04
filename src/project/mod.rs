@@ -76,20 +76,60 @@ pub fn detect(root: &Path, fs: &dyn FileSystem) -> ProjectKind {
 /// the blindest one — no aliases loaded, and no warning either, because the
 /// warning hangs off the Vite/Next arms ([#9]).
 ///
-/// The empty path is probed rather than skipped: `Path::new("src").parent()` is
-/// `""`, which is the working directory, and `reactant check src` from a
-/// project root is the common case this exists for.
-///
 /// [#9]: https://github.com/rboudrouss/reactant-analyzer/issues/9
 pub fn locate(from: &Path, fs: &dyn FileSystem) -> Option<(ProjectKind, PathBuf)> {
+    nearest_ancestor(from, |dir| match detect(dir, fs) {
+        ProjectKind::Plain => None,
+        kind => Some(kind),
+    })
+}
+
+/// The nearest ancestor of `from` (itself included) for which `probe` yields
+/// a value, and that ancestor's path.
+///
+/// The empty path is probed rather than skipped: `Path::new("src").parent()`
+/// is `""`, which is the working directory, and `reactant check src` from a
+/// project root is the common case this exists for.
+fn nearest_ancestor<T>(
+    from: &Path,
+    mut probe: impl FnMut(&Path) -> Option<T>,
+) -> Option<(T, PathBuf)> {
     let mut cur = Some(from);
     while let Some(dir) = cur {
-        match detect(dir, fs) {
-            ProjectKind::Plain => cur = dir.parent(),
-            kind => return Some((kind, dir.to_path_buf())),
+        if let Some(found) = probe(dir) {
+            return Some((found, dir.to_path_buf()));
         }
+        cur = dir.parent();
     }
     None
+}
+
+/// The tsconfig `paths` governing a project rooted at `config_root`.
+///
+/// The marker's own directory is where the walk *starts*, not where it stops
+/// ([#139]): a monorepo that keeps `vite.config.mts` in a sub-app and the
+/// `paths` map at the root would otherwise lose its aliases entirely —
+/// excalidraw analysed 37 files and reported nothing for exactly that reason.
+///
+/// The nearest ancestor that declares real `paths` wins. An ancestor
+/// declaring only a `baseUrl` is held back rather than accepted, the same
+/// discipline [`load_tsconfig_paths`] already applies to its `references`
+/// hop: it is a usable resolver, but a further ancestor with actual aliases
+/// is the better one, and it is only the answer when nothing else is.
+///
+/// [#139]: https://github.com/rboudrouss/reactant-analyzer/issues/139
+fn locate_tsconfig_paths(config_root: &Path, fs: &dyn FileSystem) -> Option<TsconfigPaths> {
+    let mut base_only: Option<TsconfigPaths> = None;
+    nearest_ancestor(config_root, |dir| match load_tsconfig_paths(dir, fs) {
+        Some(found) if !found.patterns.is_empty() => Some(found),
+        Some(found) => {
+            base_only.get_or_insert(found);
+            None
+        }
+        None => None,
+    })
+    .map(|(paths, _)| paths)
+    .or(base_only)
 }
 
 /// Narrow discovery to `<root>/src` when the Next.js router lives there.
@@ -178,7 +218,7 @@ pub fn build_context(
         ProjectKind::NextJs => "next.config",
         _ => "vite.config",
     };
-    match load_tsconfig_paths(&config_root, fs.as_ref()) {
+    match locate_tsconfig_paths(&config_root, fs.as_ref()) {
         // A patternless entry means the config declared only `baseUrl`. That
         // resolves bare specifiers (`import "lib/api"`, the Next scaffold
         // without `paths`), so it is a real resolver — but no `@/*` alias

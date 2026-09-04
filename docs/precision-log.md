@@ -77,6 +77,7 @@ cette session n'ayant survécu, et sont laissées telles quelles.
 | 2026-09-04 | un try/catch/finally est du flot de contrôle | #2 | 1 340 → **1 344** (0 retiré, 4 ajoutés) |
 | — | **corpus épinglé : la série repart** | #15 | même binaire, 1 344 → 1 358 |
 | 2026-09-04 | la variable libre d'un appelé n'est pas celle de l'appelant | #141 | 1 358 → **1 317** (41 retirés, 0 ajouté) |
+| 2026-09-04 | le marqueur est le début de la recherche du tsconfig, pas sa fin | #139 | 1 317 → 1 317 (voir l'entrée) |
 
 ---
 
@@ -952,3 +953,49 @@ de l'appelé est déjà un `HookEntry` avec son propre CFG, et il ne reste qu'un
 marqueur dans le corps. Les noms capturables ne sont donc pas dans
 `body_cfg` du tout. La carte de renommage doit être construite sur le corps
 **et** sur les sous-corps de ses hooks — ce sont eux qui lisent `t`.
+
+## #139 — le marqueur est le début de la recherche du tsconfig, pas sa fin (2026-09-04)
+
+`1 317 → 1 317`, **digest identique** : aucun emplacement n'a bougé, et c'est
+attendu. `reactant test-repo` désigne un arbre sans marqueur de build, donc
+`ProjectKind::Plain`, donc **aucun alias n'est chargé pour aucun dépôt** — le
+corpus entier n'exerce pas ce chemin. Ce n'est pas une limite du correctif,
+c'est une limite de l'instrument : quatorze projets ne se lancent pas comme un
+seul. La mesure qui compte est par projet.
+
+### Le défaut
+
+Depuis `56ff872` le **marqueur** est trouvé en remontant depuis le chemin donné.
+Le **tsconfig**, lui, était chargé depuis le répertoire du marqueur et pas plus
+haut. Un monorepo qui garde `vite.config.mts` dans une sous-application et la
+carte `paths` à la racine perdait donc tous ses alias.
+
+```
+test-repo/excalidraw/
+  tsconfig.json          ← "paths": { "@excalidraw/common": [...], … }
+  packages/
+  excalidraw-app/
+    vite.config.mts      ← marqueur trouvé ici, recherche arrêtée ici
+```
+
+### La mesure, par projet
+
+| exécution | avant | après |
+|---|---|---|
+| `excalidraw-app` | angle mort `unresolved-aliases` | 38 imports non lus, **nommés** |
+| `excalidraw-app` + `packages` | `unresolved-aliases`, 22 findings | **aucun angle mort**, 22 findings |
+
+Le compte de findings ne bouge pas : les alias résolvent vers du code que les
+imports relatifs atteignaient déjà. Le gain est entier dans le canal
+d'honnêteté ouvert par #9 — 490 fichiers, 248 composants, et pour la première
+fois un rapport qui ne retient rien.
+
+### La forme du correctif
+
+`locate` et la recherche du tsconfig partagent maintenant un seul
+`nearest_ancestor` : même remontée, prédicat différent, comme le demandait
+l'issue. Un ancêtre qui ne déclare qu'un `baseUrl` est mis de côté au profit
+d'un ancêtre plus lointain qui a de vrais `paths` — c'est la discipline que
+`load_tsconfig_paths` applique déjà à son saut par `references` — mais il reste
+la réponse quand rien de mieux n'existe, sans quoi le correctif retirerait la
+résolution des spécificateurs nus.
