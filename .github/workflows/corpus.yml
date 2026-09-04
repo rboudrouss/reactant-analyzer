@@ -64,8 +64,12 @@ jobs:
 
       - run: cargo build --release --locked
 
+      # `--fail-on never` because exit 1 means "findings were reported", and a
+      # corpus of fourteen real apps always has some. This step should fail only
+      # when the analyzer could not run — a usage error still exits 2 and still
+      # fails. Whether the *number* is acceptable is the next step's job.
       - name: Run the analyzer over the corpus
-        run: ./target/release/reactant --format json test-repo > corpus-run.json
+        run: ./target/release/reactant --format json --fail-on never test-repo > corpus-run.json
 
       - name: Compare against the committed baseline
         run: ./scripts/corpus-baseline.py corpus-run.json
