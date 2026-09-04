@@ -9,6 +9,7 @@
 //! runs the same code over a [`MemFileSystem`].
 
 pub mod filesystem;
+pub mod gitignore;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -30,6 +31,7 @@ use crate::{
 };
 
 pub use filesystem::{FileSystem, MemFileSystem, OsFileSystem};
+pub use gitignore::GitignoreStack;
 
 pub trait FileDiscoverer: Send + Sync {
     fn discover(&self, root: &Path) -> Vec<PathBuf>;
@@ -44,6 +46,11 @@ pub trait ImportResolver: Send + Sync {
 
 pub struct DefaultFileDiscoverer {
     fs: Arc<dyn FileSystem>,
+    /// `--exclude-dir` / `excludeDirs`, matched by bare name at any depth.
+    /// Non-empty *replaces* both fallbacks rather than adding to them: the
+    /// setting is an answer to "what is not source here", and a list that
+    /// silently kept the built-in names would make `dist` unwalkable.
+    exclude_dirs: Vec<String>,
 }
 
 pub struct DefaultImportResolver {
@@ -52,7 +59,17 @@ pub struct DefaultImportResolver {
 
 impl DefaultFileDiscoverer {
     pub fn new(fs: Arc<dyn FileSystem>) -> Self {
-        DefaultFileDiscoverer { fs }
+        DefaultFileDiscoverer {
+            fs,
+            exclude_dirs: Vec::new(),
+        }
+    }
+
+    /// Replace the default exclusions with an explicit list of directory
+    /// names. Empty means "no list configured" — the default policy stands.
+    pub fn with_exclude_dirs(mut self, names: Vec<String>) -> Self {
+        self.exclude_dirs = names;
+        self
     }
 }
 
@@ -477,11 +494,34 @@ pub fn analyze_with_resolvers(
     analyze_files(&files, resolver, strategy, config)
 }
 
-/// Source extensions and directory exclusions of the default discovery.
-/// `pub`: the WASM host's superset walk reads them at runtime
-/// (`host_constants`), so wrapper and core cannot drift (ADR-022 §6).
+/// Source extensions of the default discovery. `pub`: the WASM host's
+/// superset walk reads them at runtime (`host_constants`), so wrapper and
+/// core cannot drift (ADR-022 §6).
 pub const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx"];
+
+/// Never walked, under every policy: `node_modules` nests by design and holds
+/// no project source, and `.git` holds no source at all. Not overridable —
+/// `--exclude-dir` narrows what else is skipped, it does not widen the walk
+/// into a package tree.
+pub const ALWAYS_EXCLUDED_DIRS: &[&str] = &["node_modules", ".git"];
+
+/// The fallback exclusions, matched by bare name at any depth — used only for
+/// a tree no `.gitignore` governs and no `--exclude-dir` describes.
+///
+/// Matching a bare name at any depth is what made this a soundness bug
+/// (#137): it also drops build *tooling source* (`scripts/build/`) and any
+/// feature directory that happens to be called `dist`. A repository states
+/// which of its directories are generated, in the file git reads, so
+/// [`gitignore`] is consulted first and these names are only the answer when
+/// there is nothing to read.
 pub const EXCLUDED_DIRS: &[&str] = &["node_modules", "dist", "build", ".next"];
+
+/// What the WASM host's superset walk may prune without ever hiding a file
+/// the engine would have read: [`ALWAYS_EXCLUDED_DIRS`] plus `.next`, a build
+/// cache every Next.js `.gitignore` declares and whose contents would cost
+/// the host hundreds of megabytes to load for nothing. Everything else the
+/// host loads and the engine re-filters (ADR-022 §6).
+pub const HOST_PRUNED_DIRS: &[&str] = &["node_modules", ".git", ".next"];
 
 fn is_source_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -507,17 +547,45 @@ fn is_source_file(path: &Path) -> bool {
     }
 }
 
-fn walk(fs: &dyn FileSystem, dir: &Path, out: &mut Vec<PathBuf>) {
+/// Whether the walk descends into `path`, whose bare name is `name`.
+///
+/// One precedence order, three sources (#137): the list the user configured,
+/// else the repository's own `.gitignore`s, else the built-in names — with
+/// [`ALWAYS_EXCLUDED_DIRS`] short-circuiting all three.
+fn skip_dir(name: &str, path: &Path, configured: &[String], ignores: &GitignoreStack) -> bool {
+    if ALWAYS_EXCLUDED_DIRS.contains(&name) {
+        return true;
+    }
+    if !configured.is_empty() {
+        return configured.iter().any(|c| c == name);
+    }
+    if !ignores.is_empty() {
+        return ignores.ignores_dir(path);
+    }
+    EXCLUDED_DIRS.contains(&name)
+}
+
+fn walk(
+    fs: &dyn FileSystem,
+    dir: &Path,
+    configured: &[String],
+    ignores: &mut GitignoreStack,
+    out: &mut Vec<PathBuf>,
+) {
+    let pushed = ignores.push_for(fs, dir);
     for path in fs.read_dir(dir) {
         if fs.is_dir(&path) {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if EXCLUDED_DIRS.contains(&name) {
+            if skip_dir(name, &path, configured, ignores) {
                 continue;
             }
-            walk(fs, &path, out);
+            walk(fs, &path, configured, ignores, out);
         } else if fs.is_file(&path) && is_source_file(&path) {
             out.push(path);
         }
+    }
+    if pushed {
+        ignores.pop();
     }
 }
 
@@ -530,7 +598,16 @@ impl FileDiscoverer for DefaultFileDiscoverer {
             }
             return files;
         }
-        walk(self.fs.as_ref(), root, &mut files);
+        // The `.gitignore`s above `root` govern it too — `reactant check
+        // src/features` is still inside the repository that wrote them.
+        let mut ignores = GitignoreStack::seed(self.fs.as_ref(), root);
+        walk(
+            self.fs.as_ref(),
+            root,
+            &self.exclude_dirs,
+            &mut ignores,
+            &mut files,
+        );
         files.sort();
         files
     }

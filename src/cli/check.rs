@@ -45,6 +45,12 @@ pub struct CheckArgs {
     #[arg(long, value_delimiter = ',')]
     pub entry: Vec<String>,
 
+    /// Directory names to skip, at any depth (repeatable or comma-separated).
+    /// Replaces the default policy — the tree's .gitignore, or dist/build/.next
+    /// when it has none. node_modules is always skipped.
+    #[arg(long, value_delimiter = ',')]
+    pub exclude_dir: Vec<String>,
+
     /// Output format (default: human)
     // No clap default_value on this and the two Options below: a default
     // would always yield `Some`, making "flag absent" indistinguishable from
@@ -107,6 +113,7 @@ pub fn run(mut args: CheckArgs) -> i32 {
         verbose: args.verbose,
         all_roots: args.all_roots,
         entry: args.entry.clone(),
+        exclude_dirs: args.exclude_dir.clone(),
         format: args.format.map(|v| match v {
             OutputFormat::Human => FormatConfig::Human,
             OutputFormat::Json => FormatConfig::Json,
@@ -137,6 +144,7 @@ pub fn run(mut args: CheckArgs) -> i32 {
         verbose: partial.verbose,
         all_roots: partial.all_roots,
         entry: partial.entry.clone(),
+        exclude_dirs: partial.exclude_dirs.clone(),
         format: match partial.format.unwrap_or(FormatConfig::Human) {
             FormatConfig::Human => driver::ReportFormat::Human,
             FormatConfig::Json => driver::ReportFormat::Json,

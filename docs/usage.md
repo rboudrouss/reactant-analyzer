@@ -43,6 +43,7 @@ reactant check src/ --ignore-rule lazy-init      # all but this one
 | `--trace` | Show each finding's witness chain (ADR-019): typed `→` steps explaining why the rule fired (e.g. `` `loadPrefs` resolves to an import from ./prefs.ts `` → `` `fetch` has side effects ``). Steps pointing into another file (cross-file inlining) show `file:line:col`. Capped at 8 steps (`… n more step(s)`). Hidden by default; a finding with steps shows a `(N trace step(s) — rerun with --trace)` hint instead. `json` output always includes the chain. |
 | `--entry <names>` | Explicit root components. Repeatable or comma-separated (`--entry Foo,Bar`). On a name collision across files, use the qualified `Foo@path` form the output prints. A name matching no component is a usage error (exit 2). |
 | `--all-roots` | Analyze every component as an entry point (`props = ⊤`). |
+| `--exclude-dir <names>` | Directory names never walked, matched at any depth. Repeatable or comma-separated. **Replaces** the default policy (see [Discovery](#plain-everything-else)) rather than adding to it; `node_modules/` and `.git/` are skipped regardless. |
 | `--verbose` | Debug output on stderr: symbol graph topo order, fixpoint stats, per-component iterations/widened labels. |
 | `--no-color` | Disable ANSI colors. Also honored: a non-empty `NO_COLOR` env var, or stdout not being a terminal. |
 | `--config <path>` | Config file to use (default: `<project root>/reactant.config.json` when present). Also accepted by `rules` and `explain` (their default root is the cwd). |
@@ -74,8 +75,8 @@ degrades to defaults. CLI flags beat config values.
     "team/effect-writes-own-dep": { "severity": "error", "options": { "maxDeps": 8 } },
     "missing-deps": "off"                        // subsumes --ignore-rule
   },
-  // check-flag equivalents (camelCase): entry, allRoots, failOn, project,
-  // format, info, showClean, trace
+  // check-flag equivalents (camelCase): entry, excludeDirs, allRoots, failOn,
+  // project, format, info, showClean, trace
   "failOn": "error"
 }
 ```
@@ -183,8 +184,36 @@ imports that then resolve outside what you named are reported as
 ### Plain (everything else)
 
 Recursive walk of the given directories for `.ts/.tsx/.js/.jsx`, excluding
-`node_modules/`, `dist/`, `build/`, `.next/`, `*.test.*`, `*.spec.*`,
-`*.d.ts`. Relative imports only.
+`*.test.*`, `*.spec.*` and `*.d.ts`. Relative imports only.
+
+Which *directories* are skipped has one precedence order, three sources:
+
+1. **`--exclude-dir` / `excludeDirs`**, matched by bare name at any depth. An
+   explicit list is the answer, so it replaces the two fallbacks below.
+2. **The tree's own `.gitignore` files**, read the way git reads them —
+   nearest-file-wins, `!` re-includes, patterns anchored by a `/`. The search
+   for them walks up from the directory being analysed to the project root
+   (`.git` or `package.json`), so `reactant check src/features` still honors
+   the `.gitignore` at the top of the repository.
+3. **`dist/`, `build/`, `.next/`** by name at any depth, only for a tree that
+   has no `.gitignore` at all.
+
+`node_modules/` and `.git/` are skipped under all three.
+
+Reading the `.gitignore` cuts both ways: it also skips generated directories the
+old name list walked (`lib/`, `coverage/`, a codegen'd `src/generated/`). That is
+the intended reading — a directory git does not track is not this repository's
+source — and it is never silent: anything imported from an analysed file lands
+in the run's `unread-imports` blind spot by name, so the summary withholds its
+clean bill. Use `--exclude-dir` to state a different answer.
+
+Reading the `.gitignore` rather than matching names is [#137]: a directory is
+build *output* because the repository declared it generated, not because of
+what it is called. Matching `build` at any depth also dropped build *tooling
+source* — mantine keeps ten real `.ts` files in `scripts/build/`, imported
+from files that were analysed, and nothing in the output said they existed.
+
+[#137]: https://github.com/rboudrouss/reactant-analyzer/issues/137
 
 ### Server Components
 

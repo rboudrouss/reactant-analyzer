@@ -78,6 +78,7 @@ cette session n'ayant survécu, et sont laissées telles quelles.
 | — | **corpus épinglé : la série repart** | #15 | même binaire, 1 344 → 1 358 |
 | 2026-09-04 | la variable libre d'un appelé n'est pas celle de l'appelant | #141 | 1 358 → **1 317** (41 retirés, 0 ajouté) |
 | 2026-09-04 | le marqueur est le début de la recherche du tsconfig, pas sa fin | #139 | 1 317 → 1 317 (voir l'entrée) |
+| 2026-09-04 | un répertoire est généré parce que le dépôt le dit | #137 | 1 317 → 1 317 (0 retiré, 0 ajouté ; **+88 fichiers lus**) |
 
 ---
 
@@ -999,3 +1000,74 @@ d'un ancêtre plus lointain qui a de vrais `paths` — c'est la discipline que
 `load_tsconfig_paths` applique déjà à son saut par `references` — mais il reste
 la réponse quand rien de mieux n'existe, sans quoi le correctif retirerait la
 résolution des spécificateurs nus.
+
+## #137 — un répertoire est généré parce que le dépôt le dit (2026-09-04)
+
+`1 317 → 1 317` (**0 retiré, 0 ajouté**, digest identique) : pas un emplacement
+n'a bougé. Ce que le correctif déplace est la **couverture**, et c'est l'autre
+colonne — celle des angles morts — qui le dit.
+
+### Le défaut
+
+`EXCLUDED_DIRS` était quatre noms filtrés à n'importe quelle profondeur. Cela
+retire la sortie de build, ce qui est voulu, mais aussi la *source des outils*
+de build et tout répertoire métier qui s'appelle `build` ou `dist`. mantine
+tient dix vrais fichiers `.ts` dans `scripts/build/`, importés depuis des
+fichiers qui, eux, étaient analysés : personne ne savait qu'ils existaient
+jusqu'à ce que la liste d'angles morts de #9 les nomme.
+
+### La revendication
+
+Un dépôt déclare déjà ce qui est généré, dans le fichier que git lit. Une seule
+ligne de priorité, trois sources : la liste configurée (`--exclude-dir` /
+`excludeDirs`), sinon les `.gitignore` de l'arbre, sinon les noms en dur pour un
+arbre qui n'en a aucun. `node_modules` et `.git` passent avant les trois.
+
+La liste explicite **remplace** les deux replis au lieu de s'y ajouter : c'est ce
+que veut dire « priorité », et une liste qui aurait discrètement gardé les noms
+en dur aurait rendu `dist` inatteignable.
+
+### La mesure
+
+| | fichiers avant | après | angles morts avant | après |
+|---|---|---|---|---|
+| mantine | 4 784 | 4 798 (+14) | `unread-imports: 3` | **aucun** |
+| chakra-ui | 2 666 | 2 671 (+5) | aucun | aucun |
+| corpus entier | 35 453 | **35 541** (+88) | `unread-imports: 3` | **aucun** |
+
+Les trois imports non lus qui ont ouvert #137 sont lus. Le corpus entier rend
+maintenant un rapport sans rien retenir, ce qu'il n'avait jamais fait.
+
+**Les +88 se comptent, ils ne se devinent pas.** Un `find -maxdepth 4` en
+donnait 19 et c'était faux de 69 : le gros du lot est
+`twenty/packages/twenty-sdk/src/cli/utilities/build`, **68 fichiers de source
+CLI** enfouis sous `src/`. C'est le témoin le plus net que le nom ne dit rien —
+et une redite de la règle qui a ouvert #15 : un point d'arrivée se compte.
+
+### Ce que le correctif retire aussi
+
+Lire le `.gitignore` coupe dans les deux sens : il exclut désormais des
+répertoires générés que la liste de noms parcourait (`lib/`, `coverage/`, un
+`src/generated/` produit par un codegen). C'est la lecture voulue — un
+répertoire que git ne suit pas n'est pas la source de ce dépôt — et ce n'est
+jamais silencieux : tout ce qu'un fichier analysé importe atterrit nommément
+dans `unread-imports` et retient le quitus. `--exclude-dir` sert à dire autre
+chose. Sur le corpus rien n'est perdu de ce côté : les dépôts sont fraîchement
+clonés, aucune sortie de build n'existe.
+
+### Le lecteur de `.gitignore`
+
+Un module à part, volontairement conservateur : ancrage, `!`, `*`/`**`/`?`/
+`[…]`, le fichier le plus profond l'emporte, remontée bornée à la racine du
+projet comme git se borne à son arbre de travail. Un motif qu'il ne sait pas
+lire ne filtre **rien** — sur-filtrer serait la direction interdite.
+
+### L'hôte wasm devait suivre
+
+Sa marche « sur-ensemble » pré-appliquait `EXCLUDED_DIRS`, donc sous wasm le
+moteur ne pouvait jamais voir `scripts/build/` quoi qu'en dise le `.gitignore` —
+et `MemFileSystem` ne distingue pas un répertoire sauté d'un répertoire absent,
+si bien que le manque aurait été invisible au lieu d'être signalé. L'hôte
+n'élague plus que `node_modules`, `.git` et `.next` (servis en `prunedDirs`) et
+charge `.gitignore` et `package.json` dans la carte ; c'est le moteur qui
+tranche. La parité wasm ↔ natif est verte.

@@ -75,7 +75,7 @@ cargo run -- check path/to/your-project
 `check` is the default subcommand, so plain `reactant src/` works too:
 
 ```sh
-reactant check src/                            # analyze a tree (skips node_modules, build dirs, tests)
+reactant check src/                            # analyze a tree (skips node_modules, gitignored dirs, tests)
 reactant check my-vite-app/                    # auto-detects Vite: src/ discovery + @/* aliases
 reactant check my-next-app/                    # auto-detects Next.js: router discovery + @/* and baseUrl
 reactant check src/ --format json              # machine-readable output for CI

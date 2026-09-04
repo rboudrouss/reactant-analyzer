@@ -216,6 +216,14 @@ projects, and now reported as `analysis-limit` when it truncates
 [#56](https://github.com/rboudrouss/reactant-analyzer/issues/56), and a returned `FnLit`'s call site stays opaque
 [#57](https://github.com/rboudrouss/reactant-analyzer/issues/57).
 
+Discovery reads the tree's `.gitignore` files to decide which directories are
+build output [#137](https://github.com/rboudrouss/reactant-analyzer/issues/137). The reader covers what real ignore files use —
+anchoring, `!`, `*`/`**`/`?`/`[…]`, nearest-file-wins — but it is not git: a
+pattern it cannot parse matches nothing, so the walk errs toward reading more.
+It does not consult `.git/info/exclude` or the user's global excludes, and it
+stops at the project root (`.git` or `package.json`), so a tree with neither
+falls back to the `dist`/`build`/`.next` names.
+
 Plugin interface: synchronous traits only [#58](https://github.com/rboudrouss/reactant-analyzer/issues/58), eager parsing of all
 discovered files [#60](https://github.com/rboudrouss/reactant-analyzer/issues/60). (Per-file import resolution is available:
 `resolver::ScopedResolver` routes by the importing file, `resolver::ChainResolver`

@@ -25,6 +25,14 @@
         "type": "string"
       }
     },
+    "excludeDirs": {
+      "description": "Directory names never walked, matched at any depth. Non-empty replaces\nthe default policy (`.gitignore` if the tree has one, else\n`dist`/`build`/`.next`); `node_modules` is excluded regardless.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
     "failOn": {
       "anyOf": [
         {

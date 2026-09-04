@@ -35,6 +35,7 @@ function parse(argv) {
       allRoots: false,
       noColor: false,
       entry: [],
+      excludeDir: [],
       format: null,
       failOn: null,
       project: null,
@@ -75,10 +76,11 @@ function parse(argv) {
         throw new UsageError(`invalid value for ${a}: ${v ?? "(missing)"}`);
       }
       out.options[key] = v;
-    } else if (a === "--entry") {
+    } else if (a === "--entry" || a === "--exclude-dir") {
       const v = args.shift();
-      if (v == null) throw new UsageError("--entry: missing value");
-      out.options.entry.push(...v.split(",").map((s) => s.trim()));
+      if (v == null) throw new UsageError(`${a}: missing value`);
+      const into = a === "--entry" ? out.options.entry : out.options.excludeDir;
+      into.push(...v.split(",").map((s) => s.trim()));
     } else if (a === "--rule" || a === "--ignore-rule") {
       const v = args.shift();
       if (v == null) throw new UsageError(`${a}: missing value`);

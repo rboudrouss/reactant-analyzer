@@ -59,15 +59,24 @@ function resolvePacks(specs, configDir) {
   });
 }
 
-// Superset walk: every source-extension file plus tsconfig*.json and the
-// build-tool configs (vite.config.*, next.config.*) encountered — the engine's
-// own discovery re-filters over the map (d.ts/test/spec exclusions included)
-// and detects the project kind from those markers. Dir-level exclusions only,
-// taken from hostConstants so wrapper and core cannot drift.
+// Superset walk: every source-extension file plus .gitignore, tsconfig*.json
+// and the build-tool configs (vite.config.*, next.config.*) encountered — the
+// engine's own discovery re-filters over the map (d.ts/test/spec exclusions
+// included) and detects the project kind from those markers.
+//
+// The host prunes only what no policy would ever read (hostConstants'
+// prunedDirs): since #137 the engine's exclusions depend on the tree's own
+// .gitignore, and a host that pre-applied a name list would hide files the
+// engine wanted — a superset walk that is not a superset. Reading a bit more
+// than the engine walks is the price.
 function buildFileMap(paths, constants) {
   const files = {};
   const wanted = (name) =>
     constants.sourceExtensions.some((ext) => name.endsWith(`.${ext}`)) ||
+    name === ".gitignore" ||
+    // Not analyzed: it is one of the two markers that bound the upward
+    // `.gitignore` search, and `.git` never reaches the map.
+    name === "package.json" ||
     /^tsconfig[^/\\]*\.json$/.test(name) ||
     /^vite\.config\.(ts|js|mjs|mts)$/.test(name) ||
     /^next\.config\.(ts|js|mjs|cjs|mts)$/.test(name);
@@ -90,7 +99,7 @@ function buildFileMap(paths, constants) {
     for (const e of entries) {
       const p = path.join(dir, e.name);
       if (e.isDirectory()) {
-        if (!constants.excludedDirs.includes(e.name)) walk(p);
+        if (!constants.prunedDirs.includes(e.name)) walk(p);
       } else if (e.isFile() && wanted(e.name)) {
         addFile(p);
       }

@@ -55,6 +55,11 @@ pub struct ReactantConfig {
     pub show_clean: Option<bool>,
     #[serde(default)]
     pub trace: Option<bool>,
+    /// Directory names never walked, matched at any depth. Non-empty replaces
+    /// the default policy (`.gitignore` if the tree has one, else
+    /// `dist`/`build`/`.next`); `node_modules` is excluded regardless.
+    #[serde(default)]
+    pub exclude_dirs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -231,6 +236,7 @@ pub struct CheckArgsPartial {
     pub verbose: bool,
     pub all_roots: bool,
     pub entry: Vec<String>,
+    pub exclude_dirs: Vec<String>,
     pub format: Option<FormatConfig>,
     pub fail_on: Option<FailOnConfig>,
     pub project: Option<ProjectConfig>,
@@ -242,6 +248,9 @@ impl CheckArgsPartial {
     pub fn merge(&mut self, cfg: &ReactantConfig) {
         if self.entry.is_empty() {
             self.entry = cfg.entry.clone();
+        }
+        if self.exclude_dirs.is_empty() {
+            self.exclude_dirs = cfg.exclude_dirs.clone();
         }
         self.all_roots |= cfg.all_roots.unwrap_or(false);
         self.info |= cfg.info.unwrap_or(false);

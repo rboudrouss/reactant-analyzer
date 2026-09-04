@@ -23,10 +23,15 @@ use reactant::rules::{RuleRegistry, declarative};
 
 /// Discovery constants the host's superset walk needs — served by the core
 /// at runtime so wrapper and engine cannot drift.
+///
+/// `prunedDirs` is deliberately *not* the engine's exclusion list: since
+/// #137 that list depends on the tree's `.gitignore`, which only the engine
+/// reads. The host loads everything else and the engine re-filters, so the
+/// map stays a superset of what discovery walks.
 #[wasm_bindgen(js_name = hostConstants)]
 pub fn host_constants() -> String {
     serde_json::json!({
-        "excludedDirs": reactant::resolver::EXCLUDED_DIRS,
+        "prunedDirs": reactant::resolver::HOST_PRUNED_DIRS,
         "sourceExtensions": reactant::resolver::SOURCE_EXTENSIONS,
         "configFileName": config::CONFIG_FILE_NAME,
     })
@@ -112,6 +117,8 @@ struct Options {
     all_roots: bool,
     #[serde(default)]
     entry: Vec<String>,
+    #[serde(default)]
+    exclude_dir: Vec<String>,
     #[serde(default)]
     format: Option<String>,
     #[serde(default)]
@@ -251,6 +258,7 @@ fn check_options(o: &Options, cfg: &config::ReactantConfig) -> Result<CheckOptio
         verbose: o.verbose,
         all_roots: o.all_roots,
         entry: o.entry.clone(),
+        exclude_dirs: o.exclude_dir.clone(),
         format: match o.format.as_deref() {
             None => None,
             Some("human") => Some(FormatConfig::Human),
@@ -281,6 +289,7 @@ fn check_options(o: &Options, cfg: &config::ReactantConfig) -> Result<CheckOptio
         verbose: partial.verbose,
         all_roots: partial.all_roots,
         entry: partial.entry,
+        exclude_dirs: partial.exclude_dirs,
         format: match partial.format.unwrap_or(FormatConfig::Human) {
             FormatConfig::Human => driver::ReportFormat::Human,
             FormatConfig::Json => driver::ReportFormat::Json,

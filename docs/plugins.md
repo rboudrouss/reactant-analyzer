@@ -6,7 +6,7 @@ crate.
 
 | Trait | Default | What to override for |
 |-------|---------|----------------------|
-| `FileDiscoverer` | `DefaultFileDiscoverer` (recursive `*.ts?(x)` walk, excludes `node_modules`/build dirs/`*.test.*`) | Framework conventions not already built in, monorepos, glob patterns |
+| `FileDiscoverer` | `DefaultFileDiscoverer` (recursive `*.ts?(x)` walk, excludes `node_modules`, `*.test.*`, and whatever the tree's `.gitignore` calls generated — see [usage](usage.md#plain-everything-else)) | Framework conventions not already built in, monorepos, glob patterns |
 | `ImportResolver` | `DefaultImportResolver` (relative imports → `.ts`/`.tsx`/`index.*`) | Monorepo `@workspace/*`, exotic resolution schemes |
 
 Both traits live in `reactant::resolver`. Plug them in through

@@ -66,6 +66,9 @@ pub struct CheckOptions {
     pub verbose: bool,
     pub all_roots: bool,
     pub entry: Vec<String>,
+    /// Directory names never walked (`--exclude-dir`). Non-empty replaces the
+    /// default policy; see [`crate::resolver::EXCLUDED_DIRS`].
+    pub exclude_dirs: Vec<String>,
     pub format: ReportFormat,
     pub fail_on: FailOn,
     pub project: ProjectOverride,
@@ -163,7 +166,8 @@ pub fn run_check(
     }
 
     // ── Discovery ─────────────────────────────────────────────────────────────
-    let discoverer = DefaultFileDiscoverer::new(fs.clone());
+    let discoverer =
+        DefaultFileDiscoverer::new(fs.clone()).with_exclude_dirs(opts.exclude_dirs.clone());
     let mut files: Vec<PathBuf> = Vec::new();
     for input in paths {
         let p = Path::new(input);

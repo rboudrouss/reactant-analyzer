@@ -14,7 +14,7 @@ Usage:
            [--all-roots] [--entry <names>] [--format human|json]
            [--fail-on error|warning|never] [--project auto|vite|next|plain]
            [--rule <name>]… [--ignore-rule <name>]… [--no-color]
-           [--config <path>]
+           [--exclude-dir <names>] [--config <path>]
   reactant rules [--config <path>]
   reactant explain <rule> [--config <path>]
   reactant schemas [--out <dir>]
