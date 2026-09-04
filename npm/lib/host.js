@@ -22,6 +22,22 @@ function projectRoot(paths) {
   return paths.map(String).find(isDir) ?? ".";
 }
 
+// The enclosing project of `from`: the nearest ancestor holding a package.json
+// or a .git, else `from`. Mirrors the bound the engine uses for its own upward
+// searches, so the map the host loads and the tree the engine reasons about
+// have the same edge.
+function enclosingProject(from) {
+  let dir = path.resolve(from);
+  for (;;) {
+    if (fs.existsSync(path.join(dir, "package.json")) || fs.existsSync(path.join(dir, ".git"))) {
+      return dir;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return path.resolve(from);
+    dir = parent;
+  }
+}
+
 function readConfigText(configPath, root, configFileName) {
   if (configPath) {
     // Explicit --config must exist (usage error handled by the caller).
@@ -69,7 +85,14 @@ function resolvePacks(specs, configDir) {
 // .gitignore, and a host that pre-applied a name list would hide files the
 // engine wanted — a superset walk that is not a superset. Reading a bit more
 // than the engine walks is the price.
-function buildFileMap(paths, constants) {
+//
+// `followImports` widens the walk to the enclosing project for the same
+// reason (#138): the engine closes over import edges inside its own
+// filesystem view, and under wasm that view is this map. A target the host
+// never loaded is indistinguishable from one that does not exist, so the
+// closure would come back empty and say "followed 0" — wrong, and silently
+// so. The flag already means "this may cost as much as the whole project".
+function buildFileMap(paths, constants, followImports = false) {
   const files = {};
   const wanted = (name) =>
     constants.sourceExtensions.some((ext) => name.endsWith(`.${ext}`)) ||
@@ -106,7 +129,11 @@ function buildFileMap(paths, constants) {
     }
   };
 
-  for (const input of paths.length ? paths : ["."]) {
+  const inputs = paths.length ? paths : ["."];
+  const roots = followImports
+    ? [...new Set(inputs.map((p) => enclosingProject(isDir(p) ? p : path.dirname(p))))]
+    : inputs;
+  for (const input of roots) {
     if (isDir(input)) walk(input);
     else if (fs.existsSync(input)) addFile(input);
     // Nonexistent inputs stay out of the map: the engine emits the same
@@ -121,4 +148,4 @@ function toPosix(p) {
   return p.split(path.sep).join("/");
 }
 
-module.exports = { projectRoot, readConfigText, resolvePacks, buildFileMap, isDir };
+module.exports = { projectRoot, enclosingProject, readConfigText, resolvePacks, buildFileMap, isDir };

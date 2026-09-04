@@ -60,6 +60,7 @@ fn provider_findings(tmp: &Tmp) -> Vec<(String, u64)> {
         all_roots: true,
         entry: vec![],
         exclude_dirs: vec![],
+        follow_imports: false,
         format: reactant::driver::ReportFormat::Json,
         fail_on: reactant::driver::FailOn::Error,
         project: reactant::driver::ProjectOverride::Auto,

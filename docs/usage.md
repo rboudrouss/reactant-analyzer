@@ -44,6 +44,7 @@ reactant check src/ --ignore-rule lazy-init      # all but this one
 | `--entry <names>` | Explicit root components. Repeatable or comma-separated (`--entry Foo,Bar`). On a name collision across files, use the qualified `Foo@path` form the output prints. A name matching no component is a usage error (exit 2). |
 | `--all-roots` | Analyze every component as an entry point (`props = ⊤`). |
 | `--exclude-dir <names>` | Directory names never walked, matched at any depth. Repeatable or comma-separated. **Replaces** the default policy (see [Discovery](#plain-everything-else)) rather than adding to it; `node_modules/` and `.git/` are skipped regardless. |
+| `--follow-imports` | Also analyze the files the named paths import, transitively, so their hooks are read instead of treated as opaque. The report still covers only the paths you named. **Not a speed optimization** — see [Following imports](#following-imports---follow-imports). |
 | `--verbose` | Debug output on stderr: symbol graph topo order, fixpoint stats, per-component iterations/widened labels. |
 | `--no-color` | Disable ANSI colors. Also honored: a non-empty `NO_COLOR` env var, or stdout not being a terminal. |
 | `--config <path>` | Config file to use (default: `<project root>/reactant.config.json` when present). Also accepted by `rules` and `explain` (their default root is the cwd). |
@@ -75,8 +76,8 @@ degrades to defaults. CLI flags beat config values.
     "team/effect-writes-own-dep": { "severity": "error", "options": { "maxDeps": 8 } },
     "missing-deps": "off"                        // subsumes --ignore-rule
   },
-  // check-flag equivalents (camelCase): entry, excludeDirs, allRoots, failOn,
-  // project, format, info, showClean, trace
+  // check-flag equivalents (camelCase): entry, excludeDirs, followImports,
+  // allRoots, failOn, project, format, info, showClean, trace
   "failOn": "error"
 }
 ```
@@ -214,6 +215,54 @@ source* — mantine keeps ten real `.ts` files in `scripts/build/`, imported
 from files that were analysed, and nothing in the output said they existed.
 
 [#137]: https://github.com/rboudrouss/reactant-analyzer/issues/137
+
+### Following imports (`--follow-imports`)
+
+Discovery is normally the sole producer of analyzed files. On a whole-project
+run that is complete — everything the project imports is already inside the
+walk. On a **narrowed** run it is not:
+
+```
+reactant check src/features
+⚠  67 file(s), no findings — but parts of this run were not analyzed …
+     • 47 imported file(s) resolved outside the analysed set and were never read
+```
+
+The hook whose body decides whether the caller loops is one of those 47, so
+`src/features` is analyzed against an opaque `useThing()` and the finding that
+belongs *in `src/features`* never fires.
+
+`--follow-imports` closes over resolved import edges from the named paths and
+analyzes what it reaches. Two rules keep it predictable:
+
+- **The report still covers only the paths you named.** A component defined in
+  a followed file is analyzed — that is what makes the named files correct —
+  but not reported. How many findings that hid, and which files hold them, is
+  printed, so widening is a decision you make rather than one you miss.
+- **The closure is printed**, for the same reason: a run that quietly read more
+  than you asked for would be the trust failure the blind-spot list exists to
+  prevent.
+
+```
+reactant check src/features --follow-imports
+⚠  1 warning(s) across 2 file(s).
+   followed 1 imported file(s) (src/hooks/useThing.ts)
+   1 finding(s) in those file(s) are not shown — name the path(s) to report them (src/hooks/useThing.ts)
+```
+
+**It is not a faster way to analyze a project.** The closure of a file's
+imports routinely approaches the whole program, and the flag adds an import
+scan on top. If you want the project analyzed, `reactant check src/` is the
+better command — this flag buys a *narrow report over a correct analysis*, not
+speed. It is off by default because naming a directory is a cheap way to look
+at one pattern in one place, and that is what naming it should keep meaning.
+
+`node_modules` is never entered, even through an alias: package code is not
+lowered at all ([#51]), so following such an edge would cost a dependency tree
+and produce nothing. Type-only imports carry no runtime behaviour and are not
+followed either.
+
+[#51]: https://github.com/rboudrouss/reactant-analyzer/issues/51
 
 ### Server Components
 

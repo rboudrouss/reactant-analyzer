@@ -20,6 +20,7 @@ fn opts(format: driver::ReportFormat) -> CheckOptions {
         all_roots: false,
         entry: vec![],
         exclude_dirs: vec![],
+        follow_imports: false,
         format,
         fail_on: driver::FailOn::Never,
         project: driver::ProjectOverride::Auto,

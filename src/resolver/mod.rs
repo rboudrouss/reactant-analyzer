@@ -8,6 +8,7 @@
 //! the defaults are `std::fs`-backed via [`OsFileSystem`]; the WASM build
 //! runs the same code over a [`MemFileSystem`].
 
+pub mod closure;
 pub mod filesystem;
 pub mod gitignore;
 
@@ -30,6 +31,7 @@ use crate::{
     },
 };
 
+pub use closure::import_closure;
 pub use filesystem::{FileSystem, MemFileSystem, OsFileSystem};
 pub use gitignore::GitignoreStack;
 

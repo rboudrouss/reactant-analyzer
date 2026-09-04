@@ -9,6 +9,7 @@ const BOOL_FLAGS = {
   "--trace": "trace",
   "--verbose": "verbose",
   "--all-roots": "allRoots",
+  "--follow-imports": "followImports",
   "--no-color": "noColor",
 };
 
@@ -33,6 +34,7 @@ function parse(argv) {
       trace: false,
       verbose: false,
       allRoots: false,
+      followImports: false,
       noColor: false,
       entry: [],
       excludeDir: [],

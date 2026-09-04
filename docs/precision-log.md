@@ -79,6 +79,7 @@ cette session n'ayant survécu, et sont laissées telles quelles.
 | 2026-09-04 | la variable libre d'un appelé n'est pas celle de l'appelant | #141 | 1 358 → **1 317** (41 retirés, 0 ajouté) |
 | 2026-09-04 | le marqueur est le début de la recherche du tsconfig, pas sa fin | #139 | 1 317 → 1 317 (voir l'entrée) |
 | 2026-09-04 | un répertoire est généré parce que le dépôt le dit | #137 | 1 317 → 1 317 (0 retiré, 0 ajouté ; **+88 fichiers lus**) |
+| 2026-09-04 | suivre les imports d'un run restreint, derrière un drapeau | #138 | 1 317 → 1 317 (défaut inchangé ; voir l'entrée) |
 
 ---
 
@@ -1071,3 +1072,89 @@ si bien que le manque aurait été invisible au lieu d'être signalé. L'hôte
 n'élague plus que `node_modules`, `.git` et `.next` (servis en `prunedDirs`) et
 charge `.gitignore` et `package.json` dans la carte ; c'est le moteur qui
 tranche. La parité wasm ↔ natif est verte.
+
+## #138 — suivre les imports d'un run restreint, derrière un drapeau (2026-09-04)
+
+`1 317 → 1 317` par défaut (**digest identique**, le portail passe), et
+`1 317 → 1 317` *aussi* avec `--follow-imports` : sur le corpus entier le
+drapeau suit **0 fichier**. C'est le résultat attendu et il vaut d'être écrit —
+un run qui parcourt tout le projet contient déjà ses propres imports. Le
+problème que #138 décrit n'existe que sur un run **restreint**.
+
+### La décision
+
+L'issue laissait le choix ouvert : suivre toujours / derrière un drapeau / pas
+du tout. Retenu : **derrière un drapeau, défaut off**, parce que nommer un
+répertoire est une façon peu coûteuse de regarder un motif à un endroit, et que
+c'est ce que l'utilisateur a demandé. Suivre les imports contredit précisément
+l'intention de qui a restreint.
+
+Deux questions étaient confondues dans l'issue, et les séparer est ce qui rend
+le drapeau utilisable :
+
+1. **L'analyse d'un fichier nommé doit-elle lire le corps de ses imports ?**
+   Oui — c'est ce qui rend la réponse juste.
+2. **Les findings des fichiers non nommés doivent-ils être rapportés ?** Non —
+   c'est une question de portée du *rapport*, pas de soundness.
+
+Le drapeau répond oui à la première, non à la seconde. Ce que la seconde laisse
+de côté est **compté et nommé**, comme un angle mort à l'envers : rien n'est
+inconnu, c'est connu et filtré exprès, donc ça se dit.
+
+### La mesure, sur un run restreint
+
+`reactant check test-repo/excalidraw/excalidraw-app` :
+
+| | fichiers | findings | angles morts | retenus |
+|---|---|---|---|---|
+| défaut | 38 | 0 | `unread-imports` | — |
+| `--follow-imports` | **440** (402 suivis) | 0 | **aucun** | **19** |
+
+excalidraw-app n'a réellement aucun finding — c'est maintenant prouvé plutôt
+qu'esquivé — et le drapeau annonce 19 findings dans le code qu'il importe.
+
+Suivre est plus **précis** que nommer le répertoire parent : `excalidraw-app` +
+`packages` donne 490 fichiers et 22 findings, la clôture 440 et 19. La
+différence est ce que `packages/` contient et que personne n'importe.
+
+### Ce que ça coûte
+
+Le corpus entier : **826 s** sans, **822 s** avec — soit moins que le bruit
+entre deux exécutions de quatorze minutes. La pré-passe qui parse 35 541
+fichiers pour lire leurs imports ne pèse rien à côté du point fixe.
+
+Le vrai coût n'est pas la pré-passe, c'est d'analyser des fichiers qu'on
+n'analysait pas : 38 → 440 sur excalidraw-app, plus de dix fois. **Le drapeau
+n'est pas une optimisation** : si on veut le projet, `reactant check src/` est
+la meilleure commande. Le drapeau achète un *rapport étroit sur une analyse
+juste*, pas de la vitesse. C'est écrit tel quel dans `usage.md`.
+
+### Ce qu'il change vraiment
+
+Sur la forme minimale (un hook qui renvoie un objet frais, un appelant qui le
+met en dep) :
+
+```
+défaut             warn missing-deps        var:setN     ← la supposition sur un hook opaque
+--follow-imports   warn always-unstable-deps  sur `bag`  ← la vraie cause
+```
+
+Le drapeau n'ajoute pas seulement le vrai finding, il **retire un faux** :
+connaître le corps de `useThing` prouve que `setN` est un setter stable. Les
+deux findings sont ancrés dans le fichier nommé, ce qui est le cas qui
+justifiait le chantier.
+
+### Les deux hôtes
+
+La clôture tourne dans la vue filesystem du moteur, et sous wasm cette vue est
+la carte que l'hôte a chargée. L'hôte ne chargeait que les chemins nommés :
+`MemFileSystem` ne distingue pas « jamais chargé » de « n'existe pas », donc la
+clôture serait revenue vide en annonçant `followed 0` — faux, et silencieux.
+L'hôte élargit maintenant sa marche au projet englobant quand le drapeau est
+mis. Sortie identique au bit près entre natif et wasm.
+
+Au passage, `--exclude-dir` (#137) ne marchait pas du tout sous wasm :
+`npm/lib/index.js` construit son objet d'options champ par champ et le champ
+manquait. La vérification du jour comparait des *comptes*, qui coïncidaient des
+deux côtés. Comparer les fichiers nommés le montre tout de suite — comparer des
+comptes n'est pas comparer un comportement.

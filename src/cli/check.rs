@@ -51,6 +51,13 @@ pub struct CheckArgs {
     #[arg(long, value_delimiter = ',')]
     pub exclude_dir: Vec<String>,
 
+    /// Also analyze the files the named paths import, transitively, so their
+    /// hooks are read instead of treated as opaque. The report still covers
+    /// only the paths you named. Not a speed optimization: the closure often
+    /// approaches the whole project.
+    #[arg(long)]
+    pub follow_imports: bool,
+
     /// Output format (default: human)
     // No clap default_value on this and the two Options below: a default
     // would always yield `Some`, making "flag absent" indistinguishable from
@@ -114,6 +121,7 @@ pub fn run(mut args: CheckArgs) -> i32 {
         all_roots: args.all_roots,
         entry: args.entry.clone(),
         exclude_dirs: args.exclude_dir.clone(),
+        follow_imports: args.follow_imports,
         format: args.format.map(|v| match v {
             OutputFormat::Human => FormatConfig::Human,
             OutputFormat::Json => FormatConfig::Json,
@@ -145,6 +153,7 @@ pub fn run(mut args: CheckArgs) -> i32 {
         all_roots: partial.all_roots,
         entry: partial.entry.clone(),
         exclude_dirs: partial.exclude_dirs.clone(),
+        follow_imports: partial.follow_imports,
         format: match partial.format.unwrap_or(FormatConfig::Human) {
             FormatConfig::Human => driver::ReportFormat::Human,
             FormatConfig::Json => driver::ReportFormat::Json,

@@ -216,6 +216,15 @@ projects, and now reported as `analysis-limit` when it truncates
 [#56](https://github.com/rboudrouss/reactant-analyzer/issues/56), and a returned `FnLit`'s call site stays opaque
 [#57](https://github.com/rboudrouss/reactant-analyzer/issues/57).
 
+Discovery is the sole producer of analyzed files, so on a **narrowed** run
+(`reactant check src/features`) an import resolved outside the named paths is
+located and never read — the imported hook stays opaque and a finding that
+belongs in the named file can be missed [#138](https://github.com/rboudrouss/reactant-analyzer/issues/138). The run says so by name
+(`unread-imports`), and `--follow-imports` closes over those edges; it is off
+by default because naming a directory is a cheap way to look at one pattern,
+and the closure routinely approaches the whole project. A whole-project run is
+unaffected — it already contains its own imports.
+
 Discovery reads the tree's `.gitignore` files to decide which directories are
 build output [#137](https://github.com/rboudrouss/reactant-analyzer/issues/137). The reader covers what real ignore files use —
 anchoring, `!`, `*`/`**`/`?`/`[…]`, nearest-file-wins — but it is not git: a

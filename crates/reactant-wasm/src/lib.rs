@@ -120,6 +120,8 @@ struct Options {
     #[serde(default)]
     exclude_dir: Vec<String>,
     #[serde(default)]
+    follow_imports: bool,
+    #[serde(default)]
     format: Option<String>,
     #[serde(default)]
     fail_on: Option<String>,
@@ -259,6 +261,7 @@ fn check_options(o: &Options, cfg: &config::ReactantConfig) -> Result<CheckOptio
         all_roots: o.all_roots,
         entry: o.entry.clone(),
         exclude_dirs: o.exclude_dir.clone(),
+        follow_imports: o.follow_imports,
         format: match o.format.as_deref() {
             None => None,
             Some("human") => Some(FormatConfig::Human),
@@ -290,6 +293,7 @@ fn check_options(o: &Options, cfg: &config::ReactantConfig) -> Result<CheckOptio
         all_roots: partial.all_roots,
         entry: partial.entry,
         exclude_dirs: partial.exclude_dirs,
+        follow_imports: partial.follow_imports,
         format: match partial.format.unwrap_or(FormatConfig::Human) {
             FormatConfig::Human => driver::ReportFormat::Human,
             FormatConfig::Json => driver::ReportFormat::Json,

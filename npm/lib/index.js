@@ -14,7 +14,7 @@ Usage:
            [--all-roots] [--entry <names>] [--format human|json]
            [--fail-on error|warning|never] [--project auto|vite|next|plain]
            [--rule <name>]… [--ignore-rule <name>]… [--no-color]
-           [--exclude-dir <names>] [--config <path>]
+           [--exclude-dir <names>] [--follow-imports] [--config <path>]
   reactant rules [--config <path>]
   reactant explain <rule> [--config <path>]
   reactant schemas [--out <dir>]
@@ -95,7 +95,9 @@ function main(argv) {
     explainRule: parsed.explainRule,
     paths: parsed.paths,
     files:
-      parsed.command === "check" ? host.buildFileMap(parsed.paths, constants) : {},
+      parsed.command === "check"
+        ? host.buildFileMap(parsed.paths, constants, parsed.options.followImports)
+        : {},
     config: configText,
     packs,
     options: {
@@ -105,6 +107,8 @@ function main(argv) {
       verbose: parsed.options.verbose,
       allRoots: parsed.options.allRoots,
       entry: parsed.options.entry,
+      excludeDir: parsed.options.excludeDir,
+      followImports: parsed.options.followImports,
       format: parsed.options.format,
       failOn: parsed.options.failOn,
       project: parsed.options.project,

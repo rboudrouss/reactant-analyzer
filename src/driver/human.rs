@@ -99,6 +99,7 @@ pub fn render(
             );
         }
         render_blind_spots(&mut out, report, &p);
+        render_followed(&mut out, report, &p);
         return out;
     }
 
@@ -308,6 +309,7 @@ pub fn render(
         );
     }
     render_blind_spots(&mut out, report, &p);
+    render_followed(&mut out, report, &p);
     out
 }
 
@@ -322,4 +324,39 @@ fn render_blind_spots(out: &mut String, report: &CheckReport, p: &Palette) {
     for spot in &report.blind_spots {
         let _ = writeln!(out, "{}     • {}{}", p.dim, spot.detail, p.reset);
     }
+}
+
+/// What `--follow-imports` read, and what it found there and is not showing.
+///
+/// Printed under every summary, next to the blind spots, because it answers
+/// the same question from the other side: the blind-spot list says what the
+/// run could not see, this says what it saw and deliberately left out.
+fn render_followed(out: &mut String, report: &CheckReport, p: &Palette) {
+    let Some(f) = &report.followed else { return };
+    let _ = writeln!(
+        out,
+        "{}   followed {} imported file(s){}{}",
+        p.dim,
+        f.files,
+        examples(&f.examples),
+        p.reset
+    );
+    if f.withheld > 0 {
+        let _ = writeln!(
+            out,
+            "{}   {} finding(s) in those file(s) are not shown — name the path(s) to \
+             report them{}{}",
+            p.yellow,
+            f.withheld,
+            examples(&f.withheld_examples),
+            p.reset
+        );
+    }
+}
+
+fn examples(paths: &[String]) -> String {
+    if paths.is_empty() {
+        return String::new();
+    }
+    format!(" ({})", paths.join(", "))
 }

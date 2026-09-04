@@ -60,6 +60,10 @@ pub struct ReactantConfig {
     /// `dist`/`build`/`.next`); `node_modules` is excluded regardless.
     #[serde(default)]
     pub exclude_dirs: Vec<String>,
+    /// Analyze the files the named paths import, transitively. The report
+    /// still covers only the named paths. Not a speed optimization.
+    #[serde(default)]
+    pub follow_imports: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -237,6 +241,7 @@ pub struct CheckArgsPartial {
     pub all_roots: bool,
     pub entry: Vec<String>,
     pub exclude_dirs: Vec<String>,
+    pub follow_imports: bool,
     pub format: Option<FormatConfig>,
     pub fail_on: Option<FailOnConfig>,
     pub project: Option<ProjectConfig>,
@@ -256,6 +261,7 @@ impl CheckArgsPartial {
         self.info |= cfg.info.unwrap_or(false);
         self.show_clean |= cfg.show_clean.unwrap_or(false);
         self.trace |= cfg.trace.unwrap_or(false);
+        self.follow_imports |= cfg.follow_imports.unwrap_or(false);
         self.fail_on = self.fail_on.or(cfg.fail_on);
         self.format = self.format.or(cfg.format);
         self.project = self.project.or(cfg.project);

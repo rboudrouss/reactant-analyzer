@@ -23,7 +23,23 @@ struct JsonReport<'a> {
     /// What the run knows it did not read. Non-empty means `summary.errors` and
     /// `summary.warnings` are a lower bound, not a verdict (#9, #47).
     blind_spots: Vec<JsonBlindSpot<'a>>,
+    /// Present only under `--follow-imports` (#138): what the run read beyond
+    /// the named paths, and what it found there and is not reporting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    followed: Option<JsonFollowed<'a>>,
     summary: JsonSummary,
+}
+
+#[derive(Serialize)]
+struct JsonFollowed<'a> {
+    /// Source files reached through resolved import edges.
+    files: usize,
+    examples: &'a [String],
+    /// Findings anchored to components defined in those files. They are real
+    /// and were computed; the report omits them because the user named other
+    /// paths. Naming these paths reports them.
+    withheld: usize,
+    withheld_examples: &'a [String],
 }
 
 #[derive(Serialize)]
@@ -264,6 +280,12 @@ pub fn render(report: &CheckReport, display: &dyn Fn(&Path) -> String) -> String
                 detail: &b.detail,
             })
             .collect(),
+        followed: report.followed.as_ref().map(|f| JsonFollowed {
+            files: f.files,
+            examples: &f.examples,
+            withheld: f.withheld,
+            withheld_examples: &f.withheld_examples,
+        }),
         summary: JsonSummary {
             errors: report.errors,
             warnings: report.warnings,

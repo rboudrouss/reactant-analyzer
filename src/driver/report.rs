@@ -43,4 +43,26 @@ pub struct CheckReport {
     /// "no issues found" is a claim about the code, and it may only be made
     /// about code the analyzer actually read.
     pub blind_spots: Vec<BlindSpot>,
+    /// Set by `--follow-imports`: what the run pulled in beyond the paths the
+    /// user named, and what it found there but is not showing (#138).
+    pub followed: Option<Followed>,
+}
+
+/// The `--follow-imports` accounting (#138).
+///
+/// Two numbers, printed together because they answer the two questions the
+/// flag raises: *what did it read that I did not ask for*, and *what did it
+/// find there that I am not being shown*. The second is the deliberate
+/// counterpart of a blind spot — nothing here is unknown, it is known and
+/// filtered out of the report on purpose, so it is stated rather than
+/// silently dropped.
+pub struct Followed {
+    /// Source files reached through resolved import edges.
+    pub files: usize,
+    /// Up to three of them, for the "this is what widening would add" hint.
+    pub examples: Vec<String>,
+    /// Visible findings anchored to components defined in those files.
+    pub withheld: usize,
+    /// Up to three files holding them — the paths to add to the command line.
+    pub withheld_examples: Vec<String>,
 }

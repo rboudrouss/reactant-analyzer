@@ -30,7 +30,7 @@ use crate::rules::{Diagnostic, ProgramCache, RuleRegistry, SafeCheck, Severity};
 
 pub use blind_spots::BlindSpot;
 pub use palette::Palette;
-pub use report::{CheckReport, ComponentReport};
+pub use report::{CheckReport, ComponentReport, Followed};
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_FINDINGS: i32 = 1;
@@ -69,6 +69,10 @@ pub struct CheckOptions {
     /// Directory names never walked (`--exclude-dir`). Non-empty replaces the
     /// default policy; see [`crate::resolver::EXCLUDED_DIRS`].
     pub exclude_dirs: Vec<String>,
+    /// `--follow-imports`: analyse the files the named ones import, instead of
+    /// treating discovery as the sole producer of lowered files (#138). The
+    /// report still covers only the components defined in the named paths.
+    pub follow_imports: bool,
     pub format: ReportFormat,
     pub fail_on: FailOn,
     pub project: ProjectOverride,
@@ -192,6 +196,26 @@ pub fn run_check(
         }
     }
 
+    // ── Follow import edges (#138, opt-in) ────────────────────────────────────
+    // The paths the user named stay the report's scope; the closure only makes
+    // their analysis correct. Computed before lowering so it costs one extra
+    // parse per file rather than one whole extra lowering pass per depth level.
+    let named: std::collections::HashSet<PathBuf> = files
+        .iter()
+        .map(|p| crate::resolver::normalize(p))
+        .collect();
+    let mut followed_files: Vec<PathBuf> = Vec::new();
+    if opts.follow_imports {
+        followed_files =
+            crate::resolver::import_closure(fs.as_ref(), &files, ctx.resolver.as_ref());
+        if opts.verbose {
+            for path in &followed_files {
+                let _ = writeln!(err, "[verbose] followed import: {}", display(path));
+            }
+        }
+        files.extend(followed_files.iter().cloned());
+    }
+
     // ── Lower ─────────────────────────────────────────────────────────────────
     let mut lowered = lower_files_with(fs.as_ref(), &files, ctx.resolver.as_ref());
     // A file the parser recovered from is noise, and stays on the human
@@ -301,6 +325,12 @@ pub fn run_check(
             exit_code: EXIT_OK,
             file_table: lowered.file_table,
             blind_spots: blind,
+            followed: opts.follow_imports.then(|| Followed {
+                files: followed_files.len(),
+                examples: followed_files.iter().take(3).map(|p| display(p)).collect(),
+                withheld: 0,
+                withheld_examples: Vec::new(),
+            }),
         };
         return CheckOutput {
             stdout: render(&report, opts, display),
@@ -341,6 +371,11 @@ pub fn run_check(
 
     let mut components = Vec::new();
     let (mut errors, mut warnings, mut infos) = (0usize, 0usize, 0usize);
+    // Findings in files reached by `--follow-imports`: counted and named, never
+    // shown. The user asked about the paths they named, and widening the report
+    // to a file they did not name is the surprise the flag exists to avoid.
+    let mut withheld = 0usize;
+    let mut withheld_files: std::collections::BTreeSet<String> = Default::default();
 
     // One cache for the whole run: rules needing whole-program structure (the
     // churn graph of `infinite-loop`) build it once here instead of once per
@@ -368,6 +403,19 @@ pub fn run_check(
         let safe_checks: Vec<SafeCheck> = findings.safe_checks;
         let suspended_safe_checks = findings.suspended_safe_checks;
         diags.retain(|d| d.severity() != Severity::Info || opts.info);
+
+        // A component defined outside the named paths exists in this run only
+        // to make the named ones analysable. Its findings are real, and saying
+        // how many there are is the honest half of not showing them.
+        if let Some((file, _)) = component_meta.get(name)
+            && !named.contains(&crate::resolver::normalize(file))
+        {
+            if !diags.is_empty() {
+                withheld += diags.len();
+                withheld_files.insert(display(file));
+            }
+            continue;
+        }
 
         errors += diags
             .iter()
@@ -413,6 +461,12 @@ pub fn run_check(
         exit_code,
         file_table: program_result.file_table,
         blind_spots: blind,
+        followed: opts.follow_imports.then(|| Followed {
+            files: followed_files.len(),
+            examples: followed_files.iter().take(3).map(|p| display(p)).collect(),
+            withheld,
+            withheld_examples: withheld_files.iter().take(3).cloned().collect(),
+        }),
     };
     CheckOutput {
         stdout: render(&report, opts, display),

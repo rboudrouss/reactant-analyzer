@@ -43,6 +43,14 @@
         }
       ]
     },
+    "followImports": {
+      "description": "Analyze the files the named paths import, transitively. The report\nstill covers only the named paths. Not a speed optimization.",
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
     "format": {
       "anyOf": [
         {
