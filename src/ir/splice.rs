@@ -11,9 +11,11 @@
 //! The abstract environment is a single flat namespace keyed by variable name,
 //! so a callee local `data` would clobber a caller `data` once spliced in. To
 //! keep the splice hygienic, every variable *bound* inside the callee (its
-//! params and every `let` target) is renamed to a fresh `name#salt`. Free
-//! variables (module consts, sibling functions the callee calls) are left
-//! untouched so they still resolve in the caller's scope. Renaming is
+//! params and every `let` target) is renamed to a fresh `name#salt`. So is any
+//! *free* variable of the callee that the caller happens to bind: a callee's
+//! free name resolves in the callee's own module scope and can never mean a
+//! local of its caller (#141). Free names the caller does not bind are left
+//! untouched — several are recognised by name downstream. Renaming is
 //! capture-aware: descending into a nested `FnLit` drops that closure's own
 //! params from the active map (they shadow), matching [`crate::ir::free_vars`].
 
@@ -250,13 +252,10 @@ pub fn splice_callee_into_cfg(
     Some(block_offset..join_block_id)
 }
 
-/// Fresh-name map for every variable bound inside `cfg`: its `params` plus every
-/// `let` target. Assignments to variables never `let`-bound in the callee are
-/// left out — they are writes to an outer/free binding, not callee locals.
-///
-/// `salt` must be unique per splice within the final CFG so two splices of the
-/// same callee don't produce colliding fresh names.
-pub fn callee_rename_map(cfg: &CFG, params: &[Var], salt: u32) -> HashMap<Var, Var> {
+/// Every variable bound inside `cfg`: `params` plus every `let` target.
+/// Assignments to variables never `let`-bound are left out — those are writes
+/// to an outer/free binding, not locals.
+pub fn bound_vars(cfg: &CFG, params: &[Var]) -> HashSet<Var> {
     let mut bound: HashSet<Var> = params.iter().cloned().collect();
     for block in cfg.blocks.values() {
         for stmt in &block.stmts {
@@ -266,6 +265,58 @@ pub fn callee_rename_map(cfg: &CFG, params: &[Var], salt: u32) -> HashMap<Var, V
         }
     }
     bound
+}
+
+/// Fresh-name map for the variables a splice must rename: everything bound
+/// inside `cfg`, plus any *free* variable of `cfg` that `caller_bound` also
+/// binds.
+///
+/// The bound half keeps the splice hygienic — a callee local `data` must not
+/// clobber a caller `data` in the flat abstract environment.
+///
+/// The free half is lexical scoping (#141). A callee's free variable resolves
+/// in the **callee's** module scope: its imports, its module consts. It can
+/// never mean a local of whatever function happens to call it. Leaving those
+/// names untouched let the caller capture them, and the capture is silent and
+/// wrong in both directions — twenty's `useOpenAskAiPageInSidePanel` reads a
+/// `t` it imports from `@lingui/core/macro`, a module binding that cannot
+/// change between renders, and inlining it into a component holding
+/// `const { t } = useLingui()` made 208 corpus rows claim the import was a
+/// hook value that belonged in a deps array.
+///
+/// Only *colliding* free names are renamed, not all of them. A free name the
+/// caller does not bind is still the callee's own, and several of them are
+/// recognised by name downstream — `fetch`, `console`, a sibling utility the
+/// registry resolves — so renaming those wholesale would trade this false
+/// positive for a false negative. When the caller does bind the name, the two
+/// are provably different bindings and the callee's must be isolated; that it
+/// then resolves to nothing is correct, and a free variable resolving to
+/// nothing is already silent.
+///
+/// `salt` must be unique per splice within the final CFG so two splices of the
+/// same callee don't produce colliding fresh names.
+pub fn callee_rename_map(
+    cfg: &CFG,
+    hooks: &[HookEntry],
+    params: &[Var],
+    salt: u32,
+    caller_bound: &HashSet<Var>,
+) -> HashMap<Var, Var> {
+    let mut rename: HashSet<Var> = bound_vars(cfg, params);
+    // `hooks` matters: by this point a `useCallback` in the callee is a
+    // `HookEntry` with its own body CFG and only a marker left in `cfg`, so the
+    // names it reads — the ones most likely to be captured — are not in `cfg`
+    // at all. The same rename map is applied to those sub-bodies, so it has to
+    // be built from them too.
+    let bodies = std::iter::once(cfg).chain(hooks.iter().filter_map(|h| h.body_cfg()));
+    for body in bodies {
+        for free in crate::ir::free_vars::compute_free_vars(body) {
+            if !rename.contains(&free) && caller_bound.contains(&free) {
+                rename.insert(free);
+            }
+        }
+    }
+    rename
         .into_iter()
         .map(|v| {
             let fresh = format!("{v}#{salt}");
@@ -864,7 +915,7 @@ mod tests {
             blocks: cblocks,
             edges: vec![],
         };
-        let rename = callee_rename_map(&callee, &[], 7);
+        let rename = callee_rename_map(&callee, &[], &[], 7, &HashSet::new());
         let x = "x".to_string();
         let mut caller = caller(vec![let_("x", Expr::HookMarker(0, MarkerVal::Unknown))]);
         splice_callee_into_cfg(
@@ -912,7 +963,7 @@ mod tests {
             blocks: cblocks,
             edges: vec![],
         };
-        let rename = callee_rename_map(&callee, &[], 3);
+        let rename = callee_rename_map(&callee, &[], &[], 3, &HashSet::new());
         assert_eq!(rename.get("x").map(String::as_str), Some("x#3"));
     }
 
@@ -942,7 +993,7 @@ mod tests {
                 kind: EdgeKind::Unconditional,
             }],
         };
-        let rename = callee_rename_map(&callee, &[], 1);
+        let rename = callee_rename_map(&callee, &[], &[], 1, &HashSet::new());
         let mut caller = caller(vec![Stmt::ExprStmt(
             Expr::HookMarker(0, MarkerVal::Unknown),
             None,
@@ -988,7 +1039,7 @@ mod tests {
             edges: vec![],
         };
         let params = vec!["p".to_string()];
-        let rename = callee_rename_map(&callee, &params, 2);
+        let rename = callee_rename_map(&callee, &[], &params, 2, &HashSet::new());
         let args = vec![Expr::Lit(Prim::Int(5))];
         let out = "out".to_string();
         let mut caller = caller(vec![let_("out", Expr::HookMarker(0, MarkerVal::Unknown))]);

@@ -25,7 +25,7 @@ pub use source_range::{
     FileId, FileTable, SourceMap, SourceRange, compute_line_starts, offset_to_range,
 };
 pub use splice::{
-    Splice, callee_rename_map, rename_hook_entry, rename_vars_cfg, source_name,
+    Splice, bound_vars, callee_rename_map, rename_hook_entry, rename_vars_cfg, source_name,
     splice_callee_into_cfg, subst_vars_expr,
 };
 pub use stmt::Stmt;

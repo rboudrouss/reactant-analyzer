@@ -934,7 +934,16 @@ fn expand_custom_hooks(
             labels: offset,
             ids: id_offset,
         };
-        let rename = crate::ir::callee_rename_map(&hook_ir.body_cfg, &hook_ir.params, s);
+        // The caller's own bindings, so a free name of the hook body cannot be
+        // captured by one of them (#141).
+        let caller_bound = crate::ir::bound_vars(render_cfg, &[]);
+        let rename = crate::ir::callee_rename_map(
+            &hook_ir.body_cfg,
+            &hook_ir.hooks,
+            &hook_ir.params,
+            s,
+            &caller_bound,
+        );
 
         let remapped: Vec<HookEntry> = remap_hooks(hook_ir.hooks.clone(), off)
             .into_iter()
@@ -1672,7 +1681,11 @@ fn splice_one_call(
     let utility = resolve_utility(registry, caller_file, &name)?.clone();
 
     let (s, id_offset) = salt.take(alloc_span(&utility.body_cfg, &[]));
-    let rename = crate::ir::callee_rename_map(&utility.body_cfg, &utility.params, s);
+    // The caller's own bindings, so a free name of the utility cannot be
+    // captured by one of them (#141).
+    let caller_bound = crate::ir::bound_vars(cfg, &[]);
+    let rename =
+        crate::ir::callee_rename_map(&utility.body_cfg, &[], &utility.params, s, &caller_bound);
     let body = crate::ir::remap_cfg(
         utility.body_cfg,
         crate::ir::Offsets {

@@ -28,7 +28,9 @@ lignes dépend de la façon dont on compte et n'est pas une série propre d'une
 campagne à l'autre. La première entrée précède cette métrique et est citée en
 findings bruts.
 
-Corpus : `test-repo/`, 14 dépôts, 34 747 fichiers (`files_analyzed`).
+Corpus : `test-repo/`, 14 dépôts, **40 164 fichiers** depuis l'épinglage du
+2026-09-04 (34 747 auparavant — voir la rupture de série plus bas, les deux
+moitiés du tableau ne se comparent pas).
 
 **L'analyse est déterministe.** Quatre exécutions d'un binaire gelé sur un
 dépôt, et deux sur le corpus entier, donnent des fichiers JSON *identiques au
@@ -68,6 +70,13 @@ cette session n'ayant survécu, et sont laissées telles quelles.
 | 2026-09-03 | une lecture de membre a besoin du tas convergé | #135 | 1 325 → 1 325 (voir l'entrée) |
 | 2026-09-03 | les écrivains d'un slot se lisent dans la relation | #92 | 1 325 → 1 314 |
 | 2026-09-03 | un contrat de tuple est indexé par position | #37 | 1 314 → 1 314 (voir l'entrée) |
+| 2026-09-03 | le propriétaire d'un setter se lit au site d'appel | #119 | 1 314 → 1 314 (voir l'entrée) |
+| 2026-09-04 | un quitus ne vaut que pour du code lu | #9, #47 | 1 314 → 1 314 |
+| 2026-09-04 | un sous-répertoire est toujours dans son projet | #9 | 1 314 → 1 314 |
+| 2026-09-04 | un hook dans un terminateur reste un hook | #4, #5 | 1 314 → **1 340** (10 retirés, 36 ajoutés) |
+| 2026-09-04 | un try/catch/finally est du flot de contrôle | #2 | 1 340 → **1 344** (0 retiré, 4 ajoutés) |
+| — | **corpus épinglé : la série repart** | #15 | même binaire, 1 344 → 1 358 |
+| 2026-09-04 | la variable libre d'un appelé n'est pas celle de l'appelant | #141 | 1 358 → **1 317** (41 retirés, 0 ajouté) |
 
 ---
 
@@ -749,8 +758,19 @@ laissées telles quelles et marquées, plutôt que présentées comme contrôlé
 [`corpus-diff.py`](../scripts/corpus-diff.py) prend deux exécutions, imprime
 `avant / après / retirés / ajoutés`, et sort en erreur si les trois ne se
 réconcilient pas. Un point d'arrivée se compte ; il ne se déduit jamais d'un
-delta. Automatiser cela dans la CI est
-[#15](https://github.com/rboudrouss/reactant-analyzer/issues/15).
+delta.
+
+Depuis [#15](https://github.com/rboudrouss/reactant-analyzer/issues/15), la
+règle n'est plus une consigne : le chiffre est dans
+[`docs/corpus-baseline.json`](corpus-baseline.json), produit par
+[`corpus-baseline.py`](../scripts/corpus-baseline.py) et jamais tapé, et le
+workflow `corpus` le rejoue à chaque push sur `main`. Le fichier porte aussi une
+empreinte du contenu — les seuls compteurs laisseraient passer autant de
+retraits que d'ajouts, ce qui est presque la forme qu'avait l'erreur — et
+l'identité du corpus, désormais épinglé commit par commit dans
+[`setup-test-repo.sh`](../scripts/setup-test-repo.sh) : une mesure prise sur des
+sources différentes n'est pas une mesure comparable, et le script refuse plutôt
+que d'annoncer un delta.
 
 ## #4 + #5 — un hook dans un terminateur, un corps concis (2026-09-04)
 
@@ -863,3 +883,72 @@ ajoute quatre instances d'un défaut qui existait déjà à 208.
 Non réduite à un repro minimal — un import non résolu, un appel taggé, une
 descente inter-fichiers ont chacun été essayés isolément sans déclencher le
 constat. Suivi séparément.
+
+## Le corpus a été épinglé (2026-09-04) — la colonne repart de zéro
+
+Jusqu'ici [`setup-test-repo.sh`](../scripts/setup-test-repo.sh) clonait quatorze
+dépôts sur leur branche par défaut, sans commit fixé. Le corpus suivait donc les
+pushes d'autrui, et deux mesures prises à deux dates ne portaient pas sur les
+mêmes sources. Il est désormais épinglé commit par commit
+([#15](https://github.com/rboudrouss/reactant-analyzer/issues/15)).
+
+Le re-clonage a changé le contenu : **34 747 fichiers → 40 164**. Toutes les
+lignes au-dessus restent justes *telles que mesurées*, sur le corpus d'alors ;
+**aucune n'est comparable à ce qui suit**. Le même binaire `3a068ed` vaut 1 344
+sur l'ancien corpus et **1 358** sur le nouveau.
+
+Ne pas prolonger la colonne à travers cette rupture : ce serait exactement la
+faute qui a ouvert #15, un chiffre rapproché d'un autre qui ne mesure pas la
+même chose.
+
+## #141 — la variable libre d'un appelé n'est pas celle de l'appelant (2026-09-04)
+
+`1 358 → 1 317` (−41 : **41 retirés, 0 ajouté**), sur le corpus épinglé. Aucun
+ajout : le correctif ne fait que retirer des affirmations, il n'en produit
+aucune.
+
+### Le défaut
+
+Le splice alpha-renommait tout ce que l'appelé *liait* — ses paramètres et ses
+`let` — et laissait ses variables libres intactes, « so they still resolve in
+the caller's scope », dit le commentaire du module. C'est l'inverse de la portée
+lexicale : en JavaScript, un nom libre d'une fonction se résout dans **son**
+scope de module, jamais dans les locales de qui l'appelle.
+
+Deux témoins, tous deux réels :
+
+```ts
+// twenty — un import, constant par construction
+import { getFieldMetadataItemByIdOrThrow } from '@/object-metadata/utils/…';
+const cb = useCallback(() => { … getFieldMetadataItemByIdOrThrow({…}) }, [store]);
+
+// excalidraw — même chose sans import : une const de module
+export const saveCaretPosition = (doc) => { … };          // ligne 17
+const saveCaretPositionToState = useCallback(() => {
+  const position = saveCaretPosition(ownerDocument);      // ligne 78
+}, […]);
+return { saveCaretPosition: saveCaretPositionToState };   // ligne 102 ← le piège
+```
+
+Le second est le plus parlant : le hook **retourne** son résultat sous le nom
+`saveCaretPosition`, donc un consommateur écrit
+`const { saveCaretPosition } = useTextEditorFocus()` et lie ce nom. L'inlining
+faisait alors capturer la fonction de module de l'appelé par la liaison du
+consommateur. Ce n'est pas une question d'imports — c'est toute liaison de
+module, et c'est pourquoi le correctif vise les variables libres en général.
+
+### Pourquoi seulement les collisions
+
+Seuls les noms libres que l'appelant lie aussi sont renommés. Un nom libre que
+l'appelant ne lie pas reste celui de l'appelé, et plusieurs sont reconnus *par
+leur nom* en aval — `fetch`, `console`, un utilitaire frère que le registre
+résout. Les renommer tous aurait échangé ce faux positif contre un faux négatif,
+ce qui est la direction interdite.
+
+### Le piège de l'implémentation
+
+Le premier correctif ne changeait rien : au moment du splice, un `useCallback`
+de l'appelé est déjà un `HookEntry` avec son propre CFG, et il ne reste qu'un
+marqueur dans le corps. Les noms capturables ne sont donc pas dans
+`body_cfg` du tout. La carte de renommage doit être construite sur le corps
+**et** sur les sous-corps de ses hooks — ce sont eux qui lisent `t`.
