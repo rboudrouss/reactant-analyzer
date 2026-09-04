@@ -1,0 +1,82 @@
+name: corpus
+
+# The finding measure, enforced (#15).
+#
+# The unit tests guard mechanisms; the corpus guards outcomes, and nothing was
+# watching it. Every precision-log number came from a manual procedure over
+# fourteen cloned repositories, and on 2026-09-03 one of them turned out to be
+# wrong by 11 — an endpoint subtracted rather than counted, which then moved
+# every cumulative row after it.
+#
+# Not on pull requests, and not nightly: a full run is ~13 minutes over ~40k
+# files. It runs where the numbers actually come from — pushes to main that
+# touch the analyzer — and on demand. The corpus is pinned commit by commit, so
+# it cannot drift on its own between those pushes; a nightly would re-measure an
+# unchanged input.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "packs/**"
+      - "Cargo.lock"
+      - "docs/corpus-baseline.json"
+      - "scripts/setup-test-repo.sh"
+      - ".github/workflows/corpus.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: corpus-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  measure:
+    name: corpus measure
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The manifest pins every repo to a commit, so its hash is an exact cache
+      # key: the corpus is re-cloned only when someone deliberately moves it.
+      - name: Cache the corpus
+        id: corpus-cache
+        uses: actions/cache@v4
+        with:
+          path: test-repo
+          key: corpus-${{ hashFiles('scripts/setup-test-repo.sh') }}
+
+      - name: Clone the corpus
+        if: steps.corpus-cache.outputs.cache-hit != 'true'
+        run: ./scripts/setup-test-repo.sh
+
+      # Refuses to go on against a corpus that is not the pinned one — a delta
+      # measured on different sources is not a delta.
+      - name: Verify the corpus is the pinned one
+        run: ./scripts/setup-test-repo.sh --verify
+
+      - run: cargo build --release --locked
+
+      - name: Run the analyzer over the corpus
+        run: ./target/release/reactant --format json test-repo > corpus-run.json
+
+      - name: Compare against the committed baseline
+        run: ./scripts/corpus-baseline.py corpus-run.json
+
+      # Kept whatever the outcome: on a failure this is the "before" a human
+      # needs for `corpus-diff.py`, which is the only thing that names the
+      # locations that moved.
+      - name: Upload the run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-run
+          path: corpus-run.json
+          retention-days: 30
