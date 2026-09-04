@@ -39,15 +39,24 @@ export type Anchor = {
 } | {
   "relation": "render_setter_calls";
 } | {
+  "relation": "render_calls";
+} | {
   "relation": "hook_origins";
 } | {
   "relation": "context_providers";
 } | {
+  "elements"?: ElementsName | null;
   "relation": "jsx_props";
+} | {
+  "elements"?: ElementsName | null;
+  "relation": "elements";
 } | {
   "relation": "churn_cycles";
 } | {
   "relation": "context_consumers";
+} | {
+  "firing"?: FiringName | null;
+  "relation": "registrations";
 };
 
 /**
@@ -58,7 +67,12 @@ export type Anchor = {
  */
 export type CleanupName = "present" | "absent" | "unknown";
 
-export type EdgeName = "deps" | "body_setter_calls" | "args" | "writers" | "seeds";
+export type EdgeName = "deps" | "body_setter_calls" | "args" | "writers" | "calls" | "props" | "reads" | "seeds";
+
+/**
+ * Which elements a `jsx_props` anchor enumerates (#125).
+ */
+export type ElementsName = "any" | "component" | "host";
 
 /**
  * What happens to a finding whose must-guard did not certify: `keep` (the
@@ -66,6 +80,12 @@ export type EdgeName = "deps" | "body_setter_calls" | "args" | "writers" | "seed
  * stratification) or `drop` (explicit opt-in for qualification-style rules).
  */
 export type ElseBehavior = "keep" | "drop";
+
+/**
+ * How a registration re-fires (#111). Two-valued and total: every row in the
+ * registrar table is one or the other.
+ */
+export type FiringName = "repeating" | "once";
 
 /**
  * Typed navigation from the anchor (ADR-022 §2): at most one edge, one
@@ -103,6 +123,20 @@ export type Guard = {
   "of": string;
 } | {
   "kind": "name";
+  "of": string;
+  "one_of"?: PVal_Array_of_string | null;
+  "prefix"?: PVal_string | null;
+} | {
+  "kind": "receiver";
+  "of": string;
+  "one_of"?: PVal_Array_of_string | null;
+  "prefix"?: PVal_string | null;
+} | {
+  "is": PVal_Array_of_PhaseName;
+  "kind": "phase";
+  "of": string;
+} | {
+  "kind": "prop";
   "of": string;
   "one_of"?: PVal_Array_of_string | null;
   "prefix"?: PVal_string | null;
@@ -146,6 +180,14 @@ export type Guard = {
   "kind": "provider";
   "of": string;
 } | {
+  "is": PVal_Array_of_TeardownName;
+  "kind": "teardown";
+  "of": string;
+} | {
+  "firing": PVal_Array_of_FiringName;
+  "kind": "registers";
+  "of": string;
+} | {
   "is": PVal_Array_of_SeedSyncName;
   "kind": "seed_sync";
   "of": string;
@@ -168,6 +210,19 @@ export type Guard = {
   "as": string;
   "guards": Guard[];
   "kind": "every";
+  "of": string;
+} | {
+  /**
+   * Name the row binds under inside `guards`, owned by the quantifier
+   * for its own subtree and not visible in the message.
+   */
+  "as": string;
+  "guards": Guard[];
+  "kind": "none";
+  /**
+   * `anchor.<edge>` — the same spelling `count` and `every` use, and
+   * typed by the same table `forEach` navigation reads.
+   */
   "of": string;
 } | {
   "equals"?: PVal_uint64 | null;
@@ -229,6 +284,10 @@ export type PVal_Array_of_CleanupName = CleanupName[] | {
   "$param": string;
 };
 
+export type PVal_Array_of_FiringName = FiringName[] | {
+  "$param": string;
+};
+
 export type PVal_Array_of_IdentityName = IdentityName[] | {
   "$param": string;
 };
@@ -258,6 +317,10 @@ export type PVal_Array_of_SeedSyncName = SeedSyncName[] | {
 };
 
 export type PVal_Array_of_StabilityName = StabilityName[] | {
+  "$param": string;
+};
+
+export type PVal_Array_of_TeardownName = TeardownName[] | {
   "$param": string;
 };
 
@@ -365,6 +428,14 @@ export type SeverityPin = "error" | "warning" | "info";
  * Total mirror of `StabilityVerdict`.
  */
 export type StabilityName = "stable" | "versioned" | "per-render" | "unknown";
+
+/**
+ * Total mirror of the registration↔teardown pairing verdict (#111).
+ * Two-valued in the schema although the engine's fact is three-valued: the
+ * unresolvable case folds into `none-seen`, which reads as an absence of
+ * evidence and never as a proof.
+ */
+export type TeardownName = "paired" | "none-seen";
 
 /**
  * Total mirror of the `writers` updater column (ADR-028 §2); ⊤ = `unknown`.
