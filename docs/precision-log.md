@@ -813,3 +813,53 @@ est favorable : ces hooks étaient auparavant *absents*, pas mal situés. Passer
 « silencieusement manquant » à « signalé sans ligne » va dans le bon sens. La
 correction propre est un span sur `Terminator::Return`, 40 sites de compilation,
 suivie séparément.
+
+## #2 — `try`/`catch`/`finally` est du flot de contrôle (2026-09-04)
+
+`1 340 → 1 344` (+4 : **0 retiré**, 4 ajoutés). Aucun retrait : le correctif ne
+fait qu'ouvrir du code jamais abaissé, il n'en referme aucun.
+
+### Les deux défauts de la même branche
+
+La descente enchaînait les trois corps en ligne droite, chacun sous
+`!builder.is_terminated()`. Un `try` dont le corps retourne scelle le bloc, donc
+**le `catch` et le `finally` n'étaient pas abaissés du tout** — alors que le
+commentaire de la branche disait parcourir le `catch` « so hook extraction can
+find hooks inside catch blocks ». Et quand la garde passait, les deux corps
+étaient séquencés *inconditionnellement* après le corps du `try`, ce qui faisait
+croire au raisonnement tous-chemins qu'une écriture présente seulement dans le
+`catch` a lieu sur chaque chemin.
+
+Un branchement sur une condition inconnaissable — le corps peut lever ou non —
+dit les deux choses vraies à la fois : le gestionnaire est sur *un* chemin et pas
+sur tous, les deux bras convergent vers le finalizer qui est sur tous.
+
+| forme | avant | après |
+|---|---|---|
+| `useEffect` dans un `catch` après `return` | invisible, 1 hook, `✓` | `conditional-hook` (Error) + `infinite-loop` |
+| `setN` dans un `finally` après `return` | invisible, `✓` | `setter-in-render` |
+| `setN` seulement dans le `catch` | **Error** — prétendait tous-chemins | **Warning** |
+| `setN` sans `try` (témoin) | Error | Error |
+
+### Divergence assumée
+
+Un `return` dans le corps du `try` scelle son bloc, donc ce chemin n'atteint pas
+le finalizer là où JS l'exécuterait d'abord. Le finalizer reste atteignable par
+le bras qui lève, donc ses hooks et ses écritures sont trouvés ; ce qui est perdu
+est sa présence sur le chemin retournant, ce qui coûte de la force `must` (un
+Error rétrogradé en Warning) et jamais un constat.
+
+### Les 4 ajouts appartiennent à une famille de FP préexistante
+
+Tous les quatre sont `missing-deps` sur `t`, la macro Lingui de twenty, importée
+au niveau module (`import { t } from '@lingui/core/macro'`) et donc constante
+d'un rendu à l'autre : elle n'a rien à faire dans un tableau de deps.
+
+Ce n'est pas une famille créée ici. Comptée des deux côtés :
+**208 lignes `missing-deps` sur `t` avant le correctif, 212 après.** Les lectures
+de `t` en cause étaient dans des `catch` jamais abaissés ; les rendre visibles
+ajoute quatre instances d'un défaut qui existait déjà à 208.
+
+Non réduite à un repro minimal — un import non résolu, un appel taggé, une
+descente inter-fichiers ont chacun été essayés isolément sans déclencher le
+constat. Suivi séparément.

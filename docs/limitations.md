@@ -29,7 +29,7 @@ shapes, do not trust a clean result for it.**
 
 | Shape in your code | Effect | Issue |
 |---|---|---|
-| `try` whose body returns unconditionally | The whole `catch`/`finally` vanishes | [#2](https://github.com/rboudrouss/reactant-analyzer/issues/2) |
+| A `finally` reached from a `try` body that returned | Runs in JS, but that path does not reach it here, so a certain write is reported as a Warning rather than an Error | [#2](https://github.com/rboudrouss/reactant-analyzer/issues/2) |
 | A hook called inside *returned JSX* (`return <div>{useThing()}</div>`) | Hoisted out of the terminator but not classified, so it yields no hook entry | [#4](https://github.com/rboudrouss/reactant-analyzer/issues/4) |
 | A hook reached only through a `return` | Reported, but with no line or column — `Terminator::Return` carries no span | [#140](https://github.com/rboudrouss/reactant-analyzer/issues/140) |
 | A pack rule anchored on `kind: "custom"` | Sees only hooks the engine could *not* resolve | [#6](https://github.com/rboudrouss/reactant-analyzer/issues/6) |

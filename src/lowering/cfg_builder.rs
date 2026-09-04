@@ -333,33 +333,7 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
             builder.push_stmt(Stmt::ExprStmt(expr, builder.span_at(th.span.start)));
             builder.seal_with(Terminator::Unreachable);
         }
-        Statement::TryStatement(tr) => {
-            lower_stmts(&tr.block.body, builder);
-            if let Some(handler) = &tr.handler {
-                // Not on a real control-flow edge, but we walk the catch body
-                // so hook extraction can find hooks inside catch blocks.
-                if !builder.is_terminated() {
-                    // Bind the catch param (`catch (e)`) so `compute_free_vars`
-                    // doesn't see it as a component-scope capture. The thrown
-                    // value is unknowable → Top.
-                    if let Some(param) = &handler.param {
-                        let span = builder.span_at(param.span.start);
-                        lower_binding_pattern(
-                            &param.pattern,
-                            Expr::SummaryVal(crate::ir::expr::SummaryValue::Top),
-                            span,
-                            builder,
-                        );
-                    }
-                    lower_stmts(&handler.body.body, builder);
-                }
-            }
-            if let Some(finalizer) = &tr.finalizer
-                && !builder.is_terminated()
-            {
-                lower_stmts(&finalizer.body, builder);
-            }
-        }
+        Statement::TryStatement(tr) => lower_try(tr, builder),
         Statement::SwitchStatement(sw) => {
             lower_switch(sw, builder);
         }
@@ -465,6 +439,80 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
 }
 
 // ── Control-flow helpers ──────────────────────────────────────────────────────
+
+/// `try` / `catch` / `finally` as real control flow (#2).
+///
+/// It used to be one straight line: the try body, then the catch body, then the
+/// finalizer, each gated on `!builder.is_terminated()`. That gate is what broke
+/// it — a `try` whose body returns terminates the block, so **the whole `catch`
+/// and `finally` were never lowered at all**, and the arm's own comment said it
+/// walked the catch "so hook extraction can find hooks inside catch blocks",
+/// which is precisely what stopped happening. When the gate did pass, the two
+/// bodies were sequenced *unconditionally* after the try body, so all-paths
+/// reasoning was told a catch-only write happens on every path.
+///
+/// The shape below says both true things at once. A branch on an unknowable
+/// condition — the body may or may not throw — puts the handler on *a* path and
+/// not on all of them, and both arms converge on the finalizer, which is on all
+/// of them. That is what `try`/`catch`/`finally` means.
+///
+/// One honest divergence: a `return` inside the try body seals its block, so
+/// that path does not reach the finalizer, where JS would run it first. The
+/// finalizer is still reachable through the throwing arm, so its hooks and
+/// writes are still found; what is lost is only its presence on the returning
+/// path, which costs `must`-strength (an Error demoted to a Warning) and never
+/// a finding.
+fn lower_try(tr: &TryStatement, builder: &mut BlockBuilder) {
+    let span = builder.span_at(tr.span.start);
+    let try_block = builder.new_block();
+    // With no handler, a throw runs the finalizer and keeps propagating, so the
+    // throwing arm goes straight there.
+    let catch_block = builder.new_block();
+    let after = builder.new_block();
+
+    let branch = builder.seal_with(Terminator::Branch {
+        cond: Expr::SummaryVal(crate::ir::expr::SummaryValue::Top),
+        then_: try_block,
+        else_: catch_block,
+        span,
+    });
+    builder.add_edge(branch, try_block, EdgeKind::IfTrue);
+    builder.add_edge(branch, catch_block, EdgeKind::IfFalse);
+
+    builder.start_block(try_block);
+    lower_stmts(&tr.block.body, builder);
+    if !builder.is_terminated() {
+        let b = builder.seal_with(Terminator::Jump(after));
+        builder.add_edge(b, after, EdgeKind::Unconditional);
+    }
+
+    builder.start_block(catch_block);
+    if let Some(handler) = &tr.handler {
+        // Bind the catch param (`catch (e)`) so `compute_free_vars` doesn't see
+        // it as a component-scope capture. The thrown value is unknowable → Top.
+        if let Some(param) = &handler.param {
+            let pspan = builder.span_at(param.span.start);
+            lower_binding_pattern(
+                &param.pattern,
+                Expr::SummaryVal(crate::ir::expr::SummaryValue::Top),
+                pspan,
+                builder,
+            );
+        }
+        lower_stmts(&handler.body.body, builder);
+    }
+    if !builder.is_terminated() {
+        let b = builder.seal_with(Terminator::Jump(after));
+        builder.add_edge(b, after, EdgeKind::Unconditional);
+    }
+
+    // The finalizer sits on the join, which both arms reach: in JS a `finally`
+    // always runs.
+    builder.start_block(after);
+    if let Some(finalizer) = &tr.finalizer {
+        lower_stmts(&finalizer.body, builder);
+    }
+}
 
 fn lower_if(
     test: &Expression,
