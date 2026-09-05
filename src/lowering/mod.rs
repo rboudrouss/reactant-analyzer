@@ -12,14 +12,13 @@ pub mod utility_detector;
 pub mod utility_lowerer;
 
 pub use crate::ir::{FileId, FileTable, SourceMap, compute_line_starts, offset_to_range};
-use cfg_builder::ExprIds;
-pub use cfg_builder::{build_cfg, build_fn_body_cfg};
+pub use cfg_builder::{LowerCtx, build_cfg, build_fn_body_cfg};
 pub use component_detector::{ComponentCandidate, detect_components};
 pub use hook_detector::{HookCandidate, detect_custom_hooks};
 pub use hook_extractor::{extract_handlers, extract_hooks, extract_subscriptions};
 pub use import_resolution::{
-    HookOrigin, ResolvedImport, build_hook_origins, build_resolved_import_map,
-    build_resolved_imports,
+    HookOrigin, JsxOrigins, ResolvedImport, build_hook_origins, build_jsx_origins,
+    build_resolved_import_map, build_resolved_imports,
 };
 pub use module_facts::collect_module_facts;
 pub use utility_detector::{UtilityCandidate, detect_utilities};
@@ -30,8 +29,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use oxc_ast::ast::{
-    BindingPattern, Declaration, Expression, FormalParameters, FunctionBody,
-    ImportDeclarationSpecifier, Program, Statement, VariableDeclarationKind,
+    BindingPattern, Declaration, ExportDefaultDeclarationKind, Expression, FormalParameters,
+    FunctionBody, ImportDeclarationSpecifier, Program, Statement, VariableDeclarationKind,
 };
 
 use crate::{
@@ -61,6 +60,71 @@ pub(crate) fn is_hook_name(name: &str) -> bool {
             .is_some_and(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
 }
 
+/// Every name `program` binds at the top level, whatever the declaration form,
+/// including the ones an `export` wraps.
+///
+/// Deliberately not "every component": the caller
+/// ([`build_jsx_origins`]) is answering "does this file define the name
+/// itself?", and a name a file declares can never *also* be one it imports.
+/// A binding that turns out not to be a component simply matches nothing in
+/// the registry.
+pub(crate) fn top_level_binding_names(program: &Program) -> Vec<String> {
+    let mut out = Vec::new();
+    fn from_decl(decl: &Declaration, out: &mut Vec<String>) {
+        match decl {
+            Declaration::FunctionDeclaration(f) => {
+                if let Some(id) = &f.id {
+                    out.push(id.name.to_string());
+                }
+            }
+            Declaration::ClassDeclaration(c) => {
+                if let Some(id) = &c.id {
+                    out.push(id.name.to_string());
+                }
+            }
+            Declaration::VariableDeclaration(v) => {
+                for d in &v.declarations {
+                    if let Some(id) = d.id.get_binding_identifier() {
+                        out.push(id.name.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for stmt in &program.body {
+        match stmt {
+            // `export default function Widget() {}` binds `Widget` here too,
+            // and that is the name the component detector registers it under.
+            // An anonymous default export binds nothing and is registered as
+            // `DefaultExport`, which no JSX in this file can name.
+            Statement::ExportDefaultDeclaration(e) => {
+                if let ExportDefaultDeclarationKind::FunctionDeclaration(f) = &e.declaration
+                    && let Some(id) = &f.id
+                {
+                    out.push(id.name.to_string());
+                }
+                if let ExportDefaultDeclarationKind::ClassDeclaration(c) = &e.declaration
+                    && let Some(id) = &c.id
+                {
+                    out.push(id.name.to_string());
+                }
+            }
+            Statement::ExportNamedDeclaration(e) => {
+                if let Some(decl) = &e.declaration {
+                    from_decl(decl, &mut out);
+                }
+            }
+            _ => {
+                if let Some(decl) = stmt.as_declaration() {
+                    from_decl(decl, &mut out);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// A top-level function picked out by one of the detectors, ready for lowering:
 /// its binding name, parameter list, and body. Shared by the component, hook,
 /// and utility detectors — they differ in how they *classify* a function, not
@@ -86,15 +150,11 @@ impl Candidate<'_> {
     /// The single place that dispatch happens, so a new consumer of
     /// [`Candidate`] cannot forget it — which is how the flag came to be
     /// dropped in the first place.
-    pub(crate) fn build_cfg(
-        &self,
-        smap: &crate::ir::SourceMap,
-        ids: &cfg_builder::ExprIds,
-    ) -> (Vec<String>, crate::ir::cfg::CFG) {
+    pub(crate) fn build_cfg(&self, ctx: &LowerCtx) -> (Vec<String>, crate::ir::cfg::CFG) {
         if self.expression {
-            cfg_builder::build_expr_fn_body_cfg(self.params, self.body, smap, ids)
+            cfg_builder::build_expr_fn_body_cfg(self.params, self.body, ctx)
         } else {
-            cfg_builder::build_fn_body_cfg(self.params, self.body, smap, ids)
+            cfg_builder::build_fn_body_cfg(self.params, self.body, ctx)
         }
     }
 }
@@ -317,9 +377,12 @@ pub fn lower_custom_hooks_with_resolver(
     files: &mut FileTable,
     resolver: &dyn ImportResolver,
 ) -> Vec<HookIR> {
-    let smap = SourceMap::new(source, files.intern(file));
-    // One allocation-site counter per file — see `ExprIds` (#134).
-    let expr_ids = ExprIds::default();
+    // One context per file: it carries the shared allocation-site counter
+    // (`ExprIds`, #134) and the JSX callee origins (#7) into every body.
+    let ctx = LowerCtx::new(
+        SourceMap::new(source, files.intern(file)),
+        build_jsx_origins(program, file, resolver),
+    );
     let origins = build_hook_origins(program, file, resolver);
     let react_ns = build_react_ns(program);
     let candidates = detect_custom_hooks(program);
@@ -333,7 +396,7 @@ pub fn lower_custom_hooks_with_resolver(
     candidates
         .into_iter()
         .map(|candidate| {
-            let (params, mut body_cfg) = candidate.build_cfg(&smap, &expr_ids);
+            let (params, mut body_cfg) = candidate.build_cfg(&ctx);
             let (mut hooks, hook_provenance, mut next_label) =
                 extract_hooks(&mut body_cfg, &imports);
             extract_handlers(&body_cfg, &mut hooks, &mut next_label);
@@ -378,9 +441,12 @@ pub fn lower_program_with_resolver(
     files: &mut FileTable,
     resolver: &dyn ImportResolver,
 ) -> Vec<ComponentIR> {
-    let smap = SourceMap::new(source, files.intern(file));
-    // One allocation-site counter per file — see `ExprIds` (#134).
-    let expr_ids = ExprIds::default();
+    // One context per file: it carries the shared allocation-site counter
+    // (`ExprIds`, #134) and the JSX callee origins (#7) into every body.
+    let ctx = LowerCtx::new(
+        SourceMap::new(source, files.intern(file)),
+        build_jsx_origins(program, file, resolver),
+    );
     let origins = build_hook_origins(program, file, resolver);
     let react_ns = build_react_ns(program);
     let module_consts = Arc::new(collect_module_consts(program, &react_ns, file));
@@ -397,7 +463,7 @@ pub fn lower_program_with_resolver(
     detect_components(program)
         .into_iter()
         .map(|candidate| {
-            let (param_names, mut render_cfg) = candidate.build_cfg(&smap, &expr_ids);
+            let (param_names, mut render_cfg) = candidate.build_cfg(&ctx);
             let (mut hooks, hook_provenance, mut next_label) =
                 extract_hooks(&mut render_cfg, &imports);
             extract_handlers(&render_cfg, &mut hooks, &mut next_label);

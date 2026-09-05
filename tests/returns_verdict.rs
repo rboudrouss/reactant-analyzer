@@ -38,27 +38,15 @@ fn ctx_for(src: &str) -> (reactant::engine::ProgramAnalysisResult, String) {
         .expect("component C");
     let name = comp.name.clone();
     let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-    let mut map = std::collections::HashMap::new();
-    map.insert(name.clone(), result);
-    let prog = reactant::engine::ProgramAnalysisResult {
-        components: map,
-        shared_state: reactant::domains::stores::SharedStateStore::new(),
-        call_graph: reactant::engine::ComponentCallGraph::new(),
-        recursive_components: std::collections::HashSet::new(),
-        stats: reactant::engine::AnalysisStats::default(),
-        file_table: Default::default(),
-        module_table: Default::default(),
-        function_registry: Default::default(),
-        phase1_reached: Default::default(),
-    };
+    let prog = reactant::engine::ProgramAnalysisResult::single(&name, result);
     (prog, name)
 }
 
 /// Verdict of argument 0 of the first custom hook in `C`.
 fn arg0_verdict(src: &str) -> ReturnsVerdict {
     let (prog, name) = ctx_for(src);
-    let ctx = RuleCtx::new(&prog, &name);
-    let label = prog.components[&name]
+    let ctx = RuleCtx::new(&prog, prog.component_named(&name).unwrap());
+    let label = prog.components[&prog.component_named(&name).unwrap()]
         .hooks
         .iter()
         .find_map(|h| match h {
@@ -143,6 +131,6 @@ fn uncertified_var_bound_selector_is_unknown() {
 fn out_of_range_argument_is_unknown() {
     let (prog, name) =
         ctx_for("function C() {\n  const x = useStore((s) => s.a);\n  return <div>{x}</div>;\n}");
-    let ctx = RuleCtx::new(&prog, &name);
+    let ctx = RuleCtx::new(&prog, prog.component_named(&name).unwrap());
     assert_eq!(ctx.returns_verdict(999, 0), ReturnsVerdict::Unknown);
 }

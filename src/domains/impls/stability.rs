@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 
 use crate::{
     domains::AbstractDomain,
-    ir::types::{HookLabel, Symbol},
+    ir::{ComponentId, types::HookLabel},
 };
 
 /// Threshold on `Versioned` label sets before widening to `VersionedTop`
@@ -41,7 +41,7 @@ pub enum Stability {
     /// Changes *only* at setter events of these state slots (may bound).
     /// Invariant: non-empty (canonicalised — `Versioned(∅) ≡ Stable`) and
     /// `len() ≤ VERSIONED_LABELS_THRESHOLD` (widened to `VersionedTop` above).
-    Versioned(BTreeSet<(Symbol, HookLabel)>),
+    Versioned(BTreeSet<(ComponentId, HookLabel)>),
     /// Versioned by unknown state slots (threshold-widened `Versioned`).
     VersionedTop,
     /// A fresh reference every render, guaranteed (must bound).
@@ -53,7 +53,7 @@ pub enum Stability {
 
 impl Stability {
     /// Canonicalising constructor: ∅ → `Stable`, over-threshold → `VersionedTop`.
-    pub fn versioned(labels: BTreeSet<(Symbol, HookLabel)>) -> Self {
+    pub fn versioned(labels: BTreeSet<(ComponentId, HookLabel)>) -> Self {
         if labels.is_empty() {
             Stability::Stable
         } else if labels.len() > VERSIONED_LABELS_THRESHOLD {
@@ -64,7 +64,7 @@ impl Stability {
     }
 
     /// Single-slot `Versioned`.
-    pub fn versioned_by(component: Symbol, label: HookLabel) -> Self {
+    pub fn versioned_by(component: ComponentId, label: HookLabel) -> Self {
         Stability::Versioned(BTreeSet::from([(component, label)]))
     }
 }
@@ -174,7 +174,12 @@ mod tests {
     use super::*;
 
     fn v(labels: &[(&str, HookLabel)]) -> Stability {
-        Stability::Versioned(labels.iter().map(|(c, l)| (c.to_string(), *l)).collect())
+        Stability::Versioned(
+            labels
+                .iter()
+                .map(|(c, l)| (crate::test_support::named(c), *l))
+                .collect(),
+        )
     }
 
     fn all_points() -> Vec<Stability> {

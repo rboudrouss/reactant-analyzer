@@ -9,15 +9,20 @@ use crate::{
         AnalysisResult, AnalysisStats, ComponentCache, ComponentCallGraph, ComponentRegistry,
         HookRegistry, fixpoint::Config,
     },
-    ir::{component::ComponentIR, types::Symbol},
+    ir::{ComponentId, component::ComponentIR},
 };
 
 // ── AnalyzeChildFn ─────────────────────────────────────────────────────────────
 
 /// Function pointer for inlining a child component's analysis. Breaks the
 /// circular dep between `domains::transfer` and `engine::fixpoint`.
-pub type AnalyzeChildFn =
-    fn(&ComponentIR, AbstractEnv<StateValue>, Heap, &InterCtx<'_>) -> AnalysisResult<StateValue>;
+pub type AnalyzeChildFn = fn(
+    &ComponentIR,
+    ComponentId,
+    AbstractEnv<StateValue>,
+    Heap,
+    &InterCtx<'_>,
+) -> AnalysisResult<StateValue>;
 
 // ── QueryContext trait ────────────────────────────────────────────────────────
 
@@ -58,11 +63,11 @@ pub struct InterCtx<'a> {
     pub call_graph: &'a RefCell<ComponentCallGraph>,
     pub stats: &'a RefCell<AnalysisStats>,
     /// All analysis results accumulated across the entire program analysis.
-    pub results: &'a RefCell<std::collections::HashMap<Symbol, AnalysisResult<StateValue>>>,
+    pub results: &'a RefCell<std::collections::HashMap<ComponentId, AnalysisResult<StateValue>>>,
     /// Components currently being analyzed (for recursion detection).
-    pub call_stack: RefCell<Vec<Symbol>>,
-    /// Name of the component being analyzed at this level.
-    pub component_name: Symbol,
+    pub call_stack: RefCell<Vec<ComponentId>>,
+    /// The component being analyzed at this level.
+    pub component: ComponentId,
     /// Analysis config (widen_threshold etc.).
     pub config: &'a Config,
     /// Callback provided by `engine::fixpoint` to inline a child component's analysis.
@@ -74,9 +79,9 @@ pub struct InterCtx<'a> {
 impl<'a> InterCtx<'a> {
     /// Create a child context for inlining a nested component.
     /// Shares all RefCell state; new call_stack with parent pushed.
-    pub fn child(&self, child_name: Symbol) -> InterCtx<'a> {
+    pub fn child(&self, child: ComponentId) -> InterCtx<'a> {
         let mut new_stack = self.call_stack.borrow().clone();
-        new_stack.push(self.component_name.clone());
+        new_stack.push(self.component);
         InterCtx {
             registry: self.registry,
             cache: self.cache,
@@ -85,15 +90,15 @@ impl<'a> InterCtx<'a> {
             stats: self.stats,
             results: self.results,
             call_stack: RefCell::new(new_stack),
-            component_name: child_name,
+            component: child,
             config: self.config,
             analyze_child: self.analyze_child,
             hook_registry: self.hook_registry,
         }
     }
 
-    pub fn is_recursive(&self, name: &Symbol) -> bool {
-        self.call_stack.borrow().contains(name) || &self.component_name == name
+    pub fn is_recursive(&self, id: ComponentId) -> bool {
+        self.call_stack.borrow().contains(&id) || self.component == id
     }
 }
 
@@ -105,11 +110,12 @@ impl<'a> InterCtx<'a> {
 /// `env` is kept as a separate parameter since its mutability and lifetime
 /// differ between `eval_expr` (`&`) and `exec_stmt` (`&mut`).
 pub struct AnalysisCtx<'a, D: AbstractDomain> {
-    /// Name of the component under analysis. An analysis is always the
-    /// analysis of SOME component — intra or inter — so this is not an
-    /// `Option`: state-slot provenance (`Versioned` labels, `SetterVal`)
-    /// always carries the real owner.
-    pub component: Symbol,
+    /// The component under analysis. An analysis is always the analysis of
+    /// SOME component — intra or inter — so this is not an `Option`:
+    /// state-slot provenance (`Versioned` labels, `SetterVal`) always carries
+    /// the real owner. A hand-built IR analysed on its own carries
+    /// [`ComponentId::SYNTHETIC`].
+    pub component: ComponentId,
     pub state: &'a mut StateStore<D>,
     pub memo: &'a mut MemoStore<D>,
     pub heap: &'a mut Heap,
@@ -121,7 +127,7 @@ pub struct AnalysisCtx<'a, D: AbstractDomain> {
 impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
     /// Construct with `NullCtx` as the query context (tests, simple impls).
     pub fn null(
-        component: Symbol,
+        component: ComponentId,
         state: &'a mut StateStore<D>,
         memo: &'a mut MemoStore<D>,
         heap: &'a mut Heap,

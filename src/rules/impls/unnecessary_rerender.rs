@@ -39,7 +39,7 @@ impl Rule for UnnecessaryRerender {
         // Needs a state slot and a mount-only (`deps: []`) effect to overwrite it.
         result
             .components
-            .get(component)
+            .get(&component)
             .is_some_and(|c| {
                 c.hook_calls.iter().any(|h| h.kind == HookKind::State)
                     && c.effect_info
@@ -54,7 +54,7 @@ impl Rule for UnnecessaryRerender {
 
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
         let (result, component) = (ctx.program(), ctx.component());
-        let result = &result.components[component];
+        let result = &result.components[&component];
         let empty_env = AbstractEnv::bottom();
         let empty_state = StateStore::bottom();
         let empty_memo = MemoStore::new();
@@ -69,7 +69,7 @@ impl Rule for UnnecessaryRerender {
                     let val = crate::rules::eval_in_stores(
                         init,
                         &empty_env,
-                        &result.component,
+                        result.component,
                         &empty_state,
                         &empty_memo,
                         &mut crate::domains::Heap::new(),
@@ -278,7 +278,8 @@ mod tests {
             DepsArg::List(DepsList::exact(vec![])),
         );
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let diags = UnnecessaryRerender.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags =
+            UnnecessaryRerender.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].rule, "unnecessary-rerender");
         assert_eq!(diags[0].hook_label, Some(0));
@@ -308,7 +309,8 @@ mod tests {
             DepsArg::List(DepsList::exact(vec![])),
         );
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let diags = UnnecessaryRerender.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags =
+            UnnecessaryRerender.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1, "aliased setter should still warn");
         assert_eq!(diags[0].hook_label, Some(0));
     }
@@ -331,7 +333,7 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(
             UnnecessaryRerender
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -354,7 +356,7 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(
             UnnecessaryRerender
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -377,7 +379,8 @@ mod tests {
             DepsArg::List(DepsList::exact(vec![])),
         );
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let diags = UnnecessaryRerender.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags =
+            UnnecessaryRerender.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert!(
             diags[0].message.contains("useSyncExternalStore"),
@@ -408,7 +411,8 @@ mod tests {
             DepsArg::List(DepsList::exact(vec![])),
         );
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let diags = UnnecessaryRerender.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags =
+            UnnecessaryRerender.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert!(
             diags[0].message.contains("initialising directly"),
@@ -435,7 +439,7 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(
             !UnnecessaryRerender
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }

@@ -6,12 +6,12 @@ use crate::{
         stores::{AbstractEnv, Heap, MemoStore, StateStore},
     },
     ir::{
-        SourceRange,
+        ComponentId, SourceRange,
         cfg::{CFG, Terminator},
         expr::Expr,
         free_vars::AccessPath,
         hooks::{DepsArg, DepsList, HookEntry},
-        types::{BlockId, HookLabel, Symbol, Var},
+        types::{BlockId, HookLabel, Var},
     },
 };
 
@@ -170,10 +170,10 @@ impl EffectInfo {
 
 #[derive(Debug, Clone)]
 pub struct AnalysisResult<D: AbstractDomain> {
-    /// Name of the component this result belongs to. Rules re-evaluating
-    /// expressions against the result use it as the `AnalysisCtx` component
-    /// (state-slot provenance).
-    pub component: Symbol,
+    /// The component this result belongs to. Rules re-evaluating expressions
+    /// against the result use it as the `AnalysisCtx` component (state-slot
+    /// provenance).
+    pub component: ComponentId,
     /// The component's defining file — registry-resolution key for witness
     /// producers (`witness::resolve_and_classify`, ADR-019). Empty for
     /// hand-built IR (unit tests).

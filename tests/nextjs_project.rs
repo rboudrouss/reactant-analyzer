@@ -47,8 +47,7 @@ fn analyze_fixture() -> ProgramAnalysisResult {
 }
 
 fn findings(result: &ProgramAnalysisResult, component: &str, rule: &str) -> Vec<Diagnostic> {
-    let name = component.to_string();
-    let ctx = RuleCtx::new(result, &name);
+    let ctx = RuleCtx::new(result, result.component_named(component).unwrap());
     all_rules()
         .iter()
         .flat_map(|r| r.check(&ctx))
@@ -273,8 +272,7 @@ fn next_navigation_hooks_are_known_not_unknown() {
     // `usePathname` in a *client* component: a registered summary, so no
     // `analysis-limit/unknown-hook` Info.
     let result = analyze_fixture();
-    let name = "Counter".to_string();
-    let ctx = RuleCtx::new(&result, &name);
+    let ctx = RuleCtx::new(&result, result.component_named("Counter").unwrap());
     assert!(
         !all_rules()
             .iter()

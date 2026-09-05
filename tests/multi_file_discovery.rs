@@ -139,7 +139,7 @@ fn directory_input_discovers_and_analyzes_multiple_files() {
     );
 
     assert!(
-        result.components.contains_key("Page"),
+        result.component_named("Page").is_some(),
         "expected Page in analysis results, got: {:?}",
         result.components.keys().collect::<Vec<_>>()
     );

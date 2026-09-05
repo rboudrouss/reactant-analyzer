@@ -52,8 +52,7 @@ fn parse_and_analyze(src: &str) -> ProgramAnalysisResult {
 
 fn diags_for(result: &ProgramAnalysisResult, component: &str) -> Vec<Diagnostic> {
     let rules = all_rules();
-    let component = component.to_string();
-    let ctx = RuleCtx::new(result, &component);
+    let ctx = RuleCtx::new(result, result.component_named(component).unwrap());
     rules.iter().flat_map(|r| r.check(&ctx)).collect()
 }
 
@@ -76,11 +75,11 @@ fn infinite_loop_via_custom_hook_detected() {
     "#;
     let result = parse_and_analyze(src);
     assert!(
-        result.components.contains_key("Counter"),
+        result.component_named("Counter").is_some(),
         "Counter not in results"
     );
 
-    let counter_result = &result.components["Counter"];
+    let counter_result = &result.components[&result.component_named("Counter").unwrap()];
     assert!(
         !counter_result.widen_trace.is_empty(),
         "Expected widened labels (infinite loop) in Counter but got none.\n\
@@ -105,11 +104,11 @@ fn clean_custom_hook_no_widening() {
     "#;
     let result = parse_and_analyze(src);
     assert!(
-        result.components.contains_key("Counter"),
+        result.component_named("Counter").is_some(),
         "Counter not in results"
     );
 
-    let counter_result = &result.components["Counter"];
+    let counter_result = &result.components[&result.component_named("Counter").unwrap()];
     assert!(
         counter_result.widen_trace.is_empty(),
         "Expected no widened labels in Counter but got: {:?}",
@@ -130,7 +129,7 @@ fn unknown_custom_hook_no_crash() {
         }
     "#;
     let result = parse_and_analyze(src);
-    assert!(result.components.contains_key("Counter"));
+    assert!(result.component_named("Counter").is_some());
 
     // No false-positive diagnostics.
     let diags = diags_for(&result, "Counter");
@@ -167,10 +166,10 @@ fn nested_custom_hooks_state_visible() {
         }
     "#;
     let result = parse_and_analyze(src);
-    assert!(result.components.contains_key("Counter"));
+    assert!(result.component_named("Counter").is_some());
 
     // The state from useB must be tracked: at least 1 HookEntry::State visible in the result.
-    let counter_result = &result.components["Counter"];
+    let counter_result = &result.components[&result.component_named("Counter").unwrap()];
     let state_hooks = counter_result
         .hooks
         .iter()
@@ -204,7 +203,7 @@ fn setter_in_render_via_custom_hook_detected() {
         }
     "#;
     let result = parse_and_analyze(src);
-    assert!(result.components.contains_key("Comp"));
+    assert!(result.component_named("Comp").is_some());
 
     let diags = diags_for(&result, "Comp");
     let setter_diag = diags.iter().find(|d| d.rule == "setter-in-render");
@@ -237,7 +236,7 @@ fn probe_multiblock_hook_setter_in_join_block_detected() {
         }
     "#;
     let result = parse_and_analyze(src);
-    assert!(result.components.contains_key("Comp"));
+    assert!(result.component_named("Comp").is_some());
     let diags = diags_for(&result, "Comp");
     let setter_diag = diags.iter().find(|d| d.rule == "setter-in-render");
     assert!(
@@ -324,7 +323,7 @@ fn recursive_custom_hook_terminates() {
     "#;
     // Must not hang. If it runs past this point, the recursion guard worked.
     let result = parse_and_analyze(src);
-    assert!(result.components.contains_key("Comp"));
+    assert!(result.component_named("Comp").is_some());
 }
 
 // ── Test 7: members of a hook-returned object keep their own stability ────────

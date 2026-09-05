@@ -103,6 +103,20 @@ pub fn object_member<'e>(fields: &'e [(Symbol, Expr)], key: &str) -> Option<&'e 
         .map(|(_, v)| v)
 }
 
+/// The component a JSX callee was proven to name: the file that defines it and
+/// the name that file knows it by.
+///
+/// Both halves are needed, and they are exactly [`crate::engine::ComponentKey`]
+/// spelled without the engine dependency. The file settles which of several
+/// same-named components is meant; the name settles an alias, since
+/// `import { Widget as W }` writes `<W/>` here while the origin file registers
+/// `Widget`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CompOrigin {
+    pub file: std::path::PathBuf,
+    pub name: Symbol,
+}
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     // Primitive literals
@@ -172,6 +186,11 @@ pub enum Expr {
         /// else to point: unlike `NativeElem`, whose handler props are reached
         /// through `HookEntry::Handler`, a component element owns no hook.
         span: Option<SourceRange>,
+        /// Which component `name` was *proven* to name, when the file's
+        /// imports (or its own declarations) settle it — the same fact
+        /// `HookEntry::Custom::resolved_file` records for a custom hook call.
+        /// `None` is ignorance, never a proven negative.
+        origin: Option<Arc<CompOrigin>>,
     },
     NativeElem {
         tag: Symbol,

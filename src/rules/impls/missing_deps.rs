@@ -32,7 +32,7 @@ impl Rule for MissingDeps {
         // Applicable when some effect/memo/callback declared a deps array.
         result
             .components
-            .get(component)
+            .get(&component)
             .is_some_and(|c| c.effect_info.values().any(|e| e.has_deps_array()))
             .then_some(crate::rules::SafeCheck {
                 rule: Self::NAME,
@@ -42,7 +42,7 @@ impl Rule for MissingDeps {
 
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
         let (result, component) = (ctx.program(), ctx.component());
-        let result = &result.components[component];
+        let result = &result.components[&component];
         let env_exit = result.exit_env();
         let mut diags = Vec::new();
 
@@ -301,7 +301,7 @@ mod tests {
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
-        let diags = MissingDeps.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = MissingDeps.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].var.as_deref(), Some("n"));
     }
@@ -329,7 +329,7 @@ mod tests {
         let result = make_result(block_states, effect_info, trivial_cfg());
         assert!(
             MissingDeps
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -357,7 +357,7 @@ mod tests {
         let result = make_result(block_states, effect_info, trivial_cfg());
         assert!(
             MissingDeps
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -393,7 +393,7 @@ mod tests {
         let result = make_result(block_states, effect_info, trivial_cfg());
         assert!(
             MissingDeps
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty(),
             "[memo.content] must cover use of memo.content"
         );
@@ -428,7 +428,7 @@ mod tests {
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
-        let diags = MissingDeps.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = MissingDeps.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1, "memo.a not covered by [memo.b]");
         assert!(diags[0].message.contains("memo.a"), "{}", diags[0].message);
     }
@@ -461,7 +461,7 @@ mod tests {
         let result = make_result(block_states, effect_info, trivial_cfg());
         assert!(
             MissingDeps
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty(),
             "[memo] must cover memo.a"
         );
@@ -494,7 +494,7 @@ mod tests {
         let result = make_result(block_states, effect_info, trivial_cfg());
         assert_eq!(
             MissingDeps
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .len(),
             1
         );
@@ -523,7 +523,7 @@ mod tests {
         let result = make_result(block_states, effect_info, trivial_cfg());
         assert!(
             MissingDeps
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -552,7 +552,7 @@ mod tests {
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
-        let diags = MissingDeps.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = MissingDeps.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(
             diags.len(),
             1,
@@ -579,7 +579,7 @@ mod tests {
         block_states.insert(0, env_with(&[("x", StateValue::top())]));
 
         let result = make_result(block_states, effect_info, trivial_cfg());
-        let diags = MissingDeps.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = MissingDeps.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].var.as_deref(), Some("x"));
     }
@@ -606,7 +606,7 @@ mod tests {
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
-        let diags = MissingDeps.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = MissingDeps.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert!(
             diags[0].message.contains("callback"),
@@ -637,7 +637,7 @@ mod tests {
         );
 
         let result = make_result(block_states, effect_info, trivial_cfg());
-        let diags = MissingDeps.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = MissingDeps.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert!(
             diags[0].message.contains("memo"),
@@ -669,7 +669,7 @@ mod tests {
         let result = make_result(block_states, effect_info, trivial_cfg());
         assert!(
             MissingDeps
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -694,7 +694,7 @@ mod tests {
         let result = make_result(block_states, effect_info, trivial_cfg());
         assert!(
             MissingDeps
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }

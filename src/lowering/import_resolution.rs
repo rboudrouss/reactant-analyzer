@@ -7,9 +7,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use oxc_ast::ast::{ImportDeclarationSpecifier, Program, Statement};
 
+use crate::ir::expr::CompOrigin;
+use crate::ir::types::Symbol;
 use crate::resolver::ImportResolver;
 
 /// An import resolved to its defining file, keeping the name the *origin*
@@ -199,4 +202,61 @@ pub fn build_resolved_import_map(
         .into_iter()
         .map(|(local, r)| (local, r.file))
         .collect()
+}
+
+/// Local binding name → the component that name was proven to stand for, for
+/// one file.
+///
+/// The map a JSX callee is stamped with at lowering ([`Expr::CompApp::origin`]).
+/// `Arc` because every body of the file — every nested `FnLit`, every hook
+/// body — shares the one map, and lowering clones its context freely.
+///
+/// [`Expr::CompApp::origin`]: crate::ir::expr::Expr::CompApp
+#[derive(Debug, Clone, Default)]
+pub struct JsxOrigins(Arc<HashMap<Symbol, Arc<CompOrigin>>>);
+
+impl JsxOrigins {
+    /// The component `local` was proven to name here, or `None` when nothing
+    /// in this file settles it.
+    pub fn get(&self, local: &str) -> Option<&Arc<CompOrigin>> {
+        self.0.get(local)
+    }
+}
+
+/// Resolve every name `file` could write as a JSX callee to the component it
+/// names: its own top-level declarations, plus every import the resolver maps
+/// to a real file.
+///
+/// Imports are laid down last on purpose — not because a file can both declare
+/// and import one name (that is a redeclaration error), but so the rule is
+/// stated once rather than depending on which pass ran first.
+///
+/// A name absent from the map is *unresolved*, not absent from the program:
+/// namespace imports, re-export barrels and npm packages all land there, and
+/// the engine falls back to resolution by name.
+pub fn build_jsx_origins(
+    program: &Program,
+    current_file: &Path,
+    resolver: &dyn ImportResolver,
+) -> JsxOrigins {
+    let mut map: HashMap<Symbol, Arc<CompOrigin>> = HashMap::new();
+    for name in super::top_level_binding_names(program) {
+        map.insert(
+            name.clone(),
+            Arc::new(CompOrigin {
+                file: current_file.to_path_buf(),
+                name,
+            }),
+        );
+    }
+    for (local, origin) in build_resolved_imports(program, current_file, resolver) {
+        map.insert(
+            local,
+            Arc::new(CompOrigin {
+                file: origin.file,
+                name: origin.imported,
+            }),
+        );
+    }
+    JsxOrigins(Arc::new(map))
 }

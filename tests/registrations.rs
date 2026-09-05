@@ -47,7 +47,7 @@ fn comp<'a>(
     r: &'a ProgramAnalysisResult,
     name: &str,
 ) -> &'a AnalysisResult<reactant::domains::StateValue> {
-    &r.components[&name.to_string()]
+    &r.components[&r.component_named(name).unwrap()]
 }
 
 // ── The table is one table ───────────────────────────────────────────────────
@@ -298,7 +298,7 @@ export function Parent() {
 }
 "#;
     let r = parse_and_analyze(src);
-    let diags = InfiniteLoop.check(&RuleCtx::new(&r, &"Child".to_string()));
+    let diags = InfiniteLoop.check(&RuleCtx::new(&r, r.component_named("Child").unwrap()));
     assert!(diags.is_empty(), "{diags:?}");
 }
 
@@ -322,7 +322,8 @@ export function Parent() {
 }
 "#;
     let r = parse_and_analyze(src);
-    let diags = reactant::rules::MissingCleanup.check(&RuleCtx::new(&r, &"Child".to_string()));
+    let diags = reactant::rules::MissingCleanup
+        .check(&RuleCtx::new(&r, r.component_named("Child").unwrap()));
     assert_eq!(diags.len(), 1, "{diags:?}");
 }
 
@@ -345,7 +346,7 @@ export function Parent() {
 }
 "#;
     let r = parse_and_analyze(src);
-    let diags = InfiniteLoop.check(&RuleCtx::new(&r, &"Child".to_string()));
+    let diags = InfiniteLoop.check(&RuleCtx::new(&r, r.component_named("Child").unwrap()));
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(diags[0].rule, "cross-component-infinite-loop");
 }

@@ -85,7 +85,7 @@ impl Rule for LazyInit {
 
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
         let (program, component) = (ctx.program(), ctx.component());
-        let result = &program.components[component];
+        let result = &program.components[&component];
         // #1 chases a call through a local binding, but only when that binding is
         // used exactly once (at the init). A `const x = f()` statement runs on
         // every render regardless, so if `x` is read elsewhere the call is not
@@ -331,7 +331,7 @@ mod tests {
             span: None,
         }];
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
-        let diags = LazyInit.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = LazyInit.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].rule, "lazy-init");
         assert_eq!(diags[0].hook_label, Some(0));
@@ -353,7 +353,7 @@ mod tests {
             span: None,
         }];
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
-        let diags = LazyInit.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = LazyInit.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
     }
 
@@ -367,7 +367,7 @@ mod tests {
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
         assert!(
             LazyInit
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -388,7 +388,7 @@ mod tests {
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
         assert!(
             LazyInit
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -407,7 +407,7 @@ mod tests {
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
         assert!(
             LazyInit
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -426,7 +426,7 @@ mod tests {
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
         assert!(
             LazyInit
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -488,7 +488,7 @@ mod tests {
         );
         assert!(
             LazyInit
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -505,7 +505,7 @@ mod tests {
             span: None,
         }];
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
-        let diags = LazyInit.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = LazyInit.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].severity(), Severity::Warning);
         assert!(diags[0].message.contains("side effects"));
@@ -526,7 +526,7 @@ mod tests {
             span: None,
         }];
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
-        let diags = LazyInit.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = LazyInit.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].severity(), Severity::Info);
     }
@@ -549,7 +549,7 @@ mod tests {
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
         assert_eq!(
             LazyInit
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .len(),
             1
         );
@@ -570,7 +570,7 @@ mod tests {
             span: None,
         }];
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
-        let diags = LazyInit.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = LazyInit.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1, "{diags:?}");
         assert_eq!(diags[0].severity(), crate::rules::Severity::Info);
         assert!(diags[0].message.contains("useRef"), "{}", diags[0].message);
@@ -587,7 +587,7 @@ mod tests {
             span: None,
         }];
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
-        let diags = LazyInit.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = LazyInit.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1, "{diags:?}");
         assert_eq!(diags[0].severity(), crate::rules::Severity::Warning);
         assert!(
@@ -615,7 +615,7 @@ mod tests {
             },
         ];
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
-        let diags = LazyInit.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = LazyInit.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         let d = diags
             .iter()
             .find(|d| d.hook_label == Some(1))
@@ -638,7 +638,7 @@ mod tests {
             span: None,
         }];
         let result = analyze_component(component(hooks), &StateValueTransfer, &Config::default());
-        let diags = LazyInit.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = LazyInit.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert!(diags.is_empty(), "{diags:?}");
     }
 }

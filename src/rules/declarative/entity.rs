@@ -23,7 +23,7 @@ use crate::ir::SourceRange;
 use crate::ir::expr::Expr;
 use crate::ir::free_vars::{AccessPath, dep_paths};
 use crate::ir::hooks::{HookEntry, HookProvenance};
-use crate::ir::types::{BlockId, HookLabel, Symbol, Var};
+use crate::ir::types::{BlockId, HookLabel, Var};
 use crate::rules::api::query::{
     Certified, CleanupVerdict, ConditionalHookCall, ExitDominance, RuleCtx,
 };
@@ -45,6 +45,7 @@ use super::schema::{
     UpdaterName,
 };
 use super::validate::Field;
+use crate::ir::ComponentId;
 use crate::rules::helpers::purity::{ImpureBody, classify_body};
 
 // ── Entities ──────────────────────────────────────────────────────────────────
@@ -71,7 +72,7 @@ pub(crate) struct SetterEntity {
     /// A foreign row's `slot` is a label of the OWNER's component, so it must
     /// never be resolved against this component's naming table: labels are
     /// per-component and would collide.
-    pub owner: Option<Symbol>,
+    pub owner: Option<ComponentId>,
 }
 
 /// One declared deps-array entry.
@@ -861,9 +862,9 @@ impl<'a> EntityCtx<'a> {
             // local setter, the parent for a `ComponentSetter`-valued prop.
             Field::Owner => match v {
                 EntityVal::Setter(s) => Some(
-                    s.owner
-                        .clone()
-                        .unwrap_or_else(|| self.ctx.component().clone()),
+                    self.ctx
+                        .program()
+                        .display_name(s.owner.unwrap_or_else(|| self.ctx.component())),
                 ),
                 EntityVal::Hook(_)
                 | EntityVal::Dep(_)
@@ -965,10 +966,10 @@ impl<'a> EntityCtx<'a> {
     /// per-component.
     fn setter_slot_name(&self, s: &SetterEntity) -> Option<String> {
         let label = s.slot?;
-        let Some(owner) = &s.owner else {
+        let Some(owner) = s.owner else {
             return self.slot_source_name(label);
         };
-        let comp = self.ctx.program().components.get(owner)?;
+        let comp = self.ctx.program().components.get(&owner)?;
         let names = resolve_setter_aliases(&comp.render_cfg, &state_val_labels(&comp.render_cfg));
         pick_name(&names, label)
     }
@@ -998,7 +999,7 @@ impl<'a> EntityCtx<'a> {
                 let (slot, owner) = match self.setter_labels.get(&c.var) {
                     Some(&label) => (Some(label), None),
                     None => match cross.get(&c.var) {
-                        Some(prop) => (Some(prop.label), Some(prop.component.clone())),
+                        Some(prop) => (Some(prop.label), Some(prop.component)),
                         None => (None, None),
                     },
                 };

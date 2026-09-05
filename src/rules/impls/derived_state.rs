@@ -46,7 +46,7 @@ impl Rule for DerivedState {
 
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
         let (result, component) = (ctx.program(), ctx.component());
-        let result = &result.components[component];
+        let result = &result.components[&component];
         let setter_label = all_setter_labels(result);
         let state_val_label = state_val_labels(&result.render_cfg);
         let state_var_names: HashSet<Var> = state_val_label.keys().cloned().collect();

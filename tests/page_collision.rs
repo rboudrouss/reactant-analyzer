@@ -129,27 +129,31 @@ fn two_pages_in_different_files_coexist_and_only_buggy_one_warns() {
         &Config::default(),
     );
 
-    // Both should appear, with disambiguating display names on collision.
-    let keys: Vec<&String> = result.components.keys().collect();
-    let page_like: Vec<&&String> = keys.iter().filter(|k| k.starts_with("Page")).collect();
+    // Both should appear, each with its own identity and a disambiguating
+    // display name.
+    let page_like: Vec<(String, reactant::ir::ComponentId)> = result
+        .components
+        .keys()
+        .map(|id| (result.display_name(*id), *id))
+        .filter(|(name, _)| name.starts_with("Page"))
+        .collect();
     assert_eq!(
         page_like.len(),
         2,
-        "expected two Page-like results, got keys: {:?}",
-        keys
+        "expected two Page-like results, got {page_like:?}"
     );
 
     // The buggy Page (users/page.tsx) should have an infinite-loop diagnostic;
     // the clean Page (posts/page.tsx) should not.
     let rules = all_rules();
     let mut errors_per_key: Vec<(String, usize)> = Vec::new();
-    for key in &page_like {
+    for (name, id) in &page_like {
         let warns = rules
             .iter()
-            .flat_map(|r| r.check(&RuleCtx::new(&result, key)))
+            .flat_map(|r| r.check(&RuleCtx::new(&result, *id)))
             .filter(|d| d.severity() == Severity::Warning || d.severity() == Severity::Error)
             .count();
-        errors_per_key.push(((**key).clone(), warns));
+        errors_per_key.push((name.clone(), warns));
     }
     errors_per_key.sort();
     let with_warns: Vec<&(String, usize)> = errors_per_key.iter().filter(|(_, n)| *n > 0).collect();

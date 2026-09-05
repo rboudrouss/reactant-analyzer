@@ -28,6 +28,7 @@ use crate::resolver::{
 };
 use crate::rules::{Diagnostic, ProgramCache, RuleRegistry, SafeCheck, Severity};
 
+use crate::ir::{CompOrigin, ComponentId};
 pub use blind_spots::BlindSpot;
 pub use palette::Palette;
 pub use report::{CheckReport, ComponentReport, Followed};
@@ -270,15 +271,19 @@ pub fn run_check(
         RootStrategy::Heuristic
     };
 
-    // Display-name → (file, hook count) map, built before analysis consumes
-    // the components. Keyed by display name to disambiguate same-named
-    // components across files.
+    // `(file, name)` → (file, hook count), built before analysis consumes the
+    // components. Keyed by the component's *origin*, which is what
+    // `ComponentTable` resolves an id to — never by the display name, whose
+    // spelling depends on which other files the run happened to include (#7).
+    // The hook count is the lowered one, before custom-hook expansion.
     let temp_registry = ComponentRegistry::from_components(lowered.components.clone());
-    let mut component_meta: HashMap<String, (PathBuf, usize)> = HashMap::new();
+    let mut component_meta: HashMap<CompOrigin, (PathBuf, usize)> = HashMap::new();
     for c in &lowered.components {
-        let key = (c.file.clone(), c.name.clone());
         component_meta.insert(
-            temp_registry.display_name(&key),
+            CompOrigin {
+                file: c.file.clone(),
+                name: c.name.clone(),
+            },
             (c.file.clone(), c.hooks.len()),
         );
     }
@@ -366,7 +371,13 @@ pub fn run_check(
     }
 
     // ── Rules + filtering ─────────────────────────────────────────────────────
-    let mut names: Vec<&String> = program_result.components.keys().collect();
+    // Rendered in display-name order: the report's own ordering, decided
+    // where the names are minted rather than by the id interning order.
+    let mut names: Vec<(String, ComponentId)> = program_result
+        .components
+        .keys()
+        .map(|id| (program_result.display_name(*id), *id))
+        .collect();
     names.sort();
 
     let mut components = Vec::new();
@@ -382,9 +393,15 @@ pub fn run_check(
     // component, which used to make the rules phase quadratic (issue #86).
     let rule_cache = ProgramCache::new(&program_result);
 
-    for name in names {
+    for (name, id) in names {
+        // What this component is called in the report, and what the analysis
+        // knows it as: minted once here, never compared.
+        let meta = program_result
+            .component_table
+            .origin(id)
+            .and_then(|o| component_meta.get(o));
         if opts.verbose {
-            let result = &program_result.components[name];
+            let result = &program_result.components[&id];
             let mut labels: Vec<_> = result.widen_trace.keys().copied().collect();
             labels.sort_unstable();
             let _ = writeln!(
@@ -398,7 +415,7 @@ pub fn run_check(
         // off/allow filters + deterministic sort) lives in the registry —
         // shared with every other frontend. Only the `--info` visibility
         // filter is a display concern kept here.
-        let findings = registry.check_component(&rule_cache, name);
+        let findings = registry.check_component(&rule_cache, id);
         let mut diags: Vec<Diagnostic> = findings.diagnostics;
         let safe_checks: Vec<SafeCheck> = findings.safe_checks;
         let suspended_safe_checks = findings.suspended_safe_checks;
@@ -407,7 +424,7 @@ pub fn run_check(
         // A component defined outside the named paths exists in this run only
         // to make the named ones analysable. Its findings are real, and saying
         // how many there are is the honest half of not showing them.
-        if let Some((file, _)) = component_meta.get(name)
+        if let Some((file, _)) = meta
             && !named.contains(&crate::resolver::normalize(file))
         {
             if !diags.is_empty() {
@@ -430,13 +447,12 @@ pub fn run_check(
             .filter(|d| d.severity() == Severity::Info)
             .count();
 
-        let (file, hook_count) = component_meta
-            .get(name)
+        let (file, hook_count) = meta
             .map(|(f, h)| (Some(f.clone()), *h))
             .unwrap_or((None, 0));
 
         components.push(ComponentReport {
-            name: name.clone(),
+            name,
             file,
             hook_count,
             diagnostics: diags,

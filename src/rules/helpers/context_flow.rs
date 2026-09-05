@@ -31,9 +31,9 @@ use std::collections::{HashMap, HashSet};
 use crate::domains::StateValue;
 use crate::engine::{AnalysisResult, ProgramAnalysisResult};
 use crate::ir::{
-    ContextId, ModuleConstInit, SourceRange,
+    ComponentId, ContextId, ModuleConstInit, SourceRange,
     hooks::HookEntry,
-    types::{HookLabel, Symbol, Var},
+    types::{HookLabel, Var},
 };
 
 use super::providers::collect_provider_sites;
@@ -61,7 +61,7 @@ pub(in crate::rules) enum ProviderVerdict {
 #[derive(Debug, Clone)]
 pub(in crate::rules) struct ConsumerRow {
     /// The component holding the call.
-    pub component: Symbol,
+    pub component: ComponentId,
     /// The local name the call names the context by — what a message shows.
     pub name: Var,
     pub label: HookLabel,
@@ -77,10 +77,10 @@ pub(in crate::rules) struct ContextConsumers {
 
 impl ContextConsumers {
     /// The rows belonging to `component`, in call order.
-    pub(in crate::rules) fn of(&self, component: &Symbol) -> Vec<&ConsumerRow> {
+    pub(in crate::rules) fn of(&self, component: ComponentId) -> Vec<&ConsumerRow> {
         self.rows
             .iter()
-            .filter(|r| &r.component == component)
+            .filter(|r| r.component == component)
             .collect()
     }
 
@@ -97,7 +97,7 @@ impl ContextConsumers {
         let mut rows: Vec<ConsumerRow> = Vec::new();
         for (component, name, context, label, span) in consumer_sites(prog) {
             // Gate 1: unknown ancestry is not empty ancestry (#110).
-            let Some(ancestors) = prog.complete_ancestry(&component) else {
+            let Some(ancestors) = prog.complete_ancestry(component) else {
                 continue;
             };
             // A cut recursion means the closure was never walked to the end.
@@ -140,15 +140,15 @@ impl ContextConsumers {
 }
 
 /// `component → the cells it provides`.
-fn provider_index(prog: &ProgramAnalysisResult) -> HashMap<Symbol, HashSet<ContextId>> {
-    let mut out: HashMap<Symbol, HashSet<ContextId>> = HashMap::new();
-    for (name, comp) in &prog.components {
+fn provider_index(prog: &ProgramAnalysisResult) -> HashMap<ComponentId, HashSet<ContextId>> {
+    let mut out: HashMap<ComponentId, HashSet<ContextId>> = HashMap::new();
+    for (id, comp) in &prog.components {
         let ids: HashSet<ContextId> = collect_provider_sites(comp)
             .into_iter()
             .map(|s| s.context_id.clone())
             .collect();
         if !ids.is_empty() {
-            out.insert(name.clone(), ids);
+            out.insert(*id, ids);
         }
     }
     out
@@ -162,14 +162,14 @@ fn provider_index(prog: &ProgramAnalysisResult) -> HashMap<Symbol, HashSet<Conte
 /// React's.
 fn consumer_sites(
     prog: &ProgramAnalysisResult,
-) -> Vec<(Symbol, Var, ContextId, HookLabel, Option<SourceRange>)> {
+) -> Vec<(ComponentId, Var, ContextId, HookLabel, Option<SourceRange>)> {
     let mut out = Vec::new();
-    for (name, comp) in &prog.components {
+    for (comp_id, comp) in &prog.components {
         for (var, id, label, span) in context_reads(comp) {
-            out.push((name.clone(), var, id, label, span));
+            out.push((*comp_id, var, id, label, span));
         }
     }
-    out.sort_by(|a, b| (&a.0, a.3).cmp(&(&b.0, b.3)));
+    out.sort_by_key(|r| (r.0, r.3));
     out
 }
 
@@ -203,14 +203,32 @@ fn context_reads(
         .collect()
 }
 
-/// Every component name mentioned by a component phase 1 never reached.
-fn unreached_component_refs(prog: &ProgramAnalysisResult) -> HashSet<Symbol> {
-    let mut out: HashSet<Symbol> = HashSet::new();
-    for (name, comp) in &prog.components {
-        if prog.was_inter_analyzed(name) {
+/// The components a body phase 1 never reached may instantiate.
+///
+/// The caller reads a hit as "this may sit above the consumer" and drops the
+/// row, so **over**-inclusion is the safe direction and a missed component is
+/// the forbidden one. A resolved reference contributes the one component its
+/// origin proves; an unresolved one contributes every component that could be
+/// the one it wrote (#7).
+fn unreached_component_refs(prog: &ProgramAnalysisResult) -> HashSet<ComponentId> {
+    let mut refs = HashSet::new();
+    for (id, comp) in &prog.components {
+        if prog.was_inter_analyzed(*id) {
             continue;
         }
-        crate::engine::root_detector::collect_compapp_refs(&comp.render_cfg, &comp.hooks, &mut out);
+        crate::engine::root_detector::collect_compapp_refs(
+            &comp.render_cfg,
+            &comp.hooks,
+            &mut refs,
+        );
+    }
+    let table = &prog.component_table;
+    let mut out: HashSet<ComponentId> = HashSet::new();
+    for r in &refs {
+        match &r.origin {
+            Some(o) => out.extend(table.id_of(o)),
+            None => out.extend(table.ids_named(&r.name)),
+        }
     }
     out
 }

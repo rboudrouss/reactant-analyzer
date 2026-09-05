@@ -51,11 +51,14 @@ fn parse_and_analyze(src: &str) -> ProgramAnalysisResult {
 fn diags_for(src: &str, component: &str) -> Vec<reactant::rules::Diagnostic> {
     let result = parse_and_analyze(src);
     assert!(
-        result.components.contains_key(component),
+        result.component_named(component).is_some(),
         "component `{component}` not analyzed; got: {:?}",
         result.components.keys().collect::<Vec<_>>()
     );
-    FrozenInitialState.check(&RuleCtx::new(&result, &component.to_string()))
+    FrozenInitialState.check(&RuleCtx::new(
+        &result,
+        result.component_named(component).unwrap(),
+    ))
 }
 
 // ── Error: proven versioned prop, no sync ─────────────────────────────────────
@@ -721,7 +724,10 @@ fn safe_check_applicable_only_with_prop_seeded_state() {
     );
     assert!(
         FrozenInitialState
-            .safe_check(&RuleCtx::new(&synced, &"Child".to_string()))
+            .safe_check(&RuleCtx::new(
+                &synced,
+                synced.component_named("Child").unwrap()
+            ))
             .is_some(),
         "prop-seeded state → applicable"
     );
@@ -737,7 +743,10 @@ fn safe_check_applicable_only_with_prop_seeded_state() {
     );
     assert!(
         FrozenInitialState
-            .safe_check(&RuleCtx::new(&literal, &"Counter".to_string()))
+            .safe_check(&RuleCtx::new(
+                &literal,
+                literal.component_named("Counter").unwrap()
+            ))
             .is_none(),
         "literal-only state → not applicable"
     );

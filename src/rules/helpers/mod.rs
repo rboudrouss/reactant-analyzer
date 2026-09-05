@@ -28,11 +28,12 @@ use crate::{
     ir::{
         cfg::CFG,
         expr::Expr,
-        types::{HookLabel, Symbol, Var},
+        types::{HookLabel, Var},
     },
 };
 
 use super::api::query;
+use crate::ir::ComponentId;
 
 /// User-facing wording for an abstract value in a diagnostic message.
 ///
@@ -100,12 +101,12 @@ pub(crate) fn state_slot_name(
 /// primitive for `Rule::safe_check`.
 pub(crate) fn has_hook_kind(
     result: &ProgramAnalysisResult,
-    component: &Symbol,
+    component: ComponentId,
     kind: HookKind,
 ) -> bool {
     result
         .components
-        .get(component)
+        .get(&component)
         .is_some_and(|c| c.hook_calls.iter().any(|h| h.kind == kind))
 }
 
@@ -199,7 +200,7 @@ pub(crate) fn collect_callees<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
 pub(crate) fn eval_in_stores(
     expr: &Expr,
     env: &AbstractEnv<StateValue>,
-    component: &Symbol,
+    component: ComponentId,
     state: &StateStore<StateValue>,
     memo: &MemoStore<StateValue>,
     heap: &mut Heap,
@@ -209,7 +210,7 @@ pub(crate) fn eval_in_stores(
     StateValueTransfer.eval_expr(
         expr,
         env,
-        &mut AnalysisCtx::null(component.clone(), &mut s, &mut m, heap),
+        &mut AnalysisCtx::null(component, &mut s, &mut m, heap),
     )
 }
 
@@ -264,7 +265,7 @@ impl Eval<'_> {
         eval_in_stores(
             expr,
             env,
-            &self.result.component,
+            self.result.component,
             &self.result.state_store,
             &self.result.memo_store,
             &mut self.heap,

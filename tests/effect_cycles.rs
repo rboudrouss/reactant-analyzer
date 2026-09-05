@@ -49,7 +49,10 @@ fn parse_and_analyze(src: &str) -> ProgramAnalysisResult {
 fn infinite_loop_diags(src: &str, component: &str) -> Vec<(String, Severity, String)> {
     let result = parse_and_analyze(src);
     InfiniteLoop
-        .check(&RuleCtx::new(&result, &component.to_string()))
+        .check(&RuleCtx::new(
+            &result,
+            result.component_named(component).unwrap(),
+        ))
         .into_iter()
         .map(|d| (d.rule.to_string(), d.severity(), d.message))
         .collect()
@@ -202,11 +205,10 @@ function Child({ value, onUpdate }) {
 }
 "#;
     let result = parse_and_analyze(src);
-    let child = "Child".to_string();
-    if !result.components.contains_key(&child) {
+    let Some(child) = result.component_named("Child") else {
         return;
-    }
-    let diags = InfiniteLoop.check(&RuleCtx::new(&result, &child));
+    };
+    let diags = InfiniteLoop.check(&RuleCtx::new(&result, child));
     let cross: Vec<_> = diags
         .iter()
         .filter(|d| d.rule == "cross-component-infinite-loop")

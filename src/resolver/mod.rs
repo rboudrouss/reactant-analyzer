@@ -268,6 +268,13 @@ pub fn lower_files_with(
     let mut file_imports: Vec<(PathBuf, HashMap<String, ResolvedImport>)> = Vec::new();
 
     for path in files {
+        // One spelling for every registry key. `discover` hands back paths
+        // rooted the way the user typed them (`./b/W.tsx` for `reactant .`)
+        // while `ImportResolver::resolve` answers in normalized form, so a
+        // `(file, name)` lookup built from a resolved import missed every
+        // time the run was invoked with a `.`-prefixed root — silently, and
+        // for imports, hooks, contexts and utilities alike.
+        let path = &normalize(path);
         let source = match fs.read_to_string(path) {
             Ok(s) => s,
             Err(e) => {

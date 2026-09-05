@@ -212,7 +212,7 @@ function C() {
         RootStrategy::AllComponents,
         &Config::default(),
     );
-    let c = &result.components[&"C".to_string()];
+    let c = &result.components[&result.component_named("C").unwrap()];
     let has_inlined_state = c.hooks.iter().any(|h| matches!(h, HookEntry::State { .. }));
     assert!(
         has_inlined_state,

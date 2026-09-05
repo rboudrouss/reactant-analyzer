@@ -17,10 +17,7 @@ use oxc_span::SourceType;
 use reactant::ir::{cfg::CFG, expr::Expr, hooks::HookEntry, types::ExprId};
 use reactant::rules::RuleCtx;
 use reactant::{
-    domains::StateValueTransfer,
-    engine::{Config, analyze_component},
-    lowering::lower_program,
-    rules::all_rules,
+    domains::StateValueTransfer, engine::Config, lowering::lower_program, rules::all_rules,
 };
 
 fn parse(src: &str) -> (Allocator, String) {
@@ -43,29 +40,31 @@ fn diagnostics(src: &str) -> Vec<String> {
 
     let mut map = std::collections::HashMap::new();
     let mut names = Vec::new();
+
+    let mut component_table = reactant::ir::ComponentTable::default();
     for comp in components {
-        let name = comp.name.clone();
-        map.insert(
-            name.clone(),
-            analyze_component(comp, &StateValueTransfer, &Config::default()),
+        let id = component_table.intern(reactant::ir::CompOrigin {
+            file: comp.file.clone(),
+            name: comp.name.clone(),
+        });
+        let result = reactant::engine::analyze_component_as(
+            comp,
+            id,
+            &StateValueTransfer,
+            &Config::default(),
         );
-        names.push(name);
+        map.insert(id, result);
+        names.push(id);
     }
     let prog = reactant::engine::ProgramAnalysisResult {
         components: map,
-        shared_state: reactant::domains::stores::SharedStateStore::new(),
-        call_graph: reactant::engine::ComponentCallGraph::new(),
-        recursive_components: std::collections::HashSet::new(),
-        stats: reactant::engine::AnalysisStats::default(),
-        file_table: Default::default(),
-        module_table: Default::default(),
-        function_registry: Default::default(),
-        phase1_reached: Default::default(),
+        component_table,
+        ..Default::default()
     };
     let mut out = Vec::new();
     for n in &names {
         for rule in all_rules() {
-            for d in rule.check(&RuleCtx::new(&prog, n)) {
+            for d in rule.check(&RuleCtx::new(&prog, *n)) {
                 out.push(d.rule.to_string());
             }
         }
@@ -206,7 +205,7 @@ fn an_inlined_hook_does_not_take_over_the_callers_allocation_sites() {
         RootStrategy::AllComponents,
         &Config::default(),
     );
-    let result = &prog.components["C"];
+    let result = &prog.components[&prog.component_named("C").unwrap()];
     let mut ids = Vec::new();
     alloc_ids(&result.render_cfg, &mut ids);
     // The caller's own object, plus `{ v: p }` and `{ inner: held }` from each

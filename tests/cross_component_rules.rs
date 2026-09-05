@@ -57,12 +57,10 @@ fn fixture() -> String {
 #[test]
 fn cross_setter_in_render_fires_unconditional() {
     let result = parse_and_analyze(&fixture());
-    let child = "Section9_Child".to_string();
-    if !result.components.contains_key(&child) {
-        // Child not in registry (analyzed inline-only) skip gracefully.
+    let Some(child) = result.component_named("Section9_Child") else {
         return;
-    }
-    let diags = SetterInRender.check(&RuleCtx::new(&result, &child));
+    };
+    let diags = SetterInRender.check(&RuleCtx::new(&result, child));
     assert!(
         !diags.is_empty(),
         "cross-setter-in-render should fire on Section9_Child"
@@ -82,11 +80,10 @@ fn cross_setter_in_render_fires_unconditional() {
 #[test]
 fn cross_setter_in_render_no_fire_on_parent() {
     let result = parse_and_analyze(&fixture());
-    let parent = "Section9_Parent".to_string();
-    if !result.components.contains_key(&parent) {
+    let Some(parent) = result.component_named("Section9_Parent") else {
         return;
-    }
-    let diags = SetterInRender.check(&RuleCtx::new(&result, &parent));
+    };
+    let diags = SetterInRender.check(&RuleCtx::new(&result, parent));
     assert!(
         diags.is_empty(),
         "cross-setter-in-render must not fire on Section9_Parent (it owns the setter)"
@@ -98,11 +95,10 @@ fn cross_setter_in_render_no_fire_on_parent() {
 #[test]
 fn cross_setter_in_render_no_fire_setter_in_callback() {
     let result = parse_and_analyze(&fixture());
-    let child = "Section20_SafeChild".to_string();
-    if !result.components.contains_key(&child) {
+    let Some(child) = result.component_named("Section20_SafeChild") else {
         return;
-    }
-    let diags = SetterInRender.check(&RuleCtx::new(&result, &child));
+    };
+    let diags = SetterInRender.check(&RuleCtx::new(&result, child));
     assert!(
         diags.is_empty(),
         "setter only used inside onClick callback prop must not fire"
@@ -113,11 +109,10 @@ fn cross_setter_in_render_no_fire_setter_in_callback() {
 #[test]
 fn cross_setter_in_render_conditional_is_warning() {
     let result = parse_and_analyze(&fixture());
-    let child = "Section21_Child".to_string();
-    if !result.components.contains_key(&child) {
+    let Some(child) = result.component_named("Section21_Child") else {
         return;
-    }
-    let diags = SetterInRender.check(&RuleCtx::new(&result, &child));
+    };
+    let diags = SetterInRender.check(&RuleCtx::new(&result, child));
     assert!(
         !diags.is_empty(),
         "cross-setter-in-render should fire on Section21_Child (conditional path)"
@@ -136,11 +131,10 @@ fn cross_setter_in_render_conditional_is_warning() {
 #[test]
 fn cross_component_infinite_loop_no_fire_constant_write() {
     let result = parse_and_analyze(&fixture());
-    let child = "Section10_InfiniteChild".to_string();
-    if !result.components.contains_key(&child) {
+    let Some(child) = result.component_named("Section10_InfiniteChild") else {
         return;
-    }
-    let diags = InfiniteLoop.check(&RuleCtx::new(&result, &child));
+    };
+    let diags = InfiniteLoop.check(&RuleCtx::new(&result, child));
     let cross: Vec<_> = diags
         .iter()
         .filter(|d| d.rule == "cross-component-infinite-loop")
@@ -156,11 +150,10 @@ fn cross_component_infinite_loop_no_fire_constant_write() {
 #[test]
 fn cross_component_infinite_loop_fires_unbounded_nodeps() {
     let result = parse_and_analyze(&fixture());
-    let child = "Section28_Child".to_string();
-    if !result.components.contains_key(&child) {
+    let Some(child) = result.component_named("Section28_Child") else {
         return;
-    }
-    let diags = InfiniteLoop.check(&RuleCtx::new(&result, &child));
+    };
+    let diags = InfiniteLoop.check(&RuleCtx::new(&result, child));
     let cross: Vec<_> = diags
         .iter()
         .filter(|d| d.rule == "cross-component-infinite-loop")
@@ -181,11 +174,10 @@ fn cross_component_infinite_loop_fires_unbounded_nodeps() {
 #[test]
 fn cross_component_infinite_loop_no_fire_mount_only() {
     let result = parse_and_analyze(&fixture());
-    let child = "Section22_Child".to_string();
-    if !result.components.contains_key(&child) {
+    let Some(child) = result.component_named("Section22_Child") else {
         return;
-    }
-    let diags = InfiniteLoop.check(&RuleCtx::new(&result, &child));
+    };
+    let diags = InfiniteLoop.check(&RuleCtx::new(&result, child));
     assert!(
         diags.is_empty(),
         "mount-only effect (deps: []) cannot cause a render loop must not fire"
@@ -198,11 +190,10 @@ fn cross_component_infinite_loop_no_fire_mount_only() {
 #[test]
 fn cross_component_infinite_loop_fires_all_unstable_deps() {
     let result = parse_and_analyze(&fixture());
-    let child = "Section23_Child".to_string();
-    if !result.components.contains_key(&child) {
+    let Some(child) = result.component_named("Section23_Child") else {
         return;
-    }
-    let diags = InfiniteLoop.check(&RuleCtx::new(&result, &child));
+    };
+    let diags = InfiniteLoop.check(&RuleCtx::new(&result, child));
     assert!(
         !diags.is_empty(),
         "cross-component-infinite-loop should fire: [value] is entirely unstable \
@@ -221,11 +212,10 @@ fn cross_component_infinite_loop_fires_all_unstable_deps() {
 fn setter_in_render_via_local_wrapper_is_error() {
     use reactant::rules::{Rule, SetterInRender};
     let result = parse_and_analyze(&fixture());
-    let comp = "Section24_Counter".to_string();
-    if !result.components.contains_key(&comp) {
+    let Some(comp) = result.component_named("Section24_Counter") else {
         return;
-    }
-    let diags = SetterInRender.check(&RuleCtx::new(&result, &comp));
+    };
+    let diags = SetterInRender.check(&RuleCtx::new(&result, comp));
     assert!(
         !diags.is_empty(),
         "setter-in-render should fire: doReset() calls setCount unconditionally"
@@ -242,11 +232,10 @@ fn setter_in_render_via_local_wrapper_is_error() {
 #[test]
 fn cross_setter_in_render_via_wrapper_is_error() {
     let result = parse_and_analyze(&fixture());
-    let child = "Section25_Child".to_string();
-    if !result.components.contains_key(&child) {
+    let Some(child) = result.component_named("Section25_Child") else {
         return;
-    }
-    let diags = SetterInRender.check(&RuleCtx::new(&result, &child));
+    };
+    let diags = SetterInRender.check(&RuleCtx::new(&result, child));
     assert!(
         !diags.is_empty(),
         "cross-setter-in-render should fire: handleReset() wraps ComponentSetter prop"
@@ -263,11 +252,10 @@ fn cross_setter_in_render_via_wrapper_is_error() {
 fn setter_in_render_two_level_wrapper_fires() {
     use reactant::rules::{Rule, SetterInRender};
     let result = parse_and_analyze(&fixture());
-    let comp = "Section26_Counter".to_string();
-    if !result.components.contains_key(&comp) {
+    let Some(comp) = result.component_named("Section26_Counter") else {
         return;
-    }
-    let diags = SetterInRender.check(&RuleCtx::new(&result, &comp));
+    };
+    let diags = SetterInRender.check(&RuleCtx::new(&result, comp));
     assert!(
         !diags.is_empty(),
         "setter-in-render should fire at depth=2: outer() → inner() → setN()"
@@ -279,11 +267,10 @@ fn setter_in_render_two_level_wrapper_fires() {
 fn setter_in_render_no_fire_wrapper_in_handler() {
     use reactant::rules::{Rule, SetterInRender};
     let result = parse_and_analyze(&fixture());
-    let comp = "Section27_Safe".to_string();
-    if !result.components.contains_key(&comp) {
+    let Some(comp) = result.component_named("Section27_Safe") else {
         return;
-    }
-    let diags = SetterInRender.check(&RuleCtx::new(&result, &comp));
+    };
+    let diags = SetterInRender.check(&RuleCtx::new(&result, comp));
     assert!(
         diags.is_empty(),
         "wrapper only in onClick handler must not fire in render"
@@ -297,18 +284,15 @@ fn setter_in_render_no_fire_wrapper_in_handler() {
 fn neither_rule_fires_on_clean_component() {
     let result = parse_and_analyze(&fixture());
     for name in ["Section2_Display", "Section2_App"] {
-        let key = name.to_string();
-        if !result.components.contains_key(&key) {
+        let Some(key) = result.component_named(name) else {
             continue;
-        }
+        };
         assert!(
-            SetterInRender
-                .check(&RuleCtx::new(&result, &key))
-                .is_empty(),
+            SetterInRender.check(&RuleCtx::new(&result, key)).is_empty(),
             "cross-setter-in-render must not fire on {name}"
         );
         assert!(
-            InfiniteLoop.check(&RuleCtx::new(&result, &key)).is_empty(),
+            InfiniteLoop.check(&RuleCtx::new(&result, key)).is_empty(),
             "cross-component-infinite-loop must not fire on {name}"
         );
     }
@@ -330,7 +314,10 @@ fn unknown_component_emits_info() {
         }
     "#;
     let result = parse_and_analyze(src);
-    let diags = AnalysisLimitInfo.check(&RuleCtx::new(&result, &"Parent".to_string()));
+    let diags = AnalysisLimitInfo.check(&RuleCtx::new(
+        &result,
+        result.component_named("Parent").unwrap(),
+    ));
     assert!(
         diags.iter().any(|d| d.message.contains("Unknown")),
         "should emit Info for missing component `Unknown`, got: {:?}",
@@ -362,7 +349,10 @@ fn recursive_component_emits_info() {
     let result = parse_and_analyze(src);
     // The recursion fires while analyzing Tree (it calls itself).
     // Stats record (caller="Tree", callee="Tree").
-    let diags = AnalysisLimitInfo.check(&RuleCtx::new(&result, &"Tree".to_string()));
+    let diags = AnalysisLimitInfo.check(&RuleCtx::new(
+        &result,
+        result.component_named("Tree").unwrap(),
+    ));
     assert!(
         diags.iter().any(|d| d.message.contains("Tree")),
         "should emit Info for recursive cutoff of `Tree`, got: {:?}",
@@ -378,10 +368,9 @@ fn recursive_component_emits_info() {
 
 fn child_rules(src: &str) -> Vec<String> {
     let result = parse_and_analyze(src);
-    let child = "Child".to_string();
-    assert!(result.components.contains_key(&child), "Child not analyzed");
+    let child = result.component_named("Child").expect("Child not analyzed");
     SetterInRender
-        .check(&RuleCtx::new(&result, &child))
+        .check(&RuleCtx::new(&result, child))
         .into_iter()
         .map(|d| d.rule.to_string())
         .collect()

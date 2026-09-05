@@ -8,11 +8,12 @@ use crate::{
         SourceRange,
         cfg::CFG,
         hooks::{Arity, HookEntry},
-        types::{BlockId, HookLabel, Symbol, Var},
+        types::{BlockId, HookLabel, Var},
     },
 };
 
 use crate::engine::setters::SetterCallPhase;
+use crate::ir::ComponentId;
 use crate::rules::api::query::must_effect_cycle;
 use crate::rules::helpers::churn::{
     ChurnSetterCall, Freshness, classify_effect_deps, collect_churn_calls, converges_once_written,
@@ -60,7 +61,7 @@ impl Rule for InfiniteLoop {
 
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
         let (result, component) = (ctx.program(), ctx.component());
-        let comp_result = &result.components[component];
+        let comp_result = &result.components[&component];
 
         // Authoritative setter map: base setters plus alias chains
         // (`const s1 = setX`, `s2 = s1`) resolved across the render and every
@@ -199,7 +200,7 @@ impl Rule for InfiniteLoop {
                     diags.push(diag);
                 } else if let Some(prop) = cs_vars.get(&call.var) {
                     // ── Cross-component ────────────────────────────────────────
-                    let (parent_comp, parent_label) = (&prop.component, prop.label);
+                    let (parent_comp, parent_label) = (prop.component, prop.label);
                     let shared_write = result.shared_state.get(parent_comp, parent_label);
                     if shared_write.is_bottom_value() {
                         continue; // setter not reached in semantic analysis
@@ -216,7 +217,9 @@ impl Rule for InfiniteLoop {
                     let msg = format!(
                         "this effect calls `{}`, a state setter of parent `{}`{}. \
                          Parent re-renders → child re-renders → effect fires again: infinite loop",
-                        call.var, parent_comp, deps_note
+                        call.var,
+                        result.display_name(parent_comp),
+                        deps_note
                     );
                     let mut diag = Diagnostic::warn("cross-component-infinite-loop", msg)
                         .with_label(*eff_label);
@@ -252,14 +255,14 @@ impl Rule for InfiniteLoop {
 fn check_multi_effect_cycles(
     graph: &ChurnGraph,
     result: &ProgramAnalysisResult,
-    component: &Symbol,
+    component: ComponentId,
     reported_effects: &HashSet<HookLabel>,
 ) -> (Vec<Diagnostic>, HashSet<(HookLabel, HookLabel)>) {
     let (edges, cycles) = (&graph.edges, &graph.cycles);
     if edges.is_empty() {
         return (Vec::new(), HashSet::new());
     }
-    let comp_result = &result.components[component];
+    let comp_result = &result.components[&component];
 
     let mut diags = Vec::new();
     let mut covered: HashSet<(HookLabel, HookLabel)> = HashSet::new();
@@ -270,10 +273,10 @@ fn check_multi_effect_cycles(
         let cyc: Vec<&ChurnEdge> = cycle.edge_idx.iter().map(|&i| &edges[i]).collect();
         let path = cycle_path(edges, cycle, component, result, &mut names);
         for e in &cyc {
-            if e.component != *component {
+            if e.component != component {
                 continue;
             }
-            if e.to.0 == *component {
+            if e.to.0 == component {
                 covered.insert((e.effect_label, e.to.1));
             }
             if reported_effects.contains(&e.effect_label) {
@@ -346,7 +349,7 @@ fn check_multi_effect_cycles(
             }
             // Point at the cycle's other steps living in this component.
             for other in &cyc {
-                if other.effect_label == e.effect_label || other.component != *component {
+                if other.effect_label == e.effect_label || other.component != component {
                     continue;
                 }
                 let other_from = node_display(&other.from, component, result, &mut names);
@@ -382,10 +385,10 @@ fn check_multi_effect_cycles(
 
 fn check_object_churn(
     result: &ProgramAnalysisResult,
-    component: &Symbol,
+    component: ComponentId,
     covered: &HashSet<(HookLabel, HookLabel)>,
 ) -> Vec<Diagnostic> {
-    let comp_result = &result.components[component];
+    let comp_result = &result.components[&component];
     let cfg = &comp_result.render_cfg;
     let state_vals = resolve_setter_aliases(cfg, &state_val_labels(cfg));
     let setter_labels = resolve_setter_aliases(cfg, &setter_var_labels(cfg));
@@ -396,7 +399,7 @@ fn check_object_churn(
     // This arm is single-effect/single-component: local setters only.
     let setter_nodes: HashMap<Var, crate::rules::helpers::churn::SlotNode> = setter_labels
         .iter()
-        .map(|(v, l)| (v.clone(), (component.clone(), *l)))
+        .map(|(v, l)| (v.clone(), (component, *l)))
         .collect();
     let render_fn_bindings = collect_fn_bindings(cfg);
     let mut diags = Vec::new();
@@ -423,7 +426,7 @@ fn check_object_churn(
         // Self-churn is intra-component: keep only own slots.
         let versioned: HashSet<HookLabel> = versioned_qualified
             .into_iter()
-            .filter(|(c, _)| c == component)
+            .filter(|(c, _)| *c == component)
             .map(|(_, l)| l)
             .collect();
         if exact.is_empty() && versioned.is_empty() {
@@ -643,7 +646,7 @@ mod tests {
         let result = make_result_with_widened(HashSet::new(), vec![], vec![]);
         assert!(
             InfiniteLoop
-                .check(&RuleCtx::new(&prog("C", &result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog("C", &result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -674,7 +677,7 @@ mod tests {
         }];
 
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
-        let diags = InfiniteLoop.check(&RuleCtx::new(&prog("C", &result), &"C".to_string()));
+        let diags = InfiniteLoop.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].hook_label, Some(0));
     }
@@ -712,17 +715,20 @@ mod tests {
             }],
         );
 
-        let names = ["A".to_string(), "B".to_string(), "C".to_string()];
-        let mut program = prog(&names[0], &one);
-        for n in &names[1..] {
-            program.components.insert(n.clone(), one.clone());
+        let ids = ["A", "B", "C"].map(crate::test_support::named);
+        let mut program = prog("A", &one);
+        for id in &ids {
+            program.components.insert(*id, one.clone());
         }
 
         BUILDS.with(|n| n.set(0));
         let cache = ProgramCache::new(&program);
-        for n in &names {
-            let diags = InfiniteLoop.check(&RuleCtx::cached(&cache, n, Default::default()));
-            assert!(!diags.is_empty(), "the churn arm must actually run for {n}");
+        for id in &ids {
+            let diags = InfiniteLoop.check(&RuleCtx::cached(&cache, *id, Default::default()));
+            assert!(
+                !diags.is_empty(),
+                "the churn arm must actually run for {id:?}"
+            );
         }
         assert_eq!(
             BUILDS.with(|n| n.get()),
@@ -749,7 +755,7 @@ mod tests {
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
         assert!(
             InfiniteLoop
-                .check(&RuleCtx::new(&prog("C", &result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog("C", &result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -781,7 +787,7 @@ mod tests {
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
         assert!(
             InfiniteLoop
-                .check(&RuleCtx::new(&prog("C", &result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog("C", &result), crate::test_support::C))
                 .is_empty(),
             "deps:[] = one-shot, never infinite"
         );
@@ -814,7 +820,7 @@ mod tests {
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
         assert!(
             InfiniteLoop
-                .check(&RuleCtx::new(&prog("C", &result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog("C", &result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -879,7 +885,7 @@ mod tests {
             ..Default::default()
         };
         let result = analyze_component(comp, &StateValueTransfer, &config);
-        let diags = InfiniteLoop.check(&RuleCtx::new(&prog("C", &result), &"C".to_string()));
+        let diags = InfiniteLoop.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
         assert!(!diags.is_empty(), "expected InfiniteLoop warning");
     }
 
@@ -946,10 +952,7 @@ mod tests {
         };
         let result = analyze_component(comp, &StateValueTransfer, &config);
         assert!(result.widen_trace.contains_key(&0), "count should widen");
-        let diags = InfiniteLoop.check(&RuleCtx::new(
-            &prog("Counter", &result),
-            &"Counter".to_string(),
-        ));
+        let diags = InfiniteLoop.check(&RuleCtx::new(&prog("Counter", &result), result.component));
         assert!(
             !diags.is_empty(),
             "setState(count+1) should be detected as infinite loop"
@@ -1007,7 +1010,7 @@ mod tests {
             span: None,
         }];
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
-        let diags = InfiniteLoop.check(&RuleCtx::new(&prog("C", &result), &"C".to_string()));
+        let diags = InfiniteLoop.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
         assert!(
             !diags.is_empty(),
             "setter in block 1 should be detected via BFS"
@@ -1117,7 +1120,7 @@ mod tests {
         );
         assert!(
             !InfiniteLoop
-                .check(&RuleCtx::new(&prog("C", &result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog("C", &result), crate::test_support::C))
                 .is_empty(),
             "setN(n+1) inside .then should be detected as infinite loop"
         );
@@ -1151,7 +1154,7 @@ mod tests {
         );
         assert!(
             InfiniteLoop
-                .check(&RuleCtx::new(&prog("C", &result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog("C", &result), crate::test_support::C))
                 .is_empty(),
             "addEventListener handler must not trigger InfiniteLoop"
         );
@@ -1176,7 +1179,7 @@ mod tests {
         assert!(!result.widen_trace.contains_key(&0));
         assert!(
             InfiniteLoop
-                .check(&RuleCtx::new(&prog("C", &result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog("C", &result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -1238,7 +1241,7 @@ mod tests {
         );
         assert!(
             !InfiniteLoop
-                .check(&RuleCtx::new(&prog("C", &result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog("C", &result), crate::test_support::C))
                 .is_empty(),
             "the loop setter in the .then callback must now be flagged"
         );
@@ -1347,7 +1350,7 @@ mod tests {
         );
         assert!(
             InfiniteLoop
-                .check(&RuleCtx::new(&prog("C", &result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog("C", &result), crate::test_support::C))
                 .is_empty(),
             "bounded loop setter must not be flagged (anti-FP)"
         );
@@ -1470,7 +1473,7 @@ mod tests {
         );
         assert!(
             !InfiniteLoop
-                .check(&RuleCtx::new(&prog("C", &result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog("C", &result), crate::test_support::C))
                 .is_empty(),
             "setN(n+1) inside cb → setTimeout(cb) should be detected as infinite loop"
         );
@@ -1536,7 +1539,7 @@ mod tests {
         );
         assert!(
             !InfiniteLoop
-                .check(&RuleCtx::new(&prog("C", &result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog("C", &result), crate::test_support::C))
                 .is_empty(),
             "setN(n+1) inside inc → fetch().then(inc) should be detected as infinite loop"
         );
@@ -1614,7 +1617,7 @@ mod tests {
         );
         assert!(
             !InfiniteLoop
-                .check(&RuleCtx::new(&prog("C", &result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog("C", &result), crate::test_support::C))
                 .is_empty(),
             "outer() → setTimeout(inner) → setN(n+1) should be detected as infinite loop"
         );
@@ -1659,7 +1662,7 @@ mod tests {
             },
         ];
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
-        let diags = InfiniteLoop.check(&RuleCtx::new(&prog("C", &result), &"C".to_string()));
+        let diags = InfiniteLoop.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
 
         assert!(!diags.is_empty(), "should detect infinite loop");
         let handler_notes: Vec<_> = diags[0]
@@ -1704,7 +1707,7 @@ mod tests {
             },
         ];
         let result = make_result_with_widened(HashSet::from([0]), hooks, render_stmts);
-        let diags = InfiniteLoop.check(&RuleCtx::new(&prog("C", &result), &"C".to_string()));
+        let diags = InfiniteLoop.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
 
         assert!(!diags.is_empty(), "should detect infinite loop");
         assert!(

@@ -36,13 +36,25 @@ def by_rule(keys, index):
     return Counter(index[k] for k in keys).most_common()
 
 
+def sort_key(key):
+    """Order locations without assuming they have one.
+
+    A finding whose witness chain names no source range carries `line: null`
+    (limitations.md, "Every finding carries a position", residual #131), and
+    `None < int` raises. Same key `corpus-baseline.py::digest` already uses, so
+    the two scripts order the corpus identically.
+    """
+    f, line, col, msg = key
+    return (str(f), line or 0, col or 0, msg)
+
+
 def fmt(label, keys, index, show):
     if not keys:
         return
     print(f"\n{label} ({len(keys)}):")
     for rule, n in by_rule(keys, index):
         print(f"  {n:5d}  {rule}")
-    for key in sorted(keys)[:show]:
+    for key in sorted(keys, key=sort_key)[:show]:
         f, line, col, msg = key
         print(f"    {f}:{line}:{col}  {msg[:100]}")
     if show and len(keys) > show:

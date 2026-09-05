@@ -368,7 +368,7 @@ impl Rule for StateMutation {
 
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
         let (result, component) = (ctx.program(), ctx.component());
-        let result = &result.components[component];
+        let result = &result.components[&component];
         let state_val_label = state_val_labels(&result.render_cfg);
         let setter_label = all_setter_labels(result);
 

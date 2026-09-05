@@ -34,6 +34,7 @@ use crate::{
 
 use super::local_bindings;
 use super::setters::{all_setter_labels, collect_fn_bindings, collect_setter_calls_with_extra};
+use crate::ir::{CompOrigin, ComponentId};
 
 /// What the call sites prove about a consumer's mount lifetime, relative to
 /// the state slot feeding one of its seeding props.
@@ -61,9 +62,10 @@ pub enum MountCoupling {
 }
 
 /// One JSX instantiation of a component, reduced to what mount reasoning needs.
+#[derive(Clone)]
 struct MountSite {
     /// Component whose render body holds the element.
-    caller: Symbol,
+    caller: ComponentId,
     /// Access paths read by each prop expression, `key` included. `None` when
     /// the element spreads (`{...props}`): the props it really passes are not
     /// resolvable syntactically, so nothing here may be concluded.
@@ -90,14 +92,19 @@ struct Guard {
 /// Built once per program (ADR-021 §4): a rule asking this per component would
 /// walk every render CFG once per component — the quadratic shape of issue #86.
 pub(in crate::rules) struct MountIndex {
-    sites: HashMap<Symbol, Vec<MountSite>>,
+    sites: HashMap<ComponentId, Vec<MountSite>>,
 }
 
 impl MountIndex {
     pub(in crate::rules) fn build(program: &ProgramAnalysisResult) -> Self {
-        let mut sites: HashMap<Symbol, Vec<MountSite>> = HashMap::new();
+        let mut sites: HashMap<ComponentId, Vec<MountSite>> = HashMap::new();
         for (caller, comp) in &program.components {
-            collect_sites(caller, &comp.render_cfg, &mut sites);
+            collect_sites(
+                *caller,
+                &comp.render_cfg,
+                &program.component_table,
+                &mut sites,
+            );
         }
         MountIndex { sites }
     }
@@ -111,12 +118,12 @@ impl MountIndex {
     /// consumer with no visible call site proves nothing at all.
     pub(in crate::rules) fn coupling(
         &self,
-        consumer: &Symbol,
+        consumer: ComponentId,
         seed_props: &[Symbol],
-        feeder: Option<(&Symbol, HookLabel)>,
+        feeder: Option<(ComponentId, HookLabel)>,
         program: &ProgramAnalysisResult,
     ) -> MountCoupling {
-        let sites = match self.sites.get(consumer) {
+        let sites = match self.sites.get(&consumer) {
             Some(s) if !s.is_empty() => s,
             _ => return MountCoupling::Free,
         };
@@ -167,13 +174,13 @@ impl MountSite {
     /// the feeder move together, in one handler, in one commit.
     fn writer_coupled(
         &self,
-        owner: &Symbol,
+        owner: ComponentId,
         slot: HookLabel,
         program: &ProgramAnalysisResult,
     ) -> bool {
         // Guard slots are the *caller's*: a feeder owned elsewhere is written
         // where this mount condition is not, so nothing couples.
-        self.caller == *owner
+        self.caller == owner
             && self.guards.iter().any(|guard| {
                 guard.slots.iter().any(|guard_slot| {
                     *guard_slot != slot && writes_move_together(program, owner, slot, *guard_slot)
@@ -188,11 +195,11 @@ impl MountSite {
 /// commit where a mounted consumer sees the new value.
 fn writes_move_together(
     program: &ProgramAnalysisResult,
-    owner: &Symbol,
+    owner: ComponentId,
     slot: HookLabel,
     guard_slot: HookLabel,
 ) -> bool {
-    let Some(comp) = program.components.get(owner) else {
+    let Some(comp) = program.components.get(&owner) else {
         return false;
     };
     let labels = all_setter_labels(comp);
@@ -270,30 +277,53 @@ fn for_each_block_expr<'a>(cfg: &'a CFG, f: &mut impl FnMut(&'a Expr, BlockId)) 
 /// `.map(x => <Child/>)` renders just as much as a top-level element). Nested
 /// bodies get no guards: their branches live in another CFG, whose blocks the
 /// caller's dominator tree and block envs know nothing about.
-fn collect_sites(caller: &Symbol, cfg: &CFG, out: &mut HashMap<Symbol, Vec<MountSite>>) {
+fn collect_sites(
+    caller: ComponentId,
+    cfg: &CFG,
+    table: &crate::ir::ComponentTable,
+    out: &mut HashMap<ComponentId, Vec<MountSite>>,
+) {
     // What a branch tests depends on the branch alone, never on the element it
     // happens to guard — so the chase runs once per branch here, not once per
     // (branch, element) pair inside `guards_of`. A render body with hundreds of
     // both made that product the dominant cost of the whole rules phase.
     let branches = branch_conditions(cfg);
-    let mut push = |name: &Symbol, props: &Expr, block: Option<BlockId>| {
-        out.entry(name.clone()).or_default().push(MountSite {
-            caller: caller.clone(),
-            prop_paths: prop_paths(props),
-            guards: block
-                .map(|b| guards_of(cfg, b, &branches))
-                .unwrap_or_default(),
-        });
-    };
+    let mut push =
+        |name: &Symbol, origin: Option<&CompOrigin>, props: &Expr, block: Option<BlockId>| {
+            let site = MountSite {
+                caller,
+                prop_paths: prop_paths(props),
+                guards: block
+                    .map(|b| guards_of(cfg, b, &branches))
+                    .unwrap_or_default(),
+            };
+            // A resolved callee is one component; an unresolved one may be any
+            // component of that name, and every candidate has to carry the site.
+            // The relation only ever *downgrades* a finding, and it downgrades
+            // when EVERY site remounts — so an extra site can only keep a finding,
+            // never remove one (#95).
+            let targets: Vec<ComponentId> = match origin.and_then(|o| table.id_of(o)) {
+                Some(id) => vec![id],
+                None => table.ids_named(name).collect(),
+            };
+            for id in targets {
+                out.entry(id).or_default().push(site.clone());
+            }
+        };
     fn walk<'a>(
         e: &'a Expr,
         block: Option<BlockId>,
         nested: &mut Vec<&'a CFG>,
-        push: &mut impl FnMut(&Symbol, &Expr, Option<BlockId>),
+        push: &mut impl FnMut(&Symbol, Option<&CompOrigin>, &Expr, Option<BlockId>),
     ) {
         match e {
-            Expr::CompApp { name, props, .. } => {
-                push(name, props, block);
+            Expr::CompApp {
+                name,
+                props,
+                origin,
+                ..
+            } => {
+                push(name, origin.as_deref(), props, block);
                 walk(props, block, nested, push);
             }
             Expr::FnLit { body_cfg, .. } => nested.push(body_cfg),

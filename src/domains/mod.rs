@@ -154,7 +154,7 @@ pub trait Transfer {
     /// share an answer with a written `[]`, which pins the memo forever.
     fn recompute_memo(
         &self,
-        component: &crate::ir::types::Symbol,
+        component: crate::ir::ComponentId,
         deps: &crate::ir::hooks::DepsArg,
         env: &AbstractEnv<Self::Domain>,
         ctx: &mut context::AnalysisCtx<Self::Domain>,

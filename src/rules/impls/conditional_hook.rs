@@ -21,7 +21,7 @@ impl Rule for ConditionalHook {
         // Applicable as soon as the component calls any hook at all.
         result
             .components
-            .get(component)
+            .get(&component)
             .is_some_and(|c| !c.hook_calls.is_empty())
             .then_some(crate::rules::SafeCheck {
                 rule: Self::NAME,
@@ -198,7 +198,7 @@ mod tests {
                 opaque: false,
             }],
         );
-        let diags = ConditionalHook.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = ConditionalHook.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].notes.len(), 1);
         assert_eq!(diags[0].notes[0].range, Some(cond_span));
@@ -329,7 +329,7 @@ mod tests {
                 opaque: false,
             }],
         );
-        let diags = ConditionalHook.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = ConditionalHook.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].notes.len(), 1);
         assert_eq!(diags[0].notes[0].range, Some(guard_span));
@@ -350,7 +350,7 @@ mod tests {
         );
         assert!(
             ConditionalHook
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -370,7 +370,7 @@ mod tests {
         );
         assert!(
             ConditionalHook
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -388,7 +388,7 @@ mod tests {
                 opaque: false,
             }],
         );
-        let diags = ConditionalHook.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = ConditionalHook.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].hook_label, Some(0));
     }
@@ -408,7 +408,7 @@ mod tests {
         );
         assert!(
             ConditionalHook
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -433,7 +433,7 @@ mod tests {
             },
         ];
         let result = make_result(cfg, hook_calls);
-        let diags = ConditionalHook.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = ConditionalHook.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].hook_label, Some(1));
     }
@@ -475,7 +475,7 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(
             ConditionalHook
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -574,7 +574,7 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(
             !ConditionalHook
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }

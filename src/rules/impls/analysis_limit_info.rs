@@ -6,12 +6,14 @@ use crate::rules::{Diagnostic, Rule};
 /// Emits `Info` diagnostics when the analyser deliberately truncates analysis
 /// to preserve soundness.  Each site is a potential source of false negatives.
 ///
-/// Five cases:
+/// Six cases:
 /// - `recursion-cutoff` — component references itself (directly or transitively);
 ///   the recursive call is resolved to ⊤.
 /// - `unknown-component` — component instantiates a child not found in the
 ///   analysis registry (imported from an unanalyzed file); props and effects of
 ///   that child are treated as ⊤.
+/// - `ambiguous-component` — several analysed files define the child's name and
+///   the call site does not say which; the child is treated as unknown (#7).
 /// - `callback-depth-cap` — callback inlining reached MAX_INLINE_DEPTH; deeper
 ///   HOF chains (`.then(() => .then(…))`) not descended.
 /// - `unknown-hook` — custom hook call whose source is not in the registry and
@@ -35,7 +37,8 @@ impl Rule for AnalysisLimitInfo {
         let stats = &result.stats;
 
         for (caller, callee) in &stats.recursive_component_refs {
-            if caller == component {
+            if *caller == component {
+                let callee = result.display_name(*callee);
                 diags.push(Diagnostic::info(
                     "analysis-limit",
                     format!(
@@ -48,7 +51,7 @@ impl Rule for AnalysisLimitInfo {
         }
 
         for (caller, callee) in &stats.unknown_component_refs {
-            if caller == component {
+            if *caller == component {
                 diags.push(Diagnostic::info(
                     "analysis-limit",
                     format!(
@@ -59,7 +62,21 @@ impl Rule for AnalysisLimitInfo {
             }
         }
 
-        if stats.callback_depth_capped.contains(component) {
+        for (caller, callee) in &stats.ambiguous_component_refs {
+            if *caller == component {
+                diags.push(Diagnostic::info(
+                    "analysis-limit",
+                    format!(
+                        "several analysed files define a component called `{callee}` and \
+                             this reference does not resolve to one of them, so the child \
+                             is treated as unknown. Import it explicitly from its file \
+                             (FN possible)"
+                    ),
+                ));
+            }
+        }
+
+        if stats.callback_depth_capped.contains(&component) {
             diags.push(Diagnostic::info(
                 "analysis-limit",
                 format!(
@@ -70,7 +87,7 @@ impl Rule for AnalysisLimitInfo {
             ));
         }
 
-        if stats.inline_budget_exhausted.contains(component) {
+        if stats.inline_budget_exhausted.contains(&component) {
             diags.push(Diagnostic::info(
                 "analysis-limit",
                 "utility inlining ran out of splice budget here, so the remaining \
@@ -80,7 +97,7 @@ impl Rule for AnalysisLimitInfo {
         }
 
         // Unknown custom hooks survived expand_custom_hooks (not in HookRegistry or SummaryRegistry).
-        if let Some(comp_result) = result.components.get(component) {
+        if let Some(comp_result) = result.components.get(&component) {
             for call in &comp_result.hook_calls {
                 // Not `kind == Custom`: a summarized library hook is a custom
                 // hook whose abstraction is known, and it keeps its row so
@@ -117,7 +134,7 @@ impl Rule for AnalysisLimitInfo {
         // keys the suspension of "verified:" assurances off this Info, which
         // is how a component stops publishing a universal over a hook nobody
         // could check.
-        if let Some(comp_result) = result.components.get(component) {
+        if let Some(comp_result) = result.components.get(&component) {
             for info in comp_result.effect_info.values() {
                 if !info.deps_are_opaque() {
                     continue;

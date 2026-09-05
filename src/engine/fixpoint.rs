@@ -8,6 +8,7 @@ use crate::{
         stores::{AbstractEnv, MemoStore, StateStore},
     },
     ir::{
+        ComponentId,
         cfg::CFG,
         component::{ComponentIR, ModuleConstInit},
         expr::{Expr, SummaryValue},
@@ -63,12 +64,14 @@ impl Default for Config {
 /// `domains::transfer` and `engine::fixpoint`.
 pub fn analyze_component_inter(
     comp: &ComponentIR,
+    comp_id: ComponentId,
     initial_env: AbstractEnv<StateValue>,
     initial_heap: Heap,
     inter: &InterCtx<'_>,
 ) -> AnalysisResult<StateValue> {
     analyze_component_impl(
         comp.clone(),
+        comp_id,
         &crate::domains::transfer::StateValueTransfer,
         inter.config,
         initial_env,
@@ -78,13 +81,34 @@ pub fn analyze_component_inter(
 }
 
 /// Public entry point intra-component analysis only (no inter-component context).
+///
+/// The component is identified as [`ComponentId::SYNTHETIC`]: there is no
+/// registry here to intern it, and a lone intra analysis compares its
+/// component to nothing. Use [`analyze_component_as`] when several such
+/// results have to coexist in one program — they would otherwise all claim
+/// the same identity.
 pub fn analyze_component<T: Transfer<Domain = StateValue>>(
     comp: ComponentIR,
     transfer: &T,
     config: &Config,
 ) -> AnalysisResult<StateValue> {
+    analyze_component_as(comp, ComponentId::SYNTHETIC, transfer, config)
+}
+
+/// [`analyze_component`] for a caller that has already interned the component.
+///
+/// The id is what the result stamps into its own state labels and setter
+/// owners, so a program built from several of these resolves each one's
+/// provenance to the right component (#7).
+pub fn analyze_component_as<T: Transfer<Domain = StateValue>>(
+    comp: ComponentIR,
+    id: ComponentId,
+    transfer: &T,
+    config: &Config,
+) -> AnalysisResult<StateValue> {
     analyze_component_impl(
         comp,
+        id,
         transfer,
         config,
         AbstractEnv::bottom(),
@@ -105,6 +129,7 @@ pub fn analyze_component<T: Transfer<Domain = StateValue>>(
 ///   7. Widen after `config.widen_threshold` iterations.
 fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     comp: ComponentIR,
+    comp_id: ComponentId,
     transfer: &T,
     config: &Config,
     initial_env: AbstractEnv<StateValue>,
@@ -113,7 +138,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
 ) -> AnalysisResult<StateValue> {
     let ComponentIR {
         file: comp_file,
-        name: comp_name,
+        name: _,
         param: comp_param,
         dom_props: comp_dom_props,
         mut render_cfg,
@@ -140,12 +165,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         let mut seed_state = StateStore::bottom();
         let mut seed_memo: MemoStore<StateValue> = MemoStore::new();
         let mut seed_heap = crate::domains::Heap::new();
-        let mut ac = AnalysisCtx::null(
-            comp_name.clone(),
-            &mut seed_state,
-            &mut seed_memo,
-            &mut seed_heap,
-        );
+        let mut ac = AnalysisCtx::null(comp_id, &mut seed_state, &mut seed_memo, &mut seed_heap);
         let empty_env = AbstractEnv::bottom();
         let mut env = AbstractEnv::bottom();
         for (name, init) in module_consts.iter() {
@@ -194,7 +214,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             .stats
             .borrow_mut()
             .inline_budget_exhausted
-            .insert(comp_name.clone());
+            .insert(comp_id);
     }
 
     // Expand Custom entries before seeding so inlined State entries are seeded.
@@ -222,12 +242,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         let mut seed_state = StateStore::bottom();
         let mut seed_memo: MemoStore<StateValue> = MemoStore::new();
         let mut seed_heap = crate::domains::Heap::new();
-        let mut ac = AnalysisCtx::null(
-            comp_name.clone(),
-            &mut seed_state,
-            &mut seed_memo,
-            &mut seed_heap,
-        );
+        let mut ac = AnalysisCtx::null(comp_id, &mut seed_state, &mut seed_memo, &mut seed_heap);
         for hook in &hooks {
             let HookEntry::Custom { label, args, .. } = hook else {
                 continue;
@@ -310,7 +325,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     let mut init_memo_mut = init_memo.clone();
                     let mut heap = crate::domains::Heap::new();
                     let mut ac = AnalysisCtx::null(
-                        comp_name.clone(),
+                        comp_id,
                         &mut init_untyped_mut,
                         &mut init_memo_mut,
                         &mut heap,
@@ -349,7 +364,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                 callbacks: &callback_bodies,
             };
             analyze_cfg::<T>(
-                &comp_name,
+                comp_id,
                 &render_cfg,
                 initial_env.clone(),
                 &state_store,
@@ -374,7 +389,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         let memo_updates: Vec<(HookLabel, StateValue)> = {
             let null_query = NullCtx;
             let mut memo_ctx = AnalysisCtx {
-                component: comp_name.clone(),
+                component: comp_id,
                 state: &mut state_store,
                 memo: &mut memo_store,
                 heap: &mut heap,
@@ -387,7 +402,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                     HookEntry::Memo { label, deps, .. }
                     | HookEntry::Callback { label, deps, .. } => Some((
                         *label,
-                        transfer.recompute_memo(&comp_name, deps, &env_exit, &mut memo_ctx),
+                        transfer.recompute_memo(comp_id, deps, &env_exit, &mut memo_ctx),
                     )),
                     _ => None,
                 })
@@ -412,7 +427,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                         callbacks: &callback_bodies,
                     };
                     analyze_cfg::<T>(
-                        &comp_name,
+                        comp_id,
                         body_cfg,
                         env_exit.clone(),
                         &state_store,
@@ -449,7 +464,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
                         callbacks: &callback_bodies,
                     };
                     analyze_cfg::<T>(
-                        &comp_name,
+                        comp_id,
                         body_cfg,
                         env_exit.clone(),
                         &state_store,
@@ -471,7 +486,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         let new_state_incycle = state_from_render.join(&state_from_effects);
         // Include cross-component state updates made by child effects/callbacks.
         let external_updates = inter
-            .map(|i| i.shared_state.borrow().slice(&comp_name))
+            .map(|i| i.shared_state.borrow().slice(comp_id))
             .unwrap_or_else(StateStore::bottom);
         let new_state = new_state_incycle
             .join(&state_from_handlers)
@@ -531,7 +546,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
             callbacks: &callback_bodies,
         };
         let (bs, _) = analyze_cfg::<T>(
-            &comp_name,
+            comp_id,
             &render_cfg,
             initial_env.clone(),
             &state,
@@ -562,7 +577,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     for hook in &hooks {
         if let HookEntry::Effect { body_cfg, .. } = hook {
             let (_, pure_writes) = analyze_cfg::<T>(
-                &comp_name,
+                comp_id,
                 body_cfg,
                 env_exit.clone(),
                 &bottom_state,
@@ -610,7 +625,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     let hooks_clone = hooks.clone();
 
     AnalysisResult {
-        component: comp_name,
+        component: comp_id,
         file: comp_file,
         param: comp_param,
         dom_props: comp_dom_props,
@@ -655,17 +670,18 @@ pub fn analyze_program(
     let shared_state = RefCell::new(SharedStateStore::new());
     let call_graph = RefCell::new(ComponentCallGraph::new());
     let stats = RefCell::new(AnalysisStats::default());
-    let results: RefCell<HashMap<String, AnalysisResult<crate::domains::StateValue>>> =
+    let results: RefCell<HashMap<ComponentId, AnalysisResult<crate::domains::StateValue>>> =
         RefCell::new(HashMap::new());
 
     let roots = strategy.detect(&registry);
-    let mut analysed_keys: std::collections::HashSet<crate::engine::ComponentKey> =
-        std::collections::HashSet::new();
+    let mut analysed: std::collections::HashSet<ComponentId> = std::collections::HashSet::new();
 
     // Phase 1: analyze roots top-down (children inlined via eval_comp_app).
-    for root_key in &roots {
-        if let Some(root_ir) = registry.ir_for(root_key) {
-            let display = registry.display_name(root_key);
+    for &root in &roots {
+        let Some(root_key) = registry.key_of(root) else {
+            continue;
+        };
+        if let Some(root_ir) = registry.ir_for(&root_key) {
             let inter = InterCtx {
                 registry: &registry,
                 cache: &cache,
@@ -674,13 +690,14 @@ pub fn analyze_program(
                 stats: &stats,
                 results: &results,
                 call_stack: RefCell::new(vec![]),
-                component_name: display.clone(),
+                component: root,
                 config,
                 analyze_child: analyze_component_inter as AnalyzeChildFn,
                 hook_registry: Some(&hook_registry),
             };
             let result = analyze_component_impl(
                 root_ir,
+                root,
                 &StateValueTransfer,
                 config,
                 AbstractEnv::bottom(),
@@ -688,8 +705,8 @@ pub fn analyze_program(
                 Some(&inter),
             );
             stats.borrow_mut().components_analyzed += 1;
-            results.borrow_mut().insert(display, result);
-            analysed_keys.insert(root_key.clone());
+            results.borrow_mut().insert(root, result);
+            analysed.insert(root);
         }
     }
 
@@ -697,26 +714,38 @@ pub fn analyze_program(
     // `eval_comp_app` analysed top-down under an `InterCtx`. Snapshotted HERE,
     // before the sweep below adds intra-only results that record no call-graph
     // edges and would otherwise be indistinguishable from genuine roots (#110).
-    let phase1_reached: std::collections::HashSet<crate::ir::types::Symbol> =
-        results.borrow().keys().cloned().collect();
+    let phase1_reached: std::collections::HashSet<ComponentId> =
+        results.borrow().keys().copied().collect();
 
     // Phase 2: analyze unreached components (props=⊤, intra only). Skip
     // those already in `results` inter-component pass inserted precise results.
-    let mut remaining_keys: Vec<crate::engine::ComponentKey> = registry
-        .all_keys()
-        .into_iter()
-        .filter(|k| !analysed_keys.contains(k))
+    let remaining: Vec<ComponentId> = registry
+        .table()
+        .ids()
+        .filter(|id| !analysed.contains(id))
         .collect();
-    remaining_keys.sort();
-    for key in remaining_keys {
+    for id in remaining {
+        let Some(key) = registry.key_of(id) else {
+            continue;
+        };
         if let Some(ir) = registry.ir_for(&key) {
-            let display = registry.display_name(&key);
-            if results.borrow().contains_key(&display) {
+            if results.borrow().contains_key(&id) {
                 continue;
             }
-            let result = analyze_component(ir, &StateValueTransfer, config);
+            // Phase 2 is intra-only, but the component still has to record its
+            // own identity — a `Versioned` label it mints here is compared
+            // against phase-1 results.
+            let result = analyze_component_impl(
+                ir,
+                id,
+                &StateValueTransfer,
+                config,
+                AbstractEnv::bottom(),
+                Heap::new(),
+                None,
+            );
             stats.borrow_mut().components_analyzed += 1;
-            results.borrow_mut().insert(display, result);
+            results.borrow_mut().insert(id, result);
         }
     }
 
@@ -724,7 +753,7 @@ pub fn analyze_program(
     let recursive_components = final_stats
         .recursive_component_refs
         .iter()
-        .map(|(_, callee)| callee.clone())
+        .map(|(_, callee)| *callee)
         .collect();
 
     ProgramAnalysisResult {
@@ -733,6 +762,7 @@ pub fn analyze_program(
         call_graph: call_graph.into_inner(),
         recursive_components,
         stats: final_stats,
+        component_table: registry.table().clone(),
         // Both filled by `analyze_lowered` — the registry-based entry point
         // has no file table and no module facts of its own (hand-built IR).
         file_table: Default::default(),

@@ -8,10 +8,7 @@ use oxc_span::SourceType;
 use reactant::rules::RuleCtx;
 
 use reactant::{
-    domains::StateValueTransfer,
-    engine::{Config, analyze_component},
-    lowering::lower_program,
-    rules::all_rules,
+    domains::StateValueTransfer, engine::Config, lowering::lower_program, rules::all_rules,
 };
 
 fn diagnostics(src: &str) -> Vec<(String, String)> {
@@ -34,28 +31,36 @@ fn diagnostics(src: &str) -> Vec<(String, String)> {
 
     let mut components_map = std::collections::HashMap::new();
     let mut names = Vec::new();
+
+    let mut component_table = reactant::ir::ComponentTable::default();
     for comp in components {
-        let name = comp.name.clone();
-        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        components_map.insert(name.clone(), result);
-        names.push(name);
+        let id = component_table.intern(reactant::ir::CompOrigin {
+            file: comp.file.clone(),
+
+            name: comp.name.clone(),
+        });
+
+        let result = reactant::engine::analyze_component_as(
+            comp,
+            id,
+            &StateValueTransfer,
+            &Config::default(),
+        );
+
+        components_map.insert(id, result);
+
+        names.push(id);
     }
     let prog = reactant::engine::ProgramAnalysisResult {
         components: components_map,
-        shared_state: reactant::domains::stores::SharedStateStore::new(),
-        call_graph: reactant::engine::ComponentCallGraph::new(),
-        recursive_components: std::collections::HashSet::new(),
-        stats: reactant::engine::AnalysisStats::default(),
-        file_table: Default::default(),
-        module_table: Default::default(),
-        function_registry: Default::default(),
-        phase1_reached: Default::default(),
+        component_table,
+        ..Default::default()
     };
 
     let mut out = Vec::new();
     for name in &names {
         for rule in all_rules() {
-            for d in rule.check(&RuleCtx::new(&prog, name)) {
+            for d in rule.check(&RuleCtx::new(&prog, *name)) {
                 out.push((d.rule.to_string(), d.message.clone()));
             }
         }
@@ -88,27 +93,35 @@ fn diagnostics_sev(src: &str) -> Vec<(String, reactant::rules::Severity, String)
 
     let mut components_map = std::collections::HashMap::new();
     let mut names = Vec::new();
+
+    let mut component_table = reactant::ir::ComponentTable::default();
     for comp in components {
-        let name = comp.name.clone();
-        let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        components_map.insert(name.clone(), result);
-        names.push(name);
+        let id = component_table.intern(reactant::ir::CompOrigin {
+            file: comp.file.clone(),
+
+            name: comp.name.clone(),
+        });
+
+        let result = reactant::engine::analyze_component_as(
+            comp,
+            id,
+            &StateValueTransfer,
+            &Config::default(),
+        );
+
+        components_map.insert(id, result);
+
+        names.push(id);
     }
     let prog = reactant::engine::ProgramAnalysisResult {
         components: components_map,
-        shared_state: reactant::domains::stores::SharedStateStore::new(),
-        call_graph: reactant::engine::ComponentCallGraph::new(),
-        recursive_components: std::collections::HashSet::new(),
-        stats: reactant::engine::AnalysisStats::default(),
-        file_table: Default::default(),
-        module_table: Default::default(),
-        function_registry: Default::default(),
-        phase1_reached: Default::default(),
+        component_table,
+        ..Default::default()
     };
     let mut out = Vec::new();
     for name in &names {
         for rule in all_rules() {
-            for d in rule.check(&RuleCtx::new(&prog, name)) {
+            for d in rule.check(&RuleCtx::new(&prog, *name)) {
                 out.push((d.rule.to_string(), d.severity(), d.message.clone()));
             }
         }
@@ -400,7 +413,7 @@ fn program_rules_fired(src: &str) -> Vec<String> {
         .flat_map(|name| {
             all_rules()
                 .iter()
-                .flat_map(|r| r.check(&RuleCtx::new(&prog, name)))
+                .flat_map(|r| r.check(&RuleCtx::new(&prog, *name)))
                 .map(|d| d.rule.to_string())
                 .collect::<Vec<_>>()
         })

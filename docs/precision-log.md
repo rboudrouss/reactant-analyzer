@@ -77,6 +77,7 @@ from that session survived, and they are left as they are.
 | 2026-09-04 | the marker is where the tsconfig search starts, not where it stops | #139 | 1,317 → 1,317 (see the entry) |
 | 2026-09-04 | a directory is generated because the repository says so | #137 | 1,317 → 1,317 (0 removed, 0 added; **+88 files read**) |
 | 2026-09-04 | following a narrowed run's imports, behind a flag | #138 | 1,317 → 1,317 (default unchanged; see the entry) |
+| 2026-09-05 | a JSX callee is resolved by the file that writes it | #7 | 1,317 → **1,348** (29 removed, 60 added) |
 
 ---
 
@@ -1118,3 +1119,151 @@ Along the way, `--exclude-dir` (#137) did not work at all under wasm:
 missing. That day's check compared *counts*, which matched on both sides.
 Comparing the named files shows it immediately: comparing counts is not comparing
 behaviour.
+
+## #7: a JSX callee is resolved by the file that writes it (2026-09-05)
+
+`1,317 → 1,348` (**29 removed, 60 added**). A soundness correction, so it adds:
+the additions are findings a bug had been silencing. The HEAD binary re-run
+against the committed baseline first, to check the instrument: `1,317`, delta
+`+0`, so every number below is a real behaviour change.
+
+### Two defects, and both printed a clean bill
+
+The issue described three disagreeing representations of component identity.
+Two of the four symptoms it listed were already closed by the display-name
+unification; what survived was the resolution itself, and underneath it a second
+defect nobody had recorded.
+
+**A JSX callee resolved to the file that sorts first.** `eval_comp_app` asked the
+registry for a bare name, and `get_by_name` answered with the first `(file,
+name)` key in sort order. `App.tsx` importing `./b/Widget`, with an unrelated
+`a/Widget.tsx` in the tree, got `a`'s body inlined:
+
+| | decoy present | decoy deleted |
+|---|---|---|
+| HEAD | `✓ no issues found` | `cross-setter-in-render` (Error) |
+| fixed | Error | Error |
+
+**Discovery and the resolver spelled paths differently.** `discover` returns
+paths rooted the way the user typed them, so `reactant .` yields `./b/W.tsx`,
+while `ImportResolver::resolve` normalises to `b/W.tsx`. Every `(file, name)`
+lookup built from a resolved import therefore missed — not only for components:
+custom hooks, contexts and utilities all key the same way.
+
+| two files defining `useThing`, one buggy | HEAD | fixed |
+|---|---|---|
+| `reactant .` | `✓ no issues found` | `infinite-loop` |
+| `reactant <absolute path>` | `infinite-loop` | `infinite-loop` |
+
+Both defects end in `✓ … no issues found`, which is the one line
+[`limitations.md`](limitations.md) promises is printed only when the run read
+everything it was pointed at.
+
+### The claim
+
+**Who `<Name/>` refers to is a fact of the file that writes it**, settled by that
+file's own declarations and its imports, and by nothing else. It is the same
+claim `HookEntry::Custom::resolved_file` already made for a custom hook call, so
+`Expr::CompApp` now carries the same thing: a `CompOrigin` holding the defining
+file and the name that file exports it under. Both halves are load-bearing — the
+file separates twenty components called `Form`, the name resolves
+`import { Widget as Panel }`, which never resolved at all before.
+
+Resolution lives in one place, `ComponentRegistry::resolve_child`, and answers
+three ways: the proven origin, else the name when only one file defines it, else
+**`Ambiguous`**. Root detection and `SymbolGraph` read the same fact, so the
+three consumers can no longer disagree about who a `<Widget/>` is.
+
+### Ambiguous is not a licence to guess
+
+The old first-match was not non-deterministic, it was **wrong**, and a wrong
+guess inlines a body the program never renders at that site. So a name several
+files answer to, with nothing at the call site to settle it, makes the child
+unanalysable — exactly like a callee outside the run — and the parent carries an
+`analysis-limit` saying so.
+
+That trades coverage for honesty, so it was counted rather than argued:
+
+| | ambiguous refs | unknown-component refs |
+|---|---|---|
+| corpus as one tree | 8,236 | 17,539 |
+| the same 14 repositories, run separately | **1,347** | 24,500 |
+
+**Eighty-four per cent of it is the instrument.** Fourteen projects analysed as
+one tree collide on `Button`, `Link`, `Card` and `Section` across repositories
+that never import from each other — the same reason #139 could not be measured
+on the whole corpus. Run one project at a time, and **eight of the fourteen have
+none at all**; the residual is twenty (981) and dub (246), two monorepos
+importing through `@workspace/*` aliases the resolver cannot map
+([#48](https://github.com/rboudrouss/reactant-analyzer/issues/48)). Against the
+24,500 unknown-component references already reported, ambiguity adds **5.5%** to
+a limitation that was there before, and it points at the fix that removes it.
+
+Analysing *every* candidate and joining was considered and dropped on this
+measurement: it is sound and strictly more precise, but `<Button/>` has 1,453
+ambiguous sites and paying a full child analysis per candidate at each is the
+shape of the O(C²) hang [#86](https://github.com/rboudrouss/reactant-analyzer/issues/86) was.
+
+### Where the 60 additions come from
+
+Root detection marked a component referenced by **name**, so one `<Demo/>`
+anywhere demoted every `Demo` everywhere out of the root set. A component
+nothing actually renders then became neither a root nor an inlined child, and
+fell to phase 2 — intra-only, no `InterCtx`, so its custom hooks stay opaque and
+every finding inside them is lost. Marking by resolved origin puts those
+components back: mantine (+22) and twenty (+16) lead, and the additions cluster
+in `@mantine/hooks/src/use-*/`, whose bodies are now read through their
+consumers.
+
+### Where the 29 removals come from
+
+Eight are the same location reworded, and the rewording is an improvement in
+seven of them: a fuller dep list now that more of the parent is known
+(`nextStep` alone becomes `onError`, `nextStep`, `setPreviousStepState`, …), or
+`its value may change between renders` sharpening to `it is recreated on every
+render`.
+
+The other 21 are sites HEAD analysed against a body the program does not render
+there. dub's are the clearest: its `Badge`, `Logo`, `CopyButton` and `QRCode`
+come from `@dub/ui`, a workspace alias that does not resolve, and HEAD answered
+each one by inlining whichever same-named file sorted first. That coverage was
+fictitious, and the run now says so instead of reporting it.
+
+### Not fixed here, and not claimed
+
+`chakra-ui/apps/compositions/src/examples/splitter-ide-layout.tsx:166` loses an
+Error in the whole-tree run — `prop renderFileTree (a state setter of parent
+SplitterIdeLayout)`, where `renderFileTree` is a local `const` arrow, neither a
+prop nor a setter. The row is false, but it is **still emitted when chakra-ui is
+analysed alone**, so this change did not fix it; it only stopped the whole-tree
+run from reaching it. A false positive carrying an Error contradicts
+`limitations.md` and is filed separately.
+
+### The representation, replaced in the same change
+
+Resolving the callee correctly is half of #7. The other half is what the answer
+was then *carried as*: the analysis keyed its results map, its shared-state
+store, every `Versioned` label and every setter owner by the **display name**,
+which is content-dependent — a second `Widget` anywhere renames the first. An
+unrelated file therefore re-keyed all of those at once.
+
+Component identity is now an interned `ComponentId`, and the display name is
+minted only at render ([ADR-040](adr/ADR-040-component-identity-is-an-interned-id.md),
+superseding ADR-038 §5, which had unified on the display name). That part is
+**behaviour-preserving and was measured as such**: `1,348 → 1,348`, **identical
+digest**, bit for bit over 35,541 files. Two things fell out on their own, which
+is the sign the representation was the problem: `ir_for` stopped rewriting the
+component's name — it existed only because the analysis stamped its own name
+onto everything it recorded — and `Symbol` became an unused import in ten files,
+the mechanical proof that the string no longer travels as identity.
+
+### Cost
+
+`858s → 873s` over 35,541 files: one clean measurement each side, so no
+regression worth reporting and no claim of a gain either. The per-file origin
+map is built once per lowering entry point rather than shared between the three,
+and it does not show.
+
+`LowerCtx` is the shape that made the threading affordable: `SourceMap`,
+`ExprIds` and the origin map travel as one value, so a nested `FnLit` body's
+builder inherits all three and the next per-file fact needs no pass of its own.

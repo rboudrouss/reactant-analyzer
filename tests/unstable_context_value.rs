@@ -37,20 +37,10 @@ fn findings(src: &str) -> Vec<Diagnostic> {
     for comp in components {
         let name = comp.name.clone();
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let mut map = std::collections::HashMap::new();
-        map.insert(name.clone(), result);
-        let prog = reactant::engine::ProgramAnalysisResult {
-            components: map,
-            shared_state: reactant::domains::stores::SharedStateStore::new(),
-            call_graph: reactant::engine::ComponentCallGraph::new(),
-            recursive_components: std::collections::HashSet::new(),
-            stats: reactant::engine::AnalysisStats::default(),
-            file_table: Default::default(),
-            module_table: Default::default(),
-            function_registry: Default::default(),
-            phase1_reached: Default::default(),
-        };
-        out.extend(UnstableContextValue.check(&RuleCtx::new(&prog, &name)));
+        let prog = reactant::engine::ProgramAnalysisResult::single(&name, result);
+        out.extend(
+            UnstableContextValue.check(&RuleCtx::new(&prog, prog.component_named(&name).unwrap())),
+        );
     }
     out
 }

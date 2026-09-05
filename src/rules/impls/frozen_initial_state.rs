@@ -76,7 +76,7 @@ impl Rule for FrozenInitialState {
 
     fn safe_check(&self, ctx: &RuleCtx) -> Option<crate::rules::SafeCheck> {
         let (result, component) = (ctx.program(), ctx.component());
-        let comp = result.components.get(component)?;
+        let comp = result.components.get(&component)?;
         (!comp.slot_seeds.is_empty()).then_some(crate::rules::SafeCheck {
             rule: Self::NAME,
             message: "no state slot freezes a changing prop's first value",
@@ -85,7 +85,7 @@ impl Rule for FrozenInitialState {
 
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
         let (result, component) = (ctx.program(), ctx.component());
-        let comp = &result.components[component];
+        let comp = &result.components[&component];
         let render_cfg = &comp.render_cfg;
         let setter_labels = all_setter_labels(comp);
         let state_labels = state_val_labels(render_cfg);
@@ -181,7 +181,7 @@ impl Rule for FrozenInitialState {
                     names,
                     proven
                         .as_ref()
-                        .map(|(_, p)| (&p.evidence().owner, p.evidence().slot)),
+                        .map(|(_, p)| (p.evidence().owner, p.evidence().slot)),
                     result,
                 ),
                 None => MountCoupling::Free,

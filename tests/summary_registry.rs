@@ -49,8 +49,7 @@ fn parse_and_analyze_with_config(src: &str, config: Config) -> ProgramAnalysisRe
 
 fn diags_for(result: &ProgramAnalysisResult, component: &str) -> Vec<Diagnostic> {
     let rules = all_rules();
-    let component = component.to_string();
-    let ctx = RuleCtx::new(result, &component);
+    let ctx = RuleCtx::new(result, result.component_named(component).unwrap());
     rules.iter().flat_map(|r| r.check(&ctx)).collect()
 }
 
@@ -213,7 +212,7 @@ fn unresolved_custom_hook_return_is_not_provably_stable() {
         }
     "#;
     let result = parse_and_analyze_with_config(src, Config::default());
-    let comp = &result.components["C"];
+    let comp = &result.components[&result.component_named("C").unwrap()];
 
     let effect = comp
         .effect_info
@@ -221,8 +220,7 @@ fn unresolved_custom_hook_return_is_not_provably_stable() {
         .find(|e| !e.declared_deps().is_empty())
         .expect("the effect declares a dep");
     let dep = &effect.declared_deps()[0];
-    let name = "C".to_string();
-    let ctx = RuleCtx::new(&result, &name);
+    let ctx = RuleCtx::new(&result, result.component_named("C").unwrap());
 
     assert_eq!(
         ctx.stability_verdict(dep),
@@ -263,7 +261,10 @@ fn analysis_limit_suppresses_safe_check_assurances() {
     let registry = RuleRegistry::natives();
     let findings = |src: &str| {
         let result = parse_and_analyze_with_config(src, Config::default());
-        registry.check_component(&ProgramCache::new(&result), &"C".to_string())
+        registry.check_component(
+            &ProgramCache::new(&result),
+            result.component_named("C").unwrap(),
+        )
     };
 
     let truncated = findings(opaque);
@@ -366,7 +367,7 @@ fn a_summarized_hook_keeps_its_row_without_an_analysis_limit() {
         ..Config::default()
     };
     let result = parse_and_analyze_with_config(src, config);
-    let comp = &result.components["C"];
+    let comp = &result.components[&result.component_named("C").unwrap()];
     assert!(
         comp.hook_calls
             .iter()
@@ -401,14 +402,13 @@ fn an_unmodelled_react_hook_return_is_not_provably_stable() {
         }
     "#;
     let result = parse_and_analyze_with_config(src, Config::default());
-    let comp = &result.components["C"];
+    let comp = &result.components[&result.component_named("C").unwrap()];
     let effect = comp
         .effect_info
         .values()
         .find(|e| !e.declared_deps().is_empty())
         .expect("the effect declares a dep");
-    let name = "C".to_string();
-    let ctx = RuleCtx::new(&result, &name);
+    let ctx = RuleCtx::new(&result, result.component_named("C").unwrap());
     assert_eq!(
         ctx.stability_verdict(&effect.declared_deps()[0]),
         StabilityVerdict::Unknown,
@@ -455,7 +455,7 @@ fn effects_and_refs_stay_value_less() {
         }
     "#;
     let result = parse_and_analyze_with_config(src, Config::default());
-    let comp = &result.components["C"];
+    let comp = &result.components[&result.component_named("C").unwrap()];
     let markers: Vec<&MarkerVal> = comp
         .render_cfg
         .blocks

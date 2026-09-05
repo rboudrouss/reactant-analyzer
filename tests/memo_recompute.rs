@@ -49,7 +49,12 @@ fn diags(src: &str, comp: &str) -> Vec<Diagnostic> {
     );
     all_rules()
         .iter()
-        .flat_map(|r| r.check(&RuleCtx::new(&result, &comp.to_string())))
+        .flat_map(|r| {
+            r.check(&RuleCtx::new(
+                &result,
+                result.component_named(comp).unwrap(),
+            ))
+        })
         .collect()
 }
 

@@ -1,6 +1,7 @@
 pub mod bindings;
 pub mod cfg;
 pub mod component;
+pub mod component_id;
 pub mod expr;
 pub mod free_vars;
 pub mod function_ir;
@@ -15,7 +16,8 @@ pub mod types;
 
 pub use cfg::{BasicBlock, CFG, Edge, EdgeKind, Terminator};
 pub use component::{ComponentIR, ContextId, ModuleConstInit};
-pub use expr::{BinOp, Expr, Prim, UnaryOp};
+pub use component_id::{ComponentId, ComponentTable};
+pub use expr::{BinOp, CompOrigin, Expr, Prim, UnaryOp};
 pub use function_ir::FunctionIR;
 pub use hook_ir::HookIR;
 pub use hooks::HookEntry;

@@ -1,4 +1,4 @@
-use crate::ir::types::{HookLabel, Symbol};
+use crate::ir::{ComponentId, types::HookLabel};
 
 /// Flat lattice for the component-setter slot of `StateValue`.
 ///
@@ -17,14 +17,14 @@ pub enum SetterVal {
     /// ⊥ — no setter value possible.
     Bottom,
     /// Exactly this component's setter for this hook label.
-    One(Symbol, HookLabel),
+    One(ComponentId, HookLabel),
     /// ⊤ — some setter, but which one was lost at a join.
     Top,
 }
 
 impl SetterVal {
     /// Payload accessor: `Some` only when the setter identity is exact.
-    pub fn as_one(&self) -> Option<(&Symbol, &HookLabel)> {
+    pub fn as_one(&self) -> Option<(&ComponentId, &HookLabel)> {
         match self {
             SetterVal::One(c, l) => Some((c, l)),
             _ => None,
@@ -44,7 +44,7 @@ mod tests {
     use crate::domains::AbstractDomain;
 
     fn one(c: &str, l: usize) -> SetterVal {
-        SetterVal::One(c.to_string(), l)
+        SetterVal::One(crate::test_support::named(c), l)
     }
 
     #[test]

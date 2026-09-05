@@ -28,7 +28,10 @@ fn lazy_init_witness_resolves_cross_file_effectful_call() {
     assert!(lowered.parse_errors.is_empty(), "fixture must parse");
     let program = analyze_lowered(lowered, RootStrategy::AllComponents, Config::default());
 
-    let diags = LazyInit.check(&RuleCtx::new(&program, &"Settings".to_string()));
+    let diags = LazyInit.check(&RuleCtx::new(
+        &program,
+        program.component_named("Settings").unwrap(),
+    ));
     assert_eq!(diags.len(), 1, "one lazy-init finding");
     let d = &diags[0];
 

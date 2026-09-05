@@ -29,11 +29,12 @@ use crate::{
 };
 
 use super::setters::collect_fn_bindings;
+use crate::ir::ComponentId;
 
 /// A state slot qualified by its owning component: `(component, label)`. Lets a
 /// `ComponentSetter` prop (a write into a parent slot) be a first-class churn
 /// node alongside a local setter.
-pub(in crate::rules) type SlotNode = (Symbol, HookLabel);
+pub(in crate::rules) type SlotNode = (ComponentId, HookLabel);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(in crate::rules) enum Freshness {
@@ -97,7 +98,7 @@ pub(in crate::rules) fn classify_effect_deps(
                 };
                 if let Stability::Versioned(labels) = &val.reference {
                     for (c, l) in labels {
-                        versioned.insert((c.clone(), *l));
+                        versioned.insert((*c, *l));
                     }
                 }
             }
@@ -116,7 +117,7 @@ pub(in crate::rules) fn classify_effect_deps(
 #[allow(clippy::too_many_arguments)]
 pub(in crate::rules) fn write_can_retrigger(
     dep_exprs: &[Expr],
-    component: &Symbol,
+    component: ComponentId,
     label: HookLabel,
     state_vals: &HashMap<Var, HookLabel>,
     memo_vals: &HashMap<Var, HookLabel>,
@@ -133,8 +134,10 @@ pub(in crate::rules) fn write_can_retrigger(
             state_vals,
             memo_vals,
         );
-        let reacts =
-            exact.contains(&label) || versioned.iter().any(|(c, l)| *l == label && c == component);
+        let reacts = exact.contains(&label)
+            || versioned
+                .iter()
+                .any(|(c, l)| *l == label && *c == component);
         if !reacts {
             continue;
         }
@@ -400,7 +403,7 @@ fn churn_calls_in_expr(
                         None => crate::domains::StateValue::top(),
                     };
                     out.push(ChurnSetterCall {
-                        node: node.clone(),
+                        node: *node,
                         freshness,
                         block_id,
                         span,

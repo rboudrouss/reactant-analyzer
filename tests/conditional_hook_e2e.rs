@@ -25,7 +25,10 @@ fn void_hooks_after_early_return_are_flagged() {
     assert!(lowered.parse_errors.is_empty(), "fixture must parse");
     let program = analyze_lowered(lowered, RootStrategy::AllComponents, Config::default());
 
-    let diags = ConditionalHook.check(&RuleCtx::new(&program, &"EarlyReturn".to_string()));
+    let diags = ConditionalHook.check(&RuleCtx::new(
+        &program,
+        program.component_named("EarlyReturn").unwrap(),
+    ));
 
     // useEffect + useRef + useMemo after the early return; useState before it
     // is legal, and the event handler must not be flagged (not a hook).

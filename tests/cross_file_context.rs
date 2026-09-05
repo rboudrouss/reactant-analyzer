@@ -228,7 +228,7 @@ fn the_same_cell_imported_twice_has_one_canonical_identity() {
     let id_of = |comp: &str, local: &str| {
         let c = prog
             .components
-            .get(comp)
+            .get(&prog.component_named(comp).unwrap())
             .unwrap_or_else(|| panic!("no component {comp}"));
         match c.module_consts.get(local) {
             Some(ModuleConstInit::Context(id)) => id.clone(),
@@ -265,7 +265,7 @@ fn a_local_context_identifies_itself() {
     let files = vec![tmp.0.join("own.tsx")];
     let lowered = lower_files(&files, &DefaultImportResolver::default());
     let prog = analyze_lowered(lowered, RootStrategy::AllComponents, Config::default());
-    let c = &prog.components[&"C".to_string()];
+    let c = &prog.components[&prog.component_named("C").unwrap()];
     match c.module_consts.get("Own") {
         Some(ModuleConstInit::Context(id)) => {
             assert_eq!(id.origin_name, "Own");

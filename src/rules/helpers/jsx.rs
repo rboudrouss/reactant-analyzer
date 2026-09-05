@@ -336,7 +336,10 @@ pub(crate) fn each_component_element<'a>(
     expr: &'a Expr,
     f: &mut impl FnMut(&'a str, &'a Expr, Option<SourceRange>),
 ) {
-    if let Expr::CompApp { name, props, span } = expr {
+    if let Expr::CompApp {
+        name, props, span, ..
+    } = expr
+    {
         f(name, props, *span);
     }
     expr.for_each_child(&mut |child| each_component_element(child, f));
@@ -350,7 +353,9 @@ fn each_element<'a>(
     f: &mut impl FnMut(&'a str, bool, &'a Expr, Option<SourceRange>),
 ) {
     match expr {
-        Expr::CompApp { name, props, span } => f(name, false, props, *span),
+        Expr::CompApp {
+            name, props, span, ..
+        } => f(name, false, props, *span),
         Expr::NativeElem {
             tag, props, span, ..
         } => f(tag, true, props, *span),

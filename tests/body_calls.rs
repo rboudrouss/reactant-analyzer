@@ -37,20 +37,9 @@ fn run_pack(pack_json: &str, src: &str) -> Vec<Diagnostic> {
     for comp in components {
         let name = comp.name.clone();
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let mut components = std::collections::HashMap::new();
-        components.insert(name.clone(), result);
-        let prog = reactant::engine::ProgramAnalysisResult {
-            components,
-            shared_state: reactant::domains::stores::SharedStateStore::new(),
-            call_graph: reactant::engine::ComponentCallGraph::new(),
-            recursive_components: std::collections::HashSet::new(),
-            stats: reactant::engine::AnalysisStats::default(),
-            file_table: Default::default(),
-            module_table: Default::default(),
-            function_registry: Default::default(),
-            phase1_reached: Default::default(),
-        };
-        let ctx = RuleCtx::new(&prog, &name);
+        let prog = reactant::engine::ProgramAnalysisResult::single(&name, result);
+        let id = prog.component_named(&name).expect("interned above");
+        let ctx = RuleCtx::new(&prog, id);
         for rule in &pack.rules {
             out.extend(rule.rule.check(&ctx));
         }

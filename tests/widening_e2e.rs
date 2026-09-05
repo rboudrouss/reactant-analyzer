@@ -61,21 +61,10 @@ fn rule_hits<R: Rule>(
     results: &HashMap<String, AnalysisResult<StateValue>>,
     name: &str,
 ) -> usize {
-    use reactant::engine::{ComponentCallGraph, ProgramAnalysisResult};
-    let mut components = HashMap::new();
-    components.insert(name.to_string(), results[name].clone());
-    let prog = ProgramAnalysisResult {
-        components,
-        shared_state: reactant::domains::stores::SharedStateStore::new(),
-        call_graph: ComponentCallGraph::new(),
-        recursive_components: std::collections::HashSet::new(),
-        stats: reactant::engine::AnalysisStats::default(),
-        file_table: Default::default(),
-        module_table: Default::default(),
-        function_registry: Default::default(),
-        phase1_reached: Default::default(),
-    };
-    rule.check(&RuleCtx::new(&prog, &name.to_string())).len()
+    use reactant::engine::ProgramAnalysisResult;
+    let prog = ProgramAnalysisResult::single(name, results[name].clone());
+    let id = prog.component_named(name).expect("interned above");
+    rule.check(&RuleCtx::new(&prog, id)).len()
 }
 
 fn infinite_loop_hits(results: &HashMap<String, AnalysisResult<StateValue>>, name: &str) -> usize {

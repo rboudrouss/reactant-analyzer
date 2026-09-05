@@ -14,7 +14,7 @@ impl Rule for WideningInfo {
 
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
         let (result, component) = (ctx.program(), ctx.component());
-        let result = &result.components[component];
+        let result = &result.components[&component];
         let mut labels: Vec<_> = result.widen_trace.keys().copied().collect();
         labels.sort_unstable();
         labels

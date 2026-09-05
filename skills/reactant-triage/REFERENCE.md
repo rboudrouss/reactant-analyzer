@@ -67,8 +67,10 @@ finding inside an inlined custom hook gets reported in the hook's file, not in
 the component's.
 
 `component` is the display name reactant gives the component. The `@<file>`
-suffix shows up only when two files define the same component name, and that
-collision is itself a known defect (#7).
+suffix shows up only when two files define the same component name. Which one a
+`<Name/>` means is read from the writing file's imports and declarations; when
+neither settles it, the child is treated as unanalysable and the parent carries
+an `analysis-limit` saying so (#7).
 
 `notes[]` is the witness chain. `notes[].file` can differ from the diagnostic's
 `file`. Each `kind` carries its own fields (`var`, `name`/`target`,

@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use crate::ir::ComponentId;
 use crate::{
     domains::{
         AbstractEnv, StateValue,
@@ -233,7 +234,7 @@ pub(crate) fn collect_write_sites(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SetterProp {
     /// The component that owns the slot.
-    pub component: Symbol,
+    pub component: ComponentId,
     pub label: HookLabel,
     /// Calling the variable provably writes the slot — a must.
     ///
@@ -291,7 +292,7 @@ pub(crate) fn collect_component_setter_vars(
                 result.insert(
                     var.clone(),
                     SetterProp {
-                        component: component.clone(),
+                        component: *component,
                         label: *label,
                         must_write: true,
                     },
@@ -317,7 +318,7 @@ pub(crate) fn collect_component_setter_vars(
                                 result.insert(
                                     var.clone(),
                                     SetterProp {
-                                        component: component.clone(),
+                                        component: *component,
                                         label: *label,
                                         must_write: body_writes(body_cfg, name),
                                     },
@@ -419,11 +420,11 @@ fn body_writes(body_cfg: &CFG, setter: &Symbol) -> bool {
 /// `setter-in-render`).
 pub(crate) fn cross_component_setters(
     comp: &AnalysisResult<StateValue>,
-    component: &Symbol,
+    component: ComponentId,
 ) -> HashMap<Var, SetterProp> {
     collect_component_setter_vars(&comp.render_cfg, &comp.block_states, &comp.heap)
         .into_iter()
-        .filter(|(_, prop)| prop.component != *component)
+        .filter(|(_, prop)| prop.component != component)
         .collect()
 }
 

@@ -57,7 +57,7 @@ impl Rule for SetterInRender {
 
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
         let (result, component) = (ctx.program(), ctx.component());
-        let comp_result = &result.components[component];
+        let comp_result = &result.components[&component];
 
         let local_setter_info: HashMap<Var, (HookLabel, Option<crate::ir::SourceRange>)> =
             comp_result
@@ -210,8 +210,8 @@ impl Rule for SetterInRender {
                                 "prop `{}` (a state setter of parent `{}`) called during render \
                                  of `{}`, which triggers a parent re-render on every render",
                                 crate::ir::source_name(&call.var),
-                                parent_comp,
-                                component
+                                result.display_name(*parent_comp),
+                                result.display_name(component)
                             )
                         } else {
                             format!(
@@ -219,8 +219,8 @@ impl Rule for SetterInRender {
                                  with no timing summary. If that callee runs it during render, \
                                  `{}` re-renders its parent on every render",
                                 crate::ir::source_name(&call.var),
-                                parent_comp,
-                                component
+                                result.display_name(*parent_comp),
+                                result.display_name(component)
                             )
                         },
                         None,
@@ -337,7 +337,7 @@ mod tests {
         let result = make_result(vec![], vec![]);
         assert!(
             SetterInRender
-                .check(&RuleCtx::new(&prog("C", &result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog("C", &result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -352,7 +352,7 @@ mod tests {
         let result = make_result(vec![], render_stmts);
         assert!(
             SetterInRender
-                .check(&RuleCtx::new(&prog("C", &result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog("C", &result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -374,7 +374,8 @@ mod tests {
             ),
         ];
         let result = make_result(vec![], render_stmts);
-        let diags = SetterInRender.check(&RuleCtx::new(&prog("C", &result), &"C".to_string()));
+        let diags =
+            SetterInRender.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].rule, "setter-in-render");
         assert_eq!(diags[0].severity(), Severity::Error);
@@ -439,7 +440,8 @@ mod tests {
                 },
             ],
         });
-        let diags = SetterInRender.check(&RuleCtx::new(&prog("C", &result), &"C".to_string()));
+        let diags =
+            SetterInRender.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].severity(), Severity::Warning);
     }
@@ -473,7 +475,8 @@ mod tests {
             ),
         ];
         let result = make_result(vec![], render_stmts);
-        let diags = SetterInRender.check(&RuleCtx::new(&prog("C", &result), &"C".to_string()));
+        let diags =
+            SetterInRender.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
         assert_eq!(diags.len(), 2, "both setA and setB should be reported");
     }
 
@@ -532,10 +535,8 @@ mod tests {
             module_consts: Default::default(),
         };
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let diags = SetterInRender.check(&RuleCtx::new(
-            &prog("Counter", &result),
-            &"Counter".to_string(),
-        ));
+        let diags =
+            SetterInRender.check(&RuleCtx::new(&prog("Counter", &result), result.component));
         assert!(!diags.is_empty(), "setter in render body should warn");
         assert_eq!(diags[0].severity(), Severity::Error);
     }
@@ -570,7 +571,8 @@ mod tests {
             ),
         ];
         let result = make_result(vec![], render_stmts);
-        let diags = SetterInRender.check(&RuleCtx::new(&prog("C", &result), &"C".to_string()));
+        let diags =
+            SetterInRender.check(&RuleCtx::new(&prog("C", &result), crate::test_support::C));
         assert_eq!(
             diags.len(),
             1,

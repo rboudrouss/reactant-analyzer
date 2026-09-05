@@ -67,9 +67,12 @@ fn only_app() -> ProgramAnalysisResult {
 #[test]
 fn a_component_reached_top_down_is_in_the_set() {
     let prog = only_app();
-    assert!(prog.was_inter_analyzed(&sym("App")), "the root is phase 1");
     assert!(
-        prog.was_inter_analyzed(&sym("Child")),
+        prog.was_inter_analyzed(prog.component_named("App").unwrap()),
+        "the root is phase 1"
+    );
+    assert!(
+        prog.was_inter_analyzed(prog.component_named("Child").unwrap()),
         "a component reached from a root is phase 1: {:?}",
         prog.phase1_reached
     );
@@ -79,11 +82,11 @@ fn a_component_reached_top_down_is_in_the_set() {
 fn a_phase_two_only_component_is_not_in_the_set() {
     let prog = only_app();
     assert!(
-        prog.components.contains_key(&sym("Leaf")),
+        prog.component_named("Leaf").is_some(),
         "phase 2 still analyses it"
     );
     assert!(
-        !prog.was_inter_analyzed(&sym("Leaf")),
+        !prog.was_inter_analyzed(prog.component_named("Leaf").unwrap()),
         "nothing reached it top-down: {:?}",
         prog.phase1_reached
     );
@@ -93,14 +96,20 @@ fn a_phase_two_only_component_is_not_in_the_set() {
 fn the_split_separates_a_root_from_an_unreached_component() {
     // The whole point: `callers_of` cannot tell these two apart.
     let prog = only_app();
-    assert!(prog.call_graph.callers_of(&sym("App")).is_empty());
     assert!(
-        prog.call_graph.callers_of(&sym("Leaf")).is_empty(),
+        prog.call_graph
+            .callers_of(prog.component_named("App").unwrap())
+            .is_empty()
+    );
+    assert!(
+        prog.call_graph
+            .callers_of(prog.component_named("Leaf").unwrap())
+            .is_empty(),
         "a phase-2 component records no edges, so it reads as caller-less"
     );
     assert_ne!(
-        prog.was_inter_analyzed(&sym("App")),
-        prog.was_inter_analyzed(&sym("Leaf")),
+        prog.was_inter_analyzed(prog.component_named("App").unwrap()),
+        prog.was_inter_analyzed(prog.component_named("Leaf").unwrap()),
         "the persisted split is what separates them"
     );
 }
@@ -109,19 +118,22 @@ fn the_split_separates_a_root_from_an_unreached_component() {
 fn ancestry_is_unknown_rather_than_empty_for_an_unreached_component() {
     let prog = only_app();
     assert_eq!(
-        prog.complete_ancestry(&sym("App")),
+        prog.complete_ancestry(prog.component_named("App").unwrap()),
         Some(Default::default()),
         "a genuine root has a complete, empty ancestry"
     );
     assert_eq!(
-        prog.complete_ancestry(&sym("Leaf")),
+        prog.complete_ancestry(prog.component_named("Leaf").unwrap()),
         None,
         "an unreached component's ancestry is unknown, not empty"
     );
     let child = prog
-        .complete_ancestry(&sym("Child"))
+        .complete_ancestry(prog.component_named("Child").unwrap())
         .expect("Child's whole chain is inter-analysed");
-    assert!(child.contains(&sym("App")), "{child:?}");
+    assert!(
+        child.contains(&prog.component_named("App").unwrap()),
+        "{child:?}"
+    );
 }
 
 #[test]
@@ -129,9 +141,9 @@ fn a_chain_through_an_unreached_parent_has_no_complete_ancestry() {
     // `Leaf` is reached, but only from `Widget`, which nothing reached. Its
     // ancestry is therefore incomplete even though it has a known caller.
     let prog = analyze(SRC, RootStrategy::Explicit(vec![sym("App"), sym("Leaf")]));
-    assert!(prog.was_inter_analyzed(&sym("Leaf")));
+    assert!(prog.was_inter_analyzed(prog.component_named("Leaf").unwrap()));
     assert!(
-        !prog.was_inter_analyzed(&sym("Widget")),
+        !prog.was_inter_analyzed(prog.component_named("Widget").unwrap()),
         "Widget is never reached: {:?}",
         prog.phase1_reached
     );
@@ -142,7 +154,7 @@ fn every_component_is_phase_one_under_all_components() {
     // The split is a property of the strategy, not a constant.
     let prog = analyze(SRC, RootStrategy::AllComponents);
     for name in prog.components.keys() {
-        assert!(prog.was_inter_analyzed(name), "{name} should be phase 1");
+        assert!(prog.was_inter_analyzed(*name), "{name:?} should be phase 1");
     }
 }
 
@@ -160,10 +172,13 @@ function Pong() { return <Ping/>; }
     );
     for name in ["Ping", "Pong"] {
         assert!(
-            !prog.was_inter_analyzed(&sym(name)),
+            !prog.was_inter_analyzed(prog.component_named(name).unwrap()),
             "{name} was never reached top-down: {:?}",
             prog.phase1_reached
         );
-        assert_eq!(prog.complete_ancestry(&sym(name)), None);
+        assert_eq!(
+            prog.complete_ancestry(prog.component_named(name).unwrap()),
+            None
+        );
     }
 }

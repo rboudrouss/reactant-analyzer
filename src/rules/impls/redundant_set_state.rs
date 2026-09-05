@@ -4,15 +4,10 @@ use std::collections::{HashMap, HashSet};
 use crate::engine::setters::WriterRegion;
 use crate::{
     domains::{AbstractDomain, AbstractEnv, MemoStore, StateStore, StateValue},
-    ir::{
-        cfg::CFG,
-        expr::Expr,
-        hooks::HookEntry,
-        stmt::Stmt,
-        types::{HookLabel, Symbol},
-    },
+    ir::{cfg::CFG, expr::Expr, hooks::HookEntry, stmt::Stmt, types::HookLabel},
 };
 
+use crate::ir::ComponentId;
 use crate::rules::{Diagnostic, Rule};
 
 /// Fires when `setState` is called with a stable value when the state is already stable.
@@ -42,7 +37,7 @@ impl Rule for RedundantSetState {
 
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
         let (result, component) = (ctx.program(), ctx.component());
-        let result = &result.components[component];
+        let result = &result.components[&component];
         let mut diags = Vec::new();
         // One scratch heap for the whole component — see
         // [`crate::rules::helpers::Eval`].
@@ -89,7 +84,7 @@ impl Rule for RedundantSetState {
                 None => continue,
             };
             check_setter_calls(
-                &result.component,
+                result.component,
                 &block.stmts,
                 env,
                 &result.state_store,
@@ -113,7 +108,7 @@ impl Rule for RedundantSetState {
             {
                 let prev_len = diags.len();
                 check_cfg_for_redundant_sets(
-                    &result.component,
+                    result.component,
                     body_cfg,
                     &env_exit,
                     &result.state_store,
@@ -140,7 +135,7 @@ impl Rule for RedundantSetState {
 /// Skips setters whose argument differs across calls (state-transition pattern).
 #[allow(clippy::too_many_arguments)]
 fn check_cfg_for_redundant_sets(
-    component: &Symbol,
+    component: ComponentId,
     cfg: &CFG,
     env: &AbstractEnv<StateValue>,
     state: &StateStore<StateValue>,
@@ -167,7 +162,7 @@ fn check_cfg_for_redundant_sets(
 
 /// Returns setter labels whose argument value differs across calls in `cfg` (including nested FnLits).
 fn collect_transition_setters(
-    component: &Symbol,
+    component: ComponentId,
     cfg: &CFG,
     env: &AbstractEnv<StateValue>,
     state: &StateStore<StateValue>,
@@ -187,7 +182,7 @@ fn collect_transition_setters(
 }
 
 fn collect_setter_vals_in_expr(
-    component: &Symbol,
+    component: ComponentId,
     expr: &Expr,
     env: &AbstractEnv<StateValue>,
     state: &StateStore<StateValue>,
@@ -235,7 +230,7 @@ fn collect_setter_vals_in_expr(
 /// Check a list of statements for `setState(stable)` when state is already stable.
 #[allow(clippy::too_many_arguments)]
 fn check_setter_calls(
-    component: &Symbol,
+    component: ComponentId,
     stmts: &[Stmt],
     env: &AbstractEnv<StateValue>,
     state: &StateStore<StateValue>,
@@ -382,7 +377,7 @@ mod tests {
             vec![("setN", StateValue::reference(Stability::Stable), Some(0))],
             vec![(0, StateValue::reference(Stability::Stable))],
         );
-        let diags = RedundantSetState.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = RedundantSetState.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].hook_label, Some(0));
     }
@@ -414,7 +409,7 @@ mod tests {
         );
         assert!(
             RedundantSetState
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -443,7 +438,7 @@ mod tests {
         );
         assert!(
             RedundantSetState
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -460,7 +455,7 @@ mod tests {
         let result = make_result(vec![(0, stmts)], vec![], vec![]);
         assert!(
             RedundantSetState
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -488,7 +483,7 @@ mod tests {
         );
         assert_eq!(
             RedundantSetState
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .len(),
             1
         );
@@ -555,7 +550,7 @@ mod tests {
             vec![("setN", StateValue::reference(Stability::Stable), Some(0))],
             vec![(0, StateValue::reference(Stability::Stable))],
         );
-        let diags = RedundantSetState.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = RedundantSetState.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1, "effect body setter should be checked");
         assert_eq!(diags[0].hook_label, Some(0));
     }
@@ -586,7 +581,7 @@ mod tests {
         );
         assert!(
             RedundantSetState
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -617,7 +612,7 @@ mod tests {
         );
         assert!(
             RedundantSetState
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::{
     domains::{AbstractDomain, impls::StateValue},
     engine::analysis_result::AnalysisResult,
-    ir::types::Symbol,
+    ir::{ComponentId, types::Symbol},
 };
 
 const DEFAULT_MAX_PER_COMPONENT: usize = 5;
@@ -22,7 +22,7 @@ pub struct CacheEntry {
 /// On overflow: all entries are joined into one degraded entry (sound over-approximation).
 #[derive(Debug)]
 pub struct ComponentCache {
-    entries: HashMap<Symbol, Vec<CacheEntry>>,
+    entries: HashMap<ComponentId, Vec<CacheEntry>>,
     max_per_component: usize,
 }
 
@@ -47,13 +47,13 @@ impl ComponentCache {
         }
     }
 
-    /// Look up a cached result for `(name, props)`.  Returns `None` on miss.
+    /// Look up a cached result for `(comp, props)`.  Returns `None` on miss.
     pub fn lookup(
         &self,
-        name: &Symbol,
+        comp: ComponentId,
         props: &HashMap<Symbol, StateValue>,
     ) -> Option<Arc<AnalysisResult<StateValue>>> {
-        let entries = self.entries.get(name)?;
+        let entries = self.entries.get(&comp)?;
         for entry in entries {
             if props_equal(&entry.props, props) {
                 return Some(Arc::clone(&entry.result));
@@ -65,11 +65,11 @@ impl ComponentCache {
     /// Insert a new result.  On overflow, evicts by joining all entries.
     pub fn insert(
         &mut self,
-        name: Symbol,
+        comp: ComponentId,
         props: HashMap<Symbol, StateValue>,
         result: AnalysisResult<StateValue>,
     ) {
-        let entries = self.entries.entry(name).or_default();
+        let entries = self.entries.entry(comp).or_default();
         if entries.len() >= self.max_per_component {
             // Evict: join all existing props + new props into a single degraded entry.
             let all_props: Vec<&HashMap<Symbol, StateValue>> = entries
@@ -91,8 +91,8 @@ impl ComponentCache {
         }
     }
 
-    pub fn cache_size(&self, name: &Symbol) -> usize {
-        self.entries.get(name).map_or(0, |e| e.len())
+    pub fn cache_size(&self, comp: ComponentId) -> usize {
+        self.entries.get(&comp).map_or(0, |e| e.len())
     }
 }
 
@@ -151,7 +151,7 @@ mod tests {
 
     fn trivial_result() -> AnalysisResult<StateValue> {
         AnalysisResult {
-            component: "C".to_string(),
+            component: crate::test_support::cid(3),
             file: Default::default(),
             param: "props".to_string(),
             dom_props: Default::default(),
@@ -202,7 +202,7 @@ mod tests {
         let cache = ComponentCache::new();
         assert!(
             cache
-                .lookup(&"Button".to_string(), &stable_props())
+                .lookup(crate::test_support::cid(0), &stable_props())
                 .is_none()
         );
     }
@@ -210,19 +210,27 @@ mod tests {
     #[test]
     fn lookup_hit_exact_props() {
         let mut cache = ComponentCache::new();
-        cache.insert("Button".to_string(), stable_props(), trivial_result());
-        let hit = cache.lookup(&"Button".to_string(), &stable_props());
+        cache.insert(
+            crate::test_support::cid(0),
+            stable_props(),
+            trivial_result(),
+        );
+        let hit = cache.lookup(crate::test_support::cid(0), &stable_props());
         assert!(hit.is_some());
     }
 
     #[test]
     fn lookup_miss_different_props() {
         let mut cache = ComponentCache::new();
-        cache.insert("Button".to_string(), stable_props(), trivial_result());
+        cache.insert(
+            crate::test_support::cid(0),
+            stable_props(),
+            trivial_result(),
+        );
         // Unstable props ≠ Stable props → miss
         assert!(
             cache
-                .lookup(&"Button".to_string(), &unstable_props())
+                .lookup(crate::test_support::cid(0), &unstable_props())
                 .is_none()
         );
     }
@@ -230,10 +238,14 @@ mod tests {
     #[test]
     fn lookup_miss_different_component() {
         let mut cache = ComponentCache::new();
-        cache.insert("Button".to_string(), stable_props(), trivial_result());
+        cache.insert(
+            crate::test_support::cid(0),
+            stable_props(),
+            trivial_result(),
+        );
         assert!(
             cache
-                .lookup(&"Input".to_string(), &stable_props())
+                .lookup(crate::test_support::cid(1), &stable_props())
                 .is_none()
         );
     }
@@ -241,13 +253,25 @@ mod tests {
     #[test]
     fn insert_multiple_props_variants() {
         let mut cache = ComponentCache::new();
-        cache.insert("Btn".to_string(), stable_props(), trivial_result());
-        cache.insert("Btn".to_string(), unstable_props(), trivial_result());
-        assert_eq!(cache.cache_size(&"Btn".to_string()), 2);
-        assert!(cache.lookup(&"Btn".to_string(), &stable_props()).is_some());
+        cache.insert(
+            crate::test_support::cid(2),
+            stable_props(),
+            trivial_result(),
+        );
+        cache.insert(
+            crate::test_support::cid(2),
+            unstable_props(),
+            trivial_result(),
+        );
+        assert_eq!(cache.cache_size(crate::test_support::cid(2)), 2);
         assert!(
             cache
-                .lookup(&"Btn".to_string(), &unstable_props())
+                .lookup(crate::test_support::cid(2), &stable_props())
+                .is_some()
+        );
+        assert!(
+            cache
+                .lookup(crate::test_support::cid(2), &unstable_props())
                 .is_some()
         );
     }
@@ -255,14 +279,22 @@ mod tests {
     #[test]
     fn eviction_on_overflow() {
         let mut cache = ComponentCache::with_max(2);
-        cache.insert("C".to_string(), stable_props(), trivial_result());
-        cache.insert("C".to_string(), unstable_props(), trivial_result());
+        cache.insert(
+            crate::test_support::cid(3),
+            stable_props(),
+            trivial_result(),
+        );
+        cache.insert(
+            crate::test_support::cid(3),
+            unstable_props(),
+            trivial_result(),
+        );
         // Third insert → overflow → evict to 1 degraded entry
         let mut other_props = HashMap::new();
         other_props.insert("label".to_string(), StateValue::top());
-        cache.insert("C".to_string(), other_props, trivial_result());
+        cache.insert(crate::test_support::cid(3), other_props, trivial_result());
         // After eviction: exactly 1 entry remains
-        assert_eq!(cache.cache_size(&"C".to_string()), 1);
+        assert_eq!(cache.cache_size(crate::test_support::cid(3)), 1);
     }
 
     #[test]
@@ -273,10 +305,22 @@ mod tests {
         // First insert with Top props
         let mut top_props = HashMap::new();
         top_props.insert("x".to_string(), StateValue::top());
-        cache.insert("C".to_string(), top_props.clone(), trivial_result());
+        cache.insert(
+            crate::test_support::cid(3),
+            top_props.clone(),
+            trivial_result(),
+        );
         // Lookup with Top = exact match
-        assert!(cache.lookup(&"C".to_string(), &top_props).is_some());
+        assert!(
+            cache
+                .lookup(crate::test_support::cid(3), &top_props)
+                .is_some()
+        );
         // Lookup with Stable ≠ Top (strict equality fails)
-        assert!(cache.lookup(&"C".to_string(), &stable_props()).is_none());
+        assert!(
+            cache
+                .lookup(crate::test_support::cid(3), &stable_props())
+                .is_none()
+        );
     }
 }

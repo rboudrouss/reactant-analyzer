@@ -43,7 +43,7 @@ use oxc_parser::{ParseOptions, Parser};
 use oxc_span::SourceType;
 
 use reactant::domains::StateValueTransfer;
-use reactant::engine::{Config, RootStrategy, analyze_component};
+use reactant::engine::{Config, RootStrategy};
 use reactant::lowering::lower_program;
 use reactant::resolver::{DefaultImportResolver, analyze_lowered, lower_files};
 use reactant::rules::declarative::load_pack;
@@ -91,7 +91,10 @@ fn run_rule_on(pack_json: &str, rule_id: &str, fixture: &Fixture) -> Vec<Diagnos
         .find(|r| r.rule.name() == rule_id)
         .unwrap_or_else(|| panic!("rule `{rule_id}` not in pack"));
 
-    let prog_and_names: (reactant::engine::ProgramAnalysisResult, Vec<String>) = match fixture {
+    let prog_and_names: (
+        reactant::engine::ProgramAnalysisResult,
+        Vec<reactant::ir::ComponentId>,
+    ) = match fixture {
         Fixture::Single(src) => {
             let alloc = Allocator::default();
             let ret = Parser::new(&alloc, src, SourceType::tsx())
@@ -111,23 +114,30 @@ fn run_rule_on(pack_json: &str, rule_id: &str, fixture: &Fixture) -> Vec<Diagnos
             assert!(!components.is_empty(), "no component in fixture");
             let mut map = std::collections::HashMap::new();
             let mut names = Vec::new();
+            let mut component_table = reactant::ir::ComponentTable::default();
             for comp in components {
-                let name = comp.name.clone();
-                let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-                map.insert(name.clone(), result);
-                names.push(name);
+                let id = component_table.intern(reactant::ir::CompOrigin {
+                    file: comp.file.clone(),
+
+                    name: comp.name.clone(),
+                });
+
+                let result = reactant::engine::analyze_component_as(
+                    comp,
+                    id,
+                    &StateValueTransfer,
+                    &Config::default(),
+                );
+
+                map.insert(id, result);
+
+                names.push(id);
             }
             (
                 reactant::engine::ProgramAnalysisResult {
                     components: map,
-                    shared_state: reactant::domains::stores::SharedStateStore::new(),
-                    call_graph: reactant::engine::ComponentCallGraph::new(),
-                    recursive_components: std::collections::HashSet::new(),
-                    stats: reactant::engine::AnalysisStats::default(),
-                    file_table: Default::default(),
-                    module_table: Default::default(),
-                    function_registry: Default::default(),
-                    phase1_reached: Default::default(),
+                    component_table,
+                    ..Default::default()
                 },
                 names,
             )
@@ -154,7 +164,7 @@ fn run_rule_on(pack_json: &str, rule_id: &str, fixture: &Fixture) -> Vec<Diagnos
                 lowered.parse_errors
             );
             let result = analyze_lowered(lowered, RootStrategy::AllComponents, Config::default());
-            let names: Vec<String> = result.components.keys().cloned().collect();
+            let names: Vec<reactant::ir::ComponentId> = result.components.keys().copied().collect();
             let out = (result, names);
             let _ = fs::remove_dir_all(&dir);
             out
@@ -165,7 +175,7 @@ fn run_rule_on(pack_json: &str, rule_id: &str, fixture: &Fixture) -> Vec<Diagnos
     names.sort();
     names
         .iter()
-        .flat_map(|name| rule.rule.check(&RuleCtx::new(&prog, name)))
+        .flat_map(|name| rule.rule.check(&RuleCtx::new(&prog, *name)))
         .collect()
 }
 

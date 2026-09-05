@@ -58,7 +58,7 @@ fn synthetic_key(builder: &mut BlockBuilder, prefix: &str) -> String {
 pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
     let id = builder.next_expr_id();
     let mut fields: Vec<(String, Expr)> = vec![];
-    let smap = builder.smap.clone();
+    let ctx = builder.ctx.clone();
 
     // A computed member name (`class X { [k]() {} }`) is an expression that
     // runs where the class is defined — its reads have to survive.
@@ -76,8 +76,7 @@ pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
             ClassElement::MethodDefinition(m) => {
                 computed_key(&m.key, builder);
                 if let Some(body) = m.value.body.as_deref() {
-                    let ids = builder.expr_ids().clone();
-                    let (params, body_cfg) = build_fn_body_cfg(&m.value.params, body, &smap, &ids);
+                    let (params, body_cfg) = build_fn_body_cfg(&m.value.params, body, &ctx);
                     let fn_id = builder.next_expr_id();
                     fields.push((
                         synthetic_key(builder, "[method]"),
@@ -112,13 +111,12 @@ pub(super) fn lower_class(class: &Class, builder: &mut BlockBuilder) -> Expr {
             // expression would.
             ClassElement::StaticBlock(b) => {
                 let fn_id = builder.next_expr_id();
-                let ids = builder.expr_ids().clone();
                 fields.push((
                     synthetic_key(builder, "[static]"),
                     Expr::FnLit {
                         id: fn_id,
                         params: vec![],
-                        body_cfg: Arc::new(build_stmts_cfg(&b.body, &smap, &ids)),
+                        body_cfg: Arc::new(build_stmts_cfg(&b.body, &ctx)),
                     },
                 ));
             }
@@ -438,14 +436,13 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         // ── Functions ─────────────────────────────────────────────────────────
         Expression::ArrowFunctionExpression(arrow) => {
             let id = builder.next_expr_id();
-            let smap = builder.smap.clone();
-            let ids = builder.expr_ids().clone();
+            let ctx = builder.ctx.clone();
             // Concise body (`x => expr`) carries an implicit return; block body
             // (`x => { ... }`) lowers like any function body.
             let (params, body_cfg) = if arrow.expression {
-                build_expr_fn_body_cfg(&arrow.params, &arrow.body, &smap, &ids)
+                build_expr_fn_body_cfg(&arrow.params, &arrow.body, &ctx)
             } else {
-                build_fn_body_cfg(&arrow.params, &arrow.body, &smap, &ids)
+                build_fn_body_cfg(&arrow.params, &arrow.body, &ctx)
             };
             Expr::FnLit {
                 id,
@@ -455,10 +452,9 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
         }
         Expression::FunctionExpression(func) => {
             let id = builder.next_expr_id();
-            let smap = builder.smap.clone();
-            let ids = builder.expr_ids().clone();
+            let ctx = builder.ctx.clone();
             let (params, body_cfg) = if let Some(body) = func.body.as_deref() {
-                build_fn_body_cfg(&func.params, body, &smap, &ids)
+                build_fn_body_cfg(&func.params, body, &ctx)
             } else {
                 (vec![], empty_cfg())
             };
@@ -827,10 +823,17 @@ fn lower_jsx_element(jsx: &JSXElement, builder: &mut BlockBuilder) -> Expr {
                 },
             ));
         }
+        let span = builder.span_at(jsx.opening_element.span.start);
+        // Who `<Name/>` refers to is settled by this file's imports and its own
+        // declarations, and nowhere else — resolving it later, from the bare
+        // name, is how a same-named component in an unrelated file came to be
+        // inlined in its place (#7).
+        let origin = builder.ctx.jsx.get(&name).cloned();
         Expr::CompApp {
             name,
             props: Box::new(props),
-            span: builder.span_at(jsx.opening_element.span.start),
+            span,
+            origin,
         }
     } else {
         Expr::NativeElem {
@@ -1235,13 +1238,10 @@ mod tests {
             ret.diagnostics
         );
         let func = ret.program.body.iter().find_map(|s| match s {
-            Statement::FunctionDeclaration(f) => f.body.as_ref().map(|b| {
-                build_cfg(
-                    b,
-                    &crate::ir::SourceMap::empty(),
-                    &crate::lowering::cfg_builder::ExprIds::default(),
-                )
-            }),
+            Statement::FunctionDeclaration(f) => f
+                .body
+                .as_ref()
+                .map(|b| build_cfg(b, &crate::lowering::LowerCtx::empty())),
             _ => None,
         });
         func.expect("no function found")

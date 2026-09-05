@@ -78,6 +78,7 @@ fn heuristic_detects_parent_not_child_as_root() {
                     name: "Child".to_string(),
                     props: Box::new(Expr::Lit(Prim::Null)),
                     span: None,
+                    origin: None,
                 }),
             },
         );
@@ -99,7 +100,11 @@ fn heuristic_detects_parent_not_child_as_root() {
     let child = leaf_component("Child");
     let reg = ComponentRegistry::from_components(vec![parent, child]);
     let roots = RootStrategy::Heuristic.detect(&reg);
-    let names: Vec<String> = roots.into_iter().map(|(_, n)| n).collect();
+    let names: Vec<String> = roots
+        .into_iter()
+        .filter_map(|id| reg.table().name(id))
+        .map(str::to_string)
+        .collect();
     assert_eq!(names, vec!["Parent".to_string()]);
 }
 
@@ -115,8 +120,8 @@ fn analyze_program_two_isolated_components() {
         RootStrategy::AllComponents,
         &Config::default(),
     );
-    assert!(result.components.contains_key("CompA"));
-    assert!(result.components.contains_key("CompB"));
+    assert!(result.component_named("CompA").is_some());
+    assert!(result.component_named("CompB").is_some());
 }
 
 #[test]
@@ -133,6 +138,7 @@ fn analyze_program_populates_call_graph_for_parent_child() {
                     name: "Child".to_string(),
                     props: Box::new(Expr::Lit(Prim::Null)),
                     span: None,
+                    origin: None,
                 }),
             },
         );
@@ -161,12 +167,14 @@ fn analyze_program_populates_call_graph_for_parent_child() {
     );
 
     // Call graph must record Parent → Child edge.
-    let edges = result.call_graph.callees_of(&"Parent".to_string());
+    let edges = result
+        .call_graph
+        .callees_of(result.component_named("Parent").unwrap());
     assert!(
         !edges.is_empty(),
         "expected Parent→Child edge in call graph"
     );
-    assert_eq!(edges[0].callee, "Child");
+    assert_eq!(result.display_name(edges[0].callee), "Child".to_string());
 }
 
 // ── ComponentSetter propagation ───────────────────────────────────────────────
@@ -273,6 +281,7 @@ fn setter_prop_propagates_to_shared_state() {
                             )],
                         }),
                         span: None,
+                        origin: None,
                     }),
                 },
             );
@@ -307,7 +316,9 @@ fn setter_prop_propagates_to_shared_state() {
     );
 
     // SharedStateStore must have been updated: Child called Parent's setter with 42.
-    let parent_count = result.shared_state.get(&"Parent".to_string(), 0);
+    let parent_count = result
+        .shared_state
+        .get(result.component_named("Parent").unwrap(), 0);
     assert_eq!(
         parent_count,
         StateValue::number(Interval::point(42.0)),
@@ -331,6 +342,7 @@ fn recursive_component_does_not_crash() {
                     name: "TreeNode".to_string(),
                     props: Box::new(Expr::Lit(Prim::Null)),
                     span: None,
+                    origin: None,
                 }),
             },
         );
@@ -357,7 +369,7 @@ fn recursive_component_does_not_crash() {
         RootStrategy::AllComponents,
         &Config::default(),
     );
-    assert!(result.components.contains_key("TreeNode"));
+    assert!(result.component_named("TreeNode").is_some());
     assert!(
         result.stats.recursion_cutoffs >= 1,
         "recursion cutoff should have been recorded"
@@ -373,12 +385,21 @@ fn field_access_resolves_abstract_object_in_heap() {
     use reactant::domains::{AnalysisCtx, StateValueTransfer, Transfer};
     use reactant::ir::types::ExprId;
 
+    // One interned identity for the parent whose setter the object carries:
+    // any id will do, the assertion is that the same one comes back.
+    let mut table = reactant::ir::ComponentTable::default();
+    let parent = table.intern(reactant::ir::CompOrigin {
+        file: std::path::PathBuf::new(),
+        name: "Parent".to_string(),
+    });
+    let own = reactant::ir::ComponentId::SYNTHETIC;
+
     // Build a heap with an abstract object at ExprId(1)
     let mut heap = Heap::new();
     let mut fields = HashMap::new();
     fields.insert(
         "onClick".to_string(),
-        EnvVal::Val(StateValue::component_setter("Parent".to_string(), 0)),
+        EnvVal::Val(StateValue::component_setter(parent, 0)),
     );
     heap.insert(ExprId(1), reactant::domains::stores::HeapValue::Obj(fields));
 
@@ -388,7 +409,7 @@ fn field_access_resolves_abstract_object_in_heap() {
 
     let mut state = StateStore::bottom();
     let mut memo = MemoStore::new();
-    let mut ctx = AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap);
+    let mut ctx = AnalysisCtx::null(own, &mut state, &mut memo, &mut heap);
 
     let expr = Expr::FieldAccess {
         obj: Box::new(Expr::Var("props".to_string())),
@@ -398,7 +419,7 @@ fn field_access_resolves_abstract_object_in_heap() {
     let val = StateValueTransfer.eval_expr(&expr, &env, &mut ctx);
     assert_eq!(
         val,
-        StateValue::component_setter("Parent".to_string(), 0),
+        StateValue::component_setter(parent, 0),
         "FieldAccess on heap AbstractObject should return the stored value"
     );
 }
@@ -422,7 +443,12 @@ fn field_access_unknown_field_returns_top() {
 
     let mut state = StateStore::bottom();
     let mut memo = MemoStore::new();
-    let mut ctx = AnalysisCtx::null("C".to_string(), &mut state, &mut memo, &mut heap);
+    let mut ctx = AnalysisCtx::null(
+        reactant::ir::ComponentId::SYNTHETIC,
+        &mut state,
+        &mut memo,
+        &mut heap,
+    );
 
     // Access a field not in the object → Top
     let expr = Expr::FieldAccess {
@@ -471,12 +497,12 @@ fn fixture_inter_component_no_crash() {
     // Use AllComponents so every component (including self-referential TreeNode) is a root.
     let result = parse_and_analyze_with_strategy(&src, RootStrategy::AllComponents);
     assert!(
-        result.components.contains_key("Section1_Parent")
-            || result.components.contains_key("Section1_Child"),
+        result.component_named("Section1_Parent").is_some()
+            || result.component_named("Section1_Child").is_some(),
         "at least one Section1 component should be analyzed"
     );
     assert!(
-        result.components.contains_key("Section4_TreeNode"),
+        result.component_named("Section4_TreeNode").is_some(),
         "recursive component should be analyzed without crash"
     );
     // With AllComponents, Section4_TreeNode is a root → encounters itself → recursion cutoff.
@@ -492,8 +518,8 @@ fn fixture_section2_stable_prop_analysis() {
         .expect("inter_component.tsx not found");
     let result = parse_and_analyze(&src);
     assert!(
-        result.components.contains_key("Section2_App")
-            || result.components.contains_key("Section2_Display"),
+        result.component_named("Section2_App").is_some()
+            || result.component_named("Section2_Display").is_some(),
         "Section2 components should be analyzed"
     );
 }
@@ -511,9 +537,8 @@ fn missing_deps_fires_for_unstable_callback_prop() {
     // Section5_Child uses `onUpdate` in effect without declaring it in deps: [].
     // Parent passes an inline callback → Reference(Unstable) → should warn.
     // The component might be named Section5_Child (root) or analyzed as child of Section5_Parent.
-    let child_name = "Section5_Child".to_string();
-    if result.components.contains_key(&child_name) {
-        let diags = MissingDeps.check(&RuleCtx::new(&result, &child_name));
+    if let Some(child_name) = result.component_named("Section5_Child") {
+        let diags = MissingDeps.check(&RuleCtx::new(&result, child_name));
         assert!(
             !diags.is_empty(),
             "MissingDeps should fire on Section5_Child: onUpdate is unstable but not in deps"
@@ -532,9 +557,8 @@ fn missing_deps_no_fire_for_stable_setter_prop() {
 
     // Section6_Child uses `onUpdate` (= ComponentSetter, always stable) in effect.
     // Stable value → MissingDeps must NOT fire.
-    let child_name = "Section6_Child".to_string();
-    if result.components.contains_key(&child_name) {
-        let diags = MissingDeps.check(&RuleCtx::new(&result, &child_name));
+    if let Some(child_name) = result.component_named("Section6_Child") {
+        let diags = MissingDeps.check(&RuleCtx::new(&result, child_name));
         let missing_update: Vec<_> = diags
             .iter()
             .filter(|d| d.var.as_deref() == Some("onUpdate"))
@@ -615,6 +639,7 @@ fn prop_drilling_direct_ir() {
                         )],
                     }),
                     span: None,
+                    origin: None,
                 }),
             },
         );
@@ -659,6 +684,7 @@ fn prop_drilling_direct_ir() {
                         fields: vec![("action".to_string(), Expr::Var("setV".to_string()))],
                     }),
                     span: None,
+                    origin: None,
                 }),
             },
         );
@@ -690,7 +716,9 @@ fn prop_drilling_direct_ir() {
         &Config::default(),
     );
 
-    let root_state = result.shared_state.get(&"Root".to_string(), 0);
+    let root_state = result
+        .shared_state
+        .get(result.component_named("Root").unwrap(), 0);
     assert_eq!(
         root_state,
         StateValue::number(Interval::point(99.0)),
@@ -714,7 +742,9 @@ fn prop_drilling_two_levels_updates_shared_state() {
     // Section7_Root → Section7_Middle → Section7_Leaf.
     // Leaf's effect calls action(99) which is setV from Root.
     // SharedStateStore[(Section7_Root, 0)] must be Number(99).
-    let parent_state = result.shared_state.get(&"Section7_Root".to_string(), 0);
+    let parent_state = result
+        .shared_state
+        .get(result.component_named("Section7_Root").unwrap(), 0);
     assert_eq!(
         parent_state,
         StateValue::number(Interval::point(99.0)),
@@ -732,7 +762,9 @@ fn nativeelem_children_compapps_are_analyzed() {
 
     // Section8_App renders <div><BtnA onClick={setSel}/><BtnB onClick={setSel}/></div>.
     // BtnA writes 1, BtnB writes 2 → SharedStateStore[(App, 0)] = Number([1,2]).
-    let app_state = result.shared_state.get(&"Section8_App".to_string(), 0);
+    let app_state = result
+        .shared_state
+        .get(result.component_named("Section8_App").unwrap(), 0);
     use reactant::domains::impls::interval::Interval;
     assert_eq!(
         app_state,
@@ -756,8 +788,8 @@ fn no_crash_setter_via_prop_called_in_render() {
     // called in render (cross-component) without infinite looping.
     let result = parse_and_analyze(&src);
     assert!(
-        result.components.contains_key("Section9_Parent")
-            || result.components.contains_key("Section9_Child"),
+        result.component_named("Section9_Parent").is_some()
+            || result.component_named("Section9_Child").is_some(),
         "Section9 should be analyzed without crash"
     );
 }
@@ -772,12 +804,14 @@ fn no_deps_effect_calling_parent_setter_terminates() {
     // bump is setN from Section10_Parent. Analysis must terminate (widening kicks in).
     let result = parse_and_analyze(&src);
     assert!(
-        result.components.contains_key("Section10_Parent")
-            || result.components.contains_key("Section10_InfiniteChild"),
+        result.component_named("Section10_Parent").is_some()
+            || result.component_named("Section10_InfiniteChild").is_some(),
         "Section10 should complete (widening ensures convergence)"
     );
     // SharedStateStore updated: parent state was written to.
-    let parent_state = result.shared_state.get(&"Section10_Parent".to_string(), 0);
+    let parent_state = result
+        .shared_state
+        .get(result.component_named("Section10_Parent").unwrap(), 0);
     // Value may be Bottom (no deps effect doesn't fire in child's fixpoint body analysis) or
     // Number(1) if the no-deps effect ran. Either is acceptable key assertion is no panic.
     let _ = parent_state;
@@ -807,9 +841,8 @@ fn conditional_hook_fires_on_child_with_prop_gated_hook() {
 
     // Section11_Child calls useState inside an if(show) block → ConditionalHook.
     // Fires regardless of inter analysis since it's a structural CFG check.
-    let child_name = "Section11_Child".to_string();
-    if result.components.contains_key(&child_name) {
-        let diags = ConditionalHook.check(&RuleCtx::new(&result, &child_name));
+    if let Some(child_name) = result.component_named("Section11_Child") {
+        let diags = ConditionalHook.check(&RuleCtx::new(&result, child_name));
         assert!(
             !diags.is_empty(),
             "ConditionalHook should fire on Section11_Child: useState inside if(show)"
@@ -827,9 +860,8 @@ fn setter_in_render_fires_on_child_receiving_prop() {
 
     // Section12_Child calls setVal(initialValue) unconditionally in render.
     // SetterInRender fires since setVal IS in setter_bindings (child's own useState).
-    let child_name = "Section12_Child".to_string();
-    if result.components.contains_key(&child_name) {
-        let diags = SetterInRender.check(&RuleCtx::new(&result, &child_name));
+    if let Some(child_name) = result.component_named("Section12_Child") {
+        let diags = SetterInRender.check(&RuleCtx::new(&result, child_name));
         assert!(
             !diags.is_empty(),
             "SetterInRender should fire on Section12_Child: own setter called in render"
@@ -849,9 +881,8 @@ fn redundant_set_state_inter_specific_stable_string_prop() {
 
     // Inter analysis: Section13_Parent passes stableLabel="hello" → child sees StrConst("hello").
     let result_inter = parse_and_analyze(&src);
-    let child_name = "Section13_Child".to_string();
-    if result_inter.components.contains_key(&child_name) {
-        let diags = RedundantSetState.check(&RuleCtx::new(&result_inter, &child_name));
+    if let Some(child_name) = result_inter.component_named("Section13_Child") {
+        let diags = RedundantSetState.check(&RuleCtx::new(&result_inter, child_name));
         assert!(
             !diags.is_empty(),
             "Inter analysis: RedundantSetState should fire stableLabel=StrConst(\"hello\") is \
@@ -876,9 +907,8 @@ fn infinite_loop_fires_inter_specific_numeric_step() {
 
     // Section14_Child: setCount(count + step) in effect with deps:[count].
     // step comes from parent as Number(1.0) → count grows numerically → widening.
-    let child_name = "Section14_Child".to_string();
-    if result.components.contains_key(&child_name) {
-        let diags = InfiniteLoop.check(&RuleCtx::new(&result, &child_name));
+    if let Some(child_name) = result.component_named("Section14_Child") {
+        let diags = InfiniteLoop.check(&RuleCtx::new(&result, child_name));
         assert!(
             !diags.is_empty(),
             "InfiniteLoop should fire on Section14_Child when step=Number(1) from parent. \
@@ -897,9 +927,8 @@ fn derived_state_fires_on_child_mirroring_parent_state() {
 
     // Section15_Child: setDoubled(total * 2) in effect derived state pattern.
     // With inter, total=Number(5.0) so the derivation is concrete and detectable.
-    let child_name = "Section15_Child".to_string();
-    if result.components.contains_key(&child_name) {
-        let _diags = DerivedState.check(&RuleCtx::new(&result, &child_name));
+    if let Some(child_name) = result.component_named("Section15_Child") {
+        let _diags = DerivedState.check(&RuleCtx::new(&result, child_name));
         // DerivedState rule may or may not fire depending on how it identifies
         // prop-derived state (it currently focuses on state-to-state derivation).
         // Key assertion: no crash during analysis.
@@ -917,9 +946,8 @@ fn missing_deps_fires_on_callback_in_child() {
     let result = parse_and_analyze(&src);
 
     // Section16_Child has useCallback(() => data.x, []) capturing unstable data.
-    let child_name = "Section16_Child".to_string();
-    if result.components.contains_key(&child_name) {
-        let diags = MissingDeps.check(&RuleCtx::new(&result, &child_name));
+    if let Some(child_name) = result.component_named("Section16_Child") {
+        let diags = MissingDeps.check(&RuleCtx::new(&result, child_name));
         assert!(
             diags.iter().any(|d| d.var.as_deref() == Some("data")),
             "MissingDeps should fire on Section16_Child for `data` in useCallback. \
@@ -944,9 +972,8 @@ fn missing_deps_no_fire_on_memo_with_stable_string_prop_inter() {
         .expect("inter_component.tsx not found");
     let result_inter = parse_and_analyze(&src);
 
-    let child_name = "Section17_Child".to_string();
-    if result_inter.components.contains_key(&child_name) {
-        let diags = MissingDeps.check(&RuleCtx::new(&result_inter, &child_name));
+    if let Some(child_name) = result_inter.component_named("Section17_Child") {
+        let diags = MissingDeps.check(&RuleCtx::new(&result_inter, child_name));
         let fp_inter: Vec<_> = diags
             .iter()
             .filter(|d| d.var.as_deref() == Some("label"))
@@ -971,9 +998,8 @@ fn always_unstable_deps_fires_on_child_inline_object_prop() {
 
     // Section18_Child uses [config], where config is an inline {x:1} from the parent.
     // Inline ObjectLit → Reference(Unstable) propagated via inter → fires.
-    let child_name = "Section18_Child".to_string();
-    if result.components.contains_key(&child_name) {
-        let diags = AlwaysUnstableDeps.check(&RuleCtx::new(&result, &child_name));
+    if let Some(child_name) = result.component_named("Section18_Child") {
+        let diags = AlwaysUnstableDeps.check(&RuleCtx::new(&result, child_name));
         assert!(
             !diags.is_empty(),
             "AlwaysUnstableDeps should fire on Section18_Child: \
@@ -993,9 +1019,8 @@ fn lazy_init_fires_on_child_state() {
     let result = parse_and_analyze(&src);
 
     // Section19_Child has useState(expensive(seed)) → structural Expr::Call init.
-    let child_name = "Section19_Child".to_string();
-    if result.components.contains_key(&child_name) {
-        let diags = LazyInit.check(&RuleCtx::new(&result, &child_name));
+    if let Some(child_name) = result.component_named("Section19_Child") {
+        let diags = LazyInit.check(&RuleCtx::new(&result, child_name));
         assert!(
             !diags.is_empty(),
             "LazyInit should fire on Section19_Child: useState init is Expr::Call."
@@ -1015,9 +1040,8 @@ fn missing_deps_inter_specific_fp_suppression() {
 
     // Verify with INTER analysis (Heuristic): no false positive.
     let result_inter = parse_and_analyze(&src);
-    let child_name = "Section6_Child".to_string();
-    if result_inter.components.contains_key(&child_name) {
-        let diags_inter = MissingDeps.check(&RuleCtx::new(&result_inter, &child_name));
+    if let Some(child_name) = result_inter.component_named("Section6_Child") {
+        let diags_inter = MissingDeps.check(&RuleCtx::new(&result_inter, child_name));
         let fp_inter: Vec<_> = diags_inter
             .iter()
             .filter(|d| d.var.as_deref() == Some("onUpdate"))
@@ -1060,8 +1084,10 @@ fn missing_deps_inter_specific_fp_suppression() {
             RootStrategy::AllComponents,
             &Config::default(),
         );
-        let diags_intra =
-            MissingDeps.check(&RuleCtx::new(&result_intra, &"Section6_Child".to_string()));
+        let diags_intra = MissingDeps.check(&RuleCtx::new(
+            &result_intra,
+            result_intra.component_named("Section6_Child").unwrap(),
+        ));
         let fp_intra: Vec<_> = diags_intra
             .iter()
             .filter(|d| d.var.as_deref() == Some("onUpdate"))

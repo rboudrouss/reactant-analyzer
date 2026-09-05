@@ -12,9 +12,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::ir::{
-    cfg::CFG, component::ComponentIR, expr::Expr, hook_ir::HookIR, hooks::HookEntry, types::Symbol,
+    cfg::CFG,
+    component::ComponentIR,
+    expr::{CompOrigin, Expr},
+    hook_ir::HookIR,
+    hooks::HookEntry,
+    types::Symbol,
 };
 // Consumed only by the `tests` module (via `use super::*`); no longer used by
 // production code now that the CFG walk delegates to `CFG::for_each_expr`.
@@ -56,16 +62,17 @@ impl SymbolGraph {
     /// hook is added as a node; calls inside its CFG (and hook bodies for
     /// components) become outgoing edges to whichever symbol matches by name.
     ///
-    /// When two files define a symbol with the same name (e.g. two `Page`),
-    /// edges from a caller in file `F` are biased toward callees also in `F`
-    /// when ambiguous, then fall back to all matches across files. The
-    /// resulting graph is over-approximate but never under-approximate (sound
-    /// for the topo-order use case).
+    /// A callee the lowering resolved — a JSX element whose binding this file's
+    /// imports settle, a custom hook with a `resolved_file` — edges straight to
+    /// the symbol it names. For the rest, edges from a caller in file `F` are
+    /// biased toward callees also in `F`, then fall back to the first match
+    /// across files. The resulting graph is over-approximate but never
+    /// under-approximate (sound for the topo-order use case).
     pub fn build(components: &[ComponentIR], hooks: &[HookIR]) -> Self {
         let mut graph = Self::new();
 
-        // Index symbols by name for legacy name-based extraction; precise lookups
-        // use resolved_file from HookEntry::Custom.
+        // Index symbols by name, for the callees nothing resolved; the precise
+        // ones read `CompApp::origin` / `HookEntry::Custom::resolved_file`.
         let mut by_name: HashMap<Symbol, Vec<SymbolNode>> = HashMap::new();
 
         for c in components {
@@ -81,7 +88,7 @@ impl SymbolGraph {
 
         for c in components {
             let caller = SymbolNode::new(c.file.clone(), c.name.clone(), SymbolKind::Component);
-            let mut callees = Vec::new();
+            let mut callees: Vec<Callee> = Vec::new();
             collect_callees_in_cfg(&c.render_cfg, &mut callees);
             for hook in &c.hooks {
                 graph.record_hook_edge(&caller, hook, &by_name);
@@ -92,7 +99,7 @@ impl SymbolGraph {
 
         for h in hooks {
             let caller = SymbolNode::new(h.file.clone(), h.name.clone(), SymbolKind::Hook);
-            let mut callees = Vec::new();
+            let mut callees: Vec<Callee> = Vec::new();
             collect_callees_in_cfg(&h.body_cfg, &mut callees);
             for hook in &h.hooks {
                 graph.record_hook_edge(&caller, hook, &by_name);
@@ -144,11 +151,28 @@ impl SymbolGraph {
     fn record_name_edges(
         &mut self,
         caller: &SymbolNode,
-        callee_names: &[Symbol],
+        callees: &[Callee],
         by_name: &HashMap<Symbol, Vec<SymbolNode>>,
     ) {
-        for name in callee_names {
-            if let Some(matches) = by_name.get(name) {
+        for callee in callees {
+            // A JSX callee whose binding the lowering resolved names one
+            // component and no other — the same fact `resolve_child` acts on,
+            // read here so the graph and the inliner cannot disagree about who
+            // a `<Widget/>` is (#7).
+            if let Some(origin) = &callee.origin {
+                let target = SymbolNode::new(
+                    origin.file.clone(),
+                    origin.name.clone(),
+                    SymbolKind::Component,
+                );
+                if self.nodes.contains(&target) {
+                    if target != *caller {
+                        self.edges.entry(caller.clone()).or_default().push(target);
+                    }
+                    continue;
+                }
+            }
+            if let Some(matches) = by_name.get(&callee.name) {
                 let same_file = matches.iter().find(|n| n.file == caller.file).cloned();
                 let chosen = same_file.or_else(|| matches.first().cloned());
                 if let Some(target) = chosen
@@ -231,7 +255,14 @@ impl SymbolGraph {
     }
 }
 
-fn collect_callees_in_hook_body(entry: &HookEntry, out: &mut Vec<Symbol>) {
+/// One call site's callee: how it was written, plus the component the lowering
+/// proved it names when the file's imports settle that.
+struct Callee {
+    name: Symbol,
+    origin: Option<Arc<CompOrigin>>,
+}
+
+fn collect_callees_in_hook_body(entry: &HookEntry, out: &mut Vec<Callee>) {
     match entry {
         HookEntry::Effect { body_cfg, .. }
         | HookEntry::Memo { body_cfg, .. }
@@ -246,18 +277,24 @@ fn collect_callees_in_hook_body(entry: &HookEntry, out: &mut Vec<Symbol>) {
     }
 }
 
-fn collect_callees_in_cfg(cfg: &CFG, out: &mut Vec<Symbol>) {
+fn collect_callees_in_cfg(cfg: &CFG, out: &mut Vec<Callee>) {
     cfg.for_each_expr(&mut |e| collect_callees_in_expr(e, out));
 }
 
-fn collect_callees_in_expr(expr: &Expr, out: &mut Vec<Symbol>) {
+fn collect_callees_in_expr(expr: &Expr, out: &mut Vec<Callee>) {
     match expr {
         Expr::Call { fn_, .. } => {
             if let Expr::Var(name) = fn_.as_ref() {
-                out.push(name.clone());
+                out.push(Callee {
+                    name: name.clone(),
+                    origin: None,
+                });
             }
         }
-        Expr::CompApp { name, .. } => out.push(name.clone()),
+        Expr::CompApp { name, origin, .. } => out.push(Callee {
+            name: name.clone(),
+            origin: origin.clone(),
+        }),
         _ => {}
     }
     // Structural descent. `for_each_child` does not cross `FnLit`, which is

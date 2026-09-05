@@ -24,19 +24,7 @@ fn make_prog(
     name: &str,
     result: reactant::engine::AnalysisResult<reactant::domains::StateValue>,
 ) -> reactant::engine::ProgramAnalysisResult {
-    let mut components = std::collections::HashMap::new();
-    components.insert(name.to_string(), result);
-    reactant::engine::ProgramAnalysisResult {
-        components,
-        shared_state: reactant::domains::stores::SharedStateStore::new(),
-        call_graph: reactant::engine::ComponentCallGraph::new(),
-        recursive_components: std::collections::HashSet::new(),
-        stats: reactant::engine::AnalysisStats::default(),
-        file_table: Default::default(),
-        module_table: Default::default(),
-        function_registry: Default::default(),
-        phase1_reached: Default::default(),
-    }
+    reactant::engine::ProgramAnalysisResult::single(name, result)
 }
 
 fn run(src: &str) -> Vec<reactant::engine::AnalysisResult<reactant::domains::StateValue>> {
@@ -85,7 +73,9 @@ fn any_diags(src: &str) -> usize {
             let prog = make_prog(&name, result);
             all_rules()
                 .iter()
-                .flat_map(|rule| rule.check(&RuleCtx::new(&prog, &name)))
+                .flat_map(|rule| {
+                    rule.check(&RuleCtx::new(&prog, prog.component_named(&name).unwrap()))
+                })
                 .collect::<Vec<_>>()
         })
         .count()
@@ -204,7 +194,9 @@ fn destructured_state_setter_detected() {
                 &reactant::engine::Config::default(),
             );
             let prog = make_prog(&name, result);
-            SetterInRender.check(&RuleCtx::new(&prog, &name)).len()
+            SetterInRender
+                .check(&RuleCtx::new(&prog, prog.component_named(&name).unwrap()))
+                .len()
         })
         .sum();
     // The setter is inside a nested array destr it must still be recognized.
@@ -242,7 +234,9 @@ fn nested_destr_fixture_no_false_positive() {
                 &reactant::engine::Config::default(),
             );
             let prog = make_prog(&name, result);
-            InfiniteLoop.check(&RuleCtx::new(&prog, &name)).len()
+            InfiniteLoop
+                .check(&RuleCtx::new(&prog, prog.component_named(&name).unwrap()))
+                .len()
         })
         .sum();
     let sir: usize = make_results()
@@ -255,7 +249,9 @@ fn nested_destr_fixture_no_false_positive() {
                 &reactant::engine::Config::default(),
             );
             let prog = make_prog(&name, result);
-            SetterInRender.check(&RuleCtx::new(&prog, &name)).len()
+            SetterInRender
+                .check(&RuleCtx::new(&prog, prog.component_named(&name).unwrap()))
+                .len()
         })
         .sum();
     assert_eq!(il, 0, "nested_destr.tsx: no infinite-loop expected");

@@ -10,11 +10,12 @@ use crate::{
         expr::Expr,
         free_vars::{AccessPath, compute_free_paths, dep_paths, path_covered},
         hooks::{Arity, HookEntry},
-        types::{HookLabel, Symbol, Var},
+        types::{HookLabel, Var},
     },
 };
 
 use crate::engine::registrations::Firing;
+use crate::ir::ComponentId;
 use crate::rules::helpers::churn::eval_in_exit_env;
 use crate::rules::{
     Certified, Diagnostic, EffectClass, MustResult, OnAllPaths, Rule, Severity, Step, ValueClass,
@@ -122,7 +123,7 @@ struct RootSlots {
 fn resolve_root_slots(
     root: &Var,
     state_vals: &HashMap<Var, HookLabel>,
-    component: &Symbol,
+    component: ComponentId,
     comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
 ) -> RootSlots {
     // Syntactic first: state bindings and their aliases. This is what makes
@@ -149,11 +150,11 @@ fn resolve_root_slots(
         Stability::Versioned(labels) => {
             let mut local: Vec<HookLabel> = labels
                 .iter()
-                .filter(|(c, _)| c == component)
+                .filter(|(c, _)| *c == component)
                 .map(|(_, l)| *l)
                 .collect();
             local.sort_unstable();
-            let foreign = labels.iter().any(|(c, _)| c != component);
+            let foreign = labels.iter().any(|(c, _)| *c != component);
             RootSlots { local, foreign }
         }
         Stability::VersionedTop => RootSlots {
@@ -195,7 +196,7 @@ impl Rule for StaleClosure {
         let (result, component) = (ctx.program(), ctx.component());
         // Applicable when some deps-gated effect registers a long-lived
         // callback at all.
-        let comp_result = result.components.get(component)?;
+        let comp_result = result.components.get(&component)?;
         let applicable = comp_result.hooks.iter().any(|h| {
             let HookEntry::Effect { label, deps, .. } = h else {
                 return false;
@@ -210,7 +211,7 @@ impl Rule for StaleClosure {
 
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
         let (result, component) = (ctx.program(), ctx.component());
-        let comp_result = &result.components[component];
+        let comp_result = &result.components[&component];
         let render_cfg = &comp_result.render_cfg;
 
         let state_vals_render = resolve_setter_aliases(render_cfg, &state_val_labels(render_cfg));

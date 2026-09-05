@@ -71,7 +71,7 @@ fn default_discoverer_and_resolver_end_to_end() {
     );
 
     assert_eq!(file_count, 1);
-    assert!(result.components.contains_key("App"));
+    assert!(result.component_named("App").is_some());
 }
 
 #[test]
@@ -119,9 +119,9 @@ fn custom_discoverer_can_filter_to_specific_files() {
         file_count, 1,
         "plugin should only see page.tsx, not layout.tsx"
     );
-    assert!(result.components.contains_key("Users"));
+    assert!(result.component_named("Users").is_some());
     assert!(
-        !result.components.contains_key("Layout"),
+        result.component_named("Layout").is_none(),
         "Layout should not be in results since layout.tsx was filtered out"
     );
 }

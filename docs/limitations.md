@@ -30,20 +30,17 @@ These drop or falsify information the analysis then relies on.
 
 | Shape in your code | Effect | Issue |
 |---|---|---|
-| Two components with the same name | Component identity has three disagreeing representations: one finding reported twice, the wrong body inlined, counts inflated | [#7](https://github.com/rboudrouss/reactant-analyzer/issues/7) |
 | A hook reached only through a `return` | Reported, but with no line or column, since `Terminator::Return` carries no span | [#140](https://github.com/rboudrouss/reactant-analyzer/issues/140) |
 
-Only the first can hide a bug: an inlined body that belongs to a different
-component is an analysis of code you did not write. **If two components in your
-tree share a name, do not trust a clean result for either.** The second costs a
-position, never a finding.
+It costs a position, never a finding.
 
 **How to tell in general.** A run that read everything it was pointed at ends
 with `✓ … no issues found.`. A run that did not never prints that line, and lists
 what it skipped under `not analyzed:` (`blind_spots` in the JSON schema). That
 covers the whole cross-file family: unloadable aliases, dropped files, and
-imports resolving outside the analysed set. It does not cover a name collision,
-which the analyzer has no way to know is one.
+imports resolving outside the analysed set. A reference the analyzer could not
+pin to one component is reported too, as an `analysis-limit` on the component
+that writes it (see *Cross-file limits*).
 
 ## What reactant may miss (false negatives)
 
@@ -208,6 +205,23 @@ rather than passed over in silence. It handles no default exports
 [#55](https://github.com/rboudrouss/reactant-analyzer/issues/55) and no nested
 closures [#56](https://github.com/rboudrouss/reactant-analyzer/issues/56), and a returned `FnLit`'s call site stays opaque
 [#57](https://github.com/rboudrouss/reactant-analyzer/issues/57).
+
+A component's identity is the file that defines it plus the name that file
+exports it under, and nothing else — adding an unrelated file that happens to
+share a name changes how a component is *shown* (`Name@file` tells the two
+apart) but never which findings it has
+([ADR-040](adr/ADR-040-component-identity-is-an-interned-id.md)).
+
+A JSX callee is resolved through the file that writes it: that file's own
+declarations first, then its imports, alias included. When neither settles the
+name — a namespace import, a component reached through a re-export barrel, a
+component built dynamically — and **several** analysed files define it, the
+reference names no one in particular. The child is then treated as
+unanalysable, like any callee outside the run, rather than resolved to the file
+that happens to sort first: props and setters stop flowing into it, and
+cross-component findings through that reference are missed. The run says so, as
+an `analysis-limit` on the parent (`--info`), and an explicit import from the
+defining file resolves it [#7](https://github.com/rboudrouss/reactant-analyzer/issues/7).
 
 Discovery is the sole producer of analyzed files, so on a **narrowed** run
 (`reactant check src/features`) an import resolved outside the named paths is

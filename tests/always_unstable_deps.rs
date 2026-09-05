@@ -20,19 +20,7 @@ fn make_prog(
     name: &str,
     result: reactant::engine::AnalysisResult<reactant::domains::StateValue>,
 ) -> reactant::engine::ProgramAnalysisResult {
-    let mut components = std::collections::HashMap::new();
-    components.insert(name.to_string(), result);
-    reactant::engine::ProgramAnalysisResult {
-        components,
-        shared_state: reactant::domains::stores::SharedStateStore::new(),
-        call_graph: reactant::engine::ComponentCallGraph::new(),
-        recursive_components: std::collections::HashSet::new(),
-        stats: reactant::engine::AnalysisStats::default(),
-        file_table: Default::default(),
-        module_table: Default::default(),
-        function_registry: Default::default(),
-        phase1_reached: Default::default(),
-    }
+    reactant::engine::ProgramAnalysisResult::single(name, result)
 }
 
 fn hits(src: &str) -> usize {
@@ -58,7 +46,9 @@ fn hits(src: &str) -> usize {
             let name = comp.name.clone();
             let result = analyze_component(comp, &StateValueTransfer, &Config::default());
             let prog = make_prog(&name, result);
-            AlwaysUnstableDeps.check(&RuleCtx::new(&prog, &name)).len()
+            AlwaysUnstableDeps
+                .check(&RuleCtx::new(&prog, prog.component_named(&name).unwrap()))
+                .len()
         })
         .sum()
 }

@@ -132,10 +132,16 @@ pub fn remap_expr(expr: Expr, off: Offsets) -> Expr {
             fn_: Box::new(remap_expr(*fn_, off)),
             args: args.into_iter().map(|a| remap_expr(a, off)).collect(),
         },
-        Expr::CompApp { name, props, span } => Expr::CompApp {
+        Expr::CompApp {
+            name,
+            props,
+            span,
+            origin,
+        } => Expr::CompApp {
             name,
             props: Box::new(remap_expr(*props, off)),
             span,
+            origin,
         },
         Expr::NativeElem {
             tag,

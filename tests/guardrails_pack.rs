@@ -42,20 +42,8 @@ fn findings(src: &str, options: &Options) -> Vec<Diagnostic> {
     for comp in components {
         let name = comp.name.clone();
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let mut map = std::collections::HashMap::new();
-        map.insert(name.clone(), result);
-        let prog = reactant::engine::ProgramAnalysisResult {
-            components: map,
-            shared_state: reactant::domains::stores::SharedStateStore::new(),
-            call_graph: reactant::engine::ComponentCallGraph::new(),
-            recursive_components: std::collections::HashSet::new(),
-            stats: reactant::engine::AnalysisStats::default(),
-            file_table: Default::default(),
-            module_table: Default::default(),
-            function_registry: Default::default(),
-            phase1_reached: Default::default(),
-        };
-        let ctx = RuleCtx::new(&prog, &name);
+        let prog = reactant::engine::ProgramAnalysisResult::single(&name, result);
+        let ctx = RuleCtx::new(&prog, prog.component_named(&name).unwrap());
         for rule in &pack.rules {
             out.extend(rule.rule.check(&ctx));
         }
@@ -350,7 +338,7 @@ fn banned_hook_fires_even_when_the_defining_file_is_analyzed() {
         .components
         .keys()
         .flat_map(|name| {
-            let ctx = RuleCtx::new(&prog, name);
+            let ctx = RuleCtx::new(&prog, *name);
             pack.rules
                 .iter()
                 .flat_map(|r| r.rule.check(&ctx))

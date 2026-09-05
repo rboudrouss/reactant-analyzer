@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::ir::expr::{Expr, Prim};
-use crate::ir::types::{HookLabel, Symbol};
+use crate::ir::{ComponentId, types::HookLabel};
 
 use super::Stability;
 pub use super::bool_val::BoolVal;
@@ -180,7 +180,7 @@ impl StateValue {
         }
     }
 
-    pub fn component_setter(component: Symbol, label: HookLabel) -> Self {
+    pub fn component_setter(component: ComponentId, label: HookLabel) -> Self {
         StateValue {
             setter: SetterVal::One(component, label),
             ..Self::bottom_value()
@@ -268,7 +268,7 @@ impl StateValue {
     }
 
     /// Exact setter identity, only when the value can be nothing else.
-    pub fn as_setter(&self) -> Option<(&Symbol, &HookLabel)> {
+    pub fn as_setter(&self) -> Option<(&ComponentId, &HookLabel)> {
         // Only the setter slot may be populated (`as_one` still yields `None`
         // if the setter itself is ⊥/⊤).
         if self.populated_kinds().only(KindMask::SETTER) {
@@ -444,7 +444,7 @@ impl fmt::Debug for StateValue {
         }
         match &self.setter {
             SetterVal::Bottom => {}
-            SetterVal::One(c, l) => parts.push(format!("setter({c}#{l})")),
+            SetterVal::One(c, l) => parts.push(format!("setter(#{}#{l})", c.index())),
             SetterVal::Top => parts.push("setter".into()),
         }
         if self.other {
@@ -1100,7 +1100,7 @@ mod tests {
     // ── ComponentSetter (setter slot) ─────────────────────────────────────────
 
     fn cs(comp: &str, label: usize) -> StateValue {
-        StateValue::component_setter(comp.to_string(), label)
+        StateValue::component_setter(crate::test_support::named(comp), label)
     }
 
     #[test]
@@ -1138,7 +1138,7 @@ mod tests {
     #[test]
     fn component_setter_join_with_ref_keeps_both_slots() {
         let j = cs("Foo", 0).join(&StateValue::reference(Stability::Stable));
-        assert_eq!(j.setter, SetterVal::One("Foo".to_string(), 0));
+        assert_eq!(j.setter, SetterVal::One(crate::test_support::cid(0), 0));
         assert_eq!(j.reference, Stability::Stable);
         // Mixed with a reference → no longer an exact setter.
         assert!(j.as_setter().is_none());
@@ -1182,7 +1182,7 @@ mod tests {
     #[test]
     fn component_setter_as_setter_extracts_payload() {
         let v = cs("Foo", 3);
-        assert_eq!(v.as_setter(), Some((&"Foo".to_string(), &3)));
+        assert_eq!(v.as_setter(), Some((&crate::test_support::cid(0), &3)));
         // Bottom / Top / mixed values expose no exact setter.
         assert!(StateValue::bottom().as_setter().is_none());
         assert!(StateValue::top().as_setter().is_none());

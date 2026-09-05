@@ -94,8 +94,7 @@ fn analyze(
 
 fn warnings_for(result: &reactant::engine::ProgramAnalysisResult, component: &str) -> Vec<String> {
     let rules = all_rules();
-    let component = component.to_string();
-    let ctx = RuleCtx::new(result, &component);
+    let ctx = RuleCtx::new(result, result.component_named(component).unwrap());
     rules
         .iter()
         .flat_map(|r| r.check(&ctx))
@@ -151,7 +150,7 @@ fn statement_call_to_utility_does_not_panic() {
         "bump utility should be detected"
     );
     let result = analyze(components, hooks, utilities);
-    assert!(result.components.contains_key("Counter"));
+    assert!(result.component_named("Counter").is_some());
 }
 
 #[test]
@@ -201,7 +200,7 @@ fn cross_file_utility_inlines_via_caller_name_lookup() {
         RootStrategy::AllComponents,
         Config::default(),
     );
-    let comp = &result.components[&"Page".to_string()];
+    let comp = &result.components[&result.component_named("Page").unwrap()];
     assert!(
         comp.inline_origins
             .iter()
@@ -241,7 +240,7 @@ fn aliased_utility_import_inlines() {
         RootStrategy::AllComponents,
         Config::default(),
     );
-    let comp = &result.components[&"Page".to_string()];
+    let comp = &result.components[&result.component_named("Page").unwrap()];
     assert!(
         comp.inline_origins
             .iter()
@@ -289,7 +288,7 @@ fn colliding_utility_names_resolve_to_the_imported_file() {
         RootStrategy::AllComponents,
         Config::default(),
     );
-    let comp = &result.components[&"Page".to_string()];
+    let comp = &result.components[&result.component_named("Page").unwrap()];
     let origins: Vec<_> = comp.inline_origins.iter().map(|o| &o.from).collect();
     assert!(
         origins.iter().any(|f| f.ends_with("zzz.ts"))
@@ -324,7 +323,7 @@ fn unimported_cross_file_utility_stays_opaque() {
         RootStrategy::AllComponents,
         Config::default(),
     );
-    let comp = &result.components[&"Page".to_string()];
+    let comp = &result.components[&result.component_named("Page").unwrap()];
     assert!(
         comp.inline_origins.is_empty(),
         "an unimported bare name must not splice a foreign body: {:?}",
@@ -356,7 +355,7 @@ fn inlined_effect_blocks_are_edge_wired_and_engine_visible() {
     );
     let (components, hooks, utilities) = lower_file(&path);
     let result = analyze(components, hooks, utilities);
-    let page = &result.components["Page"];
+    let page = &result.components[&result.component_named("Page").unwrap()];
 
     // The spliced `setter = setC; setC(1)` block must be reachable from the
     // effect entry through `edges` (not just terminators).
@@ -421,7 +420,7 @@ fn doornot_guard_suppresses_infinite_loop_false_positive() {
         "doOrNot should be lowered as a utility"
     );
     let result = analyze(components, hooks, utilities);
-    assert!(result.components.contains_key("Counter"));
+    assert!(result.component_named("Counter").is_some());
 
     // Smoke check: the analysis completes and produces some output. The
     // engine's full semantic improvement (eliminating the infinite-loop FP)
@@ -456,7 +455,7 @@ fn recursion_guard_does_not_loop_forever() {
     );
     let (components, hooks, utilities) = lower_file(&path);
     let result = analyze(components, hooks, utilities);
-    assert!(result.components.contains_key("Page"));
+    assert!(result.component_named("Page").is_some());
 }
 
 /// The splice budget is a real limit, not a theoretical one — it is exhausted
@@ -491,13 +490,15 @@ fn an_exhausted_inline_budget_is_reported() {
     let result = analyze(components, hooks, utilities);
 
     assert!(
-        result.stats.inline_budget_exhausted.contains("Page"),
+        result
+            .stats
+            .inline_budget_exhausted
+            .contains(&result.component_named("Page").unwrap()),
         "ten utilities against a budget of {} must exhaust it",
         Config::default().max_inline_depth
     );
 
-    let component = "Page".to_string();
-    let ctx = RuleCtx::new(&result, &component);
+    let ctx = RuleCtx::new(&result, result.component_named("Page").unwrap());
     let infos: Vec<String> = all_rules()
         .iter()
         .flat_map(|r| r.check(&ctx))

@@ -47,20 +47,8 @@ fn run_pack(pack_json: &str, src: &str, options: &Options) -> Vec<Diagnostic> {
     for comp in components {
         let name = comp.name.clone();
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let mut components = std::collections::HashMap::new();
-        components.insert(name.clone(), result);
-        let prog = reactant::engine::ProgramAnalysisResult {
-            components,
-            shared_state: reactant::domains::stores::SharedStateStore::new(),
-            call_graph: reactant::engine::ComponentCallGraph::new(),
-            recursive_components: std::collections::HashSet::new(),
-            stats: reactant::engine::AnalysisStats::default(),
-            file_table: Default::default(),
-            module_table: Default::default(),
-            function_registry: Default::default(),
-            phase1_reached: Default::default(),
-        };
-        let ctx = RuleCtx::new(&prog, &name);
+        let prog = reactant::engine::ProgramAnalysisResult::single(&name, result);
+        let ctx = RuleCtx::new(&prog, prog.component_named(&name).unwrap());
         for rule in &pack.rules {
             out.extend(rule.rule.check(&ctx));
         }
@@ -1379,12 +1367,12 @@ fn run_pack_multi(pack_json: &str, files: &[std::path::PathBuf]) -> Vec<Diagnost
         lowered.parse_errors
     );
     let prog = analyze_lowered(lowered, RootStrategy::AllComponents, Config::default());
-    let mut names: Vec<&String> = prog.components.keys().collect();
+    let mut names: Vec<reactant::ir::ComponentId> = prog.components.keys().copied().collect();
     names.sort();
     names
         .iter()
         .flat_map(|name| {
-            let ctx = RuleCtx::new(&prog, name);
+            let ctx = RuleCtx::new(&prog, *name);
             pack.rules
                 .iter()
                 .flat_map(|r| r.rule.check(&ctx))
@@ -2891,11 +2879,11 @@ fn run_pack_program(pack_json: &str, src: &str) -> Vec<Diagnostic> {
         RootStrategy::Heuristic,
         &Config::default(),
     );
-    let mut names: Vec<String> = prog.components.keys().cloned().collect();
+    let mut names: Vec<reactant::ir::ComponentId> = prog.components.keys().copied().collect();
     names.sort();
     let mut out = Vec::new();
     for name in &names {
-        let ctx = RuleCtx::new(&prog, name);
+        let ctx = RuleCtx::new(&prog, *name);
         for rule in &pack.rules {
             out.extend(rule.rule.check(&ctx));
         }

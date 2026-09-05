@@ -45,7 +45,7 @@ fn analyze(src: &str) -> ProgramAnalysisResult {
 
 /// The single `EffectInfo` of the given kind in component `C`.
 fn only(result: &ProgramAnalysisResult, kind: HookKind) -> &EffectInfo {
-    let mut rows: Vec<&EffectInfo> = result.components["C"]
+    let mut rows: Vec<&EffectInfo> = result.components[&result.component_named("C").unwrap()]
         .effect_info
         .values()
         .filter(|e| e.kind == kind)
@@ -284,7 +284,7 @@ fn a_memo_with_an_unreadable_deps_argument_is_not_pinned_stable() {
         }
     "#;
     let r = analyze(src);
-    let comp = &r.components["C"];
+    let comp = &r.components[&r.component_named("C").unwrap()];
     let label = comp
         .effect_info
         .values()
@@ -311,7 +311,7 @@ fn a_memo_with_an_empty_literal_deps_array_stays_stable() {
         }
     "#;
     let r = analyze(src);
-    let comp = &r.components["C"];
+    let comp = &r.components[&r.component_named("C").unwrap()];
     let label = comp
         .effect_info
         .values()

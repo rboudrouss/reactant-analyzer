@@ -1,9 +1,26 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::{
-    engine::component_registry::{ComponentKey, ComponentRegistry},
-    ir::{cfg::CFG, component::ComponentIR, expr::Expr, hooks::HookEntry, types::Symbol},
+    engine::component_registry::ComponentRegistry,
+    ir::{
+        ComponentId,
+        cfg::CFG,
+        component::ComponentIR,
+        expr::{CompOrigin, Expr},
+        hooks::HookEntry,
+        types::Symbol,
+    },
 };
+
+/// One `<Child/>` a body instantiates: how the callee was written, and the
+/// component the call site's own file proved it names (`None` when nothing
+/// there settles it).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CompAppRef {
+    pub name: Symbol,
+    pub origin: Option<Arc<CompOrigin>>,
+}
 
 /// Strategy for selecting root components (entry points for top-down analysis).
 pub enum RootStrategy {
@@ -21,49 +38,56 @@ pub enum RootStrategy {
 /// The components an `--entry` name selects.
 ///
 /// One function so the root set and [`RootStrategy::unmatched`] cannot disagree
-/// about what "matches" means.
-fn explicit_matches(registry: &ComponentRegistry, name: &Symbol) -> Vec<ComponentKey> {
+/// about what "matches" means. A qualified `Foo@file` names one component; a
+/// bare `Foo` names every component written `Foo`, since the user asking for
+/// "the Foo entry point" of a project with two of them means both.
+fn explicit_matches(registry: &ComponentRegistry, name: &Symbol) -> Vec<ComponentId> {
+    let table = registry.table();
     if name.contains('@') {
-        return registry.resolve_display_name(name).into_iter().collect();
+        return table.resolve_display_name(name).into_iter().collect();
     }
-    registry
-        .find_all_by_name(name)
-        .into_iter()
-        .map(|c| (c.file.clone(), c.name.clone()))
-        .collect()
+    table.ids_named(name).collect()
 }
 
 impl RootStrategy {
-    /// Returns the set of root components to analyse, keyed by `(file, name)`
-    /// so distinct files defining the same name are each analysed.
-    pub fn detect(&self, registry: &ComponentRegistry) -> Vec<ComponentKey> {
+    /// The root components to analyse, by [`ComponentId`] so distinct files
+    /// defining the same name are each analysed.
+    pub fn detect(&self, registry: &ComponentRegistry) -> Vec<ComponentId> {
         match self {
             RootStrategy::Heuristic => {
-                let mut referenced: HashSet<Symbol> = HashSet::new();
+                // A reference the lowering resolved rules out exactly one
+                // component; one it did not rules out every component of that
+                // name, because any of them could be the one meant. Marking by
+                // name alone made an aliased or renamed callee (`<Panel/>` for
+                // `Widget`) leave its target looking unreferenced, so the
+                // target was analysed a second time as a root and that pass
+                // overwrote the precise result its parent had produced (#7).
+                let mut refs: HashSet<CompAppRef> = HashSet::new();
                 for comp in registry.all_components() {
-                    collect_compapp_in_component(comp, &mut referenced);
+                    collect_compapp_in_component(comp, &mut refs);
                 }
-                let mut roots: Vec<ComponentKey> = registry
-                    .all_keys()
-                    .into_iter()
-                    .filter(|(_, name)| !referenced.contains(name))
-                    .collect();
-                roots.sort();
-                roots
+                let table = registry.table();
+                let mut referenced: HashSet<ComponentId> = HashSet::new();
+                for r in &refs {
+                    match &r.origin {
+                        Some(o) => referenced.extend(table.id_of(o)),
+                        // Nothing settles the reference, so every component of
+                        // that name may be the one meant and none of them is
+                        // provably a root.
+                        None => referenced.extend(table.ids_named(&r.name)),
+                    }
+                }
+                table.ids().filter(|id| !referenced.contains(id)).collect()
             }
-            RootStrategy::AllComponents => {
-                let mut keys = registry.all_keys();
-                keys.sort();
-                keys
-            }
+            RootStrategy::AllComponents => registry.table().ids().collect(),
             RootStrategy::Explicit(names) => {
-                let mut keys: Vec<ComponentKey> = names
+                let mut ids: Vec<ComponentId> = names
                     .iter()
                     .flat_map(|name| explicit_matches(registry, name))
                     .collect();
-                keys.sort();
-                keys.dedup();
-                keys
+                ids.sort();
+                ids.dedup();
+                ids
             }
         }
     }
@@ -86,18 +110,20 @@ impl RootStrategy {
     }
 }
 
-fn collect_compapp_in_component(comp: &ComponentIR, out: &mut HashSet<Symbol>) {
+fn collect_compapp_in_component(comp: &ComponentIR, out: &mut HashSet<CompAppRef>) {
     collect_compapp_refs(&comp.render_cfg, &comp.hooks, out);
 }
 
-/// Every component name this body syntactically instantiates — the render CFG
-/// plus every hook body, nested `FnLit`s included.
+/// Every component this body syntactically instantiates — the render CFG plus
+/// every hook body, nested `FnLit`s included.
 ///
 /// A *syntactic* over-approximation of "may render", which is what both
 /// consumers want: root detection reads it as "referenced, so not a root", and
 /// the context-consumer relation reads it as "an unreached component may be a
-/// parent here, so the ancestry is not complete" (#115).
-pub(crate) fn collect_compapp_refs(cfg: &CFG, hooks: &[HookEntry], out: &mut HashSet<Symbol>) {
+/// parent here, so the ancestry is not complete" (#115). Each row keeps both
+/// the written name and the resolved origin, because those two consumers need
+/// different projections of the same walk.
+pub(crate) fn collect_compapp_refs(cfg: &CFG, hooks: &[HookEntry], out: &mut HashSet<CompAppRef>) {
     collect_compapp_in_cfg(cfg, out);
     for hook in hooks {
         match hook {
@@ -112,14 +138,17 @@ pub(crate) fn collect_compapp_refs(cfg: &CFG, hooks: &[HookEntry], out: &mut Has
     }
 }
 
-fn collect_compapp_in_cfg(cfg: &CFG, out: &mut HashSet<Symbol>) {
+fn collect_compapp_in_cfg(cfg: &CFG, out: &mut HashSet<CompAppRef>) {
     cfg.for_each_expr(&mut |e| collect_compapp_in_expr(e, out));
 }
 
-fn collect_compapp_in_expr(expr: &Expr, out: &mut HashSet<Symbol>) {
+fn collect_compapp_in_expr(expr: &Expr, out: &mut HashSet<CompAppRef>) {
     match expr {
-        Expr::CompApp { name, .. } => {
-            out.insert(name.clone());
+        Expr::CompApp { name, origin, .. } => {
+            out.insert(CompAppRef {
+                name: name.clone(),
+                origin: origin.clone(),
+            });
         }
         // `for_each_child` does not cross `FnLit`; render helpers can still
         // instantiate components, so descend into the body CFG explicitly.
@@ -170,6 +199,7 @@ mod tests {
                     name: child.to_string(),
                     props: Box::new(Expr::Lit(Prim::Null)),
                     span: None,
+                    origin: None,
                 }),
             },
         );
@@ -193,8 +223,14 @@ mod tests {
         ComponentRegistry::from_components(comps)
     }
 
-    fn names(keys: &[crate::engine::ComponentKey]) -> Vec<String> {
-        let mut out: Vec<String> = keys.iter().map(|(_, n)| n.clone()).collect();
+    /// The roots' names, read back through the registry that minted their
+    /// ids — the only place an id becomes a name.
+    fn names(reg: &ComponentRegistry, ids: &[crate::ir::ComponentId]) -> Vec<String> {
+        let mut out: Vec<String> = ids
+            .iter()
+            .filter_map(|id| reg.table().name(*id))
+            .map(str::to_string)
+            .collect();
         out.sort();
         out
     }
@@ -204,7 +240,7 @@ mod tests {
         // App has no parent → root
         let reg = registry(vec![component("App")]);
         let roots = RootStrategy::Heuristic.detect(&reg);
-        assert_eq!(names(&roots), vec!["App".to_string()]);
+        assert_eq!(names(&reg, &roots), vec!["App".to_string()]);
     }
 
     #[test]
@@ -215,7 +251,7 @@ mod tests {
             component("Child"),
         ]);
         let roots = RootStrategy::Heuristic.detect(&reg);
-        assert_eq!(names(&roots), vec!["Parent".to_string()]);
+        assert_eq!(names(&reg, &roots), vec!["Parent".to_string()]);
     }
 
     #[test]
@@ -227,7 +263,7 @@ mod tests {
             component("C"),
         ]);
         let roots = RootStrategy::Heuristic.detect(&reg);
-        assert_eq!(names(&roots), vec!["A".to_string(), "C".to_string()]);
+        assert_eq!(names(&reg, &roots), vec!["A".to_string(), "C".to_string()]);
     }
 
     #[test]
@@ -235,7 +271,7 @@ mod tests {
         let reg = registry(vec![component("X"), component("Y"), component("Z")]);
         let roots = RootStrategy::AllComponents.detect(&reg);
         assert_eq!(
-            names(&roots),
+            names(&reg, &roots),
             vec!["X".to_string(), "Y".to_string(), "Z".to_string()]
         );
     }
@@ -244,7 +280,7 @@ mod tests {
     fn explicit_returns_named() {
         let reg = registry(vec![component("A"), component("B"), component("C")]);
         let roots = RootStrategy::Explicit(vec!["B".to_string()]).detect(&reg);
-        assert_eq!(names(&roots), vec!["B".to_string()]);
+        assert_eq!(names(&reg, &roots), vec!["B".to_string()]);
         assert!(
             RootStrategy::Explicit(vec!["B".to_string()])
                 .unmatched(&reg)
@@ -259,7 +295,7 @@ mod tests {
         let reg = registry(vec![component("A")]);
         let strategy = RootStrategy::Explicit(vec!["A".to_string(), "Nope".to_string()]);
         assert_eq!(strategy.unmatched(&reg), vec!["Nope".to_string()]);
-        assert_eq!(names(&strategy.detect(&reg)), vec!["A".to_string()]);
+        assert_eq!(names(&reg, &strategy.detect(&reg)), vec!["A".to_string()]);
     }
 
     /// The qualified form is what the report prints back for a collision, so it
@@ -273,10 +309,10 @@ mod tests {
         let reg = registry(vec![a, b]);
 
         let key = ("a/Widget.tsx".into(), "Widget".to_string());
-        let display = reg.display_name(&key);
+        let display = reg.table().display_name(reg.id(&key).unwrap()).unwrap();
         let strategy = RootStrategy::Explicit(vec![display]);
         assert!(strategy.unmatched(&reg).is_empty());
-        assert_eq!(strategy.detect(&reg), vec![key]);
+        assert_eq!(strategy.detect(&reg), vec![reg.id(&key).unwrap()]);
 
         assert_eq!(
             RootStrategy::Explicit(vec!["Widget@nowhere.tsx".to_string()]).unmatched(&reg),

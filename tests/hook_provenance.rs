@@ -306,7 +306,7 @@ fn wrapped_use_layout_effect_row_survives_expansion_marked_inlined() {
     );
     let result = analyze_lowered(lowered, RootStrategy::AllComponents, Config::default());
 
-    let c = &result.components[&"C".to_string()];
+    let c = &result.components[&result.component_named("C").unwrap()];
 
     // The wrapper call itself: a direct row pointing at the wrapper's file.
     let wrapper = find_row(&c.hook_provenance, "useSafeLayoutEffect")
@@ -385,7 +385,7 @@ fn aliased_custom_hook_inlines_through_its_origin_name() {
     );
     let result = analyze_lowered(lowered, RootStrategy::AllComponents, Config::default());
 
-    let c = &result.components[&"C".to_string()];
+    let c = &result.components[&result.component_named("C").unwrap()];
     assert!(
         c.hooks.iter().any(|h| matches!(h, HookEntry::State { .. })),
         "the aliased hook's useState must reach C's fixpoint: {:?}",

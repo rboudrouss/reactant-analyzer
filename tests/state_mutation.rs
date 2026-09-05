@@ -20,19 +20,7 @@ fn make_prog(
     name: &str,
     result: reactant::engine::AnalysisResult<reactant::domains::StateValue>,
 ) -> reactant::engine::ProgramAnalysisResult {
-    let mut components = std::collections::HashMap::new();
-    components.insert(name.to_string(), result);
-    reactant::engine::ProgramAnalysisResult {
-        components,
-        shared_state: reactant::domains::stores::SharedStateStore::new(),
-        call_graph: reactant::engine::ComponentCallGraph::new(),
-        recursive_components: std::collections::HashSet::new(),
-        stats: reactant::engine::AnalysisStats::default(),
-        file_table: Default::default(),
-        module_table: Default::default(),
-        function_registry: Default::default(),
-        phase1_reached: Default::default(),
-    }
+    reactant::engine::ProgramAnalysisResult::single(name, result)
 }
 
 fn diags(src: &str) -> Vec<reactant::rules::Diagnostic> {
@@ -58,7 +46,7 @@ fn diags(src: &str) -> Vec<reactant::rules::Diagnostic> {
             let name = comp.name.clone();
             let result = analyze_component(comp, &StateValueTransfer, &Config::default());
             let prog = make_prog(&name, result);
-            StateMutation.check(&RuleCtx::new(&prog, &name))
+            StateMutation.check(&RuleCtx::new(&prog, prog.component_named(&name).unwrap()))
         })
         .collect()
 }

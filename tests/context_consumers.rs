@@ -56,12 +56,12 @@ fn run(files: &[(&str, &str)], strategy: RootStrategy) -> Vec<Diagnostic> {
     let prog = analyze_lowered(lowered, strategy, Config::default());
     let pack = load_pack(PACK, &BTreeMap::new()).expect("pack loads");
 
-    let mut names: Vec<String> = prog.components.keys().cloned().collect();
+    let mut names: Vec<reactant::ir::ComponentId> = prog.components.keys().copied().collect();
     names.sort();
     let out: Vec<Diagnostic> = names
         .iter()
         .flat_map(|n| {
-            let ctx = RuleCtx::new(&prog, n);
+            let ctx = RuleCtx::new(&prog, *n);
             pack.rules
                 .iter()
                 .flat_map(|r| r.rule.check(&ctx))

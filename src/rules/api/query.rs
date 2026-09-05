@@ -22,11 +22,11 @@ use crate::{
     domains::{Stability, StateValue},
     engine::{AnalysisResult, DominatorTree, HookKind, ProgramAnalysisResult, compute_dominators},
     ir::{
-        SourceRange,
+        ComponentId, SourceRange,
         cfg::{CFG, Terminator},
         expr::{Expr, Prim},
         stmt::Stmt,
-        types::{BlockId, HookLabel, Symbol, Var},
+        types::{BlockId, HookLabel, Var},
     },
 };
 
@@ -145,7 +145,7 @@ pub enum StabilityVerdict {
     /// Same reference every render (the only Error-safe "stable" answer).
     Stable,
     /// Changes only at the named setter events (may bound). Empty = widened.
-    Versioned(BTreeSet<(Symbol, HookLabel)>),
+    Versioned(BTreeSet<(ComponentId, HookLabel)>),
     /// Changes on every render (must bound) — **kind-agnostic motion**, not
     /// necessarily a fresh allocation (ADR-017): a numeric slot converged to a
     /// non-point interval lands here alongside an object literal. A consumer
@@ -251,7 +251,7 @@ impl RuleConfig {
 /// the future external frontends bind to (ADR-021 §4).
 pub struct RuleCtx<'a> {
     cache: CacheRef<'a>,
-    component: &'a Symbol,
+    component: ComponentId,
     comp: &'a AnalysisResult<StateValue>,
     config: RuleConfig,
 }
@@ -281,14 +281,14 @@ impl<'a> RuleCtx<'a> {
     /// The ctx gets a private [`ProgramCache`], so whole-program data is
     /// recomputed for it — the dispatcher uses [`RuleCtx::cached`] to share one
     /// cache across the whole program instead.
-    pub fn new(program: &'a ProgramAnalysisResult, component: &'a Symbol) -> Self {
+    pub fn new(program: &'a ProgramAnalysisResult, component: ComponentId) -> Self {
         Self::with_config(program, component, RuleConfig::default())
     }
 
     /// Like [`RuleCtx::new`], carrying per-rule options (ADR-022 §4).
     pub fn with_config(
         program: &'a ProgramAnalysisResult,
-        component: &'a Symbol,
+        component: ComponentId,
         config: RuleConfig,
     ) -> Self {
         Self::build(CacheRef::Own(ProgramCache::new(program)), component, config)
@@ -297,12 +297,12 @@ impl<'a> RuleCtx<'a> {
     /// The dispatcher's constructor: every component of a program binds to the
     /// same [`ProgramCache`], so program-level structures are built once
     /// instead of once per component (issue #86).
-    pub fn cached(cache: &'a ProgramCache<'a>, component: &'a Symbol, config: RuleConfig) -> Self {
+    pub fn cached(cache: &'a ProgramCache<'a>, component: ComponentId, config: RuleConfig) -> Self {
         Self::build(CacheRef::Shared(cache), component, config)
     }
 
-    fn build(cache: CacheRef<'a>, component: &'a Symbol, config: RuleConfig) -> Self {
-        let comp = &cache.get().program().components[component];
+    fn build(cache: CacheRef<'a>, component: ComponentId, config: RuleConfig) -> Self {
+        let comp = &cache.get().program().components[&component];
         RuleCtx {
             cache,
             component,
@@ -320,12 +320,21 @@ impl<'a> RuleCtx<'a> {
         self.cache.get()
     }
 
-    pub fn component(&self) -> &'a Symbol {
+    /// The component this ctx is anchored on — its **identity**, which is
+    /// what a comparison or a table lookup wants.
+    pub fn component(&self) -> ComponentId {
         self.component
     }
 
+    /// The component's name as a report shows it, for a message. Never for a
+    /// comparison: the display name is content-dependent by design (#7), so
+    /// two runs over different file sets can spell one component two ways.
+    pub fn component_name(&self) -> String {
+        self.program().display_name(self.component)
+    }
+
     /// The per-component analysis result — what every rule used to obtain via
-    /// `&result.components[component]`.
+    /// `&result.components[&component]`.
     pub fn comp(&self) -> &'a AnalysisResult<StateValue> {
         self.comp
     }
@@ -702,7 +711,7 @@ pub struct MovingFeeder {
     /// Component the slot belongs to — the half of the version label a rule
     /// needs to ask further questions about the slot (who writes it, when the
     /// consumer is mounted relative to those writes).
-    pub owner: Symbol,
+    pub owner: ComponentId,
     pub slot: HookLabel,
     /// Owner's source-level name for the slot, pre-qualified for display
     /// ("state `text` of `Parent`").
@@ -772,12 +781,13 @@ pub fn classify_motion(val: &StateValue, result: &ProgramAnalysisResult) -> Moti
             if writable {
                 let owner_states = crate::rules::state_val_labels(&owner_result.render_cfg);
                 let display = format!(
-                    "state {} of `{owner}`",
-                    crate::rules::state_slot_name(*slot, &owner_states)
+                    "state {} of `{}`",
+                    crate::rules::state_slot_name(*slot, &owner_states),
+                    result.display_name(*owner)
                 );
                 return Motion::Proven(Certified::mint(
                     MovingFeeder {
-                        owner: owner.clone(),
+                        owner: *owner,
                         slot: *slot,
                         display,
                         write_span,
@@ -855,11 +865,11 @@ pub(in crate::rules) fn must_effect_cycle(
         .edge_idx
         .iter()
         .all(|&i| edges[i].strength == EdgeStrength::Must);
-    let mut comps: HashSet<&Symbol> = HashSet::new();
+    let mut comps: HashSet<ComponentId> = HashSet::new();
     for &i in &cycle.edge_idx {
-        comps.insert(&edges[i].from.0);
-        comps.insert(&edges[i].to.0);
-        comps.insert(&edges[i].component);
+        comps.insert(edges[i].from.0);
+        comps.insert(edges[i].to.0);
+        comps.insert(edges[i].component);
     }
     if all_must && comps.len() == 1 {
         // The cycle's first edge is where the proof starts: the write that

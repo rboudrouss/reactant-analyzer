@@ -372,7 +372,7 @@ fn exec_setter_call<T: Transfer>(
         let comp_setter = transfer
             .eval_expr(fn_, env, ctx)
             .as_state_value()
-            .and_then(|sv| sv.as_setter().map(|(c, l)| (c.clone(), *l)));
+            .and_then(|sv| sv.as_setter().map(|(c, l)| (*c, *l)));
         if let Some((component, label)) = comp_setter
             && ctx.inter.is_some()
         {
@@ -385,7 +385,7 @@ fn exec_setter_call<T: Transfer>(
                 inter
                     .shared_state
                     .borrow_mut()
-                    .update(&component, label, arg_val);
+                    .update(component, label, arg_val);
             }
         }
     }
@@ -487,7 +487,7 @@ fn exec_callbacks_depth<T: Transfer>(
                 .stats
                 .borrow_mut()
                 .callback_depth_capped
-                .insert(inter.component_name.clone());
+                .insert(inter.component);
         }
         return;
     }

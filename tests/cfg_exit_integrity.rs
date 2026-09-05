@@ -48,8 +48,7 @@ fn analyze(src: &str) -> ProgramAnalysisResult {
 }
 
 fn diags(result: &ProgramAnalysisResult, component: &str) -> Vec<Diagnostic> {
-    let component = component.to_string();
-    let ctx = RuleCtx::new(result, &component);
+    let ctx = RuleCtx::new(result, result.component_named(component).unwrap());
     all_rules().iter().flat_map(|r| r.check(&ctx)).collect()
 }
 
@@ -69,7 +68,7 @@ const FALLS_OFF_THE_END: &str = r#"
 #[test]
 fn inlining_a_falling_through_hook_keeps_the_caller_exit_reachable() {
     let result = analyze(FALLS_OFF_THE_END);
-    let c = &result.components["C"];
+    let c = &result.components[&result.component_named("C").unwrap()];
     let reachable = c.render_cfg.reachable_blocks();
 
     let returns: Vec<_> = c

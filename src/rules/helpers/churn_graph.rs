@@ -42,7 +42,7 @@ use crate::{
     ir::{
         SourceRange,
         hooks::{Arity, HookEntry},
-        types::{HookLabel, Symbol},
+        types::HookLabel,
     },
 };
 
@@ -54,6 +54,7 @@ use super::setters::{
     collect_component_setter_vars, collect_fn_bindings, memo_val_labels, resolve_setter_aliases,
     setter_var_labels, state_val_labels,
 };
+use crate::ir::ComponentId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(in crate::rules) enum EdgeStrength {
@@ -69,7 +70,7 @@ pub(in crate::rules) struct ChurnEdge {
     pub to: SlotNode,
     pub strength: EdgeStrength,
     /// Component whose effect carries this edge.
-    pub component: Symbol,
+    pub component: ComponentId,
     pub effect_label: HookLabel,
     pub write_span: Option<SourceRange>,
     /// The carrying effect has no dependency array.
@@ -92,7 +93,7 @@ pub(in crate::rules) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec
     // Per-effect facts, gathered first so write-site counts are global before
     // any convergence kill is attempted (see module doc).
     struct EffectFacts<'a> {
-        comp: &'a Symbol,
+        comp: ComponentId,
         comp_result: &'a crate::engine::AnalysisResult<crate::domains::StateValue>,
         body_cfg: &'a crate::ir::cfg::CFG,
         state_vals: HashMap<crate::ir::types::Var, HookLabel>,
@@ -106,7 +107,7 @@ pub(in crate::rules) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec
     let mut writer_sites: HashMap<SlotNode, usize> = HashMap::new();
     let mut facts: Vec<EffectFacts> = Vec::new();
 
-    for (comp, comp_result) in &result.components {
+    for (&comp, comp_result) in &result.components {
         let cfg = &comp_result.render_cfg;
         let state_vals = resolve_setter_aliases(cfg, &state_val_labels(cfg));
         let memo_vals = resolve_setter_aliases(cfg, &memo_val_labels(cfg));
@@ -114,12 +115,12 @@ pub(in crate::rules) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec
 
         let mut setter_nodes: HashMap<crate::ir::types::Var, SlotNode> = local_setters
             .iter()
-            .map(|(v, l)| (v.clone(), (comp.clone(), *l)))
+            .map(|(v, l)| (v.clone(), (comp, *l)))
             .collect();
         for (v, prop) in
             collect_component_setter_vars(cfg, &comp_result.block_states, &comp_result.heap)
         {
-            if prop.component != *comp {
+            if prop.component != comp {
                 setter_nodes.insert(v, (prop.component, prop.label));
             }
         }
@@ -160,7 +161,7 @@ pub(in crate::rules) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec
             // Every write site counts — a `setX(null)` (freshness Not) still
             // revives guards, so it must block convergence kills on X.
             for c in &calls {
-                *writer_sites.entry(c.node.clone()).or_default() += 1;
+                *writer_sites.entry(c.node).or_default() += 1;
             }
             facts.push(EffectFacts {
                 comp,
@@ -180,7 +181,7 @@ pub(in crate::rules) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec
     }
 
     // Deduplicate on (from, to, component, effect): keep the strongest.
-    let mut best: HashMap<(SlotNode, SlotNode, Symbol, HookLabel), ChurnEdge> = HashMap::new();
+    let mut best: HashMap<(SlotNode, SlotNode, ComponentId, HookLabel), ChurnEdge> = HashMap::new();
     for f in &facts {
         for call in &f.calls {
             if call.freshness == Freshness::Not {
@@ -190,7 +191,7 @@ pub(in crate::rules) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec
             // slot (see module doc). Edges claim reference churn, so the
             // guard proof runs against the reference part of the written
             // value only (references are truthy and non-nullish).
-            if call.node.0 == *f.comp
+            if call.node.0 == f.comp
                 && writer_sites.get(&call.node) == Some(&1)
                 && let Some(b) = call.block_id
                 && converges_once_written(
@@ -216,17 +217,12 @@ pub(in crate::rules) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec
                 && on_all_paths(f.body_cfg, &fresh_blocks);
 
             let mut push = |from: SlotNode, strength: EdgeStrength| {
-                let key = (
-                    from.clone(),
-                    call.node.clone(),
-                    f.comp.clone(),
-                    f.effect_label,
-                );
+                let key = (from, call.node, f.comp, f.effect_label);
                 let edge = ChurnEdge {
                     from,
-                    to: call.node.clone(),
+                    to: call.node,
                     strength,
-                    component: f.comp.clone(),
+                    component: f.comp,
                     effect_label: f.effect_label,
                     write_span: call.span,
                     no_deps: f.no_deps,
@@ -247,7 +243,7 @@ pub(in crate::rules) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec
                 // self-sustaining. Auto-run callbacks (`.then`) are a known FN here.
                 if call.block_id.is_some() {
                     push(
-                        call.node.clone(),
+                        call.node,
                         if must_write {
                             EdgeStrength::Must
                         } else {
@@ -258,7 +254,7 @@ pub(in crate::rules) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec
                 continue;
             }
             for l in &f.exact_local {
-                let x: SlotNode = (f.comp.clone(), *l);
+                let x: SlotNode = (f.comp, *l);
                 // Dep-driven same-slot churn is the self-churn arm's domain.
                 if x == call.node {
                     continue;
@@ -273,14 +269,14 @@ pub(in crate::rules) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec
                 );
             }
             for x in &f.versioned {
-                if f.exact_local.contains(&x.1) && x.0 == *f.comp {
+                if f.exact_local.contains(&x.1) && x.0 == f.comp {
                     continue; // already pushed as exact
                 }
                 // Local same-slot versioned churn: self-churn arm's Warning.
-                if *x == call.node && x.0 == *f.comp {
+                if *x == call.node && x.0 == f.comp {
                     continue;
                 }
-                push(x.clone(), EdgeStrength::May);
+                push(*x, EdgeStrength::May);
             }
         }
     }
@@ -310,8 +306,8 @@ pub(in crate::rules) fn find_churn_cycles(edges: &[ChurnEdge]) -> Vec<ChurnCycle
 
     for cyc in cycles_in(edges, &must_idx) {
         for &i in &cyc {
-            covered_nodes.insert(edges[i].from.clone());
-            covered_nodes.insert(edges[i].to.clone());
+            covered_nodes.insert(edges[i].from);
+            covered_nodes.insert(edges[i].to);
         }
         cycles.push(make_cycle(edges, cyc, true));
     }
@@ -329,11 +325,11 @@ pub(in crate::rules) fn find_churn_cycles(edges: &[ChurnEdge]) -> Vec<ChurnCycle
 }
 
 fn make_cycle(edges: &[ChurnEdge], edge_idx: Vec<usize>, all_must: bool) -> ChurnCycle {
-    let mut comps: HashSet<&Symbol> = HashSet::new();
+    let mut comps: HashSet<ComponentId> = HashSet::new();
     for &i in &edge_idx {
-        comps.insert(&edges[i].from.0);
-        comps.insert(&edges[i].to.0);
-        comps.insert(&edges[i].component);
+        comps.insert(edges[i].from.0);
+        comps.insert(edges[i].to.0);
+        comps.insert(edges[i].component);
     }
     ChurnCycle {
         all_must,
@@ -522,17 +518,18 @@ impl ChurnGraph {
 
 /// Slot display names per component, resolved lazily. Building the alias table
 /// for a component is not free, and a cycle names the same slots repeatedly.
-pub(in crate::rules) type NodeNames = HashMap<Symbol, HashMap<crate::ir::types::Var, HookLabel>>;
+pub(in crate::rules) type NodeNames =
+    HashMap<ComponentId, HashMap<crate::ir::types::Var, HookLabel>>;
 
 /// Display name of a qualified slot: `` `count` `` locally,
 /// `` `count` of `Parent` `` for another component's slot.
 pub(in crate::rules) fn node_display(
     node: &SlotNode,
-    component: &Symbol,
+    component: ComponentId,
     result: &ProgramAnalysisResult,
     names: &mut NodeNames,
 ) -> String {
-    let map = names.entry(node.0.clone()).or_insert_with(|| {
+    let map = names.entry(node.0).or_insert_with(|| {
         result
             .components
             .get(&node.0)
@@ -545,10 +542,10 @@ pub(in crate::rules) fn node_display(
             .unwrap_or_default()
     });
     let base = crate::rules::state_slot_name(node.1, map);
-    if node.0 == *component {
+    if node.0 == component {
         base
     } else {
-        format!("{base} of `{}`", node.0)
+        format!("{base} of `{}`", result.display_name(node.0))
     }
 }
 
@@ -556,7 +553,7 @@ pub(in crate::rules) fn node_display(
 pub(in crate::rules) fn cycle_path(
     edges: &[ChurnEdge],
     cycle: &ChurnCycle,
-    component: &Symbol,
+    component: ComponentId,
     result: &ProgramAnalysisResult,
     names: &mut NodeNames,
 ) -> String {
@@ -603,7 +600,7 @@ pub(in crate::rules) struct CycleRow {
 pub(in crate::rules) fn collect_cycle_rows(
     graph: &ChurnGraph,
     result: &ProgramAnalysisResult,
-    component: &Symbol,
+    component: ComponentId,
 ) -> Vec<CycleRow> {
     let mut names: NodeNames = HashMap::new();
     let mut rows: Vec<CycleRow> = Vec::new();
@@ -611,7 +608,7 @@ pub(in crate::rules) fn collect_cycle_rows(
         let path = cycle_path(&graph.edges, cycle, component, result, &mut names);
         for &i in &cycle.edge_idx {
             let e = &graph.edges[i];
-            if e.component != *component {
+            if e.component != component {
                 continue;
             }
             let Some(span) = e.write_span else {
@@ -656,10 +653,10 @@ mod row_tests {
         write_span: Option<SourceRange>,
     ) -> ChurnEdge {
         ChurnEdge {
-            from: (from.0.to_string(), from.1),
-            to: (to.0.to_string(), to.1),
+            from: (crate::test_support::named(from.0), from.1),
+            to: (crate::test_support::named(to.0), to.1),
             strength: EdgeStrength::May,
-            component: carrier.to_string(),
+            component: crate::test_support::named(carrier),
             effect_label: effect,
             write_span,
             no_deps: false,
@@ -681,6 +678,7 @@ mod row_tests {
     fn empty_program() -> ProgramAnalysisResult {
         ProgramAnalysisResult {
             components: Default::default(),
+            component_table: Default::default(),
             shared_state: crate::domains::stores::SharedStateStore::new(),
             call_graph: crate::engine::ComponentCallGraph::new(),
             recursive_components: Default::default(),
@@ -705,7 +703,7 @@ mod row_tests {
             false,
         );
         let prog = empty_program();
-        let rows = collect_cycle_rows(&g, &prog, &"Child".to_string());
+        let rows = collect_cycle_rows(&g, &prog, crate::test_support::named("Child"));
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].effect, 7);
         assert!(rows[0].cross_component);
@@ -725,7 +723,7 @@ mod row_tests {
             true,
         );
         let prog = empty_program();
-        let rows = collect_cycle_rows(&g, &prog, &"C".to_string());
+        let rows = collect_cycle_rows(&g, &prog, crate::test_support::named("C"));
         assert_eq!(rows.len(), 1, "the spanless edge must drop: {rows:?}");
         assert_eq!(rows[0].effect, 8);
         assert!(rows[0].all_must);
@@ -752,7 +750,7 @@ mod row_tests {
             ],
         };
         let prog = empty_program();
-        let rows = collect_cycle_rows(&g, &prog, &"C".to_string());
+        let rows = collect_cycle_rows(&g, &prog, crate::test_support::named("C"));
         assert_eq!(rows.len(), 2, "one row per carrying effect: {rows:?}");
     }
 }

@@ -74,11 +74,16 @@ fn infinite_loop_surfaces_on_app_through_alias() {
         Config::default(),
     );
     assert_eq!(file_count, 2);
-    assert!(result.components.contains_key("App"));
+    assert!(result.component_named("App").is_some());
 
     let diags: Vec<_> = all_rules()
         .iter()
-        .flat_map(|r| r.check(&RuleCtx::new(&result, &"App".to_string())))
+        .flat_map(|r| {
+            r.check(&RuleCtx::new(
+                &result,
+                result.component_named("App").unwrap(),
+            ))
+        })
         .collect();
     assert!(
         diags

@@ -3,9 +3,9 @@ use crate::{
     domains::{AbstractEnv, MemoStore, StateStore, StateValueTransfer, impls::StateValue},
     engine::HookKind,
     ir::{
+        ComponentId,
         expr::Expr,
         hooks::{DepsList, HookEntry},
-        types::Symbol,
     },
 };
 
@@ -46,7 +46,7 @@ impl Rule for AlwaysUnstableDeps {
         // Applicable when some hook declared a non-empty deps array to defeat.
         result
             .components
-            .get(component)
+            .get(&component)
             .is_some_and(|c| {
                 c.effect_info
                     .values()
@@ -60,7 +60,7 @@ impl Rule for AlwaysUnstableDeps {
 
     fn check(&self, ctx: &RuleCtx) -> Vec<Diagnostic> {
         let (program, component) = (ctx.program(), ctx.component());
-        let result = &program.components[component];
+        let result = &program.components[&component];
         let env_exit = result.exit_env();
         let mut diags = Vec::new();
         let transfer = StateValueTransfer;
@@ -93,7 +93,7 @@ impl Rule for AlwaysUnstableDeps {
                 .iter()
                 .filter(|dep| {
                     eval_dep_is_unstable(
-                        &result.component,
+                        result.component,
                         dep,
                         &env_exit,
                         &result.state_store,
@@ -141,7 +141,7 @@ impl Rule for AlwaysUnstableDeps {
 }
 
 fn eval_dep_is_unstable(
-    component: &Symbol,
+    component: ComponentId,
     dep: &Expr,
     env: &AbstractEnv<StateValue>,
     state: &StateStore<StateValue>,
@@ -251,7 +251,7 @@ mod tests {
         }];
         let comp = component(hooks, vec![]);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let diags = AlwaysUnstableDeps.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = AlwaysUnstableDeps.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].rule, "always-unstable-deps");
         assert_eq!(diags[0].hook_label, Some(0));
@@ -272,7 +272,7 @@ mod tests {
         }];
         let comp = component(hooks, vec![]);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let diags = AlwaysUnstableDeps.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = AlwaysUnstableDeps.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
     }
 
@@ -289,7 +289,7 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(
             AlwaysUnstableDeps
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -307,7 +307,7 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(
             AlwaysUnstableDeps
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -325,7 +325,7 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(
             AlwaysUnstableDeps
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -348,7 +348,7 @@ mod tests {
         }];
         let comp = component(hooks, vec![]);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let diags = AlwaysUnstableDeps.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = AlwaysUnstableDeps.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1, "one unstable ref dep must fire");
         // The message names the dependency, not its position: an index into
         // `elems` stops being an index into the source array once lowering
@@ -381,7 +381,7 @@ mod tests {
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
         assert!(
             AlwaysUnstableDeps
-                .check(&RuleCtx::new(&prog(&result), &"C".to_string()))
+                .check(&RuleCtx::new(&prog(&result), crate::test_support::C))
                 .is_empty()
         );
     }
@@ -399,7 +399,7 @@ mod tests {
         }];
         let comp = component(hooks, vec![]);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let diags = AlwaysUnstableDeps.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = AlwaysUnstableDeps.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert!(
             diags[0].message.contains("memo"),
@@ -428,7 +428,7 @@ mod tests {
         let memo = MemoStore::<StateValue>::new();
         assert!(
             !eval_dep_is_unstable(
-                &"C".to_string(),
+                crate::test_support::C,
                 &Expr::StateVal(0),
                 &env,
                 &state,
@@ -448,7 +448,7 @@ mod tests {
         let state = StateStore::<StateValue>::bottom();
         let memo = MemoStore::<StateValue>::new();
         assert!(eval_dep_is_unstable(
-            &"C".to_string(),
+            crate::test_support::C,
             &Expr::ObjectLit {
                 id: ExprId(0),
                 fields: vec![]
@@ -478,7 +478,7 @@ mod tests {
         }];
         let comp = component(hooks, vec![]);
         let result = analyze_component(comp, &StateValueTransfer, &Config::default());
-        let diags = AlwaysUnstableDeps.check(&RuleCtx::new(&prog(&result), &"C".to_string()));
+        let diags = AlwaysUnstableDeps.check(&RuleCtx::new(&prog(&result), crate::test_support::C));
         assert_eq!(diags.len(), 1);
         assert!(
             diags[0].message.contains("callback"),

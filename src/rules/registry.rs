@@ -18,14 +18,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ir::types::Symbol;
-
 use super::api::cache::ProgramCache;
 use super::api::diagnostic::{Diagnostic, Severity};
 use super::api::query::{RuleConfig, RuleCtx};
 use super::docs::{RULE_DOCS, RuleDoc};
 use super::impls::AnalysisLimitInfo;
 use super::{Rule, SafeCheck, all_rules};
+use crate::ir::ComponentId;
 
 /// Consumer overrides, already precedence-resolved by the frontend (ADR-022
 /// §5: CLI beats config; the registry never sees raw flags).
@@ -215,7 +214,7 @@ impl RuleRegistry {
     pub fn check_component<'a>(
         &self,
         cache: &'a ProgramCache<'a>,
-        component: &'a Symbol,
+        component: ComponentId,
     ) -> ComponentFindings {
         let program = cache.program();
         let mut diags: Vec<Diagnostic> = Vec::new();
@@ -505,10 +504,13 @@ mod tests {
 
     // ── check_component behavior, on a minimal analyzed component ────────────
 
-    fn one_component() -> (ProgramAnalysisResult, Symbol) {
+    fn one_component() -> (ProgramAnalysisResult, crate::ir::ComponentId) {
         let cfg = crate::test_support::single_block_cfg(vec![]);
         let result = crate::test_support::analysis_result(cfg);
-        (crate::test_support::prog("C", result), "C".to_string())
+        (
+            crate::test_support::prog("C", result),
+            crate::test_support::C,
+        )
     }
 
     fn registry_with_stub() -> RuleRegistry {
@@ -521,7 +523,7 @@ mod tests {
     #[test]
     fn stub_rule_fires_through_the_registry() {
         let (prog, name) = one_component();
-        let findings = registry_with_stub().check_component(&ProgramCache::new(&prog), &name);
+        let findings = registry_with_stub().check_component(&ProgramCache::new(&prog), name);
         assert!(findings.diagnostics.iter().any(|d| d.rule == "test/stub"));
     }
 
@@ -538,7 +540,7 @@ mod tests {
             },
         );
         reg.set_overrides(o).unwrap();
-        let findings = reg.check_component(&ProgramCache::new(&prog), &name);
+        let findings = reg.check_component(&ProgramCache::new(&prog), name);
         assert!(!findings.diagnostics.iter().any(|d| d.rule == "test/stub"));
     }
 
@@ -551,7 +553,7 @@ mod tests {
             ..Default::default()
         };
         reg.set_overrides(o).unwrap();
-        let findings = reg.check_component(&ProgramCache::new(&prog), &name);
+        let findings = reg.check_component(&ProgramCache::new(&prog), name);
         assert!(!findings.diagnostics.iter().any(|d| d.rule == "test/stub"));
     }
 
@@ -571,7 +573,7 @@ mod tests {
         );
         o.allow = Some(BTreeSet::from(["test/stub".to_string()]));
         reg.set_overrides(o).unwrap();
-        let findings = reg.check_component(&ProgramCache::new(&prog), &name);
+        let findings = reg.check_component(&ProgramCache::new(&prog), name);
         assert!(!findings.diagnostics.iter().any(|d| d.rule == "test/stub"));
     }
 
@@ -588,7 +590,7 @@ mod tests {
             },
         );
         reg.set_overrides(o).unwrap();
-        let findings = reg.check_component(&ProgramCache::new(&prog), &name);
+        let findings = reg.check_component(&ProgramCache::new(&prog), name);
         let d = findings
             .diagnostics
             .iter()
@@ -612,7 +614,7 @@ mod tests {
             },
         );
         reg.set_overrides(o).unwrap();
-        let findings = reg.check_component(&ProgramCache::new(&prog), &name);
+        let findings = reg.check_component(&ProgramCache::new(&prog), name);
         let d = findings
             .diagnostics
             .iter()
@@ -654,7 +656,7 @@ mod tests {
             },
         );
         reg.set_overrides(o).unwrap();
-        let findings = reg.check_component(&ProgramCache::new(&prog), &name);
+        let findings = reg.check_component(&ProgramCache::new(&prog), name);
         assert!(!findings.diagnostics.iter().any(|d| d.rule == "test/two"));
         assert!(
             findings
@@ -669,7 +671,9 @@ mod tests {
     /// A component holding one `useState` row, plus an opaque custom-hook row
     /// when `truncated` — the only difference being the fact
     /// `analysis-limit/unknown-hook` is about, so the two runs are comparable.
-    fn one_component_with_hooks(truncated: bool) -> (ProgramAnalysisResult, Symbol) {
+    fn one_component_with_hooks(
+        truncated: bool,
+    ) -> (ProgramAnalysisResult, crate::ir::ComponentId) {
         use crate::engine::{HookCallInfo, HookKind};
         let cfg = crate::test_support::single_block_cfg(vec![]);
         let mut result = crate::test_support::analysis_result(cfg);
@@ -689,7 +693,10 @@ mod tests {
                 opaque: true,
             });
         }
-        (crate::test_support::prog("C", result), "C".to_string())
+        (
+            crate::test_support::prog("C", result),
+            crate::test_support::C,
+        )
     }
 
     #[test]
@@ -697,7 +704,7 @@ mod tests {
         let reg = RuleRegistry::natives();
 
         let (clean, name) = one_component_with_hooks(false);
-        let baseline = reg.check_component(&ProgramCache::new(&clean), &name);
+        let baseline = reg.check_component(&ProgramCache::new(&clean), name);
         assert!(
             !baseline.safe_checks.is_empty(),
             "the baseline must publish at least one assurance, else this test proves nothing"
@@ -705,7 +712,7 @@ mod tests {
         assert_eq!(baseline.suspended_safe_checks, 0);
 
         let (truncated, name) = one_component_with_hooks(true);
-        let findings = reg.check_component(&ProgramCache::new(&truncated), &name);
+        let findings = reg.check_component(&ProgramCache::new(&truncated), name);
         assert!(
             findings
                 .diagnostics
@@ -741,7 +748,7 @@ mod tests {
         );
         reg.set_overrides(o).unwrap();
 
-        let findings = reg.check_component(&ProgramCache::new(&truncated), &name);
+        let findings = reg.check_component(&ProgramCache::new(&truncated), name);
         assert!(
             !findings
                 .diagnostics
