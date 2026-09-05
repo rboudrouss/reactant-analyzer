@@ -1,1160 +1,1120 @@
 # Precision log
 
-Corrections de précision : une règle sur-signalait une forme, le moteur a été
-corrigé là où l'information se perdait, et le corpus l'a mesuré.
+Precision corrections: a rule over-reported a shape, the engine was fixed where
+the information was being lost, and the corpus measured it.
 
-**Ce n'est pas de l'architecture**, donc ce n'est pas dans [`adr/`](adr/). Un
-ADR enregistre une décision que le reste du système doit respecter — un domaine,
-une relation, un invariant, une alternative refusée. Une correction de précision
-enregistre une *mesure* : la forme, la revendication qui la tranche, le delta
-corpus. Une entrée ici, un message de commit, et une ligne dans
-[`limitations.md`](limitations.md) s'il reste une limite.
+**This is not architecture**, so it does not live in [`adr/`](adr/). An ADR
+records a decision the rest of the system must respect: a domain, a relation, an
+invariant, a rejected alternative. A precision correction records a
+*measurement*: the shape, the claim that settles it, the corpus delta. One entry
+here, one commit message, and one line in
+[`limitations.md`](limitations.md) if a limitation remains.
 
-Chaque revendication reste soumise aux invariants du projet : faux positifs
-tolérés, **faux négatifs interdits**. Une correction de précision ne retire que
-des emplacements ; une correction de *soundness* en ajoute, et les ajouts sont
-alors des constats qu'un bug taisait. #134 est la seule ligne des deux espèces
-à la fois — elle retire 26 emplacements et en ajoute 15, ce qui est exactement
-ce qu'on attend d'un bug d'identité : des lectures qui répondaient depuis le
-mauvais objet, dans les deux sens. Son détail est dans
-[NEXTSTEPS](NEXTSTEPS.md#134--lidentité-dun-site-dallocation-2026-09-03).
+Every claim stays subject to the project's invariants: false positives
+tolerated, **false negatives forbidden**. A precision correction only removes
+locations; a *soundness* correction adds some, and those additions are findings
+a bug had been silencing. #134 is the only line that is both at once. It removes
+26 locations and adds 15, which is exactly what an identity bug looks like:
+reads answering from the wrong object, in both directions
+([#134](https://github.com/rboudrouss/reactant-analyzer/issues/134)).
 
-## Métrique
+## The metric
 
-La colonne comparable est le nombre d'**emplacements distincts**
-`(fichier, ligne, colonne, message)`. Le JSON garde une ligne par
-(finding, composant) — #129 ne regroupe qu'à l'affichage — donc le nombre de
-lignes dépend de la façon dont on compte et n'est pas une série propre d'une
-campagne à l'autre. La première entrée précède cette métrique et est citée en
-findings bruts.
+The comparable column is the number of **distinct locations**
+`(file, line, column, message)`. The JSON keeps one row per (finding,
+component), since #129 only groups at display time, so the row count depends on
+how you count and is not a clean series from one campaign to the next. The first
+entry predates this metric and is quoted in raw findings.
 
-Corpus : `test-repo/`, 14 dépôts, **40 164 fichiers** depuis l'épinglage du
-2026-09-04 (34 747 auparavant — voir la rupture de série plus bas, les deux
-moitiés du tableau ne se comparent pas).
+Corpus: `test-repo/`, 14 repositories, **40,164 files** since the pinning of
+2026-09-04 (34,747 before it; see the series break below, the two halves of the
+table are not comparable).
 
-**L'analyse est déterministe.** Quatre exécutions d'un binaire gelé sur un
-dépôt, et deux sur le corpus entier, donnent des fichiers JSON *identiques au
-bit près*. Un écart entre deux mesures est donc toujours un vrai changement de
-comportement ou une erreur de comptage — jamais du bruit.
+**The analysis is deterministic.** Four runs of a frozen binary on one
+repository, and two on the whole corpus, produce *bit-identical* JSON files. A
+gap between two measurements is therefore always a real behaviour change or a
+counting error, never noise.
 
-**Un point d'arrivée se compte ; les retraits aussi.** Les chiffres du
-2026-09-03 ont dû être remesurés, et l'erreur portait sur les deux bouts du
-calcul : des retraits comptés en relisant une famille à la main plutôt qu'en
-diffant, et un point d'arrivée déduit du delta au lieu d'être compté. La
-colonne étant cumulative, une seule ligne fausse déplace toutes les suivantes —
-et pour #134 le signe lui-même s'est inversé. Le compte rendu complet est en
-« Correction » à la fin.
+**An endpoint is counted, and so are removals.** The 2026-09-03 figures had to
+be re-measured, and the error was at both ends of the calculation: removals
+counted by re-reading one family by hand rather than by diffing, and an endpoint
+deduced from the delta instead of counted. The column being cumulative, a single
+wrong line shifts every line after it, and for #134 the sign itself flipped. The
+full account is under "Table correction" below.
 
-La règle qui en sort : [`corpus-diff.py`](../scripts/corpus-diff.py) sur deux
-exécutions, qui imprime toujours `avant / après / retirés / ajoutés` et sort en
-erreur si les trois ne se réconcilient pas. Ce qu'on a relu à la source n'est
-pas ce qui a changé ; les deux se disent, séparément.
+The rule that comes out of it: [`corpus-diff.py`](../scripts/corpus-diff.py) over
+two runs, which always prints `before / after / removed / added` and exits with
+an error if the three do not reconcile. What was re-read at the source is not
+what changed; the two are stated separately.
 
-Les lignes du **2026-09-03** ont été remesurées (voir « Correction » en fin de
-document) ; celles du **2026-09-02** ne sont pas vérifiables, aucun binaire de
-cette session n'ayant survécu, et sont laissées telles quelles.
+The **2026-09-03** lines have been re-measured (see "Table correction" at the end
+of this document). The **2026-09-02** lines are not verifiable, since no binary
+from that session survived, and they are left as they are.
 
-| date | revendication | issue | emplacements |
+| date | claim | issue | locations |
 |---|---|---|---|
-| 2026-09-02 | le plus long préfixe stable | résidu de #88 | −686 findings (6 340 → 5 654) |
-| 2026-09-02 | un index dynamique cache ce qui est dessous, pas la chaîne au-dessus | #89 §3/§4 | 1 423 → 1 417 |
-| 2026-09-02 | une dep qui *est* la lecture | #89 §1 | 1 417 → 1 402 |
-| 2026-09-02 | une closure atteinte via un conteneur reste une closure | #89 | 1 402 → 1 394 |
-| 2026-09-02 | un renommage n'est pas une lecture | #89 §2 | 1 394 → 1 359 |
-| 2026-09-02 | une écriture qui tranche sa propre garde | #91 | 1 359 → 1 343 |
-| 2026-09-03 | un membre n'est pas le slot | #90 | 1 348 → 1 345 |
-| 2026-09-03 | l'identité d'un site d'allocation | #134 | 1 345 → 1 334 (26 retirés, **15 ajoutés**) |
-| 2026-09-03 | un contrat de bibliothèque porte sur les membres | #94 | 1 334 → 1 326 |
-| 2026-09-03 | un emballeur n'exécute pas son argument | #94 | 1 326 → 1 325 |
-| 2026-09-03 | un emballeur n'est pas forcément stable | #94 | 1 325 → 1 325 (voir l'entrée) |
-| 2026-09-03 | une lecture de membre a besoin du tas convergé | #135 | 1 325 → 1 325 (voir l'entrée) |
-| 2026-09-03 | les écrivains d'un slot se lisent dans la relation | #92 | 1 325 → 1 314 |
-| 2026-09-03 | un contrat de tuple est indexé par position | #37 | 1 314 → 1 314 (voir l'entrée) |
-| 2026-09-03 | le propriétaire d'un setter se lit au site d'appel | #119 | 1 314 → 1 314 (voir l'entrée) |
-| 2026-09-04 | un quitus ne vaut que pour du code lu | #9, #47 | 1 314 → 1 314 |
-| 2026-09-04 | un sous-répertoire est toujours dans son projet | #9 | 1 314 → 1 314 |
-| 2026-09-04 | un hook dans un terminateur reste un hook | #4, #5 | 1 314 → **1 340** (10 retirés, 36 ajoutés) |
-| 2026-09-04 | un try/catch/finally est du flot de contrôle | #2 | 1 340 → **1 344** (0 retiré, 4 ajoutés) |
-| — | **corpus épinglé : la série repart** | #15 | même binaire, 1 344 → 1 358 |
-| 2026-09-04 | la variable libre d'un appelé n'est pas celle de l'appelant | #141 | 1 358 → **1 317** (41 retirés, 0 ajouté) |
-| 2026-09-04 | le marqueur est le début de la recherche du tsconfig, pas sa fin | #139 | 1 317 → 1 317 (voir l'entrée) |
-| 2026-09-04 | un répertoire est généré parce que le dépôt le dit | #137 | 1 317 → 1 317 (0 retiré, 0 ajouté ; **+88 fichiers lus**) |
-| 2026-09-04 | suivre les imports d'un run restreint, derrière un drapeau | #138 | 1 317 → 1 317 (défaut inchangé ; voir l'entrée) |
+| 2026-09-02 | the longest stable prefix | residue of #88 | −686 findings (6,340 → 5,654) |
+| 2026-09-02 | a dynamic index hides what is below it, not the chain above | #89 §3/§4 | 1,423 → 1,417 |
+| 2026-09-02 | a dep that *is* the read | #89 §1 | 1,417 → 1,402 |
+| 2026-09-02 | a closure reached through a container is still a closure | #89 | 1,402 → 1,394 |
+| 2026-09-02 | a rename is not a read | #89 §2 | 1,394 → 1,359 |
+| 2026-09-02 | a write that settles its own guard | #91 | 1,359 → 1,343 |
+| 2026-09-03 | a member is not the slot | #90 | 1,348 → 1,345 |
+| 2026-09-03 | the identity of an allocation site | #134 | 1,345 → 1,334 (26 removed, **15 added**) |
+| 2026-09-03 | a library contract is about members | #94 | 1,334 → 1,326 |
+| 2026-09-03 | a wrapper does not run its argument | #94 | 1,326 → 1,325 |
+| 2026-09-03 | a wrapper is not necessarily stable | #94 | 1,325 → 1,325 (see the entry) |
+| 2026-09-03 | a member read needs the converged heap | #135 | 1,325 → 1,325 (see the entry) |
+| 2026-09-03 | a slot's writers are read from the relation | #92 | 1,325 → 1,314 |
+| 2026-09-03 | a tuple contract is indexed by position | #37 | 1,314 → 1,314 (see the entry) |
+| 2026-09-03 | a setter's owner is read at the call site | #119 | 1,314 → 1,314 (see the entry) |
+| 2026-09-04 | a clean bill is only worth what was read | #9, #47 | 1,314 → 1,314 |
+| 2026-09-04 | a subdirectory is still inside its project | #9 | 1,314 → 1,314 |
+| 2026-09-04 | a hook in a terminator is still a hook | #4, #5 | 1,314 → **1,340** (10 removed, 36 added) |
+| 2026-09-04 | try/catch/finally is control flow | #2 | 1,340 → **1,344** (0 removed, 4 added) |
+| n/a | **corpus pinned: the series restarts** | #15 | same binary, 1,344 → 1,358 |
+| 2026-09-04 | a callee's free variable is not the caller's | #141 | 1,358 → **1,317** (41 removed, 0 added) |
+| 2026-09-04 | the marker is where the tsconfig search starts, not where it stops | #139 | 1,317 → 1,317 (see the entry) |
+| 2026-09-04 | a directory is generated because the repository says so | #137 | 1,317 → 1,317 (0 removed, 0 added; **+88 files read**) |
+| 2026-09-04 | following a narrowed run's imports, behind a flag | #138 | 1,317 → 1,317 (default unchanged; see the entry) |
 
 ---
 
-## 2026-09-02 — le plus long préfixe stable
+## 2026-09-02: the longest stable prefix
 
-*Résidu de #88. Cadre : [ADR-017](adr/ADR-017-versioned-stability.md), identité
-contre comportement.*
+*Residue of #88. Frame: [ADR-017](adr/ADR-017-versioned-stability.md), identity
+against behaviour.*
 
-`missing-deps` demandait si une capture peut devenir **périmée** en regardant
-deux choses et rien entre les deux : la racine du chemin, et le chemin entier.
+`missing-deps` asked whether a capture can go **stale** by looking at two things
+and nothing in between: the path's root, and the whole path.
 
 ```js
 const r = useRef(0);
 const bag = { r };
-useCallback(() => r.current,     []);   // silencieux : la racine est stable
-useCallback(() => bag.r.current, []);   // signalé : « `bag` est recréé »
+useCallback(() => r.current,     []);   // silent: the root is stable
+useCallback(() => bag.r.current, []);   // reported: "`bag` is recreated"
 ```
 
-**La revendication.** Une lecture n'est périmée que si *toutes* les poignées
-qu'elle traverse peuvent changer. `bag.r` est le même ref à chaque rendu, donc
-la copie périmée de `bag` atteint ce ref et lit sa valeur courante. Un seul
-préfixe stable clôt la question. Ce n'est pas une nouvelle exemption : c'est
-celle que la règle avait déjà pour la racine, qui s'arrêtait à une profondeur
-arbitraire. `Stability::Stable` est une must-claim — ni ⊤ ni ⊥ ne sont stables —
-donc aucun préfixe ne peut être dit stable par imprécision.
+**The claim.** A read is stale only if *every* handle it goes through can
+change. `bag.r` is the same ref on every render, so the stale copy of `bag`
+reaches that ref and reads its current value. A single stable prefix closes the
+question. This is not a new exemption: it is the one the rule already had for
+the root, which stopped at an arbitrary depth. `Stability::Stable` is a must
+claim, since neither ⊤ nor ⊥ is stable, so no prefix can be called stable out of
+imprecision.
 
-**Corpus : −686 findings (6 340 → 5 654), aucun ajouté**, tous `missing-deps`,
-tous une seule forme (`$values.refValues.current`, un `useRef` atteint via un
-conteneur que `useFormValues` de mantine reconstruit à chaque rendu). 11 % de la
-sortie totale.
+**Corpus: −686 findings (6,340 → 5,654), none added**, all `missing-deps`, all
+one shape (`$values.refValues.current`, a `useRef` reached through a container
+that mantine's `useFormValues` rebuilds every render). 11% of the total output.
 
-Ce qui continue de tirer, à raison : `$values.setValues`, un `useCallback` avec
-une liste de deps **non vide**. Son identité change quand sa propre dep bouge,
-donc aucun préfixe n'est stable et la capture peut vraiment se périmer.
+What keeps firing, rightly: `$values.setValues`, a `useCallback` with a
+**non-empty** deps list. Its identity changes when its own dep moves, so no
+prefix is stable and the capture really can go stale.
 
 ---
 
-## 2026-09-02 — un index dynamique cache ce qui est dessous, pas la chaîne au-dessus
+## 2026-09-02: a dynamic index hides what is below it, not the chain above
 
-*#89, formes 3 et 4.*
+*#89, shapes 3 and 4.*
 
-`extract_path` réduisait *toute* chaîne de membres contenant un accès calculé à
-sa racine nue, donc `theme.snackBar[variant].color` s'enregistrait comme `theme`
-entier — que rien de moins qu'une dep `[theme]` ne peut couvrir.
+`extract_path` reduced *any* member chain containing a computed access to its
+bare root, so `theme.snackBar[variant].color` was recorded as the whole of
+`theme`, which nothing short of a `[theme]` dep can cover.
 
-**La revendication.** `x.a[i].b` enregistre `x.a` : la dernière poignée nommée
-que la lecture traverse. C'est la revendication du préfixe stable de l'autre
-côté de la comparaison — la lecture est fraîche dès que `x.a` l'est, exactement
-comme une dep `[x.a]` couvre déjà une lecture `x.a.b`. Les segments *sous*
-l'index restent perdus, donc une dep `[x.a.b]` ne couvre pas `x.a[i].b` : le
-test de préfixe tombe du bon côté tout seul. Côté **dep**, rien ne change :
-`[x.a[i]]` ne déclare toujours rien, car une dep épingle l'élément et non le
-conteneur.
+**The claim.** `x.a[i].b` records `x.a`: the last named handle the read goes
+through. This is the stable-prefix claim on the other side of the comparison,
+since the read is fresh as soon as `x.a` is, exactly as a `[x.a]` dep already
+covers an `x.a.b` read. The segments *below* the index stay lost, so an `[x.a.b]`
+dep does not cover `x.a[i].b`: the prefix test falls on the right side by itself.
+On the **dep** side nothing changes: `[x.a[i]]` still declares nothing, because a
+dep pins the element and not the container.
 
-La seconde forme — un `useCallback` est une closure, donc la question
-comportementale doit lui être posée aussi — est reprise et généralisée par
-l'entrée « une closure atteinte via un conteneur » plus bas.
+The second shape, that a `useCallback` is a closure and so the behavioural
+question must be asked of it too, is taken up and generalized by the "a closure
+reached through a container" entry below.
 
-**Corpus : 1 423 → 1 417 emplacements, 6 retirés, aucun ajouté**, chacun relu à
-la source (memos `PagedMemoList.tsx:163`, next-shadcn `kanban.tsx:720` — qui
-porte un `eslint-disable` disant précisément cela — twenty `SnackBar.tsx:163`,
+**Corpus: 1,423 → 1,417 locations, 6 removed, none added**, each one re-read at
+the source (memos `PagedMemoList.tsx:163`, next-shadcn `kanban.tsx:720`, which
+carries an `eslint-disable` saying precisely this, twenty `SnackBar.tsx:163`,
 mantine `use-form-errors.ts:44`).
 
-`extract_path` est partagé : `missing-deps`, `stale-closure`, l'aide au montage
-et le scan de seeds lisent tous un chemin de la même façon, et un chemin plus
-long est plus couvrable, jamais moins.
+`extract_path` is shared: `missing-deps`, `stale-closure`, the mount helper and
+the seed scan all read a path the same way, and a longer path is more coverable,
+never less.
 
 ---
 
-## 2026-09-02 — une dep qui *est* la lecture
+## 2026-09-02: a dep that *is* the read
 
-*#89 §1, sa moitié sound.*
+*#89 §1, its sound half.*
 
-Tout ce qu'un corps calcule *à partir* d'une lecture est décomposé en les
-lectures sous-jacentes, donc une deps array qui déclare le calcul plutôt que ses
-entrées ne déclarait rien :
+Everything a body computes *from* a read is decomposed into the underlying
+reads, so a deps array declaring the computation rather than its inputs declared
+nothing:
 
 ```js
 useCallback(() => {
   const sort = searchParams.get("sort");
   queryParams({ del: sort });
-}, [queryParams, searchParams.get("sort")]);   // ← signalait `searchParams.get`
+}, [queryParams, searchParams.get("sort")]);   // ← reported `searchParams.get`
 ```
 
-**La revendication.** Une sous-expression qui apparaît **verbatim** dans la deps
-array est épinglée par elle : React compare la valeur de cette expression, donc
-le hook est recréé dès qu'elle change et l'évaluation du corps ne peut pas
-diverger de la courante. Verbatim est toute la revendication, et c'est ce qui
-trace la ligne :
+**The claim.** A sub-expression appearing **verbatim** in the deps array is
+pinned by it: React compares that expression's value, so the hook is recreated as
+soon as it changes and the body's evaluation cannot diverge from the current one.
+Verbatim is the whole claim, and it is what draws the line:
 
-- `[searchParams.get(urlParam)]` épingle `searchParams.get` **et** `urlParam` ;
-- `[JSON.stringify(o)]` n'épingle **rien** pour un corps qui lit `o` nu — une
-  sérialisation est lossy, `o` peut bouger sans bouger la dep, et créditer ça
-  serait un faux négatif ;
-- `excludedPayoutIds.length` continue de tirer à côté d'un
-  `excludedPayoutIds.join(",")` épinglé : une expression différente est une
-  lecture différente.
+- `[searchParams.get(urlParam)]` pins `searchParams.get` **and** `urlParam`;
+- `[JSON.stringify(o)]` pins **nothing** for a body reading a bare `o`, because a
+  serialization is lossy: `o` can move without the dep moving, and crediting that
+  would be a false negative;
+- `excludedPayoutIds.length` keeps firing next to a pinned
+  `excludedPayoutIds.join(",")`, because a different expression is a different
+  read.
 
-**La séparation est la partie porteuse.** `EffectInfo` porte les deux ensembles.
-*Ce* hook ne peut pas se périmer sur une lecture épinglée, donc `missing-deps`
-la saute ; mais un **consommateur** de la valeur produite tient toujours une
-closure sur cette lecture, donc le contrôle de stabilité comportementale
-raisonne sur les `free_paths` complets. Les fusionner ferait passer
-`useCallback(() => log(n), [n])` pour une capture vide et tairait le
-consommateur périmé. Deux tests de régression tiennent la ligne des deux côtés.
+**The separation is the load-bearing part.** `EffectInfo` carries both sets.
+*This* hook cannot go stale on a pinned read, so `missing-deps` skips it; but a
+**consumer** of the produced value still holds a closure over that read, so the
+behavioural stability check reasons over the full `free_paths`. Merging them
+would make `useCallback(() => log(n), [n])` look like an empty capture and
+silence the stale consumer. Two regression tests hold the line on both sides.
 
-**Corpus : 1 417 → 1 402 emplacements, 15 retirés, aucun ajouté.** Coût : une
-seconde passe de chemins libres par hook dont les deps contiennent au moins une
-expression clefable — dans le bruit de mesure (dub 69,0 s → 70,8 s).
+**Corpus: 1,417 → 1,402 locations, 15 removed, none added.** Cost: a second
+free-path pass per hook whose deps contain at least one keyable expression, which
+is inside measurement noise (dub 69.0s → 70.8s).
 
 ---
 
-## 2026-09-02 — une closure atteinte via un conteneur reste une closure
+## 2026-09-02: a closure reached through a container is still a closure
 
-*#89, la moitié conteneur.*
+*#89, the container half.*
 
-La question comportementale n'était posée que d'un **nom nu** :
+The behavioural question was only asked of a **bare name**:
 
 ```js
 const bump = useCallback(() => { r.current += 1 }, [n]);
 const api  = { bump };
-useCallback(() => bump(),     []);   // silencieux
-useCallback(() => api.bump(), []);   // signalé
+useCallback(() => bump(),     []);   // silent
+useCallback(() => api.bump(), []);   // reported
 ```
 
-Un conteneur est la façon dont un custom hook rend une closure : le
-`useFormErrors()` de mantine renvoie cinq membres, chacun un `useCallback`.
+A container is how a custom hook returns a closure: mantine's `useFormErrors()`
+returns five members, each one a `useCallback`.
 
-**La revendication.** La chasse aux liaisons prend un **chemin**, pas un nom.
-Un nom nu est le cas de base ; chaque segment entre dans le champ de l'unique
-`ObjectLit` auquel le préfixe est lié, en suivant les alias de variables
-(`{ bump }` enregistre le membre comme `Var("bump")`). La barre de certitude est
-inchangée et s'applique à **chaque saut** : un nom lié zéro ou plus d'une fois
-ne résout rien, ni un membre derrière un spread qui a pu l'écraser.
+**The claim.** The binding chase takes a **path**, not a name. A bare name is the
+base case; each segment enters the field of the single `ObjectLit` the prefix is
+bound to, following variable aliases (`{ bump }` records the member as
+`Var("bump")`). The certainty bar is unchanged and applies to **every hop**: a
+name bound zero times or more than once resolves nothing, and neither does a
+member behind a spread that could have overwritten it.
 
-Deux lecteurs deviennent un : `fn_binding_in` et `callback_binding_in` étaient
-la même chasse rétrécie à une orthographe chacune ; `closure_binding_of` répond
-aux deux et dit laquelle.
+Two readers become one: `fn_binding_in` and `callback_binding_in` were the same
+chase narrowed to one spelling each; `closure_binding_of` answers both and says
+which.
 
-**Corpus : 1 402 → 1 394 emplacements, 8 retirés, aucun ajouté**, tous
-`$errors.<membre>` dans `use-form.ts` de mantine, les quatre membres vérifiés à
-la main. Ces huit valent 392 attributions parce que `useForm` est consommé dans
-tout mantine.
+**Corpus: 1,402 → 1,394 locations, 8 removed, none added**, all
+`$errors.<member>` in mantine's `use-form.ts`, the four members checked by hand.
+Those eight are worth 392 attributions because `useForm` is consumed throughout
+mantine.
 
 ---
 
-## 2026-09-02 — un renommage n'est pas une lecture
+## 2026-09-02: a rename is not a read
 
-*#89 §2, la dernière des quatre formes — issue close.*
+*#89 §2, the last of the four shapes. Issue closed.*
 
-La marche des chemins libres enregistrait chaque `Expr` rencontrée, donc une
-liaison qui ne fait que *nommer* comptait comme une lecture du tout :
+The free-path walk recorded every `Expr` it met, so a binding that only *names*
+counted as a read of the whole:
 
 ```js
 useMemo(() => {
-  const c = performanceCondition;      // ← enregistré : tout `performanceCondition`
+  const c = performanceCondition;      // ← recorded: all of `performanceCondition`
   if (!c.attribute) return "attribute";
 }, [performanceCondition?.attribute, performanceCondition?.value]);
 ```
 
-**La forme qui paie n'est pas l'alias explicite mais le déstructurage**, que
-tout code React écrit : `const { viewport } = ctx` s'abaisse en
-`__obj = ctx; viewport = __obj.viewport`, donc une lecture du contexte entier
-précédait chaque `[ctx.viewport, ctx.offset]`.
+**The shape that pays is not the explicit alias but destructuring**, which all
+React code writes: `const { viewport } = ctx` lowers to
+`__obj = ctx; viewport = __obj.viewport`, so a read of the whole context preceded
+every `[ctx.viewport, ctx.offset]`.
 
-**La revendication.** La marche saute le membre droit d'un `let` qui lie un nom,
-exactement une fois, à une chaîne de membres simple, et réécrit les chemins
-enracinés sur ce nom vers ce qu'il renomme. Tout le reste reste une lecture : un
-nom lié deux fois n'est pas un renommage, et un membre droit qui *calcule* a des
-lectures à lui. Rien n'est perdu quand l'alias est utilisé en entier —
-`JSON.stringify(c)` enregistre `c` nu, que la réécriture retourne en
-`performanceCondition` nu.
+**The claim.** The walk skips the right-hand side of a `let` that binds a name,
+exactly once, to a simple member chain, and rewrites paths rooted at that name to
+what it renames. Everything else stays a read: a name bound twice is not a
+rename, and a right-hand side that *computes* has reads of its own. Nothing is
+lost when the alias is used whole, since `JSON.stringify(c)` records a bare `c`,
+which the rewrite turns back into a bare `performanceCondition`.
 
-**Règle de nommage compagnon.** Raffiner `settings` en les huit membres qu'un
-corps touche est plus exact et moins lisible : huit lignes portant une seule
-instruction. Donc **quand la deps array ne nomme rien d'enraciné sur un objet,
-le finding nomme l'objet** ; là où elle nomme des membres, les non couverts sont
-listés un par un. Même choix une règle plus loin : plusieurs membres d'un objet
-qui seedent le même slot sont nommés par la poignée qu'ils partagent
-(`AccessPath::common_prefix`).
+**Companion naming rule.** Refining `settings` into the eight members a body
+touches is more exact and less readable: eight lines carrying one instruction.
+So **when the deps array names nothing rooted at an object, the finding names the
+object**; where it does name members, the uncovered ones are listed one by one.
+Same choice one rule further on: several members of an object seeding the same
+slot are named by the handle they share (`AccessPath::common_prefix`).
 
-**Corpus : 1 394 → 1 359 emplacements. Huit sites de hook s'éteignent sur les
-deux changements et aucun site n'en gagne** ; le reste du mouvement est le même
-finding renommé. Dix messages `frozen-initial-state` cessent de nommer un membre
-arbitraire ; neuf l'étaient déjà avant, résoudre les renommages a rendu
-l'arbitraire visible.
+**Corpus: 1,394 → 1,359 locations. Eight hook sites go quiet across the two
+changes and no site gains one**; the rest of the movement is the same finding
+renamed. Ten `frozen-initial-state` messages stop naming an arbitrary member;
+nine of them already were arbitrary before, and resolving renames made it
+visible.
 
-**Invariant modifié.** L'ensemble de racines de `compute_free_paths` est
-désormais un **sous-ensemble** de celui de `compute_free_vars`, là où il
-coïncidait. `compute_free_vars` sur-approxime exprès : `missing-deps` le lit
-pour l'ensemble de captures d'un littéral de fonction, où sous-déclarer tairait
-une vraie closure périmée.
+**Invariant changed.** The root set of `compute_free_paths` is now a **subset**
+of that of `compute_free_vars`, where the two used to coincide.
+`compute_free_vars` over-approximates deliberately: `missing-deps` reads it for
+the capture set of a function literal, where under-declaring would silence a real
+stale closure.
 
 ---
 
-## 2026-09-02 — une écriture qui tranche sa propre garde
+## 2026-09-02: a write that settles its own guard
 
-*#91, la famille compare-then-sync.*
+*#91, the compare-then-sync family.*
 
-`converges_once_written` prouvait qu'un effet ne tire qu'une fois par la
-*valeur* : lier le slot à la valeur écrite, rétrécir les gardes dominantes, voir
-si l'une tombe à ⊥. Ça prouve la forme fetch-once et rien d'autre, parce que la
-forme du corpus est **relationnelle** :
+`converges_once_written` proved that an effect fires only once by *value*: bind
+the slot to the written value, narrow the dominating guards, see if one falls to
+⊥. That proves the fetch-once shape and nothing else, because the corpus shape is
+**relational**:
 
 ```js
-if (scale < scaleForCurrentValue) { setScale(scaleForCurrentValue); }  // idiome de React
+if (scale < scaleForCurrentValue) { setScale(scaleForCurrentValue); }  // React's own idiom
 if (internalDate !== date)        { setInternalDate(date); }
 ```
 
-Aucun intervalle ne borne l'un ou l'autre côté. `x < y` après `x := y` est faux
-pour *tous* x et y, et c'est un fait sur la **relation** entre les deux, qu'aucun
-domaine non relationnel ne représente à aucune précision.
+No interval bounds either side. `x < y` after `x := y` is false for *all* x and
+y, and that is a fact about the **relation** between the two, which no
+non-relational domain represents at any precision.
 
-**La revendication.** Les orthographes disent ce que les valeurs ne peuvent pas.
-Une garde est tranchée quand un côté est un chemin enraciné sur le slot écrit et
-l'autre est, verbatim, l'expression que l'écriture y range : les deux désignent
-la même valeur au rendu suivant, donc `<`, `>`, `!=`, `!==` sont faux et `==`,
-`===`, `<=`, `>=` vrais. Si ça contredit la polarité de la branche prise, la
-branche est morte.
+**The claim.** Spellings say what values cannot. A guard is settled when one side
+is a path rooted at the written slot and the other is, verbatim, the expression
+the write puts there: both denote the same value on the next render, so `<`, `>`,
+`!=` and `!==` are false and `==`, `===`, `<=` and `>=` are true. If that
+contradicts the polarity of the branch taken, the branch is dead.
 
-Trois mécanismes déjà en place la portent jusqu'aux formes réelles : la marche
-de membres (la closure via un conteneur), la chasse aux liaisons (le renommage),
-et l'orthographe canonique **moins les appels**.
+Three mechanisms already in place carry it to the real shapes: the member walk
+(the closure through a container), the binding chase (the rename), and the
+canonical spelling **minus calls**.
 
-**Pourquoi les appels sont exclus.** La revendication est que deux orthographes
-désignent une valeur. Un appel ne le garantit pas, pas même deux fois dans un
-seul rendu — `f(x) !== f(x)` est un programme possible. L'épinglage d'une dep,
-lui, peut traverser un appel : là c'est l'`Object.is` de React qui compare. Un
-*nom* lié à un appel reste une bonne orthographe, parce que le nom est lié une
-fois. `NaN` est la seule valeur qui casserait les égalités et ne peut pas mordre :
-React abandonne une mise à jour `Object.is`-égale à la courante.
+**Why calls are excluded.** The claim is that two spellings denote one value. A
+call does not guarantee that, not even twice within one render, since
+`f(x) !== f(x)` is a possible program. Pinning a dep, on the other hand, can go
+through a call: there it is React's `Object.is` doing the comparing. A *name*
+bound to a call is still a good spelling, because the name is bound once. `NaN`
+is the only value that would break the equalities, and it cannot bite: React
+drops an update that is `Object.is`-equal to the current one.
 
-**Corpus : 1 359 → 1 343 emplacements, 16 retirés, aucun ajouté** — 10
-`infinite-loop` (un quart de la sortie de la règle) et 6 `setter-in-render`,
-dont twenty `CurrencyInput.tsx:139`, le motif « adjust state during render »
-documenté par React.
+**Corpus: 1,359 → 1,343 locations, 16 removed, none added.** Ten `infinite-loop`
+(a quarter of that rule's output) and six `setter-in-render`, including twenty
+`CurrencyInput.tsx:139`, the "adjust state during render" pattern React
+documents.
 
-Ce qui tire encore exprès, et c'est pourquoi le bras est écrit comme une
-*relation* et non comme une heuristique : `setUseAsync(Boolean(groups && !useAsync))`
-lit le slot dans la valeur qu'il écrit, donc chaque écriture rallume la garde.
-Quatre composants dub, et l'analyseur a raison sur les quatre.
+What still fires deliberately, and why the arm is written as a *relation* rather
+than a heuristic: `setUseAsync(Boolean(groups && !useAsync))` reads the slot
+inside the value it writes, so every write re-arms the guard. Four dub
+components, and the analyzer is right about all four.
 
-**Non prouvé** (voir [`limitations.md`](limitations.md)) : une garde disjonctive
-(`if (!prev || prev !== next)`) — il faudrait que *chaque* disjoint tranche, une
-autre marche — et l'arithmétique sur la valeur comparée
-(`setIndex(Math.max(0, plans.length - 1))`), qui est le travail d'un solveur.
+**Not proved** (see [`limitations.md`](limitations.md)): a disjunctive guard
+(`if (!prev || prev !== next)`), which would need *every* disjunct to settle and
+is a different walk, and arithmetic on the compared value
+(`setIndex(Math.max(0, plans.length - 1))`), which is a solver's job.
 
 ---
 
-## 2026-09-03 — un membre n'est pas le slot
+## 2026-09-03: a member is not the slot
 
-*#90 — issue close.*
+*#90. Issue closed.*
 
-Le bras self-churn d'`infinite-loop` raisonnait au grain du slot des deux côtés :
-toute écriture fraîche versionne l'objet entier, toute lecture compte comme
-lecture. Un effet qui touche des *membres différents* d'un même objet fermait
-donc un cycle impossible :
+`infinite-loop`'s self-churn arm reasoned at slot granularity on both sides: any
+fresh write versions the whole object, any read counts as a read. An effect
+touching *different members* of one object therefore closed an impossible cycle:
 
 ```tsx
-// lit `.name`, écrit `.slug`
+// reads `.name`, writes `.slug`
 useEffect(() => {
   setData((prev) => ({ ...prev, slug: slugify(prev.name) }));
 }, [data.name, oAuthApp]);
 
-// la garde lit `.leadId`, l'écriture y range null
+// the guard reads `.leadId`, the write puts null there
 } else if (!urlLeadId && sheet.leadId) {
   setSheet({ leadId: null, open: false });
 }
 ```
 
-**La revendication, côté deps.** React passe la valeur courante à un updater
-fonctionnel, donc `prev => ({ ...prev, k: v })` range la valeur de `prev` à tout
-membre que le littéral ne nomme pas. Une dep qui ne lit que ceux-là est
-`Object.is`-égale après l'écriture. C'est le geste de l'entrée précédente de
-l'autre côté de l'effet : le domaine de valeurs ne peut pas dire
-« `data.name` est inchangé » — le slot est une seule valeur abstraite — mais les
-deux orthographes le peuvent, parce que `prev` nomme la valeur même que la dep a
-lue.
+**The claim, deps side.** React passes the current value to a functional updater,
+so `prev => ({ ...prev, k: v })` puts `prev`'s value at every member the literal
+does not name. A dep reading only those is `Object.is`-equal after the write.
+This is the previous entry's move on the other side of the effect: the value
+domain cannot say "`data.name` is unchanged", since the slot is a single abstract
+value, but the two spellings can, because `prev` names the very value the dep
+read.
 
-**La revendication, côté garde.** Un conjoint qui lit un membre du slot écrit est
-tranché par la valeur que l'écriture y range, restreinte truthy ou falsy selon
-la polarité de la branche. Le slot entier, lui, est un objet truthy dans les
-deux cas.
+**The claim, guard side.** A conjunct reading a member of the written slot is
+settled by the value the write puts there, restricted truthy or falsy according
+to the branch's polarity. The whole slot, by contrast, is a truthy object either
+way.
 
-**Quatre refus la gardent sound**, chacun parce qu'un membre que la marche ne
-voit pas peut être celui qui compte : le spread doit être premier et seul, et
-sourcé du paramètre de l'updater (`{...prev, slug, ...patch}` ne prouve rien) ;
-chaque autre clef doit être une qu'un `FieldAccess` pourrait demander (une clef
-synthétique *est* « un membre sous un nom inconnu ») ; la dep doit être une
-chaîne de membres, ce qui exclut le slot nu (`[data]` compare des références) ;
-et le bras de garde ne lit qu'un littéral, donc la réponse ne dépend jamais de
-l'environnement où un nom local serait résolu.
+**Four refusals keep it sound**, each because a member the walk does not see
+could be the one that matters: the spread must be first and alone, and sourced
+from the updater's parameter (`{...prev, slug, ...patch}` proves nothing); every
+other key must be one a `FieldAccess` could ask for (a synthetic key *is* "a
+member under an unknown name"); the dep must be a member chain, which excludes
+the bare slot (`[data]` compares references); and the guard arm reads only a
+literal, so the answer never depends on an environment where a local name would
+be resolved.
 
-**Corpus : 1 343 → 1 340 emplacements, 3 retirés, aucun ajouté**, tous
-`infinite-loop`, tous dans dub, tous relus à la source. Petit pour un vrai
-défaut : la forme demande un spread *fonctionnel* sous une dep *membre*, et hors
-dub ce corpus écrit des slots entiers. Les deux bras servent aussi
-`setter-in-render`, qui partage `converges_once_written`.
+**Corpus: 1,343 → 1,340 locations, 3 removed, none added**, all `infinite-loop`,
+all in dub, all re-read at the source. Small for a real defect: the shape needs a
+*functional* spread under a *member* dep, and outside dub this corpus writes
+whole slots. Both arms also serve `setter-in-render`, which shares
+`converges_once_written`.
 
-**Non prouvé** : le graphe multi-effets, où « l'écriture de A change une dep de
-B » est une propriété d'une *paire* d'arêtes ; et le spread direct
-(`setData({...data, slug})`), où `data` est la valeur capturée au rendu et non
-la courante.
+**Not proved**: the multi-effect graph, where "A's write changes a dep of B" is a
+property of a *pair* of edges; and the direct spread (`setData({...data, slug})`),
+where `data` is the value captured at that render rather than the current one.
 
 ---
 
-## 2026-09-03 — un contrat de bibliothèque porte sur les membres
+## 2026-09-03: a library contract is about members
 
-*#94, la moitié « valeurs ». L'issue reste ouverte pour la moitié « timing ».*
+*#94, the "values" half. The issue stays open for the "timing" half.*
 
-Un `SummaryValue` était plat — `Top | StableRef | UnstableRef` — donc
-`const { setValue } = useForm()` n'avait aucune réponse : le conteneur était ⊤,
-chaque membre déstructuré aussi, et chacun était signalé absent du tableau de
-deps.
+A `SummaryValue` was flat, `Top | StableRef | UnstableRef`, so
+`const { setValue } = useForm()` had no answer: the container was ⊤, every
+destructured member was too, and each one was reported missing from the deps
+array.
 
-**La revendication.** Ce que ces bibliothèques publient est un contrat *par
-membre*, pas par objet : `useForm()` garantit que `setValue` est la même
-fonction à chaque rendu et ne garantit **rien** sur `formState`, qui est un
-Proxy qui change avec le formulaire. `SummaryValue::Shape { id, members }` porte
-exactement ça. Le conteneur reste ⊤ et un membre absent de la liste répond ⊤
-aussi — c'est ce qui empêche qu'un membre ajouté à une bibliothèque après
-l'écriture de la table hérite d'une stabilité que personne n'a promise.
+**The claim.** What these libraries publish is a *per-member* contract, not a
+per-object one: `useForm()` guarantees that `setValue` is the same function on
+every render and guarantees **nothing** about `formState`, which is a Proxy that
+changes with the form. `SummaryValue::Shape { id, members }` carries exactly
+that. The container stays ⊤, and a member absent from the list answers ⊤ as well,
+which is what stops a member added to a library after the table was written from
+inheriting a stability nobody promised.
 
-Le reste est la machinerie de #88 : `bind_rhs` enregistre la carte de membres
-comme un `HeapValue::Obj`, exactement comme pour un littéral objet, donc
-`const { setValue } = useForm()` — qui s'abaisse en
-`__obj = <marqueur>; setValue = __obj.setValue` — se résout par le tas comme
-`const { onClear } = bag`. Six lignes dans l'interpréteur, aucun nouveau chemin
-de résolution. L'`id` vient du curseur de greffe du composant (#134), donc deux
-`useForm()` dans un composant font deux objets.
+The rest is #88's machinery: `bind_rhs` records the member map as a
+`HeapValue::Obj`, exactly as it does for an object literal, so
+`const { setValue } = useForm()`, which lowers to
+`__obj = <marker>; setValue = __obj.setValue`, resolves through the heap like
+`const { onClear } = bag`. Six lines in the interpreter, no new resolution path.
+The `id` comes from the component's splice cursor (#134), so two `useForm()`
+calls in one component are two objects.
 
-Tables livrées : react-hook-form `useForm` / `useFormContext` (14 membres),
-`useRouter` de l'App Router Next (6), `mutate` de SWR. Délibérément absents :
+Tables shipped: react-hook-form `useForm` and `useFormContext` (14 members),
+Next's App Router `useRouter` (6), SWR's `mutate`. Deliberately absent:
 `formState`, `data`, `error`.
 
-**Corpus : 1 348 → 1 332 emplacements, 16 retirés, aucun ajouté**, tous
-`missing-deps`, tous relus à la source. Deux d'entre eux — `login/page.tsx:26`
-et `register/page.tsx:25` d'ai-chatbot — portent le commentaire de l'application
-elle-même : `biome-ignore … router and updateSession are stable refs`.
+**Corpus: 1,348 → 1,332 locations, 16 removed, none added**, all `missing-deps`,
+all re-read at the source. Two of them, ai-chatbot's `login/page.tsx:26` and
+`register/page.tsx:25`, carry the application's own comment:
+`biome-ignore … router and updateSession are stable refs`.
 
-Les retraits « objet entier » (`form` dans un effet qui n'appelle que
-`form.reset`) sont la même revendication lue par le plus long préfixe stable :
-une copie périmée de `form` tient le même `reset`. La question de
-`missing-deps` est la péremption, pas la couverture eslint.
+The "whole object" removals (`form` in an effect that only calls `form.reset`)
+are the same claim read by the longest stable prefix: a stale copy of `form`
+holds the same `reset`. `missing-deps` asks about staleness, not about eslint
+coverage.
 
-La moitié timing suit ci-dessous : elle repose entièrement sur la provenance
-que ce changement rend disponible.
-
----
-
-## 2026-09-03 — un emballeur n'exécute pas son argument
-
-*#94, la moitié « timing ».*
-
-`<form onSubmit={form.handleSubmit(onSubmit)}>` laissait 34 avertissements
-`setter-in-render` de classe ⊤. La marche voyait un appel opaque recevant une
-fonction qui écrit un state, et ⊤ inclut la passe de rendu — sain, et bruyant.
-
-**La revendication.** `handleSubmit(cb)` **renvoie** un gestionnaire ; il
-n'appelle pas `cb`. C'est une affirmation sur le *moment*, pas sur ce que vaut
-une valeur, donc elle voyage sur sa propre variante `SummaryValue::StableWrapper`
-plutôt que sur la valeur — cette dernière est identique à `StableRef`.
-(L'entrée du 2026-09-03 « un emballeur n'est pas forcément stable » a depuis
-scindé cette variante en `Wrapper { stable }` : la stabilité y était encore
-soudée au timing, ce que la phrase précédente prétendait justement éviter.)
-
-**Ce qui en fait un contrat et non une supposition.** ADR-034 §2 est explicite :
-faire descendre une ligne de ⊤ vers `Handler` est la seule direction qui peut
-*perdre* un constat, donc elle n'est permise que là où le timing est un contrat.
-`handleSubmit` comme nom nu est une supposition ; `handleSubmit` comme membre
-d'une valeur rendue par `useForm()` importé de `react-hook-form` est un contrat.
-Cette provenance vient de l'entrée précédente : sans les formes, il n'y avait
-rien à quoi rattacher la revendication.
-
-**Le contrôle d'échappement est l'autre moitié de la soundness.** Le contrat dit
-que l'emballeur n'exécutera pas le rappel ; il ne dit rien de ce que le composant
-fait du gestionnaire qu'il reçoit. `const submit = handleSubmit(cb); submit();`
-exécute bien `cb` pendant le rendu, et l'avertissement ⊤ avait raison. Une
-orthographe est donc abandonnée quand un nom lié à son appel est lui-même appelé
-dans le corps parcouru, ou quand l'appel est invoqué sur place
-(`handleSubmit(cb)()`). Restreindre le contrôle au corps parcouru n'est pas un
-raccourci : un effet qui appelle `submit()` est une autre phase, ce qui est
-précisément la question.
-
-Un nom déstructuré se résout par la chasse aux liaisons partagée, dont la barre
-de certitude porte le dernier cas : un nom lié plus d'une fois — deux
-formulaires inlinés dans un même corps de rendu — ne résout rien, donc la marche
-ne peut pas dire de quel objet il s'agit et garde ⊤. C'est un refus, pas un
-oubli : une première version qui filtrait les `let` à la main l'aurait
-revendiqué à tort.
-
-**Corpus : 1 332 → 1 314 emplacements, 18 retirés, aucun ajouté** — 16
-`setter-in-render` et 2 `cross-setter-in-render`, tous relus à la source, dont
-`onSubmit={form.handleSubmit(onSubmit)}` dans shadcn-admin et le
-`const submit = handleSubmit(…)` de twenty, où `submit` ne va qu'en JSX.
-
-**Non couvert**, et laissé ⊤ : les 16 restants. Neuf sont le `form.onSubmit(cb)`
-et le `form.watch(path, cb)` de `@mantine/form` — une autre bibliothèque, sans
-table ; un est un hook local (`useTwoFactorAuthenticationForm`) ; les autres
-sont les noms liés deux fois ci-dessus.
+The timing half follows below. It rests entirely on the provenance this change
+makes available.
 
 ---
 
-## 2026-09-03 — un emballeur n'est pas forcément stable
+## 2026-09-03: a wrapper does not run its argument
 
-*Suite de #94. La table `@mantine/form`, et le défaut qu'elle a révélé.*
+*#94, the "timing" half.*
 
-Les neuf `setter-in-render` restants de l'entrée précédente étaient
-`<form onSubmit={form.onSubmit(handleSubmit)}>`. Même forme que
-`handleSubmit(cb)` chez react-hook-form, donc a priori une ligne de table à
-ajouter. Mais mantine construit `onSubmit` ainsi :
+`<form onSubmit={form.handleSubmit(onSubmit)}>` left 34 `setter-in-render`
+warnings of class ⊤. The walk saw an opaque call receiving a function that writes
+state, and ⊤ includes the render pass: sound, and noisy.
+
+**The claim.** `handleSubmit(cb)` **returns** a handler; it does not call `cb`.
+That is a statement about *timing*, not about what a value is worth, so it
+travels on its own `SummaryValue::StableWrapper` variant rather than on the
+value, which is identical to `StableRef`. (The "a wrapper is not necessarily
+stable" entry below has since split that variant into `Wrapper { stable }`:
+stability was still welded to timing there, which is exactly what the previous
+sentence claimed to avoid.)
+
+**What makes it a contract rather than a guess.** ADR-034 §2 is explicit: moving
+a row down from ⊤ to `Handler` is the only direction that can *lose* a finding,
+so it is permitted only where timing is a contract. `handleSubmit` as a bare name
+is a guess; `handleSubmit` as a member of a value returned by a `useForm()`
+imported from `react-hook-form` is a contract. That provenance comes from the
+previous entry: without the shapes, there was nothing to attach the claim to.
+
+**The escape check is the other half of soundness.** The contract says the
+wrapper will not run the callback; it says nothing about what the component does
+with the handler it receives. `const submit = handleSubmit(cb); submit();` really
+does run `cb` during render, and the ⊤ warning was right. A spelling is therefore
+abandoned when a name bound to its call is itself called in the walked body, or
+when the call is invoked in place (`handleSubmit(cb)()`). Restricting the check to
+the walked body is not a shortcut: an effect calling `submit()` is a different
+phase, which is precisely the question.
+
+A destructured name resolves through the shared binding chase, whose certainty
+bar carries the last case: a name bound more than once, two forms inlined into
+one render body, resolves nothing, so the walk cannot say which object it is and
+keeps ⊤. That is a refusal, not an oversight: an early version filtering `let`
+bindings by hand would have claimed it wrongly.
+
+**Corpus: 1,332 → 1,314 locations, 18 removed, none added.** Sixteen
+`setter-in-render` and two `cross-setter-in-render`, all re-read at the source,
+including `onSubmit={form.handleSubmit(onSubmit)}` in shadcn-admin and twenty's
+`const submit = handleSubmit(…)`, where `submit` only goes into JSX.
+
+**Not covered**, and left ⊤: the remaining 16. Nine are `@mantine/form`'s
+`form.onSubmit(cb)` and `form.watch(path, cb)`, a different library with no
+table; one is a local hook (`useTwoFactorAuthenticationForm`); the rest are the
+twice-bound names above.
+
+---
+
+## 2026-09-03: a wrapper is not necessarily stable
+
+*Follow-up to #94. The `@mantine/form` table, and the defect it revealed.*
+
+The nine remaining `setter-in-render` findings from the previous entry were
+`<form onSubmit={form.onSubmit(handleSubmit)}>`. The same shape as
+react-hook-form's `handleSubmit(cb)`, so on the face of it one table line to add.
+But mantine builds `onSubmit` like this:
 
 ```js
 const onSubmit = (handleSubmit, handleValidationFailure) => (event) => { … };
 ```
 
-Une flèche nue dans le corps du hook : **une fonction neuve à chaque rendu.**
-`handleSubmit` chez react-hook-form est adossé à un `useCallback`. Les deux
-emballent, un seul est stable.
+A bare arrow in the hook's body: **a new function on every render.**
+react-hook-form's `handleSubmit` is backed by a `useCallback`. Both wrap, only
+one is stable.
 
-**Le défaut.** `SummaryValue::StableWrapper` soudait les deux affirmations, et
-son propre commentaire disait pourtant que le timing « est une affirmation
-différente sur une chose différente et ne peut donc pas voyager sur la valeur ».
-Écrire l'entrée mantine avec cette variante aurait crédité `form.onSubmit` d'une
-stabilité que personne ne promet — un faux négatif pour toute liste de deps qui
-le contient. La variante devient `Wrapper { stable: bool }` : le type dit
-maintenant ce que le commentaire disait déjà.
+**The defect.** `SummaryValue::StableWrapper` welded the two statements together,
+while its own comment said timing "is a different statement about a different
+thing and therefore cannot travel on the value". Writing the mantine entry with
+that variant would have credited `form.onSubmit` with a stability nobody
+promises, a false negative for any deps list containing it. The variant becomes
+`Wrapper { stable: bool }`: the type now says what the comment already said.
 
-**La table.** Une seule ligne, `("onSubmit", Wrapper { stable: false })`. Rien
-d'autre n'est listé : les autres membres de mantine sont des `useCallback` sur
-des deps qui ne sont pas stables non plus (`setValues` sur `[onValuesChange]`,
-un rappel utilisateur ; `getValues` sur `[refValues.current]`), ce qui n'est pas
-une garantie d'identité documentée. Un membre non listé reste ⊤. Les hooks de
-contexte que produit `createFormContext()` portent un nom choisi par
-l'utilisateur et ne peuvent donc pas être indexés par (paquet, nom) du tout.
+**The table.** One line, `("onSubmit", Wrapper { stable: false })`. Nothing else
+is listed: mantine's other members are `useCallback`s over deps that are not
+stable either (`setValues` over `[onValuesChange]`, a user callback; `getValues`
+over `[refValues.current]`), which is not a documented identity guarantee. An
+unlisted member stays ⊤. The context hooks `createFormContext()` produces carry a
+user-chosen name and therefore cannot be indexed by (package, name) at all.
 
-**La preuve que la scission est réelle** : basculer `stable` à `true` fait
-rougir exactement le test de stabilité et aucun autre.
+**The proof that the split is real**: flipping `stable` to `true` turns exactly
+the stability test red and no other.
 
-**Corpus : 1 325 → 1 325, aucun changement** — et c'est le résultat, pas un
-échec de mesure. La table est correcte : sur un fichier isolé, et sur le
-sous-arbre `@docs/demos` analysé seul, elle retire les deux sites
-`form.onSubmit(handleSubmit)` et laisse exactement les trois
-`form.watch(path, cb)`, qui sont des abonnements et ne sont délibérément pas
-dans la table.
+**Corpus: 1,325 → 1,325, no change**, and that is the result rather than a
+measurement failure. The table is correct: on an isolated file, and on the
+`@docs/demos` subtree analysed alone, it removes the two `form.onSubmit(handleSubmit)`
+sites and leaves exactly the three `form.watch(path, cb)` calls, which are
+subscriptions and are deliberately not in the table.
 
-Ce qui l'annule sur le corpus : `test-repo/mantine` contient
-`packages/@mantine/form/src/use-form.ts`. L'analyseur résout l'import vers cette
-source réelle et l'inline, et **une source inlinée prime sur un résumé de
-registre** — à raison. Il reste alors
-[#57](https://github.com/rboudrouss/reactant-analyzer/issues/57) : le `onSubmit`
-inliné renvoie un `FnLit` dont le site d'appel reste opaque, donc le timing
-redevient inconnu. Une bibliothèque dont la source se trouve dans l'arbre
-analysé est ainsi *moins* bien analysée qu'une consommée depuis `node_modules`,
-et aucune table ne peut contourner ça.
+What cancels it on the corpus: `test-repo/mantine` contains
+`packages/@mantine/form/src/use-form.ts`. The analyzer resolves the import to
+that real source and inlines it, and **an inlined source outranks a registry
+summary**, rightly. That leaves
+[#57](https://github.com/rboudrouss/reactant-analyzer/issues/57): the inlined
+`onSubmit` returns a `FnLit` whose call site stays opaque, so the timing becomes
+unknown again. A library whose source happens to sit in the analysed tree is thus
+*less* well analysed than one consumed from `node_modules`, and no table can work
+around that.
 
 ---
 
-## 2026-09-03 — une lecture de membre a besoin du tas convergé
+## 2026-09-03: a member read needs the converged heap
 
-*[#135](https://github.com/rboudrouss/reactant-analyzer/issues/135). Trouvé en
-testant l'entrée précédente — un faux négatif, donc la direction interdite.*
+*[#135](https://github.com/rboudrouss/reactant-analyzer/issues/135). Found while
+testing the previous entry: a false negative, so the forbidden direction.*
 
-`always-unstable-deps` évaluait chaque dep contre un `Heap::new()` frais. Une
-lecture de membre ne se résout qu'à travers le tas — `eval_field_access` suit le
-`Loc` jusqu'à `HeapValue::Obj` — donc avec une amorce vide elle répondait ⊤, et
-la règle lit ⊤ comme du silence, par construction et à raison.
+`always-unstable-deps` evaluated each dep against a fresh `Heap::new()`. A member
+read only resolves through the heap, since `eval_field_access` follows the `Loc`
+to a `HeapValue::Obj`, so with an empty seed it answered ⊤, and the rule reads ⊤
+as silence, by construction and rightly.
 
 ```jsx
 const obj = { f: () => {} };
-useEffect(() => {}, [obj.f]);   // silencieux : `obj.f` est neuf à chaque rendu
+useEffect(() => {}, [obj.f]);   // silent: `obj.f` is new every render
 ```
 
-**Ce n'était pas une règle.** `ConvergedEval::eval_in` prenait le tas en
-argument, sur la théorie qu'une amorce vide et une amorce convergée étaient deux
-choix légitimes ; quatre de ses six appelants prenaient le vide.
-`redundant-set-state` et `unnecessary-rerender` se gardent sur `is_stable()`,
-que ⊤ échoue aussi — même famille, mêmes constats manqués.
+**This was not one rule.** `ConvergedEval::eval_in` took the heap as an argument,
+on the theory that an empty seed and a converged seed were two legitimate
+choices; four of its six callers took the empty one. `redundant-set-state` and
+`unnecessary-rerender` guard on `is_stable()`, which ⊤ also fails: same family,
+same missed findings.
 
-**Le correctif est central, pas par règle.** `eval_in` amorce désormais
-`self.heap.clone()` et le paramètre disparaît : il n'y a plus de choix par site
-à se tromper. Un site qui évalue vraiment contre des stores *vides* appelle la
-primitive `eval_in_stores`, et ce paquet-là n'a pas de moitié convergée avec
-laquelle être incohérent.
+**The fix is central, not per rule.** `eval_in` now seeds `self.heap.clone()` and
+the parameter disappears: there is no longer a per-site choice to get wrong. A
+site that really does evaluate against *empty* stores calls the `eval_in_stores`
+primitive, and that bundle has no converged half to be inconsistent with.
 
-**Pourquoi c'était invisible jusqu'ici.** Le tas convergé ne vaut la peine
-d'être lu que depuis peu : #88 a donné aux littéraux d'objet une carte par
-membre, et #134 a fait qu'un site d'allocation identifie *un* site d'allocation.
-Avant cela, une lecture de membre pouvait répondre depuis le mauvais objet.
+**Why this was invisible until now.** The converged heap has only recently been
+worth reading: #88 gave object literals a per-member map, and #134 made an
+allocation site identify *one* allocation site. Before that, a member read could
+answer from the wrong object.
 
-`is_unstable_reference_only()` est un prédicat de preuve : le changement ne peut
-que remplacer ⊤ par une valeur prouvée.
+`is_unstable_reference_only()` is a proof predicate: the change can only replace
+⊤ with a proven value.
 
-**Corpus : 1 325 → 1 325, aucun changement** — 0 retiré, 0 ajouté, vérifié des
-deux côtés et pas seulement sur le total. Le faux négatif est réel (test unitaire
-et *gate-by-removal* : remettre `Heap::new()` fait rougir exactement le test de
-la dep-membre), il ne se produit simplement pas dans ces 14 dépôts. C'est un
-résultat, pas un échec : une correction de soundness se justifie par ce qu'elle
-rend impossible, pas par ce qu'elle déplace aujourd'hui.
+**Corpus: 1,325 → 1,325, no change.** Zero removed, zero added, verified on both
+sides and not only on the total. The false negative is real (unit test plus
+*gate-by-removal*: putting `Heap::new()` back turns exactly the member-dep test
+red), it simply does not occur in these 14 repositories. That is a result, not a
+failure: a soundness correction is justified by what it makes impossible, not by
+what it moves today.
 
-Durée inchangée : 827 s avant, 807 s après. La première version amorçait le tas
-convergé *à chaque appel* au lieu d'une fois par composant ; l'évaluateur
-[`Eval`](../src/rules/helpers/mod.rs) corrige cette forme, mais aucune des deux
-n'était mesurable (dub : 75 s / 74 s / 71 s).
+Runtime unchanged: 827s before, 807s after. The first version seeded the
+converged heap *on every call* instead of once per component; the
+[`Eval`](../src/rules/helpers/mod.rs) evaluator fixes that shape, but neither
+version was measurable (dub: 75s / 74s / 71s).
 
 ---
 
-## 2026-09-03 — les écrivains d'un slot se lisent dans la relation
+## 2026-09-03: a slot's writers are read from the relation
 
 *[#92](https://github.com/rboudrouss/reactant-analyzer/issues/92).*
 
-`derived-state` et `redundant-set-state` affirment tous deux « rien d'autre
-n'écrit ce slot », et tous deux répondaient en parcourant deux endroits : le CFG
-de rendu, et les corps des *autres* effets. Ce ne sont pas les endroits où
-vivent les écrivains manqués — un gestionnaire lié à une prop JSX, un corps de
-`useCallback`, une écriture dans le `.then()` que l'effet a lancé.
+`derived-state` and `redundant-set-state` both assert "nothing else writes this
+slot", and both answered by walking two places: the render CFG, and the bodies of
+the *other* effects. Those are not where the missed writers live: a handler bound
+to a JSX prop, a `useCallback` body, a write inside the `.then()` the effect
+launched.
 
-**La relation qui sait déjà** est sur `AnalysisResult`. `slot_writers` porte une
-région par ligne — `Render | Effect | Memo | Callback | Handler` — donc les
-trois classes que l'issue nomme y sont *déjà* enregistrées ; les deux règles ne
-posaient simplement pas la question. `slot_written_outside` la pose.
+**The relation that already knows** is on `AnalysisResult`. `slot_writers`
+carries one region per row, `Render | Effect | Memo | Callback | Handler`, so the
+three classes the issue names are *already* recorded there; the two rules simply
+were not asking. `slot_written_outside` asks.
 
-**L'autre moitié**, `setter_escapes`, existait aussi — mais comme colonne privée
-de `SlotSeed`, calculée pour les seuls slots semés par une prop. D'où le fait
-que seule `frozen-initial-state` en disposait. Promue à côté de la relation,
-avec `escaping_slots()` qui répond pour n'importe quel slot : une fois le setter
-sorti du composant, l'affirmation n'est plus la nôtre à faire.
+**The other half**, `setter_escapes`, existed too, but as a private column of
+`SlotSeed`, computed only for slots seeded by a prop. Hence only
+`frozen-initial-state` had it. Promoted next to the relation, with
+`escaping_slots()` answering for any slot: once the setter has left the
+component, the assertion is no longer ours to make.
 
-Les deux faits sont *may*-typés, et c'est ici la bonne direction : les deux
-consommateurs s'en servent pour **retenir** un constat, donc sur-approximer
-coûte un avertissement au lieu d'en inventer un.
+Both facts are *may*-typed, and that is the right direction here: both consumers
+use them to **withhold** a finding, so over-approximating costs a warning instead
+of inventing one.
 
-**Deux erreurs en chemin, gardées ici parce qu'elles se reproduiraient.**
-Construire l'ensemble d'alias depuis le seul CFG de rendu fait lire
-`const setter = setB` *dans* un effet comme une évasion au lieu de la chaîne
-d'alias qu'elle est — l'exemption de la marche est `aliases.contains(var)`, donc
-l'ensemble doit être clos sur tous les corps, exactement comme le fait
-`collect_slot_writers`. Et interroger slot par slot re-parcourait chaque CFG une
-fois par slot.
+**Two mistakes along the way, kept here because they would recur.** Building the
+alias set from the render CFG alone makes `const setter = setB` *inside* an
+effect read as an escape instead of the alias chain it is. The walk's exemption
+is `aliases.contains(var)`, so the set must be closed over every body, exactly as
+`collect_slot_writers` does. And querying slot by slot re-walked each CFG once per
+slot.
 
-**Corpus : 1 325 → 1 314, 11 retirés, aucun ajouté**, tous relus à la source.
-`derived-state` 3 → 0, `redundant-set-state` 12 → 4. Ce sont les formes que
-l'issue prédisait, plus deux vérifiées à la main : dub `main-nav.tsx:59`, où
-`setIsOpen` est à la fois écrit par un gestionnaire et passé dans
-`SideNavContext.Provider`, et twenty `use-app-preview-experience.ts:40`, qui a
-quatre autres écrivains.
+**Corpus: 1,325 → 1,314, 11 removed, none added**, all re-read at the source.
+`derived-state` 3 → 0, `redundant-set-state` 12 → 4. These are the shapes the
+issue predicted, plus two checked by hand: dub `main-nav.tsx:59`, where `setIsOpen`
+is both written by a handler and passed into `SideNavContext.Provider`, and twenty
+`use-app-preview-experience.ts:40`, which has four other writers.
 
 ---
 
-## 2026-09-03 — un contrat de tuple est indexé par position
+## 2026-09-03: a tuple contract is indexed by position
 
 *[#37](https://github.com/rboudrouss/reactant-analyzer/issues/37).*
 
-`SummaryRegistry` ne rendait qu'**une** valeur par hook, donc un hook qui renvoie
-un tuple ne pouvait pas exposer de créneau stable. jotai
-`useAtom(a) → [value, setValue]` : `missing-deps` signalait `setValue`, que la
-bibliothèque documente pourtant comme stable. Dans le corpus, l'auteur
-d'excalidraw a désactivé exactement cet avertissement à la main
-(`app-jotai.ts:33`, `// eslint-disable-next-line react-hooks/exhaustive-deps`).
+`SummaryRegistry` returned only **one** value per hook, so a hook returning a
+tuple could not expose a stable slot. jotai's
+`useAtom(a) → [value, setValue]`: `missing-deps` reported `setValue`, which the
+library documents as stable. In the corpus, excalidraw's author disabled exactly
+that warning by hand (`app-jotai.ts:33`,
+`// eslint-disable-next-line react-hooks/exhaustive-deps`).
 
-**La cause était plus générale que la table.** Le moteur évaluait *toute*
-`IndexAccess` à ⊤, sans condition. La déstructuration de tableau se ramène à
-`__arr[0]` / `__arr[1]`, donc aucun contrat par position n'était atteignable,
-quelle que soit la table écrite.
+**The cause was more general than the table.** The engine evaluated *every*
+`IndexAccess` to ⊤, unconditionally. Array destructuring reduces to `__arr[0]`
+and `__arr[1]`, so no per-position contract was reachable, whatever table was
+written.
 
-**La revendication.** Un index **constant** est une lecture de membre, et le tas
-y répond comme il répond à un membre nommé — c'est la même carte par membre que
-#88 a donnée aux littéraux d'objet et que #94 réutilise pour les résumés. Un
-index non constant reste ⊤ : ce que dénote `xs[i]` est la question de
-[#76](https://github.com/rboudrouss/reactant-analyzer/issues/76), pas celle-ci.
+**The claim.** A **constant** index is a member read, and the heap answers it as
+it answers a named member. This is the same per-member map #88 gave object
+literals and #94 reuses for summaries. A non-constant index stays ⊤: what `xs[i]`
+denotes is [#76](https://github.com/rboudrouss/reactant-analyzer/issues/76)'s
+question, not this one.
 
-Une fois cela fait, la table est une ligne : `("1", StableRef)`. La position 0
-est délibérément absente — changer est ce à quoi sert un atome.
+Once that is done, the table is one line: `("1", StableRef)`. Position 0 is
+deliberately absent, since changing is what an atom is for.
 
-**Les trois directions négatives sont testées** : la position 0 tire toujours,
-une position que la table ne nomme pas tire toujours, et un élément de tableau
-ordinaire tire toujours.
+**The three negative directions are tested**: position 0 still fires, a position
+the table does not name still fires, and an ordinary array element still fires.
 
-**Corpus : 1 314 → 1 314, aucun changement** — le troisième zéro de la journée,
-et pour une troisième raison. Le mécanisme est prouvé (test unitaire, plus un
-repro synthétique de la forme exacte d'excalidraw, qui tire avant et se tait
-après). Ce que le corpus n'atteint pas :
+**Corpus: 1,314 → 1,314, no change**, the third zero of the day and for a third
+reason. The mechanism is proven (unit test, plus a synthetic repro of excalidraw's
+exact shape that fires before and goes quiet after). What the corpus does not
+reach:
 
-- les deux seuls sites qui déstructurent `useAtom` sont dans
-  `excalidraw/excalidraw-app` — 37 fichiers, 18 composants analysés, **zéro
-  constat au total**, avec l'avertissement « no tsconfig `paths` found » : les
-  alias `@excalidraw/…` d'excalidraw sont déclarés dans la config vite, que
-  l'analyseur ne lit pas
-  ([#47](https://github.com/rboudrouss/reactant-analyzer/issues/47)) ;
-- novel n'utilise que `useAtomValue` et `useSetAtom` dans des composants qui ne
-  produisent rien de toute façon.
+- the only two sites destructuring `useAtom` are in `excalidraw/excalidraw-app`,
+  37 files, 18 components analysed, **zero findings in total**, with the "no
+  tsconfig `paths` found" warning: excalidraw's `@excalidraw/…` aliases are
+  declared in the vite config, which the analyzer does not read
+  ([#47](https://github.com/rboudrouss/reactant-analyzer/issues/47));
+- novel only uses `useAtomValue` and `useSetAtom`, in components that produce
+  nothing anyway.
 
-La moitié générale — l'index constant — vaut indépendamment de jotai : c'est le
-seul chemin par lequel un contrat par position peut exister, et `useTransition`
-/ `useOptimistic` de React attendent la même mécanique
-([#27](https://github.com/rboudrouss/reactant-analyzer/issues/27)). Elles n'ont
-délibérément **pas** de table ici : je n'ai pas pu vérifier ce que React
-documente sur l'identité de `startTransition`, et le précédent `use-debounce`
-dit de ne pas écrire une revendication qu'on n'a pas vérifiée.
+The general half, the constant index, holds independently of jotai: it is the
+only path by which a per-position contract can exist, and React's `useTransition`
+and `useOptimistic` need the same mechanics
+([#27](https://github.com/rboudrouss/reactant-analyzer/issues/27)). They
+deliberately have **no** table here: I could not verify what React documents
+about `startTransition`'s identity, and the `use-debounce` precedent says not to
+write a claim you have not checked.
 
 ---
+## Table correction (2026-09-03)
 
-## Correction du tableau (2026-09-03)
+The figures recorded for the 2026-09-03 lines **do not reproduce**. They have
+been re-measured and replaced. This section keeps what was recorded, what was
+measured, and what remains unexplained: erasing the gap by rewriting the column
+would do exactly what this log exists to prevent.
 
-Les chiffres inscrits pour les lignes du 2026-09-03 **ne se reproduisent pas**.
-Ils ont été remesurés et remplacés. Cette section garde ce qui a été inscrit,
-ce qui a été mesuré, et ce qui reste inexpliqué — effacer l'écart en réécrivant
-la colonne ferait exactement ce que ce journal existe pour empêcher.
+### What is established
 
-### Ce qui est établi
+**The analysis is deterministic.** Four runs of a frozen binary on one
+repository, two on the whole corpus: bit-identical JSON files.
 
-**L'analyse est déterministe.** Quatre exécutions d'un binaire gelé sur un
-dépôt, deux sur le corpus entier : fichiers JSON identiques au bit près.
+**Every measurement in this correction sees the same corpus**, 34,747 files and
+14,016 components, across all eight runs. The chain is therefore consistent with
+itself.
 
-**Toutes les mesures de cette correction voient le même corpus** — 34 747
-fichiers, 14 016 composants, sur les huit exécutions. La chaîne est donc
-cohérente avec elle-même.
+**Each step's binary was identified by behavioural probe**, not by timestamp: a
+`handleSubmit` case for the timing half, a `const { setValue } = useForm()` case
+for the values half. The first labelling, done by timestamp, was wrong, which
+cost one useless measurement between two binaries that both already carried the
+timing half.
 
-**Le binaire de chaque étape a été identifié par sonde comportementale**, pas
-par horodatage : un cas `handleSubmit` pour la moitié timing, un cas
-`const { setValue } = useForm()` pour la moitié valeurs. Le premier étiquetage,
-fait aux horodatages, était faux — d'où une mesure inutile entre deux binaires
-qui portaient déjà tous deux la moitié timing.
+### Recorded against measured
 
-### Inscrit contre mesuré
-
-| étape | inscrit | mesuré |
+| step | recorded | measured |
 |---|---:|---:|
-| avant #90 | 1 343 | **1 348** |
-| #90 — un membre n'est pas le slot | 1 340 (−3) | **1 345 (−3)** — delta juste |
-| #134 — l'identité d'un site d'allocation | 1 348 (**+8** : 6 retirés, 14 ajoutés) | **1 334 (−11** : 26 retirés, 15 ajoutés) |
-| #94 — moitié valeurs | 1 332 (−16) | **1 326 (−8)** |
-| #94 — moitié timing | 1 314 (−18) | **1 325 (−1)** |
+| before #90 | 1,343 | **1,348** |
+| #90, a member is not the slot | 1,340 (−3) | **1,345 (−3)**, delta correct |
+| #134, the identity of an allocation site | 1,348 (**+8**: 6 removed, 14 added) | **1,334 (−11**: 26 removed, 15 added) |
+| #94, values half | 1,332 (−16) | **1,326 (−8)** |
+| #94, timing half | 1,314 (−18) | **1,325 (−1)** |
 
-### Ce qui reste inexpliqué
+### What remains unexplained
 
-Les **deltas** sont faux, pas seulement les points d'arrivée. L'hypothèse
-naturelle — des retraits comptés en lignes JSON pendant que les bornes étaient
-comptées en emplacements — a été testée et **ne tient pas** : lignes et
-emplacements donnent le même nombre (8 et 1). Aucune variante de clef de
-comptage ne reproduit les chiffres inscrits.
+The **deltas** are wrong, not only the endpoints. The natural hypothesis, that
+removals were counted in JSON rows while the bounds were counted in locations,
+was tested and **does not hold**: rows and locations give the same number (8 and
+1). No variant of the counting key reproduces the recorded figures.
 
-Un indice sans conclusion : l'en-tête de ce document annonçait 34 730 fichiers,
-17 de moins que ce que rend aujourd'hui `files_analyzed`. Mais `test-repo/` ne
-contient rien de postérieur au 2026-09-02, donc rien ne permet d'affirmer que
-les exécutions d'alors voyaient un autre corpus.
+One clue without a conclusion: this document's header announced 34,730 files, 17
+fewer than `files_analyzed` returns today. But `test-repo/` contains nothing
+dated after 2026-09-02, so there is no basis for claiming the runs of that day
+saw a different corpus.
 
-### Le motif que cela dessine
+### The pattern this draws
 
-Le delta de **#90 est exact** (−3 des deux côtés) : à ce moment-là la mesure
-était juste, et la colonne absolue portait déjà un écart de +5 hérité du
-2026-09-02. Ce qui s'est cassé ensuite est le comptage des **retraits** :
+**#90's delta is exact** (−3 on both sides): at that point the measurement was
+right, and the absolute column already carried a +5 gap inherited from
+2026-09-02. What broke afterwards is the counting of **removals**:
 
-- #134 : 15 ajouts mesurés contre 14 inscrits — presque juste. Mais 26 retraits
-  mesurés contre 6 inscrits, et l'entrée nomme précisément une famille (les
-  `$errors.<membre>` de mantine). L'explication qui colle : la famille relue à
-  la main a été prise pour le total. Le signe du delta s'en est trouvé inversé.
-- #94 : même forme, sans que les chiffres se reconstituent pour autant. Les
-  deux moitiés valent −9 emplacements ensemble, pas −34.
+- #134: 15 additions measured against 14 recorded, nearly right. But 26 removals
+  measured against 6 recorded, and the entry names one family precisely
+  (mantine's `$errors.<member>`). The explanation that fits: the family re-read
+  by hand was taken for the total. The delta's sign flipped as a result.
+- #94: the same shape, without the figures reconstructing themselves. The two
+  halves are worth −9 locations together, not −34.
 
-Compter ce qu'on a relu n'est pas compter ce qui a changé. C'est la même erreur
-que celle du point d'arrivée soustrait, à l'autre bout du calcul.
+Counting what you re-read is not counting what changed. It is the same mistake as
+the subtracted endpoint, at the other end of the calculation.
 
-### Ce que cela ne remet pas en cause
+### What this does not call into question
 
-**La direction de chaque correction.** Chacune est tenue par un test de
-régression *gated* — désactiver le correctif fait rougir exactement ce test — et
-chaque retrait a été relu à la source. Ce qui était faux est la **taille**
-annoncée, pas le sens. Les deux moitiés de #94 valent −9 emplacements sur ce
-corpus, pas −34.
+**The direction of each correction.** Each is held by a *gated* regression test,
+where disabling the fix turns exactly that test red, and every removal was
+re-read at the source. What was wrong is the announced **size**, not the sign.
+The two halves of #94 are worth −9 locations on this corpus, not −34.
 
-### Les lignes du 2026-09-02
+### The 2026-09-02 lines
 
-Non vérifiables : aucun binaire de cette session n'a survécu. Elles sont
-laissées telles quelles et marquées, plutôt que présentées comme contrôlées.
+Not verifiable: no binary from that session survived. They are left as they are
+and marked as such, rather than presented as checked.
 
-### La règle qui évite la récidive
+### The rule that prevents a repeat
 
-[`corpus-diff.py`](../scripts/corpus-diff.py) prend deux exécutions, imprime
-`avant / après / retirés / ajoutés`, et sort en erreur si les trois ne se
-réconcilient pas. Un point d'arrivée se compte ; il ne se déduit jamais d'un
-delta.
+[`corpus-diff.py`](../scripts/corpus-diff.py) takes two runs, prints
+`before / after / removed / added`, and exits with an error if the three do not
+reconcile. An endpoint is counted; it is never deduced from a delta.
 
-Depuis [#15](https://github.com/rboudrouss/reactant-analyzer/issues/15), la
-règle n'est plus une consigne : le chiffre est dans
-[`docs/corpus-baseline.json`](corpus-baseline.json), produit par
-[`corpus-baseline.py`](../scripts/corpus-baseline.py) et jamais tapé, et le
-workflow `corpus` le rejoue à chaque push sur `main`. Le fichier porte aussi une
-empreinte du contenu — les seuls compteurs laisseraient passer autant de
-retraits que d'ajouts, ce qui est presque la forme qu'avait l'erreur — et
-l'identité du corpus, désormais épinglé commit par commit dans
-[`setup-test-repo.sh`](../scripts/setup-test-repo.sh) : une mesure prise sur des
-sources différentes n'est pas une mesure comparable, et le script refuse plutôt
-que d'annoncer un delta.
+Since [#15](https://github.com/rboudrouss/reactant-analyzer/issues/15) the rule
+is no longer an instruction: the figure lives in
+[`docs/corpus-baseline.json`](corpus-baseline.json), produced by
+[`corpus-baseline.py`](../scripts/corpus-baseline.py) and never typed, and the
+`corpus` workflow replays it on every push to `main`. The file also carries a
+digest of the content, since counters alone would let as many removals through as
+additions, which is almost the shape the error had, and the corpus identity,
+now pinned commit by commit in
+[`setup-test-repo.sh`](../scripts/setup-test-repo.sh): a measurement taken over
+different sources is not a comparable measurement, and the script refuses rather
+than announce a delta.
 
-## #4 + #5 — un hook dans un terminateur, un corps concis (2026-09-04)
+## #4 and #5: a hook in a terminator, a concise body (2026-09-04)
 
-`1 314 → 1 340` (+26 : 10 retirés, 36 ajoutés), mesuré avec
-[`corpus-diff.py`](../scripts/corpus-diff.py) sur les deux exécutions complètes.
-**La première entrée de ce journal dont le solde est positif** : les deux
-correctifs rendent visible du code qui ne l'était pas, donc ils ajoutent des
-constats plus qu'ils n'en retirent.
+`1,314 → 1,340` (+26: 10 removed, 36 added), measured with
+[`corpus-diff.py`](../scripts/corpus-diff.py) over two complete runs. **The first
+entry in this log with a positive balance**: both fixes make previously invisible
+code visible, so they add more findings than they remove.
 
-### Pourquoi une seule entrée pour deux issues
+### Why one entry for two issues
 
-#5 seul est une **régression de soundness**, et il a failli être livré tel quel.
-`Candidate` perdait le drapeau `expression` de la flèche, donc un corps concis
-se lowerait en instruction et la fonction retournait `unit`. Le corriger route
-ces corps vers `Terminator::Return` — précisément l'angle mort de #4, puisque
-`extract_hooks` ne parcourt que `block.stmts`. Résultat mesuré sur
-`const useLocal = (x) => useMystery(x)` :
+#5 alone is a **soundness regression**, and it nearly shipped as one. `Candidate`
+lost the arrow's `expression` flag, so a concise body lowered as a statement and
+the function returned `unit`. Fixing that routes those bodies to
+`Terminator::Return`, which is precisely #4's blind spot, since `extract_hooks`
+only walks `block.stmts`. Measured on `const useLocal = (x) => useMystery(x)`:
 
-| | avant | après #5 seul |
+| | before | after #5 alone |
 |---|---|---|
-| `analysis-limit` | émis | **disparu** |
-| assurances | 4 suspendues | **4 délivrées** |
+| `analysis-limit` | emitted | **gone** |
+| assurances | 4 withheld | **4 issued** |
 
-Un « je ne sais pas » honnête devenu quatre garanties non acquises : la
-direction interdite. #4 devait passer devant.
+An honest "I don't know" turned into four unearned guarantees: the forbidden
+direction. #4 had to go first.
 
-### Les retraits sont des FP, relus à la source
+### The removals are false positives, re-read at the source
 
-Le plus instructif, `useStepBar.ts:45` de twenty, enchaîne trois correctifs :
+The most instructive one, twenty's `useStepBar.ts:45`, chains three fixes:
 
 ```ts
 export const useAtomState = (state) => { return useAtom(state.atom); };   // #4
 const setStep = useCallback(..., [setStepBarInternal]);
-useEffect(() => { setStep(initialStep); }, []);   // ← `setStep` manquant, disait-on
+useEffect(() => { setStep(initialStep); }, []);   // ← `setStep` missing, we said
 ```
 
-Le hoist de #4 extrait `useAtom`, le résumé jotai ajouté pour
-[#37](https://github.com/rboudrouss/reactant-analyzer/issues/37) prouve que
-l'élément 1 du tuple est stable, donc `setStep` est stable, donc son absence des
-deps est correcte. Le constat était un vrai faux positif.
+#4's hoist extracts `useAtom`, the jotai summary added for
+[#37](https://github.com/rboudrouss/reactant-analyzer/issues/37) proves element 1
+of the tuple is stable, therefore `setStep` is stable, therefore its absence from
+the deps is correct. The finding was a genuine false positive.
 
-### Ce que les ajouts ne sont pas
+### What the additions are not
 
-**Non triés.** 25 `missing-deps`, 9 `always-unstable-deps`, 2
-`redundant-set-state`. Deux ont été relus et sont vrais (`addCartItem` de
-commerce est bien une flèche fraîche à chaque rendu ; les `setValue` de
-react-hook-form sont bien stables). Les 34 autres ne sont pas caractérisés — ils
-sont dans la direction tolérée par l'invariant du projet, pas dans la direction
-interdite, et méritent une passe de triage comme les grappes de l'`AUDIT`.
+**Untriaged.** 25 `missing-deps`, 9 `always-unstable-deps`, 2
+`redundant-set-state`. Two were re-read and are true (commerce's `addCartItem`
+really is a fresh arrow every render; react-hook-form's `setValue` really is
+stable). The other 34 are not characterized. They lie in the direction the
+project's invariant tolerates, not in the forbidden one, and they deserve a
+triage pass like the `AUDIT` clusters.
 
-### Le coût connu : 25 constats sans position
+### The known cost: 25 findings with no position
 
-`Terminator::Return` ne porte pas de span, là où `Terminator::Branch` en porte
-un. Personne n'en avait besoin tant qu'aucun hook ne sortait d'un `return`. Le
-`Stmt::Let` synthétisé par le hoist hérite donc de `span: None`, et les constats
-ancrés dessus n'ont ni ligne ni colonne — 0 avant, 25 après, sur 8 941 lignes.
+`Terminator::Return` carries no span where `Terminator::Branch` does. Nobody
+needed one while no hook came out of a `return`. The `Stmt::Let` the hoist
+synthesizes therefore inherits `span: None`, and findings anchored on it have
+neither line nor column: 0 before, 25 after, out of 8,941 rows.
 
-Ce n'est pas un défaut créé ici mais un trou de l'IR **révélé** ici, et l'échange
-est favorable : ces hooks étaient auparavant *absents*, pas mal situés. Passer de
-« silencieusement manquant » à « signalé sans ligne » va dans le bon sens. La
-correction propre est un span sur `Terminator::Return`, 40 sites de compilation,
-suivie séparément.
+This is not a defect created here but a hole in the IR **revealed** here, and the
+trade is favourable: those hooks were previously *absent*, not mislocated. Going
+from "silently missing" to "reported without a line" moves in the right
+direction. The clean fix is a span on `Terminator::Return`, 40 compilation sites,
+tracked separately.
 
-## #2 — `try`/`catch`/`finally` est du flot de contrôle (2026-09-04)
+## #2: try/catch/finally is control flow (2026-09-04)
 
-`1 340 → 1 344` (+4 : **0 retiré**, 4 ajoutés). Aucun retrait : le correctif ne
-fait qu'ouvrir du code jamais abaissé, il n'en referme aucun.
+`1,340 → 1,344` (+4: **0 removed**, 4 added). No removals: the fix only opens code
+that was never lowered, it closes none.
 
-### Les deux défauts de la même branche
+### Two defects in one branch
 
-La descente enchaînait les trois corps en ligne droite, chacun sous
-`!builder.is_terminated()`. Un `try` dont le corps retourne scelle le bloc, donc
-**le `catch` et le `finally` n'étaient pas abaissés du tout** — alors que le
-commentaire de la branche disait parcourir le `catch` « so hook extraction can
-find hooks inside catch blocks ». Et quand la garde passait, les deux corps
-étaient séquencés *inconditionnellement* après le corps du `try`, ce qui faisait
-croire au raisonnement tous-chemins qu'une écriture présente seulement dans le
-`catch` a lieu sur chaque chemin.
+The lowering chained the three bodies in a straight line, each under
+`!builder.is_terminated()`. A `try` whose body returns seals the block, so **the
+`catch` and the `finally` were not lowered at all**, even though the branch's own
+comment said it walked the `catch` "so hook extraction can find hooks inside catch
+blocks". And when the guard did pass, the two bodies were sequenced
+*unconditionally* after the `try` body, which made the all-paths reasoning believe
+a write present only in the `catch` happens on every path.
 
-Un branchement sur une condition inconnaissable — le corps peut lever ou non —
-dit les deux choses vraies à la fois : le gestionnaire est sur *un* chemin et pas
-sur tous, les deux bras convergent vers le finalizer qui est sur tous.
+A branch on an unknowable condition, since the body may or may not throw, says
+both true things at once: the handler is on *a* path and not on all of them, and
+both arms converge on the finalizer, which is on all of them.
 
-| forme | avant | après |
+| shape | before | after |
 |---|---|---|
-| `useEffect` dans un `catch` après `return` | invisible, 1 hook, `✓` | `conditional-hook` (Error) + `infinite-loop` |
-| `setN` dans un `finally` après `return` | invisible, `✓` | `setter-in-render` |
-| `setN` seulement dans le `catch` | **Error** — prétendait tous-chemins | **Warning** |
-| `setN` sans `try` (témoin) | Error | Error |
+| `useEffect` in a `catch` after `return` | invisible, 1 hook, `✓` | `conditional-hook` (Error) + `infinite-loop` |
+| `setN` in a `finally` after `return` | invisible, `✓` | `setter-in-render` |
+| `setN` only in the `catch` | **Error**, claimed all-paths | **Warning** |
+| `setN` with no `try` (control) | Error | Error |
 
-### Divergence assumée
+### An accepted divergence
 
-Un `return` dans le corps du `try` scelle son bloc, donc ce chemin n'atteint pas
-le finalizer là où JS l'exécuterait d'abord. Le finalizer reste atteignable par
-le bras qui lève, donc ses hooks et ses écritures sont trouvés ; ce qui est perdu
-est sa présence sur le chemin retournant, ce qui coûte de la force `must` (un
-Error rétrogradé en Warning) et jamais un constat.
+A `return` in the `try` body seals its block, so that path does not reach the
+finalizer where JS would run it first. The finalizer stays reachable through the
+throwing arm, so its hooks and writes are found; what is lost is its presence on
+the returning path, which costs `must` strength (an Error demoted to a Warning)
+and never a finding.
 
-### Les 4 ajouts appartiennent à une famille de FP préexistante
+### The 4 additions belong to a pre-existing FP family
 
-Tous les quatre sont `missing-deps` sur `t`, la macro Lingui de twenty, importée
-au niveau module (`import { t } from '@lingui/core/macro'`) et donc constante
-d'un rendu à l'autre : elle n'a rien à faire dans un tableau de deps.
+All four are `missing-deps` on `t`, twenty's Lingui macro, imported at module
+level (`import { t } from '@lingui/core/macro'`) and therefore constant from one
+render to the next: it has no business in a deps array.
 
-Ce n'est pas une famille créée ici. Comptée des deux côtés :
-**208 lignes `missing-deps` sur `t` avant le correctif, 212 après.** Les lectures
-de `t` en cause étaient dans des `catch` jamais abaissés ; les rendre visibles
-ajoute quatre instances d'un défaut qui existait déjà à 208.
+This is not a family created here. Counted on both sides: **208 `missing-deps`
+rows on `t` before the fix, 212 after.** The reads of `t` involved were inside
+`catch` blocks that were never lowered; making them visible adds four instances
+of a defect that already stood at 208.
 
-Non réduite à un repro minimal — un import non résolu, un appel taggé, une
-descente inter-fichiers ont chacun été essayés isolément sans déclencher le
-constat. Suivi séparément.
+Not reduced to a minimal repro. An unresolved import, a tagged call and a
+cross-file lowering were each tried in isolation without triggering the finding.
+Tracked separately.
 
-## Le corpus a été épinglé (2026-09-04) — la colonne repart de zéro
+## The corpus was pinned (2026-09-04): the column restarts
 
-Jusqu'ici [`setup-test-repo.sh`](../scripts/setup-test-repo.sh) clonait quatorze
-dépôts sur leur branche par défaut, sans commit fixé. Le corpus suivait donc les
-pushes d'autrui, et deux mesures prises à deux dates ne portaient pas sur les
-mêmes sources. Il est désormais épinglé commit par commit
+Until now [`setup-test-repo.sh`](../scripts/setup-test-repo.sh) cloned fourteen
+repositories on their default branch, with no fixed commit. The corpus therefore
+followed other people's pushes, and two measurements taken on two dates were not
+over the same sources. It is now pinned commit by commit
 ([#15](https://github.com/rboudrouss/reactant-analyzer/issues/15)).
 
-Le re-clonage a changé le contenu : **34 747 fichiers → 40 164**. Toutes les
-lignes au-dessus restent justes *telles que mesurées*, sur le corpus d'alors ;
-**aucune n'est comparable à ce qui suit**. Le même binaire `3a068ed` vaut 1 344
-sur l'ancien corpus et **1 358** sur le nouveau.
+Re-cloning changed the content: **34,747 files → 40,164**. Every line above stays
+correct *as measured*, on the corpus of the time; **none of them is comparable to
+what follows**. The same binary `3a068ed` gives 1,344 on the old corpus and
+**1,358** on the new one.
 
-Ne pas prolonger la colonne à travers cette rupture : ce serait exactement la
-faute qui a ouvert #15, un chiffre rapproché d'un autre qui ne mesure pas la
-même chose.
+Do not extend the column across this break: that would be exactly the fault that
+opened #15, one figure set next to another that does not measure the same thing.
 
-## #141 — la variable libre d'un appelé n'est pas celle de l'appelant (2026-09-04)
+## #141: a callee's free variable is not the caller's (2026-09-04)
 
-`1 358 → 1 317` (−41 : **41 retirés, 0 ajouté**), sur le corpus épinglé. Aucun
-ajout : le correctif ne fait que retirer des affirmations, il n'en produit
-aucune.
+`1,358 → 1,317` (−41: **41 removed, 0 added**), on the pinned corpus. No
+additions: the fix only removes assertions, it produces none.
 
-### Le défaut
+### The defect
 
-Le splice alpha-renommait tout ce que l'appelé *liait* — ses paramètres et ses
-`let` — et laissait ses variables libres intactes, « so they still resolve in
-the caller's scope », dit le commentaire du module. C'est l'inverse de la portée
-lexicale : en JavaScript, un nom libre d'une fonction se résout dans **son**
-scope de module, jamais dans les locales de qui l'appelle.
+The splice alpha-renamed everything the callee *bound*, its parameters and its
+`let` bindings, and left its free variables intact, "so they still resolve in the
+caller's scope", said the module comment. That is the inverse of lexical scoping:
+in JavaScript, a function's free name resolves in **its** module scope, never in
+the locals of whoever calls it.
 
-Deux témoins, tous deux réels :
+Two witnesses, both real:
 
 ```ts
-// twenty — un import, constant par construction
+// twenty: an import, constant by construction
 import { getFieldMetadataItemByIdOrThrow } from '@/object-metadata/utils/…';
 const cb = useCallback(() => { … getFieldMetadataItemByIdOrThrow({…}) }, [store]);
 
-// excalidraw — même chose sans import : une const de module
-export const saveCaretPosition = (doc) => { … };          // ligne 17
+// excalidraw: the same thing without an import, a module const
+export const saveCaretPosition = (doc) => { … };          // line 17
 const saveCaretPositionToState = useCallback(() => {
-  const position = saveCaretPosition(ownerDocument);      // ligne 78
+  const position = saveCaretPosition(ownerDocument);      // line 78
 }, […]);
-return { saveCaretPosition: saveCaretPositionToState };   // ligne 102 ← le piège
+return { saveCaretPosition: saveCaretPositionToState };   // line 102 ← the trap
 ```
 
-Le second est le plus parlant : le hook **retourne** son résultat sous le nom
-`saveCaretPosition`, donc un consommateur écrit
-`const { saveCaretPosition } = useTextEditorFocus()` et lie ce nom. L'inlining
-faisait alors capturer la fonction de module de l'appelé par la liaison du
-consommateur. Ce n'est pas une question d'imports — c'est toute liaison de
-module, et c'est pourquoi le correctif vise les variables libres en général.
+The second is the more telling: the hook **returns** its result under the name
+`saveCaretPosition`, so a consumer writes
+`const { saveCaretPosition } = useTextEditorFocus()` and binds that name. Inlining
+then made the callee's module function be captured by the consumer's binding.
+This is not a question of imports, it is any module binding, which is why the fix
+targets free variables in general.
 
-### Pourquoi seulement les collisions
+### Why only collisions
 
-Seuls les noms libres que l'appelant lie aussi sont renommés. Un nom libre que
-l'appelant ne lie pas reste celui de l'appelé, et plusieurs sont reconnus *par
-leur nom* en aval — `fetch`, `console`, un utilitaire frère que le registre
-résout. Les renommer tous aurait échangé ce faux positif contre un faux négatif,
-ce qui est la direction interdite.
+Only free names the caller also binds are renamed. A free name the caller does
+not bind stays the callee's, and several are recognized *by name* downstream:
+`fetch`, `console`, a sibling utility the registry resolves. Renaming all of them
+would have traded this false positive for a false negative, which is the
+forbidden direction.
 
-### Le piège de l'implémentation
+### The implementation trap
 
-Le premier correctif ne changeait rien : au moment du splice, un `useCallback`
-de l'appelé est déjà un `HookEntry` avec son propre CFG, et il ne reste qu'un
-marqueur dans le corps. Les noms capturables ne sont donc pas dans
-`body_cfg` du tout. La carte de renommage doit être construite sur le corps
-**et** sur les sous-corps de ses hooks — ce sont eux qui lisent `t`.
+The first fix changed nothing: at splice time, a callee's `useCallback` is already
+a `HookEntry` with its own CFG, and only a marker remains in the body. The
+capturable names are therefore not in `body_cfg` at all. The rename map must be
+built over the body **and** over its hooks' sub-bodies, since those are what read
+`t`.
 
-## #139 — le marqueur est le début de la recherche du tsconfig, pas sa fin (2026-09-04)
+## #139: the marker is where the tsconfig search starts, not where it stops (2026-09-04)
 
-`1 317 → 1 317`, **digest identique** : aucun emplacement n'a bougé, et c'est
-attendu. `reactant test-repo` désigne un arbre sans marqueur de build, donc
-`ProjectKind::Plain`, donc **aucun alias n'est chargé pour aucun dépôt** — le
-corpus entier n'exerce pas ce chemin. Ce n'est pas une limite du correctif,
-c'est une limite de l'instrument : quatorze projets ne se lancent pas comme un
-seul. La mesure qui compte est par projet.
+`1,317 → 1,317`, **identical digest**: not one location moved, and that is
+expected. `reactant test-repo` names a tree with no build marker, hence
+`ProjectKind::Plain`, hence **no aliases are loaded for any repository**, so the
+whole corpus does not exercise this path. That is not a limitation of the fix but
+a limitation of the instrument: fourteen projects do not run as one. The
+measurement that counts is per project.
 
-### Le défaut
+### The defect
 
-Depuis `56ff872` le **marqueur** est trouvé en remontant depuis le chemin donné.
-Le **tsconfig**, lui, était chargé depuis le répertoire du marqueur et pas plus
-haut. Un monorepo qui garde `vite.config.mts` dans une sous-application et la
-carte `paths` à la racine perdait donc tous ses alias.
+Since `56ff872` the **marker** is found by walking up from the given path. The
+**tsconfig**, however, was loaded from the marker's directory and no higher. A
+monorepo keeping `vite.config.mts` in a sub-application and the `paths` map at
+the root therefore lost all its aliases.
 
 ```
 test-repo/excalidraw/
   tsconfig.json          ← "paths": { "@excalidraw/common": [...], … }
   packages/
   excalidraw-app/
-    vite.config.mts      ← marqueur trouvé ici, recherche arrêtée ici
+    vite.config.mts      ← marker found here, search stopped here
 ```
 
-### La mesure, par projet
+### The measurement, per project
 
-| exécution | avant | après |
+| run | before | after |
 |---|---|---|
-| `excalidraw-app` | angle mort `unresolved-aliases` | 38 imports non lus, **nommés** |
-| `excalidraw-app` + `packages` | `unresolved-aliases`, 22 findings | **aucun angle mort**, 22 findings |
+| `excalidraw-app` | `unresolved-aliases` blind spot | 38 unread imports, **named** |
+| `excalidraw-app` + `packages` | `unresolved-aliases`, 22 findings | **no blind spot**, 22 findings |
 
-Le compte de findings ne bouge pas : les alias résolvent vers du code que les
-imports relatifs atteignaient déjà. Le gain est entier dans le canal
-d'honnêteté ouvert par #9 — 490 fichiers, 248 composants, et pour la première
-fois un rapport qui ne retient rien.
+The finding count does not move: the aliases resolve to code the relative imports
+already reached. The gain is entirely in the honesty channel #9 opened: 490 files,
+248 components, and for the first time a report that withholds nothing.
 
-### La forme du correctif
+### The shape of the fix
 
-`locate` et la recherche du tsconfig partagent maintenant un seul
-`nearest_ancestor` : même remontée, prédicat différent, comme le demandait
-l'issue. Un ancêtre qui ne déclare qu'un `baseUrl` est mis de côté au profit
-d'un ancêtre plus lointain qui a de vrais `paths` — c'est la discipline que
-`load_tsconfig_paths` applique déjà à son saut par `references` — mais il reste
-la réponse quand rien de mieux n'existe, sans quoi le correctif retirerait la
-résolution des spécificateurs nus.
+`locate` and the tsconfig search now share one `nearest_ancestor`: same walk,
+different predicate, as the issue asked. An ancestor declaring only a `baseUrl` is
+set aside in favour of a further ancestor with real `paths`, which is the
+discipline `load_tsconfig_paths` already applies to its `references` hop, but it
+remains the answer when nothing better exists, otherwise the fix would remove bare
+specifier resolution.
 
-## #137 — un répertoire est généré parce que le dépôt le dit (2026-09-04)
+## #137: a directory is generated because the repository says so (2026-09-04)
 
-`1 317 → 1 317` (**0 retiré, 0 ajouté**, digest identique) : pas un emplacement
-n'a bougé. Ce que le correctif déplace est la **couverture**, et c'est l'autre
-colonne — celle des angles morts — qui le dit.
+`1,317 → 1,317` (**0 removed, 0 added**, identical digest): not one location
+moved. What the fix moves is **coverage**, and it is the other column, the blind
+spots, that says so.
 
-### Le défaut
+### The defect
 
-`EXCLUDED_DIRS` était quatre noms filtrés à n'importe quelle profondeur. Cela
-retire la sortie de build, ce qui est voulu, mais aussi la *source des outils*
-de build et tout répertoire métier qui s'appelle `build` ou `dist`. mantine
-tient dix vrais fichiers `.ts` dans `scripts/build/`, importés depuis des
-fichiers qui, eux, étaient analysés : personne ne savait qu'ils existaient
-jusqu'à ce que la liste d'angles morts de #9 les nomme.
+`EXCLUDED_DIRS` was four names filtered at any depth. That removes build output,
+which is intended, but also build *tooling source* and any business directory
+called `build` or `dist`. mantine keeps ten real `.ts` files in `scripts/build/`,
+imported from files that were themselves analysed: nobody knew they existed until
+#9's blind-spot list named them.
 
-### La revendication
+### The claim
 
-Un dépôt déclare déjà ce qui est généré, dans le fichier que git lit. Une seule
-ligne de priorité, trois sources : la liste configurée (`--exclude-dir` /
-`excludeDirs`), sinon les `.gitignore` de l'arbre, sinon les noms en dur pour un
-arbre qui n'en a aucun. `node_modules` et `.git` passent avant les trois.
+A repository already declares what is generated, in the file git reads. One
+precedence order, three sources: the configured list (`--exclude-dir` /
+`excludeDirs`), otherwise the tree's `.gitignore` files, otherwise the hardcoded
+names for a tree with none. `node_modules` and `.git` come before all three.
 
-La liste explicite **remplace** les deux replis au lieu de s'y ajouter : c'est ce
-que veut dire « priorité », et une liste qui aurait discrètement gardé les noms
-en dur aurait rendu `dist` inatteignable.
+The explicit list **replaces** the two fallbacks instead of adding to them: that
+is what "precedence" means, and a list that had quietly kept the hardcoded names
+would have made `dist` unreachable.
 
-### La mesure
+### The measurement
 
-| | fichiers avant | après | angles morts avant | après |
+| | files before | after | blind spots before | after |
 |---|---|---|---|---|
-| mantine | 4 784 | 4 798 (+14) | `unread-imports: 3` | **aucun** |
-| chakra-ui | 2 666 | 2 671 (+5) | aucun | aucun |
-| corpus entier | 35 453 | **35 541** (+88) | `unread-imports: 3` | **aucun** |
+| mantine | 4,784 | 4,798 (+14) | `unread-imports: 3` | **none** |
+| chakra-ui | 2,666 | 2,671 (+5) | none | none |
+| whole corpus | 35,453 | **35,541** (+88) | `unread-imports: 3` | **none** |
 
-Les trois imports non lus qui ont ouvert #137 sont lus. Le corpus entier rend
-maintenant un rapport sans rien retenir, ce qu'il n'avait jamais fait.
+The three unread imports that opened #137 are read. The whole corpus now returns
+a report that withholds nothing, which it had never done.
 
-**Les +88 se comptent, ils ne se devinent pas.** Un `find -maxdepth 4` en
-donnait 19 et c'était faux de 69 : le gros du lot est
-`twenty/packages/twenty-sdk/src/cli/utilities/build`, **68 fichiers de source
-CLI** enfouis sous `src/`. C'est le témoin le plus net que le nom ne dit rien —
-et une redite de la règle qui a ouvert #15 : un point d'arrivée se compte.
+**The +88 are counted, not guessed.** A `find -maxdepth 4` gave 19 and was wrong
+by 69: most of the batch is
+`twenty/packages/twenty-sdk/src/cli/utilities/build`, **68 files of CLI source**
+buried under `src/`. It is the clearest witness that the name says nothing, and a
+restatement of the rule that opened #15: an endpoint is counted.
 
-### Ce que le correctif retire aussi
+### What the fix also removes
 
-Lire le `.gitignore` coupe dans les deux sens : il exclut désormais des
-répertoires générés que la liste de noms parcourait (`lib/`, `coverage/`, un
-`src/generated/` produit par un codegen). C'est la lecture voulue — un
-répertoire que git ne suit pas n'est pas la source de ce dépôt — et ce n'est
-jamais silencieux : tout ce qu'un fichier analysé importe atterrit nommément
-dans `unread-imports` et retient le quitus. `--exclude-dir` sert à dire autre
-chose. Sur le corpus rien n'est perdu de ce côté : les dépôts sont fraîchement
-clonés, aucune sortie de build n'existe.
+Reading the `.gitignore` cuts both ways: it now excludes generated directories the
+name list used to walk (`lib/`, `coverage/`, a codegen'd `src/generated/`). That
+is the intended reading, since a directory git does not track is not this
+repository's source, and it is never silent: anything an analysed file imports
+lands by name in `unread-imports` and withholds the clean bill. `--exclude-dir` is
+there to say something different. Nothing is lost on the corpus from that side:
+the repositories are freshly cloned and no build output exists.
 
-### Le lecteur de `.gitignore`
+### The `.gitignore` reader
 
-Un module à part, volontairement conservateur : ancrage, `!`, `*`/`**`/`?`/
-`[…]`, le fichier le plus profond l'emporte, remontée bornée à la racine du
-projet comme git se borne à son arbre de travail. Un motif qu'il ne sait pas
-lire ne filtre **rien** — sur-filtrer serait la direction interdite.
+A separate module, deliberately conservative: anchoring, `!`, `*`, `**`, `?`,
+`[…]`, deepest file wins, walking up bounded by the project root as git bounds
+itself to its working tree. A pattern it cannot read filters **nothing**, since
+over-filtering would be the forbidden direction.
 
-### L'hôte wasm devait suivre
+### The wasm host had to follow
 
-Sa marche « sur-ensemble » pré-appliquait `EXCLUDED_DIRS`, donc sous wasm le
-moteur ne pouvait jamais voir `scripts/build/` quoi qu'en dise le `.gitignore` —
-et `MemFileSystem` ne distingue pas un répertoire sauté d'un répertoire absent,
-si bien que le manque aurait été invisible au lieu d'être signalé. L'hôte
-n'élague plus que `node_modules`, `.git` et `.next` (servis en `prunedDirs`) et
-charge `.gitignore` et `package.json` dans la carte ; c'est le moteur qui
-tranche. La parité wasm ↔ natif est verte.
+Its "superset" walk pre-applied `EXCLUDED_DIRS`, so under wasm the engine could
+never see `scripts/build/` whatever the `.gitignore` said, and `MemFileSystem`
+does not distinguish a skipped directory from an absent one, so the gap would have
+been invisible instead of reported. The host now prunes only `node_modules`,
+`.git` and `.next` (served as `prunedDirs`) and loads `.gitignore` and
+`package.json` into the map; the engine decides. wasm-to-native parity is green.
 
-## #138 — suivre les imports d'un run restreint, derrière un drapeau (2026-09-04)
+## #138: following a narrowed run's imports, behind a flag (2026-09-04)
 
-`1 317 → 1 317` par défaut (**digest identique**, le portail passe), et
-`1 317 → 1 317` *aussi* avec `--follow-imports` : sur le corpus entier le
-drapeau suit **0 fichier**. C'est le résultat attendu et il vaut d'être écrit —
-un run qui parcourt tout le projet contient déjà ses propres imports. Le
-problème que #138 décrit n'existe que sur un run **restreint**.
+`1,317 → 1,317` by default (**identical digest**, the gate passes), and
+`1,317 → 1,317` *also* with `--follow-imports`: on the whole corpus the flag
+follows **0 files**. That is the expected result and worth writing down, since a
+run that walks the whole project already contains its own imports. The problem
+#138 describes exists only on a **narrowed** run.
 
-### La décision
+### The decision
 
-L'issue laissait le choix ouvert : suivre toujours / derrière un drapeau / pas
-du tout. Retenu : **derrière un drapeau, défaut off**, parce que nommer un
-répertoire est une façon peu coûteuse de regarder un motif à un endroit, et que
-c'est ce que l'utilisateur a demandé. Suivre les imports contredit précisément
-l'intention de qui a restreint.
+The issue left the choice open: always follow, behind a flag, or not at all.
+Chosen: **behind a flag, off by default**, because naming a directory is a cheap
+way to look at one pattern in one place, and that is what the user asked for.
+Following imports contradicts precisely the intent of whoever narrowed.
 
-Deux questions étaient confondues dans l'issue, et les séparer est ce qui rend
-le drapeau utilisable :
+Two questions were conflated in the issue, and separating them is what makes the
+flag usable:
 
-1. **L'analyse d'un fichier nommé doit-elle lire le corps de ses imports ?**
-   Oui — c'est ce qui rend la réponse juste.
-2. **Les findings des fichiers non nommés doivent-ils être rapportés ?** Non —
-   c'est une question de portée du *rapport*, pas de soundness.
+1. **Should analysing a named file read the bodies of its imports?** Yes, that is
+   what makes the answer correct.
+2. **Should findings in unnamed files be reported?** No, that is a question about
+   the *report's* scope, not about soundness.
 
-Le drapeau répond oui à la première, non à la seconde. Ce que la seconde laisse
-de côté est **compté et nommé**, comme un angle mort à l'envers : rien n'est
-inconnu, c'est connu et filtré exprès, donc ça se dit.
+The flag answers yes to the first and no to the second. What the second leaves out
+is **counted and named**, like a blind spot in reverse: nothing is unknown, it is
+known and filtered on purpose, so it is stated.
 
-### La mesure, sur un run restreint
+### The measurement, on a narrowed run
 
-`reactant check test-repo/excalidraw/excalidraw-app` :
+`reactant check test-repo/excalidraw/excalidraw-app`:
 
-| | fichiers | findings | angles morts | retenus |
+| | files | findings | blind spots | withheld |
 |---|---|---|---|---|
-| défaut | 38 | 0 | `unread-imports` | — |
-| `--follow-imports` | **440** (402 suivis) | 0 | **aucun** | **19** |
+| default | 38 | 0 | `unread-imports` | n/a |
+| `--follow-imports` | **440** (402 followed) | 0 | **none** | **19** |
 
-excalidraw-app n'a réellement aucun finding — c'est maintenant prouvé plutôt
-qu'esquivé — et le drapeau annonce 19 findings dans le code qu'il importe.
+excalidraw-app really has no findings, which is now proven rather than dodged, and
+the flag announces 19 findings in the code it imports.
 
-Suivre est plus **précis** que nommer le répertoire parent : `excalidraw-app` +
-`packages` donne 490 fichiers et 22 findings, la clôture 440 et 19. La
-différence est ce que `packages/` contient et que personne n'importe.
+Following is more **precise** than naming the parent directory: `excalidraw-app`
+plus `packages` gives 490 files and 22 findings, the closure gives 440 and 19. The
+difference is what `packages/` contains and nobody imports.
 
-### Ce que ça coûte
+### What it costs
 
-Le corpus entier : **826 s** sans, **822 s** avec — soit moins que le bruit
-entre deux exécutions de quatorze minutes. La pré-passe qui parse 35 541
-fichiers pour lire leurs imports ne pèse rien à côté du point fixe.
+The whole corpus: **826s** without, **822s** with, which is less than the noise
+between two fourteen-minute runs. The pre-pass parsing 35,541 files to read their
+imports weighs nothing next to the fixpoint.
 
-Le vrai coût n'est pas la pré-passe, c'est d'analyser des fichiers qu'on
-n'analysait pas : 38 → 440 sur excalidraw-app, plus de dix fois. **Le drapeau
-n'est pas une optimisation** : si on veut le projet, `reactant check src/` est
-la meilleure commande. Le drapeau achète un *rapport étroit sur une analyse
-juste*, pas de la vitesse. C'est écrit tel quel dans `usage.md`.
+The real cost is not the pre-pass, it is analysing files that were not being
+analysed: 38 → 440 on excalidraw-app, more than ten times as many. **The flag is
+not an optimization**: if you want the project, `reactant check src/` is the
+better command. The flag buys a *narrow report over a correct analysis*, not
+speed. It says so in `usage.md`.
 
-### Ce qu'il change vraiment
+### What it really changes
 
-Sur la forme minimale (un hook qui renvoie un objet frais, un appelant qui le
-met en dep) :
+On the minimal shape (a hook returning a fresh object, a caller putting it in a
+dep):
 
 ```
-défaut             warn missing-deps        var:setN     ← la supposition sur un hook opaque
---follow-imports   warn always-unstable-deps  sur `bag`  ← la vraie cause
+default            warn missing-deps          var:setN   ← the guess about an opaque hook
+--follow-imports   warn always-unstable-deps  on `bag`   ← the real cause
 ```
 
-Le drapeau n'ajoute pas seulement le vrai finding, il **retire un faux** :
-connaître le corps de `useThing` prouve que `setN` est un setter stable. Les
-deux findings sont ancrés dans le fichier nommé, ce qui est le cas qui
-justifiait le chantier.
+The flag does not only add the true finding, it **removes a false one**: knowing
+`useThing`'s body proves `setN` is a stable setter. Both findings are anchored in
+the named file, which is the case that justified the work.
 
-### Les deux hôtes
+### The two hosts
 
-La clôture tourne dans la vue filesystem du moteur, et sous wasm cette vue est
-la carte que l'hôte a chargée. L'hôte ne chargeait que les chemins nommés :
-`MemFileSystem` ne distingue pas « jamais chargé » de « n'existe pas », donc la
-clôture serait revenue vide en annonçant `followed 0` — faux, et silencieux.
-L'hôte élargit maintenant sa marche au projet englobant quand le drapeau est
-mis. Sortie identique au bit près entre natif et wasm.
+The closure runs in the engine's filesystem view, and under wasm that view is the
+map the host loaded. The host only loaded the named paths, and `MemFileSystem`
+does not distinguish "never loaded" from "does not exist", so the closure would
+have come back empty while announcing `followed 0`: wrong, and silent. The host
+now widens its walk to the enclosing project when the flag is set. Output is
+bit-identical between native and wasm.
 
-Au passage, `--exclude-dir` (#137) ne marchait pas du tout sous wasm :
-`npm/lib/index.js` construit son objet d'options champ par champ et le champ
-manquait. La vérification du jour comparait des *comptes*, qui coïncidaient des
-deux côtés. Comparer les fichiers nommés le montre tout de suite — comparer des
-comptes n'est pas comparer un comportement.
+Along the way, `--exclude-dir` (#137) did not work at all under wasm:
+`npm/lib/index.js` builds its options object field by field and the field was
+missing. That day's check compared *counts*, which matched on both sides.
+Comparing the named files shows it immediately: comparing counts is not comparing
+behaviour.
