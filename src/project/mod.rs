@@ -228,7 +228,7 @@ pub fn build_context(
             discovery_root,
             resolver: Box::new(TsconfigPathsResolver::new(paths, fs)),
             alias_warning: Some(format!(
-                "tsconfig declares `baseUrl` but no `paths` — bare specifiers resolve \
+                "tsconfig declares `baseUrl` but no `paths`, so bare specifiers resolve \
                  against it, but `@/...`-style aliases stay unresolved and their targets \
                  are NOT analyzed (possible false negatives). Aliases declared only in \
                  {config_name} are not read."
@@ -245,7 +245,7 @@ pub fn build_context(
             discovery_root,
             resolver: Box::new(DefaultImportResolver::new(fs)),
             alias_warning: Some(format!(
-                "no tsconfig `paths` found — aliased imports (e.g. `@/...`) stay \
+                "no tsconfig `paths` found, so aliased imports (e.g. `@/...`) stay \
                  unresolved and their targets are NOT analyzed (possible false \
                  negatives). Aliases declared only in {config_name} are not read."
             )),

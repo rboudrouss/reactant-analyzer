@@ -140,7 +140,7 @@ pub fn run_check(
         };
         let _ = writeln!(
             err,
-            "[warn] --project {flag}: no {marker} found in {} — still trying tsconfig paths",
+            "[warn] --project {flag}: no {marker} found in {}, still trying tsconfig paths",
             project_root.display()
         );
     }
@@ -232,7 +232,7 @@ pub fn run_check(
             dropped += 1;
             let _ = writeln!(
                 err,
-                "[skipped] {}: {} — the file was not analyzed",
+                "[skipped] {}: {}, the file was not analyzed",
                 e.file.display(),
                 e.message
             );

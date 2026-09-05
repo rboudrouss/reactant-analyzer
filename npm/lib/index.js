@@ -7,7 +7,7 @@ const path = require("node:path");
 const { parse, UsageError } = require("./args.js");
 const host = require("./host.js");
 
-const HELP = `reactant — static analyzer for React hook bugs (WASM build)
+const HELP = `reactant, a static analyzer for React hook bugs (WASM build)
 
 Usage:
   reactant [check] [paths…] [--info] [--show-clean] [--trace] [--verbose]

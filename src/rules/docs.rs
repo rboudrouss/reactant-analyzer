@@ -65,7 +65,7 @@ const fn doc(
 pub const RULE_DOCS: &[RuleDoc] = &[
     doc(
         "always-unstable-deps",
-        "a dep is a fresh reference every render — the deps array never matches",
+        "a dep is a fresh reference every render, so the deps array never matches",
         "React compares deps with `Object.is`. An object, array, or function \
                       literal allocated during render has a new identity every render, so a \
                       single such dep defeats the whole array: the hook re-runs every render \
@@ -83,7 +83,7 @@ pub const RULE_DOCS: &[RuleDoc] = &[
                       recursive components (recursion-cutoff), children not found in the \
                       registry (unknown-component), callback inlining past the depth cap \
                       (callback-depth-cap), or custom hooks with no source and no summary \
-                      (unknown-hook). Each site is a place where a real bug could hide — a \
+                      (unknown-hook). Each site is a place where a real bug could hide. A \
                       clean report does NOT cover these regions.",
         "const data = useVendorHook(); // hook body not in the analyzed files",
         "Not a code bug. Include the hook's source in the analyzed paths, or register a \
@@ -93,7 +93,7 @@ pub const RULE_DOCS: &[RuleDoc] = &[
         "conditional-hook",
         "hook called inside a conditional branch",
         "Hooks must be called unconditionally, in the same order, on every \
-                      render — React matches hook calls to state slots by call order. A hook \
+                      render. React matches hook calls to state slots by call order. A hook \
                       whose block does not dominate every render exit can be skipped on some \
                       path, shifting every later hook onto the wrong slot.",
         "if (visible) { const [n, setN] = useState(0); }",
@@ -102,7 +102,7 @@ pub const RULE_DOCS: &[RuleDoc] = &[
     ),
     doc(
         "cross-component-infinite-loop",
-        "child effect sets parent state — parent re-renders child, effect refires",
+        "child effect sets parent state, parent re-renders child, effect refires",
         "An effect in a child component calls a setter received as a prop, and \
                       the abstract value of the parent's state slot keeps growing across \
                       fixpoint iterations. Parent re-renders → child re-renders → effect \
@@ -119,36 +119,36 @@ pub const RULE_DOCS: &[RuleDoc] = &[
                       a parent re-render while the child is rendering. React errors with \
                       \"Cannot update a component while rendering a different component\", or \
                       loops. Error needs two proofs: the call dominates every exit, and \
-                      calling the prop provably writes — a prop that only *carries* a \
+                      calling the prop provably writes. A prop that only *carries* a \
                       captured setter into a handler warns instead.",
         "function Child({ setTotal }) { setTotal(42); return <div/>; }",
         "Move the call into a `useEffect` or an event handler.",
     ),
     doc(
         "derived-state",
-        "effect only mirrors another state — should be computed during render",
+        "effect only mirrors another state, so compute it during render",
         "A `useEffect` that unconditionally sets state B to a call-free function \
                       of state A stores derived data in state. It costs an extra render on \
                       every change of A (render with stale B, effect, render again) and can \
                       go stale.",
         "useEffect(() => setFull(first + ' ' + last), [first, last]);",
-        "Compute it during render — `const full = first + ' ' + last;` — or `useMemo` if \
+        "Compute it during render with `const full = first + ' ' + last;`, or `useMemo` if \
               it's expensive. Delete the state slot.",
     ),
     doc(
         "frozen-initial-state",
-        "useState seeded from a prop that changes — the state freezes at the first value",
+        "useState seeded from a prop that changes, so the state freezes at the first value",
         "`useState` reads its initializer on the first render only; every later \
                       render ignores it. When the initializer reads a prop and no effect keyed \
                       on that prop (and no render-time write) ever syncs the slot, the state \
-                      stays frozen at the first prop value while the prop moves on — the \
+                      stays frozen at the first prop value while the prop moves on. This is the \
                       classic \"my component doesn't update when props change\". Error when \
                       the prop is proven to be fed by another component's state that is \
                       actually written (cross-component analysis) and a mounted instance can \
                       observe the change; Warning when the prop's motion is uncertain, the \
                       setter escapes the component, or the call sites mount the component under \
                       a condition written by the feeder's own handlers; Info when \
-                      intent is declared — every seeding prop is named for seed-once \
+                      intent is declared: every seeding prop is named for seed-once \
                       (`initial*`/`default*`), the slot is never written at all (a \
                       deliberate mount-time snapshot), or every call site re-seeds the \
                       component when the prop moves (`key={seed}`, or a render guarded by \
@@ -164,7 +164,7 @@ pub const RULE_DOCS: &[RuleDoc] = &[
     ),
     doc(
         "infinite-loop",
-        "effect sets state that re-triggers the effect — state diverges",
+        "effect sets state that re-triggers the effect, and the state diverges",
         "The render → effect → setState → render cycle never stabilizes: the \
                       abstract value of the state slot required widening and the effect's \
                       write stays unbounded, the structural signature of an infinite render \
@@ -180,7 +180,7 @@ pub const RULE_DOCS: &[RuleDoc] = &[
         "lazy-init",
         "useState initializer calls a function on every render",
         "`useState(f())` evaluates `f()` on every render but uses the result \
-                      only on mount — wasted work on each subsequent render. The lazy form \
+                      only on mount, so every later render wastes the work. The lazy form \
                       `useState(() => f())` runs it once. Severity is graded by what the call \
                       does: a state-setter call is an Error (state write every render); a \
                       side-effecting/async call (`fetch`, `subscribe`, `setTimeout`) is a \
@@ -193,13 +193,13 @@ pub const RULE_DOCS: &[RuleDoc] = &[
         "missing-cleanup",
         "effect starts something long-lived and returns no teardown",
         "An effect that calls `setInterval`, `addEventListener`, `subscribe`, \
-                      `on` or `addListener` registers again every time it re-runs — on every \
+                      `on` or `addListener` registers again every time it re-runs: on every \
                       deps change, on every mount, and twice on the first mount under \
                       StrictMode. With no cleanup nothing ever unregisters, so the handlers \
                       accumulate and the ones from earlier renders keep firing against state \
                       the component no longer has. One-shot registrars (`setTimeout`, `.then`) \
                       are out of scope: they fire late rather than repeatedly, which wants an \
-                      abort flag, not a teardown. Warning only — the teardown may live in a \
+                      abort flag, not a teardown. Warning only, because the teardown may live in a \
                       helper this rule cannot see through, so it fires solely when the effect \
                       provably returns nothing at all.",
         "useEffect(() => { window.addEventListener('resize', onResize); }, []);",
@@ -211,7 +211,7 @@ pub const RULE_DOCS: &[RuleDoc] = &[
         "effect body captures a variable not listed in its deps array",
         "A `useEffect`/`useMemo`/`useCallback` body reads a non-stable free \
                       variable that is missing from the deps array. The closure keeps seeing \
-                      the value from the render when deps last matched — the classic stale \
+                      the value from the render when deps last matched. That is the classic stale \
                       closure: the hook silently works on outdated data.",
         "useEffect(() => { fetch(url); }, []); // url captured, not declared",
         "Add the captured variable to the deps array, or move it inside the effect if \
@@ -266,7 +266,7 @@ pub const RULE_DOCS: &[RuleDoc] = &[
                       `setTimeout` or a promise `.then` inside an effect closes over the \
                       variable values from the render that last ran the effect. When the \
                       effect's deps array does not cover a captured state value, the callback \
-                      keeps reading that old value after the state changes — with `[]` deps, \
+                      keeps reading that old value after the state changes. With `[]` deps, \
                       forever. When the callback also writes the slot it reads \
                       (`setN(n + 1)` in an interval), the state can never advance past its \
                       first update: every firing recomputes from the same frozen capture \
@@ -280,15 +280,15 @@ pub const RULE_DOCS: &[RuleDoc] = &[
     ),
     doc(
         "state-mutation",
-        "state or prop object mutated in place — same reference, no re-render",
+        "state or prop object mutated in place, same reference, no re-render",
         "Mutating a state object (`arr.push(x)`, `obj.f = v`) keeps its reference \
                       identity; calling the setter with that same reference makes React bail \
-                      out (`Object.is(old, new)` is true) and skip the re-render — the UI \
+                      out (`Object.is(old, new)` is true) and skip the re-render. The UI \
                       silently freezes (Error). Mutating an object received via props writes \
                       into data owned by the parent (Warning).",
         "const [items, setItems] = useState([]);\n\
                   const add = (x) => { items.push(x); setItems(items); };",
-        "Create a new reference: `setItems([...items, x])` — or for objects, \
+        "Create a new reference: `setItems([...items, x])`, or for objects \
               `setUser({ ...user, name })`. Never write through the current state value.",
     ),
     doc(
@@ -296,10 +296,10 @@ pub const RULE_DOCS: &[RuleDoc] = &[
         "mount-only effect immediately overwrites the initial state",
         "A `deps: []` effect sets a state slot to a stable constant different \
                       from its `useState` init. Every mount renders with the init value, then \
-                      immediately re-renders with the effect's value — one wasted render and \
+                      immediately re-renders with the effect's value. That is one wasted render and \
                       a visible flash, when the init could be the final value directly.",
         "const [mode, setMode] = useState('none');\nuseEffect(() => setMode('grid'), []);",
-        "Put the final value in the initializer: `useState('grid')` — or compute it \
+        "Put the final value in the initializer: `useState('grid')`, or compute it \
               lazily: `useState(() => readSetting())`.",
     ),
     doc(
@@ -308,7 +308,7 @@ pub const RULE_DOCS: &[RuleDoc] = &[
         "A `<Ctx.Provider value={…}>` whose value is allocated in the \
                       provider's own render body is a different object on every render. \
                       `useContext` compares with `Object.is`, so every consumer re-renders \
-                      whenever the providing component does — however deep the tree, and \
+                      whenever the providing component does, however deep the tree and \
                       however little actually changed. Fires only on a *proven* context \
                       (a module-level `createContext` reached through a React import) with \
                       a *proven* fresh value, and stays a Warning: the fresh reference is \
@@ -326,7 +326,7 @@ pub const RULE_DOCS: &[RuleDoc] = &[
                       Downstream checks on this slot are less precise. Often accompanies a \
                       real divergence (see infinite-loop) but is not itself a bug.",
         "useEffect(() => setN(n + 1), [n]); // n widens to [0, +∞)",
-        "Not a code bug per se — see the companion diagnostic on the same slot if any.",
+        "Not a code bug per se. See the companion diagnostic on the same slot if any.",
     ),
 ];
 

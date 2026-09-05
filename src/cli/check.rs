@@ -46,7 +46,7 @@ pub struct CheckArgs {
     pub entry: Vec<String>,
 
     /// Directory names to skip, at any depth (repeatable or comma-separated).
-    /// Replaces the default policy — the tree's .gitignore, or dist/build/.next
+    /// Replaces the default policy: the tree's .gitignore, or dist/build/.next
     /// when it has none. node_modules is always skipped.
     #[arg(long, value_delimiter = ',')]
     pub exclude_dir: Vec<String>,

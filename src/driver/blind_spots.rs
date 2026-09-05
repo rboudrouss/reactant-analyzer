@@ -48,7 +48,7 @@ impl BlindSpot {
             kind: "unparsed-files",
             count,
             detail: format!(
-                "{count} file(s) could not be parsed and were dropped — nothing in them \
+                "{count} file(s) could not be parsed and were dropped, so nothing in them \
                  was analysed"
             ),
         }
@@ -64,7 +64,7 @@ impl BlindSpot {
             count: total,
             detail: format!(
                 "{total} imported file(s) resolved outside the analysed set and were never \
-                 read — pass them on the command line to analyse them ({}{})",
+                 read. Pass them on the command line to analyse them ({}{})",
                 examples.join(", "),
                 if total > examples.len() { ", …" } else { "" }
             ),

@@ -123,7 +123,7 @@ impl Rule for LazyInit {
                 (InitEffect::PureCheap(_), true) => continue,
                 (InitEffect::Unknown, true) => Diagnostic::info(
                     "lazy-init",
-                    "this useRef is initialised by a direct function call — the call runs on \
+                    "this useRef is initialised by a direct function call. The call runs on \
                      every render but the result is only kept from the first; if it is not \
                      cheap, initialise lazily with `if (ref.current === null) ref.current = …`",
                 ),
@@ -131,13 +131,13 @@ impl Rule for LazyInit {
                     "lazy-init",
                     format!(
                         "this useRef init calls `{name}`, which has side effects, on every \
-                         render — only the first render's value is kept, so every later render \
+                         render, and only the first render's value is kept, so every later render \
                          repeats the effect (duplicate subscriptions/requests/timers); \
                          initialise lazily with `if (ref.current === null) ref.current = …`"
                     ),
                 ),
                 (InitEffect::Setter, true) => {
-                    let msg = "this useRef init calls a state setter — it runs a state write on \
+                    let msg = "this useRef init calls a state setter, so it runs a state write on \
                                every render (only the first render's value is kept); move the \
                                call into an effect or event handler";
                     match must_init_calls_setter(init, &setters) {
@@ -146,7 +146,7 @@ impl Rule for LazyInit {
                     }
                 }
                 (InitEffect::Setter, false) => {
-                    let msg = "this useState init calls a state setter — it runs a state write on \
+                    let msg = "this useState init calls a state setter, so it runs a state write on \
                                every render (the result is discarded after mount); move the call \
                                into an effect or event handler";
                     match must_init_calls_setter(init, &setters) {
@@ -160,7 +160,7 @@ impl Rule for LazyInit {
                     "lazy-init",
                     format!(
                         "this useState init calls `{name}`, which has side effects, on every \
-                         render — the result is only used on mount, so every later render \
+                         render, and the result is only used on mount, so every later render \
                          repeats the effect (duplicate subscriptions/requests/timers, not \
                          just wasted work); wrap as `useState(() => …)`"
                     ),
@@ -174,8 +174,8 @@ impl Rule for LazyInit {
                 ),
                 (InitEffect::Unknown, false) => Diagnostic::warn(
                     "lazy-init",
-                    "this useState is initialised by a direct function call \
-                     the call runs on every render but the result is only used on mount; \
+                    "this useState is initialised by a direct function call. \
+                     The call runs on every render but the result is only used on mount; \
                      wrap as `useState(() => …)` to defer it",
                 ),
             }

@@ -929,7 +929,7 @@ impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for PVal<T> {
         }
         T::deserialize(v).map(PVal::Value).map_err(|e| {
             D::Error::custom(format!(
-                "expected a value or {{\"$param\": \"<name>\"}} — {e}"
+                "expected a value or {{\"$param\": \"<name>\"}}: {e}"
             ))
         })
     }

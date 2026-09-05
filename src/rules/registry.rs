@@ -85,19 +85,19 @@ impl std::fmt::Display for RegistryError {
         match self {
             RegistryError::UnknownRule(n) => write!(
                 f,
-                "unknown rule `{n}` — run `reactant rules` for the list of valid names"
+                "unknown rule `{n}`. Run `reactant rules` for the list of valid names"
             ),
             RegistryError::OptionsOnNative(n) => {
                 write!(f, "rule `{n}` is built-in and declares no options")
             }
             RegistryError::OptionsOnDiagnosticOnly(n) => write!(
                 f,
-                "`{n}` is a diagnostic name, not a rule id — options must target the rule"
+                "`{n}` is a diagnostic name, not a rule id. Options must target the rule"
             ),
             RegistryError::DuplicateName(n) => write!(f, "rule `{n}` is already registered"),
             RegistryError::BareDynamicName(n) => write!(
                 f,
-                "custom rule `{n}` must be namespaced `pack/rule` — bare names are reserved \
+                "custom rule `{n}` must be namespaced `pack/rule`. Bare names are reserved \
                  for built-in rules"
             ),
         }

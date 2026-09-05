@@ -406,7 +406,7 @@ impl<'a> RuleCtx<'a> {
                 let mut notes = Vec::new();
                 if let Some((_, guard_span)) = guard_site(cfg, call.block_id) {
                     let step = Step::Branch {
-                        desc: "a condition evaluated here — some render paths skip the hook"
+                        desc: "a condition evaluated here, so some render paths skip the hook"
                             .to_string(),
                     };
                     notes.push(Note {
@@ -1098,7 +1098,7 @@ mod tests {
 
         let setters = HashSet::from(["setX".to_string()]);
         let MustResult::All(proof) = must_setter_on_all_paths(&cfg, &setters, None) else {
-            panic!("the setter is called on every path — expected an all-paths proof");
+            panic!("the setter is called on every path, expected an all-paths proof");
         };
         assert_eq!(proof.evidence().block_id, Some(1));
         assert_eq!(proof.evidence().span.map(|s| s.line), Some(10));

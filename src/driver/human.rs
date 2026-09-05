@@ -93,7 +93,7 @@ pub fn render(
         } else {
             let _ = writeln!(
                 out,
-                "{}⚠  {} file(s), no components detected — and parts of this run were \
+                "{}⚠  {} file(s), no components detected, and parts of this run were \
                  not analyzed.{}",
                 p.yellow, report.files_analyzed, p.reset
             );
@@ -235,7 +235,7 @@ pub fn render(
             } else if !d.notes.is_empty() {
                 let _ = writeln!(
                     out,
-                    "       {}({} trace step(s) — rerun with --trace){}",
+                    "       {}({} trace step(s), rerun with --trace){}",
                     p.dim,
                     d.notes.len(),
                     p.reset
@@ -248,7 +248,7 @@ pub fn render(
     if hidden_repeat > 0 {
         let _ = writeln!(
             out,
-            "{}   {} component(s) hidden — every finding in them is a source line already \
+            "{}   {} component(s) hidden. Every finding in them is a source line already \
              reported above{}",
             p.dim, hidden_repeat, p.reset
         );
@@ -257,7 +257,7 @@ pub fn render(
     if hidden_clean > 0 && !show_clean {
         let _ = writeln!(
             out,
-            "{}   {} clean component(s) hidden — rerun with --show-clean{}",
+            "{}   {} clean component(s) hidden, rerun with --show-clean{}",
             p.dim, hidden_clean, p.reset
         );
     }
@@ -276,7 +276,7 @@ pub fn render(
         } else {
             let _ = writeln!(
                 out,
-                "{}⚠  {} file(s), no findings — but parts of this run were not analyzed, \
+                "{}⚠  {} file(s), no findings, but parts of this run were not analyzed, \
                  so this is not a clean bill.{}",
                 p.yellow, report.files_analyzed, p.reset
             );
@@ -294,7 +294,7 @@ pub fn render(
         // the two differ.
         let attributions = report.errors + report.warnings;
         let collapsed = if attributions > locations.errors + locations.warnings {
-            format!(" — {attributions} component attribution(s)")
+            format!(", {attributions} component attribution(s)")
         } else {
             String::new()
         };
@@ -344,7 +344,7 @@ fn render_followed(out: &mut String, report: &CheckReport, p: &Palette) {
     if f.withheld > 0 {
         let _ = writeln!(
             out,
-            "{}   {} finding(s) in those file(s) are not shown — name the path(s) to \
+            "{}   {} finding(s) in those file(s) are not shown. Name the path(s) to \
              report them{}{}",
             p.yellow,
             f.withheld,

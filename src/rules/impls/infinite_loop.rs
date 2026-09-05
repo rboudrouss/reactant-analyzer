@@ -141,7 +141,7 @@ impl Rule for InfiniteLoop {
                     }
 
                     let deps_note = if deps.is_declared() {
-                        " (its deps do not provably gate it — the effect can re-run every render)"
+                        " (its deps do not provably gate it, so the effect can re-run every render)"
                     } else {
                         ""
                     };
@@ -149,7 +149,7 @@ impl Rule for InfiniteLoop {
                         "infinite-loop",
                         format!(
                             "this effect keeps pushing state {}{} to new values \
-                             on every run potential infinite render loop",
+                             on every run. Potential infinite render loop",
                             state_slot_name(state_label, &state_names),
                             deps_note
                         ),
@@ -209,13 +209,13 @@ impl Rule for InfiniteLoop {
                     }
 
                     let deps_note = if deps.is_declared() {
-                        " (its deps do not provably gate it — the effect can re-run every render)"
+                        " (its deps do not provably gate it, so the effect can re-run every render)"
                     } else {
                         ""
                     };
                     let msg = format!(
-                        "this effect calls `{}`, a state setter of parent `{}`{} \
-                         parent re-renders → child re-renders → effect fires again: infinite loop",
+                        "this effect calls `{}`, a state setter of parent `{}`{}. \
+                         Parent re-renders → child re-renders → effect fires again: infinite loop",
                         call.var, parent_comp, deps_note
                     );
                     let mut diag = Diagnostic::warn("cross-component-infinite-loop", msg)
@@ -297,24 +297,24 @@ fn check_multi_effect_cycles(
             let msg = if cyc.len() == 1 && e.no_deps {
                 format!(
                     "this effect has no dependency array and stores a fresh \
-                     reference into state {to_name} it re-runs after every \
+                     reference into state {to_name}, so it re-runs after every \
                      render and re-triggers itself: infinite render loop"
                 )
             } else if cyc.len() == 1 {
                 format!(
                     "this effect stores a fresh reference into state {to_name} \
-                     which its own deps react to the re-render runs it again: \
+                     which its own deps react to, so the re-render runs it again: \
                      infinite render loop"
                 )
             } else if cycle.all_must {
                 format!(
-                    "these effects form a state-update cycle ({path}) each \
+                    "these effects form a state-update cycle ({path}) where each \
                      step stores a fresh reference that re-runs the next \
                      effect: infinite render loop"
                 )
             } else {
                 format!(
-                    "these effects may form a state-update cycle ({path}) \
+                    "these effects may form a state-update cycle ({path}) where \
                      each step may store a fresh reference that re-runs the \
                      next effect: possible infinite render loop"
                 )
@@ -548,8 +548,8 @@ fn check_object_churn(
                     "infinite-loop",
                     proof,
                     format!(
-                        "this effect recreates object state {state} it depends on \
-                         every run stores a fresh reference (`Object.is` always fails) \
+                        "this effect recreates object state {state} it depends on. \
+                         Every run stores a fresh reference (`Object.is` always fails) \
                          and re-triggers itself: infinite render loop",
                         state = state_slot_name(state_label, &state_vals)
                     ),
@@ -558,7 +558,7 @@ fn check_object_churn(
                     "infinite-loop",
                     format!(
                         "this effect depends on object state but freshly recreates \
-                         state {state} outside its deps no update cycle was found, \
+                         state {state} outside its deps. No update cycle was found, \
                          but deps may be too imprecise to rule one out",
                         state = state_slot_name(state_label, &state_vals)
                     ),
@@ -567,7 +567,7 @@ fn check_object_churn(
                     "infinite-loop",
                     format!(
                         "this effect may store a fresh reference into state \
-                         {state} which its deps react to possible infinite render loop",
+                         {state} which its deps react to: possible infinite render loop",
                         state = state_slot_name(state_label, &state_vals)
                     ),
                 ),

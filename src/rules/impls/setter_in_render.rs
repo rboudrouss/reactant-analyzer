@@ -208,7 +208,7 @@ impl Rule for SetterInRender {
                         if call.class == SetterCallPhase::Sync {
                             format!(
                                 "prop `{}` (a state setter of parent `{}`) called during render \
-                                 of `{}` triggers parent re-render on every render",
+                                 of `{}`, which triggers a parent re-render on every render",
                                 crate::ir::source_name(&call.var),
                                 parent_comp,
                                 component
@@ -216,7 +216,7 @@ impl Rule for SetterInRender {
                         } else {
                             format!(
                                 "prop `{}` (a state setter of parent `{}`) is handed to a callee \
-                                 with no timing summary — if that callee runs it during render, \
+                                 with no timing summary. If that callee runs it during render, \
                                  `{}` re-renders its parent on every render",
                                 crate::ir::source_name(&call.var),
                                 parent_comp,
@@ -278,7 +278,7 @@ impl Rule for SetterInRender {
 /// would state as fact the one thing the walk could not establish.
 fn unknown_phase_message(var: &Var) -> String {
     format!(
-        "setter `{}` is handed to a callee with no timing summary — if that callee \
+        "setter `{}` is handed to a callee with no timing summary. If that callee \
          runs it during render, this re-renders on every render",
         crate::ir::source_name(var)
     )

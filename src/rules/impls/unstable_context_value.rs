@@ -56,7 +56,7 @@ impl Rule for UnstableContextValue {
                 let mut d = Diagnostic::warn(
                     Self::NAME,
                     format!(
-                        "`{context}.Provider` is given a newly allocated value on every render — \
+                        "`{context}.Provider` is given a newly allocated value on every render. \
                          `Object.is` fails for every consumer, so each `useContext({context})` \
                          re-renders whenever this component does, even when nothing in the value \
                          changed; wrap the value in `useMemo`"

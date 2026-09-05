@@ -208,7 +208,7 @@ impl Rule for FrozenInitialState {
                         severity,
                         format!(
                             "state {slot_name} is seeded from `{path}`, which is fed by \
-                             {display} and changes — `useState` reads its initializer on the \
+                             {display} and changes. `useState` reads its initializer on the \
                              first render only and nothing here re-syncs it, so {slot_name} \
                              stays frozen at the first `{path}` value",
                             display = feeder.display
@@ -219,7 +219,7 @@ impl Rule for FrozenInitialState {
                 (None, Some(path)) => (
                     Severity::Warning,
                     format!(
-                        "state {slot_name} is seeded from `{path}` and never re-synced — \
+                        "state {slot_name} is seeded from `{path}` and never re-synced. \
                          `useState` reads its initializer on the first render only, so if \
                          `{path}` changes, {slot_name} keeps the mount-time value"
                     ),

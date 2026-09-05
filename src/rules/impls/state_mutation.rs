@@ -451,7 +451,7 @@ impl Rule for StateMutation {
                 .unwrap_or(&sets[0]);
             let message = format!(
                 "{slot} is mutated in place and `{setter_name}` is called with the same \
-                 reference — React compares with `Object.is`, sees no change, and skips \
+                 reference. React compares with `Object.is`, sees no change, and skips \
                  the re-render"
             );
             let mut d = match proof {
@@ -496,7 +496,7 @@ impl Rule for StateMutation {
             let mut d = Diagnostic::warn(
                 "state-mutation",
                 format!(
-                    "`{}` roots in this component's props — mutating it writes into an object \
+                    "`{}` roots in this component's props, so mutating it writes into an object \
                      owned by the parent; copy it before changing",
                     site.desc
                 ),

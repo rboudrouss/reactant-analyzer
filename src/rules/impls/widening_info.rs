@@ -24,7 +24,7 @@ impl Rule for WideningInfo {
                     "widening-info",
                     format!(
                         "state {label} kept changing during analysis and was \
-                         approximated to converge — findings that depend on it \
+                         approximated to converge, so findings that depend on it \
                          may be imprecise"
                     ),
                 )

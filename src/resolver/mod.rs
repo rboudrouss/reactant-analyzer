@@ -461,7 +461,7 @@ pub fn analyze_files(
             eprintln!("[parse error] {}: {}", e.file.display(), e.message);
         } else {
             eprintln!(
-                "[skipped] {}: {} — the file was not analyzed",
+                "[skipped] {}: {}, the file was not analyzed",
                 e.file.display(),
                 e.message
             );
@@ -944,7 +944,7 @@ export function App() {
         assert_eq!(lowered.parse_errors[0].file, file);
         assert!(
             !lowered.parse_errors[0].analyzed,
-            "a dropped file must say so — its findings are missing, not absent"
+            "a dropped file must say so, its findings are missing, not absent"
         );
     }
 

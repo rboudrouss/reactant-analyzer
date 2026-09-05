@@ -979,7 +979,7 @@ fn check_keys(
                 return Err(PackError::new(
                     format!("{path}.{key}"),
                     format!(
-                        "{what} does not accept field `{key}` — allowed: {}",
+                        "{what} does not accept field `{key}`. Allowed: {}",
                         allowed.join(", ")
                     ),
                 ));
@@ -1098,7 +1098,7 @@ impl<'a> ParamEnv<'a> {
                     return Err(PackError::new(
                         format!("{path}.options.{key}"),
                         format!(
-                            "unknown option `{key}` — declared params: {}",
+                            "unknown option `{key}`. Declared params: {}",
                             if decls.is_empty() {
                                 "none".to_string()
                             } else {
@@ -1211,7 +1211,7 @@ fn validate_rule(
         return Err(PackError::new(
             format!("{path}.id"),
             format!(
-                "rule id `{}` contains `/` — the pack name is the namespace, ids are bare",
+                "rule id `{}` contains `/`. The pack name is the namespace, ids are bare",
                 def.id
             ),
         ));
@@ -1386,7 +1386,7 @@ fn validate_rule(
     if def.severity == SeverityPin::Error && !has_must {
         warnings.push(LoadWarning {
             rule: full_id.clone(),
-            message: "severity is pinned \"error\" but no must_* guard is used — findings can \
+            message: "severity is pinned \"error\" but no must_* guard is used, so findings can \
                       only emit as warnings"
                 .into(),
         });
@@ -1408,7 +1408,7 @@ fn validate_rule(
         warnings.push(LoadWarning {
             rule: full_id.clone(),
             message: "a `kind: \"custom\"` anchor only binds hooks the engine could not \
-                      resolve (#6) — identity rules belong on the `hook_origins` anchor, \
+                      resolve (#6). Identity rules belong on the `hook_origins` anchor, \
                       which survives inlining"
                 .into(),
         });
@@ -1489,8 +1489,8 @@ impl GuardCx<'_> {
             Err(PackError::new(
                 format!("{g_path}.of"),
                 match self.bound_name {
-                    Some(b) => format!("unknown binding `{of}` — available: anchor, {b}"),
-                    None => format!("unknown binding `{of}` — available: anchor"),
+                    Some(b) => format!("unknown binding `{of}`. Available: anchor, {b}"),
+                    None => format!("unknown binding `{of}`. Available: anchor"),
                 },
             ))
         }
@@ -2174,8 +2174,8 @@ fn validate_guard(
                 {
                     warnings.push(format!(
                         "at `{c_path}`: a `must_*` branch of `any_of` with the default \
-                         `\"else\": \"keep\"` always passes, so the disjunction is always true \
-                         — add `\"else\": \"drop\"` if the branch is meant to be a condition"
+                         `\"else\": \"keep\"` always passes, so the disjunction is always true. \
+                         Add `\"else\": \"drop\"` if the branch is meant to be a condition"
                     ));
                 }
                 children.push(validate_guard(
@@ -2342,7 +2342,7 @@ fn text_guard(
         return Err(PackError::new(
             format!("{g_path}.of"),
             format!(
-                "guard `{kind}` matches the `{kind}` field, which {} does not carry — its \
+                "guard `{kind}` matches the `{kind}` field, which {} does not carry. Its \
                  fields: {}",
                 sort.describe(),
                 match fields_of(sort).as_slice() {
@@ -2446,11 +2446,11 @@ fn parse_template(
                         path,
                         match bound_name {
                             Some(b) => format!(
-                                "unknown binding `{binding}` in template — available: anchor, \
+                                "unknown binding `{binding}` in template. Available: anchor, \
                                  {b}, param"
                             ),
                             None => format!(
-                                "unknown binding `{binding}` in template — available: anchor, \
+                                "unknown binding `{binding}` in template. Available: anchor, \
                                  param"
                             ),
                         },
@@ -2460,7 +2460,7 @@ fn parse_template(
                     return Err(PackError::new(
                         path,
                         format!(
-                            "`{binding}` binds {} which has no field `{field}` — available: {}",
+                            "`{binding}` binds {} which has no field `{field}`. Available: {}",
                             sort.describe(),
                             fields_of(sort).join(", ")
                         ),
@@ -2495,7 +2495,7 @@ pub(crate) fn validate_pack(
         return Err(PackError::new(
             "schemaVersion",
             format!(
-                "unsupported schemaVersion {} — only 1 exists",
+                "unsupported schemaVersion {}, only 1 exists",
                 pack.schema_version
             ),
         ));

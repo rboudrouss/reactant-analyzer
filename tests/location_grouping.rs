@@ -40,7 +40,7 @@ fn the_shared_location_is_printed_once_and_says_how_many_reach_it() {
 fn the_summary_counts_locations_and_names_the_attributions() {
     let out = human(&[]);
     assert!(
-        out.contains("1 warning(s) across 2 file(s) — 3 component attribution(s)."),
+        out.contains("1 warning(s) across 2 file(s), 3 component attribution(s)."),
         "{out}"
     );
 }

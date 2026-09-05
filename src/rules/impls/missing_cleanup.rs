@@ -96,7 +96,7 @@ impl Rule for MissingCleanup {
             let mut d = Diagnostic::warn(
                 Self::NAME,
                 format!(
-                    "this effect calls {what} but returns no cleanup — the registration is \
+                    "this effect calls {what} but returns no cleanup. The registration is \
                      repeated every time the effect re-runs (and on every mount, twice under \
                      StrictMode) and nothing ever undoes it; return a function that tears it down"
                 ),

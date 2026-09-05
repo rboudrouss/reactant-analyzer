@@ -1053,7 +1053,7 @@ mod tests {
         let cfg = cfg_of("const { a = fallback } = o;");
         assert!(
             crate::ir::free_vars::compute_free_vars(&cfg).contains("fallback"),
-            "a default expression still runs — its reads must survive"
+            "a default expression still runs, its reads must survive"
         );
     }
 
@@ -1204,7 +1204,7 @@ mod tests {
         let free = crate::ir::free_vars::compute_free_vars(&cfg);
         assert!(
             free.contains("init"),
-            "the static block runs — its reads must survive: {free:?}"
+            "the static block runs, its reads must survive: {free:?}"
         );
         assert!(
             free.contains("key"),
@@ -1233,7 +1233,7 @@ mod tests {
         let second = block_calling(&cfg, "g");
         assert!(
             !reaches(&cfg, first, second),
-            "`case 1` breaks — it must not reach `case 2`: {:?}",
+            "`case 1` breaks, it must not reach `case 2`: {:?}",
             cfg.edges
         );
         assert!(
@@ -1250,7 +1250,7 @@ mod tests {
         let cfg = cfg_of("switch (k) { case 1: f(); case 2: g(); }");
         assert!(
             reaches(&cfg, block_calling(&cfg, "f"), block_calling(&cfg, "g")),
-            "`case 1` has no `break` — it must fall into `case 2`: {:?}",
+            "`case 1` has no `break`, it must fall into `case 2`: {:?}",
             cfg.edges
         );
     }

@@ -36,11 +36,11 @@ async function evaluate(input) {
   } catch (e) {
     if (e && e.code === "ERR_UNKNOWN_FILE_EXTENSION") {
       throw new Error(
-        `${input}: this Node cannot load that extension directly — ` +
+        `${input}: this Node cannot load that extension directly. ` +
           `compile it to .js first (or use a Node with type stripping)`,
       );
     }
-    throw new Error(`${input}: evaluation failed — ${e.message}`);
+    throw new Error(`${input}: evaluation failed: ${e.message}`);
   }
   let pack = mod && "default" in mod ? mod.default : mod;
   // ESM/CJS interop can double-wrap the default export.
@@ -86,7 +86,7 @@ async function build(input, outPath, wasm, io = { out: process.stdout, err: proc
     fs.mkdirSync(path.dirname(path.resolve(target)), { recursive: true });
     fs.writeFileSync(target, json);
     io.out.write(
-      `wrote ${target} — pack \`${verdict.ok.name}\`, ${verdict.ok.rules.length} rule(s): ` +
+      `wrote ${target}: pack \`${verdict.ok.name}\`, ${verdict.ok.rules.length} rule(s): ` +
         `${verdict.ok.rules.join(", ")}\n`,
     );
     return 0;
@@ -97,7 +97,7 @@ async function build(input, outPath, wasm, io = { out: process.stdout, err: proc
   const target = outPath ?? defaultOut(input);
   fs.mkdirSync(path.dirname(path.resolve(target)), { recursive: true });
   fs.writeFileSync(target, json);
-  io.out.write(`wrote ${target} (not validated — this bundle lacks validatePack; ` +
+  io.out.write(`wrote ${target} (not validated, this bundle lacks validatePack; ` +
     `the core validates it on the next check)\n`);
   return 0;
 }

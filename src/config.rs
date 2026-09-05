@@ -114,7 +114,7 @@ fn level_from_str<E: serde::de::Error>(s: &str) -> Result<RuleSetting, E> {
         "info" => setting.severity = Some(Severity::Info),
         other => {
             return Err(E::custom(format!(
-                "unknown rule setting `{other}` — expected {LEVELS}"
+                "unknown rule setting `{other}`, expected {LEVELS}"
             )));
         }
     }
@@ -163,7 +163,7 @@ impl<'de> Deserialize<'de> for RuleSetting {
                         }
                         other => {
                             return Err(serde::de::Error::custom(format!(
-                                "unknown key `{other}` in rule setting — expected \
+                                "unknown key `{other}` in rule setting, expected \
                                  \"severity\" or \"options\""
                             )));
                         }

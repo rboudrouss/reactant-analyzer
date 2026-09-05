@@ -157,15 +157,15 @@ impl Rule for UnnecessaryRerender {
 
                     let message = if is_mount_flag {
                         format!(
-                            "mount-only effect flips state {} from `false` to `true` \
-                             the SSR mount-flag idiom costs one extra rerender on every \
+                            "mount-only effect flips state {} from `false` to `true`. \
+                             The SSR mount-flag idiom costs one extra rerender on every \
                              mount; prefer `useSyncExternalStore` for client detection",
                             state_slot_name(state_label, &state_names)
                         )
                     } else {
                         format!(
                             "mount-only effect sets state {} to a constant \
-                             different from its initial value causes one extra rerender on mount; \
+                             different from its initial value, which costs one extra rerender on mount; \
                              consider initialising directly with the target value",
                             state_slot_name(state_label, &state_names)
                         )

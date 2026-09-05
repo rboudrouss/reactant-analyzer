@@ -392,20 +392,20 @@ impl Rule for StaleClosure {
                 let message = match (f.severity, f.mount_only) {
                     (Severity::Error, _) => format!(
                         "the `{reg}` callback registered by this mount-only effect reads \
-                         `{path}` and writes it back — `{path}` was captured once at mount, \
+                         `{path}` and writes it back. `{path}` was captured once at mount, \
                          so every firing recomputes from the same frozen value and the \
                          state can never advance past its first update",
                         reg = f.registrar,
                     ),
                     (_, true) => format!(
                         "`{path}` is captured by the `{reg}` callback registered in this \
-                         mount-only effect — the callback outlives the render and keeps \
+                         mount-only effect, so the callback outlives the render and keeps \
                          reading the mount-time value after `{path}` changes",
                         reg = f.registrar,
                     ),
                     (_, false) => format!(
                         "`{path}` is captured by the `{reg}` callback registered in this \
-                         effect, but the deps array does not cover it — after `{path}` \
+                         effect, but the deps array does not cover it, so after `{path}` \
                          changes, the callback keeps reading the value from the effect's \
                          last run",
                         reg = f.registrar,

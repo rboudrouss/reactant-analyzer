@@ -112,7 +112,7 @@ impl Rule for AlwaysUnstableDeps {
             let mut d = Diagnostic::warn(
                 "always-unstable-deps",
                 format!(
-                    "this {word} depends on {what} — a new reference every \
+                    "this {word} depends on {what}, a new reference every \
                      render, so `Object.is` always differs and the {word} \
                      re-runs on every render regardless of the other deps",
                     what = fmt_deps(&unstable),

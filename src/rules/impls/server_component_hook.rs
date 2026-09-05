@@ -179,7 +179,7 @@ impl Rule for ServerComponentHook {
         let mut d = Diagnostic::warn(
             Self::NAME,
             format!(
-                "{list} {verb} called in a Server Component — {why} and no `\"use client\"` \
+                "{list} {verb} called in a Server Component. {why} and no `\"use client\"` \
                  directive covers it, so React renders it on the server, where hooks do not \
                  exist; add `\"use client\"` at the top of the file, or move the stateful \
                  part into a child component that declares it"

@@ -39,7 +39,7 @@ impl Rule for AnalysisLimitInfo {
                 diags.push(Diagnostic::info(
                     "analysis-limit",
                     format!(
-                        "recursive component reference `{callee}` not followed — \
+                        "recursive component reference `{callee}` is not followed, so \
                              its props are treated as unknown; cross-component cycles \
                              are not fully analysed (FN possible)"
                     ),
@@ -52,8 +52,8 @@ impl Rule for AnalysisLimitInfo {
                 diags.push(Diagnostic::info(
                     "analysis-limit",
                     format!(
-                        "component `{callee}` not found in analysis registry \
-                             pass its file on the command line to analyse it (FN possible)"
+                        "component `{callee}` was not found in the analysis registry. \
+                             Pass its file on the command line to analyse it (FN possible)"
                     ),
                 ));
             }
@@ -63,8 +63,8 @@ impl Rule for AnalysisLimitInfo {
             diags.push(Diagnostic::info(
                 "analysis-limit",
                 format!(
-                    "callback inlining reached depth cap ({}) \
-                         deeper HOF chains not descended (FN possible on nested callbacks)",
+                    "callback inlining reached the depth cap ({}), so \
+                         deeper HOF chains are not descended (FN possible on nested callbacks)",
                     crate::domains::interp::MAX_INLINE_DEPTH
                 ),
             ));
@@ -73,7 +73,7 @@ impl Rule for AnalysisLimitInfo {
         if stats.inline_budget_exhausted.contains(component) {
             diags.push(Diagnostic::info(
                 "analysis-limit",
-                "utility inlining ran out of splice budget here — the remaining \
+                "utility inlining ran out of splice budget here, so the remaining \
                  utility calls are treated as unknown (FN possible); raise \
                  `max_inline_depth` to inline more",
             ));
@@ -99,8 +99,8 @@ impl Rule for AnalysisLimitInfo {
                 let mut d = Diagnostic::info(
                     "analysis-limit",
                     format!(
-                        "hook `{name}` not found in registry \
-                         pass its source file or add a HookSummary to analyse it (FN possible)"
+                        "hook `{name}` was not found in the registry. \
+                         Pass its source file or add a HookSummary to analyse it (FN possible)"
                     ),
                 )
                 .with_label(call.label);
@@ -125,7 +125,7 @@ impl Rule for AnalysisLimitInfo {
                 let mut d = Diagnostic::info(
                     "analysis-limit",
                     "the deps argument here is not a written array, so its entries \
-                     cannot be enumerated — deps checks run with nothing declared \
+                     cannot be enumerated, and deps checks run with nothing declared \
                      (FP possible, and FN on whatever the list does gate)",
                 )
                 .with_label(info.label);

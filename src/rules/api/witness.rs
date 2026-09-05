@@ -153,7 +153,7 @@ impl Step {
                     }
                     ResolveTarget::Setter => format!("`{n}` is a state setter"),
                     ResolveTarget::Unknown => {
-                        format!("`{n}` could not be resolved — treated as opaque")
+                        format!("`{n}` could not be resolved, treated as opaque")
                     }
                 }
             }
@@ -161,7 +161,7 @@ impl Step {
                 let callee = crate::ir::source_name(callee);
                 match class {
                     EffectClass::Setter => {
-                        format!("`{callee}` is a state setter — calling it writes state")
+                        format!("`{callee}` is a state setter, so calling it writes state")
                     }
                     EffectClass::Effectful => format!(
                         "`{callee}` has side effects (subscriptions/requests/timers re-fire on \
@@ -200,15 +200,15 @@ impl Step {
             ),
             Step::Mutate { target } => {
                 let target = crate::ir::source_name(target);
-                format!("`{target}` is mutated in place here — its reference identity is unchanged")
+                format!("`{target}` is mutated in place here, so its reference identity is unchanged")
             }
             Step::Capture { what } => format!(
-                "`{}` is captured at registration time — the callback keeps this value, \
+                "`{}` is captured at registration time, so the callback keeps this value, \
                  not the latest one",
                 crate::ir::source_name(what)
             ),
             Step::InitOnce { slot } => format!(
-                "state {} reads its initializer on the first render only — later renders \
+                "state {} reads its initializer on the first render only, so later renders \
                  ignore it",
                 name(*slot)
             ),
