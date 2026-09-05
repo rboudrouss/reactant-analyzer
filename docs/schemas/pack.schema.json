@@ -4,7 +4,7 @@
   "type": "object",
   "properties": {
     "$schema": {
-      "description": "Editor-facing schema URL; not interpreted. Accepted for the same reason\n`reactant.config.json` accepts it — a published schema is only useful if\nthe file is allowed to point at it.",
+      "description": "Editor-facing schema URL; not interpreted. Accepted for the same reason\n`reactant.config.json` accepts it: a published schema is only useful if\nthe file is allowed to point at it.",
       "type": [
         "string",
         "null"
@@ -36,7 +36,7 @@
   ],
   "$defs": {
     "Anchor": {
-      "description": "The anchor: a relation the engine has already resolved (ADR-022 §1) —\nnever a syntax pattern.",
+      "description": "The anchor: a relation the engine has already resolved (ADR-022 §1),\nnever a syntax pattern.",
       "oneOf": [
         {
           "description": "One row of the `hook_calls` table, optionally kind-filtered.",
@@ -75,7 +75,7 @@
           ]
         },
         {
-          "description": "Non-hook call sites in the render body (#126, ADR-036) — the same\nrelation the `calls` edge exposes, anchored where there is no hook to\nhang an edge on. `router.push(…)` during render lives here.\n\nA `name` guard is mandatory, for the same reason it is on the edge.",
+          "description": "Non-hook call sites in the render body (#126, ADR-036): the same\nrelation the `calls` edge exposes, anchored where there is no hook to\nhang an edge on. `router.push(…)` during render lives here.\n\nA `name` guard is mandatory, for the same reason it is on the edge.",
           "type": "object",
           "properties": {
             "relation": {
@@ -88,7 +88,7 @@
           ]
         },
         {
-          "description": "One `hook_provenance` row: every hook call whose identity the engine\nresolved, *surviving* custom-hook inlining (ADR-027 §7 — the #6 fix:\na resolved hook keeps no `hook_calls` row of kind `custom`, so\nidentity rules anchor here). `name` reads the origin hook's name,\n`source` its import specifier; the row carries no kind and no edges.",
+          "description": "One `hook_provenance` row: every hook call whose identity the engine\nresolved, *surviving* custom-hook inlining (ADR-027 §7, the #6 fix:\na resolved hook keeps no `hook_calls` row of kind `custom`, so\nidentity rules anchor here). `name` reads the origin hook's name,\n`source` its import specifier; the row carries no kind and no edges.",
           "type": "object",
           "properties": {
             "relation": {
@@ -114,7 +114,7 @@
           ]
         },
         {
-          "description": "Every prop of every element the render body builds (#71 step 2, #125).\nEdge-less; `name` is the element, `prop` the prop's name, `identity`\nthe value's identity verdict, `kind` whether the element is a component\napplication or a host element.\n\n`elements` selects which kinds are enumerated and defaults to\n`component` — what the relation has always meant, and the only place a\nprop is compared by `Object.is` across a memo boundary. `host` binds\n`<input ref={r} value={v}/>` instead, and `any` binds both. It is an\nanchor option rather than a widening-by-guard because it changes which\nrows exist, and a shipped pack must keep binding the rows it always did\n(ADR-027 §2, the rule #107 followed).",
+          "description": "Every prop of every element the render body builds (#71 step 2, #125).\nEdge-less; `name` is the element, `prop` the prop's name, `identity`\nthe value's identity verdict, `kind` whether the element is a component\napplication or a host element.\n\n`elements` selects which kinds are enumerated and defaults to\n`component`, the only meaning the relation has, and the only place a\nprop is compared by `Object.is` across a memo boundary. `host` binds\n`<input ref={r} value={v}/>` instead, and `any` binds both. It is an\nanchor option rather than a widening-by-guard because it changes which\nrows exist, and a shipped pack must keep binding the rows it always did\n(ADR-027 §2, the rule #107 followed).",
           "type": "object",
           "properties": {
             "elements": {
@@ -137,7 +137,7 @@
           ]
         },
         {
-          "description": "One element the render body builds (#126): the anchor `jsx_props`\ncould not be, because a rule about a prop's *absence* — `<input\nvalue={v}/>` with no `onChange` — needs the element as the subject and\nits props as an edge.\n\n`name` is the component name or the host tag, `kind` says which.\n`elements` narrows the enumeration exactly as it does on `jsx_props`,\nand defaults to `component` for the same reason.",
+          "description": "One element the render body builds (#126): the anchor `jsx_props`\ncould not be, because a rule about a prop's *absence*, `<input\nvalue={v}/>` with no `onChange`, needs the element as the subject and\nits props as an edge.\n\n`name` is the component name or the host tag, `kind` says which.\n`elements` narrows the enumeration exactly as it does on `jsx_props`,\nand defaults to `component` for the same reason.",
           "type": "object",
           "properties": {
             "elements": {
@@ -160,7 +160,7 @@
           ]
         },
         {
-          "description": "One render-loop cycle of the program's churn graph, seen from the\neffect of THIS component that carries one of its edges (#108,\nADR-029). Edge-less: `cycle` renders the loop as `a → b → a`, and the\n`cycle` guard filters on the two exact folds the graph already\ncomputed — whether the loop spans components, and whether every step\nis a must-step.\n\nA row's identity is the carrying edge's write site (ADR-024), so a\ncycle whose carrying edge has no span produces none. No `must_*` guard\naccepts this sort, so an Error is not reachable through the anchor.",
+          "description": "One render-loop cycle of the program's churn graph, seen from the\neffect of THIS component that carries one of its edges (#108,\nADR-029). Edge-less: `cycle` renders the loop as `a → b → a`, and the\n`cycle` guard filters on the two exact folds the graph already\ncomputed: whether the loop spans components, and whether every step\nis a must-step.\n\nA row's identity is the carrying edge's write site (ADR-024), so a\ncycle whose carrying edge has no span produces none. No `must_*` guard\naccepts this sort, so an Error is not reachable through the anchor.",
           "type": "object",
           "properties": {
             "relation": {
@@ -173,7 +173,7 @@
           ]
         },
         {
-          "description": "One `useContext` call site whose ancestry the analysis could complete\n(#115, ADR-032). `name` is the local name the call reads the context by;\nthe `provider` guard says whether any component that may render this one\nprovides that same cell.\n\nA row exists only when every ancestor chain is complete — inter-analysed,\nnon-recursive, and not mentioned by any component phase 1 never reached.\nThe verdict is an ABSENCE, and an absence is only as good as the paths\nyou can see, so an incomplete closure produces no row rather than a\nconfident one. Edge-less; no `must_*` accepts the sort, so Error is\nunreachable.",
+          "description": "One `useContext` call site whose ancestry the analysis could complete\n(#115, ADR-032). `name` is the local name the call reads the context by;\nthe `provider` guard says whether any component that may render this one\nprovides that same cell.\n\nA row exists only when every ancestor chain is complete: inter-analysed,\nnon-recursive, and not mentioned by any component phase 1 never reached.\nThe verdict is an ABSENCE, and an absence is only as good as the paths\nyou can see, so an incomplete closure produces no row rather than a\nconfident one. Edge-less; no `must_*` accepts the sort, so Error is\nunreachable.",
           "type": "object",
           "properties": {
             "relation": {
@@ -186,7 +186,7 @@
           ]
         },
         {
-          "description": "One callback registration in an effect body (#111/#116, ADR-034): a\ncall that hands a callback to something outliving the effect. `name` is\nthe registrar (`setInterval`, `addEventListener`, `subscribe`, …),\n`firing` whether it re-fires unboundedly, `listener` the site-identity\nverdict of the callback.\n\nThe relation is a **may**-registration: a match on the registrar name\ntable, never a proof that the callee is the host primitive. That is\nwontfix #42's accepted-FP decision, now extended to the public\nvocabulary — so the polarity is capped at may/Warning, no `must_*`\nbinds this sort, and Error is unreachable through the anchor.\nEdge-less; the `teardown` guard carries the pairing fact.\n\nOptional `firing` narrows the enumeration the way `kind` does for\n`hook_calls`: `repeating` selects the registrars that keep firing until\ntorn down, which is the only class where a missing teardown\naccumulates. Absent = every row.",
+          "description": "One callback registration in an effect body (#111/#116, ADR-034): a\ncall that hands a callback to something outliving the effect. `name` is\nthe registrar (`setInterval`, `addEventListener`, `subscribe`, …),\n`firing` whether it re-fires unboundedly, `listener` the site-identity\nverdict of the callback.\n\nThe relation is a **may**-registration: a match on the registrar name\ntable, never a proof that the callee is the host primitive. That is\nwontfix #42's accepted-FP decision, now extended to the public\nvocabulary, so the polarity is capped at may/Warning, no `must_*`\nbinds this sort, and Error is unreachable through the anchor.\nEdge-less; the `teardown` guard carries the pairing fact.\n\nOptional `firing` narrows the enumeration the way `kind` does for\n`hook_calls`: `repeating` selects the registrars that keep firing until\ntorn down, which is the only class where a missing teardown\naccumulates. Absent = every row.",
           "type": "object",
           "properties": {
             "firing": {
@@ -211,7 +211,7 @@
       ]
     },
     "CleanupName": {
-      "description": "Total mirror of `CleanupVerdict` (#100): what an effect body returns, seen\nas teardown. `absent` is the claim — every exit returns nothing at all —\nand `unknown` folds to the may side (there may be a cleanup), so it is\nmatchable but never actionable as an absence.",
+      "description": "Total mirror of `CleanupVerdict` (#100): what an effect body returns, seen\nas teardown. `absent` is the claim, every exit returns nothing at all, and\nand `unknown` folds to the may side (there may be a cleanup), so it is\nmatchable but never actionable as an absence.",
       "type": "string",
       "enum": [
         "present",
@@ -237,12 +237,12 @@
           "const": "args"
         },
         {
-          "description": "Writers of a state-hook anchor's slot (ADR-027 §1, ADR-028 §1): one row\nper **call site**, spliced wrappers' setter params included. Two\n`setCount(…)` calls in one body are two rows; one write a local helper\ncontributes is one row however many times the helper is called.\n`{w.region}` is the lexical body — exact; `{w.phase}` is a MAY verdict,\n`unknown` = may run in any phase.",
+          "description": "Writers of a state-hook anchor's slot (ADR-027 §1, ADR-028 §1): one row\nper **call site**, spliced wrappers' setter params included. Two\n`setCount(…)` calls in one body are two rows; one write a local helper\ncontributes is one row however many times the helper is called.\n`{w.region}` is the lexical body, exact; `{w.phase}` is a MAY verdict,\n`unknown` = may run in any phase.",
           "type": "string",
           "const": "writers"
         },
         {
-          "description": "Non-hook call sites in the anchor's body CFG (#126, ADR-036): one row\nper call the setter walk passes, carrying the callee `name`, the\n`receiver` root of a member call, and the `phase` it runs in — the same\nlattice the writer rows use, so a call in a `.then`, after an `await`,\nor in the effect's returned cleanup is distinguishable from one in the\nbody.\n\nUnbounded, unlike every other relation: it enumerates *every* call.\nA `name` guard on the bound row is therefore **mandatory** — a rule\nthat fires on \"some call\" fires on all of them.",
+          "description": "Non-hook call sites in the anchor's body CFG (#126, ADR-036): one row\nper call the setter walk passes, carrying the callee `name`, the\n`receiver` root of a member call, and the `phase` it runs in, the same\nlattice the writer rows use, so a call in a `.then`, after an `await`,\nor in the effect's returned cleanup is distinguishable from one in the\nbody.\n\nUnbounded, unlike every other relation: it enumerates *every* call.\nA `name` guard on the bound row is therefore **mandatory**, since a rule\nthat fires on \"some call\" fires on all of them.",
           "type": "string",
           "const": "calls"
         },
@@ -252,12 +252,12 @@
           "const": "props"
         },
         {
-          "description": "Readers of a state-hook anchor's slot (#127, ADR-037): one row per read\nsite, over the same regions the `writers` edge enumerates. `{r.region}`\nis the lexical body — exact; `{r.phase}` is the same MAY verdict, so a\nread in a `.then` continuation or a cleanup is distinguishable from one\nin the render body.\n\nA read the walk never entered — inside a closure nothing calls, past the\ndepth cap — contributes no row, so the ABSENCE of rows is not a proof\nthat the slot is unread. `none` over this edge reads as \"no read the\nanalysis could see\", and over-reports rather than losing a finding.",
+          "description": "Readers of a state-hook anchor's slot (#127, ADR-037): one row per read\nsite, over the same regions the `writers` edge enumerates. `{r.region}`\nis the lexical body, exact; `{r.phase}` is the same MAY verdict, so a\nread in a `.then` continuation or a cleanup is distinguishable from one\nin the render body.\n\nA read the walk never entered, inside a closure nothing calls or past the\ndepth cap, contributes no row, so the ABSENCE of rows is not a proof\nthat the slot is unread. `none` over this edge reads as \"no read the\nanalysis could see\", and over-reports rather than losing a finding.",
           "type": "string",
           "const": "reads"
         },
         {
-          "description": "Prop seeds of a state-hook anchor's slot (#106, ADR-031): one row per\nprop path the `useState` initializer reads. `{s.path}` is the path as\nwritten; the `seed_sync` guard reads whether anything visibly re-syncs\nthe slot when that prop moves.\n\nA slot whose initializer reads no prop has no rows, so a rule on this\nedge is silent on it by construction — that is knowledge, not a filter.",
+          "description": "Prop seeds of a state-hook anchor's slot (#106, ADR-031): one row per\nprop path the `useState` initializer reads. `{s.path}` is the path as\nwritten; the `seed_sync` guard reads whether anything visibly re-syncs\nthe slot when that prop moves.\n\nA slot whose initializer reads no prop has no rows, so a rule on this\nedge is silent on it by construction, which is knowledge, not a filter.",
           "type": "string",
           "const": "seeds"
         }
@@ -273,7 +273,7 @@
           ]
         },
         {
-          "description": "Resolved component applications only — the default.",
+          "description": "Resolved component applications only. The default.",
           "type": "string",
           "const": "component"
         },
@@ -285,7 +285,7 @@
       ]
     },
     "ElseBehavior": {
-      "description": "What happens to a finding whose must-guard did not certify: `keep` (the\ndefault — it survives as a Warning-ceiling finding, ADR-022 §3's free\nstratification) or `drop` (explicit opt-in for qualification-style rules).",
+      "description": "What happens to a finding whose must-guard did not certify: `keep` (the\ndefault, so it survives as a Warning-ceiling finding, ADR-022 §3's free\nstratification) or `drop` (explicit opt-in for qualification-style rules).",
       "type": "string",
       "enum": [
         "keep",
@@ -308,7 +308,7 @@
       ]
     },
     "ForEach": {
-      "description": "Typed navigation from the anchor (ADR-022 §2): at most one edge, one\nbinding — no joins.",
+      "description": "Typed navigation from the anchor (ADR-022 §2): at most one edge, one\nbinding, no joins.",
       "type": "object",
       "properties": {
         "as": {
@@ -325,10 +325,10 @@
       ]
     },
     "Guard": {
-      "description": "A guard: a predicate over an engine verdict. `must_*` guards certify\n(attach the `Certified` proof on `All`); the others filter. The `must_`\nprefix makes polarity visible in the JSON — the §3 load-time warning is\na prefix scan.",
+      "description": "A guard: a predicate over an engine verdict. `must_*` guards certify\n(attach the `Certified` proof on `All`); the others filter. The `must_`\nprefix makes polarity visible in the JSON, and the §3 load-time warning is\na prefix scan.",
       "oneOf": [
         {
-          "description": "Stability verdict of a deps entry. Exactly one of `is`/`not`; the\nverdict names mirror `StabilityVerdict` totally — ⊤ (`unknown`) can\nbe matched but never silently dropped.",
+          "description": "Stability verdict of a deps entry. Exactly one of `is`/`not`; the\nverdict names mirror `StabilityVerdict` totally, so ⊤ (`unknown`) can\nbe matched but never silently dropped.",
           "type": "object",
           "properties": {
             "is": {
@@ -365,7 +365,7 @@
           ]
         },
         {
-          "description": "Returns-verdict of a call-site argument (ADR-023 §3): what the\nfunction-valued argument *returns* — the identity question, so a store\nselector returning a fresh reference is distinguishable from one\nreturning a value-compared primitive. Exactly one of `is`/`not`; the\nnames mirror `ReturnsVerdict` totally — ⊤ (`unknown`) is matchable,\nnever dropped.",
+          "description": "Returns-verdict of a call-site argument (ADR-023 §3): what the\nfunction-valued argument *returns*, the identity question, so a store\nselector returning a fresh reference is distinguishable from one\nreturning a value-compared primitive. Exactly one of `is`/`not`; the\nnames mirror `ReturnsVerdict` totally, so ⊤ (`unknown`) is matchable,\nnever dropped.",
           "type": "object",
           "properties": {
             "is": {
@@ -497,7 +497,7 @@
           ]
         },
         {
-          "description": "Receiver filter on a `calls` row: the root binding a member call was\nmade on (`socket` in `socket.join(r)`). The other half of a callee —\n`name` says which method ran, this says whose. A bare call has no\nreceiver and fails the guard, positive-only like every name filter.\nExactly one of `one_of`/`prefix`.",
+          "description": "Receiver filter on a `calls` row: the root binding a member call was\nmade on (`socket` in `socket.join(r)`). The other half of a callee:\n`name` says which method ran, this says whose. A bare call has no\nreceiver and fails the guard, positive-only like every name filter.\nExactly one of `one_of`/`prefix`.",
           "type": "object",
           "properties": {
             "kind": {
@@ -534,7 +534,7 @@
           ]
         },
         {
-          "description": "Execution phase of a `calls` (#126) or `reads` (#127) row — a total\nmirror of [`PhaseName`], ⊤ included, so a rule that wants \"provably\ndeferred\" says `is: [\"deferred\"]` and one that will accept ⊤ names it.\n\nPositive-only, because the fact is may-typed: `unknown` means the call\nmay run in any phase, and a negated form would let a rule suppress a\nfinding on a ⊤ row.",
+          "description": "Execution phase of a `calls` (#126) or `reads` (#127) row, a total\nmirror of [`PhaseName`], ⊤ included, so a rule that wants \"provably\ndeferred\" says `is: [\"deferred\"]` and one that will accept ⊤ names it.\n\nPositive-only, because the fact is may-typed: `unknown` means the call\nmay run in any phase, and a negated form would let a rule suppress a\nfinding on a ⊤ row.",
           "type": "object",
           "properties": {
             "is": {
@@ -592,7 +592,7 @@
           ]
         },
         {
-          "description": "Import-specifier filter on a custom hook row — the package it was\nimported from (`@chakra-ui/react`), which is how a team bans a\ndependency rather than a local name. Never the resolved path: that is\nabsolute, so matching it would tie a pack to one checkout. A hook with\nno specifier (defined locally, or imported relatively) does not match.\nExactly one of `one_of`/`prefix`.",
+          "description": "Import-specifier filter on a custom hook row: the package it was\nimported from (`@chakra-ui/react`), which is how a team bans a\ndependency rather than a local name. Never the resolved path: that is\nabsolute, so matching it would tie a pack to one checkout. A hook with\nno specifier (defined locally, or imported relatively) does not match.\nExactly one of `one_of`/`prefix`.",
           "type": "object",
           "properties": {
             "kind": {
@@ -629,7 +629,7 @@
           ]
         },
         {
-          "description": "Identity verdict of a `context_providers` row's value (#71). Exactly\none of `is`/`not`; the names mirror `ValueIdentity` totally — ⊤\n(`unknown`) is matchable, never dropped.",
+          "description": "Identity verdict of a `context_providers` row's value (#71). Exactly\none of `is`/`not`; the names mirror `ValueIdentity` totally, so ⊤\n(`unknown`) is matchable, never dropped.",
           "type": "object",
           "properties": {
             "is": {
@@ -666,7 +666,7 @@
           ]
         },
         {
-          "description": "Teardown verdict of an `effect` anchor's own body (#100). Exactly one\nof `is`/`not`; the names mirror `CleanupVerdict` totally — ⊤\n(`unknown`) is matchable, never dropped. `absent` is the only proven\nside (every exit returns nothing), so `is: [\"absent\"]` cannot fire on\na body whose return could not be classified.\n\nADR-023 §1 says the growth path is entities, not guards. This is the\nadmissible exception the shipped vocabulary already established — §3's\n`returns`, then ADR-027's `identity` and `writer_phases`: what §1\nrefuses is a guard naming a *syntactic shape*, and a total mirror of an\nengine verdict read at the anchor's own position names none. There is\nno new entity to grow here — the effect row IS the subject, and the\nverdict is a property of the body it already carries.",
+          "description": "Teardown verdict of an `effect` anchor's own body (#100). Exactly one\nof `is`/`not`; the names mirror `CleanupVerdict` totally, so ⊤\n(`unknown`) is matchable, never dropped. `absent` is the only proven\nside (every exit returns nothing), so `is: [\"absent\"]` cannot fire on\na body whose return could not be classified.\n\nADR-023 §1 says the growth path is entities, not guards. This is the\nadmissible exception the shipped vocabulary already established. §3's\n`returns`, then ADR-027's `identity` and `writer_phases`: what §1\nrefuses is a guard naming a *syntactic shape*, and a total mirror of an\nengine verdict read at the anchor's own position names none. There is\nno new entity to grow here: the effect row IS the subject, and the\nverdict is a property of the body it already carries.",
           "type": "object",
           "properties": {
             "is": {
@@ -703,7 +703,7 @@
           ]
         },
         {
-          "description": "Write-provenance filter on a `writers` row (ADR-027 §4): whether the\nwrite is caller-authored (`direct`) or reached through named inlined\nwrappers (`through` — matched anywhere in the chain, against EXPORTED\nnames, so aliased imports don't escape). At least one of\n`through`/`direct`; a row whose site could not be placed fails both\nforms (positive-only).",
+          "description": "Write-provenance filter on a `writers` row (ADR-027 §4): whether the\nwrite is caller-authored (`direct`) or reached through named inlined\nwrappers (`through`, matched anywhere in the chain, against EXPORTED\nnames, so aliased imports don't escape). At least one of\n`through`/`direct`; a row whose site could not be placed fails both\nforms (positive-only).",
           "type": "object",
           "properties": {
             "direct": {
@@ -740,7 +740,7 @@
           ]
         },
         {
-          "description": "MAY existential over the writers of a state-hook anchor's slot\n(ADR-027 §1 — the #70 join dissolver): passes when some write of the\nslot may run in one of the named phases. A ⊤-phase write (`unknown`)\nsatisfies every query — suppressing a finding on a may-fact would be\na false negative. Positive-only; there is no negated form.",
+          "description": "MAY existential over the writers of a state-hook anchor's slot\n(ADR-027 §1, the #70 join dissolver): passes when some write of the\nslot may run in one of the named phases. A ⊤-phase write (`unknown`)\nsatisfies every query, since suppressing a finding on a may-fact would be\na false negative. Positive-only; there is no negated form.",
           "type": "object",
           "properties": {
             "includes": {
@@ -761,7 +761,7 @@
           ]
         },
         {
-          "description": "How a `writers` row's argument 0 classifies (ADR-028 §2). A total\nmirror of [`UpdaterName`] — ⊤ (`unknown`) is nameable, so a rule that\nwants \"not proven functional\" says so instead of getting it by\naccident. Positive-only: there is no negated form.\n\n`functional` is claimed only for a proven function literal — inline, or\na variable bound exactly once to one. Everything else folds to\n`unknown`, so a rule keyed on it over-reports rather than missing a\nwrite.",
+          "description": "How a `writers` row's argument 0 classifies (ADR-028 §2). A total\nmirror of [`UpdaterName`], so ⊤ (`unknown`) is nameable and a rule that\nwants \"not proven functional\" says so instead of getting it by\naccident. Positive-only: there is no negated form.\n\n`functional` is claimed only for a proven function literal: inline, or\na variable bound exactly once to one. Everything else folds to\n`unknown`, so a rule keyed on it over-reports rather than missing a\nwrite.",
           "type": "object",
           "properties": {
             "is": {
@@ -782,7 +782,7 @@
           ]
         },
         {
-          "description": "Whether a `writers` row's updater body writes to something it does not\nown (ADR-028 §2) — a mutation whose receiver roots at a parameter or a\ncaptured name, or a setter call.\n\nA derived reading of the same `updater` column the [`Guard::Updater`]\nguard classifies, never a second column and never a second pass over\nthe setter argument (ADR-027 §4). A total mirror: `impure` is claimed\nonly for a proven-rooted site, and everything else — including an\nupdater the walk could not resolve to a literal — is `unknown`, so ⊤\ncannot misfire.\n\nIt is a **presence** fact: the site is in the body CFG or it is not, no\nabstract value is read at any program point, so ADR-023 §2's gate does\nnot apply. Whether a call reaches the site is conditional, which caps\nthe class at Warning.",
+          "description": "Whether a `writers` row's updater body writes to something it does not\nown (ADR-028 §2): a mutation whose receiver roots at a parameter or a\ncaptured name, or a setter call.\n\nA derived reading of the same `updater` column the [`Guard::Updater`]\nguard classifies, never a second column and never a second pass over\nthe setter argument (ADR-027 §4). A total mirror: `impure` is claimed\nonly for a proven-rooted site, and everything else, including an\nupdater the walk could not resolve to a literal, is `unknown`, so ⊤\ncannot misfire.\n\nIt is a **presence** fact: the site is in the body CFG or it is not, no\nabstract value is read at any program point, so ADR-023 §2's gate does\nnot apply. Whether a call reaches the site is conditional, which caps\nthe class at Warning.",
           "type": "object",
           "properties": {
             "is": {
@@ -803,7 +803,7 @@
           ]
         },
         {
-          "description": "A `writers` row whose slot may be written **again** in the same tick:\nanother sync write of the same slot in the same region is CFG-reachable\nfrom this one, self-reachability through a back edge included (a lone\nwrite inside a loop co-executes with itself).\n\nThe guard carries no value field, and that is the design: the fact is\nmay-typed in one direction only. Reachability is exact on the CFG, but\nthe walk that found the writes is depth-capped, so \"no other write is\nreachable\" is not a promise the engine can keep — there is no negated\nform to assert it with.",
+          "description": "A `writers` row whose slot may be written **again** in the same tick:\nanother sync write of the same slot in the same region is CFG-reachable\nfrom this one, self-reachability through a back edge included (a lone\nwrite inside a loop co-executes with itself).\n\nThe guard carries no value field, and that is the design: the fact is\nmay-typed in one direction only. Reachability is exact on the CFG, but\nthe walk that found the writes is depth-capped, so \"no other write is\nreachable\" is not a promise the engine can keep, and there is no negated\nform to assert it with.",
           "type": "object",
           "properties": {
             "kind": {
@@ -820,7 +820,7 @@
           ]
         },
         {
-          "description": "Whether a provider of a `context_consumers` row's context sits on a\npath that reaches it (#115).\n\nMAY-typed and positive-only. `none-on-analyzed-paths` is named for what\nit is: what the completed paths showed, never a proof that no provider\nexists — an unanalyzed mounting shell above a root, an inline-arrow\nprovider (#30), or a value-position component reference (#63) all land\nthere. No `must_*` binds the sort, so a rule keyed on it is capped at\nWarning by construction.",
+          "description": "Whether a provider of a `context_consumers` row's context sits on a\npath that reaches it (#115).\n\nMAY-typed and positive-only. `none-on-analyzed-paths` is named for what\nit is: what the completed paths showed, never a proof that no provider\nexists. An unanalyzed mounting shell above a root, an inline-arrow\nprovider (#30), or a value-position component reference (#63) all land\nthere. No `must_*` binds the sort, so a rule keyed on it is capped at\nWarning by construction.",
           "type": "object",
           "properties": {
             "is": {
@@ -862,7 +862,7 @@
           ]
         },
         {
-          "description": "Does an `effect` anchor register a callback that outlives it (#111)?\n\nExistential MAY over the effect's registration rows, filtered by firing\nclass: `repeating` for the ones that keep firing until torn down\n(`setInterval`, `addEventListener`, `subscribe`, `on`, `addListener`),\n`once` for a timeout, a rAF or a promise continuation. Positive-only —\nthe relation is a name-table match, so \"registers nothing\" is not a\npromise the engine keeps and there is no negated form to assert it\nwith.",
+          "description": "Does an `effect` anchor register a callback that outlives it (#111)?\n\nExistential MAY over the effect's registration rows, filtered by firing\nclass: `repeating` for the ones that keep firing until torn down\n(`setInterval`, `addEventListener`, `subscribe`, `on`, `addListener`),\n`once` for a timeout, a rAF or a promise continuation. Positive-only:\nthe relation is a name-table match, so \"registers nothing\" is not a\npromise the engine keeps and there is no negated form to assert it\nwith.",
           "type": "object",
           "properties": {
             "firing": {
@@ -883,7 +883,7 @@
           ]
         },
         {
-          "description": "Whether anything visibly re-syncs a `seeds` row's slot when that prop\nmoves (#106): a render-time write, or an effect whose declared deps\ncover the seed path (or that declares none, so it re-runs every\nrender).\n\nMAY-typed in one direction, and the guard is positive-only for exactly\nthat reason: `synced` is a claim the relation makes from a write it\nsaw, `none-seen` is the absence of one. A setter the component handed\nout could be called from anywhere, so \"no sync exists\" is not a promise\nthe engine keeps — which is why the name is `none-seen` and not\n`unsynced`.\n\nStructurally may-typed: no `must_*` guard binds a seed row, so a rule\nkeyed on this cannot reach Error. `must_frozen_seed` stays native and\nis deliberately not exposed — it certifies a motion proof this relation\ndoes not carry.",
+          "description": "Whether anything visibly re-syncs a `seeds` row's slot when that prop\nmoves (#106): a render-time write, or an effect whose declared deps\ncover the seed path (or that declares none, so it re-runs every\nrender).\n\nMAY-typed in one direction, and the guard is positive-only for exactly\nthat reason: `synced` is a claim the relation makes from a write it\nsaw, `none-seen` is the absence of one. A setter the component handed\nout could be called from anywhere, so \"no sync exists\" is not a promise\nthe engine keeps, which is why the name is `none-seen` and not\n`unsynced`.\n\nStructurally may-typed: no `must_*` guard binds a seed row, so a rule\nkeyed on this cannot reach Error. `must_frozen_seed` stays native and\nis deliberately not exposed: it certifies a motion proof this relation\ndoes not carry.",
           "type": "object",
           "properties": {
             "is": {
@@ -904,7 +904,7 @@
           ]
         },
         {
-          "description": "Who owns the state slot a `render_setter_calls` row writes (#107):\n`local` — the anchored component's own `useState` — or `foreign`, a\n`ComponentSetter`-valued prop the top-down inter-component pass placed\nin this component's environment.\n\n**Naming ownership is what widens the enumeration.** Without this\nguard the sort binds local rows only, exactly as it did before foreign\nrows existed: changing what a shipped sort enumerates changes which\nfindings a shipped pack fires (ADR-027 §2).\n\nTwo-valued and total — every enumerated row is one or the other by\nconstruction — but the *attribution* is may-typed: it is the same\nper-block existential the native `setter-in-render` rule consumes, so a\nvariable that holds the parent's setter on one path and something else\non another still produces a row. Over-reporting, never a miss.",
+          "description": "Who owns the state slot a `render_setter_calls` row writes (#107):\n`local`, the anchored component's own `useState`, or `foreign`, a\n`ComponentSetter`-valued prop the top-down inter-component pass placed\nin this component's environment.\n\n**Naming ownership is what widens the enumeration.** Without this\nguard the sort binds local rows only, exactly as it did before foreign\nrows existed: changing what a shipped sort enumerates changes which\nfindings a shipped pack fires (ADR-027 §2).\n\nTwo-valued and total, since every enumerated row is one or the other by\nconstruction, but the *attribution* is may-typed: it is the same\nper-block existential the native `setter-in-render` rule consumes, so a\nvariable that holds the parent's setter on one path and something else\non another still produces a row. Over-reporting, never a miss.",
           "type": "object",
           "properties": {
             "is": {
@@ -925,7 +925,7 @@
           ]
         },
         {
-          "description": "Shape filter on a `churn_cycles` row (#108): whether the loop spans\nmore than one component, and whether every one of its steps is a\nmust-step. At least one of `cross_component` / `all_must`; the given\nfields are conjoined.\n\nBoth are **exact** booleans — folds of the node table and the edge\nstrengths the graph already computed — so unlike the may-typed verdict\nguards this one has a meaningful negative and takes plain booleans\nrather than a ⊤-bearing name list. What is may-typed is the graph\nitself: a cycle it never saw yields no row at all, which is the\nmissing-findings direction.",
+          "description": "Shape filter on a `churn_cycles` row (#108): whether the loop spans\nmore than one component, and whether every one of its steps is a\nmust-step. At least one of `cross_component` / `all_must`; the given\nfields are conjoined.\n\nBoth are **exact** booleans, folds of the node table and the edge\nstrengths the graph already computed, so unlike the may-typed verdict\nguards this one has a meaningful negative and takes plain booleans\nrather than a ⊤-bearing name list. What is may-typed is the graph\nitself: a cycle it never saw yields no row at all, which is the\nmissing-findings direction.",
           "type": "object",
           "properties": {
             "all_must": {
@@ -962,11 +962,11 @@
           ]
         },
         {
-          "description": "Universal quantification over `anchor.deps` (ADR-023 §4, whose stated\ngate — \"making truncation representable in the IR\" — the `exact` bit\ndischarges): passes when every element satisfies the nested guards.\n\n**Whether ⊤ satisfies is the body's decision, not the quantifier's.**\nThe verdict guards name their own ⊤: `is: [\"stable\"]` means *provably*\nstable and a ⊤ element fails it, exactly as it does under a `forEach`;\n`is: [\"stable\", \"unknown\"]` accepts a list that may conform. Folding\n⊤-satisfies into `every` instead would make the two quantifiers of the\nsame guard disagree about the same fact, and would fire every\n\"all deps stable\" rule on every effect keyed on a ⊤ prop.\n\nPositive-only — there is no negated form, and `not every` is just the\nexistential a `forEach` already writes.\n\nQuantifying needs a domain. A **written** array supplies one even when\na spread hides part of it — the fold ranges over the elements the\nengine can see, and one visible violator refutes ∀ outright. An absent\nor unreadable deps argument supplies no element at all, and a claim\nabout nothing is not a claim the engine may make, so the guard fails\nthere. A list that is known empty quantifies vacuously true; pair with\n`count` when a rule needs at least one element.\n\nNever mints a proof: a `must_*` guard anywhere inside a rule that uses\n`every` is rejected at load time, so an `every`-selected finding cannot\ncarry Error authority for a row a may-fact put there (ADR-021).",
+          "description": "Universal quantification over `anchor.deps` (ADR-023 §4, whose stated\ngate, \"making truncation representable in the IR\", is what the `exact` bit\ndischarges): passes when every element satisfies the nested guards.\n\n**Whether ⊤ satisfies is the body's decision, not the quantifier's.**\nThe verdict guards name their own ⊤: `is: [\"stable\"]` means *provably*\nstable and a ⊤ element fails it, exactly as it does under a `forEach`;\n`is: [\"stable\", \"unknown\"]` accepts a list that may conform. Folding\n⊤-satisfies into `every` instead would make the two quantifiers of the\nsame guard disagree about the same fact, and would fire every\n\"all deps stable\" rule on every effect keyed on a ⊤ prop.\n\nPositive-only: there is no negated form, and `not every` is just the\nexistential a `forEach` already writes.\n\nQuantifying needs a domain. A **written** array supplies one even when\na spread hides part of it, since the fold ranges over the elements the\nengine can see, and one visible violator refutes ∀ outright. An absent\nor unreadable deps argument supplies no element at all, and a claim\nabout nothing is not a claim the engine may make, so the guard fails\nthere. A list that is known empty quantifies vacuously true; pair with\n`count` when a rule needs at least one element.\n\nNever mints a proof: a `must_*` guard anywhere inside a rule that uses\n`every` is rejected at load time, so an `every`-selected finding cannot\ncarry Error authority for a row a may-fact put there (ADR-021).",
           "type": "object",
           "properties": {
             "as": {
-              "description": "Name the element binds under inside `guards`. It is the same slot a\nrule-level `forEach` binding uses, which the quantifier owns for\nits own subtree — so the outer binding is not visible inside, and\nthis name is not visible in the message.",
+              "description": "Name the element binds under inside `guards`. It is the same slot a\nrule-level `forEach` binding uses, which the quantifier owns for\nits own subtree, so the outer binding is not visible inside, and\nthis name is not visible in the message.",
               "type": "string"
             },
             "guards": {
@@ -991,7 +991,7 @@
           ]
         },
         {
-          "description": "Negated existential over an edge of the anchor (#126): passes when\n**no** row satisfies the nested guards.\n\nThe one thing the guard language could not say, and what the wish-list\nkept asking for: \"acquires a resource and releases none\", \"has a `value`\nprop and no `onChange`\", \"subscribes and never reads the current value\".\nA `forEach` is the existential; this is its negation, and neither can be\nwritten as the other.\n\n**The unsound direction is the safe one here.** Every relation it can\nquantify over may under-enumerate — a depth-capped walk, a callee it\ncould not resolve — and a missing row makes `none` pass, so the rule\nfires where it should not. That is a false positive, which this project\naccepts; the direction it never takes is losing a finding.\n\nNever mints a proof, exactly like `every`: a `must_*` anywhere in a rule\nthat uses it is rejected at load time.",
+          "description": "Negated existential over an edge of the anchor (#126): passes when\n**no** row satisfies the nested guards.\n\nThe one thing the guard language could not say, and what the wish-list\nkept asking for: \"acquires a resource and releases none\", \"has a `value`\nprop and no `onChange`\", \"subscribes and never reads the current value\".\nA `forEach` is the existential; this is its negation, and neither can be\nwritten as the other.\n\n**The unsound direction is the safe one here.** Every relation it can\nquantify over may under-enumerate, a depth-capped walk or a callee it\ncould not resolve, and a missing row makes `none` pass, so the rule\nfires where it should not. That is a false positive, which this project\naccepts; the direction it never takes is losing a finding.\n\nNever mints a proof, exactly like `every`: a `must_*` anywhere in a rule\nthat uses it is rejected at load time.",
           "type": "object",
           "properties": {
             "as": {
@@ -1009,7 +1009,7 @@
               "const": "none"
             },
             "of": {
-              "description": "`anchor.<edge>` — the same spelling `count` and `every` use, and\ntyped by the same table `forEach` navigation reads.",
+              "description": "`anchor.<edge>`, the same spelling `count` and `every` use, and\ntyped by the same table `forEach` navigation reads.",
               "type": "string"
             }
           },
@@ -1021,7 +1021,7 @@
           ]
         },
         {
-          "description": "Cardinality of `anchor.<edge>` (only `anchor.deps` in v1). Exactly one\ncomparator.\n\nAn elision keeps the count exact — `[a, , b]` declares three entries,\neven though lowering can only show two. A spread leaves a lower bound\ninstead, and the guard then answers what that bound **refutes**,\npassing otherwise: `[a, …, g, ...rest]` provably holds more than five.\nRefusing an open-ended list outright would delete findings, which is\nthe one direction this project does not trade. With no written array at\nall there is nothing to count and the guard fails — `deps_declared` is\nthe guard that asks whether one was passed.",
+          "description": "Cardinality of `anchor.<edge>` (only `anchor.deps` in v1). Exactly one\ncomparator.\n\nAn elision keeps the count exact: `[a, , b]` declares three entries,\neven though lowering can only show two. A spread leaves a lower bound\ninstead, and the guard then answers what that bound **refutes**,\npassing otherwise: `[a, …, g, ...rest]` provably holds more than five.\nRefusing an open-ended list outright would delete findings, which is\nthe one direction this project does not trade. With no written array at\nall there is nothing to count and the guard fails. `deps_declared` is\nthe guard that asks whether one was passed.",
           "type": "object",
           "properties": {
             "equals": {
@@ -1219,7 +1219,7 @@
       ]
     },
     "IdentityName": {
-      "description": "Total mirror of `ValueIdentity` (#71): what a provider's `value` hands\nconsumers across renders. Two-valued on purpose — `fresh-every-render` is\na proven fact, everything else is `unknown` (may side, never actionable).",
+      "description": "Total mirror of `ValueIdentity` (#71): what a provider's `value` hands\nconsumers across renders. Two-valued on purpose: `fresh-every-render` is\na proven fact, everything else is `unknown` (may side, never actionable).",
       "type": "string",
       "enum": [
         "fresh-every-render",
@@ -1235,7 +1235,7 @@
           "const": "impure"
         },
         {
-          "description": "⊤ — nothing provable was found, the updater is not a resolvable\nliteral, or the receiver could not be rooted.",
+          "description": "⊤: nothing provable was found, the updater is not a resolvable\nliteral, or the receiver could not be rooted.",
           "type": "string",
           "const": "unknown"
         }
@@ -1639,7 +1639,7 @@
           ]
         },
         {
-          "description": "Proved deferred (timer, microtask, promise continuation) — never\ninside a React phase.",
+          "description": "Proved deferred (timer, microtask, promise continuation), never\ninside a React phase.",
           "type": "string",
           "const": "deferred"
         },
@@ -1733,7 +1733,7 @@
       "type": "object",
       "properties": {
         "description": {
-          "description": "One line — what the rule detects (`reactant rules`).",
+          "description": "One line saying what the rule detects (`reactant rules`).",
           "type": "string"
         },
         "example": {
@@ -1817,7 +1817,7 @@
           "const": "functional"
         },
         {
-          "description": "⊤ — a value expression, a call, an argument the walk could not resolve,\nor no argument at all.",
+          "description": "⊤: a value expression, a call, an argument the walk could not resolve,\nor no argument at all.",
           "type": "string",
           "const": "unknown"
         }

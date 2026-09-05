@@ -1,4 +1,4 @@
-// GENERATED from schemas/pack.schema.json by scripts/gen-pack-dts.js — do not edit.
+// GENERATED from schemas/pack.schema.json by scripts/gen-pack-dts.js. Do not edit.
 // The schema and the validator compile from the same Rust types, so these
 // TypeScript types cannot drift from what the core accepts.
 //
@@ -14,7 +14,7 @@
 export interface PackFile {
   /**
    * Editor-facing schema URL; not interpreted. Accepted for the same reason
-   * `reactant.config.json` accepts it — a published schema is only useful if
+   * `reactant.config.json` accepts it: a published schema is only useful if
    * the file is allowed to point at it.
    */
   "$schema"?: string | null;
@@ -30,7 +30,7 @@ export interface PackFile {
 }
 
 /**
- * The anchor: a relation the engine has already resolved (ADR-022 §1) —
+ * The anchor: a relation the engine has already resolved (ADR-022 §1),
  * never a syntax pattern.
  */
 export type Anchor = {
@@ -61,7 +61,7 @@ export type Anchor = {
 
 /**
  * Total mirror of `CleanupVerdict` (#100): what an effect body returns, seen
- * as teardown. `absent` is the claim — every exit returns nothing at all —
+ * as teardown. `absent` is the claim, every exit returns nothing at all, and
  * and `unknown` folds to the may side (there may be a cleanup), so it is
  * matchable but never actionable as an absence.
  */
@@ -76,7 +76,7 @@ export type ElementsName = "any" | "component" | "host";
 
 /**
  * What happens to a finding whose must-guard did not certify: `keep` (the
- * default — it survives as a Warning-ceiling finding, ADR-022 §3's free
+ * default, so it survives as a Warning-ceiling finding, ADR-022 §3's free
  * stratification) or `drop` (explicit opt-in for qualification-style rules).
  */
 export type ElseBehavior = "keep" | "drop";
@@ -89,7 +89,7 @@ export type FiringName = "repeating" | "once";
 
 /**
  * Typed navigation from the anchor (ADR-022 §2): at most one edge, one
- * binding — no joins.
+ * binding, no joins.
  */
 export interface ForEach {
   "as": string;
@@ -99,7 +99,7 @@ export interface ForEach {
 /**
  * A guard: a predicate over an engine verdict. `must_*` guards certify
  * (attach the `Certified` proof on `All`); the others filter. The `must_`
- * prefix makes polarity visible in the JSON — the §3 load-time warning is
+ * prefix makes polarity visible in the JSON, and the §3 load-time warning is
  * a prefix scan.
  */
 export type Guard = {
@@ -204,7 +204,7 @@ export type Guard = {
   /**
    * Name the element binds under inside `guards`. It is the same slot a
    * rule-level `forEach` binding uses, which the quantifier owns for
-   * its own subtree — so the outer binding is not visible inside, and
+   * its own subtree, so the outer binding is not visible inside, and
    * this name is not visible in the message.
    */
   "as": string;
@@ -220,7 +220,7 @@ export type Guard = {
   "guards": Guard[];
   "kind": "none";
   /**
-   * `anchor.<edge>` — the same spelling `count` and `every` use, and
+   * `anchor.<edge>`, the same spelling `count` and `every` use, and
    * typed by the same table `forEach` navigation reads.
    */
   "of": string;
@@ -263,7 +263,7 @@ export type HookKindFilter = "state" | "effect" | "memo" | "callback" | "ref" | 
 
 /**
  * Total mirror of `ValueIdentity` (#71): what a provider's `value` hands
- * consumers across renders. Two-valued on purpose — `fresh-every-render` is
+ * consumers across renders. Two-valued on purpose: `fresh-every-render` is
  * a proven fact, everything else is `unknown` (may side, never actionable).
  */
 export type IdentityName = "fresh-every-render" | "unknown";
@@ -399,7 +399,7 @@ export interface RuleDef {
  */
 export interface RuleDocs {
   /**
-   * One line — what the rule detects (`reactant rules`).
+   * One line saying what the rule detects (`reactant rules`).
    */
   "description": string;
   /**

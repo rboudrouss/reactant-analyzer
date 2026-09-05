@@ -1,11 +1,11 @@
-//! Serde model of `pack.json` (ADR-022 §5) — the single source of truth for
+//! Serde model of `pack.json` (ADR-022 §5), the single source of truth for
 //! the published JSON schema (schemars derives, behind `schema-gen`).
 //!
 //! Deserialization strategy: everything is derived, including the
 //! internally-tagged `Guard`/`Anchor` enums. serde cannot enforce
 //! `deny_unknown_fields` on internally-tagged enums, so unknown-key checks
 //! for guards and anchors are done by the validator against the raw JSON
-//! value (`validate::check_unknown_keys`) — same loudness, exact paths.
+//! value (`validate::check_unknown_keys`): same loudness, exact paths.
 
 use std::collections::BTreeMap;
 
@@ -19,7 +19,7 @@ use schemars::JsonSchema;
 #[serde(deny_unknown_fields)]
 pub struct PackFile {
     /// Editor-facing schema URL; not interpreted. Accepted for the same reason
-    /// `reactant.config.json` accepts it — a published schema is only useful if
+    /// `reactant.config.json` accepts it: a published schema is only useful if
     /// the file is allowed to point at it.
     #[serde(rename = "$schema", default)]
     pub schema: Option<String>,
@@ -61,7 +61,7 @@ pub struct RuleDef {
 #[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RuleDocs {
-    /// One line — what the rule detects (`reactant rules`).
+    /// One line saying what the rule detects (`reactant rules`).
     pub description: String,
     /// Why it matters (`reactant explain`).
     pub why: String,
@@ -103,7 +103,7 @@ pub enum ParamType {
     StringList,
 }
 
-/// The anchor: a relation the engine has already resolved (ADR-022 §1) —
+/// The anchor: a relation the engine has already resolved (ADR-022 §1),
 /// never a syntax pattern.
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
@@ -116,14 +116,14 @@ pub enum Anchor {
     },
     /// Alias-resolved setter calls in the render body.
     RenderSetterCalls,
-    /// Non-hook call sites in the render body (#126, ADR-036) — the same
+    /// Non-hook call sites in the render body (#126, ADR-036): the same
     /// relation the `calls` edge exposes, anchored where there is no hook to
     /// hang an edge on. `router.push(…)` during render lives here.
     ///
     /// A `name` guard is mandatory, for the same reason it is on the edge.
     RenderCalls,
     /// One `hook_provenance` row: every hook call whose identity the engine
-    /// resolved, *surviving* custom-hook inlining (ADR-027 §7 — the #6 fix:
+    /// resolved, *surviving* custom-hook inlining (ADR-027 §7, the #6 fix:
     /// a resolved hook keeps no `hook_calls` row of kind `custom`, so
     /// identity rules anchor here). `name` reads the origin hook's name,
     /// `source` its import specifier; the row carries no kind and no edges.
@@ -142,7 +142,7 @@ pub enum Anchor {
     /// application or a host element.
     ///
     /// `elements` selects which kinds are enumerated and defaults to
-    /// `component` — what the relation has always meant, and the only place a
+    /// `component`, the only meaning the relation has, and the only place a
     /// prop is compared by `Object.is` across a memo boundary. `host` binds
     /// `<input ref={r} value={v}/>` instead, and `any` binds both. It is an
     /// anchor option rather than a widening-by-guard because it changes which
@@ -153,8 +153,8 @@ pub enum Anchor {
         elements: Option<ElementsName>,
     },
     /// One element the render body builds (#126): the anchor `jsx_props`
-    /// could not be, because a rule about a prop's *absence* — `<input
-    /// value={v}/>` with no `onChange` — needs the element as the subject and
+    /// could not be, because a rule about a prop's *absence*, `<input
+    /// value={v}/>` with no `onChange`, needs the element as the subject and
     /// its props as an edge.
     ///
     /// `name` is the component name or the host tag, `kind` says which.
@@ -168,7 +168,7 @@ pub enum Anchor {
     /// effect of THIS component that carries one of its edges (#108,
     /// ADR-029). Edge-less: `cycle` renders the loop as `a → b → a`, and the
     /// `cycle` guard filters on the two exact folds the graph already
-    /// computed — whether the loop spans components, and whether every step
+    /// computed: whether the loop spans components, and whether every step
     /// is a must-step.
     ///
     /// A row's identity is the carrying edge's write site (ADR-024), so a
@@ -180,7 +180,7 @@ pub enum Anchor {
     /// the `provider` guard says whether any component that may render this one
     /// provides that same cell.
     ///
-    /// A row exists only when every ancestor chain is complete — inter-analysed,
+    /// A row exists only when every ancestor chain is complete: inter-analysed,
     /// non-recursive, and not mentioned by any component phase 1 never reached.
     /// The verdict is an ABSENCE, and an absence is only as good as the paths
     /// you can see, so an incomplete closure produces no row rather than a
@@ -196,7 +196,7 @@ pub enum Anchor {
     /// The relation is a **may**-registration: a match on the registrar name
     /// table, never a proof that the callee is the host primitive. That is
     /// wontfix #42's accepted-FP decision, now extended to the public
-    /// vocabulary — so the polarity is capped at may/Warning, no `must_*`
+    /// vocabulary, so the polarity is capped at may/Warning, no `must_*`
     /// binds this sort, and Error is unreachable through the anchor.
     /// Edge-less; the `teardown` guard carries the pairing fact.
     ///
@@ -215,7 +215,7 @@ pub enum Anchor {
 #[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum ElementsName {
-    /// Resolved component applications only — the default.
+    /// Resolved component applications only. The default.
     Component,
     /// Host elements only (`<div/>`, `<input/>`).
     Host,
@@ -236,7 +236,7 @@ pub enum HookKindFilter {
 }
 
 /// Typed navigation from the anchor (ADR-022 §2): at most one edge, one
-/// binding — no joins.
+/// binding, no joins.
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -263,18 +263,18 @@ pub enum EdgeName {
     /// per **call site**, spliced wrappers' setter params included. Two
     /// `setCount(…)` calls in one body are two rows; one write a local helper
     /// contributes is one row however many times the helper is called.
-    /// `{w.region}` is the lexical body — exact; `{w.phase}` is a MAY verdict,
+    /// `{w.region}` is the lexical body, exact; `{w.phase}` is a MAY verdict,
     /// `unknown` = may run in any phase.
     Writers,
     /// Non-hook call sites in the anchor's body CFG (#126, ADR-036): one row
     /// per call the setter walk passes, carrying the callee `name`, the
-    /// `receiver` root of a member call, and the `phase` it runs in — the same
+    /// `receiver` root of a member call, and the `phase` it runs in, the same
     /// lattice the writer rows use, so a call in a `.then`, after an `await`,
     /// or in the effect's returned cleanup is distinguishable from one in the
     /// body.
     ///
     /// Unbounded, unlike every other relation: it enumerates *every* call.
-    /// A `name` guard on the bound row is therefore **mandatory** — a rule
+    /// A `name` guard on the bound row is therefore **mandatory**, since a rule
     /// that fires on "some call" fires on all of them.
     Calls,
     /// Props of an `elements` anchor's element (#126): the same rows
@@ -283,12 +283,12 @@ pub enum EdgeName {
     Props,
     /// Readers of a state-hook anchor's slot (#127, ADR-037): one row per read
     /// site, over the same regions the `writers` edge enumerates. `{r.region}`
-    /// is the lexical body — exact; `{r.phase}` is the same MAY verdict, so a
+    /// is the lexical body, exact; `{r.phase}` is the same MAY verdict, so a
     /// read in a `.then` continuation or a cleanup is distinguishable from one
     /// in the render body.
     ///
-    /// A read the walk never entered — inside a closure nothing calls, past the
-    /// depth cap — contributes no row, so the ABSENCE of rows is not a proof
+    /// A read the walk never entered, inside a closure nothing calls or past the
+    /// depth cap, contributes no row, so the ABSENCE of rows is not a proof
     /// that the slot is unread. `none` over this edge reads as "no read the
     /// analysis could see", and over-reports rather than losing a finding.
     Reads,
@@ -298,20 +298,20 @@ pub enum EdgeName {
     /// the slot when that prop moves.
     ///
     /// A slot whose initializer reads no prop has no rows, so a rule on this
-    /// edge is silent on it by construction — that is knowledge, not a filter.
+    /// edge is silent on it by construction, which is knowledge, not a filter.
     Seeds,
 }
 
 /// A guard: a predicate over an engine verdict. `must_*` guards certify
 /// (attach the `Certified` proof on `All`); the others filter. The `must_`
-/// prefix makes polarity visible in the JSON — the §3 load-time warning is
+/// prefix makes polarity visible in the JSON, and the §3 load-time warning is
 /// a prefix scan.
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Guard {
     /// Stability verdict of a deps entry. Exactly one of `is`/`not`; the
-    /// verdict names mirror `StabilityVerdict` totally — ⊤ (`unknown`) can
+    /// verdict names mirror `StabilityVerdict` totally, so ⊤ (`unknown`) can
     /// be matched but never silently dropped.
     Stability {
         of: String,
@@ -321,10 +321,10 @@ pub enum Guard {
         not: Option<PVal<Vec<StabilityName>>>,
     },
     /// Returns-verdict of a call-site argument (ADR-023 §3): what the
-    /// function-valued argument *returns* — the identity question, so a store
+    /// function-valued argument *returns*, the identity question, so a store
     /// selector returning a fresh reference is distinguishable from one
     /// returning a value-compared primitive. Exactly one of `is`/`not`; the
-    /// names mirror `ReturnsVerdict` totally — ⊤ (`unknown`) is matchable,
+    /// names mirror `ReturnsVerdict` totally, so ⊤ (`unknown`) is matchable,
     /// never dropped.
     Returns {
         of: String,
@@ -364,7 +364,7 @@ pub enum Guard {
         prefix: Option<PVal<String>>,
     },
     /// Receiver filter on a `calls` row: the root binding a member call was
-    /// made on (`socket` in `socket.join(r)`). The other half of a callee —
+    /// made on (`socket` in `socket.join(r)`). The other half of a callee:
     /// `name` says which method ran, this says whose. A bare call has no
     /// receiver and fails the guard, positive-only like every name filter.
     /// Exactly one of `one_of`/`prefix`.
@@ -375,7 +375,7 @@ pub enum Guard {
         #[serde(default)]
         prefix: Option<PVal<String>>,
     },
-    /// Execution phase of a `calls` (#126) or `reads` (#127) row — a total
+    /// Execution phase of a `calls` (#126) or `reads` (#127) row, a total
     /// mirror of [`PhaseName`], ⊤ included, so a rule that wants "provably
     /// deferred" says `is: ["deferred"]` and one that will accept ⊤ names it.
     ///
@@ -397,7 +397,7 @@ pub enum Guard {
         #[serde(default)]
         prefix: Option<PVal<String>>,
     },
-    /// Import-specifier filter on a custom hook row — the package it was
+    /// Import-specifier filter on a custom hook row: the package it was
     /// imported from (`@chakra-ui/react`), which is how a team bans a
     /// dependency rather than a local name. Never the resolved path: that is
     /// absolute, so matching it would tie a pack to one checkout. A hook with
@@ -411,7 +411,7 @@ pub enum Guard {
         prefix: Option<PVal<String>>,
     },
     /// Identity verdict of a `context_providers` row's value (#71). Exactly
-    /// one of `is`/`not`; the names mirror `ValueIdentity` totally — ⊤
+    /// one of `is`/`not`; the names mirror `ValueIdentity` totally, so ⊤
     /// (`unknown`) is matchable, never dropped.
     Identity {
         of: String,
@@ -421,17 +421,17 @@ pub enum Guard {
         not: Option<PVal<Vec<IdentityName>>>,
     },
     /// Teardown verdict of an `effect` anchor's own body (#100). Exactly one
-    /// of `is`/`not`; the names mirror `CleanupVerdict` totally — ⊤
+    /// of `is`/`not`; the names mirror `CleanupVerdict` totally, so ⊤
     /// (`unknown`) is matchable, never dropped. `absent` is the only proven
     /// side (every exit returns nothing), so `is: ["absent"]` cannot fire on
     /// a body whose return could not be classified.
     ///
     /// ADR-023 §1 says the growth path is entities, not guards. This is the
-    /// admissible exception the shipped vocabulary already established — §3's
+    /// admissible exception the shipped vocabulary already established. §3's
     /// `returns`, then ADR-027's `identity` and `writer_phases`: what §1
     /// refuses is a guard naming a *syntactic shape*, and a total mirror of an
     /// engine verdict read at the anchor's own position names none. There is
-    /// no new entity to grow here — the effect row IS the subject, and the
+    /// no new entity to grow here: the effect row IS the subject, and the
     /// verdict is a property of the body it already carries.
     Cleanup {
         of: String,
@@ -442,7 +442,7 @@ pub enum Guard {
     },
     /// Write-provenance filter on a `writers` row (ADR-027 §4): whether the
     /// write is caller-authored (`direct`) or reached through named inlined
-    /// wrappers (`through` — matched anywhere in the chain, against EXPORTED
+    /// wrappers (`through`, matched anywhere in the chain, against EXPORTED
     /// names, so aliased imports don't escape). At least one of
     /// `through`/`direct`; a row whose site could not be placed fails both
     /// forms (positive-only).
@@ -454,20 +454,20 @@ pub enum Guard {
         direct: Option<PVal<bool>>,
     },
     /// MAY existential over the writers of a state-hook anchor's slot
-    /// (ADR-027 §1 — the #70 join dissolver): passes when some write of the
+    /// (ADR-027 §1, the #70 join dissolver): passes when some write of the
     /// slot may run in one of the named phases. A ⊤-phase write (`unknown`)
-    /// satisfies every query — suppressing a finding on a may-fact would be
+    /// satisfies every query, since suppressing a finding on a may-fact would be
     /// a false negative. Positive-only; there is no negated form.
     WriterPhases {
         of: String,
         includes: PVal<Vec<PhaseName>>,
     },
     /// How a `writers` row's argument 0 classifies (ADR-028 §2). A total
-    /// mirror of [`UpdaterName`] — ⊤ (`unknown`) is nameable, so a rule that
+    /// mirror of [`UpdaterName`], so ⊤ (`unknown`) is nameable and a rule that
     /// wants "not proven functional" says so instead of getting it by
     /// accident. Positive-only: there is no negated form.
     ///
-    /// `functional` is claimed only for a proven function literal — inline, or
+    /// `functional` is claimed only for a proven function literal: inline, or
     /// a variable bound exactly once to one. Everything else folds to
     /// `unknown`, so a rule keyed on it over-reports rather than missing a
     /// write.
@@ -476,14 +476,14 @@ pub enum Guard {
         is: PVal<Vec<UpdaterName>>,
     },
     /// Whether a `writers` row's updater body writes to something it does not
-    /// own (ADR-028 §2) — a mutation whose receiver roots at a parameter or a
+    /// own (ADR-028 §2): a mutation whose receiver roots at a parameter or a
     /// captured name, or a setter call.
     ///
     /// A derived reading of the same `updater` column the [`Guard::Updater`]
     /// guard classifies, never a second column and never a second pass over
     /// the setter argument (ADR-027 §4). A total mirror: `impure` is claimed
-    /// only for a proven-rooted site, and everything else — including an
-    /// updater the walk could not resolve to a literal — is `unknown`, so ⊤
+    /// only for a proven-rooted site, and everything else, including an
+    /// updater the walk could not resolve to a literal, is `unknown`, so ⊤
     /// cannot misfire.
     ///
     /// It is a **presence** fact: the site is in the body CFG or it is not, no
@@ -502,7 +502,7 @@ pub enum Guard {
     /// The guard carries no value field, and that is the design: the fact is
     /// may-typed in one direction only. Reachability is exact on the CFG, but
     /// the walk that found the writes is depth-capped, so "no other write is
-    /// reachable" is not a promise the engine can keep — there is no negated
+    /// reachable" is not a promise the engine can keep, and there is no negated
     /// form to assert it with.
     SameTick { of: String },
     /// Whether a provider of a `context_consumers` row's context sits on a
@@ -510,7 +510,7 @@ pub enum Guard {
     ///
     /// MAY-typed and positive-only. `none-on-analyzed-paths` is named for what
     /// it is: what the completed paths showed, never a proof that no provider
-    /// exists — an unanalyzed mounting shell above a root, an inline-arrow
+    /// exists. An unanalyzed mounting shell above a root, an inline-arrow
     /// provider (#30), or a value-position component reference (#63) all land
     /// there. No `must_*` binds the sort, so a rule keyed on it is capped at
     /// Warning by construction.
@@ -537,7 +537,7 @@ pub enum Guard {
     /// Existential MAY over the effect's registration rows, filtered by firing
     /// class: `repeating` for the ones that keep firing until torn down
     /// (`setInterval`, `addEventListener`, `subscribe`, `on`, `addListener`),
-    /// `once` for a timeout, a rAF or a promise continuation. Positive-only —
+    /// `once` for a timeout, a rAF or a promise continuation. Positive-only:
     /// the relation is a name-table match, so "registers nothing" is not a
     /// promise the engine keeps and there is no negated form to assert it
     /// with.
@@ -554,19 +554,19 @@ pub enum Guard {
     /// that reason: `synced` is a claim the relation makes from a write it
     /// saw, `none-seen` is the absence of one. A setter the component handed
     /// out could be called from anywhere, so "no sync exists" is not a promise
-    /// the engine keeps — which is why the name is `none-seen` and not
+    /// the engine keeps, which is why the name is `none-seen` and not
     /// `unsynced`.
     ///
     /// Structurally may-typed: no `must_*` guard binds a seed row, so a rule
     /// keyed on this cannot reach Error. `must_frozen_seed` stays native and
-    /// is deliberately not exposed — it certifies a motion proof this relation
+    /// is deliberately not exposed: it certifies a motion proof this relation
     /// does not carry.
     SeedSync {
         of: String,
         is: PVal<Vec<SeedSyncName>>,
     },
     /// Who owns the state slot a `render_setter_calls` row writes (#107):
-    /// `local` — the anchored component's own `useState` — or `foreign`, a
+    /// `local`, the anchored component's own `useState`, or `foreign`, a
     /// `ComponentSetter`-valued prop the top-down inter-component pass placed
     /// in this component's environment.
     ///
@@ -575,8 +575,8 @@ pub enum Guard {
     /// rows existed: changing what a shipped sort enumerates changes which
     /// findings a shipped pack fires (ADR-027 §2).
     ///
-    /// Two-valued and total — every enumerated row is one or the other by
-    /// construction — but the *attribution* is may-typed: it is the same
+    /// Two-valued and total, since every enumerated row is one or the other by
+    /// construction, but the *attribution* is may-typed: it is the same
     /// per-block existential the native `setter-in-render` rule consumes, so a
     /// variable that holds the parent's setter on one path and something else
     /// on another still produces a row. Over-reporting, never a miss.
@@ -589,8 +589,8 @@ pub enum Guard {
     /// must-step. At least one of `cross_component` / `all_must`; the given
     /// fields are conjoined.
     ///
-    /// Both are **exact** booleans — folds of the node table and the edge
-    /// strengths the graph already computed — so unlike the may-typed verdict
+    /// Both are **exact** booleans, folds of the node table and the edge
+    /// strengths the graph already computed, so unlike the may-typed verdict
     /// guards this one has a meaningful negative and takes plain booleans
     /// rather than a ⊤-bearing name list. What is may-typed is the graph
     /// itself: a cycle it never saw yields no row at all, which is the
@@ -603,7 +603,7 @@ pub enum Guard {
         all_must: Option<PVal<bool>>,
     },
     /// Universal quantification over `anchor.deps` (ADR-023 §4, whose stated
-    /// gate — "making truncation representable in the IR" — the `exact` bit
+    /// gate, "making truncation representable in the IR", is what the `exact` bit
     /// discharges): passes when every element satisfies the nested guards.
     ///
     /// **Whether ⊤ satisfies is the body's decision, not the quantifier's.**
@@ -614,11 +614,11 @@ pub enum Guard {
     /// same guard disagree about the same fact, and would fire every
     /// "all deps stable" rule on every effect keyed on a ⊤ prop.
     ///
-    /// Positive-only — there is no negated form, and `not every` is just the
+    /// Positive-only: there is no negated form, and `not every` is just the
     /// existential a `forEach` already writes.
     ///
     /// Quantifying needs a domain. A **written** array supplies one even when
-    /// a spread hides part of it — the fold ranges over the elements the
+    /// a spread hides part of it, since the fold ranges over the elements the
     /// engine can see, and one visible violator refutes ∀ outright. An absent
     /// or unreadable deps argument supplies no element at all, and a claim
     /// about nothing is not a claim the engine may make, so the guard fails
@@ -632,7 +632,7 @@ pub enum Guard {
         of: String,
         /// Name the element binds under inside `guards`. It is the same slot a
         /// rule-level `forEach` binding uses, which the quantifier owns for
-        /// its own subtree — so the outer binding is not visible inside, and
+        /// its own subtree, so the outer binding is not visible inside, and
         /// this name is not visible in the message.
         #[serde(rename = "as")]
         r#as: String,
@@ -648,8 +648,8 @@ pub enum Guard {
     /// written as the other.
     ///
     /// **The unsound direction is the safe one here.** Every relation it can
-    /// quantify over may under-enumerate — a depth-capped walk, a callee it
-    /// could not resolve — and a missing row makes `none` pass, so the rule
+    /// quantify over may under-enumerate, a depth-capped walk or a callee it
+    /// could not resolve, and a missing row makes `none` pass, so the rule
     /// fires where it should not. That is a false positive, which this project
     /// accepts; the direction it never takes is losing a finding.
     ///
@@ -657,7 +657,7 @@ pub enum Guard {
     /// that uses it is rejected at load time.
     #[serde(rename = "none")]
     NoneOf {
-        /// `anchor.<edge>` — the same spelling `count` and `every` use, and
+        /// `anchor.<edge>`, the same spelling `count` and `every` use, and
         /// typed by the same table `forEach` navigation reads.
         of: String,
         /// Name the row binds under inside `guards`, owned by the quantifier
@@ -669,13 +669,13 @@ pub enum Guard {
     /// Cardinality of `anchor.<edge>` (only `anchor.deps` in v1). Exactly one
     /// comparator.
     ///
-    /// An elision keeps the count exact — `[a, , b]` declares three entries,
+    /// An elision keeps the count exact: `[a, , b]` declares three entries,
     /// even though lowering can only show two. A spread leaves a lower bound
     /// instead, and the guard then answers what that bound **refutes**,
     /// passing otherwise: `[a, …, g, ...rest]` provably holds more than five.
     /// Refusing an open-ended list outright would delete findings, which is
     /// the one direction this project does not trade. With no written array at
-    /// all there is nothing to count and the guard fails — `deps_declared` is
+    /// all there is nothing to count and the guard fails. `deps_declared` is
     /// the guard that asks whether one was passed.
     Count {
         of: String,
@@ -727,7 +727,7 @@ pub enum Guard {
 }
 
 /// What happens to a finding whose must-guard did not certify: `keep` (the
-/// default — it survives as a Warning-ceiling finding, ADR-022 §3's free
+/// default, so it survives as a Warning-ceiling finding, ADR-022 §3's free
 /// stratification) or `drop` (explicit opt-in for qualification-style rules).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
@@ -760,7 +760,7 @@ pub enum StabilityName {
 pub enum ImpureName {
     /// A mutation rooted at a parameter or a captured name, or a setter call.
     Impure,
-    /// ⊤ — nothing provable was found, the updater is not a resolvable
+    /// ⊤: nothing provable was found, the updater is not a resolvable
     /// literal, or the receiver could not be rooted.
     Unknown,
 }
@@ -773,7 +773,7 @@ pub enum UpdaterName {
     /// Proven a function literal: `set(prev => …)`, or a variable bound
     /// exactly once to one.
     Functional,
-    /// ⊤ — a value expression, a call, an argument the walk could not resolve,
+    /// ⊤: a value expression, a call, an argument the walk could not resolve,
     /// or no argument at all.
     Unknown,
 }
@@ -854,7 +854,7 @@ pub enum PhaseName {
     Memo,
     Callback,
     Handler,
-    /// Proved deferred (timer, microtask, promise continuation) — never
+    /// Proved deferred (timer, microtask, promise continuation), never
     /// inside a React phase.
     Deferred,
     /// An effect's returned cleanup function.
@@ -863,7 +863,7 @@ pub enum PhaseName {
 }
 
 /// Total mirror of `ValueIdentity` (#71): what a provider's `value` hands
-/// consumers across renders. Two-valued on purpose — `fresh-every-render` is
+/// consumers across renders. Two-valued on purpose: `fresh-every-render` is
 /// a proven fact, everything else is `unknown` (may side, never actionable).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[cfg_attr(feature = "schema-gen", derive(JsonSchema))]
@@ -874,7 +874,7 @@ pub enum IdentityName {
 }
 
 /// Total mirror of `CleanupVerdict` (#100): what an effect body returns, seen
-/// as teardown. `absent` is the claim — every exit returns nothing at all —
+/// as teardown. `absent` is the claim, every exit returns nothing at all, and
 /// and `unknown` folds to the may side (there may be a cleanup), so it is
 /// matchable but never actionable as an absence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -897,7 +897,7 @@ pub enum ReturnsName {
 }
 
 /// Value-or-parameter: a leaf constant position that accepts either a JSON
-/// value of type `T` or `{"$param": "<name>"}` (ADR-022 §4 — parameters are
+/// value of type `T` or `{"$param": "<name>"}` (ADR-022 §4, parameters are
 /// values, never structure).
 #[derive(Debug, Clone, PartialEq)]
 pub enum PVal<T> {

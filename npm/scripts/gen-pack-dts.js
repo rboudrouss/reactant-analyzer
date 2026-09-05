@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Generate lib/pack.d.ts from schemas/pack.schema.json — the SAME schemars
+// Generate lib/pack.d.ts from schemas/pack.schema.json, the SAME schemars
 // output the validator compiles from, so the TS types cannot drift from what
 // the core accepts (ADR-023 §5: ship a .d.ts generated from the same types
 // as pack.schema.json). Run by build.sh after the schemas are written;
@@ -20,7 +20,7 @@ function main() {
     const disk = fs.existsSync(OUT) ? fs.readFileSync(OUT, "utf8") : "";
     if (disk !== text) {
       process.stderr.write(
-        "lib/pack.d.ts is stale — regenerate with `node scripts/gen-pack-dts.js`\n",
+        "lib/pack.d.ts is stale, regenerate with `node scripts/gen-pack-dts.js`\n",
       );
       process.exit(1);
     }
@@ -110,7 +110,7 @@ function sanitizeName(name) {
 }
 
 function render(schema) {
-  const header = `// GENERATED from schemas/pack.schema.json by scripts/gen-pack-dts.js — do not edit.
+  const header = `// GENERATED from schemas/pack.schema.json by scripts/gen-pack-dts.js. Do not edit.
 // The schema and the validator compile from the same Rust types, so these
 // TypeScript types cannot drift from what the core accepts.
 //
