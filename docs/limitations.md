@@ -26,9 +26,7 @@ page is the second.
 
 ## Confirmed defects
 
-These drop or falsify information the analysis then relies on. The audit that
-opened this section ran on 2026-08-27 with six entries; four have shipped since
-and are listed under "Recently fixed" at the end of this page.
+These drop or falsify information the analysis then relies on.
 
 | Shape in your code | Effect | Issue |
 |---|---|---|
@@ -294,20 +292,3 @@ Rules that would re-do eslint AST pattern-matching (raw exhaustive-deps,
 rules-of-hooks, index-as-key, naming) are explicitly out of scope. Proposed
 *semantic* rules that only abstract interpretation can catch: `stale-update`
 [#61](https://github.com/rboudrouss/reactant-analyzer/issues/61) and `async-setState-race` [#62](https://github.com/rboudrouss/reactant-analyzer/issues/62).
-
-## Recently fixed
-
-Entries this page used to carry, kept here for a release or two so a reader
-coming back with an old copy can tell what moved. Each links to the measurement.
-
-| Was | Fixed by |
-|---|---|
-| A `finally` reached from a `try` body that returned was never lowered, and a write present only in the `catch` was reported as certain | [#2](https://github.com/rboudrouss/reactant-analyzer/issues/2), [precision-log](precision-log.md#2-trycatchfinally-is-control-flow-2026-09-04) |
-| A hook called inside returned JSX or reached through a `return` produced no hook entry | [#4](https://github.com/rboudrouss/reactant-analyzer/issues/4), [precision-log](precision-log.md#4-and-5-a-hook-in-a-terminator-a-concise-body-2026-09-04) |
-| A `kind: "custom"` pack anchor was the only way to write an identity rule, and it was blind to resolved hooks | [#6](https://github.com/rboudrouss/reactant-analyzer/issues/6), ADR-027 §7 |
-| An import alias resolving outside the analysed set was located, never read, and never reported | [#9](https://github.com/rboudrouss/reactant-analyzer/issues/9), [#138](https://github.com/rboudrouss/reactant-analyzer/issues/138) |
-| A setter nested deeper than four closures was missed, the depth cap standing in for a cycle guard | [#45](https://github.com/rboudrouss/reactant-analyzer/issues/45) |
-| Class bodies inside a component were not lowered, hiding a setter called from a method | [#77](https://github.com/rboudrouss/reactant-analyzer/issues/77) |
-| The bitwise, shift, `~`, `typeof` and unary `+` operators evaluated to ⊤ | [#74](https://github.com/rboudrouss/reactant-analyzer/issues/74), [#75](https://github.com/rboudrouss/reactant-analyzer/issues/75) |
-| The setter slot of a tuple-returning hook such as jotai's `useAtom` read ⊤ | [#37](https://github.com/rboudrouss/reactant-analyzer/issues/37), [precision-log](precision-log.md#2026-09-03-a-tuple-contract-is-indexed-by-position) |
-| The `writers` relation collapsed two same-slot writes in one body into one row | [#105](https://github.com/rboudrouss/reactant-analyzer/issues/105) |
