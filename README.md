@@ -129,7 +129,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: check
-        uses: rboudrouss/reactant-analyzer@v0.3.0
+        uses: rboudrouss/reactant-analyzer@v0.4.0
         with:
           path: .                # the project root, so tsconfig aliases load
           fail-on: error         # warnings annotate the PR but don't fail it
