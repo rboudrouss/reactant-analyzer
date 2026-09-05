@@ -22,7 +22,7 @@ projects are detected on their own, tsconfig `paths` included.
 // src/page.tsx
 import { useData } from "./hooks/useData";
 
-function Page() {
+export function Page() {
   const data = useData(0);
   return <div>{data}</div>;
 }
@@ -30,7 +30,9 @@ function Page() {
 
 ```ts
 // src/hooks/useData.ts
-function useData(initial) {
+import { useState, useEffect } from "react";
+
+export function useData(initial: number) {
   const [value, setValue] = useState(initial);
   useEffect(() => {
     setValue(value + 1);        // writes the state its own deps watch
@@ -39,20 +41,11 @@ function useData(initial) {
 }
 ```
 
-```
-$ npx reactant-analyzer check src/
-
-  Page  (1 hooks)  src/page.tsx
-    warn   infinite-loop  [hook:1]  (src/hooks/useData.ts:4:2)  this effect keeps
-    pushing state `value` (its deps do not provably gate it, so the effect can
-    re-run every render) to new values on every run. Potential infinite render loop
-       (2 trace step(s), rerun with --trace)
-
-⚠  1 warning(s) across 2 file(s).
-```
+![reactant reporting an infinite render loop that spans two files](docs/demo.svg)
 
 ESLint says nothing here. `useData` lives in another file, and inside that file
-the deps array is correct.
+the deps array is correct. `--trace` prints the chain behind the finding: which
+call writes the slot, and why its value never settled.
 
 ## What it catches
 

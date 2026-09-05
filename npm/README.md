@@ -22,7 +22,7 @@ npx reactant-analyzer check src/
 // src/page.tsx
 import { useData } from "./hooks/useData";
 
-function Page() {
+export function Page() {
   const data = useData(0);
   return <div>{data}</div>;
 }
@@ -30,7 +30,9 @@ function Page() {
 
 ```ts
 // src/hooks/useData.ts
-function useData(initial) {
+import { useState, useEffect } from "react";
+
+export function useData(initial: number) {
   const [value, setValue] = useState(initial);
   useEffect(() => {
     setValue(value + 1);        // writes the state its own deps watch
@@ -41,12 +43,16 @@ function useData(initial) {
 
 ```
   Page  (1 hooks)  src/page.tsx
-    warn   infinite-loop  [hook:1]  (src/hooks/useData.ts:4:2)  this effect keeps
+    warn   infinite-loop  [hook:1]  (src/hooks/useData.ts:5:2)  this effect keeps
     pushing state `value` (its deps do not provably gate it, so the effect can
     re-run every render) to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
 
 ⚠  1 warning(s) across 2 file(s).
 ```
+
+ESLint says nothing here. `useData` lives in another file, and inside that file
+the deps array is correct.
 
 Vite and Next.js projects are detected on their own: router-aware discovery,
 tsconfig `paths` and `baseUrl` followed across files, and under the Next App
