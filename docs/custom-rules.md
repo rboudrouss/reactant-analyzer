@@ -1,286 +1,283 @@
-# Règles custom : écrire un pack de règles
+# Custom rules: writing a rule pack
 
-Ce document explique comment écrire ses propres règles pour reactant : ce
-qu'un pack peut faire, la syntaxe complète, et comment le brancher sur un
-projet. Le modèle est décidé dans
-[ADR-022](adr/ADR-022-custom-rule-frontends-distribution.md), et son
-vocabulaire étendu par [ADR-023](adr/ADR-023-tier-a-vocabulary-growth.md).
+This document covers writing your own rules for reactant: what a pack can do,
+the full syntax, and how to wire one into a project. The model is decided in
+[ADR-022](adr/ADR-022-custom-rule-frontends-distribution.md), and its
+vocabulary extended by [ADR-023](adr/ADR-023-tier-a-vocabulary-growth.md).
 
-## L'idée
+## The idea
 
-Une règle custom ne fait pas de pattern-matching sur le code source. Ça,
-c'est le travail d'ESLint. Elle interroge des faits que le moteur a déjà
-prouvés : appels de hooks résolus à travers les alias et les hooks inlinés
-cross-file, appels de setters, entrées de deps arrays avec leur verdict de
-stabilité. C'est ce qui la rend robuste au refactoring et à l'indirection.
-Renommer un setter, le passer en prop ou l'envelopper dans un hook custom ne
-fait pas échapper le code à la règle.
+A custom rule does not pattern-match source code. That is ESLint's job. It
+queries facts the engine has already proven: hook calls resolved through
+aliases and through cross-file inlined hooks, setter calls, deps array entries
+with their stability verdict. That is what makes it survive refactoring and
+indirection. Renaming a setter, passing it as a prop or wrapping it in a custom
+hook does not get the code out of the rule's reach.
 
-Concrètement, une règle dit : « prends chaque *ancre* (par exemple chaque
-appel `useEffect`), navigue vers ses voisins (ses deps, les setters de son
-corps), applique des *guards* (prédicats sur les verdicts du moteur), et si
-tout passe, émets ce *message* ».
+Concretely, a rule says: take every *anchor* (every `useEffect` call, say),
+navigate to its neighbours (its deps, the setters in its body), apply *guards*
+(predicates over the engine's verdicts), and if all of them pass, emit this
+*message*.
 
-## Utiliser un pack (côté consommateur)
+## Using a pack (the consumer side)
 
-Un pack est un fichier `pack.json`, ou un paquet npm qui en contient un.
-On le déclare dans `reactant.config.json` à la racine du projet :
+A pack is a `pack.json` file, or an npm package containing one. You declare it
+in `reactant.config.json` at the project root:
 
 ```jsonc
 {
   "$schema": "./node_modules/reactant-analyzer/schemas/reactant-config.schema.json",
   "packs": [
-    "@team/react-rules",     // paquet npm (champ "reactant" de son package.json)
-    "./rules/pack.json"      // ou chemin relatif au fichier de config
+    "@team/react-rules",     // npm package (the "reactant" field of its package.json)
+    "./rules/pack.json"      // or a path relative to the config file
   ],
   "rules": {
-    // les règles d'un pack s'adressent "nom-du-pack/nom-de-la-règle"
+    // a pack's rules are addressed "pack-name/rule-name"
     "team/oversized-effect": { "severity": "warning", "options": { "maxDeps": 8 } },
     "team/banned-hook": "off"
   }
 }
 ```
 
-Les règles de pack se comportent exactement comme les natives :
+Pack rules behave exactly like the native ones:
 
 ```sh
-reactant check src/ --rule team/banned-hook     # ne lancer que celle-là
+reactant check src/ --rule team/banned-hook     # run only this one
 reactant check src/ --ignore-rule team/banned-hook
-reactant rules                                  # les liste avec les natives
-reactant explain team/banned-hook               # affiche ses docs
+reactant rules                                  # lists them alongside the natives
+reactant explain team/banned-hook               # prints its docs
 ```
 
-Leurs findings ont des witness chains (`--trace`), sortent dans le JSON, et
-leurs Errors font échouer `--fail-on` comme les règles natives.
+Their findings carry witness chains (`--trace`), appear in the JSON output, and
+their Errors fail `--fail-on` the way native rules do.
 
-## Anatomie d'une règle
+## Anatomy of a rule
 
 ```jsonc
 {
   "$schema": "./node_modules/reactant-analyzer/schemas/pack.schema.json",
-  "schemaVersion": 1,          // seule version existante
-  "name": "team",              // namespace : les règles s'adressent team/<id>
+  "schemaVersion": 1,          // the only version there is
+  "name": "team",              // namespace: rules are addressed team/<id>
   "rules": [
     {
       "id": "self-retriggering-effect",
-      "docs": {                // OBLIGATOIRE, pack rejeté sinon
-        "description": "un effect écrit un state slot listé dans ses propres deps",
-        "why": "L'écriture change une dep, qui relance l'effect, qui réécrit : boucle infinie.",
-        "fix": "Dériver la valeur au render, ou retirer le slot des deps et utiliser l'updater fonctionnel.",
-        "example": "useEffect(() => { setCount(count + 1) }, [count])"   // optionnel
+      "docs": {                // MANDATORY, the pack is rejected without it
+        "description": "an effect writes a state slot listed in its own deps",
+        "why": "The write changes a dep, which re-runs the effect, which writes again: infinite loop.",
+        "fix": "Derive the value during render, or drop the slot from the deps and use the functional updater.",
+        "example": "useEffect(() => { setCount(count + 1) }, [count])"   // optional
       },
-      "severity": "error",     // un PLAFOND souhaité, pas une garantie (voir plus bas)
+      "severity": "error",     // a desired CEILING, not a guarantee (see below)
 
-      // 1. L'ancre : une relation déjà résolue par le moteur
+      // 1. The anchor: a relation the engine has already resolved
       "anchor": { "relation": "hook_calls", "kind": "effect" },
 
-      // 2. Navigation typée (optionnelle) : au plus une arête, un binding
+      // 2. Typed navigation (optional): at most one edge, one binding
       "forEach": { "edge": "body_setter_calls", "as": "setter" },
 
-      // 3. Les guards : une conjonction de prédicats sur des verdicts
+      // 3. The guards: a conjunction of predicates over verdicts
       "guards": [
         { "kind": "in_deps", "of": "setter" },
         { "kind": "must_setter_on_all_paths", "of": "setter" }
       ],
 
-      // 4. Le message, avec interpolation des entités naviguées
-      "message": "cet effect écrit {setter.slot}, qui est dans son propre deps array"
+      // 4. The message, interpolating the navigated entities
+      "message": "this effect writes {setter.slot}, which is in its own deps array"
     }
   ]
 }
 ```
 
-Lecture : pour chaque appel de hook de kind `effect` (l'ancre), pour chaque
-appel de setter dans son corps (`forEach`), si le slot écrit figure dans les
-deps de l'effect et que le moteur prouve que l'écriture a lieu sur tous les
-chemins (`must_*` = certifié), émettre le finding.
+Read it as: for every hook call of kind `effect` (the anchor), for every setter
+call in its body (`forEach`), if the written slot appears in the effect's deps
+and the engine proves the write happens on every path (`must_*` = certified),
+emit the finding.
 
-## Référence de syntaxe
+## Syntax reference
 
-### Le pack
+### The pack
 
-| Champ | Rôle |
+| Field | Role |
 |-------|------|
-| `schemaVersion` | `1` (seule version). |
-| `name` | Namespace du pack. Les règles s'adressent `<name>/<id>`. |
-| `rules` | La liste des règles. |
-| `$schema` | Optionnel, pour l'autocomplétion éditeur (non interprété). |
+| `schemaVersion` | `1` (the only version). |
+| `name` | The pack's namespace. Rules are addressed `<name>/<id>`. |
+| `rules` | The list of rules. |
+| `$schema` | Optional, for editor autocompletion (not interpreted). |
 
-### Une règle (`RuleDef`)
+### A rule (`RuleDef`)
 
-| Champ | Requis | Rôle |
-|-------|--------|------|
-| `id` | oui | Nom de la règle, sans `/` (le `/` est réservé au namespace). Une collision avec un nom natif rejette le pack. |
-| `docs` | oui | `description` (une ligne, pour `reactant rules`), `why`, `fix` ; `example` optionnel. Sans docs, le pack est rejeté au chargement. |
-| `severity` | oui | `"error"`, `"warning"` ou `"info"`. Un plafond (voir « Sévérité »). |
-| `anchor` | oui | La relation de départ. |
-| `forEach` | non | Une arête de navigation + un nom de binding. |
-| `guards` | non | Conjonction de prédicats (défaut : vide, la règle fire sur chaque ancre). |
-| `message` | oui | Template du message. |
-| `params` | non | Paramètres configurables (voir « Paramètres »). |
+| Field | Required | Role |
+|-------|----------|------|
+| `id` | yes | The rule's name, without `/` (the `/` is reserved for the namespace). A collision with a native name rejects the pack. |
+| `docs` | yes | `description` (one line, for `reactant rules`), `why`, `fix`; `example` optional. Without docs the pack is rejected at load time. |
+| `severity` | yes | `"error"`, `"warning"` or `"info"`. A ceiling (see "Severity"). |
+| `anchor` | yes | The starting relation. |
+| `forEach` | no | One navigation edge plus a binding name. |
+| `guards` | no | A conjunction of predicates (default: empty, the rule fires on every anchor). |
+| `message` | yes | The message template. |
+| `params` | no | Configurable parameters (see "Parameters"). |
 
-### Les ancres (`anchor`)
+### Anchors (`anchor`)
 
-| Relation | Ce qu'elle sélectionne |
-|----------|------------------------|
-| `hook_calls` | Chaque appel de hook du composant, y compris ceux atteints via des hooks custom inlinés cross-file. Filtre optionnel `"kind"` : `state`, `effect`, `memo`, `callback`, `ref`, `custom`, `handler`. |
-| `render_setter_calls` | Chaque appel de setter dans le corps du render, résolu à travers les alias. |
-| `hook_origins` | Chaque ligne de provenance : tout appel de hook dont l'identité est résolue, **y compris** ceux que l'inlining a dissous. C'est l'ancre des règles d'identité (bannir un hook, imposer un wrapper) : contrairement à `hook_calls` + `kind: "custom"`, elle voit aussi les hooks que le moteur a résolus. Sans `kind`, sans arête ; `name` = nom d'origine du hook, `source` = spécificateur d'import brut. |
+| Relation | What it selects |
+|----------|-----------------|
+| `hook_calls` | Every hook call in the component, including those reached through cross-file inlined custom hooks. Optional `"kind"` filter: `state`, `effect`, `memo`, `callback`, `ref`, `custom`, `handler`. |
+| `render_setter_calls` | Every setter call in the render body, resolved through aliases. |
+| `hook_origins` | Every provenance row: any hook call whose identity is resolved, **including** the ones inlining dissolved. This is the anchor for identity rules (banning a hook, mandating a wrapper): unlike `hook_calls` + `kind: "custom"`, it also sees the hooks the engine resolved. No `kind`, no edge; `name` = the hook's origin name, `source` = the raw import specifier. |
+| `context_providers` | Every `<Ctx.Provider value={…}>` element in the render body whose `Ctx` is a module-level `createContext` the engine proved (#71). Render-only by semantics: a provider built inside a `useMemo` keeps its identity. `name` = the context binding, `identity` = the value's identity verdict. No `kind`, no edge. |
+| `jsx_props` | Every prop of every element the render body builds, including inside a callback it runs synchronously, so `items.map(it => <Row/>)` is enumerated (#125). Optional `elements` filter: `component` (the default, resolved component applications, the only place a prop is compared with `Object.is` at a memo boundary), `host` (`<input ref={r} value={v}/>`), or `any`. Inside a list callback there is no analysed env, so `identity` answers `fresh-every-render` for an allocation written in place and `unknown` otherwise; an element built inside an event handler is never enumerated. `name` = the element (the tag, for a host element), `prop` = the prop name, `kind` = `component` or `host`, `identity` = the value's identity verdict. Which children memoize is unknown: name them with a `name` guard. No edge. |
+| `churn_cycles` | Every render loop in the **program's** churn graph, projected onto the effect of THIS component that carries one of its steps (#108). A whole-program relation without a whole-program schema: the row stays a fact about a single component, so the single-anchor rule holds. `cycle` = the path (`a → b → a`, each node qualified by its owning component). A row's identity is the write site of the carrying edge (ADR-024): an edge with no span produces no row. No `kind`, no edge, and no `must_*` accepts this kind, so Error is unreachable. |
+| `registrations` | Every callback registration in this component's effect bodies (#111): a call that hands a callback to something outliving the effect. `name` = the registrar as written (`setInterval`, `socket.addEventListener`, `.then`), `firing` is `repeating` or `once`, `identity` is the listener's site identity verdict, `fresh-every-render` for an inline literal or a name bound once to something allocated each pass, `unknown` otherwise. The relation is a **may** registration: a match against the name table, never a proof that the callee is the host primitive (wontfix decision #42 to accept those false positives, extended to the public vocabulary). Warning ceiling, since no `must_*` accepts this kind. No `kind`, no edge; the pairing fact is the `teardown` guard. |
+| `context_consumers` | Every `useContext` call in this component whose ancestry is **complete** (#115). `name` = the local name the call reads the context through; the `provider` guard says whether a component that may render this one provides the same cell. A row exists only if the whole ancestor chain is inter-analysed, non-recursive, and mentioned by no component phase 1 never reached: the verdict is an ABSENCE, and an absence is worth only what the visible paths are worth. No edge; no `must_*` accepts this kind. |
+| `elements` | Every **element** the render body builds, among the requested kinds (#126). This is the anchor `jsx_props` could not be, because a rule about a prop's *absence* (`<input value={v}/>` with no `onChange`) needs the element as its subject and the props as an edge. Same optional `elements` filter and same default (`component`). `name` = the component name or the host tag, `kind` says which. One edge: `props`. |
+| `render_calls` | Every **named non-hook call** in the render body (#126), the same relation as the `calls` edge, anchored where there is no hook to hang an edge off (`router.push(…)` during render). `name` = the callee (the method, for a member call), `receiver` = the root binding it is called on, `phase` = the phase it runs in. A `name` guard is **mandatory**: the relation enumerates every call, so without one the rule fires on all of them. Warning ceiling, since no `must_*` accepts this kind. |
 
-| `context_providers` | Chaque élément `<Ctx.Provider value={…}>` du corps du render dont `Ctx` est un `createContext` prouvé au niveau module (#71). Render-only par sémantique (un provider construit dans un `useMemo` garde son identité). `name` = le binding du contexte, `identity` = le verdict d'identité de la value. Sans `kind`, sans arête. |
-| `jsx_props` | Chaque prop de chaque élément que le corps de rendu construit — y compris à l'intérieur d'un callback qu'il exécute synchroniquement, donc `items.map(it => <Row/>)` est énuméré (#125). `elements` optionnel : `component` (défaut — les applications de composant résolues, seul endroit où une prop est comparée par `Object.is` à une frontière de mémo), `host` (`<input ref={r} value={v}/>`), ou `any`. Dans un callback de liste il n'y a pas d'env analysé, donc `identity` répond `fresh-every-render` pour une allocation écrite sur place et `unknown` sinon ; un élément construit dans un gestionnaire d'événement n'est jamais énuméré. `name` = l'élément (le tag, pour un élément hôte), `prop` = le nom de la prop, `kind` = `component` ou `host`, `identity` = le verdict d'identité de la valeur. Quels enfants mémoïsent est inconnu : nommez-les avec une garde `name`. Pas d'arête. |
-| `churn_cycles` | Chaque boucle de rendu du graphe de churn du **programme**, projetée sur l'effet de CE composant qui en porte une étape (#108). Une relation whole-program sans schéma whole-program : la ligne reste un fait sur un seul composant, donc l'ancre unique tient. `cycle` = le chemin (`a → b → a`, chaque nœud qualifié par son composant propriétaire). L'identité d'une ligne est le site d'écriture de l'arête porteuse (ADR-024) : une arête sans span ne produit aucune ligne. Sans `kind`, sans arête, et aucun `must_*` n'accepte cette sorte — Error inatteignable. |
-| `registrations` | Chaque enregistrement de callback dans les corps d'effet de ce composant (#111) : un appel qui confie un callback à quelque chose qui survit à l'effet. `name` = le registrar tel qu'écrit (`setInterval`, `socket.addEventListener`, `.then`), `firing` vaut `repeating` ou `once`, `identity` est le verdict d'identité de site du listener — `fresh-every-render` pour un littéral inline ou un nom lié une seule fois alloué à chaque tour, `unknown` sinon. La relation est un enregistrement **may** : une correspondance avec la table de noms, jamais une preuve que le callee est la primitive hôte (décision wontfix #42 d'accepter ces FP, étendue au vocabulaire public). Plafond Warning — aucun `must_*` n'accepte cette sorte. Pas de `kind`, pas d'arête ; le fait d'appariement est la garde `teardown`. |
-| `context_consumers` | Chaque appel `useContext` de ce composant dont l'ascendance est **complète** (#115). `name` = le nom local par lequel l'appel lit le contexte ; la garde `provider` dit si un composant susceptible de rendre celui-ci fournit la même cellule. Une ligne n'existe que si toute la chaîne d'ancêtres est inter-analysée, non récursive, et n'est mentionnée par aucun composant que la phase 1 n'a jamais atteint : le verdict est une ABSENCE, et une absence ne vaut que ce que valent les chemins visibles. Sans arête ; aucun `must_*` n'accepte cette sorte. |
-| `elements` | Chaque **élément** que le corps de rendu construit, parmi les sortes demandées (#126) — l'ancre que `jsx_props` ne pouvait pas être, car une règle sur l'*absence* d'une prop (`<input value={v}/>` sans `onChange`) a besoin de l'élément comme sujet et de ses props comme arête. Même filtre `elements` optionnel et même défaut (`component`). `name` = le nom du composant ou le tag hôte, `kind` dit lequel. Une seule arête : `props`. |
-| `render_calls` | Chaque **appel non-hook nommé** du corps de rendu (#126) — la même relation que l'arête `calls`, ancrée là où il n'y a aucun hook auquel accrocher une arête (`router.push(…)` pendant le rendu). `name` = le callee (la méthode, pour un appel membre), `receiver` = le binding racine sur lequel il est appelé, `phase` = la phase où il s'exécute. Une garde `name` est **obligatoire** : la relation énumère tous les appels, donc sans elle la règle se déclenche sur tous. Plafond Warning — aucun `must_*` n'accepte cette sorte. |
+There is deliberately no syntactic anchor, no "every function call", no AST
+pattern: a rule that cannot be expressed semantically is refused, never
+emulated.
 
-Il n'y a volontairement aucune ancre syntaxique (pas de « tout appel de
-fonction », pas de pattern AST) : une règle inexprimable sémantiquement est
-refusée, jamais émulée.
+### Navigation (`forEach`)
 
-### La navigation (`forEach`)
+At most one edge, one binding. No join between two free anchors.
 
-Au plus une arête, un binding. Pas de jointure entre deux ancres libres.
+| Edge | From | What it enumerates |
+|------|------|--------------------|
+| `deps` | effect / memo / callback | The declared entries of the deps array. |
+| `body_setter_calls` | effect (and hooks with bodies) | The setter calls in the body, resolved through aliases. |
+| `args` | `custom` hook | The call site's arguments (accepts the `returns` guard, not `stability`). |
+| `writers` | `state` hook | The writers of the anchor's slot: one row per (region, alias-resolved setter variable, sync vs nested), spliced wrappers included. `{w.region}` = the lexical body (exact); `{w.phase}` = a MAY verdict (`unknown` = can run in any phase). |
+| `reads` | `state` hook | The read sites of a `state` anchor's slot (#127): one row per read, over the same regions as `writers`. `{r.region}` = the lexical body (exact); `{r.phase}` = the same MAY verdict, so a read inside a `.then` continuation or a cleanup is distinguishable from a read in the render body; `{r.name}` = the binding written in place, possibly an alias. No `setter` and no `via`: those are write-provenance facts. A read the walk never entered (a closure nothing calls, past the depth cap) produces no row, so an ABSENCE of rows is not a proof that the slot is unread. `none` over this edge over-reports rather than lose a finding. |
+| `props` | `elements` anchor | The props of the anchored element (#126), the same rows as `jsx_props`, grouped under the element carrying them, so `none of anchor.props` can ask whether one is missing. |
+| `seeds` | `state` hook | The prop seeds of a `state` anchor's slot (#106): one row per prop path the `useState` initializer reads. `{s.path}` = the path as written; the `seed_sync` guard says whether anything visibly resyncs the slot when that prop moves. A slot whose initializer reads no prop has no rows, which is knowledge, not a filter. |
+| `calls` | effect / memo / callback / handler | Every **named non-hook call** in the anchor's body (#126): `name` = the callee (the method, for a member call), `receiver` = the root binding of a member call, `phase` = the phase the walk ran it in, the writers' lattice, so a call inside a `.then`, after an `await`, or in the returned cleanup is distinguishable from one in the body. A callee that is neither a name nor a member (an IIFE, an array element) produces no row. A `name` guard on the bound row is **mandatory**, at the top level and not inside an `any_of`: this is the only unbounded relation. Warning ceiling, since no `must_*` accepts this kind. Argument values stay out of scope (#67). |
 
-| Arête | Depuis | Ce qu'elle énumère |
-|-------|--------|--------------------|
-| `deps` | effect / memo / callback | Les entrées déclarées du deps array. |
-| `body_setter_calls` | effect (et hooks à corps) | Les appels de setters dans le corps, résolus via alias. |
-| `args` | hook `custom` | Les arguments du site d'appel (admet le guard `returns`, pas `stability`). |
-| `writers` | hook `state` | Les écrivains du slot de l'ancre : une ligne par (région, variable setter résolue par alias, sync vs imbriqué), wrappers splicés compris. `{w.region}` = le corps lexical (exact) ; `{w.phase}` = verdict MAY (`unknown` = peut tourner dans n'importe quelle phase). |
-| `reads` | Les sites de lecture du slot d'une ancre `state` (#127) : une ligne par lecture, sur les mêmes régions que `writers`. `{r.region}` = le corps lexical (exact) ; `{r.phase}` = le même verdict MAY, donc une lecture dans une continuation `.then` ou un cleanup se distingue d'une lecture du corps de rendu ; `{r.name}` = le binding écrit sur place, éventuellement un alias. Pas de `setter` ni de `via` : ce sont des faits de provenance d'écriture. Une lecture où la marche n'est jamais entrée (une closure que rien n'appelle, au-delà de la limite de profondeur) ne produit aucune ligne : une ABSENCE de lignes n'est donc pas une preuve que le slot n'est pas lu — `none` sur cette arête sur-rapporte au lieu de perdre un constat. |
-| `props` | Les props de l'élément ancré (#126) — les mêmes lignes que `jsx_props`, groupées sous l'élément qui les porte, pour que `none of anchor.props` puisse demander s'il en manque une. |
-| `seeds` | Les graines-prop du slot d'une ancre `state` (#106) : une ligne par chemin de prop que l'initialisateur `useState` lit. `{s.path}` = le chemin tel qu'écrit ; la garde `seed_sync` dit si quelque chose resynchronise visiblement le slot quand cette prop bouge. Un slot dont l'initialisateur ne lit aucune prop n'a aucune ligne — c'est du savoir, pas un filtre. |
-| `calls` | Chaque **appel non-hook nommé** du corps de l'ancre (#126), pour effect/memo/callback/handler : `name` = le callee (la méthode, pour un appel membre), `receiver` = le binding racine d'un appel membre, `phase` = la phase où la marche l'a exécuté — le treillis des writers, donc un appel dans un `.then`, après un `await`, ou dans le cleanup retourné se distingue d'un appel du corps. Un callee qui n'est ni un nom ni un membre (une IIFE, un élément de tableau) ne produit aucune ligne. Une garde `name` sur la ligne liée est **obligatoire**, au niveau supérieur et non dans un `any_of` : c'est la seule relation non bornée. Plafond Warning — aucun `must_*` n'accepte cette sorte. Les valeurs d'arguments restent hors sujet (#67). |
+### Guards
 
-### Les guards
+The `guards` list is a conjunction: all of them must pass. Each guard targets a
+binding through `"of"`: `"anchor"`, the name given in `forEach.as`, or
+`"anchor.deps"` for `count`.
 
-La liste `guards` est une conjonction : tous doivent passer. Chaque guard
-vise un binding via `"of"` : `"anchor"`, le nom donné dans `forEach.as`, ou
-`"anchor.deps"` pour `count`.
+Filtering guards (the finding stays capped at Warning):
 
-Guards filtrants (le finding reste plafonné Warning) :
+| Kind | Predicate | Fields |
+|------|-----------|--------|
+| `stability` | A dep's stability verdict at render exit. | Exactly one of `is` / `not`, listing among `stable`, `versioned`, `per-render`, `unknown`. |
+| `returns` | What a custom hook's function argument *returns* (a store selector returning a fresh reference vs a primitive). | Exactly one of `is` / `not`, among `stable`, `fresh-reference`, `unknown`. |
+| `origin` | A hook call's provenance: resolved identity (`useLayoutEffect` even when reached through an alias) and/or called directly in the component vs through an inlined wrapper hook. | At least one of `hook` (list of names) / `direct` (bool). A row without provenance fails. |
+| `in_deps` | The slot the setter writes appears in the anchor's deps. | Optional `negate`. |
+| `identity` | The identity verdict of a `context_providers` row's value, of a `jsx_props` row's prop, or of an `args` entry read at the call's own block (#112): `fresh-every-render` (a new reference every render, a must-fact) or `unknown` (⊤, never actionable). | Exactly one of `is` / `not`, non-empty list. |
+| `cleanup` | The teardown verdict of an `effect` anchor's body: `absent` (every exit returns nothing, the only proven side), `present`, or `unknown` (⊤, folded to the may side: it never reads as an absence). Says nothing about what the effect registers, so the rule must restrict itself. | Exactly one of `is` / `not`, non-empty list. `kind: "effect"` anchors only. |
+| `provenance` | A `writers` row's provenance: a direct write (`direct`) or one reached through named inlined wrappers (`through`, matched anywhere in the chain, against EXPORTED names, so an aliased import does not escape it). A row that cannot be placed fails both forms. | At least one of `through` (list) / `direct` (bool). |
+| `writer_phases` | A MAY existential over the writers of a `state` anchor's slot: passes if a write of the slot *can* run in one of the named phases. A ⊤ write (`unknown`) satisfies any query, since suppressing a finding on a may-fact would be a false negative. Positive only, no negated form. | `includes`, non-empty list among `render`, `effect`, `memo`, `callback`, `handler`, `deferred` (timer, microtask or promise continuation, proven outside any React phase), `cleanup` (a function returned from an effect), `unknown`. |
+| `updater` | The classification of a `writers` row's argument 0 (ADR-028 §2). A total mirror: `functional` is claimed only for a proven function literal (inline, or a variable bound exactly once to one); everything else falls into `unknown` (⊤). Positive only, no negated form: a rule wanting "not proven functional" names `unknown` explicitly. | `is`, non-empty list among `functional`, `unknown`. |
+| `provider` | Is a provider of the context a `context_consumers` row reads on a path that reaches it (#115)? May-typed and positive only: `none-on-analyzed-paths` is named for what it is, what the completed paths showed, never a proof that no provider exists. The unanalysed mounting shell above a root, inline-arrow providers (#30) and component references in value position (#63) all land there. No `must_*` binds this kind: a Warning ceiling by construction. | `is`, non-empty list among `provider-seen`, `none-on-analyzed-paths`. |
+| `teardown` | Does anything visibly take back a `registrations` row (#111): the effect's cleanup releases that registration, matched on **the value the teardown identifies it by**, the listener binding for `removeEventListener` / `off`, the handle the call returned for `clearInterval`, or that same handle *invoked* for the returned-disposer idiom (`const u = s.subscribe(f); return () => u()`). A registration that takes itself back (`addEventListener(t, h, {once: true})`) is matched outright. May-typed in one direction only, hence positive only, exactly like `seed_sync`: `paired` is a claim drawn from a teardown that was read, `none-seen` is the absence of such a teardown, and an unreadable cleanup and a listener that is not a resolvable name both land there. Matching the teardown's *name* alone would certify precisely the shape a "fresh listener" rule exists to catch: the binding is the fact. | `is`, non-empty list among `paired`, `none-seen`. |
+| `registers` | Does an `effect` anchor register a callback that outlives it (#111)? A MAY existential over the effect's registration rows, filtered by firing class. Positive only: the relation is a name match, so "registers nothing" is not a promise the engine keeps, and there is no negated form to assert it. | `firing`, non-empty list among `repeating`, `once`. `kind: "effect"` anchors only. |
+| `seed_sync` | Does anything visibly resync a `seeds` row's slot when that prop moves (#106): a render-time write, or an effect whose declared deps cover the seed's path (or which declares none at all, so it re-runs every render). May-typed in one direction only, which is why the guard is positive only: `synced` is a claim drawn from a write that was seen, `none-seen` is the absence of such a write. A setter the component let escape can be called from anywhere, so "no sync exists" is not a promise the engine keeps, hence the name `none-seen` and not `unsynced`. No `must_*` binds a `seeds` row: Error is structurally unreachable, and `must_frozen_seed` stays native. | `is`, non-empty list among `synced`, `none-seen`. |
+| `slot_ownership` | Who owns the slot a `render_setter_calls` row writes: `local` (the anchored component's own state) or `foreign` (a prop valued `ComponentSetter`, a parent setter the downward inter-component pass placed here). **Naming the ownership is what widens the enumeration**: without this guard the kind binds only local rows, exactly as before foreign rows existed, since changing what an already-published kind enumerates changes which findings a published pack fires. Two values, total; the owner attribution itself is may-typed (the same one the native rule consumes, #119). | `is`, non-empty list among `local`, `foreign`. |
+| `cycle` | The shape of a `churn_cycles` row: does the loop cross several components, and is every one of its steps a must-step? Both are **exact booleans**, folds of the node table and edge strengths the graph already computed, so unlike the may-typed verdict guards this one has a negative that means something, and takes booleans rather than a list of names carrying ⊤. What is may-typed is the graph itself: a loop it did not see produces no row. | At least one of `cross_component` / `all_must` (bool), conjoined. |
+| `same_tick` | Can the `writers` row co-execute with another write of the same slot in the same tick? True when another sync write of the same slot in the same region is reachable from this one in the CFG, self-reachability through a back edge included (a lone write in a loop co-executes with itself). **No value field**: the walk is depth-bounded, so "no other write reachable" is not a promise the engine can keep, and there is no negated form to assert it. | `of` only. |
+| `updater_body` | Does a `writers` row's updater body write into something it does not own? A reading **derived from the same column** as `updater`, never a second pass over the setter's argument (ADR-027 §4). `impure` = a mutation site whose receiver roots outside the body (a parameter or a capture), or a setter call, is PRESENT in the body. A total mirror: an updater the walk does not resolve to a literal has no body to classify and answers `unknown`, so ⊤ never fires. A presence fact, not a value verdict, so the ADR-023 §2 guard does not apply. Warning ceiling: the site's execution stays conditional. | `is`, non-empty list among `impure`, `unknown`. |
+| `name` | The resolved entity's source name: a custom hook's name, the variable bound by a state/memo/callback/ref, or, on `hook_origins`, the resolved hook's origin name. | Exactly one of `one_of` (list) / `prefix`. |
+| `receiver` | The root binding a `calls` row's member call was made on (`socket` in `socket.join(r)`), the other half of a callee: `name` says which method ran, this one says on what. A bare call has no receiver and fails the guard, positive only like every name filter. | Exactly one of `one_of` (list) / `prefix`. |
+| `prop` | A `jsx_props` row's prop name (`value`, `key`, `children`, `onChange`). The relation already carried the field; without this guard a rule could neither skip `children`, fresh every render on any wrapper, nor restrict itself to one prop. | Exactly one of `one_of` (list) / `prefix`. |
+| `phase` | Where a `calls` (#126) or `reads` (#127) row runs, a total mirror of the writers' lattice: `render` / `effect` / `memo` / `callback` / `handler` / `deferred` / `cleanup` / `unknown`. Positive only: the fact is may-typed, `unknown` means the call can run in any phase, and a negative form would let a rule suppress a finding on a ⊤ row. | `is`, non-empty list. |
+| `source` | The import specifier of a custom hook or of a `hook_origins` row (`@chakra-ui/react`), for banning a whole dependency. A local hook or a relatively imported one has no `source`: value absent, guard failed. Never "passes by default". | Exactly one of `one_of` / `prefix`. |
+| `count` | The cardinality of `anchor.deps`. An elision keeps the count exact (`[a, , b]` declares three entries). A spread leaves only a lower bound: the guard then answers what that bound **refutes** and passes otherwise (`[a, …, g, ...rest]` provably exceeds 5). With no written array at all, an absent or unreadable argument, there is nothing to count and the guard fails; `deps_declared` is what asks whether an argument was passed. | Exactly one of `equals` / `more_than` / `less_than`. |
+| `deps_declared` | Did the anchor receive a deps argument at all? Only an **absent** argument answers no: `[]` declares, and an argument the engine cannot read (a variable) still gates the hook. | `eq: true/false`. |
+| `any_of` | Disjunction: passes if at least one nested guard passes. The only way to write "X or Y" without duplicating the rule. | `guards: [...]`. |
+| `every` | ∀ over `anchor.deps`: passes if **every** visible element satisfies the nested guards. The body decides whether ⊤ counts. `is: ["stable"]` means *proven* stable and a ⊤ dep fails, exactly as under a `forEach`; `is: ["stable", "unknown"]` accepts a list that *may* conform. Positive only, no negated form. A written array provides a domain even if a spread hides part of it (the fold ranges over the source, and one visible element that violates refutes the ∀); an absent or unreadable argument provides none and **fails** the guard. A list known to be empty is vacuously true, so combine with `count` if the rule requires at least one element. A rule using `every` can carry no `must_*` guard: a Warning ceiling by construction. | `of: "anchor.deps"`, `as` (the element's name inside `guards`), non-empty `guards: [...]`. |
+| `none` | A negated existential over one of the anchor's edges, written `anchor.<edge>`, passing when **no** row satisfies the nested guards. The one thing the language could not say: *acquires a resource and releases none*, *has a `value` prop and no `onChange`*, *subscribes without ever reading the current value*. A `forEach` is the existential; neither is written using the other. The unproven direction is the right one here: any relation it quantifies over can under-enumerate (a depth-bounded walk, an unresolved callee), and a missing row makes `none` pass, so the rule over-reports rather than lose a finding. It never fabricates proof: a `must_*` anywhere in the rule is refused, exactly as with `every`. | `of` (`anchor.<edge>`), `as` (the row's name inside, invisible in the message), non-empty `guards`. |
 
-| Kind | Prédicat | Champs |
-|------|----------|--------|
-| `stability` | Verdict de stabilité d'une dep, à la sortie du render. | Exactement un de `is` / `not`, liste parmi `stable`, `versioned`, `per-render`, `unknown`. |
-| `returns` | Ce que *retourne* un argument-fonction d'un hook custom (un sélecteur de store qui retourne une référence fraîche vs un primitif). | Exactement un de `is` / `not`, parmi `stable`, `fresh-reference`, `unknown`. |
-| `origin` | Provenance d'un appel de hook : identité résolue (`useLayoutEffect` même atteint via un alias) et/ou appel direct dans le composant vs via un hook wrapper inliné. | Au moins un de `hook` (liste de noms) / `direct` (bool). Une ligne sans provenance échoue. |
-| `in_deps` | Le slot écrit par le setter figure dans les deps de l'ancre. | `negate` optionnel. |
-| `identity` | Verdict d'identité de la value d'une ligne `context_providers`, de la prop d'une ligne `jsx_props`, ou d'une entrée `args` lue au bloc de l'appel lui-même (#112) : `fresh-every-render` (référence neuve à chaque render, un must-fait) ou `unknown` (⊤, jamais actionnable). | Exactement un de `is` / `not`, liste non vide. |
-| `cleanup` | Verdict de teardown du corps d'une ancre `effect` : `absent` (toutes les sorties ne renvoient rien — le seul côté prouvé), `present`, ou `unknown` (⊤, replié du côté may : ne se lit jamais comme une absence). Ne dit rien de ce que l'effet enregistre — à la règle de se restreindre. | Exactement un de `is` / `not`, liste non vide. Ancres `kind: "effect"` uniquement. |
-| `provenance` | Provenance d'une ligne `writers` : écriture directe (`direct`) ou atteinte via des wrappers inlinés nommés (`through`, matché n'importe où dans la chaîne, sur les noms EXPORTÉS — un import aliasé n'y échappe pas). Une ligne non plaçable échoue les deux formes. | Au moins un de `through` (liste) / `direct` (bool). |
-| `writer_phases` | Existentiel MAY sur les écrivains du slot d'une ancre `state` : passe si une écriture du slot *peut* tourner dans une des phases nommées. Une écriture ⊤ (`unknown`) satisfait toute requête — supprimer un finding sur un may-fait serait un faux négatif. Positif seulement, pas de forme niée. | `includes`, liste non vide parmi `render`, `effect`, `memo`, `callback`, `handler`, `deferred` (timer/microtask/continuation de promesse — prouvé hors de toute phase React), `cleanup` (fonction retournée d'un effect), `unknown`. |
-| `updater` | Classement de l'argument 0 d'une ligne `writers` (ADR-028 §2). Miroir total : `functional` n'est revendiqué que pour un littéral de fonction prouvé (inline, ou une variable liée exactement une fois à un) ; tout le reste tombe dans `unknown` (⊤). Positif seulement, pas de forme niée — une règle qui veut « pas prouvé fonctionnel » nomme `unknown` explicitement. | `is`, liste non vide parmi `functional`, `unknown`. |
-| `provider` | Un fournisseur du contexte lu par une ligne `context_consumers` se trouve-t-il sur un chemin qui l'atteint (#115) ? May-typée et positive seulement : `none-on-analyzed-paths` est nommée pour ce qu'elle est — ce que les chemins complétés ont montré, jamais une preuve qu'aucun fournisseur n'existe. La coquille de montage non analysée au-dessus d'une racine, les fournisseurs en flèche inline (#30) et les références de composant en position de valeur (#63) atterrissent toutes là. Aucun `must_*` ne lie cette sorte : plafond Warning par construction. | `is`, liste non vide parmi `provider-seen`, `none-on-analyzed-paths`. |
-| `teardown` | Quelque chose reprend-il visiblement une ligne `registrations` (#111) : le cleanup de l'effet libère cet enregistrement, apparié sur **la valeur par laquelle le teardown l'identifie** — le binding du listener pour `removeEventListener`/`off`, le handle retourné par l'appel pour `clearInterval`, ou ce même handle *invoqué* pour l'idiome du disposer retourné (`const u = s.subscribe(f); return () => u()`). Un enregistrement qui se reprend lui-même (`addEventListener(t, h, {once: true})`) est apparié d'office. May-typée dans un seul sens, donc positive seulement, exactement comme `seed_sync` : `paired` est une revendication tirée d'un teardown lu, `none-seen` est l'absence d'un tel teardown — un cleanup illisible et un listener qui n'est pas un nom résoluble atterrissent tous deux là. Faire correspondre le *nom* du teardown seul certifierait précisément la forme qu'une règle « listener frais » existe pour attraper : c'est le binding qui est le fait. | `is`, liste non vide parmi `paired`, `none-seen`. |
-| `registers` | Une ancre `effect` enregistre-t-elle un callback qui lui survit (#111) ? Existentiel MAY sur les lignes d'enregistrement de l'effet, filtré par classe de déclenchement. Positive seulement : la relation est une correspondance de noms, donc « n'enregistre rien » n'est pas une promesse que le moteur tient, et il n'existe aucune forme niée pour l'affirmer. | `firing`, liste non vide parmi `repeating`, `once`. Ancres `kind: "effect"` uniquement. |
-| `seed_sync` | Quelque chose resynchronise-t-il visiblement le slot d'une ligne `seeds` quand cette prop bouge (#106) : une écriture au moment du render, ou un effet dont les deps déclarées couvrent le chemin de la graine (ou qui n'en déclare aucune, donc re-tourne à chaque render). May-typée dans un seul sens, et c'est pourquoi la garde est positive seulement : `synced` est une revendication tirée d'une écriture vue, `none-seen` est l'absence d'une telle écriture. Un setter que le composant a laissé filer peut être appelé de n'importe où — « aucune sync n'existe » n'est pas une promesse que le moteur tient, d'où le nom `none-seen` et non `unsynced`. Aucun `must_*` ne lie une ligne `seeds` : Error est structurellement inatteignable, et `must_frozen_seed` reste natif. | `is`, liste non vide parmi `synced`, `none-seen`. |
-| `slot_ownership` | Qui possède le slot qu'une ligne `render_setter_calls` écrit : `local` (le state du composant ancré) ou `foreign` (une prop valuée `ComponentSetter`, un setter parent que la passe inter-composants descendante a placé ici). **Nommer l'appartenance est ce qui élargit l'énumération** : sans cette garde, la sorte ne lie que les lignes locales, exactement comme avant que les lignes étrangères existent — changer ce qu'une sorte déjà publiée énumère change quels findings un pack publié déclenche. Deux valeurs, totales ; l'attribution du propriétaire, elle, est may-typée (la même que la règle native consomme, #119). | `is`, liste non vide parmi `local`, `foreign`. |
-| `cycle` | Forme d'une ligne `churn_cycles` : la boucle traverse-t-elle plusieurs composants, et chacune de ses étapes est-elle une must-étape ? Les deux sont des **booléens exacts** — des replis de la table de nœuds et des forces d'arêtes que le graphe a déjà calculées — donc, contrairement aux gardes de verdict may-typées, celle-ci a un négatif qui veut dire quelque chose et prend des booléens plutôt qu'une liste de noms portant ⊤. Ce qui est may-typé, c'est le graphe lui-même : une boucle qu'il n'a pas vue ne produit aucune ligne. | Au moins un de `cross_component` / `all_must` (bool), conjoints. |
-| `same_tick` | La ligne `writers` peut-elle co-exécuter avec une autre écriture du même slot dans le même tick ? Vrai quand une autre écriture sync du même slot dans la même région est atteignable depuis celle-ci dans le CFG, auto-atteignabilité par arête arrière comprise (une écriture seule dans une boucle co-exécute avec elle-même). **Aucun champ de valeur** : le walk est borné en profondeur, donc « aucune autre écriture atteignable » n'est pas une promesse que le moteur peut tenir — il n'y a pas de forme niée pour l'affirmer. | `of` seulement. |
-| `updater_body` | Le corps de l'updater d'une ligne `writers` écrit-il dans quelque chose qu'il ne possède pas ? Lecture **dérivée de la même colonne** que `updater` — jamais une seconde passe sur l'argument du setter (ADR-027 §4). `impure` = un site de mutation dont le receveur s'enracine hors du corps (paramètre ou capture), ou un appel de setter, est PRÉSENT dans le corps. Miroir total : un updater que le walk ne résout pas en littéral n'a pas de corps à classer et répond `unknown`, donc ⊤ ne se déclenche jamais. Fait de présence, pas de verdict de valeur — la garde ADR-023 §2 ne s'y applique pas. Plafond Warning : l'exécution du site reste conditionnelle. | `is`, liste non vide parmi `impure`, `unknown`. |
-| `name` | Nom source de l'entité résolue : nom d'un hook custom, variable liée par un state/memo/callback/ref, ou — sur `hook_origins` — le nom d'origine du hook résolu. | Exactement un de `one_of` (liste) / `prefix`. |
-| `receiver` | Le binding racine sur lequel l'appel membre d'une ligne `calls` a été fait (`socket` dans `socket.join(r)`) — l'autre moitié d'un callee : `name` dit quelle méthode a tourné, celle-ci dit chez qui. Un appel nu n'a pas de receiver et échoue à la garde, positive seulement comme tout filtre de nom. | Exactement un de `one_of` (liste) / `prefix`. |
-| `prop` | Le nom de prop d'une ligne `jsx_props` (`value`, `key`, `children`, `onChange`). La relation portait déjà le champ ; sans cette garde une règle ne pouvait ni ignorer `children` — frais à chaque rendu sur tout wrapper — ni se restreindre à une prop. | Exactement un de `one_of` (liste) / `prefix`. |
-| `phase` | Où s'exécute une ligne `calls` (#126) ou `reads` (#127), miroir total du treillis des writers — `render` / `effect` / `memo` / `callback` / `handler` / `deferred` / `cleanup` / `unknown`. Positive seulement : le fait est may-typé, `unknown` signifie que l'appel peut tourner dans n'importe quelle phase, et une forme négative laisserait une règle supprimer un constat sur une ligne ⊤. | `is`, liste non vide. |
-| `source` | Spécificateur d'import d'un hook custom ou d'une ligne `hook_origins` (`@chakra-ui/react`), pour bannir une dépendance entière. Un hook local ou importé relativement n'a pas de `source` : valeur absente, guard échoué. Jamais « passe par défaut ». | Exactement un de `one_of` / `prefix`. |
-| `count` | Cardinalité de `anchor.deps`. Une élision garde le compte exact (`[a, , b]` déclare trois entrées). Un spread ne laisse qu'une borne inférieure : le guard répond alors ce que cette borne **réfute** et passe sinon (`[a, …, g, ...rest]` dépasse prouvablement 5). Sans array écrit du tout — argument absent ou illisible — il n'y a rien à compter et le guard échoue ; c'est `deps_declared` qui demande si un argument a été passé. | Exactement un de `equals` / `more_than` / `less_than`. |
-| `deps_declared` | L'ancre a-t-elle reçu un argument deps, quel qu'il soit ? Seul l'argument **absent** répond non : `[]` déclare, et un argument que le moteur ne sait pas lire (une variable) gate quand même le hook. | `eq: true/false`. |
-| `any_of` | Disjonction : passe si au moins un des guards imbriqués passe. Seule façon d'écrire « X ou Y » sans dupliquer la règle. | `guards: [...]`. |
-| `every` | ∀ sur `anchor.deps` : passe si **chaque** élément visible satisfait les guards imbriqués. Le corps décide si ⊤ compte — `is: ["stable"]` veut dire *prouvé* stable et un dep ⊤ échoue, exactement comme sous un `forEach` ; `is: ["stable", "unknown"]` accepte une liste qui *peut* conformer. Positif seulement, pas de forme niée. Un array écrit fournit un domaine même si un spread en cache une partie (le fold porte sur la source, et un seul élément visible qui viole réfute le ∀) ; un argument absent ou illisible n'en fournit aucun et **échoue** le guard. Une liste connue vide est vraie par vacuité — combiner avec `count` si la règle exige au moins un élément. Une règle qui utilise `every` ne peut porter aucun guard `must_*` : plafond Warning par construction. | `of: "anchor.deps"`, `as` (nom de l'élément dans `guards`), `guards: [...]` non vide. |
-| `none` | Existentielle niée sur une arête de l'ancre, écrite `anchor.<edge>` — passe quand **aucune** ligne ne satisfait les gardes imbriquées. La seule chose que le langage ne pouvait pas dire : *acquiert une ressource et n'en libère aucune*, *a une prop `value` et pas de `onChange`*, *s'abonne sans jamais lire la valeur courante*. Un `forEach` est l'existentielle ; aucune des deux ne s'écrit avec l'autre. La direction non prouvée est la bonne ici : toute relation qu'elle quantifie peut sous-énumérer (marche bornée en profondeur, callee non résolu), et une ligne manquante fait passer `none` — la règle sur-rapporte au lieu de perdre un constat. Ne fabrique jamais de preuve : un `must_*` n'importe où dans la règle est refusé, exactement comme avec `every`. | `of` (`anchor.<edge>`), `as` (le nom de la ligne à l'intérieur, invisible dans le message), `guards` (non vide). |
+Certifying guards (`must_*`): when the engine answers "proven on every path",
+the finding carries a proof and can reach Error.
 
-Guards certifiants (`must_*`) : quand le moteur répond « prouvé sur tous
-les chemins », le finding porte une preuve et peut atteindre Error.
+| Kind | Certifies that… |
+|------|-----------------|
+| `must_setter_on_all_paths` | the setter is called on every path through the body. |
+| `must_dominates_all_exits` | the entity dominates every exit. |
+| `must_init_calls_setter` | the initialization calls the setter. |
+| `must_hook_is_conditional` | the hook call is conditional. |
+| `must_direct_write` | the targeted `writers` row is a direct write, outside any spliced region. This is the proof behind a policy rule like "state is only written through our wrapper" pinned at `error`. |
 
-| Kind | Certifie que… |
-|------|---------------|
-| `must_setter_on_all_paths` | le setter est appelé sur tous les chemins du corps. |
-| `must_dominates_all_exits` | l'entité domine toutes les sorties. |
-| `must_init_calls_setter` | l'initialisation appelle le setter. |
-| `must_hook_is_conditional` | l'appel de hook est conditionnel. |
-| `must_direct_write` | la ligne `writers` visée est une écriture directe (hors de toute région splicée) — la preuve derrière une règle de politique « le state ne s'écrit qu'à travers notre wrapper » pinnée `error`. |
+Every `must_*` accepts `"else"`: `"keep"` (the default, an uncertified finding
+survives as a Warning) or `"drop"` (the uncertified finding is dropped, for
+qualification-style rules).
 
-Chaque `must_*` accepte `"else"` : `"keep"` (défaut, un finding non certifié
-survit en Warning) ou `"drop"` (le finding non certifié est abandonné, pour
-les règles de type « qualification »).
+### Severity: `pin ⊓ polarity`
 
-### Sévérité : `pin ⊓ polarity`
-
-Le `severity` déclaré est un plafond (« pin »), pas une promesse. À
-l'émission de chaque finding :
+The declared `severity` is a ceiling (a "pin"), not a promise. As each finding
+is emitted:
 
 ```
-sévérité effective = pin ⊓ polarité du verdict de CE finding
+effective severity = pin ⊓ the polarity of THIS finding's verdict
 ```
 
-- Un verdict certifié (guard `must_*` qui a prouvé) honore le pin jusqu'à
+- A certified verdict (a `must_*` guard that proved) honours the pin up to
   Error.
-- Un verdict « peut-être » plafonne à Warning, quel que soit le pin. Le
-  clamp est structurel : l'exécuteur ne peut construire un Error qu'à partir
-  d'une preuve du moteur, il ne peut pas en forger un.
-- Les downgrades (`"warning"`, `"info"`) sont toujours honorés, y compris par
-  la config du consommateur.
+- A "maybe" verdict caps at Warning whatever the pin says. The clamp is
+  structural: the executor can only build an Error out of an engine proof, it
+  cannot forge one.
+- Downgrades (`"warning"`, `"info"`) are always honoured, including from the
+  consumer's config.
 
-Conséquence utile : une règle pinnée `"error"` est stratifiée gratuitement,
-Error là où c'est prouvé, Warning ailleurs. Une règle pinnée `"error"` sans
-aucun guard `must_*` se charge quand même, avec un warning au chargement,
-puisqu'elle ne pourra jamais émettre que des Warnings.
+A useful consequence: a rule pinned `"error"` is stratified for free, Error
+where it is proven and Warning elsewhere. A rule pinned `"error"` with no
+`must_*` guard still loads, with a warning at load time, since it will only
+ever emit Warnings.
 
-### Paramètres (`params`)
+### Parameters (`params`)
 
-Un paramètre ne peut apparaître que dans une position de constante feuille
-(un seuil, une liste de noms, une valeur comparée), jamais dans la structure
-de la règle. Pas de guard ni d'ancre paramétrique.
+A parameter can appear only in a leaf-constant position (a threshold, a list of
+names, a compared value), never in the rule's structure. No parametric guard,
+no parametric anchor.
 
 ```jsonc
-// côté pack
+// pack side
 "params": { "maxDeps": { "type": "number", "default": 5 } },
 "guards": [{ "kind": "count", "of": "anchor.deps", "more_than": { "$param": "maxDeps" } }],
-"message": "cet effect déclare plus de {param.maxDeps} deps, découpe-le par responsabilité"
+"message": "this effect declares more than {param.maxDeps} deps, split it by responsibility"
 ```
 
 ```jsonc
-// côté consommateur (reactant.config.json)
+// consumer side (reactant.config.json)
 "rules": { "team/oversized-effect": { "severity": "warning", "options": { "maxDeps": 8 } } }
 ```
 
-Types : `number`, `string`, `boolean`, `string[]`. `default` est obligatoire.
-La validation est bruyante : `$param` non déclaré, type incompatible ou
-option inconnue rejette le pack ou la config (exit 2) avec une erreur précise.
+Types: `number`, `string`, `boolean`, `string[]`. `default` is mandatory.
+Validation is loud: an undeclared `$param`, an incompatible type or an unknown
+option rejects the pack or the config (exit 2) with a precise error.
 
-### Le template de message
+### The message template
 
-`{binding.champ}` interpole une entité naviguée ; `{param.x}` un paramètre ;
-`{{` / `}}` échappent les accolades. Champs disponibles par type d'entité :
+`{binding.field}` interpolates a navigated entity; `{param.x}` a parameter;
+`{{` and `}}` escape the braces. Available fields per entity type:
 
-| Entité | Champs |
+| Entity | Fields |
 |--------|--------|
-| Appel de hook (ancre `hook_calls`) | `kind`, `name` (nom du hook custom, ou variable liée), `source` (spécificateur d'import, `unknown` si absent) |
-| Ligne de provenance (ancre `hook_origins`) | `name` (nom d'origine du hook), `source` (spécificateur d'import, `unknown` si absent) |
-| Provider (`context_providers`) | `name` (binding du contexte), `identity` (le verdict, en mots) |
-| Prop JSX (`jsx_props`) | `name` (l'élément, ou le tag pour un élément hôte), `prop` (le nom de la prop), `kind` (`component` / `host`), `identity` (le verdict, en mots) |
-| Cycle (`churn_cycles`) | `cycle` (le chemin `a → b → a`, nœuds déjà qualifiés et quotés) |
-| Consommateur (`context_consumers`) | `name` (le binding local par lequel le contexte est lu) |
-| Enregistrement (`registrations`) | `name` (le registrar tel qu'écrit), `firing` (`repeating` / `once`), `identity` (le verdict du listener, en mots) |
-| Écrivain (`writers`) | `slot`, `setter`, `region` (corps lexical, exact), `phase` (verdict MAY, `unknown` = ⊤), `via` (chaîne de wrappers `outer → inner`, ou `direct` / `unknown`) |
-| Setter (`render_setter_calls`, `body_setter_calls`) | `slot` (le state écrit — pour une ligne étrangère, résolu dans le composant PROPRIÉTAIRE : les labels sont par composant), `setter` (le nom du setter), `owner` (le composant qui possède le slot ; le composant ancré lui-même pour une ligne locale) |
-| Dep (`deps`) | `path`, `stability` (le verdict, en mots) |
-| Graine (`seeds`) | `path` (le chemin de prop tel qu'écrit au site de la graine) |
-| Lecture (`reads`) | `slot`, `name` (le binding lu), `region` (corps lexical, exact), `phase` (verdict MAY, `unknown` = ⊤) |
-| Argument (`args`) | `returns` (le verdict, en mots) |
-| Appel (`calls`, `render_calls`) | `name` (le callee, ou la méthode d'un appel membre), `receiver` (le binding racine d'un appel membre ; `no receiver` pour un appel nu), `phase` (verdict MAY, `unknown` = ⊤) |
+| Hook call (`hook_calls` anchor) | `kind`, `name` (the custom hook's name, or the bound variable), `source` (import specifier, `unknown` if absent) |
+| Provenance row (`hook_origins` anchor) | `name` (the hook's origin name), `source` (import specifier, `unknown` if absent) |
+| Provider (`context_providers`) | `name` (the context binding), `identity` (the verdict, in words) |
+| JSX prop (`jsx_props`) | `name` (the element, or the tag for a host element), `prop` (the prop name), `kind` (`component` / `host`), `identity` (the verdict, in words) |
+| Cycle (`churn_cycles`) | `cycle` (the path `a → b → a`, nodes already qualified and quoted) |
+| Consumer (`context_consumers`) | `name` (the local binding the context is read through) |
+| Registration (`registrations`) | `name` (the registrar as written), `firing` (`repeating` / `once`), `identity` (the listener's verdict, in words) |
+| Writer (`writers`) | `slot`, `setter`, `region` (lexical body, exact), `phase` (MAY verdict, `unknown` = ⊤), `via` (the wrapper chain `outer → inner`, or `direct` / `unknown`) |
+| Setter (`render_setter_calls`, `body_setter_calls`) | `slot` (the state written; for a foreign row, resolved in the OWNING component, since labels are per-component), `setter` (the setter's name), `owner` (the component owning the slot; the anchored component itself for a local row) |
+| Dep (`deps`) | `path`, `stability` (the verdict, in words) |
+| Seed (`seeds`) | `path` (the prop path as written at the seed site) |
+| Read (`reads`) | `slot`, `name` (the binding read), `region` (lexical body, exact), `phase` (MAY verdict, `unknown` = ⊤) |
+| Argument (`args`) | `returns` (the verdict, in words) |
+| Call (`calls`, `render_calls`) | `name` (the callee, or the method of a member call), `receiver` (the root binding of a member call; `no receiver` for a bare call), `phase` (MAY verdict, `unknown` = ⊤) |
 
-Un champ inconnu pour l'entité visée est rejeté à la validation, qui liste
-les champs que l'entité porte réellement.
+A field the targeted entity does not have is rejected at validation, which
+lists the fields the entity actually carries.
 
-## Écrire le pack en JS/TS (`reactant packs build`)
+## Writing the pack in JS or TS (`reactant packs build`)
 
-Plutôt que du JSON à la main, un pack peut être écrit comme un module JS/TS,
-sur le modèle de `eslint.config.js` : types, constantes partagées, génération
-de N règles depuis une table.
+Rather than hand-written JSON, a pack can be a JS or TS module, on the
+`eslint.config.js` model: types, shared constants, N rules generated from a
+table.
 
 ```js
 // team.pack.js
@@ -288,7 +285,7 @@ de N règles depuis une table.
 module.exports = {
   schemaVersion: 1,
   name: "team",
-  rules: [ /* … typé, autocomplété … */ ],
+  rules: [ /* … typed, autocompleted … */ ],
 };
 ```
 
@@ -297,33 +294,31 @@ npx reactant packs build team.pack.js              # → team.pack.json
 npx reactant packs build team.pack.js --out rules/pack.json
 ```
 
-Le module est évalué au build, validé par le même validateur que le moteur
-(via WASM), et le JSON généré est l'artefact commité. L'analyseur ne consomme
-que le JSON inerte : lancer un check n'exécute jamais de code d'auteur. ESM,
-CJS et fonctions (`module.exports = async () => pack`) sont acceptés ; le
-`.ts` direct nécessite un Node avec type stripping.
+The module is evaluated at build time, validated by the same validator the
+engine uses (through WASM), and the generated JSON is the committed artifact.
+The analyzer only ever consumes the inert JSON: running a check never executes
+author code. ESM, CJS and functions (`module.exports = async () => pack`) are
+all accepted; direct `.ts` needs a Node with type stripping.
 
-Les JSON Schemas (autocomplétion éditeur) sont publiés dans le paquet npm et
-regénérables par `reactant schemas --out DIR`.
+The JSON Schemas (for editor autocompletion) ship in the npm package and can be
+regenerated with `reactant schemas --out DIR`.
 
-## Ce qu'un pack ne peut PAS exprimer (par design)
+## What a pack CANNOT express (by design)
 
-- Pas de patterns syntaxiques. « Interdire `moment()` dans les composants »
-  est hors périmètre sémantique : refusé, ESLint fait ça.
-- Une seule ancre par règle, pas de jointure entre deux ancres libres. Les
-  règles cross-composants sont inexprimables en Tier A (limitation
-  enregistrée, ADR-022 §Limitations).
-- Pas de quantificateur universel sur `forEach` (« toutes les deps
-  sont… »), refusé délibérément (ADR-023 §4). `any_of` compose des guards,
-  il ne replie pas une liste.
+- No syntactic patterns. "Ban `moment()` in components" is outside the semantic
+  perimeter: refused, ESLint does that.
+- One anchor per rule, no join between two free anchors. Cross-component rules
+  are inexpressible in Tier A (a recorded limitation, ADR-022 §Limitations).
+- No universal quantifier over `forEach` ("all the deps are…"), deliberately
+  refused (ADR-023 §4). `any_of` composes guards, it does not fold a list.
 
-Si une règle ne rentre pas, la réponse est une extension du vocabulaire au
-niveau moteur, pas un contournement.
+If a rule does not fit, the answer is a vocabulary extension at the engine
+level, not a workaround.
 
-## Exemples complets
+## Complete examples
 
-- [`packs/guardrails.json`](../packs/guardrails.json) : pack first-party, 5
-  règles commentées (deps array absent, dep unique inerte, effect
-  auto-relançant, budget de deps, hooks bannis).
-- [`tests/fixtures/packs/team.json`](../tests/fixtures/packs/team.json) :
-  l'exemple de la suite de tests.
+- [`packs/guardrails.json`](../packs/guardrails.json): the first-party pack, 5
+  commented rules (missing deps array, single inert dep, self-retriggering
+  effect, deps budget, banned hooks).
+- [`tests/fixtures/packs/team.json`](../tests/fixtures/packs/team.json): the
+  test suite's example.
