@@ -1,21 +1,20 @@
-# TODO — déplacé
+# TODO, moved
 
-Ce fichier ne tient plus le backlog. Son contenu a été éclaté en issues, une par
-limite, le 2026-08-27.
+This file no longer holds the backlog. Its contents were split into issues, one
+per limitation, on 2026-08-27.
 
-- **Résumé des limites connues, pour les utilisateurs** :
-  [limitations.md](limitations.md)
-- **Travail ouvert, une entrée par limite** :
-  [le tracker](https://github.com/rboudrouss/reactant-analyzer/issues)
+- Known limitations, summarized for users: [limitations.md](limitations.md)
+- Open work, one entry per limitation:
+  [the tracker](https://github.com/rboudrouss/reactant-analyzer/issues)
 
-Labels : `soundness-bug` (l'analyse est fausse, pas seulement imprécise),
-`precision-fn` / `precision-fp` (compromis assumés), `infra`, `rule-proposal`,
-`ux` ; taille `size/S|M|L` ; `blocked` quand une issue en attend une autre.
+Labels: `soundness-bug` (the analysis is wrong, not merely imprecise),
+`precision-fn` and `precision-fp` (accepted trade-offs), `infra`,
+`rule-proposal`, `ux`. Size is `size/S|M|L`, and `blocked` marks an issue
+waiting on another.
 
-Les limites tranchées « on ne corrige pas » sont des issues **fermées**
-`wontfix`, pour que le raisonnement reste citable et que personne ne repropose
-le fix :
+Limitations settled as "we are not fixing this" are **closed** `wontfix`
+issues, so the reasoning stays citable and nobody proposes the fix again:
 [`--state closed --label wontfix`](https://github.com/rboudrouss/reactant-analyzer/issues?q=is%3Aissue+is%3Aclosed+label%3Awontfix).
 
-> Ce fichier reste comme redirection : une dizaine d'ADR le référencent par ce
-> chemin, et un ADR est un enregistrement historique qu'on ne réécrit pas.
+This file stays as a redirect because a dozen ADRs cite it by this path, and an
+ADR is a historical record that does not get rewritten.

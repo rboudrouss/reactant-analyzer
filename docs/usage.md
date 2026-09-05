@@ -40,11 +40,11 @@ reactant check src/ --ignore-rule lazy-init      # all but this one
 | `--ignore-rule <name>` | Suppress this diagnostic (repeatable). |
 | `--info` | Also display `Info` diagnostics (known analysis limits: widening, recursion cutoff, unknown hooks), plus, per shown component, the applicable checks that ran and found nothing (`verified: …`) or, where the analysis was truncated, the count withheld (`suspended: …`). See [The assurance channel](#the-assurance-channel---info). |
 | `--show-clean` | Show components with no findings (hidden by default). Without it, a trailing note reports how many clean components were hidden. |
-| `--trace` | Show each finding's witness chain (ADR-019): typed `→` steps explaining why the rule fired (e.g. `` `loadPrefs` resolves to an import from ./prefs.ts `` → `` `fetch` has side effects ``). Steps pointing into another file (cross-file inlining) show `file:line:col`. Capped at 8 steps (`… n more step(s)`). Hidden by default; a finding with steps shows a `(N trace step(s) — rerun with --trace)` hint instead. `json` output always includes the chain. |
+| `--trace` | Show each finding's witness chain (ADR-019): typed `→` steps explaining why the rule fired (e.g. `` `loadPrefs` resolves to an import from ./prefs.ts `` → `` `fetch` has side effects ``). Steps pointing into another file (cross-file inlining) show `file:line:col`. Capped at 8 steps (`… n more step(s)`). Hidden by default; a finding with steps shows a `(N trace step(s), rerun with --trace)` hint instead. `json` output always includes the chain. |
 | `--entry <names>` | Explicit root components. Repeatable or comma-separated (`--entry Foo,Bar`). On a name collision across files, use the qualified `Foo@path` form the output prints. A name matching no component is a usage error (exit 2). |
 | `--all-roots` | Analyze every component as an entry point (`props = ⊤`). |
 | `--exclude-dir <names>` | Directory names never walked, matched at any depth. Repeatable or comma-separated. **Replaces** the default policy (see [Discovery](#plain-everything-else)) rather than adding to it; `node_modules/` and `.git/` are skipped regardless. |
-| `--follow-imports` | Also analyze the files the named paths import, transitively, so their hooks are read instead of treated as opaque. The report still covers only the paths you named. **Not a speed optimization** — see [Following imports](#following-imports---follow-imports). |
+| `--follow-imports` | Also analyze the files the named paths import, transitively, so their hooks are read instead of treated as opaque. The report still covers only the paths you named. **Not a speed optimization**, see [Following imports](#following-imports---follow-imports). |
 | `--verbose` | Debug output on stderr: symbol graph topo order, fixpoint stats, per-component iterations/widened labels. |
 | `--no-color` | Disable ANSI colors. Also honored: a non-empty `NO_COLOR` env var, or stdout not being a terminal. |
 | `--config <path>` | Config file to use (default: `<project root>/reactant.config.json` when present). Also accepted by `rules` and `explain` (their default root is the cwd). |
@@ -143,7 +143,7 @@ and the router conventions are the ones that govern the sources.
 
 Discovery still walks exactly the directories you named. The `<root>/src`
 narrowing below is a convenience for "analyse this project" and applies only
-when the path you gave *is* the project root — pointing inside is already a
+when the path you gave *is* the project root. Pointing inside is already a
 narrowing, and widening it back out would analyse files nobody asked for. The
 imports that then resolve outside what you named are reported as
 [blind spots](#the-last-line-and-when-it-is-withheld), by name.
@@ -161,9 +161,9 @@ imports that then resolve outside what you named are reported as
   warns: bare specifiers resolve, but `@/...` aliases do not exist.
 - `next/navigation`, `next/router` and `next/compat/router` hooks are known to
   the analyzer, so a real `useRouter`/`useSearchParams` is not reported as an
-  unknown hook. `usePathname` is modelled as a string — a primitive is
+  unknown hook. `usePathname` is modelled as a string, and a primitive is
   compared by value, so it never reads as an unstable dep.
-- Server Components are analysed, not skipped — see below.
+- Server Components are analysed, not skipped. See below.
 
 ### Vite (`vite.config.{ts,js,mjs,mts}` present)
 
@@ -191,7 +191,7 @@ Which *directories* are skipped has one precedence order, three sources:
 
 1. **`--exclude-dir` / `excludeDirs`**, matched by bare name at any depth. An
    explicit list is the answer, so it replaces the two fallbacks below.
-2. **The tree's own `.gitignore` files**, read the way git reads them —
+2. **The tree's own `.gitignore` files**, read the way git reads them:
    nearest-file-wins, `!` re-includes, patterns anchored by a `/`. The search
    for them walks up from the directory being analysed to the project root
    (`.git` or `package.json`), so `reactant check src/features` still honors
@@ -203,28 +203,28 @@ Which *directories* are skipped has one precedence order, three sources:
 
 Reading the `.gitignore` cuts both ways: it also skips generated directories the
 old name list walked (`lib/`, `coverage/`, a codegen'd `src/generated/`). That is
-the intended reading — a directory git does not track is not this repository's
-source — and it is never silent: anything imported from an analysed file lands
+the intended reading, since a directory git does not track is not this
+repository's source, and it is never silent: anything imported from an analysed file lands
 in the run's `unread-imports` blind spot by name, so the summary withholds its
 clean bill. Use `--exclude-dir` to state a different answer.
 
 Reading the `.gitignore` rather than matching names is [#137]: a directory is
 build *output* because the repository declared it generated, not because of
-what it is called. Matching `build` at any depth also dropped build *tooling
-source* — mantine keeps ten real `.ts` files in `scripts/build/`, imported
-from files that were analysed, and nothing in the output said they existed.
+what it is called. Matching `build` at any depth also drops build *tooling
+source*: mantine keeps ten real `.ts` files in `scripts/build/`, imported from
+files that are analysed, and nothing in the output would say they existed.
 
 [#137]: https://github.com/rboudrouss/reactant-analyzer/issues/137
 
 ### Following imports (`--follow-imports`)
 
 Discovery is normally the sole producer of analyzed files. On a whole-project
-run that is complete — everything the project imports is already inside the
-walk. On a **narrowed** run it is not:
+run that is complete, since everything the project imports is already inside
+the walk. On a **narrowed** run it is not:
 
 ```
 reactant check src/features
-⚠  67 file(s), no findings — but parts of this run were not analyzed …
+⚠  67 file(s), no findings, but parts of this run were not analyzed …
      • 47 imported file(s) resolved outside the analysed set and were never read
 ```
 
@@ -236,8 +236,8 @@ belongs *in `src/features`* never fires.
 analyzes what it reaches. Two rules keep it predictable:
 
 - **The report still covers only the paths you named.** A component defined in
-  a followed file is analyzed — that is what makes the named files correct —
-  but not reported. How many findings that hid, and which files hold them, is
+  a followed file is analyzed, which is what makes the named files correct, but
+  it is not reported. How many findings that hid, and which files hold them, is
   printed, so widening is a decision you make rather than one you miss.
 - **The closure is printed**, for the same reason: a run that quietly read more
   than you asked for would be the trust failure the blind-spot list exists to
@@ -247,13 +247,13 @@ analyzes what it reaches. Two rules keep it predictable:
 reactant check src/features --follow-imports
 ⚠  1 warning(s) across 2 file(s).
    followed 1 imported file(s) (src/hooks/useThing.ts)
-   1 finding(s) in those file(s) are not shown — name the path(s) to report them (src/hooks/useThing.ts)
+   1 finding(s) in those file(s) are not shown. Name the path(s) to report them (src/hooks/useThing.ts)
 ```
 
 **It is not a faster way to analyze a project.** The closure of a file's
 imports routinely approaches the whole program, and the flag adds an import
 scan on top. If you want the project analyzed, `reactant check src/` is the
-better command — this flag buys a *narrow report over a correct analysis*, not
+better command. This flag buys a *narrow report over a correct analysis*, not
 speed. It is off by default because naming a directory is a cheap way to look
 at one pattern in one place, and that is what naming it should keep meaning.
 
@@ -268,7 +268,7 @@ followed either.
 
 Under the App Router, a module is a Server Component unless a `"use client"`
 directive opens a client boundary above it. reactant **analyses those modules
-like any other** — a Server Component has no state, so the abstract
+like any other**. A Server Component has no state, so the abstract
 interpretation over-approximates it exactly as it does a component whose props
 are ⊤, and skipping them on an import graph that may be missing edges would
 turn every misclassification into a missed bug.
@@ -279,12 +279,12 @@ when it is reachable from an App Router entry (`page`, `layout`, `template`,
 `"use client"` directive, and a hook called there cannot run. The rule stays
 silent in projects that never write the directive, reports once per component
 rather than once per hook, and never suppresses other rules' findings in the
-same module — the missing directive is named beside them, not instead of them.
+same module. The missing directive is named beside them, not instead of them.
 
-Its two supporting facts — a filename convention and the resolved import graph
-— live outside the abstract domain, which is why the finding is a `Warning`
-and why it under-reports rather than over-reports: an unresolved specifier on
-the path from an entry leaves that subtree unclassified.
+Its two supporting facts, a filename convention and the resolved import graph,
+live outside the abstract domain. That is why the finding is a `Warning`, and
+why it under-reports rather than over-reports: an unresolved specifier on the
+path from an entry leaves that subtree unclassified.
 
 ## JSON schema (v2)
 
@@ -361,7 +361,7 @@ Semantics:
 - `parse_errors[].analyzed` says what became of the file. `true`: the parser
   recovered and the file was analysed anyway, so the entry is noise. `false`:
   the file was dropped from the run (read error, or a parser panic leaving an
-  empty program), so its findings are *missing*, not absent — a dropped file is
+  empty program), so its findings are *missing*, not absent. A dropped file is
   also reported on stderr whatever the `--format`.
 - `blind_spots` is what the run knows it did not read. **Non-empty means
   `summary.errors` and `summary.warnings` are a lower bound, not a verdict**:
@@ -370,17 +370,17 @@ Semantics:
   `kind` ∈ `unresolved-aliases` (the project's aliases could not be loaded, so
   every aliased target is unlowered) | `unparsed-files` (files the parser
   dropped) | `unread-imports` (imports that resolved to a real file discovery
-  never walked to — pass those paths on the command line). `count` aggregates
+  never walked to; pass those paths on the command line). `count` aggregates
   the occurrences, `detail` is the sentence the human renderer prints.
   A blind spot is *not* a finding: it never changes the exit code (added in
-  v2 — a v2 consumer written before this field can ignore it).
+  v2, and a v2 consumer written before this field can ignore it).
 
 ## Reading the human output
 
 ```
   Counter  (3 hooks)  src/Counter.tsx  ✓      ← analyzed, no diagnostic
   Page  (2 hooks)  src/users/page.tsx         ← with diagnostics
-    warn   infinite-loop  [hook:1]  (line 7:2)  — effect 2 sets state 1 ...
+    warn   infinite-loop  [hook:1]  (line 7:2)  this effect keeps pushing ...
        → handler `onClick` also calls setter ... [hook:3] (line 12:4)
     warn   missing-deps  [hook:4]  (src/hooks/useData.ts:9:2)  ...
 ```
@@ -404,10 +404,10 @@ A run that did **not** never prints it, because "no issues found" is a claim
 about the code and the analyzer may only make it about code it actually read:
 
 ```
-⚠  37 file(s), no findings — but parts of this run were not analyzed,
+⚠  37 file(s), no findings, but parts of this run were not analyzed,
    so this is not a clean bill.
    not analyzed:
-     • no tsconfig `paths` found — aliased imports (e.g. `@/...`) stay unresolved …
+     • no tsconfig `paths` found, so aliased imports (e.g. `@/...`) stay unresolved …
      • 3 imported file(s) resolved outside the analysed set and were never read …
 ```
 
@@ -419,8 +419,8 @@ or naming the missing directory on the command line.
 
 Deliberately *not* listed here: `analysis-limit`, which is what the analyzer
 says about code it did read and abstracted soundly (an npm hook it models as
-⊤). It fires on essentially every run — 370 sites on a 209-file app, almost all
-of them third-party — and a caveat printed every time is a caveat nobody reads.
+⊤). It fires on essentially every run, 370 sites on a 209-file app and almost all
+of them third-party, and a caveat printed every time is a caveat nobody reads.
 It stays on the `--info` channel below.
 
 ### The assurance channel (`--info`)
@@ -495,7 +495,7 @@ cargo run -- check tests/fixtures/cross_file_hook
 ## Plugin API
 
 When the CLI conventions aren't enough (monorepos, workspace specifiers,
-exotic resolution schemes — Vite and Next.js are built in):
+exotic resolution schemes; Vite and Next.js are built in):
 
 ```rust
 use std::path::Path;
@@ -530,7 +530,7 @@ Most impactful:
 - Utility inlining is statement-level only; `if (util(x))` and `setX(util(y))`
   stay opaque.
 - `--entry Foo`, when ambiguous across files, analyzes **both**. Use the
-  qualified `Foo@path` form — exactly what the report prints back — to pin one.
+  qualified `Foo@path` form, exactly what the report prints back, to pin one.
 
 ## Tests
 

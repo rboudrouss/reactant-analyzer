@@ -1,37 +1,45 @@
-# Reactant plugin guide (ADR-013 Phase 4)
+# Reactant plugin guide
 
-The analyzer's discovery and import-resolution behaviour is exposed through
-two trait objects so external code can override either without forking the
-crate.
+The analyzer's file discovery and import resolution are exposed as two trait
+objects, so external code can replace either one without forking the crate.
 
-| Trait | Default | What to override for |
-|-------|---------|----------------------|
-| `FileDiscoverer` | `DefaultFileDiscoverer` (recursive `*.ts?(x)` walk, excludes `node_modules`, `*.test.*`, and whatever the tree's `.gitignore` calls generated — see [usage](usage.md#plain-everything-else)) | Framework conventions not already built in, monorepos, glob patterns |
-| `ImportResolver` | `DefaultImportResolver` (relative imports → `.ts`/`.tsx`/`index.*`) | Monorepo `@workspace/*`, exotic resolution schemes |
+## Check whether you need this first
 
-Both traits live in `reactant::resolver`. Plug them in through
+Vite and Next.js are built in. Project detection, router-aware discovery,
+tsconfig `paths` and `baseUrl` probing all ship with the crate, so neither
+framework needs a custom discoverer or resolver:
+
+```rust
+use reactant::project;
+let ctx = project::build_context(root, None, Arc::new(OsFileSystem));   // detects Vite/Next, loads tsconfig paths
+// ctx.resolver: Box<dyn ImportResolver>, ctx.discovery_root: PathBuf
+```
+
+`project::TsconfigPathsResolver::new(paths)` is also constructible directly
+from a `project::TsconfigPaths` if you load the aliases yourself.
+
+What follows is for everything else: framework conventions the crate does not
+know, monorepo layouts, and alias schemes that live somewhere other than a
+tsconfig.
+
+## The two traits
+
+| Trait | Default | What to override it for |
+|-------|---------|-------------------------|
+| `FileDiscoverer` | `DefaultFileDiscoverer`, a recursive `*.ts?(x)` walk excluding `node_modules`, `*.test.*`, and whatever the tree's `.gitignore` calls generated ([details](usage.md#plain-everything-else)) | Framework conventions not already built in, monorepos, glob patterns |
+| `ImportResolver` | `DefaultImportResolver`, relative imports to `.ts` / `.tsx` / `index.*` | Monorepo `@workspace/*`, exotic resolution schemes |
+
+Both live in `reactant::resolver`. Plug them in through
 `analyze_with_resolvers`, or use the finer-grained pipeline
 (`resolver::{lower_files, analyze_lowered, analyze_files}`) when you need to
-inspect the lowered IR between phases (the CLI does this to map component
-display names to files).
+inspect the lowered IR between phases. The CLI does exactly that, to map
+component display names back to files.
 
-> Vite and Next.js are built in — tsconfig `paths` since ADR-016, Next.js
-> detection, router-aware discovery and `baseUrl` probing since ADR-026 — so
-> you no longer need a custom discoverer or resolver for either:
->
-> ```rust
-> use reactant::project;
-> let ctx = project::build_context(root, None, Arc::new(OsFileSystem));   // detects Vite/Next, loads tsconfig paths
-> // ctx.resolver: Box<dyn ImportResolver>, ctx.discovery_root: PathBuf
-> ```
->
-> The skeleton below is kept as an illustration of the trait; a real Next.js
-> project needs none of it.
->
-> `project::TsconfigPathsResolver::new(paths)` is also directly constructible
-> from a `project::TsconfigPaths` if you load aliases yourself.
+`FileDiscoverer` decides *which files to read*. `ImportResolver` decides *which
+file an import points to*. They are orthogonal: a monorepo plugin may want
+default discovery with tsconfig-aware imports, or the reverse.
 
-## Skeleton
+## A custom discoverer
 
 ```rust
 use std::path::{Path, PathBuf};
@@ -81,11 +89,10 @@ fn main() {
 }
 ```
 
-## Wrapping `DefaultImportResolver` for custom aliases
+## A custom alias scheme
 
-For alias schemes *not* declared in tsconfig `paths` (which are built in, see
-above), such as aliases hardcoded in a bundler config, wrap the default
-resolver:
+For aliases that are not declared in tsconfig `paths`, such as ones hardcoded
+in a bundler config, wrap the default resolver:
 
 ```rust
 use std::path::{Path, PathBuf};
@@ -120,8 +127,7 @@ impl ImportResolver for AliasResolver {
 
 ## Composing resolvers, and per-file resolution
 
-Two combinators in `reactant::resolver` cover the cases that used to need a
-bespoke `impl`:
+Two combinators in `reactant::resolver` cover the common cases:
 
 ```rust
 use reactant::resolver::{ChainResolver, DefaultImportResolver, ScopedResolver};
@@ -132,7 +138,7 @@ let chain = ChainResolver::new(vec![
     Box::new(DefaultImportResolver::default()),
 ]);
 
-// Route by the *importing* file — a monorepo where `packages/ui` and
+// Route by the *importing* file, for a monorepo where `packages/ui` and
 // `apps/web` resolve the same specifier to different files.
 let resolver = ScopedResolver::new(Box::new(DefaultImportResolver::default()))
     .scope("/repo/packages/ui", Box::new(ui_resolver))
@@ -140,36 +146,28 @@ let resolver = ScopedResolver::new(Box::new(DefaultImportResolver::default()))
 ```
 
 `ScopedResolver` picks the scope whose root is the **longest** prefix of the
-importing file, so a nested package overrides the one containing it; a file
-under no scope goes to the fallback. This is the per-file override a run used
-to lack — before it, one `ImportResolver` served the whole run and the dispatch
-had to be hand-rolled inside a custom impl.
+importing file, so a nested package overrides the one containing it. A file
+under no scope goes to the fallback.
 
-## How custom resolvers flow through the pipeline
+## How a custom resolver flows through the pipeline
 
-When a relative specifier is resolved successfully, it populates
+When a relative specifier resolves, it populates
 `HookEntry::Custom::resolved_file` at lowering time (see
 `src/lowering/import_resolution.rs`). The engine then keys registry lookups by
-`(file, name)` so a hook imported from `./hooks/useData.ts` is matched against
-the lowered IR from that exact file, not just by name (ADR-013 §1).
+`(file, name)`, so a hook imported from `./hooks/useData.ts` is matched against
+the lowered IR of that exact file rather than by name alone (ADR-013 §1).
 
-If the resolver returns `None`, the symbol is treated as external (npm package
-or unresolvable alias) and analysis falls back to the existing summary /
+If the resolver returns `None`, the symbol is treated as external, an npm
+package or an unresolvable alias, and analysis falls back to the summary or
 opaque-call behaviour.
 
-## Why two traits instead of one
-
-`FileDiscoverer` is about *which files to read*. `ImportResolver` is about
-*which file an import points to*. They're orthogonal: a monorepo plugin
-may want default discovery but tsconfig-aware imports, or vice versa.
-
-## Module facts (ADR-026)
+## Module facts
 
 `LoweredProgram` and `ProgramAnalysisResult` carry a `ModuleTable`: per file,
-the directive prologue (`"use client"`, `"use server"`, …) and the import
-edges the resolver mapped to a real file. A custom `ImportResolver` therefore
-feeds the module graph as well as the hook registry — an alias your resolver
-declines to resolve is an edge the graph never sees.
+the directive prologue (`"use client"`, `"use server"`, and so on) and the
+import edges the resolver mapped to a real file. A custom `ImportResolver`
+therefore feeds the module graph as well as the hook registry, and an alias
+your resolver declines to resolve is an edge the graph never sees.
 
 ```rust
 let table = &result.module_table;
@@ -182,9 +180,7 @@ table.reachable_from([entry], Some("use client"));    // walk, stopping at bound
 
 ## Limitations
 
-- Both traits are sync. Async discovery (e.g. fetching files from a remote
-  workspace) needs a wrapper that drives the futures to completion before
+- Both traits are sync. Async discovery, fetching files from a remote workspace
+  for instance, needs a wrapper that drives the futures to completion before
   returning to `analyze_with_resolvers`.
-- A single `ImportResolver` is used for the whole run; per-file overrides
-  require composing inside a custom impl.
-- Discovered files are parsed up front (eager). No lazy mode in this phase.
+- Discovered files are parsed up front. There is no lazy mode.
