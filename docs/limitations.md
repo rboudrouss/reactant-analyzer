@@ -24,37 +24,35 @@ decided.
 Everything under *Confirmed defects* is the first kind. Everything else on this
 page is the second.
 
-## Confirmed defects (audit 2026-08-27)
+## Confirmed defects
 
-These drop or falsify information the analysis then relies on. Several also
-publish a `verified: …` assurance over the gap, which is worse than silence.
-**If your code has one of these shapes, do not trust a clean result for it.**
+These drop or falsify information the analysis then relies on. The audit that
+opened this section ran on 2026-08-27 with six entries; four have shipped since
+and are listed under "Recently fixed" at the end of this page.
 
 | Shape in your code | Effect | Issue |
 |---|---|---|
-| A `finally` reached from a `try` body that returned | Runs in JS, but that path does not reach it here, so a certain write is reported as a Warning rather than an Error | [#2](https://github.com/rboudrouss/reactant-analyzer/issues/2) |
-| A hook called inside *returned JSX* (`return <div>{useThing()}</div>`) | Hoisted out of the terminator but not classified, so it yields no hook entry | [#4](https://github.com/rboudrouss/reactant-analyzer/issues/4) |
+| Two components with the same name | Component identity has three disagreeing representations: one finding reported twice, the wrong body inlined, counts inflated | [#7](https://github.com/rboudrouss/reactant-analyzer/issues/7) |
 | A hook reached only through a `return` | Reported, but with no line or column, since `Terminator::Return` carries no span | [#140](https://github.com/rboudrouss/reactant-analyzer/issues/140) |
-| A pack rule anchored on `kind: "custom"` | Sees only hooks the engine could *not* resolve | [#6](https://github.com/rboudrouss/reactant-analyzer/issues/6) |
-| Two components with the same name | One finding reported twice, wrong body inlined, counts inflated | [#7](https://github.com/rboudrouss/reactant-analyzer/issues/7) |
-| An import alias pointing outside the analysed set | Resolved, then never read. The run names the files on its last line, but the code is still not analysed | [#9](https://github.com/rboudrouss/reactant-analyzer/issues/9) |
 
-**How to tell.** Every shape above is a run that reads clean while a bug goes
-unseen, so the summary line is the thing to read. A run that read everything it
-was pointed at ends with `✓ … no issues found.`. A run that did not never prints
-that line, and lists what it skipped under `not analyzed:` (`blind_spots` in the
-JSON schema). That list does not cover the whole table, since a `try` that
-swallows a `catch` is invisible to the analyzer and to the caveat alike, but it
-does cover the whole cross-file family: unloadable aliases, dropped files, and
-imports resolving outside the analysed set.
+Only the first can hide a bug: an inlined body that belongs to a different
+component is an analysis of code you did not write. **If two components in your
+tree share a name, do not trust a clean result for either.** The second costs a
+position, never a finding.
+
+**How to tell in general.** A run that read everything it was pointed at ends
+with `✓ … no issues found.`. A run that did not never prints that line, and lists
+what it skipped under `not analyzed:` (`blind_spots` in the JSON schema). That
+covers the whole cross-file family: unloadable aliases, dropped files, and
+imports resolving outside the analysed set. It does not cover a name collision,
+which the analyzer has no way to know is one.
 
 ## What reactant may miss (false negatives)
 
 - Hooks and callees it cannot reach: npm-package callees and utilities cut off by the inlining depth
-  [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19); utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52); a setter nested
-  deeper than four closures [#45](https://github.com/rboudrouss/reactant-analyzer/issues/45) or called through an index or a returned function
-  [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46). A setter *call* in any expression position, `wrap(setN(1))`, a ternary arm, a JSX
-  prop, is seen; it is the callee's *inlining* that is not.
+  [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19); utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52); a setter called
+  through an index or a returned function [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46). A setter *call* in any expression position,
+  `wrap(setN(1))`, a ternary arm, a JSX prop, is seen; it is the callee's *inlining* that is not.
 - `useContext` is unmodelled, so a context value reads ⊤. This is the single largest source of
   analysis limits, 363 sites across the eight corpora [#28](https://github.com/rboudrouss/reactant-analyzer/issues/28).
 - Seven React hooks are unmodelled and emit an Info rather than a summary: `useActionState`,
@@ -72,19 +70,16 @@ imports resolving outside the analysed set.
   [#21](https://github.com/rboudrouss/reactant-analyzer/issues/21).
 - By decision: `arr.slice()` and `arr.concat()` in a deps array are not proven fresh, because the same
   method on a string returns a primitive and the proof would be false [#22](https://github.com/rboudrouss/reactant-analyzer/issues/22).
-- Operators the abstract domain does not model evaluate to ⊤, so a guard over them narrows nothing:
-  `%`, `**`, `in`, `instanceof` [#73](https://github.com/rboudrouss/reactant-analyzer/issues/73), the bitwise and shift operators [#74](https://github.com/rboudrouss/reactant-analyzer/issues/74),
-  and `~`, `typeof`, unary `+` [#75](https://github.com/rboudrouss/reactant-analyzer/issues/75).
+- Four operators the abstract domain does not model evaluate to ⊤, so a guard over them narrows
+  nothing: `%`, `**`, `in` and `instanceof` [#73](https://github.com/rboudrouss/reactant-analyzer/issues/73).
 - A spread or computed key is kept for its reads but not modeled, so `{ ...opts }.foo` does not
   resolve and a setter forwarded through `f(...handlers)` is not seen [#76](https://github.com/rboudrouss/reactant-analyzer/issues/76).
-- Class bodies declared inside a component are not lowered, so a setter called from a method is
-  invisible [#77](https://github.com/rboudrouss/reactant-analyzer/issues/77).
 - **Mount-coupled seeds.** `frozen-initial-state` drops to Info, hidden without `--info`, when every
   call site renders the consumer under a `key` built from the seeding prop, or under a guard built
   from it (`{msg && <Toast msg={msg}/>}`). Neither shape is a proof: a `msg` moving between two
   *truthy* values keeps the child mounted (`if (!data) return <Spinner/>` over refetched data), and
-  an object `key` stringifies to a constant. The finding is downgraded, never deleted
-  [#95](https://github.com/rboudrouss/reactant-analyzer/issues/95).
+  an object `key` stringifies to a constant. The finding is downgraded, never deleted. The residual
+  family, a caller that always remounts with a `key`, is [#136](https://github.com/rboudrouss/reactant-analyzer/issues/136).
 
 ## Why reactant may warn wrongly (false positives)
 
@@ -93,8 +88,7 @@ carries an Error.
 
 - **`missing-deps`** on a deliberately omitted unstable callback in a mount-only or trigger-keyed
   effect [#32](https://github.com/rboudrouss/reactant-analyzer/issues/32); on a conditionally re-bound closure (`let cb = a ? f : g`)
-  [#35](https://github.com/rboudrouss/reactant-analyzer/issues/35); on the setter slot of a tuple-returning third-party hook such as jotai's `useAtom`
-  [#37](https://github.com/rboudrouss/reactant-analyzer/issues/37).
+  [#35](https://github.com/rboudrouss/reactant-analyzer/issues/35).
 - **Module-level constants** read as ⊤ when the initializer is a call (`const X = f()`)
   [#34](https://github.com/rboudrouss/reactant-analyzer/issues/34), or when the hook was inlined from another file [#36](https://github.com/rboudrouss/reactant-analyzer/issues/36).
 - **`state-mutation`** on a DOM-typed prop whose type is imported from another file [#38](https://github.com/rboudrouss/reactant-analyzer/issues/38).
@@ -112,7 +106,7 @@ carries an Error.
 - **`stale-closure`** treats any two-argument `on` or `addListener` (and any one-argument
   `subscribe`) as a long-lived registration [#42](https://github.com/rboudrouss/reactant-analyzer/issues/42).
 - **`frozen-initial-state`** still fires on a child remounted by machinery it cannot see: a dialog
-  body unmounted by its library wrapper, a route that swaps the subtree [#95](https://github.com/rboudrouss/reactant-analyzer/issues/95).
+  body unmounted by its library wrapper, a route that swaps the subtree [#136](https://github.com/rboudrouss/reactant-analyzer/issues/136).
 - **`missing-deps`** asks whether a capture can go *stale*, so a read through a handle that never
   changes is silent even when the container around it does. `bag.ref.current`, where `bag` is rebuilt
   every render but `bag.ref` is a `useRef`, reads the live value and the rule says nothing. The
@@ -144,7 +138,7 @@ carries an Error.
   neighbouring shapes are not proved and still fire: a **disjunctive** guard
   (`if (!prev || prev !== next)`), and **arithmetic** on the compared value
   (`setIndex(Math.max(0, plans.length - 1))` under `index >= plans.length`)
-  [precision-log](precision-log.md#2026-09-02-a-write-that-settles-its-own-guard).
+  [#91](https://github.com/rboudrouss/reactant-analyzer/issues/91), [precision-log](precision-log.md#2026-09-02-a-write-that-settles-its-own-guard).
 - **A library hook's per-member contract is a table, not an inference.** `useForm()`, `useRouter()`
   and SWR's `mutate` have their stable members listed by name. A member that is not listed reads ⊤, so
   a library that adds one, or a library with no entry at all, keeps firing. `formState`, `data` and
@@ -158,7 +152,7 @@ carries an Error.
   would be a guess, and ADR-034 §2 allows narrowing off ⊤ only on the first. Three things keep it ⊤
   deliberately: a library with no table, a handler this body invokes itself, and a name bound more
   than once, since two forms inlined into one render body leave no way to say whose `handleSubmit` a
-  call means [#94](https://github.com/rboudrouss/reactant-analyzer/issues/94).
+  call means [precision-log](precision-log.md#2026-09-03-a-wrapper-does-not-run-its-argument).
 - **Being a wrapper and being stable are two claims, and a table entry says them separately.**
   react-hook-form's `handleSubmit` is `useCallback`-backed; `@mantine/form`'s `onSubmit` is
   `(handler) => (event) => …`, rebuilt on every render. Both wrap, only one is stable, and the mantine
@@ -166,6 +160,12 @@ carries an Error.
   [precision-log](precision-log.md#2026-09-03-a-wrapper-is-not-necessarily-stable). The context hooks
   `@mantine/form`'s `createFormContext()` builds are user-named, so they cannot be keyed by package
   plus hook name and get no table at all.
+- **A state slot that is never written** still reads `Versioned` rather than `Stable`, so a dep on it
+  cannot be omitted. The domain has no "ever written" bit; `stale-closure` implements the syntactic
+  half locally [#41](https://github.com/rboudrouss/reactant-analyzer/issues/41).
+- **`same_tick`** reads mutually exclusive branch writes as co-executing once they sit in an inlined
+  local helper, so a rule quantifying over same-tick writes fires on an if/else chain that can only
+  take one arm [#123](https://github.com/rboudrouss/reactant-analyzer/issues/123).
 - **The assurance channel** (`verified:` lines under `--info`) is withheld per component rather than
   per (limit kind, check), so an unanalysed *child* costs the parent guarantees about its own body
   [#31](https://github.com/rboudrouss/reactant-analyzer/issues/31). This affects `--info` output only, never a diagnostic and never the exit code.
@@ -204,9 +204,10 @@ local alias [#50](https://github.com/rboudrouss/reactant-analyzer/issues/50). `n
 `SummaryRegistry` is the supported extension point [#51](https://github.com/rboudrouss/reactant-analyzer/issues/51).
 
 Utility inlining is statement position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52), runs once per
-recursive utility [#53](https://github.com/rboudrouss/reactant-analyzer/issues/53), and has a global splice budget of 8, which
-real projects reach and which is reported as `analysis-limit` when it truncates
-[#54](https://github.com/rboudrouss/reactant-analyzer/issues/54). It handles no default exports [#55](https://github.com/rboudrouss/reactant-analyzer/issues/55) and no nested
+recursive utility [#53](https://github.com/rboudrouss/reactant-analyzer/issues/53), and has a global splice budget of 8. Large
+repositories do reach it, and the truncation is reported as `analysis-limit`
+rather than passed over in silence. It handles no default exports
+[#55](https://github.com/rboudrouss/reactant-analyzer/issues/55) and no nested
 closures [#56](https://github.com/rboudrouss/reactant-analyzer/issues/56), and a returned `FnLit`'s call site stays opaque
 [#57](https://github.com/rboudrouss/reactant-analyzer/issues/57).
 
@@ -265,19 +266,17 @@ The one blocked entry, `nullable-return-unguarded`, is excluded by design
 type-flow question rather than a hook-semantics one.
 
 Anchor identity rules on the `hook_origins` relation, which sees resolved and
-inlined hooks alike. A `kind: "custom"` anchor is blind to every hook the engine
-resolved, which silently disables the rules a team actually writes
-[#6](https://github.com/rboudrouss/reactant-analyzer/issues/6).
+inlined hooks alike. A `kind: "custom"` anchor sees only the hooks the engine
+could *not* resolve, which is rarely what an identity rule means; the pack
+validator warns when a rule written that way could move to `hook_origins`.
 
-Three things still bound the vocabulary, in decreasing order of leverage:
+Two things still bound the vocabulary:
 
 - Prop, provider-value and setter-argument positions carry no expression verdict
   [#67](https://github.com/rboudrouss/reactant-analyzer/issues/67).
 - Tier A is single-anchor [#68](https://github.com/rboudrouss/reactant-analyzer/issues/68). In practice a whole-program relation
   can project onto the anchored component, which is how the churn-cycle and
   context-consumer rules avoid needing a second anchor.
-- The `writers` relation collapses two same-slot writes in one body into one row,
-  so same-tick multi-write classes stay out of reach [#105](https://github.com/rboudrouss/reactant-analyzer/issues/105).
 
 The history of how the vocabulary grew lives in the ADRs, chiefly ADR-023 and
 ADR-027 through ADR-034.
@@ -295,3 +294,20 @@ Rules that would re-do eslint AST pattern-matching (raw exhaustive-deps,
 rules-of-hooks, index-as-key, naming) are explicitly out of scope. Proposed
 *semantic* rules that only abstract interpretation can catch: `stale-update`
 [#61](https://github.com/rboudrouss/reactant-analyzer/issues/61) and `async-setState-race` [#62](https://github.com/rboudrouss/reactant-analyzer/issues/62).
+
+## Recently fixed
+
+Entries this page used to carry, kept here for a release or two so a reader
+coming back with an old copy can tell what moved. Each links to the measurement.
+
+| Was | Fixed by |
+|---|---|
+| A `finally` reached from a `try` body that returned was never lowered, and a write present only in the `catch` was reported as certain | [#2](https://github.com/rboudrouss/reactant-analyzer/issues/2), [precision-log](precision-log.md#2-trycatchfinally-is-control-flow-2026-09-04) |
+| A hook called inside returned JSX or reached through a `return` produced no hook entry | [#4](https://github.com/rboudrouss/reactant-analyzer/issues/4), [precision-log](precision-log.md#4-and-5-a-hook-in-a-terminator-a-concise-body-2026-09-04) |
+| A `kind: "custom"` pack anchor was the only way to write an identity rule, and it was blind to resolved hooks | [#6](https://github.com/rboudrouss/reactant-analyzer/issues/6), ADR-027 §7 |
+| An import alias resolving outside the analysed set was located, never read, and never reported | [#9](https://github.com/rboudrouss/reactant-analyzer/issues/9), [#138](https://github.com/rboudrouss/reactant-analyzer/issues/138) |
+| A setter nested deeper than four closures was missed, the depth cap standing in for a cycle guard | [#45](https://github.com/rboudrouss/reactant-analyzer/issues/45) |
+| Class bodies inside a component were not lowered, hiding a setter called from a method | [#77](https://github.com/rboudrouss/reactant-analyzer/issues/77) |
+| The bitwise, shift, `~`, `typeof` and unary `+` operators evaluated to ⊤ | [#74](https://github.com/rboudrouss/reactant-analyzer/issues/74), [#75](https://github.com/rboudrouss/reactant-analyzer/issues/75) |
+| The setter slot of a tuple-returning hook such as jotai's `useAtom` read ⊤ | [#37](https://github.com/rboudrouss/reactant-analyzer/issues/37), [precision-log](precision-log.md#2026-09-03-a-tuple-contract-is-indexed-by-position) |
+| The `writers` relation collapsed two same-slot writes in one body into one row | [#105](https://github.com/rboudrouss/reactant-analyzer/issues/105) |

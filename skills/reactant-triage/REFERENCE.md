@@ -56,8 +56,7 @@ code has one of the shapes below, the absence of a finding tells you nothing.
   break past one level (#49).
 - A utility function is inlined only when the call is a whole statement, so
   `if (util(x))` and `setX(util(y))` stay opaque (#52).
-- A setter nested deeper than four closures, or reached through an index, a
-  returned function, a spread or a class method (#45, #46, #76, #77).
+- A setter reached through an index, a returned function or a spread (#46, #76).
 
 Say this out loud when you report a clean run over code that uses one of them.
 
