@@ -130,7 +130,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rboudrouss/reactant-analyzer@v0.4.0
+      - uses: rboudrouss/reactant-analyzer@v0.5.0
         with:
           path: .              # the project root, so tsconfig aliases load
           fail-on: error       # warnings annotate the PR without failing it
