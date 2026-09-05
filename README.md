@@ -41,7 +41,7 @@ export function useData(initial: number) {
 }
 ```
 
-![reactant reporting an infinite render loop that spans two files](docs/demo.svg)
+![reactant reporting an infinite render loop that spans two files](docs/demo.gif)
 
 ESLint says nothing here. `useData` lives in another file, and inside that file
 the deps array is correct. `--trace` prints the chain behind the finding: which

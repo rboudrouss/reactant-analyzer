@@ -2,14 +2,18 @@
 # Records the README demo and renders it to docs/demo.svg.
 #
 # Two tools, neither of them a project dependency:
-#   pip install asciinema            (2.4+, records the terminal)
-#   npm install -g svg-term-cli      (renders the cast as an animated SVG)
+#   pip install asciinema                              (2.4+, records)
+#   cargo install --git https://github.com/asciinema/agg   (renders the GIF)
+#
+# svg-term-cli was tried first and rejected: it animates the first line and
+# leaves the rest of the frames in the file but never displays them, so the
+# command typed out and the analyzer's output never appeared.
 #
 # The demo project is generated here rather than committed, so the recording
 # has exactly one source of truth and no stray .tsx files sit in the tree.
 # Re-render without re-recording:
-#   svg-term --in docs/demo.cast --out docs/demo.svg --window --width 96 \
-#            --height 10 --padding 14
+#   agg docs/demo.cast docs/demo.gif --theme github-dark --font-size 16 \
+#       --fps-cap 15 --last-frame-duration 3
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
@@ -55,15 +59,15 @@ type_run() {
 }
 sleep 0.7
 
-type_run 'reactant check src/ --trace' "$BIN check src/ --trace || true"
+type_run 'npx reactant-analyzer check src/ --trace' "$BIN check src/ --trace || true"
 sleep 3.0
 SCENE
 chmod +x "$WORK/run.sh"
 
 cd "$WORK"
-asciinema rec --overwrite --cols 96 --rows 12 -c ./run.sh "$ROOT/docs/demo.cast"
+asciinema rec --overwrite --cols 96 --rows 11 -c ./run.sh "$ROOT/docs/demo.cast"
 cd "$ROOT"
-svg-term --in docs/demo.cast --out docs/demo.svg \
-  --window --width 96 --height 10 --padding 14
+agg docs/demo.cast docs/demo.gif \
+  --theme github-dark --font-size 16 --fps-cap 15 --last-frame-duration 3
 
-echo "wrote docs/demo.cast and docs/demo.svg"
+echo "wrote docs/demo.cast and docs/demo.gif"
