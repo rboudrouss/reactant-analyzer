@@ -46,9 +46,9 @@ impl ExprIds {
 /// table, the allocation-site counter, and the JSX callee origins.
 ///
 /// One carrier rather than three parameters. Nested bodies are lowered through
-/// their own [`BlockBuilder`], so a per-file fact only reaches a `FnLit` body
-/// if it travels with the builder that makes it; bundling is what keeps the
-/// next such fact from needing its own threading pass.
+/// their own `BlockBuilder`, so a per-file fact only reaches a `FnLit` body if
+/// it travels with the builder that makes it; bundling is what keeps the next
+/// such fact from needing its own threading pass.
 #[derive(Debug, Clone)]
 pub struct LowerCtx {
     pub smap: SourceMap,

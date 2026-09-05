@@ -30,8 +30,8 @@ pub enum RootStrategy {
     AllComponents,
     /// `--entry Foo,Bar`: explicit list. A bare `Foo` makes every `(file, name)`
     /// entry called `Foo` a root; the qualified `Foo@src/a/Foo.tsx` form — what
-    /// [`ComponentRegistry::display_name`] mints for a collision, and what the
-    /// report prints back — selects exactly one.
+    /// [`crate::ir::ComponentTable::display_name`] mints for a collision, and
+    /// what the report prints back — selects exactly one.
     Explicit(Vec<Symbol>),
 }
 
