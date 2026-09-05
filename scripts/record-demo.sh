@@ -13,7 +13,7 @@
 # has exactly one source of truth and no stray .tsx files sit in the tree.
 # Re-render without re-recording:
 #   agg docs/demo.cast docs/demo.gif --theme github-dark --font-size 16 \
-#       --fps-cap 15 --last-frame-duration 3
+#       --fps-cap 15 --last-frame-duration 10
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
@@ -69,6 +69,6 @@ cd "$WORK"
 asciinema rec --overwrite --cols 96 --rows 10 -c ./run.sh "$ROOT/docs/demo.cast"
 cd "$ROOT"
 agg docs/demo.cast docs/demo.gif \
-  --theme github-dark --font-size 16 --fps-cap 15 --last-frame-duration 3
+  --theme github-dark --font-size 16 --fps-cap 15 --last-frame-duration 10
 
 echo "wrote docs/demo.cast and docs/demo.gif"
