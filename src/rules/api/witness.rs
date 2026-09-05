@@ -200,7 +200,9 @@ impl Step {
             ),
             Step::Mutate { target } => {
                 let target = crate::ir::source_name(target);
-                format!("`{target}` is mutated in place here, so its reference identity is unchanged")
+                format!(
+                    "`{target}` is mutated in place here, so its reference identity is unchanged"
+                )
             }
             Step::Capture { what } => format!(
                 "`{}` is captured at registration time, so the callback keeps this value, \
