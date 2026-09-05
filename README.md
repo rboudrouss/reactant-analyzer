@@ -1,162 +1,22 @@
 # reactant
 
-A static analyzer for React hook bugs, built on abstract interpretation over a dedicated CFG-based IR. It evaluates the component's state in an abstract domain instead of pattern-matching the AST, which is how it catches a class of bugs `eslint-plugin-react-hooks` cannot see: infinite render loops, derived state, callbacks-via-prop instability, cross-file hook misuse.
+Finds React hook bugs that ESLint has no rule for: infinite render loops,
+effects that mirror state instead of computing it, callbacks stuck reading a
+value frozen at mount, providers that re-render every consumer on every render.
 
-> The concrete semantics follow the [React-tRace paper](https://arxiv.org/abs/2507.05234) (Lee, Ahn, Yi. OOPSLA 2025).
-
-
-## What it catches
-
-| Rule | What it catches |
-|------|-----------------|
-| `infinite-loop` | an effect sets state that re-triggers the effect, and the state diverges |
-| `cross-component-infinite-loop` | a child effect sets parent state; the parent re-renders the child and the effect refires |
-| `derived-state` | an effect only mirrors another state; compute it during render instead |
-| `missing-deps` | an effect body captures a variable not listed in its deps array |
-| `always-unstable-deps` | a dep is a fresh reference every render, so the deps array never matches |
-| `stale-closure` | a long-lived callback keeps a state value frozen at registration time |
-| `setter-in-render` | setState called during the render body |
-| `cross-setter-in-render` | a parent's setter (received as prop) called during render |
-| `conditional-hook` | a hook called inside a conditional branch |
-| `frozen-initial-state` | useState seeded from a prop that changes; the state freezes at the first value |
-| `state-mutation` | a state or prop object mutated in place: same reference, no re-render |
-| `redundant-set-state` | setState called with the value the state already holds |
-| `unnecessary-rerender` | a mount-only effect immediately overwrites the initial state |
-| `missing-cleanup` | an effect starts something long-lived and returns no teardown |
-| `lazy-init` | a useState initializer calls a function on every render |
-| `unstable-context-value` | a context provider hands consumers a new object every render |
-| `server-component-hook` | a hook is called in a Next.js Server Component, where hooks do not exist |
-
-Two info-level diagnostics (`analysis-limit` and `widening-info`, behind
-`--info`) report where the analyzer deliberately lost precision. They tell you
-where a clean report is a proof and where it is only best-effort.
-
-`--info` also turns on the other half of that story. Rather than leaving you to
-infer soundness from silence, each component lists the checks that were
-applicable and found nothing:
-
-```
-  Counter  (3 hooks)  src/Counter.tsx  ✓
-    verified   conditional-hook  all hooks run unconditionally, in a stable order
-    verified   infinite-loop     no effect diverges into an infinite render loop
-```
-
-Where the analysis was truncated, those assurances are withheld and the count is
-reported instead, because an opaque hook body can hide the very thing each one
-claims:
-
-```
-  Widget  (4 hooks)  src/Widget.tsx
-    info       analysis-limit  hook `useThing` not found in registry … (FN possible)
-    suspended  analysis-limit  10 passing check(s) withheld
-```
-
-Withholding an *assurance* is not withholding an *alert*: unknown values stay ⊤
-and the rules that read them still fire, false positives included. Details in
-[docs/usage.md](docs/usage.md#the-assurance-channel---info).
-
-Rules live in `src/rules/`, one file per rule, all post-pass on a single `AnalysisResult`. Custom rule packs (semantic, not AST patterns) are described in [docs/custom-rules.md](docs/custom-rules.md).
-
-## Quick start
+It follows values across files, so a bug hiding inside a custom hook two
+imports away is still reported, on the component that suffers it.
 
 ```sh
 npx reactant-analyzer check src/
 ```
 
-The npm package ships a WASM build of the analyzer: no toolchain to install,
-byte-identical output to the native binary on every platform. Or from source:
+Nothing to install, nothing to configure. Node 20 or later. Vite and Next.js
+projects are detected on their own, tsconfig `paths` included.
 
-```sh
-git clone https://github.com/rboudrouss/reactant-analyzer
-cd reactant-analyzer
-cargo run -- check path/to/your-project
-```
+## What a finding looks like
 
-`check` is the default subcommand, so plain `reactant src/` works too:
-
-```sh
-reactant check src/                            # analyze a tree (skips node_modules, gitignored dirs, tests)
-reactant check my-vite-app/                    # auto-detects Vite: src/ discovery + @/* aliases
-reactant check my-next-app/                    # auto-detects Next.js: router discovery + @/* and baseUrl
-reactant check src/ --format json              # machine-readable output for CI
-reactant check src/ --fail-on error            # warnings don't fail the build
-reactant check src/ --ignore-rule lazy-init    # filter diagnostics
-reactant rules                                 # list every diagnostic
-reactant explain infinite-loop                 # what it is, example, how to fix
-```
-
-Exit codes: `0` clean, `1` findings, `2` usage error. See [docs/usage.md](docs/usage.md) for all flags, the JSON schema, and project-kind detection.
-
-### Next.js projects
-
-A directory containing `next.config.*` is analyzed with Next conventions.
-Discovery narrows to `src/` only when `src/app` or `src/pages` lives there, so
-both the root-router and `src/` layouts work. Aliases come from tsconfig
-`paths`; a non-relative specifier no pattern claims is then probed against
-`baseUrl`, which is what a scaffold with `"baseUrl": "."` and no `paths` needs
-to address its own tree (`import { getCart } from "lib/shopify"`). Hooks from
-`next/navigation` and `next/router` are known to the analyzer rather than
-reported as unknown.
-
-**Server Components are analyzed, not skipped.** A Server Component has no
-state, so the abstract interpretation over-approximates it exactly as it does
-any component whose props are ⊤ — and skipping modules based on an import
-graph that may be missing edges would turn every misclassification into a
-missed bug. What the analyzer adds instead is `server-component-hook`: it
-tracks `"use client"` boundaries through the resolved import graph, and warns
-when a hook is called in a module Next compiles into the server graph. The
-rule stays silent in projects that never write the directive, and it never
-suppresses other rules' findings in the same module — the missing directive is
-named beside them.
-
-### Vite projects
-
-A directory containing `vite.config.*` is analyzed with Vite conventions: sources are discovered under `src/`, and `@/*`-style aliases are loaded from tsconfig `paths`. The tsconfig is parsed as JSONC, and `extends` chains and project `references` are followed, so the standard Vite scaffold with `tsconfig.app.json` works out of the box. An aliased custom hook is then resolved and inlined cross-file exactly like a relative import.
-
-Aliases declared *only* in `vite.config.*` are not read, since that would require executing JS. When no tsconfig `paths` are found, the run does not just warn — it **withholds the clean bill**: unresolved imports are analysis blind spots, blind spots mean possible false negatives, and a green tick over unread source would be the one lie this tool cannot afford. See [the last line](docs/usage.md#the-last-line-and-when-it-is-withheld).
-
-## CI with the GitHub Action
-
-The repository doubles as a GitHub Action. It runs the npm CLI and turns every
-finding into a PR annotation on the exact file and line.
-
-```yaml
-name: reactant
-on: [pull_request]
-jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - id: check
-        uses: rboudrouss/reactant-analyzer@v0.4.0
-        with:
-          path: .                # the project root, so tsconfig aliases load
-          fail-on: error         # warnings annotate the PR but don't fail it
-```
-
-Narrowing `path` to a subdirectory is fine — the marker and tsconfig are looked
-up in the ancestors too, so the project's aliases still load — but the run then
-sees only what you named, and says so: every import that resolves outside it is
-listed by name on the last line.
-
-Inputs: `path`, `fail-on` (`error|warning|never`), `config`, `version` (npm
-version to run), `args` (extra `reactant check` flags). Outputs: `errors`,
-`warnings`, `infos`, `exit-code`, `json` (path to the full JSON report, schema
-v2) and `blind-spots` — how many things the run knows it did not read. That
-last one never affects the exit code; gate on it yourself if your project wants
-a run that reads everything or fails:
-
-```yaml
-      - if: steps.check.outputs.blind-spots != '0'
-        run: exit 1
-```
-
-See [action.yml](action.yml).
-
-## Example
-
-Given a custom hook with an infinite loop, imported from a sibling file:
+`Page` looks fine. The hook it imports does not.
 
 ```tsx
 // src/page.tsx
@@ -173,128 +33,153 @@ function Page() {
 function useData(initial) {
   const [value, setValue] = useState(initial);
   useEffect(() => {
-    setValue(value + 1);
+    setValue(value + 1);        // writes the state its own deps watch
   }, [value]);
   return value;
 }
 ```
 
-`cargo run -- check src/` produces:
-
 ```
+$ npx reactant-analyzer check src/
+
   Page  (1 hooks)  src/page.tsx
-    warn   infinite-loop  [hook:1]  (line 7:2)  — effect 2 sets state 1 (all deps unstable — effect runs every render) which needed widening — potential infinite render loop
+    warn   infinite-loop  [hook:1]  (src/hooks/useData.ts:4:2)  this effect keeps
+    pushing state `value` (its deps do not provably gate it, so the effect can
+    re-run every render) to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
 
 ⚠  1 warning(s) across 2 file(s).
 ```
 
-The bug is detected on `Page` after the analyzer resolves `./hooks/useData`, lowers `useData`'s body, and inlines it into `Page`'s fixpoint.
+ESLint says nothing here. `useData` lives in another file, and inside that file
+the deps array is correct.
 
-## reactant vs React Compiler vs `eslint-plugin-react-hooks`
+## What it catches
 
-Three tools, three different jobs. `eslint-plugin-react-hooks` pattern-matches
-the AST. That makes it fast, in-editor, and exactly right for the lexical
-rules-of-hooks, but one level of indirection (a helper function, a custom hook
-in another file) and the pattern no longer matches. The React Compiler
-rewrites code for performance. It auto-memoizes, which erodes the urgency of
-the referential-stability bug class where it compiles. Reactant proves
-properties about runtime behavior. It computes, by abstract interpretation
-over a CFG-based IR, a superset of what the component can do, and reports from
-that.
+Most of these have no ESLint counterpart.
 
-The useful distinction per bug class is whether a tool catches the bug, masks
-the symptom, or is blind to it:
+| Rule | What goes wrong |
+|---|---|
+| `infinite-loop` | an effect sets state that re-triggers the effect, and the value never settles |
+| `cross-component-infinite-loop` | a child effect sets parent state, the parent re-renders the child, the effect fires again |
+| `derived-state` | an effect only mirrors another state, so compute it during render |
+| `stale-closure` | a long-lived callback keeps reading a value frozen at registration time |
+| `frozen-initial-state` | `useState` is seeded from a prop that later changes, so the state sticks at the first value |
+| `state-mutation` | a state or prop object is mutated in place, so the reference never changes and React skips the re-render |
+| `unstable-context-value` | a provider hands consumers a new object every render |
+| `setter-in-render`, `cross-setter-in-render` | `setState` runs during the render body, directly or through a prop |
+| `missing-cleanup` | an effect starts something long-lived and returns no teardown |
+| `redundant-set-state` | `setState` is called with the value the state already holds |
+| `unnecessary-rerender` | a mount-only effect immediately overwrites the initial state |
+| `lazy-init` | a `useState` initializer calls a function on every render |
+| `server-component-hook` | a hook runs in a Next.js Server Component, where hooks do not exist |
+
+Three more overlap with ESLint, but reactant follows the value rather than the
+syntax, so they also fire through helpers and cross-file custom hooks.
+
+| Rule | ESLint counterpart |
+|---|---|
+| `missing-deps` | `exhaustive-deps`, carried through indirection |
+| `always-unstable-deps` | partly covered by `exhaustive-deps` |
+| `conditional-hook` | `rules-of-hooks`, carried past the lexical case |
+
+`reactant rules` lists them all. `reactant explain <rule>` gives an example and
+a fix for one.
+
+## reactant, ESLint and React Compiler
+
+Three tools, three jobs. None of them replaces another.
+
+`eslint-plugin-react-hooks` matches patterns in the AST. That makes it fast,
+in-editor, and exactly right for the lexical rules of hooks. Add one level of
+indirection, a helper or a custom hook in another file, and the pattern stops
+matching.
+
+React Compiler rewrites code for performance. Where it compiles, its
+auto-memoization removes the re-renders that unstable references cause. It does
+not fix logic bugs, and it bails out silently, so a symptom disappearing proves
+nothing.
+
+reactant runs your components. It walks the render body, the effects, the
+callbacks and the imported hooks, tracks what each state slot can hold across
+renders, and reports the shapes that cannot settle.
 
 | Bug class | eslint-plugin-react-hooks | React Compiler | reactant |
 |---|---|---|---|
-| Conditional hook call | catches (lexical) | bails out of compiling; the bug stays | catches (`conditional-hook`) |
-| Missing effect dep | catches literal same-file deps arrays | out of scope | catches through value flow, including deps captured inside a cross-file custom hook (`missing-deps`) |
-| Unstable dep / context value / callback identity | partial heuristics | masks it: auto-memoization removes the re-renders where compilation succeeds, and silently bails where it doesn't, leaving the symptom intact | catches and explains (`always-unstable-deps`, `unstable-context-value`) |
-| Infinite render loop | blind | not fixed; memoization can't break a set-state cycle whose value actually changes | proves divergence via widening in the fixpoint (`infinite-loop`, `cross-component-infinite-loop`) |
-| Derived state in an effect | blind | not fixed; still an extra render pass and a stale-mirror window | catches (`derived-state`) |
-| Stale closure | blind | not fixed | catches (`stale-closure`) |
-| Cross-component cycles (setter via prop, child→parent effect loops) | blind (single file, no call graph) | blind (compiles function by function) | whole-program: setters tracked through the call graph, hooks inlined cross-file |
+| Conditional hook call | catches (lexical) | refuses to compile, the bug stays | catches |
+| Missing effect dep | catches literal same-file deps arrays | out of scope | catches through value flow, including inside a cross-file hook |
+| Unstable dep, context value or callback identity | partial heuristics | hides the symptom where it compiles, silently bails where it does not | catches and explains |
+| Infinite render loop | blind | not fixed, memoization cannot break a cycle whose value keeps changing | catches |
+| Derived state in an effect | blind | not fixed | catches |
+| Stale closure | blind | not fixed | catches |
+| Cross-component cycles | blind, one file at a time | blind, one function at a time | catches, setters tracked through the call graph |
 
-The compiler corrects performance symptoms, not logic bugs. After React
-Compiler adoption, the bugs that remain are the semantic ones: loops, derived
-state, stale closures, cross-component cycles. And because bail-outs are
-silent, a symptom disappearing is not evidence of anything. Reactant is sound
-the other way around: false positives are tolerated, false negatives are
-forbidden, and the places where it deliberately loses precision are themselves
-reported (`--info`). A clean report is a proof over a superset of behaviors,
-not a pattern that failed to match — and it is only *issued* when the analyzer
-read everything it was pointed at. A run with source it could not open says so
-on its last line instead of ticking green.
+Use all three. ESLint in the editor, the compiler for performance, reactant as
+the gate in CI. reactant is slower than a linter because it runs a whole-program
+fixpoint rather than one file at a time: 528 files in 1.8s on excalidraw, 4,195
+files in 76s on dub.
 
-Use all three: eslint for lexical rules in the editor, the compiler for
-performance, reactant as the semantic gate in CI. Reactant is slower
-(whole-program fixpoint, not single-file) and is not a replacement for either.
+## In CI
 
-## A verifier for AI-written code
+The repository is also a GitHub Action. Every finding becomes an annotation on
+the file and line that produced it.
 
-LLMs produce exactly the bugs this analyzer targets: effect loops, missing
-deps hidden behind indirection, derived state, stale closures. And they
-produce them behind enough abstraction that AST patterns don't fire.
-`--format json` gives a deterministic, machine-readable oracle. Every finding
-carries a witness chain, typed steps an agent can use as a causal explanation
-for an autofix rather than just a location: this binding resolves there, this
-call writes that slot, this value widened. The GitHub Action above is the
-corresponding gate: generated code doesn't merge until the analyzer stops
-finding divergence.
+```yaml
+name: reactant
+on: [pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rboudrouss/reactant-analyzer@v0.4.0
+        with:
+          path: .              # the project root, so tsconfig aliases load
+          fail-on: error       # warnings annotate the PR without failing it
+```
 
-## Using it from Claude Code
+Inputs and outputs are documented in [action.yml](action.yml).
 
-The analyzer ships as a Claude Code plugin, so an agent can run it and act on
-the report without you explaining the output format first.
+## For AI-generated code
+
+LLMs write exactly these bugs, and they write them behind enough abstraction
+that AST patterns never fire. `--format json` gives a machine-readable report
+where every finding carries a witness chain, the typed steps that led to it, so
+an agent can fix the cause instead of the line. The Action above is the gate.
+
+reactant also ships as a Claude Code plugin:
 
 ```
 /plugin marketplace add rboudrouss/reactant-analyzer
 /plugin install reactant@reactant-analyzer
 ```
 
-It installs two skills. `reactant-triage` runs the analyzer, sorts every
-finding into true positive, false positive or not worth fixing, and ends on a
-ranked fix plan. It knows which warnings are known limits of the analysis
-rather than bugs in your code, and it refuses to call a component clean when
-the analysis was truncated there. `reactant-rules` writes custom rule packs,
-starting with a feasibility check, because a rule that cannot be expressed
-over the semantics is refused rather than approximated.
+`reactant-triage` runs the analyzer and sorts each finding into true positive,
+false positive, or not worth fixing. `reactant-rules` writes custom rule packs.
 
-A triage runs one `check` plus one `explain` per rule it found. To stop
-approving each call, allow the binary once in `.claude/settings.json`:
+## Team rules
 
-```json
-{ "permissions": { "allow": ["Bash(npx reactant-analyzer:*)"] } }
-```
+Team conventions ship as rule packs, written against facts the engine already
+resolved (which hook a value came from, what a setter writes, what a selector
+returns) rather than against source patterns, so they survive refactoring.
+Authored in JSON or JavaScript, compiled with `reactant packs build`. See
+[docs/custom-rules.md](docs/custom-rules.md).
 
-## Plugin API
+## Documentation
 
-When the CLI isn't enough (monorepos, workspace specifiers), drop down to the Rust API:
-
-```rust
-use reactant::engine::{Config, RootStrategy};
-use reactant::resolver::{DefaultImportResolver, FileDiscoverer, analyze_with_resolvers};
-
-let (result, file_count) = analyze_with_resolvers(
-    Path::new("./my-nextjs-app"),
-    &MyDiscoverer,                 // implement FileDiscoverer
-    &DefaultImportResolver,        // or your own ImportResolver
-    RootStrategy::AllComponents,
-    Config::default(),
-);
-```
-
-Vite and Next.js detection, tsconfig-paths/`baseUrl` alias resolution and the `"use client"` module graph are built in (`reactant::project::build_context`); `resolver::{lower_files, analyze_lowered, analyze_files}` expose the pipeline at finer grain. See [docs/plugins.md](docs/plugins.md) for full examples (custom discoverers and resolvers, reading module facts).
-
-## Known limitations
-
-Summary in [docs/limitations.md](docs/limitations.md); open work on the
-[issue tracker](https://github.com/rboudrouss/reactant-analyzer/issues)
-(`soundness-bug` for defects, `precision-fn` / `precision-fp` for trade-offs).
+- [docs/usage.md](docs/usage.md), every flag, the JSON schema, project detection, exit codes
+- [docs/custom-rules.md](docs/custom-rules.md), writing rule packs
+- [docs/limitations.md](docs/limitations.md), what it misses and what it may report wrongly
+- [docs/plugins.md](docs/plugins.md), the Rust API for custom discoverers and resolvers
+- [docs/adr/](docs/adr/), how the analysis works and why each decision was made
 
 ## Building from source
 
 ```sh
-cargo build --release    # binary at target/release/reactant
-cargo test               # full suite, runs in a few seconds
+cargo build --release   # binary at target/release/reactant
+cargo test
 ```
+
+MIT licensed. The concrete semantics follow the
+[React-tRace paper](https://arxiv.org/abs/2507.05234) (Lee, Ahn and Yi,
+OOPSLA 2025).

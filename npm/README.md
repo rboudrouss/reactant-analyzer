@@ -1,14 +1,14 @@
 # reactant-analyzer
 
-A sound static analyzer for React hook bugs, built on abstract interpretation.
-It evaluates your components in an abstract domain instead of pattern-matching
-the AST, so it catches the bugs `eslint-plugin-react-hooks` cannot see and
-React Compiler does not fix: infinite render loops, derived state, stale
-closures, cross-component setter cycles, bugs hidden inside cross-file custom
-hooks.
+Finds React hook bugs that ESLint has no rule for: infinite render loops,
+effects that mirror state instead of computing it, callbacks stuck reading a
+value frozen at mount, providers that re-render every consumer on every render.
 
-This package ships a WASM build of the analyzer: no toolchain to install,
-byte-identical output to the native binary on every platform. Node ≥ 20.
+It follows values across files, so a bug hiding inside a custom hook two
+imports away is still reported, on the component that suffers it.
+
+This package is a WASM build of the analyzer. No toolchain to install, and the
+same output on every platform. Node 20 or later.
 
 ## Quick start
 
@@ -16,55 +16,80 @@ byte-identical output to the native binary on every platform. Node ≥ 20.
 npx reactant-analyzer check src/
 ```
 
+`Page` looks fine. The hook it imports does not.
+
+```tsx
+// src/page.tsx
+import { useData } from "./hooks/useData";
+
+function Page() {
+  const data = useData(0);
+  return <div>{data}</div>;
+}
 ```
-  Counter  (2 hooks)  src/Counter.tsx
-    warn   infinite-loop  [hook:0]  (line 4:2)  this effect keeps pushing
-    state `n` to new values on every run — potential infinite render loop
+
+```ts
+// src/hooks/useData.ts
+function useData(initial) {
+  const [value, setValue] = useState(initial);
+  useEffect(() => {
+    setValue(value + 1);        // writes the state its own deps watch
+  }, [value]);
+  return value;
+}
 ```
+
+```
+  Page  (1 hooks)  src/page.tsx
+    warn   infinite-loop  [hook:1]  (src/hooks/useData.ts:4:2)  this effect keeps
+    pushing state `value` (its deps do not provably gate it, so the effect can
+    re-run every render) to new values on every run. Potential infinite render loop
+
+⚠  1 warning(s) across 2 file(s).
+```
+
+Vite and Next.js projects are detected on their own: router-aware discovery,
+tsconfig `paths` and `baseUrl` followed across files, and under the Next App
+Router, `"use client"` boundaries tracked through the import graph.
 
 ```sh
-reactant check src/ --format json      # machine-readable report + witness chains
-reactant check src/ --fail-on error    # warnings don't fail CI
-reactant check src/ --trace            # show why each rule fired, step by step
+reactant check src/ --format json      # machine-readable report with witness chains
+reactant check src/ --fail-on error    # warnings do not fail CI
+reactant check src/ --trace            # why each rule fired, step by step
 reactant rules                         # list every diagnostic
-reactant explain infinite-loop         # what it is, example, how to fix
+reactant explain infinite-loop         # what it is, an example, how to fix it
 ```
 
-Exit codes: `0` clean, `1` findings, `2` usage error. Vite and Next.js
-projects are auto-detected: router-aware discovery, tsconfig-`paths` and
-`baseUrl` aliases followed cross-file, and — under the Next App Router —
-`"use client"` boundaries tracked through the import graph.
+Exit codes: `0` clean, `1` findings, `2` usage error.
 
 ## What it catches
 
 `infinite-loop`, `cross-component-infinite-loop`, `derived-state`,
-`missing-deps`, `always-unstable-deps`, `stale-closure`, `setter-in-render`,
-`cross-setter-in-render`, `conditional-hook`, `frozen-initial-state`,
-`state-mutation`, `redundant-set-state`, `unnecessary-rerender`,
-`missing-cleanup`, `lazy-init`, `unstable-context-value`,
-`server-component-hook`. Run `reactant explain <rule>` for any of them.
+`stale-closure`, `frozen-initial-state`, `state-mutation`,
+`unstable-context-value`, `setter-in-render`, `cross-setter-in-render`,
+`missing-cleanup`, `redundant-set-state`, `unnecessary-rerender`, `lazy-init`,
+`server-component-hook`, plus `missing-deps`, `always-unstable-deps` and
+`conditional-hook`, which overlap with ESLint but fire through helpers and
+cross-file custom hooks too.
 
-The soundness contract is that the analysis computes a superset of the
-component's behaviors. False positives are possible; false negatives are
-forbidden. The places where the analyzer deliberately loses precision are
-themselves reported (`--info`).
+Run `reactant explain <rule>` for any of them.
 
-Every finding carries a witness chain: typed steps explaining why the rule
-fired (this binding resolves there, this call writes that state slot, this
-value kept growing). `--format json` exposes them as structured data, a
-deterministic oracle for CI gates and AI-agent loops.
+Every finding carries a witness chain: the typed steps explaining why the rule
+fired, such as which binding resolves where, which call writes which state slot,
+which value kept growing. `--format json` exposes them as structured data, which
+makes the report usable as a CI gate or by a coding agent.
 
-## Custom rules
+## Team rules
 
-Team conventions ship as rule packs: JSON rules over semantic facts the
-engine has proven (hook provenance, setter aliases, deps entries, what a
-store selector returns). Because they match resolved facts rather than AST
-patterns, they survive refactoring and indirection. Configure via
-`reactant.config.json`; JSON Schemas for both are in `schemas/`.
+Team conventions ship as rule packs, written against facts the engine already
+resolved (which hook a value came from, what a setter writes, what a store
+selector returns) rather than against source patterns, so they survive
+refactoring. Configure them through `reactant.config.json`; JSON Schemas for
+both files are in `schemas/`.
 
-Packs can be authored in JavaScript, the `eslint.config.js` model: typed via
-`lib/pack.d.ts`, testable, rules generated from a table. `packs build`
-compiles the module to the JSON the analyzer consumes:
+Packs can be written in JavaScript, following the `eslint.config.js` model:
+typed through `lib/pack.d.ts`, testable, and generated from a table if you want.
+`packs build` compiles the module into the JSON the analyzer reads.
 
 ```bash
 npx reactant packs build team.pack.js        # writes team.pack.json
@@ -94,18 +119,18 @@ module.exports = {
 ```
 
 The generated JSON is the committed artifact. Your module runs only on the
-authoring machine at build time, never during analysis or CI, and the native
-and WASM analyzers consume the same inert file. `packs build` validates the
-output through the exact loader a check run uses.
+authoring machine at build time, never during analysis or CI, and the native and
+WASM analyzers read the same inert file. `packs build` validates its output
+through the exact loader a check run uses.
 
-## Docs & source
+## Docs and source
 
-Full documentation, GitHub Action, comparison with React Compiler and
-eslint-plugin-react-hooks, and the Rust plugin API:
+Full documentation, the GitHub Action, the comparison with React Compiler and
+`eslint-plugin-react-hooks`, and the Rust plugin API:
 <https://github.com/rboudrouss/reactant-analyzer>
 
 The concrete semantics follow the
-[React-tRace paper](https://arxiv.org/abs/2507.05234) (Lee, Ahn, Yi.
+[React-tRace paper](https://arxiv.org/abs/2507.05234) (Lee, Ahn and Yi,
 OOPSLA 2025).
 
 MIT.
