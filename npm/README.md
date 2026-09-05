@@ -4,8 +4,9 @@ Finds React hook bugs that ESLint has no rule for: infinite render loops,
 effects that mirror state instead of computing it, callbacks stuck reading a
 value frozen at mount, providers that re-render every consumer on every render.
 
-It follows values across files, so a bug hiding inside a custom hook two
-imports away is still reported, on the component that suffers it.
+It follows values across files and across component boundaries, so a setter
+handed down as a prop or a hook imported from elsewhere is still checked, and
+the finding lands on the component that suffers the bug.
 
 This package is a WASM build of the analyzer. No toolchain to install, and the
 same output on every platform. Node 20 or later.
@@ -16,43 +17,49 @@ same output on every platform. Node 20 or later.
 npx reactant-analyzer check src/
 ```
 
-`Page` looks fine. The hook it imports does not.
+`Dashboard` owns the state. `Filters` normalizes it and hands it back up.
+Neither file has a bug you can see by reading it on its own.
 
 ```tsx
-// src/page.tsx
-import { useData } from "./hooks/useData";
+// src/Dashboard.tsx
+import { useState } from "react";
+import { Filters } from "./Filters";
 
-export function Page() {
-  const data = useData(0);
-  return <div>{data}</div>;
+export function Dashboard() {
+  const [query, setQuery] = useState({ term: "", tags: [] });
+  return <Filters value={query} onChange={setQuery} />;
 }
 ```
 
-```ts
-// src/hooks/useData.ts
-import { useState, useEffect } from "react";
+```tsx
+// src/Filters.tsx
+import { useEffect } from "react";
 
-export function useData(initial: number) {
-  const [value, setValue] = useState(initial);
+export function Filters({ value, onChange }) {
   useEffect(() => {
-    setValue(value + 1);        // writes the state its own deps watch
-  }, [value]);
-  return value;
+    onChange({ ...value, term: value.term.trim() });   // a new object, every run
+  }, [value, onChange]);
+
+  return <input value={value.term} />;
 }
 ```
 
 ```
-  Page  (1 hooks)  src/page.tsx
-    warn   infinite-loop  [hook:1]  (src/hooks/useData.ts:5:2)  this effect keeps
-    pushing state `value` (its deps do not provably gate it, so the effect can
-    re-run every render) to new values on every run. Potential infinite render loop
-       (2 trace step(s), rerun with --trace)
+  Filters  (1 hooks)  src/Filters.tsx
+    warn   cross-component-infinite-loop  [hook:0]  (line 4:2)  this effect calls
+    `onChange`, a state setter of parent `Dashboard` (its deps do not provably
+    gate it, so the effect can re-run every render). Parent re-renders → child
+    re-renders → effect fires again: infinite loop
+   1 clean component(s) hidden, rerun with --show-clean
 
 ⚠  1 warning(s) across 2 file(s).
 ```
 
-ESLint says nothing here. `useData` lives in another file, and inside that file
-the deps array is correct.
+The spread allocates a fresh object, so `Object.is` fails, the parent
+re-renders, `value` comes back as a new reference, and the effect fires again.
+ESLint sees two correct files: the deps array lists everything the effect
+reads, and no hook is conditional. reactant follows `setQuery` through the prop
+into the child and closes the cycle.
 
 Vite and Next.js projects are detected on their own: router-aware discovery,
 tsconfig `paths` and `baseUrl` followed across files, and under the Next App

@@ -22,28 +22,29 @@ BIN=$ROOT/target/release/reactant
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-mkdir -p "$WORK/src/hooks"
+mkdir -p "$WORK/src"
 
-cat > "$WORK/src/page.tsx" <<'TSX'
-import { useData } from "./hooks/useData";
+cat > "$WORK/src/Dashboard.tsx" <<'TSX'
+import { useState } from "react";
+import { Filters } from "./Filters";
 
-export function Page() {
-  const data = useData(0);
-  return <div>{data}</div>;
+export function Dashboard() {
+  const [query, setQuery] = useState({ term: "", tags: [] });
+  return <Filters value={query} onChange={setQuery} />;
 }
 TSX
 
-cat > "$WORK/src/hooks/useData.ts" <<'TS'
-import { useState, useEffect } from "react";
+cat > "$WORK/src/Filters.tsx" <<'TSX'
+import { useEffect } from "react";
 
-export function useData(initial: number) {
-  const [value, setValue] = useState(initial);
+export function Filters({ value, onChange }) {
   useEffect(() => {
-    setValue(value + 1);
-  }, [value]);
-  return value;
+    onChange({ ...value, term: value.term.trim() });
+  }, [value, onChange]);
+
+  return <input value={value.term} />;
 }
-TS
+TSX
 
 cat > "$WORK/run.sh" <<SCENE
 #!/usr/bin/env bash
@@ -59,13 +60,13 @@ type_run() {
 }
 sleep 0.7
 
-type_run 'npx reactant-analyzer check src/ --trace' "$BIN check src/ --trace || true"
+type_run 'npx reactant-analyzer check src/' "$BIN check src/ || true"
 sleep 3.0
 SCENE
 chmod +x "$WORK/run.sh"
 
 cd "$WORK"
-asciinema rec --overwrite --cols 96 --rows 11 -c ./run.sh "$ROOT/docs/demo.cast"
+asciinema rec --overwrite --cols 96 --rows 10 -c ./run.sh "$ROOT/docs/demo.cast"
 cd "$ROOT"
 agg docs/demo.cast docs/demo.gif \
   --theme github-dark --font-size 16 --fps-cap 15 --last-frame-duration 3

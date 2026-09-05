@@ -4,8 +4,9 @@ Finds React hook bugs that ESLint has no rule for: infinite render loops,
 effects that mirror state instead of computing it, callbacks stuck reading a
 value frozen at mount, providers that re-render every consumer on every render.
 
-It follows values across files, so a bug hiding inside a custom hook two
-imports away is still reported, on the component that suffers it.
+It follows values across files and across component boundaries, so a setter
+handed down as a prop or a hook imported from elsewhere is still checked, and
+the finding lands on the component that suffers the bug.
 
 ```sh
 npx reactant-analyzer check src/
@@ -16,36 +17,40 @@ projects are detected on their own, tsconfig `paths` included.
 
 ## What a finding looks like
 
-`Page` looks fine. The hook it imports does not.
+`Dashboard` owns the state. `Filters` normalizes it and hands it back up.
+Neither file has a bug you can see by reading it on its own.
 
 ```tsx
-// src/page.tsx
-import { useData } from "./hooks/useData";
+// src/Dashboard.tsx
+import { useState } from "react";
+import { Filters } from "./Filters";
 
-export function Page() {
-  const data = useData(0);
-  return <div>{data}</div>;
+export function Dashboard() {
+  const [query, setQuery] = useState({ term: "", tags: [] });
+  return <Filters value={query} onChange={setQuery} />;
 }
 ```
 
-```ts
-// src/hooks/useData.ts
-import { useState, useEffect } from "react";
+```tsx
+// src/Filters.tsx
+import { useEffect } from "react";
 
-export function useData(initial: number) {
-  const [value, setValue] = useState(initial);
+export function Filters({ value, onChange }) {
   useEffect(() => {
-    setValue(value + 1);        // writes the state its own deps watch
-  }, [value]);
-  return value;
+    onChange({ ...value, term: value.term.trim() });   // a new object, every run
+  }, [value, onChange]);
+
+  return <input value={value.term} />;
 }
 ```
 
-![reactant reporting an infinite render loop that spans two files](docs/demo.gif)
+![reactant closing an infinite render loop between a parent and its child](docs/demo.gif)
 
-ESLint says nothing here. `useData` lives in another file, and inside that file
-the deps array is correct. `--trace` prints the chain behind the finding: which
-call writes the slot, and why its value never settled.
+The spread allocates a fresh object, so `Object.is` fails, the parent
+re-renders, `value` comes back as a new reference, and the effect fires again.
+ESLint sees two correct files: the deps array lists everything the effect
+reads, and no hook is conditional. reactant follows `setQuery` through the prop
+into the child and closes the cycle.
 
 ## What it catches
 
