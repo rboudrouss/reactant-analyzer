@@ -14,7 +14,7 @@ same output on every platform. Node 20 or later.
 ## Quick start
 
 ```sh
-npx reactant-analyzer check src/
+npx reactant-analyzer
 ```
 
 `Dashboard` owns the state. `Filters` normalizes it and hands it back up.

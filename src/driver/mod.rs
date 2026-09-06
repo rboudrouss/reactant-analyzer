@@ -112,6 +112,22 @@ pub fn run_check(
 ) -> CheckOutput {
     let mut err = String::new();
 
+    // ── Mistyped command ──────────────────────────────────────────────────────
+    // A first argument naming nothing on disk is a mistyped path when it looks
+    // like one, and a mistyped command otherwise (`reactant chekc`), which the
+    // command list answers better than an IO error. Only the first argument:
+    // that is the only position a command can occupy.
+    if let Some(first) = paths.first()
+        && !first.contains(['/', '\\', '.'])
+        && !fs.is_dir(Path::new(first))
+        && !fs.is_file(Path::new(first))
+    {
+        let _ = writeln!(err, "[error] no command or path named `{first}`");
+        let _ = writeln!(err);
+        err.push_str(&run_help(opts.color));
+        return CheckOutput::usage(err);
+    }
+
     // ── Project context ───────────────────────────────────────────────────────
     // The first directory argument drives project detection; other paths are
     // discovered as-is with the same resolver.
@@ -503,6 +519,106 @@ fn render(report: &CheckReport, opts: &CheckOptions, display: &dyn Fn(&Path) -> 
         ),
         ReportFormat::Json => json::render(report, display),
     }
+}
+
+/// The help page: the command listing both frontends print, for `reactant
+/// help`, for `npx reactant-analyzer --help`, and for a first argument that
+/// names neither a command nor a path. It lives here, next to the other
+/// renderers, so the native binary and the WASM wrapper cannot drift apart.
+pub fn run_help(color: bool) -> String {
+    const USAGE: &[(&str, &str)] = &[
+        ("reactant", "analyze the current directory"),
+        ("reactant <paths>...", "analyze these files and directories"),
+        ("reactant <command> [args]", "run one of the commands below"),
+    ];
+    const COMMANDS: &[(&str, &str)] = &[
+        (
+            "check [paths]...",
+            "analyze files or directories (the default command)",
+        ),
+        ("rules", "list every diagnostic the analyzer can emit"),
+        (
+            "explain <rule>",
+            "document one diagnostic, with an example and a fix",
+        ),
+        (
+            "schemas [--out <dir>]",
+            "emit the JSON Schemas for packs and the config file",
+        ),
+        (
+            "packs build <file>",
+            "compile a JS rule pack to pack.json (npm package only)",
+        ),
+        ("help", "print this page"),
+    ];
+    const OPTIONS: &[(&str, &str)] = &[
+        ("--info", "show Info diagnostics and the checks that passed"),
+        ("--show-clean", "show components with no findings"),
+        ("--trace", "show each finding's causal chain"),
+        (
+            "--verbose",
+            "debug output (symbol graph, fixpoint stats) on stderr",
+        ),
+        ("--all-roots", "analyze every component as an entry point"),
+        ("--entry <names>", "entry point components, comma-separated"),
+        (
+            "--exclude-dir <names>",
+            "directory names to skip, at any depth",
+        ),
+        (
+            "--follow-imports",
+            "also analyze what the named paths import",
+        ),
+        ("--format <fmt>", "human or json (default: human)"),
+        (
+            "--fail-on <severity>",
+            "error, warning or never (default: warning)",
+        ),
+        (
+            "--project <kind>",
+            "auto, vite, next or plain (default: auto)",
+        ),
+        ("--rule <name>", "only report this diagnostic (repeatable)"),
+        (
+            "--ignore-rule <name>",
+            "suppress this diagnostic (repeatable)",
+        ),
+        (
+            "--config <path>",
+            "config file (default: <root>/reactant.config.json)",
+        ),
+        ("--no-color", "disable ANSI colors (also honored: NO_COLOR)"),
+    ];
+
+    let p = Palette::pick(color);
+    let mut out = String::new();
+    let section = |out: &mut String, title: &str, rows: &[(&str, &str)]| {
+        let width = rows.iter().map(|(name, _)| name.len()).max().unwrap_or(0) + 3;
+        let _ = writeln!(out);
+        let _ = writeln!(out, "{}{title}{}", p.bold, p.reset);
+        for (name, text) in rows {
+            let _ = writeln!(out, "  {}{name:<width$}{}{text}", p.bold, p.reset);
+        }
+    };
+
+    let _ = writeln!(
+        out,
+        "reactant: static analyzer for React hook bugs, based on abstract interpretation"
+    );
+    section(&mut out, "Usage:", USAGE);
+    section(&mut out, "Commands:", COMMANDS);
+    section(&mut out, "Options (check):", OPTIONS);
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Exit codes: 0 clean, 1 findings at or above --fail-on, 2 usage or IO error."
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Run `reactant rules` for every diagnostic, `reactant explain <rule>` for one."
+    );
+    out
 }
 
 /// The `rules` listing: every diagnostic name with its summary.

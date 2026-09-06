@@ -5,10 +5,16 @@
 use std::process::{Command, Output};
 
 fn reactant(args: &[&str]) -> Output {
+    reactant_in(env!("CARGO_MANIFEST_DIR"), args)
+}
+
+/// Same, from another working directory: what a bare `reactant` analyzes is
+/// the cwd, so it can only be tested from inside a fixture.
+fn reactant_in(dir: &str, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_reactant"))
         .args(args)
         .env("NO_COLOR", "1")
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .current_dir(dir)
         .output()
         .expect("run reactant binary")
 }
@@ -150,8 +156,15 @@ fn unknown_rule_filter_is_usage_error() {
 
 #[test]
 fn nonexistent_path_is_usage_error() {
+    // Path-shaped, so it keeps the IO error: the help page is for arguments
+    // that look like a mistyped *command* (see the unknown-command test).
     let out = reactant(&["check", "does/not/exist"]);
     assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).contains("no such file or directory"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 /// An `--entry` name matching nothing selects no root, which silently collapses
@@ -234,10 +247,47 @@ fn explain_unknown_rule_exits_2_with_suggestion() {
 // ── misc ──────────────────────────────────────────────────────────────────────
 
 #[test]
-fn bare_invocation_prints_help_exit_2() {
-    let out = reactant(&[]);
+fn bare_invocation_checks_the_current_directory() {
+    // `npx reactant-analyzer` with no argument at all is the headline
+    // invocation: it must analyze, not print help.
+    let out = reactant_in(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/vite_project"),
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(1), "findings → exit 1");
+    assert!(stdout(&out).contains("infinite-loop"), "{}", stdout(&out));
+}
+
+#[test]
+fn help_command_lists_the_commands() {
+    let out = reactant(&["help"]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = stdout(&out);
+    for expected in [
+        "Usage:",
+        "Commands:",
+        "check",
+        "rules",
+        "explain",
+        "schemas",
+    ] {
+        assert!(text.contains(expected), "help misses {expected}:\n{text}");
+    }
+}
+
+#[test]
+fn an_unknown_command_prints_the_help_not_an_io_error() {
+    let out = reactant(&["chekc"]);
     assert_eq!(out.status.code(), Some(2));
-    assert!(stdout(&out).contains("Usage"));
+    let err = stderr(&out);
+    assert!(err.contains("no command or path named `chekc`"), "{err}");
+    assert!(
+        err.contains("Commands:"),
+        "the help page comes with it: {err}"
+    );
+    // stdout stays empty on a usage error, so `--format json` output is never
+    // polluted by a help page.
+    assert!(stdout(&out).is_empty(), "{}", stdout(&out));
 }
 
 #[test]

@@ -35,6 +35,8 @@ compare "pack project"  check tests/fixtures/pack_project --format json --fail-o
 compare "config off"    check tests/fixtures/config_project --config tests/fixtures/config_project/off.json --format json --fail-on never
 compare "rules"         rules
 compare "explain"       explain infinite-loop
+compare "help"          help
+compare "unknown cmd"   chekc
 compare "explain pack"  explain team/effect-writes-own-dep --config tests/fixtures/pack_project/reactant.config.json
 
 # The JS→JSON authoring path (byte-identity + d.ts currency).

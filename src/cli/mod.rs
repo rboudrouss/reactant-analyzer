@@ -1,8 +1,9 @@
 //! Command-line interface (ADR-016).
 //!
-//! Subcommands: `check` (default — `reactant src/` still works), `rules`,
-//! `explain <rule>`. Exit codes: 0 clean (or `--fail-on never`), 1 findings
-//! at or above the `--fail-on` threshold, 2 usage/IO error.
+//! Subcommands: `check` (the default, so `reactant src/` and a bare
+//! `reactant` both check), `rules`, `explain <rule>`, `schemas`, `help`.
+//! Exit codes: 0 clean (or `--fail-on never`), 1 findings at or above the
+//! `--fail-on` threshold, 2 usage/IO error.
 
 mod check;
 mod color;
@@ -32,7 +33,10 @@ pub(crate) fn display_relative(path: &Path) -> String {
     name = "reactant",
     version,
     about = "Static analyzer for React hook bugs, based on abstract interpretation",
-    args_conflicts_with_subcommands = true
+    args_conflicts_with_subcommands = true,
+    // `help` is ours (`driver::run_help`), shared with the WASM frontend;
+    // clap keeps `-h`/`--help`, which stays the exhaustive flag reference.
+    disable_help_subcommand = true
 )]
 struct Cli {
     #[command(subcommand)]
@@ -67,6 +71,8 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Print the command listing
+    Help,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -109,15 +115,13 @@ pub fn run() -> i32 {
         Some(Command::Rules { config }) => rules_cmd::run(config.as_deref()),
         Some(Command::Explain { rule, config }) => explain::run(&rule, config.as_deref()),
         Some(Command::Schemas { out }) => schemas_cmd::run(out.as_deref()),
-        None => {
-            if cli.check.paths.is_empty() {
-                // Bare `reactant`: print help, exit as a usage error.
-                use clap::CommandFactory;
-                let _ = Cli::command().print_help();
-                println!();
-                return EXIT_USAGE;
-            }
-            check::run(cli.check)
+        Some(Command::Help) => {
+            print!("{}", reactant::driver::run_help(color::enabled(false)));
+            EXIT_OK
         }
+        // Bare `reactant` and the legacy `reactant src/` form are both a
+        // check; `check` itself defaults its paths to the current directory,
+        // so nothing here has to know about that default.
+        None => check::run(cli.check),
     }
 }

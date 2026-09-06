@@ -3,23 +3,34 @@
 ## Subcommands
 
 ```sh
+reactant                       # analyze the current directory
 reactant check [PATHS...]      # analyze files/directories (the default subcommand)
 reactant rules                 # list every diagnostic the analyzer can emit
 reactant explain <rule>        # full doc for one diagnostic: what, example, fix
 reactant schemas [--out DIR]   # emit the JSON Schemas (pack.json, reactant.config.json)
+reactant help                  # the command listing
 ```
 
-`check` is the default: `reactant src/` ≡ `reactant check src/` (the historical
-flat form keeps working). Two consequences of the clap setup:
+`check` is the default and its paths default to the cwd, so a bare `reactant`
+is `reactant check .`, and `reactant src/` ≡ `reactant check src/` (the
+historical flat form keeps working). Two consequences of the clap setup:
 
 - flags can't precede a subcommand (`reactant --info check src/` is rejected;
   write `reactant check src/ --info`);
 - a directory literally named `rules` or `check` must be passed as `./rules`.
 
+A first argument that names nothing on disk and does not look like a path
+(no `/`, no `\`, no `.`) is read as a mistyped command: `reactant chekc` prints
+"no command or path named chekc" plus the help page on stderr and exits `2`.
+A path-shaped argument keeps its `no such file or directory` error. The page
+is rendered by the core (`driver::run_help`), so the native binary and the
+npm/WASM wrapper print the same bytes; `reactant --help` stays clap's
+exhaustive flag reference.
+
 ## `reactant check`
 
 ```sh
-reactant check                                   # current directory
+reactant check                                   # current directory (so is a bare `reactant`)
 reactant check src/ lib/utils.ts                 # mix directories and files
 reactant check my-vite-app/                      # auto-detects Vite (see below)
 reactant check my-next-app/                      # auto-detects Next.js (see below)
@@ -55,7 +66,7 @@ reactant check src/ --ignore-rule lazy-init      # all but this one
 |------|---------|
 | `0` | No findings at/above the `--fail-on` threshold (always `0` with `--fail-on never`). |
 | `1` | Findings at/above the threshold. |
-| `2` | Usage/IO error: no input files found, nonexistent path, unknown rule name, bare `reactant` with no args. |
+| `2` | Usage/IO error: no input files found, nonexistent path, unknown rule name, mistyped command. |
 
 A missing or unparseable `tsconfig.json` is not an error: the run degrades
 to relative-only import resolution with a warning on stderr.

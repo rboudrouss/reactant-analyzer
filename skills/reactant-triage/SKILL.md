@@ -13,7 +13,7 @@ text.
 ## 1. Run
 
 ```sh
-npx reactant-analyzer check src/ --format json --info --fail-on never
+npx reactant-analyzer check . --format json --info --fail-on never
 ```
 
 `--format json` prints one JSON document on stdout, witness chains included.

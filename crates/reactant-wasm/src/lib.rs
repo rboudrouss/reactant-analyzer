@@ -38,6 +38,15 @@ pub fn host_constants() -> String {
     .to_string()
 }
 
+/// The help page, rendered by the core so `npx reactant-analyzer help` and
+/// `reactant help` print the same bytes. Standalone rather than a [`run`]
+/// command: printing the command listing must not depend on a config file
+/// that parses.
+#[wasm_bindgen(js_name = helpPage)]
+pub fn help_page(color: bool) -> String {
+    driver::run_help(color)
+}
+
 /// Extract the `packs` list from raw config text — the one config field the
 /// host needs *before* calling [`run`] (to resolve pack files). Parsed by
 /// the same validator as the real run, so the host never interprets JSONC.

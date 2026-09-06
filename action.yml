@@ -11,9 +11,9 @@ branding:
 inputs:
   path:
     description: >-
-      Files or directories to analyze, space-separated. The first directory
-      is the project root (Vite/Next.js detection, reactant.config.json
-      discovery).
+      Files or directories to analyze, space-separated. Project detection
+      (Vite/Next.js, tsconfig paths, reactant.config.json) walks up from the
+      first directory, so pointing inside a project still uses its config.
     required: false
     default: "."
   fail-on:

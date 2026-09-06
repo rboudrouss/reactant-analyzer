@@ -47,7 +47,7 @@ function parse(argv) {
   };
 
   let args = [...argv];
-  if (["check", "rules", "explain", "schemas", "packs"].includes(args[0])) {
+  if (["check", "rules", "explain", "schemas", "packs", "help"].includes(args[0])) {
     out.command = args.shift();
   }
   if (out.command === "packs") {

@@ -9,11 +9,13 @@ handed down as a prop or a hook imported from elsewhere is still checked, and
 the finding lands on the component that suffers the bug.
 
 ```sh
-npx reactant-analyzer check src/
+npx reactant-analyzer
 ```
 
-Nothing to install, nothing to configure. Node 20 or later. Vite and Next.js
-projects are detected on their own, tsconfig `paths` included.
+Nothing to install, nothing to configure. Node 20 or later. Vite and Next.js projects are
+detected on their own, tsconfig `paths` included, and pointing at a
+subdirectory (`npx reactant-analyzer src/features`) still runs inside the
+project the config files describe.
 
 ## What a finding looks like
 
@@ -132,7 +134,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: rboudrouss/reactant-analyzer@v0.5.0
         with:
-          path: .              # the project root, so tsconfig aliases load
+          path: .              # default: the whole checkout
           fail-on: error       # warnings annotate the PR without failing it
 ```
 

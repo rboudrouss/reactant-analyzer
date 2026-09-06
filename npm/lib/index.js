@@ -7,20 +7,6 @@ const path = require("node:path");
 const { parse, UsageError } = require("./args.js");
 const host = require("./host.js");
 
-const HELP = `reactant, a static analyzer for React hook bugs (WASM build)
-
-Usage:
-  reactant [check] [paths…] [--info] [--show-clean] [--trace] [--verbose]
-           [--all-roots] [--entry <names>] [--format human|json]
-           [--fail-on error|warning|never] [--project auto|vite|next|plain]
-           [--rule <name>]… [--ignore-rule <name>]… [--no-color]
-           [--exclude-dir <names>] [--follow-imports] [--config <path>]
-  reactant rules [--config <path>]
-  reactant explain <rule> [--config <path>]
-  reactant schemas [--out <dir>]
-  reactant packs build <pack.js> [--out <pack.json>]
-`;
-
 function main(argv) {
   let parsed;
   try {
@@ -32,9 +18,12 @@ function main(argv) {
     }
     throw e;
   }
-  if (parsed.command === "help" || (parsed.command === "check" && !argv.length)) {
-    process.stdout.write(HELP);
-    return parsed.command === "help" ? 0 : 2;
+  if (parsed.command === "help") {
+    // Rendered by the core (same bytes as the native `reactant help`), and
+    // before any config is read: a broken config must not hide the help.
+    const core = require("../dist/reactant_wasm.js");
+    process.stdout.write(core.helpPage(useColor(parsed.options.noColor)));
+    return 0;
   }
   if (parsed.command === "schemas") {
     return schemas(parsed.schemasOut);
@@ -85,11 +74,6 @@ function main(argv) {
     }
   }
 
-  const color =
-    !parsed.options.noColor &&
-    process.stdout.isTTY &&
-    !(process.env.NO_COLOR ?? "");
-
   const input = {
     command: parsed.command,
     explainRule: parsed.explainRule,
@@ -114,7 +98,7 @@ function main(argv) {
       project: parsed.options.project,
       rule: parsed.options.rule,
       ignoreRule: parsed.options.ignoreRule,
-      color: Boolean(color),
+      color: useColor(parsed.options.noColor),
     },
   };
 
@@ -122,6 +106,14 @@ function main(argv) {
   process.stderr.write(out.stderr);
   process.stdout.write(out.stdout);
   return out.exitCode;
+}
+
+// Colors are on iff: no `--no-color`, stdout is a terminal, and NO_COLOR is
+// absent or empty (https://no-color.org). Mirrors src/cli/color.rs.
+function useColor(noColor) {
+  return (
+    !noColor && Boolean(process.stdout.isTTY) && !(process.env.NO_COLOR ?? "")
+  );
 }
 
 // The shipped schemas (generated at build time by the native binary from
