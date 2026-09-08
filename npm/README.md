@@ -9,8 +9,8 @@ handed down as a prop or a hook imported from elsewhere is still checked, and
 the finding lands on the component that suffers the bug.
 
 This package is a WASM build of the analyzer. No toolchain to install, and the
-same output on every platform. Use it as a CLI, from a script, or in a browser
-— one `.wasm`, all three. Node 20.19 or later.
+same output on every platform. Use it as a CLI, from a script, or in a
+browser, all three from one `.wasm`. Node 20.19 or later.
 
 ## Quick start
 
@@ -96,7 +96,7 @@ process.exitCode = exitCode;
 all. Findings are a result, not an exception: only a usage error throws.
 
 There is no filesystem inside the analyzer, so a tree you hand it in memory is
-a first-class input rather than a test-only mode — which is what makes the
+a first-class input rather than a test-only mode, which is what makes the
 browser work at all. Discovery, project detection, tsconfig chains and alias
 resolution all run inside the engine over that map:
 
@@ -147,7 +147,7 @@ npx reactant packs build team.pack.js        # writes team.pack.json
 ```
 
 ```js
-// team.pack.js — a CommonJS project; in an ESM one, `export default { … }`
+// team.pack.js, in a CommonJS project. In an ESM one: `export default { … }`
 /** @type {import("reactant-analyzer/lib/pack").Pack} */
 module.exports = {
   schemaVersion: 1,
@@ -176,9 +176,9 @@ through the exact loader a check run uses.
 
 ## Docs and source
 
-Full documentation — the JavaScript API in detail, the JSON schema, the GitHub
-Action, the comparison with React Compiler and `eslint-plugin-react-hooks`, and
-the Rust plugin API:
+Full documentation, covering the JavaScript API in detail, the JSON schema,
+the GitHub Action, the comparison with React Compiler and
+`eslint-plugin-react-hooks`, and the Rust plugin API:
 <https://github.com/rboudrouss/reactant-analyzer>
 
 The concrete semantics follow the

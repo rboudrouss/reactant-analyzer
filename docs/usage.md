@@ -391,11 +391,11 @@ Semantics:
 
 The npm package is the analyzer, not just a CLI wrapper: the same `.wasm` and
 the same JS glue run under Node and in a browser (wasm-bindgen's `--target
-web` output — the emitted module is byte-identical across its targets, and
+web` output: the emitted module is byte-identical across its targets, and
 the web glue loads under Node from `readFileSync` instead of `fetch`). One
 artifact, both hosts.
 
-Every call is async — the glue is ESM and instantiates on first use — and
+Every call is async (the glue is ESM and instantiates on first use), and
 every call goes through the same envelope builder the CLI uses
 (`npm/lib/envelope.js`), so an option cannot mean one thing to `npx reactant`
 and another to a script.
@@ -412,7 +412,7 @@ process.exitCode = exitCode;
 
 `report` is the schema-v2 document above, verbatim: the wire schema is the
 stability contract, so the API introduces no second shape that could drift
-from it. Findings are a *result*, never an exception — only a usage error (a
+from it. Findings are a *result*, never an exception. Only a usage error (a
 bad option, an unparseable config, a rejected pack) throws, as `UsageError`
 with `exitCode: 2`.
 

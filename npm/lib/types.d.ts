@@ -14,13 +14,13 @@ export type FileMap = Record<string, string> | Map<string, string>;
 
 /** A pack's JSON, as text or as the object to serialize. */
 export interface PackInput {
-  /** The spec that named it — error messages quote this. */
+  /** The spec that named it. Error messages quote this. */
   name?: string;
   json: string | Record<string, unknown>;
 }
 
 export interface Options {
-  /** Report Info diagnostics — the analyzer's own blind spots. */
+  /** Report Info diagnostics: the analyzer's own blind spots. */
   info?: boolean;
   /** List components with no findings. */
   showClean?: boolean;
@@ -31,7 +31,7 @@ export interface Options {
   allRoots?: boolean;
   /** Close over resolved import edges beyond the named paths. */
   followImports?: boolean;
-  /** Emit ANSI colors. Off by default — a string consumer wants none. */
+  /** Emit ANSI colors. Off by default, since a string consumer wants none. */
   color?: boolean;
   entry?: string[] | string;
   excludeDir?: string[] | string;
@@ -62,7 +62,7 @@ export interface RunInput extends AnalysisInput, Options {
   explainRule?: string;
 }
 
-/** What the core wrote, for any format — the CLI's own three streams. */
+/** What the core wrote, for any format: the CLI's own three streams. */
 export interface RunOutput {
   exitCode: number;
   stdout: string;
@@ -129,7 +129,7 @@ export interface Diagnostic {
   /** Registry display name, `Page@src/a/page.tsx` when names collide. */
   component: string;
   /**
-   * The file `line`/`col` point into — the anchor's own file, which for a
+   * The file `line`/`col` point into: the anchor's own file, which for a
    * finding inside a cross-file inlined hook is not `component_file`.
    */
   file: string | null;
@@ -221,8 +221,8 @@ export interface ReactantApi {
    * Check a tree and get the report as data. `report` is the JSON reporter's
    * document verbatim (wire schema v2).
    *
-   * Findings are a result, not a failure: only a usage error — a bad option,
-   * an unparseable config, a rejected pack — throws `UsageError`.
+   * Findings are a result, not a failure. Only a usage error throws
+   * `UsageError`: a bad option, an unparseable config, a rejected pack.
    */
   analyze(input?: AnalyzeInput): Promise<AnalyzeResult>;
 
@@ -239,7 +239,7 @@ export interface ReactantApi {
   /** One rule's long-form docs. Throws `UsageError` if unknown. */
   explain(rule: string, input?: RunInput): Promise<TextResult>;
 
-  /** The help page — the same bytes as `reactant help`. */
+  /** The help page, the same bytes as `reactant help`. */
   help(options?: { color?: boolean }): Promise<string>;
 
   /** The `packs` specs a config names, per the core's own config parser. */

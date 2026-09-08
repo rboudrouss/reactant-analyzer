@@ -1,4 +1,4 @@
-// The browser entry point — the same API as Node's, minus the calls that
+// The browser entry point: the same API as Node's, minus the calls that
 // need a filesystem, plus control over where the wasm comes from.
 //
 //   import { analyze } from "reactant-analyzer";
@@ -27,8 +27,8 @@ export class UsageError extends Error {
 
 /**
  * Instantiate from an explicit source: a URL, a `Response`, the raw bytes,
- * or a compiled module. Optional — the first `analyze` otherwise fetches the
- * `.wasm` next to the glue. Later calls reuse the instance.
+ * or a compiled module. Optional: without it, the first `analyze` fetches
+ * the `.wasm` next to the glue. Later calls reuse the instance.
  */
 export function initWasm(
   source?: string | URL | Response | BufferSource | WebAssembly.Module,

@@ -36,7 +36,7 @@ export interface ProjectInput
  * resolve the packs it names, then `analyze`. The disk-reading half of
  * `npx reactant check`, minus the reporting.
  *
- * For a virtual tree — an editor buffer, a test fixture, a playground —
+ * For a virtual tree (an editor buffer, a test fixture, a playground),
  * call `analyze({ files })` instead.
  */
 export function analyzeProject(

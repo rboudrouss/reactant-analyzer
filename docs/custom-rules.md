@@ -280,7 +280,7 @@ Rather than hand-written JSON, a pack can be a JS or TS module, on the
 table.
 
 ```js
-// team.pack.js — a CommonJS project; in an ESM one, `export default { … }`
+// team.pack.js, in a CommonJS project. In an ESM one: `export default { … }`
 /** @type {import("reactant-analyzer/lib/pack").Pack} */
 module.exports = {
   schemaVersion: 1,
