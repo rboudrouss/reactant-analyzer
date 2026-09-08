@@ -12,21 +12,19 @@
 // being written. Without it (stale local dist), the file is written with a
 // note — the core re-validates everything it receives on the next check
 // anyway (ADR-022 §6: the host is never a trust boundary).
-"use strict";
-
-const fs = require("node:fs");
-const path = require("node:path");
-const { pathToFileURL } = require("node:url");
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 /** Default output path: `team.pack.js` → `team.pack.json`, `team.js` → `team.json`. */
-function defaultOut(input) {
+export function defaultOut(input) {
   const dir = path.dirname(input);
   const base = path.basename(input).replace(/\.(js|mjs|cjs|ts|mts|cts)$/, "");
   return path.join(dir, `${base}.json`);
 }
 
 /** Evaluate the authored module to a plain pack object. */
-async function evaluate(input) {
+export async function evaluate(input) {
   const abs = path.resolve(input);
   let mod;
   try {
@@ -62,7 +60,7 @@ async function evaluate(input) {
  * available, write pretty JSON to `out` (committed artifact — diffable).
  * Returns a process exit code.
  */
-async function build(input, outPath, wasm, io = { out: process.stdout, err: process.stderr }) {
+export async function build(input, outPath, wasm, io = { out: process.stdout, err: process.stderr }) {
   let pack;
   try {
     pack = await evaluate(input);
@@ -101,5 +99,3 @@ async function build(input, outPath, wasm, io = { out: process.stdout, err: proc
     `the core validates it on the next check)\n`);
   return 0;
 }
-
-module.exports = { build, defaultOut, evaluate };

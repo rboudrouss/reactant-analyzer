@@ -5,7 +5,9 @@
 // Author a pack as a JS module and compile it with `reactant packs build`:
 //
 //   /** @type {import("reactant-analyzer/lib/pack").Pack} *​/
-//   module.exports = { schemaVersion: 1, name: "team", rules: [ /* … */ ] };
+//   export default { schemaVersion: 1, name: "team", rules: [ /* … */ ] };
+//
+// (`module.exports = …` in a CommonJS project.)
 //
 // The generated JSON is the committed artifact; the analyzer only ever
 // consumes the inert JSON.

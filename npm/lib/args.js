@@ -1,7 +1,7 @@
 // argv → { command, explainRule, paths, options, configPath, schemasOut }.
 // Thin and enumerable: every flag maps 1:1 onto the wasm envelope; anything
 // unknown is a usage error (exit 2), matching the native clap behavior.
-"use strict";
+import { UsageError } from "./envelope.js";
 
 const BOOL_FLAGS = {
   "--info": "info",
@@ -19,7 +19,7 @@ const VALUE_FLAGS = {
   "--project": ["project", ["auto", "vite", "next", "plain"]],
 };
 
-function parse(argv) {
+export function parse(argv) {
   const out = {
     command: "check",
     explainRule: null,
@@ -106,7 +106,3 @@ function parse(argv) {
   }
   return out;
 }
-
-class UsageError extends Error {}
-
-module.exports = { parse, UsageError };

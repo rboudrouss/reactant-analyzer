@@ -9,12 +9,16 @@ cd "$(dirname "$0")/.."
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 
-node bin/reactant.js packs build test/fixtures/team.pack.js --out "$out/team.pack.json" > /dev/null
-if ! cmp -s "$out/team.pack.json" test/fixtures/team.pack.expected.json; then
-  echo "FAIL: packs build output drifted from test/fixtures/team.pack.expected.json"
-  diff test/fixtures/team.pack.expected.json "$out/team.pack.json" | head -20 || true
-  exit 1
-fi
-echo "ok:   packs build (byte-identical)"
+# Both authoring shapes compile to the same committed JSON: `module.exports`
+# (a CommonJS project) and a default export (an ESM one).
+for src in test/fixtures/team.pack.cjs test/fixtures/team.pack.mjs; do
+  node bin/reactant.js packs build "$src" --out "$out/team.pack.json" > /dev/null
+  if ! cmp -s "$out/team.pack.json" test/fixtures/team.pack.expected.json; then
+    echo "FAIL: packs build $src drifted from test/fixtures/team.pack.expected.json"
+    diff test/fixtures/team.pack.expected.json "$out/team.pack.json" | head -20 || true
+    exit 1
+  fi
+  echo "ok:   packs build $src (byte-identical)"
+done
 
 node scripts/gen-pack-dts.js --check

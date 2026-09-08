@@ -1,12 +1,24 @@
 {
   "name": "reactant-analyzer",
   "version": "0.5.0",
-  "description": "Static analyzer for React hook bugs (infinite loops, missing deps, derived state, …) based on abstract interpretation. WASM build — identical behavior on every platform.",
+  "description": "Static analyzer for React hook bugs (infinite loops, missing deps, derived state, …) based on abstract interpretation. WASM build — identical behavior in Node and in the browser.",
   "license": "MIT",
   "repository": "github:rboudrouss/reactant-analyzer",
   "keywords": ["react", "static-analysis", "linter", "hooks", "abstract-interpretation"],
-  "type": "commonjs",
+  "type": "module",
   "bin": { "reactant": "bin/reactant.js" },
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "browser": { "types": "./lib/browser.d.ts", "default": "./lib/browser.js" },
+      "default": { "types": "./lib/index.d.ts", "default": "./lib/index.js" }
+    },
+    "./browser": { "types": "./lib/browser.d.ts", "default": "./lib/browser.js" },
+    "./wasm": "./dist/reactant_wasm.js",
+    "./lib/pack": { "types": "./lib/pack.d.ts" },
+    "./package.json": "./package.json"
+  },
   "files": ["bin/", "lib/", "dist/", "schemas/"],
-  "engines": { "node": ">=20" }
+  "engines": { "node": ">=20.19" }
 }

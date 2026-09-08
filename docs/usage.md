@@ -354,7 +354,8 @@ Semantics:
 - `component_file`: the component's defining file; what `file` meant in v1.
 - `notes`: the finding's witness chain (ADR-019), typed steps explaining
   why the rule fired. `kind` ∈ `binding | resolve | call | write | read |
-  branch | handler | cycle-edge | widen`; each kind adds its structured
+  branch | handler | cycle-edge | widen | mutate | capture | init-once`;
+  each kind adds its structured
   fields (`var`, `name`/`target`, `callee`/`effect_class`,
   `slot`/`value_class`, `what`, `desc`, `event`, `from`/`to`, `iteration`).
   `notes[].file` names the file the step's position points into; it may
@@ -385,6 +386,73 @@ Semantics:
   the occurrences, `detail` is the sentence the human renderer prints.
   A blind spot is *not* a finding: it never changes the exit code (added in
   v2, and a v2 consumer written before this field can ignore it).
+
+## JavaScript API
+
+The npm package is the analyzer, not just a CLI wrapper: the same `.wasm` and
+the same JS glue run under Node and in a browser (wasm-bindgen's `--target
+web` output — the emitted module is byte-identical across its targets, and
+the web glue loads under Node from `readFileSync` instead of `fetch`). One
+artifact, both hosts.
+
+Every call is async — the glue is ESM and instantiates on first use — and
+every call goes through the same envelope builder the CLI uses
+(`npm/lib/envelope.js`), so an option cannot mean one thing to `npx reactant`
+and another to a script.
+
+```js
+import { analyzeProject } from "reactant-analyzer";
+
+const { report, exitCode } = await analyzeProject(["src"], { info: true });
+for (const d of report.diagnostics) {
+  console.log(`${d.file}:${d.line} [${d.severity}] ${d.rule}: ${d.message}`);
+}
+process.exitCode = exitCode;
+```
+
+`report` is the schema-v2 document above, verbatim: the wire schema is the
+stability contract, so the API introduces no second shape that could drift
+from it. Findings are a *result*, never an exception — only a usage error (a
+bad option, an unparseable config, a rejected pack) throws, as `UsageError`
+with `exitCode: 2`.
+
+There is no filesystem in the core (ADR-013's traits, `MemFileSystem` under
+wasm), so a virtual tree is a first-class input rather than a test-only mode.
+This is the only mode a browser has:
+
+```js
+import { analyze } from "reactant-analyzer/browser";
+
+const { report } = await analyze({
+  files: { "src/App.tsx": editorBuffer },   // cwd-relative POSIX keys
+  config: { rules: { "derived-state": "off" } },
+});
+```
+
+Discovery, project detection, tsconfig chains and alias resolution all run
+inside the engine over that map, so a virtual run and a disk run take the
+same code path. Everything the run may read has to be *in* the map: a file
+the host did not put there is indistinguishable from one that does not exist.
+
+| call | what it does |
+| --- | --- |
+| `analyze(input)` | check a tree → `{ report, exitCode, stderr }` |
+| `analyzeProject(paths, input)` | walk disk, discover the config and its packs, then `analyze` (Node only) |
+| `run(input)` | one core invocation, any format → `{ exitCode, stdout, stderr }` |
+| `rules(input)` / `explain(rule, input)` | the rendered rules table / one rule's docs |
+| `validatePack(pack)` | the same `load_pack` a check run uses → `{ name, rules, warnings }` |
+| `hostConstants()` | the discovery constants the core serves its hosts |
+| `initWasm(source)` | browser only: instantiate from an explicit URL, `Response`, bytes or module |
+
+`analyze` runs to completion synchronously once the wasm is up and holds the
+thread for the duration, so an interactive host (an editor, a playground)
+should call it from a Worker. Wasm memory only grows, so a long-lived page
+that analyzes on every keystroke should recycle its worker rather than trust
+the instance forever.
+
+Types ship with the package (`lib/types.d.ts`); they are hand-written against
+the schema above, unlike `lib/pack.d.ts`, which is generated from the same
+schemars output the validator compiles from.
 
 ## Reading the human output
 

@@ -947,7 +947,7 @@ fn stability_template_field_rejects_an_args_binding() {
 // ── JS/TS pack authoring (ADR-023 §5) ─────────────────────────────────────────
 
 /// The committed output of `reactant packs build` on the JS-authored fixture
-/// (`npm/test/fixtures/team.pack.js`) must load through the same `load_pack`
+/// (`npm/test/fixtures/team.pack.cjs`) must load through the same `load_pack`
 /// every check run uses — the codegen cannot bless a pack the core rejects.
 /// The byte-identity of the build itself is `npm/test/packs.sh`.
 #[test]

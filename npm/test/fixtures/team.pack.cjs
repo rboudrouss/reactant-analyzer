@@ -2,6 +2,10 @@
 // shared constants and a generate-rules-from-a-table loop, i.e. exactly the
 // composition-at-authoring-time the JSON cannot express. `packs build`
 // compiles it to team.pack.json; the JSON is what a repo would commit.
+//
+// `.cjs` because this fixture lives inside an ESM package; a `module.exports`
+// pack in a consumer's own CommonJS project is a plain `.js` file, and
+// team.pack.mjs covers the ESM shape.
 
 /** @type {import("../../lib/pack.d.ts").Pack} */
 

@@ -4,12 +4,10 @@
 // the core accepts (ADR-023 §5: ship a .d.ts generated from the same types
 // as pack.schema.json). Run by build.sh after the schemas are written;
 // `--check` verifies the committed file is current (smoke test).
-"use strict";
+import fs from "node:fs";
+import path from "node:path";
 
-const fs = require("node:fs");
-const path = require("node:path");
-
-const ROOT = path.join(__dirname, "..");
+const ROOT = path.join(import.meta.dirname, "..");
 const SCHEMA = path.join(ROOT, "schemas", "pack.schema.json");
 const OUT = path.join(ROOT, "lib", "pack.d.ts");
 
@@ -117,7 +115,9 @@ function render(schema) {
 // Author a pack as a JS module and compile it with \`reactant packs build\`:
 //
 //   /** @type {import("reactant-analyzer/lib/pack").Pack} *​/
-//   module.exports = { schemaVersion: 1, name: "team", rules: [ /* … */ ] };
+//   export default { schemaVersion: 1, name: "team", rules: [ /* … */ ] };
+//
+// (\`module.exports = …\` in a CommonJS project.)
 //
 // The generated JSON is the committed artifact; the analyzer only ever
 // consumes the inert JSON.

@@ -42,4 +42,7 @@ compare "explain pack"  explain team/effect-writes-own-dep --config tests/fixtur
 # The JS→JSON authoring path (byte-identity + d.ts currency).
 if ! npm/test/packs.sh; then fail=1; fi
 
+# The programmatic API, including that it agrees with the CLI above.
+if ! node npm/test/api.js; then fail=1; fi
+
 exit $fail

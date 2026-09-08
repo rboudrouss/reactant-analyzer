@@ -9,7 +9,8 @@ handed down as a prop or a hook imported from elsewhere is still checked, and
 the finding lands on the component that suffers the bug.
 
 This package is a WASM build of the analyzer. No toolchain to install, and the
-same output on every platform. Node 20 or later.
+same output on every platform. Use it as a CLI, from a script, or in a browser
+— one `.wasm`, all three. Node 20.19 or later.
 
 ## Quick start
 
@@ -75,6 +76,43 @@ reactant explain infinite-loop         # what it is, an example, how to fix it
 
 Exit codes: `0` clean, `1` findings, `2` usage error.
 
+## From a script, or in a browser
+
+The package is the analyzer, not a wrapper around a binary: the same module
+runs in Node and in the browser, and every call goes through the same envelope
+the CLI uses, so an option cannot mean two different things.
+
+```js
+import { analyzeProject } from "reactant-analyzer";
+
+const { report, exitCode } = await analyzeProject(["src"]);
+for (const d of report.diagnostics) {
+  console.log(`${d.file}:${d.line} [${d.severity}] ${d.rule}: ${d.message}`);
+}
+process.exitCode = exitCode;
+```
+
+`report` is the same JSON document `--format json` prints, witness chains and
+all. Findings are a result, not an exception: only a usage error throws.
+
+There is no filesystem inside the analyzer, so a tree you hand it in memory is
+a first-class input rather than a test-only mode — which is what makes the
+browser work at all. Discovery, project detection, tsconfig chains and alias
+resolution all run inside the engine over that map:
+
+```js
+import { analyze } from "reactant-analyzer/browser";
+
+const { report } = await analyze({
+  files: { "src/App.tsx": editorBuffer, "src/Filters.tsx": otherBuffer },
+});
+```
+
+No bundler config, no `fs` shim, no server round-trip: the `.wasm` is fetched
+next to the glue (`initWasm(url)` if you serve it from elsewhere). Analysis
+holds the thread while it runs, so an interactive page should call it from a
+Worker. Types ship with the package.
+
 ## What it catches
 
 `infinite-loop`, `cross-component-infinite-loop`, `derived-state`,
@@ -109,7 +147,7 @@ npx reactant packs build team.pack.js        # writes team.pack.json
 ```
 
 ```js
-// team.pack.js
+// team.pack.js — a CommonJS project; in an ESM one, `export default { … }`
 /** @type {import("reactant-analyzer/lib/pack").Pack} */
 module.exports = {
   schemaVersion: 1,
@@ -138,8 +176,9 @@ through the exact loader a check run uses.
 
 ## Docs and source
 
-Full documentation, the GitHub Action, the comparison with React Compiler and
-`eslint-plugin-react-hooks`, and the Rust plugin API:
+Full documentation — the JavaScript API in detail, the JSON schema, the GitHub
+Action, the comparison with React Compiler and `eslint-plugin-react-hooks`, and
+the Rust plugin API:
 <https://github.com/rboudrouss/reactant-analyzer>
 
 The concrete semantics follow the

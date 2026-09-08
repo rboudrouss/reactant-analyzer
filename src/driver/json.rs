@@ -89,7 +89,7 @@ struct JsonDiagnostic<'a> {
 struct JsonNote<'a> {
     message: &'a str,
     /// binding | resolve | call | write | read | branch | handler |
-    /// cycle-edge | widen
+    /// cycle-edge | widen | mutate | capture | init-once
     kind: &'static str,
     hook_label: Option<usize>,
     /// File the note's position points into — may differ from the
