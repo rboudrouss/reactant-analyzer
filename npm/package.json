@@ -1,6 +1,6 @@
 {
   "name": "reactant-analyzer",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Static analyzer for React hook bugs (infinite loops, missing deps, derived state, …) based on abstract interpretation. WASM build — identical behavior in Node and in the browser.",
   "license": "MIT",
   "repository": "github:rboudrouss/reactant-analyzer",
