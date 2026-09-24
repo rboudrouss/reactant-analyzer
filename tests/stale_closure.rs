@@ -256,6 +256,72 @@ fn non_empty_deps_uncovered_capture_warns() {
     assert_eq!(d[0].severity(), Severity::Warning);
 }
 
+#[test]
+fn name_matched_registrar_warns_not_error() {
+    // #142: `on` is a registrar by name only. The callee may call `fn` once,
+    // synchronously, and never again — nothing proves a later firing, so the
+    // freeze is a may, whatever the rest of the shape.
+    let d = diags(
+        r#"
+        import { useState, useEffect } from "react";
+        const registry = { on(name, fn) { fn(); } };
+        function Counter() {
+          const [n, setN] = useState(0);
+          useEffect(() => {
+            registry.on("init", () => setN(n + 1));
+          }, []);
+          return <div>{n}</div>;
+        }
+        "#,
+    );
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert_eq!(d[0].severity(), Severity::Warning);
+}
+
+#[test]
+fn conditional_self_write_warns_not_error() {
+    // #142: the write back is on one branch of the callback only. If that
+    // branch never runs, the slot never moves and nothing goes stale.
+    let d = diags(
+        r#"
+        import { useState, useEffect } from "react";
+        function Timer(props) {
+          const [n, setN] = useState(0);
+          useEffect(() => {
+            const id = setInterval(() => { if (props.live) setN(n + 1); }, 1000);
+            return () => clearInterval(id);
+          }, []);
+          return <div>{n}</div>;
+        }
+        "#,
+    );
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert_eq!(d[0].severity(), Severity::Warning);
+}
+
+#[test]
+fn self_write_on_every_branch_errors() {
+    // The write back is conditional per branch but covers every path of the
+    // callback: each firing writes, so the freeze is certain.
+    let d = diags(
+        r#"
+        import { useState, useEffect } from "react";
+        function Timer(props) {
+          const [n, setN] = useState(0);
+          useEffect(() => {
+            const id = setInterval(() => {
+              if (props.up) { setN(n + 1); } else { setN(n - 1); }
+            }, 1000);
+            return () => clearInterval(id);
+          }, []);
+          return <div>{n}</div>;
+        }
+        "#,
+    );
+    assert_eq!(d.len(), 1, "expected exactly one finding: {d:?}");
+    assert_eq!(d[0].severity(), Severity::Error);
+}
+
 // ── Silence: proven-safe patterns ─────────────────────────────────────────────
 
 #[test]

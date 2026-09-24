@@ -845,6 +845,81 @@ pub fn must_frozen_seed(
     }
 }
 
+/// Evidence that a registered callback freezes the slot it writes: it keeps
+/// firing long after the mount-only effect registered it, and every firing
+/// writes the slot back from the mount-time capture.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StaleCapture {
+    /// The registrar table row (`setInterval`, `addEventListener`).
+    pub registrar: &'static str,
+    /// The first write back to the slot in the callback body.
+    pub write_span: Option<SourceRange>,
+}
+
+/// `All` iff every conjunct of the certain `stale-closure` claim holds (#142):
+/// the effect is mount-only (`[]`, so it never re-registers), the registration
+/// is on every path of its body, the registrar re-fires (`Repeating`) and
+/// provably fires *after* the registering call (a proven `timing`: the
+/// name-matched rows, `on`/`subscribe`/`addListener`, are `Timing::Unknown`
+/// because their callee may run the callback once, synchronously, and never
+/// again), and `cb_body` calls one of `slot_setters` on every path. `None`
+/// otherwise: the freeze is then a MAY.
+///
+/// Re-derived here from the raw registration and bodies rather than from
+/// caller-computed facts, so a proof of one conjunct cannot stand in for the
+/// claim. Only top-level writes of `cb_body` count: one behind a nested
+/// function call is not known to run on every firing.
+pub fn must_stale_capture(
+    reg: &crate::engine::registrations::Registration,
+    deps: &crate::ir::hooks::DepsArg,
+    effect_body: &CFG,
+    cb_body: &CFG,
+    slot_setters: &HashSet<Var>,
+) -> MustResult<StaleCapture> {
+    use crate::engine::registrations::{Firing, Timing};
+    let mount_only = matches!(deps.list(), Some(l) if l.arity == crate::ir::hooks::Arity::Exact(0));
+    if !mount_only || reg.firing != Firing::Repeating || reg.timing == Timing::Unknown {
+        return MustResult::None;
+    }
+    let Some(reg_block) = reg.block_id else {
+        return MustResult::None;
+    };
+    if !crate::rules::helpers::churn::on_all_paths(effect_body, &HashSet::from([reg_block])) {
+        return MustResult::None;
+    }
+
+    let mut write_blocks: HashSet<BlockId> = HashSet::new();
+    let mut write_spans: Vec<SourceRange> = Vec::new();
+    for (bid, block) in &cb_body.blocks {
+        for stmt in &block.stmts {
+            if let Stmt::ExprStmt(expr, span) = stmt
+                && try_extract_setter_call(expr, slot_setters).is_some()
+            {
+                write_blocks.insert(*bid);
+                write_spans.extend(*span);
+            }
+        }
+        // A concise arrow body (`() => setN(n + 1)`) returns the call.
+        if let Terminator::Return(expr) = &block.term
+            && try_extract_setter_call(expr, slot_setters).is_some()
+        {
+            write_blocks.insert(*bid);
+        }
+    }
+    if write_blocks.is_empty()
+        || !crate::rules::helpers::churn::on_all_paths(cb_body, &write_blocks)
+    {
+        return MustResult::None;
+    }
+    MustResult::All(Certified::mint(
+        StaleCapture {
+            registrar: reg.registrar,
+            write_span: write_spans.into_iter().min_by_key(|r| r.pos_key()),
+        },
+        Provenance::at(reg.span, Some(reg.effect)),
+    ))
+}
+
 /// Evidence that an effect churn cycle re-runs on every render on all paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EffectCycleProof;

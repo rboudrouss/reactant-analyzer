@@ -99,7 +99,9 @@ carries an Error.
   the whole object. Kept deliberately, since the warning is sound and eslint-aligned
   [#40](https://github.com/rboudrouss/reactant-analyzer/issues/40).
 - **`stale-closure`** treats any two-argument `on` or `addListener` (and any one-argument
-  `subscribe`) as a long-lived registration [#42](https://github.com/rboudrouss/reactant-analyzer/issues/42).
+  `subscribe`) as a long-lived registration [#42](https://github.com/rboudrouss/reactant-analyzer/issues/42). Such a match never reaches Error, and
+  neither does a write back that is not on every path of the callback
+  [#142](https://github.com/rboudrouss/reactant-analyzer/issues/142).
 - **`frozen-initial-state`** still fires on a child remounted by machinery it cannot see: a dialog
   body unmounted by its library wrapper, a route that swaps the subtree [#136](https://github.com/rboudrouss/reactant-analyzer/issues/136).
 - **`missing-deps`** asks whether a capture can go *stale*, so a read through a handle that never

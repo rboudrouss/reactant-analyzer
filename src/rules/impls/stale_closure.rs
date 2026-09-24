@@ -14,14 +14,13 @@ use crate::{
     },
 };
 
-use crate::engine::registrations::Firing;
 use crate::ir::ComponentId;
 use crate::rules::helpers::churn::eval_in_exit_env;
 use crate::rules::{
-    Certified, Diagnostic, EffectClass, MustResult, OnAllPaths, Rule, Severity, Step, ValueClass,
+    Certified, Diagnostic, EffectClass, MustResult, Rule, Severity, StaleCapture, Step, ValueClass,
     all_setter_labels, collect_fn_bindings, collect_setter_calls_with_extra, fn_lit_binding,
-    may_written_slots, memo_val_labels, must_on_all_paths, resolve_setter_aliases, state_slot_name,
-    state_val_labels,
+    may_written_slots, memo_val_labels, must_stale_capture, resolve_setter_aliases,
+    state_slot_name, state_val_labels,
 };
 
 /// Fires when a callback that **outlives the render** — handed to
@@ -38,14 +37,18 @@ use crate::rules::{
 /// (`setN(n + 1)` in an interval), the freeze is self-inflicted and certain:
 /// the state can never advance past its first update — Error.
 ///
-/// Stratification (three-level doctrine — Error only on a triple must):
-/// - **Error**: repeating registrar ∧ deps `[]` (never re-runs) ∧ the
-///   registration is on all paths of the effect body ∧ the callback writes a
-///   slot it captures.
+/// Stratification (three-level doctrine — Error only when every conjunct is a
+/// must, all certified by [`crate::rules::must_stale_capture`]):
+/// - **Error**: repeating registrar that provably fires after the registering
+///   call ∧ deps `[]` (never re-runs) ∧ the registration is on all paths of
+///   the effect body ∧ the callback writes a slot it captures on all of its
+///   paths.
 /// - **Warning**: everything else that survives the kills below — one-shot
-///   registrars (`setTimeout`, `.then`: bounded staleness window), non-empty
-///   deps (freeze lasts until an unrelated dep changes), conditional or
-///   nested registration, foreign/unknown slots.
+///   registrars (`setTimeout`, `.then`: bounded staleness window), registrars
+///   matched by name only (`on`, `subscribe`, `addListener`: the callee may
+///   run the callback once, synchronously), non-empty deps (freeze lasts
+///   until an unrelated dep changes), conditional or nested registration or
+///   write back, foreign/unknown slots.
 ///
 /// Stays silent when (each kill is a proof, not a heuristic):
 /// - the captured path is covered by the deps array (the effect re-runs and
@@ -171,9 +174,9 @@ fn resolve_root_slots(
 /// Best finding for one captured path within one effect.
 struct PathFinding {
     severity: Severity,
-    /// The must-reach proof backing the Error tier (`None` for Warning). Carried
-    /// through the per-path dedup so `Diagnostic::error` can mint from it.
-    proof: Option<Certified<OnAllPaths>>,
+    /// The proof backing the Error tier (`None` for Warning). Carried through
+    /// the per-path dedup so `Diagnostic::error` can mint from it.
+    proof: Option<Certified<StaleCapture>>,
     registrar: String,
     reg_span: Option<SourceRange>,
     resolved_via: Option<String>,
@@ -337,23 +340,18 @@ impl Rule for StaleClosure {
                             .and_then(|c| setter_labels.get(&c.var).map(|l| (*l, c.span)))
                     };
 
-                    // must-reach as a certified proof (the only path to Error).
-                    let reach_proof = reg.block_id.and_then(|b| {
-                        match must_on_all_paths(body_cfg, &HashSet::from([b])) {
+                    // The whole Error claim is one proof (#142): a proof of
+                    // one conjunct (the registration's reach) is not enough.
+                    let proof =
+                        match must_stale_capture(reg, deps, body_cfg, cb_body, &slot_setters) {
                             MustResult::All(c) => Some(c),
                             _ => None,
-                        }
-                    });
-                    let is_error = reg.firing == Firing::Repeating
-                        && mount_only
-                        && reach_proof.is_some()
-                        && self_write.is_some();
-                    let severity = if is_error {
+                        };
+                    let severity = if proof.is_some() {
                         Severity::Error
                     } else {
                         Severity::Warning
                     };
-                    let proof = if is_error { reach_proof } else { None };
 
                     let rank = |s: Severity| match s {
                         Severity::Error => 2,

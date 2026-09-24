@@ -267,10 +267,13 @@ pub const RULE_DOCS: &[RuleDoc] = &[
                       variable values from the render that last ran the effect. When the \
                       effect's deps array does not cover a captured state value, the callback \
                       keeps reading that old value after the state changes. With `[]` deps, \
-                      forever. When the callback also writes the slot it reads \
-                      (`setN(n + 1)` in an interval), the state can never advance past its \
-                      first update: every firing recomputes from the same frozen capture \
-                      (Error).",
+                      forever. When the callback also writes the slot it reads on every \
+                      path (`setN(n + 1)` in an interval), the state can never advance past \
+                      its first update: every firing recomputes from the same frozen capture \
+                      (Error). The Error needs a registrar known to fire later and \
+                      repeatedly (`setInterval`, `addEventListener`); one recognized by its \
+                      name only (`on`, `subscribe`, `addListener`) might call the callback \
+                      once, synchronously, and stays a Warning.",
         "const [n, setN] = useState(0);\n\
                   useEffect(() => { setInterval(() => setN(n + 1), 1000); }, []);",
         "Use the functional updater (`setN(n => n + 1)`) so the callback never reads \
