@@ -1,6 +1,6 @@
 {
-  "total": 1348,
-  "digest": "1e9cb23a8a49045fdf6ad1ecf6ed29614a45087f859de88af98ea4091cfff408",
+  "total": 1346,
+  "digest": "50a75ef81793db37bc60431c09cc888fdc064126afc9a1eb82dc2ce99e094a41",
   "by_rule": {
     "always-unstable-deps": 381,
     "conditional-hook": 9,
@@ -11,7 +11,7 @@
     "lazy-init": 222,
     "missing-cleanup": 3,
     "missing-deps": 476,
-    "redundant-set-state": 8,
+    "redundant-set-state": 6,
     "server-component-hook": 1,
     "setter-in-render": 35,
     "stale-closure": 2,
@@ -32,7 +32,7 @@
     "novel": 2,
     "precedent": 1,
     "shadcn-admin": 9,
-    "twenty": 403,
+    "twenty": 401,
     "zustand": 3
   },
   "corpus": "00e5fa79fa000c85"
