@@ -78,13 +78,16 @@ that writes it (see *Cross-file limits*).
 - **Render cascades stop at what the analysis cannot see into.** `state-lifted-too-high` and
   `wasted-subtree-render` ([ADR-041](adr/ADR-041-render-dependence.md)) treat an element whose
   component does not resolve as a use, and never count it as wasted. That covers a library
-  component, a `memo`/`forwardRef` wrapper [#64](https://github.com/rboudrouss/reactant-analyzer/issues/64)
-  and a context provider. So a state lifted above a `memo` child, or a heavy `memo`-less library
-  subtree next to a fast input, goes unreported. Context values are not modelled, so a cascade that
-  runs through a context is not followed either [#145](https://github.com/rboudrouss/reactant-analyzer/issues/145).
+  component and a `memo`/`forwardRef` wrapper [#64](https://github.com/rboudrouss/reactant-analyzer/issues/64).
+  So a state lifted above a `memo` child, or a heavy `memo`-less library subtree next to a fast
+  input, goes unreported. A proven context's provider is followed to the consumers below it
+  [#145](https://github.com/rboudrouss/reactant-analyzer/issues/145), but under it, such an element
+  counts as a possible consumer. So does a component that reads a context through a custom hook,
+  whatever context that is. A cascade through a context imported from a package, or re-exported
+  through a third file, still stops at the provider.
   A setter handed to a child is a trigger where it lands on a host element's handler, or on an
   `onX` prop of an element the analysis cannot see into. One passed under another name to such an
-  element, or called by the child outside any handler, is not a trigger.
+  element, called by the child outside any handler, or read from a context, is not a trigger.
 
 ## Why reactant may warn wrongly (false positives)
 
@@ -177,7 +180,8 @@ carries an Error.
   ([ADR-041](adr/ADR-041-render-dependence.md) §2). A call bound to a variable is taken to depend
   only on its callee and arguments, and a module-level mutable binding is not a render input. A
   render that reads such a binding can therefore be reported as unaffected by a write that in fact
-  changes it [#147](https://github.com/rboudrouss/reactant-analyzer/issues/147).
+  changes it [#147](https://github.com/rboudrouss/reactant-analyzer/issues/147). A custom hook
+  called inline in JSX (`<p>{useTheme()}</p>`) is such a call, so a context it reads is not seen.
 - **Trigger frequency is a ranking, not a proof.** `wasted-subtree-render` files an event as
   continuous from its name and the host element the handler lands on, with its literal `type`,
   followed down through the components it is handed to. For an element the analysis cannot see

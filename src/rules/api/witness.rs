@@ -113,11 +113,12 @@ pub enum Step {
     InitOnce { slot: HookLabel },
     /// A component hands the value down to a child element without using it.
     /// `from`/`to` are component display names, `props` the props that carry
-    /// it (empty: through a spread).
+    /// it (empty: through a spread, or through `context` when it names one).
     Forward {
         from: String,
         to: String,
         props: Vec<String>,
+        context: Option<String>,
     },
     /// An element re-renders with its parent although none of its inputs
     /// changed. `renders` is a lower bound on the component renders it costs.
@@ -231,7 +232,19 @@ impl Step {
                  ignore it",
                 name(*slot)
             ),
-            Step::Forward { from, to, props } => {
+            Step::Forward {
+                from,
+                to,
+                props,
+                context: Some(ctx),
+            } if props.is_empty() => {
+                format!(
+                    "`{from}` renders `<{to}>` inside the `{ctx}` provider without using it itself"
+                )
+            }
+            Step::Forward {
+                from, to, props, ..
+            } => {
                 let via = if props.is_empty() {
                     "through a spread".to_string()
                 } else {

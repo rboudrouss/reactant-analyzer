@@ -4,7 +4,7 @@ Status, 2026-09-24:
 - **Shipped:** M1, M3 and M4 (the parts M4 needs), `state-lifted-too-high`,
   `wasted-subtree-render`, and options on built-in rules.
 - **Recorded in** [ADR-041](../adr/ADR-041-render-dependence.md).
-- **Still open:** M2 (#64), M5 and the rules after them.
+- **Still open:** M2 (#64), M5 members and the rules after them.
 
 See §9 for the corpus measurement.
 
@@ -156,8 +156,7 @@ happens in the graph (M4), not through inlining. Components analysed only in
 phase 2, with ⊤ props, therefore keep a precise summary.
 
 `Setter(label)` is a source too: a *write capability* that never changes but
-pins its user below the slot's owner. `Context(ContextId)` is not in v1;
-`useContext` reads as `Hook(label)`.
+pins its user below the slot's owner. `Context(ContextId)` came with M5.
 
 Done (#149): `MountIndex` reads an element's guard slots from its
 `ElementSite::guard` and no longer chases `Expr::StateVal` syntactically.
@@ -218,11 +217,15 @@ Triggers get a frequency class taken from the event name:
   interval, a rAF;
 - **discrete**: everything else.
 
-### M5. Context values (later)
+### M5. Context values (whole value shipped, #145)
 
-`useContext(C)` evaluates to `deps = {Context(C)}`. With the #88 per-member
-object heap, a consumer that destructures `{ user }` keeps `user`'s own
-member deps, which is what makes the gutenberg case decidable.
+`useContext(C)` evaluates to `deps = {Context(C)}`. The provider site of a
+proven context is transparent: its `value` deps reach every site nested in it
+as `Context(C)` (ADR-041, Consequences). Still to do, with
+`context-mixes-update-frequencies`: members. With the #88 per-member object
+heap, a consumer that destructures `{ user }` keeps `user`'s own member deps,
+which is what makes the gutenberg case decidable. The same refinement lets a
+setter handed on in a context value be a trigger.
 
 ## 6. Rules
 
@@ -406,7 +409,7 @@ typing.
 ## 10. Follow-up issues
 
 The limits recorded in `docs/limitations.md`:
-- #145: cascades through a context value (plan M5).
+- #145 (done): cascades through a context value (plan M5, whole value).
 - #146 (done): a setter called by a child as a trigger of the owner.
 - #147: the two stated assumptions of render dependence.
 - #148 (done): trigger frequency from the event name. The host element a
@@ -417,6 +420,27 @@ The other work left:
 - #149 (done): `MountIndex` onto render dependence.
 - #150 (done): the corpus baseline, from the `corpus` workflow's run.
 - #64: `memo` as a barrier.
+
+### Corpus effect of context values (#145, 2026-09-24, per repo)
+
+1 510 findings before and after, 7 removed and 7 added. Only
+`wasted-subtree-render` moves, and five of the seven pairs are the same
+finding with a smaller count, since a provider is no longer counted as a
+component render. The other changes come from an opaque hook's result now
+depending on its arguments:
+- dub `use-in-viewport` loses `<DomainConfiguration>` and `<DomainCardMenu>`.
+  `useSWR`'s key reads `isVisible`, so their props do change (two FPs gone).
+- twenty `SettingsAdminApps` is removed: its rows read `useQuery` data keyed
+  by `useDebounce(searchQuery)`. This is a sound loss, because the debounce
+  keeps the value, which the analysis cannot know.
+- dub `link-qr-modal` is added: `useDebouncedCallback(c => setData(…))` in
+  `ColorSection` is now a trigger, and `<ProBadgeTooltip>` reads only the
+  workspace. True, though the debounce makes the rate lower than "each
+  `change` event".
+
+No provider-wrapped subtree newly qualifies on the corpus. Under a provider,
+an element the analysis cannot see into still counts as a possible consumer,
+and so does a component reading any context through a custom hook.
 
 ### Corpus effect of the key test (#148, 2026-09-24, per repo)
 

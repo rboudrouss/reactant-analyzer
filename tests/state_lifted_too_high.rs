@@ -140,6 +140,18 @@ fn what_cannot_be_proven_is_not_claimed() {
     }
 }
 
+/// A provider is followed to the consumers of its context, and the state
+/// moves with it; an element the analysis cannot see into, under the
+/// provider, may be a consumer too (#145).
+#[test]
+fn a_state_reaching_its_consumer_by_context_is_followed() {
+    let ds = findings("context.tsx", &[]);
+    assert_eq!(ds.len(), 1, "{ds:#?}");
+    let m = message(&ds[0]);
+    assert!(m.contains("`<Search>`, 2 levels below `App`"), "{m}");
+    assert!(m.contains("with the `Query` provider"), "{m}");
+}
+
 /// List items are many instances: the descent stops at the component that
 /// maps them, never inside one item.
 #[test]

@@ -171,6 +171,25 @@ fn children_from_above_and_provider_subtrees_are_not_claimed() {
     assert!(findings("provider.tsx", &[]).is_empty());
 }
 
+/// What a provider wraps re-renders with its owner; its consumers do not
+/// count as wasted, read directly or through a custom hook (#145).
+#[test]
+fn a_provider_is_followed_to_its_consumers() {
+    let ds = findings("context.tsx", &[]);
+    let ms: Vec<String> = ds.iter().map(message).collect();
+    assert_eq!(ms.len(), 2, "{ms:#?}");
+    let cascade = ms.iter().find(|m| m.contains("`<Mid>`")).expect("Cascade");
+    assert!(cascade.contains("(2 component renders)"), "{cascade}");
+    let hooked = ms
+        .iter()
+        .find(|m| m.contains("`<Static>`"))
+        .expect("Hooked");
+    assert!(
+        !hooked.contains("HookLeaf") && !hooked.contains("InlineLeaf"),
+        "{hooked}"
+    );
+}
+
 /// A trigger spliced in from a custom hook is the hook's to fix, and the
 /// message says so.
 #[test]

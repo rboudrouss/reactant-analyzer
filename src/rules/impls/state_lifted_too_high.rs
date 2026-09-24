@@ -105,9 +105,19 @@ impl Rule for StateLiftedTooHigh {
             } else {
                 format!("move the state into `{target}`")
             };
+            // Reached by context, the state takes its provider along, and the
+            // components on the way do not even pass it down.
+            let context = home.path.iter().find_map(|h| h.context.as_deref());
+            let (why, fix) = match context {
+                Some(ctx) => (
+                    "although none of them uses it",
+                    format!("{fix}, with the `{ctx}` provider that hands it on"),
+                ),
+                None => ("only to pass it down", fix),
+            };
             let message = format!(
                 "state {slot} is only used inside `<{target}>`, {levels} level{} below `{}`. \
-                 Every write re-renders {} only to pass it down; {fix}",
+                 Every write re-renders {} {why}; {fix}",
                 if levels == 1 { "" } else { "s" },
                 program.display_name(owner),
                 join_names(&rerendered),
@@ -122,6 +132,7 @@ impl Rule for StateLiftedTooHigh {
                         from: program.display_name(hop.from),
                         to: program.display_name(hop.to),
                         props: hop.props.clone().unwrap_or_default(),
+                        context: hop.context.clone(),
                     },
                     None,
                     hop.span,

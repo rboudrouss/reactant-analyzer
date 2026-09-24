@@ -32,7 +32,9 @@ variable maps to a may-set of `Source`:
 - `Setter(l)`: its setter, a write capability that never changes;
 - `Prop(name)` and `AllProps`;
 - `Ref(l)`;
-- `Hook(l)`: an opaque hook result.
+- `Hook(l)`: an opaque hook result, which also takes its arguments;
+- `Context(id)`: a proven context (`ModuleConstInit::Context`), what
+  `useContext(C)` reads.
 
 The sets join by union. Every operator, call, member access and literal takes
 the union of its operands. A function literal takes its captured variables.
@@ -114,7 +116,15 @@ a team's call, not the analyzer's.
   trigger as discrete. It never changes a proof.
 - `MountIndex` reads its guard slots from `ElementSite::guard`, which
   retired its syntactic `StateVal` scan (#149).
+- A provider of a proven context is followed, not a use (#145). Its `value`
+  reaches, as `Context(id)`, every element nested in it. So the elements it
+  wraps can be wasted, and a state can be at home below its provider. A
+  consumer is affected, and so is anything that may read a context the
+  analysis cannot name: an element it cannot see into, a `useContext`
+  reached through an inlined hook, or a hook of user code it could not
+  inline (`RenderDeps::any_context`). The granularity is the whole value.
+  Members, and triggers through a context, come with
+  `context-mixes-update-frequencies`, which needs them.
 - Still to do, as issues:
-  - context values as a `Context` source (#145);
   - the two stated assumptions (#147);
   - #64 (`memo`), which turns today's opaque `memo` elements into barriers.

@@ -43,8 +43,10 @@ use crate::ir::{
     source_range::SourceRange,
     stmt::{MemberKey, Stmt},
     types::{BlockId, HookLabel, Symbol, Var},
+    {ContextId, ModuleConstInit},
 };
 use crate::lowering::hook_extractor::{is_event_prop, prop_to_event};
+use crate::lowering::is_hook_name;
 
 /// A render input a value may be computed from, in the frame of one component.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -62,8 +64,12 @@ pub enum Source {
     /// A ref's contents.
     Ref(HookLabel),
     /// The result of a hook the engine does not model (an unresolved custom
-    /// hook, `useContext`, …): a reactive source outside the model.
+    /// hook, a library hook, …): a reactive source outside the model.
     Hook(HookLabel),
+    /// A proven React context: the context object itself, and what
+    /// `useContext` reads from it. Its value comes from the nearest provider
+    /// above, which the element tree pairs it with.
+    Context(ContextId),
 }
 
 /// May-set of sources. `top` is "may depend on anything".
@@ -126,7 +132,7 @@ impl Deps {
     /// a source, either side is ⊤, or one side depends on the whole props
     /// object while the other names a prop.
     pub fn touches(&self, rel: &Relevance) -> bool {
-        self.top || self.set.iter().any(|s| source_touches(s, rel))
+        (self.top && !rel.is_empty()) || self.set.iter().any(|s| source_touches(s, rel))
     }
 
     /// `true` when every source of `rel` these deps carry is gated: calling
@@ -142,22 +148,46 @@ impl Deps {
 }
 
 fn source_touches(s: &Source, rel: &Relevance) -> bool {
-    match rel {
-        Relevance::All => matches!(s, Source::Prop(_) | Source::AllProps),
-        Relevance::Sources(r) => {
-            r.contains(s)
-                || (*s == Source::AllProps && r.iter().any(|x| matches!(x, Source::Prop(_))))
-        }
-    }
+    rel.sources.contains(s)
+        || (rel.any_prop && matches!(s, Source::Prop(_) | Source::AllProps))
+        || (*s == Source::AllProps && rel.sources.iter().any(|x| matches!(x, Source::Prop(_))))
 }
 
 /// The sources a question is about, in one component's frame.
-#[derive(Debug, Clone)]
-pub enum Relevance {
+#[derive(Debug, Clone, Default)]
+pub struct Relevance {
     /// Every prop: the parent spread a relevant value into the element, so
     /// any prop may carry it.
-    All,
-    Sources(BTreeSet<Source>),
+    pub any_prop: bool,
+    pub sources: BTreeSet<Source>,
+}
+
+impl Relevance {
+    pub fn of(sources: impl IntoIterator<Item = Source>) -> Self {
+        Relevance {
+            any_prop: false,
+            sources: sources.into_iter().collect(),
+        }
+    }
+
+    pub fn any_prop() -> Self {
+        Relevance {
+            any_prop: true,
+            sources: BTreeSet::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.any_prop && self.sources.is_empty()
+    }
+
+    /// The contexts it names: a context reaches every element below its
+    /// provider, whatever props they are handed.
+    pub fn contexts(&self) -> impl Iterator<Item = &Source> {
+        self.sources
+            .iter()
+            .filter(|s| matches!(s, Source::Context(_)))
+    }
 }
 
 /// A component element built by the render (`<Child a={x} />`).
@@ -176,6 +206,10 @@ pub struct ElementSite {
     /// Built in a callback the render passes to a call (`.map`): possibly
     /// many instances, possibly none.
     pub in_list: bool,
+    /// The element is the provider of a proven context (`<Ctx.Provider>`, or
+    /// `<Ctx>` since React 19): its `value` reaches the context's consumers
+    /// below, and its children render unchanged.
+    pub provides: Option<ContextId>,
     /// Index (in [`RenderDeps::sites`]) of the element this one is nested in
     /// as a prop or child: `<Provider value={v}><Row /></Provider>` gives
     /// `Row` the provider's index. What reaches the enclosing element may
@@ -211,6 +245,18 @@ pub struct RenderDeps {
     pub genuine: Deps,
     pub sites: Vec<ElementSite>,
     pub handlers: Vec<HostHandler>,
+    /// The component may read a context the analysis cannot name: a
+    /// `useContext` of an unproven object or reached through an inlined hook,
+    /// or a hook of user code the engine could not see into.
+    pub any_context: bool,
+}
+
+impl RenderDeps {
+    /// Whether the component uses `rel`: its own output, effects or hooks
+    /// depend on it, or `rel` names a context it may read.
+    pub fn uses(&self, rel: &Relevance) -> bool {
+        self.genuine.touches(rel) || (self.any_context && rel.contexts().next().is_some())
+    }
 }
 
 /// Iteration cap per CFG. The lattice is finite, so the cap is a guard, not a
@@ -301,14 +347,22 @@ pub fn render_deps(result: &AnalysisResult<impl AbstractDomain>) -> RenderDeps {
         .iter()
         .map(|h| (h.label, h.kind))
         .collect();
+    let inlined: HashSet<HookLabel> = result
+        .hook_provenance
+        .iter()
+        .filter(|p| p.inlined)
+        .map(|p| p.label)
+        .collect();
     let mut a = Analyzer {
         hooks: &hooks,
         kinds: &kinds,
+        consts: &result.module_consts,
         param: &result.param,
         out: RenderDeps::default(),
         top: false,
         free: Default::default(),
         gated: Default::default(),
+        inline_hook: Default::default(),
     };
     let mut entry = Env::new();
     entry.insert(
@@ -353,6 +407,7 @@ pub fn render_deps(result: &AnalysisResult<impl AbstractDomain>) -> RenderDeps {
                 for e in args {
                     used.union_with(&a.eval(e, &env).deps);
                 }
+                a.out.any_context |= a.reads_unnamed_context(hook, &env, &inlined);
             }
             _ => continue,
         }
@@ -361,12 +416,14 @@ pub fn render_deps(result: &AnalysisResult<impl AbstractDomain>) -> RenderDeps {
     if a.top {
         a.out.genuine = Deps::top();
     }
+    a.out.any_context |= a.inline_hook.get();
     a.out
 }
 
 struct Analyzer<'a> {
     hooks: &'a HashMap<HookLabel, &'a HookEntry>,
     kinds: &'a HashMap<HookLabel, HookKind>,
+    consts: &'a HashMap<Var, ModuleConstInit>,
     param: &'a Var,
     out: RenderDeps,
     /// Set when a cap was hit: the whole summary degrades to ⊤.
@@ -376,6 +433,9 @@ struct Analyzer<'a> {
     free: std::cell::RefCell<HashMap<usize, Arc<HashSet<Var>>>>,
     /// [`param_gated_vars`] per body, by address, for the same reason.
     gated: std::cell::RefCell<HashMap<usize, Arc<HashSet<Var>>>>,
+    /// The render calls a hook where lowering records none
+    /// (`<p>{useTheme()}</p>`): it may read any context.
+    inline_hook: std::cell::Cell<bool>,
 }
 
 struct Run {
@@ -435,8 +495,61 @@ impl<'a> Analyzer<'a> {
             });
         }
         // Not bound here: module scope, an import or a global. Never a render
-        // input (a module-level mutable binding is the stated blind spot).
-        env.get(v).cloned().unwrap_or_else(DVal::empty)
+        // input (a module-level mutable binding is the stated blind spot),
+        // except a proven context object, whose value its provider sets.
+        env.get(v)
+            .cloned()
+            .unwrap_or_else(|| match self.consts.get(v) {
+                Some(ModuleConstInit::Context(id)) => {
+                    DVal::of(Deps::one(Source::Context(id.clone())))
+                }
+                _ => DVal::empty(),
+            })
+    }
+
+    /// The proven context a name denotes here (not shadowed by a local).
+    fn context_of(&self, name: &str, env: &Env) -> Option<ContextId> {
+        if env.contains_key(name) {
+            return None;
+        }
+        match self.consts.get(name) {
+            Some(ModuleConstInit::Context(id)) => Some(id.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether an opaque hook call may read a context [`Source::Context`]
+    /// does not name. `useContext(C)` (or `use(C)`) written in the component
+    /// with a proven `C` is named by its argument. Inlined from a custom hook,
+    /// the argument is a name of the hook's file, which this file's constants
+    /// cannot prove. Any other hook of user code may call `useContext`
+    /// itself; a package hook cannot reach a context of the user's modules
+    /// unless handed it, which its arguments show.
+    fn reads_unnamed_context(
+        &self,
+        hook: &HookEntry,
+        env: &Env,
+        inlined: &HashSet<HookLabel>,
+    ) -> bool {
+        let HookEntry::Custom {
+            label,
+            name,
+            args,
+            import_source,
+            resolved_file,
+            ..
+        } = hook
+        else {
+            return false;
+        };
+        if name == "useContext" || name == "use" {
+            let proven = match args.first().map(Expr::peel_ts) {
+                Some(Expr::Var(v)) => self.context_of(v, env).is_some(),
+                _ => false,
+            };
+            return inlined.contains(label) || !proven;
+        }
+        resolved_file.is_some() || import_source.is_none()
     }
 
     /// Forward fixpoint over `cfg`, then (when `root`) the collection pass that
@@ -590,7 +703,17 @@ impl<'a> Analyzer<'a> {
             Expr::StateSetter(l) => DVal::of(Deps::one(Source::Setter(*l))),
             Expr::HookMarker(l, _) => match self.kinds.get(l) {
                 Some(HookKind::Ref) => DVal::of(Deps::one(Source::Ref(*l))),
-                Some(HookKind::Custom) | None => DVal::of(Deps::one(Source::Hook(*l))),
+                // An opaque hook's result may be computed from its arguments,
+                // like any call's (`useContext(Ctx)` reads `Ctx`'s value).
+                Some(HookKind::Custom) | None => {
+                    let mut d = Deps::one(Source::Hook(*l));
+                    if let Some(HookEntry::Custom { args, .. }) = self.hooks.get(l) {
+                        for a in args {
+                            d.union_with(&self.eval(a, env).deps.ungated());
+                        }
+                    }
+                    DVal::of(d)
+                }
                 _ => DVal::empty(),
             },
             // A memoised value or callback is computed from what its body
@@ -649,6 +772,14 @@ impl<'a> Analyzer<'a> {
                 DVal::of(self.eval(arg, env).deps)
             }
             Expr::Call { fn_, args } => {
+                let callee = match fn_.peel_ts() {
+                    Expr::Var(v) => Some(v.as_str()),
+                    Expr::FieldAccess { field, .. } => Some(field.as_str()),
+                    _ => None,
+                };
+                if callee.is_some_and(|n| n == "use" || is_hook_name(n)) {
+                    self.inline_hook.set(true);
+                }
                 let mut d = self.eval(fn_, env).deps.ungated();
                 for a in args {
                     d.union_with(&self.eval(a, env).deps.ungated());
@@ -726,6 +857,7 @@ impl<'a> Analyzer<'a> {
                     spread: Deps::default(),
                     guard,
                     in_list: ctx.in_list,
+                    provides: self.context_of(name.strip_suffix(".Provider").unwrap_or(name), env),
                     parent: ctx.parent,
                 };
                 match props.peel_ts() {

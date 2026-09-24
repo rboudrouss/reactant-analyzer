@@ -12,7 +12,7 @@
 //! element whose component does not resolve, a component re-entered through
 //! recursion, and a summary that hit a cap (⊤) all stop the descent.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use crate::engine::ProgramAnalysisResult;
 use crate::engine::render_deps::{
@@ -39,6 +39,9 @@ pub(in crate::rules) struct Hop {
     pub span: Option<SourceRange>,
     /// The props that carry it (`None`: through a spread).
     pub props: Option<Vec<Symbol>>,
+    /// No prop carries it, the context of this name does: `<to>` is nested
+    /// in its provider.
+    pub context: Option<String>,
 }
 
 /// Where a slot's uses live.
@@ -143,9 +146,9 @@ impl RenderIndex {
         label: HookLabel,
         program: &ProgramAnalysisResult,
     ) -> Option<Home> {
-        let both = Relevance::Sources(BTreeSet::from([Source::Slot(label), Source::Setter(label)]));
-        let reads = Relevance::Sources(BTreeSet::from([Source::Slot(label)]));
-        let writes = Relevance::Sources(BTreeSet::from([Source::Setter(label)]));
+        let both = Relevance::of([Source::Slot(label), Source::Setter(label)]);
+        let reads = Relevance::of([Source::Slot(label)]);
+        let writes = Relevance::of([Source::Setter(label)]);
         let mut visiting = HashSet::from([owner]);
         if !self
             .uses(owner, &reads, program, &mut visiting, 0)
@@ -183,7 +186,10 @@ impl RenderIndex {
             .iter()
             .map(|hop| {
                 self.summaries.get(&hop.from).map_or(0, |s| {
-                    s.sites.iter().filter(|site| site.span != hop.span).count()
+                    s.sites
+                        .iter()
+                        .filter(|site| site.span != hop.span && site.provides.is_none())
+                        .count()
                 })
             })
             .sum();
@@ -205,14 +211,17 @@ impl RenderIndex {
         let Some(summary) = self.summaries.get(&owner) else {
             return Vec::new();
         };
-        let rel = Relevance::Sources(labels.iter().map(|l| Source::Slot(*l)).collect());
+        let rel = Relevance::of(labels.iter().map(|l| Source::Slot(*l)));
+        // A provider hands its `value` on by context, which is followed below
+        // (`carried`), and renders its children unchanged: only its mount
+        // condition reaches what it wraps.
         let touched: Vec<bool> = summary
             .sites
             .iter()
             .map(|s| {
                 s.guard.touches(&rel)
-                    || s.spread.touches(&rel)
-                    || s.props.iter().any(|(_, d)| d.touches(&rel))
+                    || (s.provides.is_none()
+                        && (s.spread.touches(&rel) || s.props.iter().any(|(_, d)| d.touches(&rel))))
             })
             .collect();
         let reached = |mut i: usize| -> bool {
@@ -234,8 +243,13 @@ impl RenderIndex {
             let Some(child) = resolve(site, program) else {
                 continue;
             };
+            // A consumer of a context the write changes re-renders anyway.
+            let carried = Relevance::of(contexts_at(summary, i, &rel));
+            if self.summaries.get(&child).is_none_or(|s| s.uses(&carried)) {
+                continue;
+            }
             let mut visiting = HashSet::from([owner]);
-            let (renders, list) = self.subtree_renders(child, program, &mut visiting, 0);
+            let (renders, list) = self.subtree_renders(child, &carried, program, &mut visiting, 0);
             out.push(Wasted {
                 child,
                 span: site.span,
@@ -246,12 +260,16 @@ impl RenderIndex {
         out
     }
 
-    /// Component renders one render of `comp` costs: itself and every
-    /// component element below it, counting a list's item once (a lower
-    /// bound; `list` says the real number is unknown).
+    /// Component renders one render of `comp` costs for nothing: itself and
+    /// every component element below it, counting a list's item once (a
+    /// lower bound; `list` says the real number is unknown). `carried`: the
+    /// contexts the write changes. A consumer of one re-renders anyway, and
+    /// so may an element the analysis cannot see into; neither is counted,
+    /// nor is anything below them.
     fn subtree_renders(
         &self,
         comp: ComponentId,
+        carried: &Relevance,
         program: &ProgramAnalysisResult,
         visiting: &mut HashSet<ComponentId>,
         depth: usize,
@@ -263,10 +281,20 @@ impl RenderIndex {
         }
         if let Some(s) = self.summaries.get(&comp) {
             for site in &s.sites {
+                let child = resolve(site, program);
+                let consumer = match child {
+                    Some(c) => self.summaries.get(&c).is_none_or(|s| s.uses(carried)),
+                    None => !carried.is_empty(),
+                };
+                // A provider is not a component render.
+                if consumer || site.provides.is_some() {
+                    continue;
+                }
                 list |= site.in_list;
-                match resolve(site, program) {
+                match child {
                     Some(child) => {
-                        let (r, l) = self.subtree_renders(child, program, visiting, depth + 1);
+                        let (r, l) =
+                            self.subtree_renders(child, carried, program, visiting, depth + 1);
                         renders += r;
                         list |= l;
                     }
@@ -289,7 +317,7 @@ impl RenderIndex {
         label: HookLabel,
         program: &ProgramAnalysisResult,
     ) -> Vec<Landing> {
-        let rel = Relevance::Sources(BTreeSet::from([Source::Setter(label)]));
+        let rel = Relevance::of([Source::Setter(label)]);
         let mut out = Vec::new();
         let mut visiting = HashSet::from([owner]);
         self.land(
@@ -367,18 +395,18 @@ impl RenderIndex {
                 }
             };
             if all {
-                descend(Relevance::All, keyed || site.spread.gated_for(rel), out);
+                descend(
+                    Relevance::any_prop(),
+                    keyed || site.spread.gated_for(rel),
+                    out,
+                );
             }
             // One prop at a time: a prop that lands below must not hide one
             // that does not.
             for p in &props {
                 let keyed = keyed || site.props.iter().any(|(k, d)| k == p && d.gated_for(rel));
                 let before = out.len();
-                descend(
-                    Relevance::Sources(BTreeSet::from([Source::Prop(p.clone())])),
-                    keyed,
-                    out,
-                );
+                descend(Relevance::of([Source::Prop(p.clone())]), keyed, out);
                 if out.len() == before && is_event_prop(p) {
                     out.push(Landing {
                         component: comp,
@@ -409,18 +437,24 @@ impl RenderIndex {
             return UseTree::user();
         };
         let mut tree = UseTree {
-            user: summary.genuine.touches(rel),
+            user: summary.uses(rel),
             kids: Vec::new(),
         };
-        for site in &summary.sites {
+        for (i, site) in summary.sites.iter().enumerate() {
             // Whether the element exists, or which component it is, depends
             // on it: deciding that is a use, whatever the props carry.
             if site.guard.touches(rel) {
                 tree.user = true;
                 continue;
             }
+            // A provider's value is followed to the elements it wraps, which
+            // it renders unchanged.
+            if site.provides.is_some() {
+                continue;
+            }
             let (props, all) = forwarded(site, rel);
-            if props.is_empty() && !all {
+            let contexts = contexts_at(summary, i, rel);
+            if props.is_empty() && !all && contexts.is_empty() {
                 continue;
             }
             // One of many instances: the owner of the site holds the state.
@@ -436,10 +470,20 @@ impl RenderIndex {
                 tree.user = true;
                 continue;
             }
-            let child_rel = if all {
-                Relevance::All
-            } else {
-                Relevance::Sources(props.iter().cloned().map(Source::Prop).collect())
+            // Only the prop-less hop names its context: a prop is what the
+            // message has to show when there is one.
+            let context = match contexts.first() {
+                Some(Source::Context(c)) if props.is_empty() && !all => Some(c.origin_name.clone()),
+                _ => None,
+            };
+            let child_rel = Relevance {
+                any_prop: all,
+                sources: props
+                    .iter()
+                    .cloned()
+                    .map(Source::Prop)
+                    .chain(contexts)
+                    .collect(),
             };
             let sub = self.uses(child, &child_rel, program, visiting, depth + 1);
             visiting.remove(&child);
@@ -449,12 +493,37 @@ impl RenderIndex {
                     to: child,
                     span: site.span,
                     props: (!all).then_some(props),
+                    context,
                 },
                 sub,
             ));
         }
         tree
     }
+}
+
+/// The contexts that carry `rel` (in the builder's frame) to site `i`: those
+/// `rel` already names, since a context reaches every element below its
+/// provider, and those of the providers the site is nested in whose `value`
+/// may depend on `rel`. A nearer provider of the same context is not taken
+/// to hide it: more consumers only means fewer claims.
+fn contexts_at(summary: &RenderDeps, i: usize, rel: &Relevance) -> Vec<Source> {
+    let mut out: Vec<Source> = rel.contexts().cloned().collect();
+    let mut at = summary.sites[i].parent;
+    while let Some(j) = at {
+        let site = &summary.sites[j];
+        if let Some(c) = &site.provides
+            && (site.spread.touches(rel)
+                || site
+                    .props
+                    .iter()
+                    .any(|(k, d)| k == "value" && d.touches(rel)))
+        {
+            out.push(Source::Context(c.clone()));
+        }
+        at = site.parent;
+    }
+    out
 }
 
 /// The props of `site` that may carry `rel`, and whether a spread does (then
@@ -490,14 +559,12 @@ fn forwarded(site: &ElementSite, rel: &Relevance) -> (Vec<Symbol>, bool) {
 /// `deps` is the props object itself; `None` when the spread may rename.
 fn renamed_through(deps: &Deps, rel: &Relevance) -> Option<Vec<Symbol>> {
     let props_object = !deps.top && deps.set.len() == 1 && deps.set.contains(&Source::AllProps);
-    let Relevance::Sources(r) = rel else {
-        return None;
-    };
-    if !props_object || r.contains(&Source::AllProps) {
+    if !props_object || rel.any_prop || rel.sources.contains(&Source::AllProps) {
         return None;
     }
     Some(
-        r.iter()
+        rel.sources
+            .iter()
             .filter_map(|s| match s {
                 Source::Prop(p) => Some(p.clone()),
                 _ => None,
