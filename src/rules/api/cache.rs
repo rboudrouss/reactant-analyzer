@@ -17,6 +17,7 @@ use crate::engine::ProgramAnalysisResult;
 use crate::rules::helpers::churn_graph::ChurnGraph;
 use crate::rules::helpers::context_flow::ContextConsumers;
 use crate::rules::helpers::mount::MountIndex;
+use crate::rules::helpers::render_tree::RenderIndex;
 
 /// Program-scoped, lazily-computed derived data shared by every component's
 /// rule pass. Bound to the program it was built from, so a cache can never be
@@ -26,6 +27,7 @@ pub struct ProgramCache<'a> {
     churn: OnceLock<ChurnGraph>,
     mounts: OnceLock<MountIndex>,
     consumers: OnceLock<ContextConsumers>,
+    render: OnceLock<RenderIndex>,
 }
 
 impl<'a> ProgramCache<'a> {
@@ -35,6 +37,7 @@ impl<'a> ProgramCache<'a> {
             churn: OnceLock::new(),
             mounts: OnceLock::new(),
             consumers: OnceLock::new(),
+            render: OnceLock::new(),
         }
     }
 
@@ -60,5 +63,12 @@ impl<'a> ProgramCache<'a> {
     /// index behind mount-lifetime reasoning (issue #95).
     pub(in crate::rules) fn mounts(&self) -> &MountIndex {
         self.mounts.get_or_init(|| MountIndex::build(self.program))
+    }
+
+    /// Every component's render dependence summary, built on first request.
+    /// Whole-program because a slot's uses are looked for down the element
+    /// tree, through other components' summaries.
+    pub(in crate::rules) fn render(&self) -> &RenderIndex {
+        self.render.get_or_init(|| RenderIndex::build(self.program))
     }
 }

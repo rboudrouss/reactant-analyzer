@@ -380,6 +380,25 @@ impl StateValue {
             || self.other
     }
 
+    /// True if the value ranges over a few primitives only: booleans,
+    /// `null`/`undefined`, a finite set of string constants, a narrow integer
+    /// range. A state holding such a value re-renders only when a write
+    /// *changes* it (React bails out on `Object.is`-equal writes), so however
+    /// often it is written, it re-renders at the rate of its transitions.
+    pub fn is_finitely_valued(&self) -> bool {
+        const NARROW: f64 = 16.0;
+        let num_ok = self.num.is_bottom()
+            || (self.num.is_int
+                && self.num.lo.is_finite()
+                && self.num.hi.is_finite()
+                && self.num.hi - self.num.lo <= NARROW);
+        num_ok
+            && matches!(self.str, StrConst::Bottom | StrConst::Set(_))
+            && self.reference == Stability::Bottom
+            && self.setter == SetterVal::Bottom
+            && !self.other
+    }
+
     /// The reference slot's change-trace labels when it carries them
     /// (`Versioned`/`VersionedTop`), else `None`. Lets a caller preserve the
     /// version labels while degrading the value's *kind* — the recurring

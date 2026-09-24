@@ -282,6 +282,27 @@ pub const RULE_DOCS: &[RuleDoc] = &[
               the callback is re-registered with a fresh capture.",
     ),
     doc(
+        "state-lifted-too-high",
+        "state is used only deep in one child subtree; the components above re-render to pass it down",
+        "When a component owns a state that only one branch of its render tree \
+                      uses, every write re-renders the owner, every component between it and \
+                      that branch, and all their other children, only so the value (or its \
+                      setter) can travel down as props. \"Used\" means the value reaches host \
+                      output, an effect, a render-phase side effect or an element's mount \
+                      condition; forwarding it as a prop is not a use. Typing in a field whose \
+                      value lives three components up re-renders all three on every \
+                      keystroke. The rule stops at what it cannot see into (an unresolved \
+                      component, a list item, recursion), so it only reports what it proved. \
+                      Warning: the extra re-renders are certain, their cost is not.",
+        "function App() {\n  const [q, setQ] = useState('');\n  return <Layout q={q} onQ={setQ} />;\n}\n\
+         function Layout({ q, onQ }) { return <main><Search q={q} onQ={onQ} /><Content /></main>; }\n\
+         function Search({ q, onQ }) { return <input value={q} onChange={e => onQ(e.target.value)} />; }",
+        "Move the state into the component the message names (here `Search`), \
+              or into a small wrapper around the part of its output that uses it. If a \
+              component above needs a value derived from it, lift only that value, or read \
+              it from the URL or a store.",
+    ),
+    doc(
         "state-mutation",
         "state or prop object mutated in place, same reference, no re-render",
         "Mutating a state object (`arr.push(x)`, `obj.f = v`) keeps its reference \
@@ -320,6 +341,26 @@ pub const RULE_DOCS: &[RuleDoc] = &[
         "Memoize the value: \
               `const v = useMemo(() => ({ user, logout }), [user, logout]);` then \
               `<Ctx.Provider value={v}>`.",
+    ),
+    doc(
+        "wasted-subtree-render",
+        "a state written on every keystroke or pointer move re-renders subtrees that do not depend on it",
+        "A component re-renders all the component elements it builds whenever one \
+                      of its states changes, whether or not their props changed. When the \
+                      state is written from a continuous event (typing, pointer motion, \
+                      scrolling, dragging, a timer) and the component also builds elements \
+                      none of whose inputs depend on it, those subtrees render identical \
+                      output many times a second. Only elements the analysis resolved are \
+                      counted (an unresolved one may be `memo`), and none nested in an element \
+                      that receives the state (a provider could pass it on). Warning: the \
+                      extra renders are certain, their cost is not.",
+        "function Page() {\n  const [text, setText] = useState('');\n  return <div>\n    \
+         <input value={text} onChange={e => setText(e.target.value)} />\n    \
+         <ExpensiveTree />\n  </div>;\n}",
+        "Move the state and the elements that use it into their own component \
+              (`<Editor />` holding the input), or build the heavy subtree in the \
+              parent and pass it in as `children`. Wrapping the heavy child in `memo` \
+              also works when all its props are stable.",
     ),
     doc(
         "widening-info",

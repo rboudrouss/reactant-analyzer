@@ -263,6 +263,9 @@ pub struct Registration {
     pub block_id: Option<BlockId>,
     pub span: Option<SourceRange>,
     pub pairing: Pairing,
+    /// The event name, when the registrar takes one as a string literal
+    /// before the callback (`addEventListener("mousemove", h)`).
+    pub event: Option<String>,
 }
 
 /// Does this callee **un**register — `removeEventListener`, `unsubscribe`,
@@ -644,6 +647,10 @@ fn scan_expr(
                     block_id,
                     span,
                     pairing: Pairing::Unknown,
+                    event: args[..reg.cb_arg].first().and_then(|a| match a.peel_ts() {
+                        Expr::Lit(crate::ir::expr::Prim::String(s)) => Some(s.clone()),
+                        _ => None,
+                    }),
                 });
             }
             // Direct call of a locally-bound helper executes inline: the

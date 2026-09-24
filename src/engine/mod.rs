@@ -8,6 +8,7 @@ pub mod function_registry;
 pub mod hook_registry;
 pub mod program_result;
 pub mod registrations;
+pub mod render_deps;
 pub mod root_detector;
 pub mod seeds;
 pub mod setters;

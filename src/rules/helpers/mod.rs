@@ -11,6 +11,7 @@ pub mod jsx;
 pub mod mount;
 pub mod providers;
 pub mod purity;
+pub mod render_tree;
 /// Moved to the engine (ADR-027 §1): the slot-writer relation is computed at
 /// convergence and stored on `AnalysisResult`, so the collection/alias
 /// machinery lives below the rules layer. Re-exported here so rule-side
@@ -60,6 +61,15 @@ pub(crate) fn describe_value(val: &StateValue) -> &'static str {
 /// seven kinds, which is invisible in native messages (they only ever ask about
 /// deps-carrying kinds) but is what a Tier-A `{anchor.kind}` renders. Each word
 /// has to read in "this {word}".
+/// `a`, `a and b`, `a, b and c`: a list of names in a message.
+pub(crate) fn join_names(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
+}
+
 pub(crate) fn hook_kind_word(kind: HookKind) -> &'static str {
     match kind {
         HookKind::State => "state",

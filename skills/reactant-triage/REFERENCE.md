@@ -15,7 +15,7 @@ often or sits on a rarely-mounted leaf.
 | The app hangs or burns CPU forever | `infinite-loop`, `cross-component-infinite-loop`, `setter-in-render`, `cross-setter-in-render` | now. The user sees a freeze |
 | React throws, or hook state corrupts | `conditional-hook`, `server-component-hook` | now. It crashes at runtime |
 | The UI shows stale or wrong data | `stale-closure`, `frozen-initial-state`, `state-mutation`, `missing-deps` | soon. Wrong behaviour, nothing in the console |
-| Extra renders and wasted work | `derived-state`, `unnecessary-rerender`, `unstable-context-value`, `always-unstable-deps`, `lazy-init`, `redundant-set-state`, `missing-cleanup` | later. Measure before spending time |
+| Extra renders and wasted work | `derived-state`, `unnecessary-rerender`, `unstable-context-value`, `state-lifted-too-high`, `wasted-subtree-render`, `always-unstable-deps`, `lazy-init`, `redundant-set-state`, `missing-cleanup` | later. Measure before spending time |
 | Not a defect | `analysis-limit`, `widening-info` | never a work item |
 
 `missing-cleanup` jumps to "soon" when the effect subscribes, opens a socket or

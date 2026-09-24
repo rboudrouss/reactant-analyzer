@@ -119,7 +119,7 @@ Worker. Types ship with the package.
 `stale-closure`, `frozen-initial-state`, `state-mutation`,
 `unstable-context-value`, `setter-in-render`, `cross-setter-in-render`,
 `missing-cleanup`, `redundant-set-state`, `unnecessary-rerender`, `lazy-init`,
-`server-component-hook`, plus `missing-deps`, `always-unstable-deps` and
+`state-lifted-too-high`, `wasted-subtree-render`, `server-component-hook`, plus `missing-deps`, `always-unstable-deps` and
 `conditional-hook`, which overlap with ESLint but fire through helpers and
 cross-file custom hooks too.
 

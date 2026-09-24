@@ -243,6 +243,72 @@ impl RuleConfig {
     pub fn option(&self, key: &str) -> Option<&serde_json::Value> {
         self.options.get(key)
     }
+
+    /// An unsigned-integer option, or the spec's default. The registry
+    /// validated the value against the rule's [`OptionSpec`] before any rule
+    /// ran, so a present value is always in range here.
+    pub fn uint(&self, spec: &OptionSpec) -> u64 {
+        let OptionKind::UInt { default, .. } = spec.kind else {
+            unreachable!("`uint` on a non-integer option `{}`", spec.name)
+        };
+        self.options
+            .get(spec.name)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(default)
+    }
+
+    /// A boolean option, or the spec's default.
+    pub fn flag(&self, spec: &OptionSpec) -> bool {
+        let OptionKind::Bool { default } = spec.kind else {
+            unreachable!("`flag` on a non-boolean option `{}`", spec.name)
+        };
+        self.options
+            .get(spec.name)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(default)
+    }
+}
+
+/// One option a built-in rule accepts, declared by [`crate::rules::Rule::options`].
+/// The registry validates every configured value against it, loudly, before
+/// the analysis runs: an option that is misspelled or out of range is a
+/// usage error, never a silently ignored setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptionSpec {
+    pub name: &'static str,
+    pub kind: OptionKind,
+    /// One line, shown by `reactant explain`.
+    pub doc: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionKind {
+    UInt { default: u64, min: u64, max: u64 },
+    Bool { default: bool },
+}
+
+impl OptionSpec {
+    /// `Err(expected)` when `value` does not fit the spec.
+    pub fn check(&self, value: &serde_json::Value) -> Result<(), String> {
+        match self.kind {
+            OptionKind::UInt { min, max, .. } => match value.as_u64() {
+                Some(n) if (min..=max).contains(&n) => Ok(()),
+                _ => Err(format!("an integer between {min} and {max}")),
+            },
+            OptionKind::Bool { .. } => match value.as_bool() {
+                Some(_) => Ok(()),
+                None => Err("`true` or `false`".to_string()),
+            },
+        }
+    }
+
+    /// The default, as the user would write it.
+    pub fn default_text(&self) -> String {
+        match self.kind {
+            OptionKind::UInt { default, .. } => default.to_string(),
+            OptionKind::Bool { default } => default.to_string(),
+        }
+    }
 }
 
 /// The single object a rule's `check`/`safe_check` binds to: the program result,
@@ -261,7 +327,7 @@ pub struct RuleCtx<'a> {
 /// one-off ctx (single-component callers, tests).
 enum CacheRef<'a> {
     Shared(&'a ProgramCache<'a>),
-    Own(ProgramCache<'a>),
+    Own(Box<ProgramCache<'a>>),
 }
 
 impl<'a> CacheRef<'a> {
@@ -291,7 +357,11 @@ impl<'a> RuleCtx<'a> {
         component: ComponentId,
         config: RuleConfig,
     ) -> Self {
-        Self::build(CacheRef::Own(ProgramCache::new(program)), component, config)
+        Self::build(
+            CacheRef::Own(Box::new(ProgramCache::new(program))),
+            component,
+            config,
+        )
     }
 
     /// The dispatcher's constructor: every component of a program binds to the

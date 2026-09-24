@@ -661,6 +661,20 @@ pub fn run_explain(registry: &RuleRegistry, rule: &str, color: bool) -> CheckOut
             }
             let _ = writeln!(out, "{}Fix:{}", p.bold, p.reset);
             let _ = writeln!(out, "  {}", doc.fix);
+            let options = registry.options_of(rule);
+            if !options.is_empty() {
+                let _ = writeln!(out);
+                let _ = writeln!(out, "{}Options:{}", p.bold, p.reset);
+                for o in options {
+                    let _ = writeln!(
+                        out,
+                        "  {} (default {}): {}",
+                        o.name,
+                        o.default_text(),
+                        o.doc
+                    );
+                }
+            }
             CheckOutput {
                 stdout: out,
                 stderr: String::new(),

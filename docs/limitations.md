@@ -75,6 +75,15 @@ that writes it (see *Cross-file limits*).
   *truthy* values keeps the child mounted (`if (!data) return <Spinner/>` over refetched data), and
   an object `key` stringifies to a constant. The finding is downgraded, never deleted. The residual
   family, a caller that always remounts with a `key`, is [#136](https://github.com/rboudrouss/reactant-analyzer/issues/136).
+- **Render cascades stop at what the analysis cannot see into.** `state-lifted-too-high` and
+  `wasted-subtree-render` ([ADR-041](adr/ADR-041-render-dependence.md)) treat an element whose
+  component does not resolve as a use, and never count it as wasted. That covers a library
+  component, a `memo`/`forwardRef` wrapper [#64](https://github.com/rboudrouss/reactant-analyzer/issues/64)
+  and a context provider. So a state lifted above a `memo` child, or a heavy `memo`-less library
+  subtree next to a fast input, goes unreported. Context values are not modelled, so a cascade that
+  runs through a context is not followed either [#145](https://github.com/rboudrouss/reactant-analyzer/issues/145).
+  `wasted-subtree-render` counts only the owner's own writes: a setter passed down and called by a
+  child is not a trigger of the owner [#146](https://github.com/rboudrouss/reactant-analyzer/issues/146).
 
 ## Why reactant may warn wrongly (false positives)
 
@@ -163,6 +172,18 @@ carries an Error.
 - **`same_tick`** reads mutually exclusive branch writes as co-executing once they sit in an inlined
   local helper, so a rule quantifying over same-tick writes fires on an if/else chain that can only
   take one arm [#123](https://github.com/rboudrouss/reactant-analyzer/issues/123).
+- **Render dependence assumes two things it does not prove**
+  ([ADR-041](adr/ADR-041-render-dependence.md) §2). A call bound to a variable is taken to depend
+  only on its callee and arguments, and a module-level mutable binding is not a render input. A
+  render that reads such a binding can therefore be reported as unaffected by a write that in fact
+  changes it [#147](https://github.com/rboudrouss/reactant-analyzer/issues/147).
+- **Trigger frequency is a ranking, not a proof.** `wasted-subtree-render` files an event as
+  continuous from its name, the host element and its literal `type`, or, for a handler on a
+  component element, a hint in the component's name (`Input`, `Textarea`, `Slider`…). A state that
+  holds only a few primitive values re-renders at the rate of its transitions, so it is filed as
+  discrete however often it is written. A misfiled trigger changes whether a finding is shown by
+  default (`continuousOnly`), never what the finding claims
+  [#148](https://github.com/rboudrouss/reactant-analyzer/issues/148).
 - **The assurance channel** (`verified:` lines under `--info`) is withheld per component rather than
   per (limit kind, check), so an unanalysed *child* costs the parent guarantees about its own body
   [#31](https://github.com/rboudrouss/reactant-analyzer/issues/31). This affects `--info` output only, never a diagnostic and never the exit code.

@@ -292,6 +292,45 @@ pub fn resolve_overrides(
     overrides
 }
 
+/// One `--rule-option <rule>:<key>=<value>` argument, parsed. The value is
+/// read as JSON when it parses as JSON (`3`, `true`) and as a string
+/// otherwise, so the registry validates it exactly like a config value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuleOptionArg {
+    pub rule: String,
+    pub key: String,
+    pub value: serde_json::Value,
+}
+
+pub fn parse_rule_option(arg: &str) -> Result<RuleOptionArg, String> {
+    let expected = || format!("`--rule-option {arg}`: expected `<rule>:<key>=<value>`");
+    let (rule, rest) = arg.split_once(':').ok_or_else(expected)?;
+    let (key, value) = rest.split_once('=').ok_or_else(expected)?;
+    if rule.is_empty() || key.is_empty() {
+        return Err(expected());
+    }
+    let value = serde_json::from_str(value)
+        .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
+    Ok(RuleOptionArg {
+        rule: rule.to_string(),
+        key: key.to_string(),
+        value,
+    })
+}
+
+/// Lay CLI rule options over the resolved overrides: a CLI value beats the
+/// config value of the same key, other config keys stay.
+pub fn apply_rule_options(overrides: &mut crate::rules::RuleOverrides, args: &[RuleOptionArg]) {
+    for a in args {
+        overrides
+            .entries
+            .entry(a.rule.clone())
+            .or_default()
+            .options
+            .insert(a.key.clone(), a.value.clone());
+    }
+}
+
 /// `<root>/reactant.config.json` when it exists — the same root-marker
 /// contract as `vite.config.*`/tsconfig detection: no upward walk, no cwd
 /// fallback (an explicit `--config <path>` covers every other layout).

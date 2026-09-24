@@ -216,6 +216,12 @@ fn to_json_note<'a>(
         Step::Mutate { target } => j.what = Some(target),
         Step::Capture { what } => j.what = Some(what),
         Step::InitOnce { slot } => j.slot = Some(*slot),
+        // The props that carry the value are named in the message.
+        Step::Forward { from, to, .. } => {
+            j.from = Some(from);
+            j.to = Some(to);
+        }
+        Step::Rerender { component, .. } => j.what = Some(component),
     }
     j
 }

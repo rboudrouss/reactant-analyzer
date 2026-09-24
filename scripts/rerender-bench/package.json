@@ -1,0 +1,8 @@
+{
+  "name": "rerender-bench",
+  "private": true,
+  "type": "module",
+  "description": "Runtime oracle for the render-cascade campaign: counts renders per component during an interaction",
+  "scripts": { "bench": "for f in scenarios/*.tsx; do node run.mjs $f; done" },
+  "dependencies": { "esbuild": "^0.28.2", "jsdom": "^30.1.1", "react": "^19.3.0", "react-dom": "^19.3.0" }
+}

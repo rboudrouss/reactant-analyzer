@@ -67,6 +67,8 @@ Most of these have no ESLint counterpart.
 | `frozen-initial-state` | `useState` is seeded from a prop that later changes, so the state sticks at the first value |
 | `state-mutation` | a state or prop object is mutated in place, so the reference never changes and React skips the re-render |
 | `unstable-context-value` | a provider hands consumers a new object every render |
+| `state-lifted-too-high` | a state is used only deep in one child subtree, so every component above it re-renders to pass it down |
+| `wasted-subtree-render` | typing, scrolling or pointer motion writes a state and re-renders siblings that do not depend on it |
 | `setter-in-render`, `cross-setter-in-render` | `setState` runs during the render body, directly or through a prop |
 | `missing-cleanup` | an effect starts something long-lived and returns no teardown |
 | `redundant-set-state` | `setState` is called with the value the state already holds |

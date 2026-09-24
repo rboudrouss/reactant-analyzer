@@ -82,6 +82,11 @@ pub struct CheckArgs {
     #[arg(long)]
     pub ignore_rule: Vec<String>,
 
+    /// Set a rule option, `<rule>:<key>=<value>` (repeatable; beats the
+    /// config; `reactant explain <rule>` lists the options a rule accepts)
+    #[arg(long, value_name = "RULE:KEY=VALUE")]
+    pub rule_option: Vec<String>,
+
     /// Disable ANSI colors (also honored: NO_COLOR env, non-tty stdout)
     #[arg(long)]
     pub no_color: bool,
@@ -140,7 +145,18 @@ pub fn run(mut args: CheckArgs) -> i32 {
         }),
     };
     partial.merge(&cfg);
-    let overrides = reactant::config::resolve_overrides(&cfg, &args.rule, &args.ignore_rule);
+    let mut overrides = reactant::config::resolve_overrides(&cfg, &args.rule, &args.ignore_rule);
+    let mut rule_options = Vec::new();
+    for arg in &args.rule_option {
+        match reactant::config::parse_rule_option(arg) {
+            Ok(o) => rule_options.push(o),
+            Err(err) => {
+                eprintln!("[error] {err}");
+                return EXIT_USAGE;
+            }
+        }
+    }
+    reactant::config::apply_rule_options(&mut overrides, &rule_options);
     if let Err(err) = registry.set_overrides(overrides) {
         eprintln!("[error] {err}");
         return EXIT_USAGE;

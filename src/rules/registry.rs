@@ -66,9 +66,12 @@ pub struct ComponentFindings {
 pub enum RegistryError {
     /// Override key matches no known diagnostic name.
     UnknownRule(String),
-    /// Options addressed to a native rule — natives declare no params in v1
-    /// (ADR-022 §4).
+    /// Options addressed to a native rule that declares none.
     OptionsOnNative(String),
+    /// An option the native rule does not declare: `(rule, key, declared)`.
+    UnknownOption(String, String, Vec<&'static str>),
+    /// An option value outside its spec: `(rule, key, expected)`.
+    InvalidOption(String, String, String),
     /// Options addressed to a diagnostic-only name (e.g.
     /// `cross-setter-in-render`), which is not a rule id.
     OptionsOnDiagnosticOnly(String),
@@ -88,6 +91,18 @@ impl std::fmt::Display for RegistryError {
             ),
             RegistryError::OptionsOnNative(n) => {
                 write!(f, "rule `{n}` is built-in and declares no options")
+            }
+            RegistryError::UnknownOption(n, k, declared) => write!(
+                f,
+                "rule `{n}` has no option `{k}`. It accepts: {}",
+                declared
+                    .iter()
+                    .map(|d| format!("`{d}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            RegistryError::InvalidOption(n, k, expected) => {
+                write!(f, "option `{k}` of rule `{n}` must be {expected}")
             }
             RegistryError::OptionsOnDiagnosticOnly(n) => write!(
                 f,
@@ -150,11 +165,26 @@ impl RuleRegistry {
                 return Err(RegistryError::UnknownRule(name.clone()));
             }
             if !entry.options.is_empty() {
-                if !self.rules.iter().any(|r| r.name() == name) {
+                let Some(rule) = self.rules.iter().find(|r| r.name() == name) else {
                     return Err(RegistryError::OptionsOnDiagnosticOnly(name.clone()));
-                }
+                };
                 if !name.contains('/') {
-                    return Err(RegistryError::OptionsOnNative(name.clone()));
+                    let specs = rule.options();
+                    if specs.is_empty() {
+                        return Err(RegistryError::OptionsOnNative(name.clone()));
+                    }
+                    for (key, value) in &entry.options {
+                        let Some(spec) = specs.iter().find(|s| s.name == key) else {
+                            return Err(RegistryError::UnknownOption(
+                                name.clone(),
+                                key.clone(),
+                                specs.iter().map(|s| s.name).collect(),
+                            ));
+                        };
+                        spec.check(value).map_err(|expected| {
+                            RegistryError::InvalidOption(name.clone(), key.clone(), expected)
+                        })?;
+                    }
                 }
             }
         }
@@ -167,6 +197,16 @@ impl RuleRegistry {
         }
         self.overrides = overrides;
         Ok(())
+    }
+
+    /// The options a registered built-in rule declares (empty for a pack rule,
+    /// a diagnostic-only name, or an unknown name).
+    pub fn options_of(&self, name: &str) -> &'static [super::OptionSpec] {
+        self.rules
+            .iter()
+            .find(|r| r.name() == name)
+            .map(|r| r.options())
+            .unwrap_or(&[])
     }
 
     pub fn doc(&self, name: &str) -> Option<&RuleDoc> {

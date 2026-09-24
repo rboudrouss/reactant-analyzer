@@ -111,6 +111,21 @@ pub enum Step {
     /// `useState`/`useRef` evaluate their initializer on the first render
     /// only — later renders ignore it.
     InitOnce { slot: HookLabel },
+    /// A component hands the value down to a child element without using it.
+    /// `from`/`to` are component display names, `props` the props that carry
+    /// it (empty: through a spread).
+    Forward {
+        from: String,
+        to: String,
+        props: Vec<String>,
+    },
+    /// An element re-renders with its parent although none of its inputs
+    /// changed. `renders` is a lower bound on the component renders it costs.
+    Rerender {
+        component: String,
+        renders: usize,
+        list: bool,
+    },
 }
 
 impl Step {
@@ -129,6 +144,8 @@ impl Step {
             Step::Mutate { .. } => "mutate",
             Step::Capture { .. } => "capture",
             Step::InitOnce { .. } => "init-once",
+            Step::Forward { .. } => "forward",
+            Step::Rerender { .. } => "rerender",
         }
     }
 
@@ -214,6 +231,29 @@ impl Step {
                  ignore it",
                 name(*slot)
             ),
+            Step::Forward { from, to, props } => {
+                let via = if props.is_empty() {
+                    "through a spread".to_string()
+                } else {
+                    let names: Vec<String> = props.iter().map(|p| format!("`{p}`")).collect();
+                    format!("as {}", names.join(", "))
+                };
+                format!("`{from}` passes it to `<{to}>` {via} without using it itself")
+            }
+            Step::Rerender {
+                component,
+                renders,
+                list,
+            } => {
+                let cost = match (renders, list) {
+                    (1, false) => "1 component render".to_string(),
+                    (n, false) => format!("{n} component renders"),
+                    (n, true) => format!("at least {n} component renders, including a list"),
+                };
+                format!(
+                    "`<{component}>` re-renders ({cost}) although none of its props depends on it"
+                )
+            }
         }
     }
 }

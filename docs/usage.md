@@ -49,6 +49,7 @@ reactant check src/ --ignore-rule lazy-init      # all but this one
 | `--project auto\|vite\|next\|plain` | Project-kind handling. `auto` (default) detects from marker files; `vite`/`next` force those conventions; `plain` disables detection. |
 | `--rule <name>` | Only report this diagnostic (repeatable). An unknown name exits with code 2. |
 | `--ignore-rule <name>` | Suppress this diagnostic (repeatable). |
+| `--rule-option <rule>:<key>=<value>` | Set an option of a rule (repeatable), e.g. `--rule-option state-lifted-too-high:minDepth=2`. Beats the config's value for the same key. `reactant explain <rule>` lists what a rule accepts; an unknown key or an out-of-range value exits with code 2. |
 | `--info` | Also display `Info` diagnostics (known analysis limits: widening, recursion cutoff, unknown hooks; and patterns that look intentional: a seed-once prop name, a cheap pure initializer), plus, per shown component, the applicable checks that ran and found nothing (`verified: …`) or, where the analysis was truncated, the count withheld (`suspended: …`). See [The assurance channel](#the-assurance-channel---info). |
 | `--show-clean` | Show components with no findings (hidden by default). Without it, a trailing note reports how many clean components were hidden. |
 | `--trace` | Show each finding's witness chain (ADR-019): typed `→` steps explaining why the rule fired (e.g. `` `loadPrefs` resolves to an import from ./prefs.ts `` → `` `fetch` has side effects ``). Steps pointing into another file (cross-file inlining) show `file:line:col`. Capped at 8 steps (`… n more step(s)`). Hidden by default; a finding with steps shows a `(N trace step(s), rerun with --trace)` hint instead. `json` output always includes the chain. |
@@ -105,8 +106,14 @@ degrades to defaults. CLI flags beat config values.
   fallback `pack.json`) or paths relative to the config file. Pack rules are
   addressed `pack/rule`, work with `--rule`/`--ignore-rule`/`rules`/`explain`,
   and their Errors gate `--fail-on` exactly like native ones.
-- `options` are validated against the params the pack rule declares
-  (an unknown key or a type mismatch exits with code 2).
+- `options` are validated against the params the rule declares
+  (an unknown key or a type mismatch exits with code 2). A built-in rule
+  accepts only the options `reactant explain <rule>` lists; today that is
+  `state-lifted-too-high` (`minDepth`, `minWastedRenders`):
+
+  ```jsonc
+  "rules": { "state-lifted-too-high": { "options": { "minDepth": 2 } } }
+  ```
 
 ## Rule packs (Tier A)
 
