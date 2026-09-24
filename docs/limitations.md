@@ -181,8 +181,9 @@ carries an Error.
 - **Trigger frequency is a ranking, not a proof.** `wasted-subtree-render` files an event as
   continuous from its name and the host element the handler lands on, with its literal `type`,
   followed down through the components it is handed to. For an element the analysis cannot see
-  into, a hint in the component's name stands in (`Input`, `Textarea`, `Slider`…). A `keydown`
-  handler that writes only on one key is still filed as typing. A state that
+  into, a hint in the component's name stands in (`Input`, `Textarea`, `Slider`…). A key
+  handler that writes only behind a test of its event (`if (e.key === "Enter")`) is filed as
+  discrete, whatever the test picks out (`if (e.shiftKey)` too). A state that
   holds only a few primitive values re-renders at the rate of its transitions, so it is filed as
   discrete however often it is written. A misfiled trigger changes whether a finding is shown by
   default (`continuousOnly`), never what the finding claims

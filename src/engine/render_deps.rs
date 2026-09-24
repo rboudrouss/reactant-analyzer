@@ -38,7 +38,7 @@ use crate::engine::{AnalysisResult, HookKind};
 use crate::ir::{
     cfg::{CFG, Terminator},
     expr::{CompOrigin, Expr, Prim, SPREAD_KEY_PREFIX},
-    free_vars::compute_free_vars,
+    free_vars::{collect_used_vars, compute_free_vars},
     hooks::HookEntry,
     source_range::SourceRange,
     stmt::{MemberKey, Stmt},
@@ -71,20 +71,25 @@ pub enum Source {
 pub struct Deps {
     pub top: bool,
     pub set: BTreeSet<Source>,
+    /// The part of `set` a function value reaches, when called, only behind
+    /// a test of its own arguments (`e => { if (e.key === "Enter") f() }`
+    /// has `f` here). A must-fact: one ungated contributor takes a source
+    /// out.
+    pub gated: BTreeSet<Source>,
 }
 
 impl Deps {
     pub fn one(s: Source) -> Self {
         Deps {
-            top: false,
             set: BTreeSet::from([s]),
+            ..Deps::default()
         }
     }
 
     pub fn top() -> Self {
         Deps {
             top: true,
-            set: BTreeSet::new(),
+            ..Deps::default()
         }
     }
 
@@ -94,29 +99,54 @@ impl Deps {
 
     pub fn union_with(&mut self, other: &Deps) {
         self.top |= other.top;
-        if !self.top {
-            self.set.extend(other.set.iter().cloned());
-        } else {
+        if self.top {
             self.set.clear();
+            self.gated.clear();
+            return;
         }
+        let ungated: BTreeSet<Source> = self
+            .set
+            .difference(&self.gated)
+            .chain(other.set.difference(&other.gated))
+            .cloned()
+            .collect();
+        self.gated.extend(other.gated.iter().cloned());
+        self.gated.retain(|s| !ungated.contains(s));
+        self.set.extend(other.set.iter().cloned());
+    }
+
+    /// The same sources, none of them gated: the value is no longer the
+    /// function whose calls the gating described.
+    fn ungated(mut self) -> Self {
+        self.gated.clear();
+        self
     }
 
     /// `true` when a value with these deps may be affected by `rel`: they share
     /// a source, either side is ⊤, or one side depends on the whole props
     /// object while the other names a prop.
     pub fn touches(&self, rel: &Relevance) -> bool {
-        if self.top {
-            return true;
-        }
-        match rel {
-            Relevance::All => self
-                .set
-                .iter()
-                .any(|s| matches!(s, Source::Prop(_) | Source::AllProps)),
-            Relevance::Sources(r) => self.set.iter().any(|s| {
-                r.contains(s)
-                    || (*s == Source::AllProps && r.iter().any(|x| matches!(x, Source::Prop(_))))
-            }),
+        self.top || self.set.iter().any(|s| source_touches(s, rel))
+    }
+
+    /// `true` when every source of `rel` these deps carry is gated: calling
+    /// the value reaches `rel` only behind a test of the call's arguments.
+    pub fn gated_for(&self, rel: &Relevance) -> bool {
+        let mut hit = self
+            .set
+            .iter()
+            .filter(|s| source_touches(s, rel))
+            .peekable();
+        !self.top && hit.peek().is_some() && hit.all(|s| self.gated.contains(s))
+    }
+}
+
+fn source_touches(s: &Source, rel: &Relevance) -> bool {
+    match rel {
+        Relevance::All => matches!(s, Source::Prop(_) | Source::AllProps),
+        Relevance::Sources(r) => {
+            r.contains(s)
+                || (*s == Source::AllProps && r.iter().any(|x| matches!(x, Source::Prop(_))))
         }
     }
 }
@@ -278,6 +308,7 @@ pub fn render_deps(result: &AnalysisResult<impl AbstractDomain>) -> RenderDeps {
         out: RenderDeps::default(),
         top: false,
         free: Default::default(),
+        gated: Default::default(),
     };
     let mut entry = Env::new();
     entry.insert(
@@ -343,6 +374,8 @@ struct Analyzer<'a> {
     /// Free variables per body, by address: a body is evaluated once per
     /// fixpoint round, and bodies are shared (`Arc`) across splices.
     free: std::cell::RefCell<HashMap<usize, Arc<HashSet<Var>>>>,
+    /// [`param_gated_vars`] per body, by address, for the same reason.
+    gated: std::cell::RefCell<HashMap<usize, Arc<HashSet<Var>>>>,
 }
 
 struct Run {
@@ -368,6 +401,30 @@ impl<'a> Analyzer<'a> {
         let f = Arc::new(compute_free_vars(body));
         self.free.borrow_mut().insert(key, f.clone());
         f
+    }
+
+    /// A function value: what its body captures, with the captures it reaches
+    /// only behind a test of `params` gated.
+    fn closure(&self, params: &[Var], body: &CFG, env: &Env) -> Deps {
+        let key = body as *const CFG as usize;
+        let cached = self.gated.borrow().get(&key).cloned();
+        let behind = cached.unwrap_or_else(|| {
+            let g = Arc::new(param_gated_vars(params, body));
+            self.gated.borrow_mut().insert(key, g.clone());
+            g
+        });
+        let mut d = Deps::default();
+        for v in self.free_vars(body).iter() {
+            if params.contains(v) {
+                continue;
+            }
+            let mut c = self.var(env, v).deps;
+            if behind.contains(v) {
+                c.gated = c.set.clone();
+            }
+            d.union_with(&c);
+        }
+        d
     }
 
     fn var(&self, env: &Env, v: &Var) -> DVal {
@@ -555,11 +612,7 @@ impl<'a> Analyzer<'a> {
                         params,
                         ..
                     }) => {
-                        for v in self.free_vars(body_cfg).iter() {
-                            if !params.contains(v) {
-                                d.union_with(&self.var(env, v).deps);
-                            }
-                        }
+                        d = self.closure(params, body_cfg, env);
                         for e in deps.list().map(|l| l.elems.as_slice()).unwrap_or(&[]) {
                             d.union_with(&self.eval(e, env).deps);
                         }
@@ -570,15 +623,7 @@ impl<'a> Analyzer<'a> {
             }
             Expr::FnLit {
                 params, body_cfg, ..
-            } => {
-                let mut d = Deps::default();
-                for v in self.free_vars(body_cfg).iter() {
-                    if !params.contains(v) {
-                        d.union_with(&self.var(env, v).deps);
-                    }
-                }
-                DVal::of(d)
-            }
+            } => DVal::of(self.closure(params, body_cfg, env)),
             Expr::FieldAccess { obj, field } => {
                 let base = self.eval(obj, env);
                 match &base.shape {
@@ -604,9 +649,9 @@ impl<'a> Analyzer<'a> {
                 DVal::of(self.eval(arg, env).deps)
             }
             Expr::Call { fn_, args } => {
-                let mut d = self.eval(fn_, env).deps;
+                let mut d = self.eval(fn_, env).deps.ungated();
                 for a in args {
-                    d.union_with(&self.eval(a, env).deps);
+                    d.union_with(&self.eval(a, env).deps.ungated());
                 }
                 DVal::of(d)
             }
@@ -821,6 +866,73 @@ fn root_var(e: &Expr) -> Option<Var> {
         Expr::FieldAccess { obj, .. } | Expr::IndexAccess { arr: obj, .. } => root_var(obj),
         _ => None,
     }
+}
+
+/// The free variables a function body reaches only behind a test of its own
+/// parameters: `e => { if (e.key !== "Enter") return; submit(v) }` gives
+/// `submit`. A use in a nested closure counts where the closure is built.
+pub(crate) fn param_gated_vars(params: &[Var], body: &CFG) -> HashSet<Var> {
+    let controllers = controlling_branches(body);
+    let uses = |e: &Expr, tainted: &HashSet<Var>| {
+        let mut u = HashSet::new();
+        collect_used_vars(e, &mut u);
+        u.iter().any(|v| tainted.contains(v))
+    };
+    // What the parameters flow into, and the blocks a test of them controls.
+    let mut tainted: HashSet<Var> = params.iter().cloned().collect();
+    let behind = |b: &BlockId, tainted: &HashSet<Var>| {
+        controllers.get(b).into_iter().flatten().any(|br| {
+            matches!(body.blocks.get(br).map(|x| &x.term),
+                Some(Terminator::Branch { cond, .. }) if uses(cond, tainted))
+        })
+    };
+    loop {
+        let before = tainted.len();
+        for (b, block) in &body.blocks {
+            let under = behind(b, &tainted);
+            for stmt in &block.stmts {
+                if let Stmt::Let { var, rhs, .. } | Stmt::Assign { var, rhs, .. } = stmt
+                    && (under || uses(rhs, &tainted))
+                {
+                    tainted.insert(var.clone());
+                }
+            }
+        }
+        if tainted.len() == before {
+            break;
+        }
+    }
+    let mut gated = HashSet::new();
+    let mut open = HashSet::new();
+    for (b, block) in &body.blocks {
+        let out = if behind(b, &tainted) {
+            &mut gated
+        } else {
+            &mut open
+        };
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => collect_used_vars(rhs, out),
+                Stmt::ExprStmt(e, _) => collect_used_vars(e, out),
+                Stmt::MemberWrite { obj, key, rhs, .. } => {
+                    collect_used_vars(obj, out);
+                    collect_used_vars(rhs, out);
+                    if let MemberKey::Index(i) = key {
+                        collect_used_vars(i, out);
+                    }
+                }
+            }
+        }
+        match &block.term {
+            Terminator::Return(e) | Terminator::Branch { cond: e, .. } => collect_used_vars(e, out),
+            _ => {}
+        }
+    }
+    let free = compute_free_vars(body);
+    gated
+        .into_iter()
+        .filter(|v| !open.contains(v) && free.contains(v) && !params.contains(v))
+        .collect()
 }
 
 /// For every block, the branch blocks that control it: exactly one side of the

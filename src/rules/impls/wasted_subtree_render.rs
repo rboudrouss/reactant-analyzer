@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use crate::engine::WriterRegion;
+use crate::engine::render_deps::param_gated_vars;
 use crate::ir::free_vars::compute_free_vars;
 use crate::ir::hooks::HookEntry;
 use crate::ir::{ComponentId, HookLabel, SourceRange, expr::Expr};
@@ -99,7 +100,7 @@ impl Rule for WastedSubtreeRender {
         // setter was handed to: either way the write re-renders the owner.
         for &slot in &states {
             for l in index.landings(owner, slot, program) {
-                let f = event_frequency(&l.event, Some(&l.target));
+                let f = event_frequency(&l.event, Some(&l.target), l.keyed);
                 let events =
                     BTreeSet::from([(l.event.to_ascii_lowercase(), f == Frequency::Continuous)]);
                 let elsewhere = l.component != owner;
@@ -132,7 +133,7 @@ impl Rule for WastedSubtreeRender {
                 .filter(|r| r.effect == e && may_call(&r.callback, &w.setter))
                 .map(|r| {
                     let ev = r.event.clone().unwrap_or_else(|| r.registrar.to_string());
-                    let f = event_frequency(&ev, None);
+                    let f = event_frequency(&ev, None, keyed_call(&r.callback, &w.setter));
                     (ev.to_ascii_lowercase(), f == Frequency::Continuous)
                 })
                 .collect();
@@ -297,5 +298,16 @@ fn may_call(callback: &Expr, setter: &str) -> bool {
     match callback.peel_ts() {
         Expr::FnLit { body_cfg, .. } => compute_free_vars(body_cfg).contains(setter),
         _ => true,
+    }
+}
+
+/// Whether a registered callback calls `setter` only behind a test of its
+/// event argument.
+fn keyed_call(callback: &Expr, setter: &str) -> bool {
+    match callback.peel_ts() {
+        Expr::FnLit {
+            params, body_cfg, ..
+        } => param_gated_vars(params, body_cfg).contains(setter),
+        _ => false,
     }
 }

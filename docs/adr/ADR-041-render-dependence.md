@@ -108,14 +108,13 @@ a team's call, not the analyzer's.
   - a component-name hint for an `onX` prop of an element the analysis
     cannot see into.
 
-  A miss files a trigger as discrete. It never changes a proof.
+  A key event whose write every hop reaches only behind a test of the event
+  argument is discrete: `Deps::gated` records, for a function value, the
+  captures its body reaches only under such a test (#148). A miss files a
+  trigger as discrete. It never changes a proof.
 - `MountIndex` reads its guard slots from `ElementSite::guard`, which
   retired its syntactic `StateVal` scan (#149).
 - Still to do, as issues:
   - context values as a `Context` source (#145);
   - the two stated assumptions (#147);
-  - a write guarded by a test of the event argument (#148);
   - #64 (`memo`), which turns today's opaque `memo` elements into barriers.
-
-  The committed corpus baseline still has to be regenerated from a
-  whole-corpus run (#150).

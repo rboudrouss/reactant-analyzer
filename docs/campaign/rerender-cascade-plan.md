@@ -409,14 +409,21 @@ The limits recorded in `docs/limitations.md`:
 - #145: cascades through a context value (plan M5).
 - #146 (done): a setter called by a child as a trigger of the owner.
 - #147: the two stated assumptions of render dependence.
-- #148: trigger frequency from the event name. The host element a handler
-  lands on is now followed down the tree; a write guarded by a test of the
-  event argument is still filed by the event's name.
+- #148 (done): trigger frequency from the event name. The host element a
+  handler lands on is followed down the tree, and a key handler that writes
+  only behind a test of its event is discrete.
 
 The other work left:
 - #149 (done): `MountIndex` onto render dependence.
-- #150: regenerate the corpus baseline.
+- #150 (done): the corpus baseline, from the `corpus` workflow's run.
 - #64: `memo` as a barrier.
+
+### Corpus effect of the key test (#148, 2026-09-24, per repo)
+
+Only `wasted-subtree-render` moves: 7 findings removed, none added (dub 4,
+memos 2, twenty 1). All seven are `keydown` handlers that write behind a key
+test, such as Enter to send in dub's support chat or Enter to add a tag in
+memos. Now discrete, they are hidden by `continuousOnly`.
 
 ### Corpus effect of #146, #148 and #149 (2026-09-24, per repo)
 

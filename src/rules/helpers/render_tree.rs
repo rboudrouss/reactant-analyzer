@@ -84,6 +84,9 @@ pub(in crate::rules) struct Landing {
     /// The owner's element the capability leaves through (`None`: it lands
     /// in the owner's own output).
     pub via: Option<SourceRange>,
+    /// Some hop on the way calls the capability only behind a test of its
+    /// event argument (`if (e.key === "Enter")`).
+    pub keyed: bool,
 }
 
 struct UseTree {
@@ -289,7 +292,16 @@ impl RenderIndex {
         let rel = Relevance::Sources(BTreeSet::from([Source::Setter(label)]));
         let mut out = Vec::new();
         let mut visiting = HashSet::from([owner]);
-        self.land(owner, &rel, None, program, &mut visiting, 0, &mut out);
+        self.land(
+            owner,
+            &rel,
+            None,
+            false,
+            program,
+            &mut visiting,
+            0,
+            &mut out,
+        );
         out
     }
 
@@ -299,6 +311,7 @@ impl RenderIndex {
         comp: ComponentId,
         rel: &Relevance,
         via: Option<SourceRange>,
+        keyed: bool,
         program: &ProgramAnalysisResult,
         visiting: &mut HashSet<ComponentId>,
         depth: usize,
@@ -323,34 +336,47 @@ impl RenderIndex {
                     .map(|p| prop_to_event(p))
                     .collect(),
             };
+            let keyed = keyed || h.deps.gated_for(rel);
             out.extend(events.into_iter().map(|event| Landing {
                 component: comp,
                 event,
                 target: host(h),
                 span: h.span,
                 via,
+                keyed,
             }));
         }
         for site in &summary.sites {
             let (props, all) = forwarded(site, rel);
             let via = via.or(site.span);
             let child = resolve(site, program).filter(|_| depth < MAX_DEPTH);
-            let mut descend = |child_rel: Relevance, out: &mut Vec<Landing>| {
+            let mut descend = |child_rel: Relevance, keyed: bool, out: &mut Vec<Landing>| {
                 let Some(child) = child else { return };
                 if visiting.insert(child) {
-                    self.land(child, &child_rel, via, program, visiting, depth + 1, out);
+                    self.land(
+                        child,
+                        &child_rel,
+                        via,
+                        keyed,
+                        program,
+                        visiting,
+                        depth + 1,
+                        out,
+                    );
                     visiting.remove(&child);
                 }
             };
             if all {
-                descend(Relevance::All, out);
+                descend(Relevance::All, keyed || site.spread.gated_for(rel), out);
             }
             // One prop at a time: a prop that lands below must not hide one
             // that does not.
             for p in &props {
+                let keyed = keyed || site.props.iter().any(|(k, d)| k == p && d.gated_for(rel));
                 let before = out.len();
                 descend(
                     Relevance::Sources(BTreeSet::from([Source::Prop(p.clone())])),
+                    keyed,
                     out,
                 );
                 if out.len() == before && is_event_prop(p) {
@@ -362,6 +388,7 @@ impl RenderIndex {
                         },
                         span: site.span,
                         via,
+                        keyed,
                     });
                 }
             }
@@ -525,14 +552,24 @@ const TEXT_COMPONENT_HINTS: &[&str] = &[
     "Input", "TextArea", "Textarea", "Search", "Editor", "Slider",
 ];
 
-/// Frequency of an event dispatched on `target` (see [`handler_target`]);
-/// `None` target: a listener registered in an effect, on an unknown object.
-pub(in crate::rules) fn event_frequency(event: &str, target: Option<&HandlerTarget>) -> Frequency {
+/// Events that name one key, which a handler can pick out.
+const KEY_EVENTS: &[&str] = &["keydown", "keyup", "keypress"];
+
+/// Frequency of an event dispatched on `target`; `None` target: a listener
+/// registered in an effect, on an unknown object. `keyed`: the write sits
+/// behind a test of the event argument, which on a key event picks out a
+/// key, not every keystroke (a `change` behind a test of its value still
+/// writes on most keystrokes).
+pub(in crate::rules) fn event_frequency(
+    event: &str,
+    target: Option<&HandlerTarget>,
+    keyed: bool,
+) -> Frequency {
     let e = event.to_ascii_lowercase();
     if MOTION_EVENTS.contains(&e.as_str()) || e == "setinterval" {
         return Frequency::Continuous;
     }
-    if !TYPING_EVENTS.contains(&e.as_str()) {
+    if !TYPING_EVENTS.contains(&e.as_str()) || (keyed && KEY_EVENTS.contains(&e.as_str())) {
         return Frequency::Discrete;
     }
     let typing = match target {

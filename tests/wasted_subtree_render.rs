@@ -109,6 +109,29 @@ fn a_handler_is_followed_through_rest_spreads() {
     );
 }
 
+/// A key handler that writes only behind a test of its event is discrete,
+/// in the owner, in a child it is handed to, or in an effect's listener; one
+/// that writes on every key is not (#148).
+#[test]
+fn a_write_behind_a_key_test_is_discrete() {
+    let components = |extra: &[&str]| -> Vec<String> {
+        let mut c: Vec<String> = findings("keyed.tsx", extra)
+            .iter()
+            .map(|d| d["component"].as_str().expect("component").to_string())
+            .collect();
+        c.sort();
+        c
+    };
+    assert_eq!(components(&[]), ["KeyLog"]);
+    assert_eq!(
+        components(&[
+            "--rule-option",
+            "wasted-subtree-render:continuousOnly=false",
+        ]),
+        ["Escape", "Handed", "KeyLog", "Submit"]
+    );
+}
+
 /// Clicks, checkbox toggles and drag crossings are discrete: reported only
 /// when asked.
 #[test]
