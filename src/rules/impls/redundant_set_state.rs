@@ -76,6 +76,8 @@ impl Rule for RedundantSetState {
                 .filter(|s| multi.contains(s) || escaping.contains(s))
                 .collect()
         };
+        let state_names = crate::rules::state_val_labels(&result.render_cfg);
+        let name_of = |l: HookLabel| crate::rules::state_slot_name(l, &state_names);
 
         // ── Render body ───────────────────────────────────────────────────────
         for (&block_id, block) in &result.render_cfg.blocks {
@@ -91,6 +93,7 @@ impl Rule for RedundantSetState {
                 &result.memo_store,
                 &mut scratch,
                 &contested,
+                &name_of,
                 &mut diags,
                 &HashSet::new(),
             );
@@ -115,6 +118,7 @@ impl Rule for RedundantSetState {
                     &result.memo_store,
                     &mut scratch,
                     &contested,
+                    &name_of,
                     &mut diags,
                 );
                 if let Some(r) = result.effect_info.get(eff_label).and_then(|i| i.span) {
@@ -142,6 +146,7 @@ fn check_cfg_for_redundant_sets(
     memo: &MemoStore<StateValue>,
     heap: &mut crate::domains::Heap,
     contested: &HashSet<HookLabel>,
+    name_of: &dyn Fn(HookLabel) -> String,
     diags: &mut Vec<Diagnostic>,
 ) {
     let skip_labels = collect_transition_setters(component, cfg, env, state, memo, heap);
@@ -154,6 +159,7 @@ fn check_cfg_for_redundant_sets(
             memo,
             heap,
             contested,
+            name_of,
             diags,
             &skip_labels,
         );
@@ -237,6 +243,7 @@ fn check_setter_calls(
     memo: &MemoStore<StateValue>,
     heap: &mut crate::domains::Heap,
     contested: &HashSet<HookLabel>,
+    name_of: &dyn Fn(HookLabel) -> String,
     diags: &mut Vec<Diagnostic>,
     skip_labels: &HashSet<HookLabel>,
 ) {
@@ -261,9 +268,9 @@ fn check_setter_calls(
                     Diagnostic::warn(
                         "redundant-set-state",
                         format!(
-                            "setState for hook {} called with a stable value \
-                                     when state is already stable update is redundant",
-                            label
+                            "state {} is set to a stable value it already holds, so the update is \
+                             redundant",
+                            name_of(label)
                         ),
                     )
                     .with_label(label)
@@ -276,7 +283,7 @@ fn check_setter_calls(
                         },
                         Some(label),
                         *call_span,
-                        &crate::rules::api::witness::fallback_name,
+                        name_of,
                     ),
                 );
             }

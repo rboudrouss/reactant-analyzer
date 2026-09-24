@@ -160,6 +160,27 @@ export function C() {
 // ── may cycles → Warning ─────────────────────────────────────────────────────
 
 #[test]
+fn nodeps_conditional_fresh_write_is_worded_as_possible() {
+    // The self-edge is a may (the write sits behind `flag`): a Warning, and
+    // the message must not assert the loop the severity does not claim.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ flag }) {
+  const [o, setO] = useState({});
+  useEffect(() => { if (flag) setO({ a: 1 }); });
+  return <div>{o.a}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    let (_, sev, msg) = diags
+        .iter()
+        .find(|(r, _, m)| r == "infinite-loop" && m.contains("no dependency array"))
+        .unwrap_or_else(|| panic!("expected the no-deps self-loop: {diags:?}"));
+    assert_eq!(*sev, Severity::Warning);
+    assert!(msg.contains("possible infinite render loop"), "{msg}");
+}
+
+#[test]
 fn multi_writer_revival_is_warning() {
     // e1's guarded write to `b` would converge alone, but e3 also writes `b`
     // (reviving the guard on the next automatic round) → the convergence

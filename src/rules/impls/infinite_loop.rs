@@ -296,20 +296,35 @@ fn check_multi_effect_cycles(
                 _ => None,
             };
 
+            // The wording follows the proof, not `all_must`: a cross-component
+            // cycle can be all-must and still carry no proof (Warning).
+            let certain = cycle_proof.is_some();
             let to_name = node_display(&e.to, component, result, &mut names);
-            let msg = if cyc.len() == 1 && e.no_deps {
+            let msg = if cyc.len() == 1 && e.no_deps && certain {
                 format!(
                     "this effect has no dependency array and stores a fresh \
                      reference into state {to_name}, so it re-runs after every \
                      render and re-triggers itself: infinite render loop"
                 )
-            } else if cyc.len() == 1 {
+            } else if cyc.len() == 1 && e.no_deps {
+                format!(
+                    "this effect has no dependency array and may store a fresh \
+                     reference into state {to_name}, so it re-runs after every \
+                     render and can re-trigger itself: possible infinite render loop"
+                )
+            } else if cyc.len() == 1 && certain {
                 format!(
                     "this effect stores a fresh reference into state {to_name} \
                      which its own deps react to, so the re-render runs it again: \
                      infinite render loop"
                 )
-            } else if cycle.all_must {
+            } else if cyc.len() == 1 {
+                format!(
+                    "this effect may store a fresh reference into state {to_name} \
+                     which its own deps react to, so the re-render can run it again: \
+                     possible infinite render loop"
+                )
+            } else if certain {
                 format!(
                     "these effects form a state-update cycle ({path}) where each \
                      step stores a fresh reference that re-runs the next \
