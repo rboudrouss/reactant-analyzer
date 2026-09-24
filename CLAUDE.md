@@ -22,8 +22,10 @@ Analyseur statique React (niveau 3, interprétation abstraite) en Rust.
 
 - **Soundness** : l'interprétation abstraite calcule un sur-ensemble des
   comportements. Faux positifs tolérés, faux négatifs INTERDITS.
-- **Niveaux de diagnostic** : Error (certain), Warning (incertain),
-  Info (limitations, derrière `--info`).
+- **Niveaux de diagnostic** : Error (défaut certain dès que le code
+  s'exécute, preuve de *toute* la conclusion, pas d'un seul conjoint),
+  Warning (défaut possible, ou fait certain au coût incertain), Info (limite
+  de l'analyse ou motif qui a l'air voulu, derrière `--info`).
 
 ## Références
 

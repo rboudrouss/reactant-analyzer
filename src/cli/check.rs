@@ -20,7 +20,8 @@ pub struct CheckArgs {
     /// Directories are walked recursively for .ts/.tsx/.js/.jsx files.
     pub paths: Vec<String>,
 
-    /// Show Info diagnostics (analysis limitations) plus, per shown component,
+    /// Show Info diagnostics (analysis limitations, intentional-looking
+    /// patterns) plus, per shown component,
     /// the applicable checks that ran and passed ("verified: …")
     #[arg(long)]
     pub info: bool,

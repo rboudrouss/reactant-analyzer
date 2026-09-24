@@ -46,9 +46,9 @@ Severity tells you how strong the proof is. It says nothing about urgency.
 
 | severity | means | default stance |
 |---|---|---|
-| `error` | the engine certified it on every path, and it can only emit an Error from a proof | true positive. Overturn it only with a concrete counter-example, and that counter-example is an analyzer bug worth reporting |
-| `warning` | "may". Uncertain by construction | verify against the source before acting |
-| `info` | not a defect, a limit of the analysis | never fix. It marks where a *missing* finding is possible |
+| `error` | the engine certified the whole claim: the defect happens whenever the flagged code runs, and an Error can only come from a proof | true positive. Overturn it only with a concrete counter-example, and that counter-example is an analyzer bug worth reporting |
+| `warning` | "may" (uncertain by construction), or a certain fact whose cost is uncertain (a fresh reference, one wasted render) | verify against the source before acting |
+| `info` | not actionable without context. Either a limit of the analysis (`analysis-limit`, `widening-info`, the `infinite-loop` "deps may be too imprecise" note), or a pattern that looks intentional (`frozen-initial-state` on an `initial*` prop or a keyed call site, `lazy-init` on a cheap pure call) | a limit: never fix, it marks where a *missing* finding is possible. An intentional-looking pattern: fix only if the intent turns out to be absent |
 
 Verify a warning by trying to falsify its chain. Each `notes[]` entry makes one
 claim (`binding`, `resolve`, `call`, `write`, `read`, `branch`, `handler`,

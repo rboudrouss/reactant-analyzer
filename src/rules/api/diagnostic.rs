@@ -23,9 +23,13 @@ use super::witness::{Note, Step};
 
 /// Confidence level of a diagnostic.
 ///
-/// - `Error`   violation on ALL execution paths.
-/// - `Warning` possible but uncertain (conditional path or over-approx).
-/// - `Info`    known analysis limitation (widening, depth cap). Hidden by default; show with --info.
+/// - `Error`   the defect is certain whenever the flagged code runs. Built only
+///   from a proof of the whole claim, not of one of its conjuncts (#142).
+/// - `Warning` a possible defect (conditional path, over-approximation), or a
+///   certain fact whose cost is not (a fresh reference, one wasted render).
+/// - `Info`    not actionable without context: a known analysis limitation
+///   (widening, depth cap), or a pattern that looks intentional (a seed-once
+///   prop name, a cheap pure initializer). Hidden by default; show with --info.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Severity {
     Error,
@@ -179,8 +183,8 @@ impl Diagnostic {
         Diagnostic::new(rule, message).with_severity(Severity::Warning)
     }
 
-    /// An Info: a known analysis limitation. Makes no must/may claim; hidden
-    /// unless `--info`.
+    /// An Info: a known analysis limitation, or a pattern that looks
+    /// intentional. Makes no must/may claim; hidden unless `--info`.
     pub fn info(rule: impl Into<Cow<'static, str>>, message: impl Into<String>) -> Self {
         Diagnostic::new(rule, message).with_severity(Severity::Info)
     }
