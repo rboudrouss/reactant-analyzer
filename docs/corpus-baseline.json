@@ -1,6 +1,6 @@
 {
-  "total": 1500,
-  "digest": "25004cf824990a04366c7d91e05d09c6177152a9de70fd48443f05e212bdcebc",
+  "total": 1493,
+  "digest": "9079af6ac932dd3e596df43de1d5e8586290302339295b709a0347b8a2d9c075",
   "by_rule": {
     "always-unstable-deps": 381,
     "conditional-hook": 9,
@@ -19,22 +19,22 @@
     "state-mutation": 15,
     "unnecessary-rerender": 10,
     "unstable-context-value": 51,
-    "wasted-subtree-render": 127
+    "wasted-subtree-render": 120
   },
   "by_repo": {
     "ai-chatbot": 11,
     "bulletproof-react": 3,
     "chakra-ui": 25,
     "commerce": 5,
-    "dub": 537,
+    "dub": 533,
     "excalidraw": 33,
     "mantine": 363,
-    "memos": 59,
+    "memos": 57,
     "next-shadcn-dashboard-starter": 20,
     "novel": 6,
     "precedent": 1,
     "shadcn-admin": 9,
-    "twenty": 425,
+    "twenty": 424,
     "zustand": 3
   },
   "corpus": "00e5fa79fa000c85"
