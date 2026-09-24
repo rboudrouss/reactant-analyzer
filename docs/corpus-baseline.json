@@ -1,6 +1,6 @@
 {
-  "total": 1493,
-  "digest": "9079af6ac932dd3e596df43de1d5e8586290302339295b709a0347b8a2d9c075",
+  "total": 1494,
+  "digest": "d53131f551e08a4aab91435a338b6c22af0980caf226a6f57cadcfc6c275bda2",
   "by_rule": {
     "always-unstable-deps": 381,
     "conditional-hook": 9,
@@ -19,14 +19,14 @@
     "state-mutation": 15,
     "unnecessary-rerender": 10,
     "unstable-context-value": 51,
-    "wasted-subtree-render": 120
+    "wasted-subtree-render": 121
   },
   "by_repo": {
     "ai-chatbot": 11,
     "bulletproof-react": 3,
     "chakra-ui": 25,
     "commerce": 5,
-    "dub": 533,
+    "dub": 534,
     "excalidraw": 33,
     "mantine": 363,
     "memos": 57,
