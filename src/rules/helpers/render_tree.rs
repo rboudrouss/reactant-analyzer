@@ -15,8 +15,11 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::engine::ProgramAnalysisResult;
-use crate::engine::render_deps::{ElementSite, Relevance, RenderDeps, Source, render_deps};
+use crate::engine::render_deps::{
+    Deps, ElementSite, HostHandler, Relevance, RenderDeps, Source, render_deps,
+};
 use crate::ir::{ComponentId, HookLabel, SourceRange, Symbol};
+use crate::lowering::hook_extractor::{is_event_prop, prop_to_event};
 
 /// Depth past which the descent stops (as if the element were opaque).
 const MAX_DEPTH: usize = 64;
@@ -67,6 +70,22 @@ pub(in crate::rules) struct Wasted {
     pub list: bool,
 }
 
+/// Where a write capability (a setter, or a closure calling one) handed
+/// down from an owner is called: an event handler of a host element, or an
+/// event prop of an element the analysis cannot see into.
+#[derive(Debug, Clone)]
+pub(in crate::rules) struct Landing {
+    /// The component whose render builds the element.
+    pub component: ComponentId,
+    pub event: String,
+    pub target: HandlerTarget,
+    /// The handler prop on a host element; the element on an opaque one.
+    pub span: Option<SourceRange>,
+    /// The owner's element the capability leaves through (`None`: it lands
+    /// in the owner's own output).
+    pub via: Option<SourceRange>,
+}
+
 struct UseTree {
     user: bool,
     kids: Vec<(Hop, UseTree)>,
@@ -98,6 +117,11 @@ impl RenderIndex {
             }
         }
         RenderIndex { summaries, mounts }
+    }
+
+    /// The render dependence summary of component `c`.
+    pub(in crate::rules) fn summary(&self, c: ComponentId) -> Option<&RenderDeps> {
+        self.summaries.get(&c)
     }
 
     /// Element sites naming `c` across the program: more than one means `c`
@@ -251,6 +275,99 @@ impl RenderIndex {
         (renders, list)
     }
 
+    /// Where the setter of `owner`'s slot `label` may be called from an
+    /// event: the host handlers, in `owner` or down its element tree, whose
+    /// value may depend on it. An event prop (`onX`) that carries it into a
+    /// component without landing anywhere below (an opaque element, a child
+    /// that only calls it from an effect) lands on the element itself.
+    pub(in crate::rules) fn landings(
+        &self,
+        owner: ComponentId,
+        label: HookLabel,
+        program: &ProgramAnalysisResult,
+    ) -> Vec<Landing> {
+        let rel = Relevance::Sources(BTreeSet::from([Source::Setter(label)]));
+        let mut out = Vec::new();
+        let mut visiting = HashSet::from([owner]);
+        self.land(owner, &rel, None, program, &mut visiting, 0, &mut out);
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn land(
+        &self,
+        comp: ComponentId,
+        rel: &Relevance,
+        via: Option<SourceRange>,
+        program: &ProgramAnalysisResult,
+        visiting: &mut HashSet<ComponentId>,
+        depth: usize,
+        out: &mut Vec<Landing>,
+    ) {
+        let Some(summary) = self.summaries.get(&comp) else {
+            return;
+        };
+        let host = |h: &HostHandler| HandlerTarget::Host {
+            tag: h.tag.clone(),
+            input_type: h.input_type.clone(),
+        };
+        for h in summary.handlers.iter().filter(|h| h.deps.touches(rel)) {
+            let events = match &h.event {
+                Some(e) => vec![e.clone()],
+                // A spread of the props object onto the element: every event
+                // prop `rel` names becomes one of its handlers.
+                None => renamed_through(&h.deps, rel)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|p| is_event_prop(p) && !h.named.contains(p))
+                    .map(|p| prop_to_event(p))
+                    .collect(),
+            };
+            out.extend(events.into_iter().map(|event| Landing {
+                component: comp,
+                event,
+                target: host(h),
+                span: h.span,
+                via,
+            }));
+        }
+        for site in &summary.sites {
+            let (props, all) = forwarded(site, rel);
+            let via = via.or(site.span);
+            let child = resolve(site, program).filter(|_| depth < MAX_DEPTH);
+            let mut descend = |child_rel: Relevance, out: &mut Vec<Landing>| {
+                let Some(child) = child else { return };
+                if visiting.insert(child) {
+                    self.land(child, &child_rel, via, program, visiting, depth + 1, out);
+                    visiting.remove(&child);
+                }
+            };
+            if all {
+                descend(Relevance::All, out);
+            }
+            // One prop at a time: a prop that lands below must not hide one
+            // that does not.
+            for p in &props {
+                let before = out.len();
+                descend(
+                    Relevance::Sources(BTreeSet::from([Source::Prop(p.clone())])),
+                    out,
+                );
+                if out.len() == before && is_event_prop(p) {
+                    out.push(Landing {
+                        component: comp,
+                        event: prop_to_event(p),
+                        target: HandlerTarget::Component {
+                            name: site.name.clone(),
+                        },
+                        span: site.span,
+                        via,
+                    });
+                }
+            }
+        }
+    }
+
     /// Which part of `comp`'s render tree uses `rel` (sources in `comp`'s own
     /// frame).
     fn uses(
@@ -315,14 +432,51 @@ impl RenderIndex {
 
 /// The props of `site` that may carry `rel`, and whether a spread does (then
 /// any prop of the child may).
+///
+/// A spread of the builder's own props object (`{...rest}`) hands each prop
+/// on under its own name, so the names `rel` holds survive it; any other
+/// spread may put the value under any name.
 fn forwarded(site: &ElementSite, rel: &Relevance) -> (Vec<Symbol>, bool) {
-    let props = site
+    let mut props: Vec<Symbol> = site
         .props
         .iter()
         .filter(|(_, d)| d.touches(rel))
         .map(|(k, _)| k.clone())
         .collect();
-    (props, site.spread.touches(rel))
+    if !site.spread.touches(rel) {
+        return (props, false);
+    }
+    match renamed_through(&site.spread, rel) {
+        Some(names) => {
+            for n in names {
+                if !props.contains(&n) {
+                    props.push(n);
+                }
+            }
+            (props, false)
+        }
+        None => (props, true),
+    }
+}
+
+/// The prop names of `rel` a spread of `deps` passes on unchanged, when
+/// `deps` is the props object itself; `None` when the spread may rename.
+fn renamed_through(deps: &Deps, rel: &Relevance) -> Option<Vec<Symbol>> {
+    let props_object = !deps.top && deps.set.len() == 1 && deps.set.contains(&Source::AllProps);
+    let Relevance::Sources(r) = rel else {
+        return None;
+    };
+    if !props_object || r.contains(&Source::AllProps) {
+        return None;
+    }
+    Some(
+        r.iter()
+            .filter_map(|s| match s {
+                Source::Prop(p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 /// How often a trigger fires during one interaction.
@@ -413,54 +567,6 @@ pub(in crate::rules) enum HandlerTarget {
     Component {
         name: Symbol,
     },
-}
-
-/// The element whose prop a handler was extracted from, found by the span the
-/// extractor recorded: the prop's own span on a host element, the element's
-/// span on a component element (`hook_extractor::collect_handlers_in_expr`).
-pub(in crate::rules) fn handler_target(
-    render_cfg: &crate::ir::CFG,
-    span: SourceRange,
-) -> Option<HandlerTarget> {
-    use crate::ir::expr::{Expr, Prim};
-    fn walk(e: &Expr, span: SourceRange, found: &mut Option<HandlerTarget>) {
-        if found.is_some() {
-            return;
-        }
-        match e {
-            Expr::NativeElem {
-                tag,
-                props,
-                prop_spans,
-                ..
-            } if prop_spans.iter().any(|(_, s)| *s == Some(span)) => {
-                let input_type = match props.peel_ts() {
-                    Expr::ObjectLit { fields, .. } => fields
-                        .iter()
-                        .find(|(k, _)| k == "type")
-                        .and_then(|(_, v)| match v.peel_ts() {
-                            Expr::Lit(Prim::String(s)) => Some(s.to_ascii_lowercase()),
-                            _ => None,
-                        }),
-                    _ => None,
-                };
-                *found = Some(HandlerTarget::Host {
-                    tag: tag.clone(),
-                    input_type,
-                });
-            }
-            Expr::CompApp { name, span: s, .. } if *s == Some(span) => {
-                *found = Some(HandlerTarget::Component { name: name.clone() });
-            }
-            Expr::FnLit { body_cfg, .. } => {
-                body_cfg.for_each_expr(&mut |c| walk(c, span, found));
-            }
-            _ => e.for_each_child(&mut |c| walk(c, span, found)),
-        }
-    }
-    let mut found = None;
-    render_cfg.for_each_expr(&mut |e| walk(e, span, &mut found));
-    found
 }
 
 /// The component an element names, when exactly one.

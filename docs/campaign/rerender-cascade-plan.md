@@ -159,8 +159,9 @@ phase 2, with ⊤ props, therefore keep a precise summary.
 pins its user below the slot's owner. `Context(ContextId)` is not in v1;
 `useContext` reads as `Hook(label)`.
 
-Still to do (#149): `MountIndex::Guard.slots` switches to it and drops its syntactic
-chase, with `frozen-initial-state` unmoved on the corpus.
+Done (#149): `MountIndex` reads an element's guard slots from its
+`ElementSite::guard` and no longer chases `Expr::StateVal` syntactically.
+`frozen-initial-state` is unmoved on the corpus.
 
 ### M2. `memo` / `forwardRef` detection (#64)
 
@@ -406,11 +407,38 @@ typing.
 
 The limits recorded in `docs/limitations.md`:
 - #145: cascades through a context value (plan M5).
-- #146: a setter called by a child as a trigger of the owner.
+- #146 (done): a setter called by a child as a trigger of the owner.
 - #147: the two stated assumptions of render dependence.
-- #148: trigger frequency from the event name.
+- #148: trigger frequency from the event name. The host element a handler
+  lands on is now followed down the tree; a write guarded by a test of the
+  event argument is still filed by the event's name.
 
 The other work left:
-- #149: `MountIndex` onto render dependence.
+- #149 (done): `MountIndex` onto render dependence.
 - #150: regenerate the corpus baseline.
 - #64: `memo` as a barrier.
+
+### Corpus effect of #146, #148 and #149 (2026-09-24, per repo)
+
+#149 is byte-identical on the corpus (1 485 rows, severities included).
+
+#146 and #148 change only `wasted-subtree-render`: 1 485 to 1 518 findings
+(47 added, 14 removed).
+
+Removed:
+- 13 of the 14 are the same trigger renamed: the message now names the
+  component the handler sits in (`each change event in <Input>`).
+- The last one, the first story of `Combobox.story.tsx`, is a false positive
+  that went away. Its handler also calls `store.openDropdown()`, which writes
+  `opened` through `useCombobox`. That slot is now in the same batch, and
+  `<Combobox>` depends on it.
+
+Added:
+- Setters handed to a child form or modal (`EditProgramDescriptionModal`,
+  `TokenStep`, `KeyValuePairInput`).
+- `scroll` handlers returned by a custom hook (`useScrollProgress` in dub,
+  five findings), whose writes `slot_writers` did not attribute to a handler.
+- Handlers followed through rest spreads down to the host input.
+
+`state-lifted-too-high` is unchanged. It shares `forwarded`, and prop names
+now survive a rest spread there too.

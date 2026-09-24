@@ -60,9 +60,11 @@ impl<'a> ProgramCache<'a> {
     }
 
     /// Component → its JSX call sites, built on first request. The reverse
-    /// index behind mount-lifetime reasoning (issue #95).
+    /// index behind mount-lifetime reasoning (issue #95). Its mount conditions
+    /// are read from the render dependence summaries (#149).
     pub(in crate::rules) fn mounts(&self) -> &MountIndex {
-        self.mounts.get_or_init(|| MountIndex::build(self.program))
+        self.mounts
+            .get_or_init(|| MountIndex::build(self.program, self.render()))
     }
 
     /// Every component's render dependence summary, built on first request.

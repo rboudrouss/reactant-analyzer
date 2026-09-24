@@ -348,7 +348,8 @@ pub const RULE_DOCS: &[RuleDoc] = &[
         "A component re-renders all the component elements it builds whenever one \
                       of its states changes, whether or not their props changed. When the \
                       state is written from a continuous event (typing, pointer motion, \
-                      scrolling, dragging, a timer) and the component also builds elements \
+                      scrolling, dragging, a timer), by the component's own handlers or by a \
+                      child it handed the setter to, and the component also builds elements \
                       none of whose inputs depend on it, those subtrees render identical \
                       output many times a second. Only elements the analysis resolved are \
                       counted (an unresolved one may be `memo`), and none nested in an element \

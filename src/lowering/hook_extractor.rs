@@ -240,14 +240,14 @@ fn collect_handlers_in_expr(
     }
 }
 
-fn is_event_prop(name: &str) -> bool {
+pub(crate) fn is_event_prop(name: &str) -> bool {
     let mut chars = name.chars();
     chars.next() == Some('o')
         && chars.next() == Some('n')
         && chars.next().is_some_and(|c| c.is_ascii_uppercase())
 }
 
-fn prop_to_event(name: &str) -> String {
+pub(crate) fn prop_to_event(name: &str) -> String {
     // "onClick" → "click",  "onChange" → "change"
     // Non-`onX` callback props (`ref`, render props) keep their name as-is.
     if !is_event_prop(name) {

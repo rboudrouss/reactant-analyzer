@@ -20,7 +20,9 @@
 //!   hook, and the conditions every returned value is built under;
 //! - [`RenderDeps::sites`]: every component element the render builds, with
 //!   the sources each prop may depend on. An element's props are *forwarded*,
-//!   not used: the element value itself contributes nothing to `genuine`.
+//!   not used: the element value itself contributes nothing to `genuine`;
+//! - [`RenderDeps::handlers`]: the event handler props of its host elements,
+//!   with their sources: where a setter handed down lands.
 //!
 //! Over-approximation, in the direction the consumers need: a source missing
 //! from `genuine` is proven unused by the component, up to two stated
@@ -35,13 +37,14 @@ use crate::domains::AbstractDomain;
 use crate::engine::{AnalysisResult, HookKind};
 use crate::ir::{
     cfg::{CFG, Terminator},
-    expr::{CompOrigin, Expr, SPREAD_KEY_PREFIX},
+    expr::{CompOrigin, Expr, Prim, SPREAD_KEY_PREFIX},
     free_vars::compute_free_vars,
     hooks::HookEntry,
     source_range::SourceRange,
     stmt::{MemberKey, Stmt},
     types::{BlockId, HookLabel, Symbol, Var},
 };
+use crate::lowering::hook_extractor::{is_event_prop, prop_to_event};
 
 /// A render input a value may be computed from, in the frame of one component.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -150,11 +153,34 @@ pub struct ElementSite {
     pub parent: Option<usize>,
 }
 
+/// An event handler prop of a host element built by the render
+/// (`<input onChange={f} />`): where a write capability the component was
+/// handed ends up being called.
+#[derive(Debug, Clone)]
+pub struct HostHandler {
+    /// The event, as `HookEntry::Handler` names it (`onChange` → `change`).
+    /// `None` for a spread onto the element (`<input {...rest} />`), which
+    /// may hand it any handler.
+    pub event: Option<String>,
+    pub tag: Symbol,
+    /// The element's literal `type` attribute, lowercased.
+    pub input_type: Option<String>,
+    /// The prop's span, the one `HookEntry::Handler` records (the element's
+    /// for a spread).
+    pub span: Option<SourceRange>,
+    /// For a spread: the event props the element also names, which are its
+    /// own handlers, not the spread's.
+    pub named: Vec<Symbol>,
+    /// What the handler value may depend on.
+    pub deps: Deps,
+}
+
 /// Render dependence summary of one component.
 #[derive(Debug, Clone, Default)]
 pub struct RenderDeps {
     pub genuine: Deps,
     pub sites: Vec<ElementSite>,
+    pub handlers: Vec<HostHandler>,
 }
 
 /// Iteration cap per CFG. The lattice is finite, so the cap is a guard, not a
@@ -709,10 +735,47 @@ impl<'a> Analyzer<'a> {
             // A host element is output of the component that builds it,
             // wherever it travels next (`<Modal><input value={text} /></Modal>`
             // hands the input to Modal, but only this render can refresh it).
-            Expr::NativeElem { .. } => {
+            Expr::NativeElem {
+                tag,
+                props,
+                prop_spans,
+                span,
+                ..
+            } => {
                 let mut used = self.eval(e, env).deps;
                 used.union_with(&ctx.pc);
                 self.out.genuine.union_with(&used);
+                if let Expr::ObjectLit { fields, .. } = props.peel_ts() {
+                    let input_type = fields.iter().find(|(k, _)| k == "type").and_then(|(_, v)| {
+                        match v.peel_ts() {
+                            Expr::Lit(Prim::String(s)) => Some(s.to_ascii_lowercase()),
+                            _ => None,
+                        }
+                    });
+                    let named: Vec<Symbol> = fields
+                        .iter()
+                        .filter(|(k, _)| is_event_prop(k))
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    for (k, v) in fields {
+                        let (event, at, named) = if k.starts_with(SPREAD_KEY_PREFIX) {
+                            (None, *span, named.clone())
+                        } else if is_event_prop(k) {
+                            let at = prop_spans.iter().find(|(p, _)| p == k);
+                            (Some(prop_to_event(k)), at.and_then(|(_, s)| *s), Vec::new())
+                        } else {
+                            continue;
+                        };
+                        self.out.handlers.push(HostHandler {
+                            event,
+                            tag: tag.clone(),
+                            input_type: input_type.clone(),
+                            span: at,
+                            named,
+                            deps: self.eval(v, env).deps,
+                        });
+                    }
+                }
                 e.for_each_child(&mut |c| self.collect(c, env, ctx));
             }
             _ => e.for_each_child(&mut |c| self.collect(c, env, ctx)),

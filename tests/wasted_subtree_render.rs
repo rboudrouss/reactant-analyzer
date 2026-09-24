@@ -68,6 +68,47 @@ fn a_listener_registered_in_an_effect_is_a_trigger() {
     assert!(message(&ds[0]).contains("each `mousemove` event"));
 }
 
+/// A setter handed to a child is a trigger where the child calls it: the
+/// child's input, on each keystroke (#146).
+#[test]
+fn a_setter_called_by_a_child_is_a_trigger() {
+    let ds = findings("child_setter.tsx", &[]);
+    assert_eq!(ds.len(), 1, "{ds:#?}");
+    let m = message(&ds[0]);
+    assert!(
+        m.contains("each `change` event in `<Field>` writes state `v`"),
+        "{m}"
+    );
+    // Field receives only the setter, which never changes.
+    assert!(m.contains("re-renders `<Field>` and `<Heavy>`"), "{m}");
+}
+
+/// A handler on a component element is as frequent as the host element it
+/// lands on, whatever the component's name (#148).
+#[test]
+fn a_handler_on_a_component_takes_the_frequency_of_its_host_element() {
+    let ds = findings("wrapped_input.tsx", &[]);
+    assert_eq!(ds.len(), 1, "{ds:#?}");
+    let m = message(&ds[0]);
+    assert!(
+        m.contains("each `change` event in `<Field>` writes state `v`"),
+        "{m}"
+    );
+}
+
+/// A prop keeps its name through a rest spread, down to the host element it
+/// is spread onto.
+#[test]
+fn a_handler_is_followed_through_rest_spreads() {
+    let ds = findings("spread_input.tsx", &[]);
+    assert_eq!(ds.len(), 1, "{ds:#?}");
+    let m = message(&ds[0]);
+    assert!(
+        m.contains("each `change` event in `<Field>` writes state `v`"),
+        "{m}"
+    );
+}
+
 /// Clicks, checkbox toggles and drag crossings are discrete: reported only
 /// when asked.
 #[test]

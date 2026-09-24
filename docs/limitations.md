@@ -82,8 +82,9 @@ that writes it (see *Cross-file limits*).
   and a context provider. So a state lifted above a `memo` child, or a heavy `memo`-less library
   subtree next to a fast input, goes unreported. Context values are not modelled, so a cascade that
   runs through a context is not followed either [#145](https://github.com/rboudrouss/reactant-analyzer/issues/145).
-  `wasted-subtree-render` counts only the owner's own writes: a setter passed down and called by a
-  child is not a trigger of the owner [#146](https://github.com/rboudrouss/reactant-analyzer/issues/146).
+  A setter handed to a child is a trigger where it lands on a host element's handler, or on an
+  `onX` prop of an element the analysis cannot see into. One passed under another name to such an
+  element, or called by the child outside any handler, is not a trigger.
 
 ## Why reactant may warn wrongly (false positives)
 
@@ -178,8 +179,10 @@ carries an Error.
   render that reads such a binding can therefore be reported as unaffected by a write that in fact
   changes it [#147](https://github.com/rboudrouss/reactant-analyzer/issues/147).
 - **Trigger frequency is a ranking, not a proof.** `wasted-subtree-render` files an event as
-  continuous from its name, the host element and its literal `type`, or, for a handler on a
-  component element, a hint in the component's name (`Input`, `Textarea`, `Slider`…). A state that
+  continuous from its name and the host element the handler lands on, with its literal `type`,
+  followed down through the components it is handed to. For an element the analysis cannot see
+  into, a hint in the component's name stands in (`Input`, `Textarea`, `Slider`…). A `keydown`
+  handler that writes only on one key is still filed as typing. A state that
   holds only a few primitive values re-renders at the rate of its transitions, so it is filed as
   discrete however often it is written. A misfiled trigger changes whether a finding is shown by
   default (`continuousOnly`), never what the finding claims

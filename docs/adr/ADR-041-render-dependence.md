@@ -73,7 +73,11 @@ recursion, the depth cap and ⊤. Two assumptions are stated, not proven:
   tree that holds all its uses and writers, is strictly below the owner. A
   list item or a mount condition stops the descent.
 - `wasted-subtree-render`: one trigger writes a set of slots. The trigger is a
-  handler, or a listener or timer registered in an effect. The rule fires
+  host element's handler whose value may depend on a slot's setter, in the
+  owner or down the element tree the setter is handed through (the summary
+  records each host handler's sources), or a listener or timer registered in
+  an effect. A prop keeps its name through a spread of the props object
+  (`{...rest}`), down to a host element it is spread onto. The rule fires
   when the owner also builds resolved elements that no written slot reaches,
   either directly or through an element they are nested in (a provider could
   pass the value on). Triggers are grouped because one batch is one render.
@@ -99,18 +103,18 @@ a team's call, not the analyzer's.
   plan, §9 "Why these defaults".
 - The trigger frequency (continuous or discrete) is a ranking fact. Two
   sources feed it:
-  - the event name, with the host element and its literal `type` found by
-    the handler's recorded span;
-  - a component-name hint for a handler on a component element.
+  - the event name, with the host element the handler lands on and its
+    literal `type`;
+  - a component-name hint for an `onX` prop of an element the analysis
+    cannot see into.
 
   A miss files a trigger as discrete. It never changes a proof.
+- `MountIndex` reads its guard slots from `ElementSite::guard`, which
+  retired its syntactic `StateVal` scan (#149).
 - Still to do, as issues:
-  - `MountIndex::Guard.slots` onto `render_deps`, retiring its syntactic
-    scan (#149);
   - context values as a `Context` source (#145);
-  - child-called setters as triggers (#146);
   - the two stated assumptions (#147);
-  - the frequency ranking (#148);
+  - a write guarded by a test of the event argument (#148);
   - #64 (`memo`), which turns today's opaque `memo` elements into barriers.
 
   The committed corpus baseline still has to be regenerated from a

@@ -22,8 +22,12 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    engine::ProgramAnalysisResult,
+    engine::{
+        ProgramAnalysisResult,
+        render_deps::{RenderDeps, Source},
+    },
     ir::{
+        SourceRange,
         cfg::{CFG, Terminator},
         expr::Expr,
         free_vars::{AccessPath, collect_used_paths, path_covered},
@@ -33,6 +37,7 @@ use crate::{
 };
 
 use super::local_bindings;
+use super::render_tree::RenderIndex;
 use super::setters::{all_setter_labels, collect_fn_bindings, collect_setter_calls_with_extra};
 use crate::ir::{CompOrigin, ComponentId};
 
@@ -72,6 +77,9 @@ struct MountSite {
     prop_paths: Option<HashMap<Symbol, Vec<AccessPath>>>,
     /// Branches the element is control-dependent on.
     guards: Vec<Guard>,
+    /// State slots of the caller the element's mount condition may depend
+    /// on, from its render dependence summary (`ElementSite::guard`).
+    guard_slots: HashSet<HookLabel>,
 }
 
 /// A branch the element only renders under one side of.
@@ -80,11 +88,6 @@ struct Guard {
     /// Paths read by the condition, chased through the temps the lowering of
     /// `&&` / `?:` binds it to.
     paths: Vec<AccessPath>,
-    /// State slots of the caller the condition reads. Read syntactically
-    /// (`Expr::StateVal`) rather than from the version labels of the abstract
-    /// value: those live on the reference slot only, so a boolean mount flag
-    /// — `useState(false)`, the shape every dialog uses — carries none.
-    slots: HashSet<HookLabel>,
 }
 
 /// Component → every JSX element that instantiates it, program-wide.
@@ -96,13 +99,14 @@ pub(in crate::rules) struct MountIndex {
 }
 
 impl MountIndex {
-    pub(in crate::rules) fn build(program: &ProgramAnalysisResult) -> Self {
+    pub(in crate::rules) fn build(program: &ProgramAnalysisResult, render: &RenderIndex) -> Self {
         let mut sites: HashMap<ComponentId, Vec<MountSite>> = HashMap::new();
         for (caller, comp) in &program.components {
             collect_sites(
                 *caller,
                 &comp.render_cfg,
                 &program.component_table,
+                &guard_slots_by_span(render.summary(*caller)),
                 &mut sites,
             );
         }
@@ -181,10 +185,8 @@ impl MountSite {
         // Guard slots are the *caller's*: a feeder owned elsewhere is written
         // where this mount condition is not, so nothing couples.
         self.caller == owner
-            && self.guards.iter().any(|guard| {
-                guard.slots.iter().any(|guard_slot| {
-                    *guard_slot != slot && writes_move_together(program, owner, slot, *guard_slot)
-                })
+            && self.guard_slots.iter().any(|guard_slot| {
+                *guard_slot != slot && writes_move_together(program, owner, slot, *guard_slot)
             })
     }
 }
@@ -275,12 +277,14 @@ fn for_each_block_expr<'a>(cfg: &'a CFG, f: &mut impl FnMut(&'a Expr, BlockId)) 
 
 /// Record every `CompApp` in `cfg` (and in the `FnLit` bodies it nests — a
 /// `.map(x => <Child/>)` renders just as much as a top-level element). Nested
-/// bodies get no guards: their branches live in another CFG, whose blocks the
-/// caller's dominator tree and block envs know nothing about.
+/// bodies get no guard paths: their branches live in another CFG, whose blocks
+/// the caller's dominator tree and block envs know nothing about. Their guard
+/// slots come from the render dependence summary, which does follow them.
 fn collect_sites(
     caller: ComponentId,
     cfg: &CFG,
     table: &crate::ir::ComponentTable,
+    guard_slots: &HashMap<SourceRange, HashSet<HookLabel>>,
     out: &mut HashMap<ComponentId, Vec<MountSite>>,
 ) {
     // What a branch tests depends on the branch alone, never on the element it
@@ -288,42 +292,49 @@ fn collect_sites(
     // (branch, element) pair inside `guards_of`. A render body with hundreds of
     // both made that product the dominant cost of the whole rules phase.
     let branches = branch_conditions(cfg);
-    let mut push =
-        |name: &Symbol, origin: Option<&CompOrigin>, props: &Expr, block: Option<BlockId>| {
-            let site = MountSite {
-                caller,
-                prop_paths: prop_paths(props),
-                guards: block
-                    .map(|b| guards_of(cfg, b, &branches))
-                    .unwrap_or_default(),
-            };
-            // A resolved callee is one component; an unresolved one may be any
-            // component of that name, and every candidate has to carry the site.
-            // The relation only ever *downgrades* a finding, and it downgrades
-            // when EVERY site remounts — so an extra site can only keep a finding,
-            // never remove one (#95).
-            let targets: Vec<ComponentId> = match origin.and_then(|o| table.id_of(o)) {
-                Some(id) => vec![id],
-                None => table.ids_named(name).collect(),
-            };
-            for id in targets {
-                out.entry(id).or_default().push(site.clone());
-            }
+    let mut push = |name: &Symbol,
+                    origin: Option<&CompOrigin>,
+                    props: &Expr,
+                    span: Option<SourceRange>,
+                    block: Option<BlockId>| {
+        let site = MountSite {
+            caller,
+            prop_paths: prop_paths(props),
+            guards: block
+                .map(|b| guards_of(cfg, b, &branches))
+                .unwrap_or_default(),
+            guard_slots: span
+                .and_then(|s| guard_slots.get(&s))
+                .cloned()
+                .unwrap_or_default(),
         };
+        // A resolved callee is one component; an unresolved one may be any
+        // component of that name, and every candidate has to carry the site.
+        // The relation only ever *downgrades* a finding, and it downgrades
+        // when EVERY site remounts — so an extra site can only keep a finding,
+        // never remove one (#95).
+        let targets: Vec<ComponentId> = match origin.and_then(|o| table.id_of(o)) {
+            Some(id) => vec![id],
+            None => table.ids_named(name).collect(),
+        };
+        for id in targets {
+            out.entry(id).or_default().push(site.clone());
+        }
+    };
     fn walk<'a>(
         e: &'a Expr,
         block: Option<BlockId>,
         nested: &mut Vec<&'a CFG>,
-        push: &mut impl FnMut(&Symbol, Option<&CompOrigin>, &Expr, Option<BlockId>),
+        push: &mut impl FnMut(&Symbol, Option<&CompOrigin>, &Expr, Option<SourceRange>, Option<BlockId>),
     ) {
         match e {
             Expr::CompApp {
                 name,
                 props,
                 origin,
-                ..
+                span,
             } => {
-                push(name, origin.as_deref(), props, block);
+                push(name, origin.as_deref(), props, *span, block);
                 walk(props, block, nested, push);
             }
             Expr::FnLit { body_cfg, .. } => nested.push(body_cfg),
@@ -351,6 +362,34 @@ fn collect_sites(
         for_each_block_expr(body, &mut |e, _| walk(e, None, &mut deeper, &mut push));
         nested.extend(deeper);
     }
+}
+
+/// The caller's state slots each element's mount condition may depend on,
+/// keyed by the element's span. A span the summary records more than once
+/// (a closure body spliced in at several call sites) keeps only the slots
+/// every copy is guarded by, and a ⊤ guard names none: a slot counts only
+/// when it is proven to be part of the condition.
+fn guard_slots_by_span(summary: Option<&RenderDeps>) -> HashMap<SourceRange, HashSet<HookLabel>> {
+    let mut out: HashMap<SourceRange, HashSet<HookLabel>> = HashMap::new();
+    for site in summary.into_iter().flat_map(|s| &s.sites) {
+        let Some(span) = site.span else { continue };
+        let slots: HashSet<HookLabel> = if site.guard.top {
+            HashSet::new()
+        } else {
+            site.guard
+                .set
+                .iter()
+                .filter_map(|s| match s {
+                    Source::Slot(l) => Some(*l),
+                    _ => None,
+                })
+                .collect()
+        };
+        out.entry(span)
+            .and_modify(|seen| seen.retain(|l| slots.contains(l)))
+            .or_insert(slots);
+    }
+    out
 }
 
 /// Access paths read by each field of a JSX props object; `None` when the
@@ -435,28 +474,25 @@ fn branch_conditions(cfg: &CFG) -> Vec<Branch> {
                 return None;
             };
             let mut paths = HashSet::new();
-            let mut slots = HashSet::new();
             let mut seen = HashSet::new();
             // The condition as written counts first: `linkModalState ? … : null`
             // guards on that very name, and resolving straight to what the
             // binding reads would drop it.
             collect_used_paths(cond, &mut paths);
-            collect_state_labels(cond, &mut slots);
             match cond.peel_ts() {
                 Expr::Var(v) => {
                     seen.insert(v.clone());
                     for rhs in lets.get(v.as_str()).into_iter().flatten() {
-                        chase(&bindings, rhs, &mut paths, &mut slots, &mut seen);
+                        chase(&bindings, rhs, &mut paths, &mut seen);
                     }
                 }
-                other => chase(&bindings, other, &mut paths, &mut slots, &mut seen),
+                other => chase(&bindings, other, &mut paths, &mut seen),
             }
             Some(Branch {
                 then_: *then_,
                 else_: *else_,
                 guard: Guard {
                     paths: paths.into_iter().collect(),
-                    slots,
                 },
             })
         })
@@ -478,9 +514,8 @@ fn blocks_reaching(cfg: &CFG, target: BlockId) -> HashSet<BlockId> {
     seen
 }
 
-/// Collect what an expression reads — its access paths and the state slots
-/// behind them — following every variable to *every* expression the CFG binds
-/// it to.
+/// Collect the access paths an expression reads, following every variable to
+/// *every* expression the CFG binds it to.
 ///
 /// Both `let` and `assign` matter once inside the condition, and that is what
 /// makes a chained guard readable: `a && b` lowers its left operand to
@@ -497,11 +532,9 @@ fn chase(
     bindings: &HashMap<&str, Vec<&Expr>>,
     expr: &Expr,
     paths: &mut HashSet<AccessPath>,
-    slots: &mut HashSet<HookLabel>,
     seen: &mut HashSet<Var>,
 ) {
     collect_used_paths(expr, paths);
-    collect_state_labels(expr, slots);
     let mut vars = HashSet::new();
     crate::ir::free_vars::collect_used_vars(expr, &mut vars);
     for v in vars {
@@ -510,7 +543,7 @@ fn chase(
         }
         for rhs in bindings.get(v.as_str()).into_iter().flatten() {
             if is_condition_shaped(rhs) {
-                chase(bindings, rhs, paths, slots, seen);
+                chase(bindings, rhs, paths, seen);
             }
         }
     }
@@ -530,16 +563,4 @@ fn is_condition_shaped(e: &Expr) -> bool {
             | Expr::ObjectLit { .. }
             | Expr::ArrayLit { .. }
     )
-}
-
-/// The state slots an expression reads directly, closures excluded (their
-/// reads happen on invocation, not while deciding what to render).
-fn collect_state_labels(expr: &Expr, out: &mut HashSet<HookLabel>) {
-    match expr.peel_ts() {
-        Expr::StateVal(label) => {
-            out.insert(*label);
-        }
-        Expr::FnLit { .. } => {}
-        other => other.for_each_child(&mut |c| collect_state_labels(c, out)),
-    }
 }

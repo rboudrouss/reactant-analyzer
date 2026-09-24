@@ -1,11 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use crate::engine::WriterRegion;
 use crate::ir::free_vars::compute_free_vars;
 use crate::ir::hooks::HookEntry;
-use crate::ir::{HookLabel, expr::Expr};
+use crate::ir::{ComponentId, HookLabel, SourceRange, expr::Expr};
 use crate::rules::helpers::join_names;
-use crate::rules::helpers::render_tree::{Frequency, event_frequency, handler_target};
+use crate::rules::helpers::render_tree::{Frequency, event_frequency};
 use crate::rules::{
     Diagnostic, OptionKind, OptionSpec, Rule, RuleCtx, Step, state_slot_name, state_val_labels,
 };
@@ -74,45 +74,80 @@ impl Rule for WastedSubtreeRender {
                 _ => None,
             })
             .collect();
-        // One trigger (a handler, or an effect's registered callbacks) writes
-        // its slots in one batch, so they re-render together: group by it.
-        type Events = BTreeSet<(String, bool)>;
-        let mut triggers: BTreeMap<WriterRegion, (BTreeSet<HookLabel>, Events)> = BTreeMap::new();
+        // One trigger (an event handler, or an effect's registered callbacks)
+        // writes its slots in one batch, so they re-render together: group
+        // by it.
+        let mut triggers: Vec<Trigger> = Vec::new();
+        let mut add = |key: TriggerKey, slot: HookLabel, events: Events, span, place| {
+            let i = match triggers.iter().position(|t| t.key == key) {
+                Some(i) => i,
+                None => {
+                    triggers.push(Trigger {
+                        key,
+                        slots: BTreeSet::new(),
+                        events: BTreeSet::new(),
+                        span,
+                        place,
+                    });
+                    triggers.len() - 1
+                }
+            };
+            triggers[i].slots.insert(slot);
+            triggers[i].events.extend(events);
+        };
+        // A handler may be the owner's own, or one down the tree that the
+        // setter was handed to: either way the write re-renders the owner.
+        for &slot in &states {
+            for l in index.landings(owner, slot, program) {
+                let f = event_frequency(&l.event, Some(&l.target));
+                let events =
+                    BTreeSet::from([(l.event.to_ascii_lowercase(), f == Frequency::Continuous)]);
+                let elsewhere = l.component != owner;
+                let (span, place) = if elsewhere {
+                    (l.via, Some(l.component))
+                } else {
+                    (l.span, None)
+                };
+                add(
+                    TriggerKey::Handler(l.via, l.component, l.span, l.event),
+                    slot,
+                    events,
+                    span,
+                    place,
+                );
+            }
+        }
         for w in &result.slot_writers {
             if !states.contains(&w.slot) {
                 continue;
             }
-            let events: Events = match w.region {
-                WriterRegion::Handler(h) => result
-                    .handler_info
-                    .get(&h)
-                    .map(|i| {
-                        let target = i.span.and_then(|s| handler_target(&result.render_cfg, s));
-                        let f = event_frequency(&i.event, target.as_ref());
-                        (i.event.to_ascii_lowercase(), f == Frequency::Continuous)
-                    })
-                    .into_iter()
-                    .collect(),
-                // The registrations of the effect whose callback may write
-                // through this setter.
-                WriterRegion::Effect(e) => result
-                    .registrations
-                    .iter()
-                    .filter(|r| r.effect == e && may_call(&r.callback, &w.setter))
-                    .map(|r| {
-                        let ev = r.event.clone().unwrap_or_else(|| r.registrar.to_string());
-                        let f = event_frequency(&ev, None);
-                        (ev.to_ascii_lowercase(), f == Frequency::Continuous)
-                    })
-                    .collect(),
-                _ => continue,
+            // The registrations of the effect whose callback may write
+            // through this setter.
+            let WriterRegion::Effect(e) = w.region else {
+                continue;
             };
-            let entry = triggers.entry(w.region).or_default();
-            entry.0.insert(w.slot);
-            entry.1.extend(events);
+            let events: Events = result
+                .registrations
+                .iter()
+                .filter(|r| r.effect == e && may_call(&r.callback, &w.setter))
+                .map(|r| {
+                    let ev = r.event.clone().unwrap_or_else(|| r.registrar.to_string());
+                    let f = event_frequency(&ev, None);
+                    (ev.to_ascii_lowercase(), f == Frequency::Continuous)
+                })
+                .collect();
+            let span = result.effect_info.get(&e).and_then(|i| i.span);
+            add(TriggerKey::Effect(e), w.slot, events, span, None);
         }
         let mut diags = Vec::new();
-        for (region, (slots, events)) in triggers {
+        for Trigger {
+            key,
+            slots,
+            events,
+            span,
+            place,
+        } in triggers
+        {
             // A continuous event re-renders continuously only if it can keep
             // writing new values: a boolean or a few constants re-render at
             // the rate of their transitions (`scrollY > 50` flips once).
@@ -143,11 +178,12 @@ impl Rule for WastedSubtreeRender {
                 .copied()
                 .or_else(|| events.iter().next().map(|(e, _)| e))
                 .expect("a trigger has an event");
-            let trigger = format!("each `{event}` event writes {noun} {slot} and");
-            let span = match region {
-                WriterRegion::Handler(h) => result.handler_info.get(&h).and_then(|i| i.span),
-                WriterRegion::Effect(e) => result.effect_info.get(&e).and_then(|i| i.span),
-                _ => None,
+            let trigger = match place {
+                Some(c) => format!(
+                    "each `{event}` event in `<{}>` writes {noun} {slot} and",
+                    program.display_name(c)
+                ),
+                None => format!("each `{event}` event writes {noun} {slot} and"),
             };
             let label = &labels[0];
             let elements: Vec<String> = wasted
@@ -162,7 +198,11 @@ impl Rule for WastedSubtreeRender {
             let pronoun = if labels.len() == 1 { "it" } else { "them" };
             // A trigger spliced in from a custom hook is the hook's to fix:
             // every component calling it pays the same renders.
-            let fix = match region_hook(program, result, region) {
+            let hook = match key {
+                TriggerKey::Effect(e) => region_hook(program, result, e),
+                TriggerKey::Handler(..) => None,
+            };
+            let fix = match hook {
                 Some(hook) => format!(
                     "The writes come from `{hook}`, which does this to every component that \
                      calls it: write only when a value its callers read changes, or call it \
@@ -201,18 +241,43 @@ impl Rule for WastedSubtreeRender {
     }
 }
 
-/// The custom hook a trigger region was inlined from, by name: the region's
-/// inlined provenance row is positioned in the hook's file, and the
-/// component's own call of a non-React hook resolved to that file names it.
+type Events = BTreeSet<(String, bool)>;
+
+/// What makes two writes one batch.
+#[derive(PartialEq)]
+enum TriggerKey {
+    /// One event handler: the owner's element the setter leaves through (two
+    /// instances of one child are two handlers), the component building the
+    /// handler's element, the handler prop's span, the event.
+    Handler(
+        Option<SourceRange>,
+        ComponentId,
+        Option<SourceRange>,
+        String,
+    ),
+    /// The listeners and timers one effect registers.
+    Effect(HookLabel),
+}
+
+struct Trigger {
+    key: TriggerKey,
+    slots: BTreeSet<HookLabel>,
+    /// Each event, and whether it is continuous.
+    events: Events,
+    /// Where the finding points: in the owner.
+    span: Option<SourceRange>,
+    /// The component the handler sits in, when not the owner.
+    place: Option<ComponentId>,
+}
+
+/// The custom hook an effect was inlined from, by name: the effect's inlined
+/// provenance row is positioned in the hook's file, and the component's own
+/// call of a non-React hook resolved to that file names it.
 fn region_hook(
     program: &crate::engine::ProgramAnalysisResult,
     result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
-    region: WriterRegion,
+    label: HookLabel,
 ) -> Option<String> {
-    let label = match region {
-        WriterRegion::Handler(l) | WriterRegion::Effect(l) => l,
-        _ => return None,
-    };
     let at = result
         .hook_provenance
         .iter()
