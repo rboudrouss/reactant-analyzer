@@ -13,11 +13,12 @@ use crate::{
 };
 
 use crate::engine::setters::SetterCallPhase;
+use crate::engine::{EffectTrigger, triggers_of};
 use crate::ir::ComponentId;
 use crate::rules::api::query::must_effect_cycle;
 use crate::rules::helpers::churn::{
-    ChurnSetterCall, Freshness, classify_effect_deps, collect_churn_calls, converges_once_written,
-    reference_part, write_can_retrigger,
+    ChurnSetterCall, Freshness, collect_churn_calls, converges_once_written, reference_part,
+    write_can_retrigger,
 };
 use crate::rules::helpers::churn_graph::{
     ChurnEdge, ChurnGraph, NodeNames, cycle_path, node_display,
@@ -25,7 +26,7 @@ use crate::rules::helpers::churn_graph::{
 use crate::rules::{
     Certified, Diagnostic, MustResult, OnAllPaths, Rule, Severity, all_deps_provably_stable,
     all_setter_labels, collect_fn_bindings, collect_setter_calls, collect_setter_calls_with_extra,
-    memo_val_labels, must_on_all_paths, resolve_setter_aliases, setter_var_labels, state_slot_name,
+    must_on_all_paths, resolve_setter_aliases, setter_var_labels, state_slot_name,
     state_val_labels,
 };
 
@@ -407,7 +408,6 @@ fn check_object_churn(
     let cfg = &comp_result.render_cfg;
     let state_vals = resolve_setter_aliases(cfg, &state_val_labels(cfg));
     let setter_labels = resolve_setter_aliases(cfg, &setter_var_labels(cfg));
-    let memo_vals = resolve_setter_aliases(cfg, &memo_val_labels(cfg));
     if setter_labels.is_empty() {
         return vec![];
     }
@@ -436,13 +436,19 @@ fn check_object_churn(
             continue; // mount-only
         }
 
-        let (exact, versioned_qualified) =
-            classify_effect_deps(dep_exprs.as_slice(), comp_result, &state_vals, &memo_vals);
-        // Self-churn is intra-component: keep only own slots.
-        let versioned: HashSet<HookLabel> = versioned_qualified
-            .into_iter()
-            .filter(|(c, _)| *c == component)
-            .map(|(_, l)| l)
+        // The effect's trigger rows (ADR-042 §3). Self-churn is
+        // intra-component: keep only own slots.
+        let triggers: Vec<&EffectTrigger> =
+            triggers_of(&comp_result.effect_triggers, *eff_label).collect();
+        let exact: HashSet<HookLabel> = triggers
+            .iter()
+            .filter(|t| t.exact)
+            .map(|t| t.slot.1)
+            .collect();
+        let versioned: HashSet<HookLabel> = triggers
+            .iter()
+            .filter(|t| !t.exact && t.slot.0 == component)
+            .map(|t| t.slot.1)
             .collect();
         if exact.is_empty() && versioned.is_empty() {
             continue;
@@ -501,12 +507,11 @@ fn check_object_churn(
                     // reading only those cannot be re-triggered by it (#90).
                     if !write_can_retrigger(
                         dep_exprs.as_slice(),
+                        &triggers,
                         component,
                         state_label,
                         &state_vals,
-                        &memo_vals,
                         call.written_expr.as_ref(),
-                        comp_result,
                     ) {
                         continue;
                     }

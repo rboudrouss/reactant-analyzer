@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::{
-    domains::{AbstractDomain, impls::Stability},
+    domains::AbstractDomain,
     ir::{
         SourceRange,
         cfg::CFG,
@@ -29,6 +29,7 @@ use crate::{
 };
 
 use super::setters::collect_fn_bindings;
+use crate::engine::EffectTrigger;
 use crate::ir::{ComponentId, QualifiedSlot};
 
 /// A state slot qualified by its owning component: `(component, label)`. Lets a
@@ -62,48 +63,6 @@ pub(in crate::rules) struct ChurnSetterCall {
     pub(in crate::rules) written_expr: Option<Expr>,
 }
 
-/// Classify effect deps against the component's own state slots:
-/// - `exact` — deps that ARE a local state slot (`StateVal(l)` or a var
-///   resolving to one): must-change whenever a fresh value is stored.
-/// - `versioned` — qualified slots `(component, label)` that merely version
-///   a dep (field reads, memo chains, props): may-change under a fresh set.
-pub(in crate::rules) fn classify_effect_deps(
-    dep_exprs: &[Expr],
-    comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
-    state_vals: &HashMap<Var, HookLabel>,
-    memo_vals: &HashMap<Var, HookLabel>,
-) -> (HashSet<HookLabel>, HashSet<SlotNode>) {
-    let mut exact: HashSet<HookLabel> = HashSet::new();
-    let mut versioned: HashSet<SlotNode> = HashSet::new();
-    for dep in dep_exprs {
-        match dep.peel_ts() {
-            Expr::StateVal(l) => {
-                exact.insert(*l);
-            }
-            Expr::Var(v) if state_vals.contains_key(v) => {
-                exact.insert(state_vals[v]);
-            }
-            other => {
-                // Memo/callback bindings: their env value is stale ⊤
-                // (bound before memo recompute) — read the memo store.
-                let val = match other {
-                    Expr::MemoVal(l) | Expr::CallbackVal(l) => comp_result.memo_store.get(*l),
-                    Expr::Var(v) if memo_vals.contains_key(v) => {
-                        comp_result.memo_store.get(memo_vals[v])
-                    }
-                    _ => eval_in_exit_env(other, comp_result),
-                };
-                if let Stability::Versioned(labels) = &val.reference {
-                    for (c, l) in labels {
-                        versioned.insert((*c, *l));
-                    }
-                }
-            }
-        }
-    }
-    (exact, versioned)
-}
-
 /// Can a write of `written_expr` into `label` change any dep of this effect?
 ///
 /// A functional update that spreads its own parameter — `prev => ({ ...prev,
@@ -111,30 +70,24 @@ pub(in crate::rules) fn classify_effect_deps(
 /// not name, so a dep that reads only those members is `Object.is`-equal after
 /// the write and cannot re-trigger the effect (#90). Sound by default: a dep
 /// this walk cannot place under a preserved member answers `true`.
-#[allow(clippy::too_many_arguments)]
+///
+/// `triggers` are the effect's rows of the trigger relation (ADR-042 §3): a
+/// dep reacts to `label` when one of its rows names this component's slot.
 pub(in crate::rules) fn write_can_retrigger(
     dep_exprs: &[Expr],
+    triggers: &[&EffectTrigger],
     component: ComponentId,
     label: HookLabel,
     state_vals: &HashMap<Var, HookLabel>,
-    memo_vals: &HashMap<Var, HookLabel>,
     written_expr: Option<&Expr>,
-    comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
 ) -> bool {
     let Some(overwritten) = updater_overwrites(written_expr) else {
         return true;
     };
-    for dep in dep_exprs {
-        let (exact, versioned) = classify_effect_deps(
-            std::slice::from_ref(dep),
-            comp_result,
-            state_vals,
-            memo_vals,
-        );
-        let reacts = exact.contains(&label)
-            || versioned
-                .iter()
-                .any(|(c, l)| *l == label && *c == component);
+    for (i, dep) in dep_exprs.iter().enumerate() {
+        let reacts = triggers
+            .iter()
+            .any(|t| t.dep == i && t.slot == (component, label));
         if !reacts {
             continue;
         }

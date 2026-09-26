@@ -644,6 +644,27 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     // scan of the effect bodies, read by `stale-closure`, `missing-cleanup`
     // and the Tier-A `registrations` anchor alike.
     let registrations = crate::engine::registrations::collect_registrations(&render_cfg, &hooks);
+    // The effect-trigger relation (ADR-042 §3): a dep evaluated in the render
+    // exit env, the one every hook body starts from.
+    let effect_triggers = {
+        let mut scratch = heap.clone();
+        crate::engine::triggers::collect_effect_triggers(
+            comp_id,
+            &render_cfg,
+            &hooks,
+            &memo_store,
+            |e| {
+                crate::engine::eval::eval_in_stores(
+                    e,
+                    &env_exit,
+                    comp_id,
+                    &final_state,
+                    &memo_store,
+                    &mut scratch,
+                )
+            },
+        )
+    };
     let hooks_clone = hooks.clone();
 
     AnalysisResult {
@@ -670,6 +691,7 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
         slot_writers,
         slot_seeds,
         registrations,
+        effect_triggers,
         iterations: iteration,
         heap,
     }

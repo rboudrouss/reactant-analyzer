@@ -47,14 +47,15 @@ use crate::{
 };
 
 use super::churn::{
-    ChurnSetterCall, Freshness, SlotNode, classify_effect_deps, collect_churn_calls,
-    converges_once_written, reference_part,
+    ChurnSetterCall, Freshness, SlotNode, collect_churn_calls, converges_once_written,
+    reference_part,
 };
 use super::setters::{
-    collect_component_setter_vars, collect_fn_bindings, memo_val_labels, resolve_setter_aliases,
-    setter_var_labels, state_val_labels,
+    collect_component_setter_vars, collect_fn_bindings, resolve_setter_aliases, setter_var_labels,
+    state_val_labels,
 };
 use crate::engine::dominance::on_all_paths;
+use crate::engine::triggers_of;
 use crate::ir::ComponentId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -111,7 +112,6 @@ pub(in crate::rules) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec
     for (&comp, comp_result) in &result.components {
         let cfg = &comp_result.render_cfg;
         let state_vals = resolve_setter_aliases(cfg, &state_val_labels(cfg));
-        let memo_vals = resolve_setter_aliases(cfg, &memo_val_labels(cfg));
         let local_setters = resolve_setter_aliases(cfg, &setter_var_labels(cfg));
 
         let mut setter_nodes: HashMap<crate::ir::types::Var, SlotNode> = local_setters
@@ -145,10 +145,17 @@ pub(in crate::rules) fn build_churn_graph(result: &ProgramAnalysisResult) -> Vec
             if matches!(deps.list(), Some(d) if d.arity == Arity::Exact(0)) {
                 continue;
             }
-            let (exact_local, versioned) = match deps.list() {
-                None => (HashSet::new(), HashSet::new()),
-                Some(d) => classify_effect_deps(d.as_slice(), comp_result, &state_vals, &memo_vals),
-            };
+            // The effect's trigger rows (ADR-042 §3): exact deps are local by
+            // construction, versioned ones may name a parent's slot.
+            let mut exact_local: HashSet<HookLabel> = HashSet::new();
+            let mut versioned: HashSet<SlotNode> = HashSet::new();
+            for t in triggers_of(&comp_result.effect_triggers, *label) {
+                if t.exact {
+                    exact_local.insert(t.slot.1);
+                } else {
+                    versioned.insert(t.slot);
+                }
+            }
             let mut calls = Vec::new();
             collect_churn_calls(
                 body_cfg,

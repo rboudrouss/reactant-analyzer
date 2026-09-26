@@ -14,6 +14,7 @@ pub mod root_detector;
 pub mod seeds;
 pub mod setters;
 pub mod symbol_graph;
+pub mod triggers;
 pub mod written;
 
 pub use analysis_result::{
@@ -39,4 +40,5 @@ pub use setters::{
     collect_slot_reads,
 };
 pub use symbol_graph::{SymbolGraph, SymbolKind, SymbolNode};
+pub use triggers::{EffectTrigger, triggers_of};
 pub use written::{Freshness, SiteEnvs, Written};
