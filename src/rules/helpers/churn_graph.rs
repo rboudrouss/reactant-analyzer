@@ -48,12 +48,13 @@ use crate::{
 
 use super::churn::{
     ChurnSetterCall, Freshness, SlotNode, classify_effect_deps, collect_churn_calls,
-    converges_once_written, on_all_paths, reference_part,
+    converges_once_written, reference_part,
 };
 use super::setters::{
     collect_component_setter_vars, collect_fn_bindings, memo_val_labels, resolve_setter_aliases,
     setter_var_labels, state_val_labels,
 };
+use crate::engine::dominance::on_all_paths;
 use crate::ir::ComponentId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

@@ -3,6 +3,7 @@ pub mod cfg_analyzer;
 pub mod component_cache;
 pub mod component_registry;
 pub mod dominance;
+pub mod eval;
 pub mod fixpoint;
 pub mod function_registry;
 pub mod hook_registry;
@@ -21,7 +22,8 @@ pub use analysis_result::{
 pub use cfg_analyzer::analyze_cfg;
 pub use component_cache::ComponentCache;
 pub use component_registry::{ComponentKey, ComponentRegistry};
-pub use dominance::{DominatorTree, compute_dominators, dominates, rpo};
+pub use dominance::{DominatorTree, compute_dominators, dominates, on_all_paths, rpo};
+pub use eval::{ConvergedEval, Eval, eval_in_stores};
 pub use fixpoint::{
     Config, analyze_component, analyze_component_as, analyze_component_inter, analyze_program,
 };

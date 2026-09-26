@@ -40,7 +40,7 @@ impl Rule for RedundantSetState {
         let result = &result.components[&component];
         let mut diags = Vec::new();
         // One scratch heap for the whole component — see
-        // [`crate::rules::helpers::Eval`].
+        // [`crate::engine::eval::Eval`].
         let mut scratch = result.heap.clone();
 
         // Slots whose value this rule has no standing to talk about (#92).

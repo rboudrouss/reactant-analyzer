@@ -622,10 +622,10 @@ pub fn must_setter_on_all_paths(
 }
 
 /// `All` iff every entry→exit path of `cfg` passes through one of `blocks`
-/// (promotes `churn::on_all_paths`); `None` otherwise. The shared "on all paths"
-/// must-forward (ADR-021 §3).
+/// (the typed face of `engine::dominance::on_all_paths`); `None` otherwise. The
+/// shared "on all paths" must-forward (ADR-021 §3).
 pub fn must_on_all_paths(cfg: &CFG, blocks: &HashSet<BlockId>) -> MustResult<OnAllPaths> {
-    if crate::rules::helpers::churn::on_all_paths(cfg, blocks) {
+    if crate::engine::dominance::on_all_paths(cfg, blocks) {
         // No provenance: the proof is a property of the whole CFG, not of one
         // position in it. The blocks it holds are on the evidence.
         MustResult::All(Certified::mint(
@@ -954,7 +954,7 @@ pub fn must_stale_capture(
     let Some(reg_block) = reg.block_id else {
         return MustResult::None;
     };
-    if !crate::rules::helpers::churn::on_all_paths(effect_body, &HashSet::from([reg_block])) {
+    if !crate::engine::dominance::on_all_paths(effect_body, &HashSet::from([reg_block])) {
         return MustResult::None;
     }
 
@@ -976,9 +976,7 @@ pub fn must_stale_capture(
             write_blocks.insert(*bid);
         }
     }
-    if write_blocks.is_empty()
-        || !crate::rules::helpers::churn::on_all_paths(cb_body, &write_blocks)
-    {
+    if write_blocks.is_empty() || !crate::engine::dominance::on_all_paths(cb_body, &write_blocks) {
         return MustResult::None;
     }
     MustResult::All(Certified::mint(

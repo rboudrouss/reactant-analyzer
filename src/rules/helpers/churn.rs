@@ -29,12 +29,13 @@ use crate::{
 };
 
 use super::setters::collect_fn_bindings;
-use crate::ir::ComponentId;
+use crate::ir::{ComponentId, QualifiedSlot};
 
 /// A state slot qualified by its owning component: `(component, label)`. Lets a
 /// `ComponentSetter` prop (a write into a parent slot) be a first-class churn
-/// node alongside a local setter.
-pub(in crate::rules) type SlotNode = (ComponentId, HookLabel);
+/// node alongside a local setter. The IR's [`QualifiedSlot`], under the name
+/// this module always used.
+pub(in crate::rules) type SlotNode = QualifiedSlot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(in crate::rules) enum Freshness {
@@ -820,27 +821,4 @@ fn guard_var(cond: &Expr) -> Option<&str> {
         },
         _ => None,
     }
-}
-
-/// True when every entry→exit path of `cfg` passes through one of `blocks`.
-pub(in crate::rules) fn on_all_paths(cfg: &CFG, blocks: &HashSet<BlockId>) -> bool {
-    if blocks.contains(&cfg.entry) {
-        return true;
-    }
-    // BFS avoiding `blocks`; reaching an exit block means a path escapes.
-    let mut visited: HashSet<BlockId> = HashSet::new();
-    let mut queue = vec![cfg.entry];
-    visited.insert(cfg.entry);
-    while let Some(bid) = queue.pop() {
-        let succs = cfg.successors(bid);
-        if succs.is_empty() {
-            return false; // exit reached without hitting a call block
-        }
-        for succ in succs {
-            if !blocks.contains(&succ) && visited.insert(succ) {
-                queue.push(succ);
-            }
-        }
-    }
-    true
 }
