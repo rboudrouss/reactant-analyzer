@@ -40,7 +40,7 @@ impl Rule for RedundantSetState {
         let result = &result.components[&component];
         let mut diags = Vec::new();
         // One scratch heap for the whole component — see
-        // [`crate::rules::helpers::Eval`].
+        // [`crate::engine::eval::Eval`].
         let mut scratch = result.heap.clone();
 
         // Slots whose value this rule has no standing to talk about (#92).
@@ -58,6 +58,9 @@ impl Rule for RedundantSetState {
             let mut regions: HashMap<HookLabel, WriterRegion> = HashMap::new();
             let mut multi: HashSet<HookLabel> = HashSet::new();
             for w in &result.slot_writers {
+                if w.owner.is_some() {
+                    continue; // a foreign label is the owner's (ADR-042 §2)
+                }
                 match regions.entry(w.slot) {
                     std::collections::hash_map::Entry::Vacant(e) => {
                         e.insert(w.region);

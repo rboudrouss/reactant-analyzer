@@ -166,7 +166,7 @@ impl RenderIndex {
             .get(&owner)
             .into_iter()
             .flat_map(|r| &r.slot_writers)
-            .filter(|w| w.slot == label)
+            .filter(|w| w.owner.is_none() && w.slot == label)
             .filter_map(|w| match w.region {
                 WriterRegion::Effect(e) => Some(e),
                 _ => None,

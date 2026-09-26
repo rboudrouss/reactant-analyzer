@@ -122,7 +122,7 @@ impl Rule for WastedSubtreeRender {
             }
         }
         for w in &result.slot_writers {
-            if !states.contains(&w.slot) {
+            if w.owner.is_some() || !states.contains(&w.slot) {
                 continue;
             }
             // The registrations of the effect whose callback may write

@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 
 use crate::{
     domains::AbstractDomain,
-    ir::{ComponentId, types::HookLabel},
+    ir::{ComponentId, QualifiedSlot, types::HookLabel},
 };
 
 /// Threshold on `Versioned` label sets before widening to `VersionedTop`
@@ -41,7 +41,7 @@ pub enum Stability {
     /// Changes *only* at setter events of these state slots (may bound).
     /// Invariant: non-empty (canonicalised — `Versioned(∅) ≡ Stable`) and
     /// `len() ≤ VERSIONED_LABELS_THRESHOLD` (widened to `VersionedTop` above).
-    Versioned(BTreeSet<(ComponentId, HookLabel)>),
+    Versioned(BTreeSet<QualifiedSlot>),
     /// Versioned by unknown state slots (threshold-widened `Versioned`).
     VersionedTop,
     /// A fresh reference every render, guaranteed (must bound).
@@ -53,7 +53,7 @@ pub enum Stability {
 
 impl Stability {
     /// Canonicalising constructor: ∅ → `Stable`, over-threshold → `VersionedTop`.
-    pub fn versioned(labels: BTreeSet<(ComponentId, HookLabel)>) -> Self {
+    pub fn versioned(labels: BTreeSet<QualifiedSlot>) -> Self {
         if labels.is_empty() {
             Stability::Stable
         } else if labels.len() > VERSIONED_LABELS_THRESHOLD {
