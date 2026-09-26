@@ -161,6 +161,28 @@ fn list_items_keep_the_state_in_the_component_that_maps_them() {
     assert!(message(&ds[0]).contains("`<Wrapper>`, 1 level below `App`"));
 }
 
+/// A writer that also writes a module binding changes whatever reads it: a
+/// sibling of the state's reader that does keeps the home at the owner
+/// (#147).
+#[test]
+fn a_module_binding_written_by_the_writer_is_a_use_where_it_is_read() {
+    let ds = findings("module_write.tsx", &[]);
+    let ms: Vec<&str> = ds.iter().map(message).collect();
+    assert_eq!(ms.len(), 2, "{ms:#?}");
+    assert!(
+        ms.iter()
+            .any(|m| m.contains("`<PlainField>`, 2 levels below `Plain`")),
+        "{ms:#?}"
+    );
+    // A utility inlined into the writer binds its result locally: no module
+    // write, so the opaque sibling is not a possible reader of one.
+    assert!(
+        ms.iter()
+            .any(|m| m.contains("`<InlinedField>`, 2 levels below `Inlined`")),
+        "{ms:#?}"
+    );
+}
+
 #[test]
 fn a_bad_option_is_a_usage_error() {
     let out = Command::new(env!("CARGO_BIN_EXE_reactant"))

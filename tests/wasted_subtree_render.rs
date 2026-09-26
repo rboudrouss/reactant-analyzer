@@ -200,3 +200,35 @@ fn a_trigger_inside_a_custom_hook_names_the_hook() {
     assert!(m.contains("each `resize` event writes state `size`"), "{m}");
     assert!(m.contains("The writes come from `useWindowSize`"), "{m}");
 }
+
+/// A handler that writes a module binding beside the state changes whatever
+/// reads that binding: directly, through a local utility, or through a
+/// mutating method. The write travels with the setter it is handed along
+/// with, and through a call that may return a function calling its argument
+/// (#147). `continuousOnly` is off because a state written only inside a
+/// closure handed to an opaque call reads as finitely valued.
+#[test]
+fn a_module_binding_written_beside_the_state_is_followed_to_its_readers() {
+    let ds = findings(
+        "module_write.tsx",
+        &[
+            "--rule-option",
+            "wasted-subtree-render:continuousOnly=false",
+        ],
+    );
+    let ms: Vec<String> = ds.iter().map(message).collect();
+    assert_eq!(ms.len(), 4, "{ms:#?}");
+    let control = ms.iter().find(|m| m.contains("`<Hits>`")).expect("Control");
+    assert!(
+        control.contains("`<Hits>`, `<Count>`, `<Seen>`, `<Stats>` and `<Chart>`"),
+        "{control}"
+    );
+    for m in ms.iter().filter(|m| !m.contains("`<Hits>`")) {
+        assert!(
+            m.contains("re-renders `<Chart>` (2 component renders)"),
+            "{m}"
+        );
+        assert!(!m.contains("Last"), "{m}");
+    }
+    assert!(ms.iter().any(|m| m.contains("in `<Field>`")), "{ms:#?}");
+}

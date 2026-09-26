@@ -103,6 +103,51 @@ pub fn object_member<'e>(fields: &'e [(Symbol, Expr)], key: &str) -> Option<&'e 
         .map(|(_, v)| v)
 }
 
+/// Methods that mutate their receiver in place (Array, Map/Set, typed arrays).
+/// The receiver's reference identity is unchanged — that is the bug when the
+/// receiver is state: React compares with `Object.is` and bails out.
+///
+/// The one list every reader of "is this a mutation site" shares (ADR-028
+/// §2): `state-mutation`, the Tier-A purity guard and render dependence.
+pub const MUTATING_METHODS: &[&str] = &[
+    "push",
+    "pop",
+    "shift",
+    "unshift",
+    "splice",
+    "sort",
+    "reverse",
+    "fill",
+    "copyWithin",
+    "add",
+    "delete",
+    "clear",
+    "set",
+];
+
+/// The receiver `expr` mutates in place, when `expr` is a mutation site in
+/// call position.
+///
+/// The statement form is [`crate::ir::stmt::Stmt::MemberWrite`], whose `obj`
+/// is its receiver; it has no expression to match, which is why it is not
+/// folded in here.
+pub fn mutation_receiver(expr: &Expr) -> Option<&Expr> {
+    let Expr::Call { fn_, args } = expr else {
+        return None;
+    };
+    match fn_.as_ref() {
+        // `items.push(x)` — the receiver is mutated.
+        Expr::FieldAccess { obj, field } if MUTATING_METHODS.contains(&field.as_str()) => Some(obj),
+        // `Object.assign(target, …)` mutates its first argument, not `Object`.
+        Expr::FieldAccess { obj, field }
+            if field == "assign" && matches!(obj.as_ref(), Expr::Var(v) if v == "Object") =>
+        {
+            args.first()
+        }
+        _ => None,
+    }
+}
+
 /// The component a JSX callee was proven to name: the file that defines it and
 /// the name that file knows it by.
 ///

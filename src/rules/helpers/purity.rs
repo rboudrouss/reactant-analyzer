@@ -1,16 +1,19 @@
 //! What counts as an in-place mutation, and whether a function body performs
 //! one on something it does not own.
 //!
-//! Two clients ask different questions of the same syntax. `state-mutation`
+//! Three clients ask different questions of the same syntax. `state-mutation`
 //! asks "is this receiver *that* state slot", to pair a mutation with a
 //! same-reference set. The Tier-A `updater_body` guard asks "does this body
-//! touch anything it did not allocate". Only the first half — *which shapes
-//! are mutation sites at all* — is shared, and it is shared here so the two
-//! cannot drift: a method added to `MUTATING_METHODS` is seen by both, and a
-//! new mutation form is recognised in one place (ADR-028 §2).
+//! touch anything it did not allocate". Render dependence asks "which
+//! module-scope names does this handler write". Only the first half — *which
+//! shapes are mutation sites at all* — is shared, and it lives in the IR
+//! ([`crate::ir::expr::mutation_receiver`]) so the three cannot drift: a
+//! method added to `MUTATING_METHODS` is seen by all, and a new mutation form
+//! is recognised in one place (ADR-028 §2).
 //!
-//! The rooting question stays with each client, because it is genuinely two
-//! questions: one is about a named slot, the other about ownership.
+//! The rooting question stays with each client, because it is genuinely
+//! different questions: one is about a named slot, one about ownership, one
+//! about the file's scope.
 
 use std::collections::{HashMap, HashSet};
 
@@ -22,46 +25,7 @@ use crate::ir::{
     types::Var,
 };
 
-/// Methods that mutate their receiver in place (Array, Map/Set, typed arrays).
-/// The receiver's reference identity is unchanged — that is the bug when the
-/// receiver is state: React compares with `Object.is` and bails out.
-pub(crate) const MUTATING_METHODS: &[&str] = &[
-    "push",
-    "pop",
-    "shift",
-    "unshift",
-    "splice",
-    "sort",
-    "reverse",
-    "fill",
-    "copyWithin",
-    "add",
-    "delete",
-    "clear",
-    "set",
-];
-
-/// The receiver `expr` mutates in place, when `expr` is a mutation site in
-/// call position.
-///
-/// The statement form is [`Stmt::MemberWrite`], whose `obj` is its receiver;
-/// it has no expression to match, which is why it is not folded in here.
-pub(crate) fn mutation_receiver(expr: &Expr) -> Option<&Expr> {
-    let Expr::Call { fn_, args } = expr else {
-        return None;
-    };
-    match fn_.as_ref() {
-        // `items.push(x)` — the receiver is mutated.
-        Expr::FieldAccess { obj, field } if MUTATING_METHODS.contains(&field.as_str()) => Some(obj),
-        // `Object.assign(target, …)` mutates its first argument, not `Object`.
-        Expr::FieldAccess { obj, field }
-            if field == "assign" && matches!(obj.as_ref(), Expr::Var(v) if v == "Object") =>
-        {
-            args.first()
-        }
-        _ => None,
-    }
-}
+pub(crate) use crate::ir::expr::mutation_receiver;
 
 /// Whether a function body writes to something it does not own (ADR-028 §2).
 ///

@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use crate::engine::WriterRegion;
-use crate::engine::render_deps::param_gated_vars;
+use crate::engine::render_deps::{Relevance, Source, Writes, param_gated_vars};
 use crate::ir::free_vars::compute_free_vars;
 use crate::ir::hooks::HookEntry;
 use crate::ir::{ComponentId, HookLabel, SourceRange, expr::Expr};
@@ -79,7 +79,7 @@ impl Rule for WastedSubtreeRender {
         // writes its slots in one batch, so they re-render together: group
         // by it.
         let mut triggers: Vec<Trigger> = Vec::new();
-        let mut add = |key: TriggerKey, slot: HookLabel, events: Events, span, place| {
+        let mut add = |key: TriggerKey, slot: HookLabel, events: Events, span, place, writes| {
             let i = match triggers.iter().position(|t| t.key == key) {
                 Some(i) => i,
                 None => {
@@ -89,12 +89,14 @@ impl Rule for WastedSubtreeRender {
                         events: BTreeSet::new(),
                         span,
                         place,
+                        writes: Writes::default(),
                     });
                     triggers.len() - 1
                 }
             };
             triggers[i].slots.insert(slot);
             triggers[i].events.extend(events);
+            triggers[i].writes.union_with(&writes);
         };
         // A handler may be the owner's own, or one down the tree that the
         // setter was handed to: either way the write re-renders the owner.
@@ -115,6 +117,7 @@ impl Rule for WastedSubtreeRender {
                     events,
                     span,
                     place,
+                    l.writes,
                 );
             }
         }
@@ -138,7 +141,8 @@ impl Rule for WastedSubtreeRender {
                 })
                 .collect();
             let span = result.effect_info.get(&e).and_then(|i| i.span);
-            add(TriggerKey::Effect(e), w.slot, events, span, None);
+            let writes = index.effect_writes(owner, e);
+            add(TriggerKey::Effect(e), w.slot, events, span, None, writes);
         }
         let mut diags = Vec::new();
         for Trigger {
@@ -147,8 +151,14 @@ impl Rule for WastedSubtreeRender {
             events,
             span,
             place,
+            writes,
         } in triggers
         {
+            // A trigger that may write anything leaves no element proven
+            // unaffected.
+            if writes.top {
+                continue;
+            }
             // A continuous event re-renders continuously only if it can keep
             // writing new values: a boolean or a few constants re-render at
             // the rate of their transitions (`scrollY > 50` flips once).
@@ -164,7 +174,15 @@ impl Rule for WastedSubtreeRender {
                 continue;
             }
             let labels: Vec<HookLabel> = slots.iter().copied().collect();
-            let wasted = index.wasted_siblings(owner, &labels, program);
+            // The batch changes the slots, and whatever reads a module name
+            // the trigger writes beside them.
+            let rel = Relevance::of(
+                labels
+                    .iter()
+                    .map(|l| Source::Slot(*l))
+                    .chain(writes.sources()),
+            );
+            let wasted = index.wasted_siblings(owner, &rel, program);
             let total: usize = wasted.iter().map(|w| w.renders).sum();
             let list = wasted.iter().any(|w| w.list);
             if wasted.is_empty() || (total < min_wasted && !list) {
@@ -269,6 +287,8 @@ struct Trigger {
     span: Option<SourceRange>,
     /// The component the handler sits in, when not the owner.
     place: Option<ComponentId>,
+    /// The module names the batch writes beside the slots.
+    writes: Writes,
 }
 
 /// The custom hook an effect was inlined from, by name: the effect's inlined
