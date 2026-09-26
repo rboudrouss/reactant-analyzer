@@ -157,7 +157,11 @@ pub fn splice_callee_into_cfg(
             },
             Terminator::Return(ret) => {
                 if let Some(var) = bound_var {
-                    block.stmts.push(Stmt::Assign {
+                    // A `Let`, like the call statement it replaces: the
+                    // variable is bound here, and an `Assign` without a `Let`
+                    // is the IR's spelling of a write to an outer binding
+                    // (see `bound_vars`), which this is not.
+                    block.stmts.push(Stmt::Let {
                         var: var.clone(),
                         rhs: ret,
                         // `Terminator::Return` carries no span of its own, so
@@ -950,13 +954,14 @@ mod tests {
                 .any(|s| matches!(s, Stmt::Let { var, .. } if var == "a#7")),
             "callee local `a` should be renamed to `a#7`: {stmts:?}"
         );
-        // The return value is bound to the caller variable `x`.
+        // The return value is bound to the caller variable `x`, by a `Let`:
+        // the call statement it replaces was one.
         assert!(
             stmts.iter().any(|s| matches!(
                 s,
-                Stmt::Assign { var, rhs: Expr::Var(v), .. } if var == "x" && v == "a#7"
+                Stmt::Let { var, rhs: Expr::Var(v), .. } if var == "x" && v == "a#7"
             )),
-            "return should bind `x = a#7`: {stmts:?}"
+            "return should bind `let x = a#7`: {stmts:?}"
         );
     }
 
