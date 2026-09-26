@@ -13,7 +13,10 @@ use crate::{
         AbstractEnv, StateValue,
         stores::{EnvVal, Heap, HeapValue},
     },
-    engine::AnalysisResult,
+    engine::{
+        AnalysisResult,
+        written::{self, SiteEnvs, Written},
+    },
     ir::{
         SourceRange,
         cfg::{CFG, Terminator},
@@ -141,7 +144,7 @@ pub fn collect_setter_calls_with_extra(
     for site in &found {
         by_var
             .entry(site.var.clone())
-            .or_insert((site.span, site.block_id, site.class));
+            .or_insert((site.span, site.at.map(|(b, _)| b), site.class));
     }
     by_var
         .into_iter()
@@ -163,9 +166,15 @@ pub(crate) struct WriteSite {
     pub span: Option<SourceRange>,
     pub class: WalkClass,
     pub prov_block: Option<BlockId>,
+    /// The statement of the region CFG a `Sync` site runs in: its block and
+    /// the statement's index in it (the terminator counts as one past the
+    /// last statement). `None` for every other class.
+    pub at: Option<(BlockId, usize)>,
     /// The site may run many times per tick (a sync HOF callback).
     pub repeats: bool,
     pub updater: Updater,
+    /// Argument 0 as written, `None` for a bare `setX()`.
+    pub arg: Option<Expr>,
 }
 
 /// Every write site in `cfg`, one row per call site — no collapse of any
@@ -224,8 +233,10 @@ pub(crate) fn collect_write_sites(
             span: s.span,
             class: s.class,
             prov_block: s.prov_block,
+            at: s.at,
             repeats: s.repeats,
             updater: s.updater,
+            arg: s.arg,
         })
         .collect()
 }
@@ -751,6 +762,20 @@ pub struct SlotWriter {
     /// depth-capped, so a write it never saw cannot make this `false` a
     /// promise, which is why no guard may assert the negative.
     pub same_tick: bool,
+    /// The component that owns `slot` when it is not this one: the write went
+    /// through a `ComponentSetter` prop (ADR-042 §2, the ADR-030 §1 device).
+    /// `None` for a local slot. A foreign row's `slot` is the OWNER's label,
+    /// so a reader that resolves it against this component's tables names an
+    /// unrelated slot (ADR-030 §3); every native reader filters on `owner`.
+    /// A foreign row is a may-write: the prop may be a closure that merely
+    /// carries the setter.
+    pub owner: Option<ComponentId>,
+    /// The block of the region's CFG the write runs in, for a write that runs
+    /// synchronously in the region, once per pass — what `must_on_all_paths`
+    /// takes. `None` for a nested, deferred, cleanup or repeating site.
+    pub block: Option<BlockId>,
+    /// What the write stores (ADR-042 §2).
+    pub written: Written,
 }
 
 /// Provenance of one write site (ADR-027 §4).
@@ -967,12 +992,25 @@ pub(crate) fn collect_slot_writers(
     hooks: &[HookEntry],
     regions: &InlineRegions,
     hook_provenance: &[crate::ir::hooks::HookProvenance],
+    foreign: &HashMap<Var, SetterProp>,
+    envs: &SiteEnvs<'_>,
 ) -> Vec<SlotWriter> {
     let mut labels = setter_var_labels(render_cfg);
     for cfg in std::iter::once(render_cfg).chain(hooks.iter().filter_map(|h| h.body_cfg())) {
         labels = resolve_setter_aliases(cfg, &labels);
     }
-    let setter_vars: HashSet<Var> = labels.keys().cloned().collect();
+    // Every name a write can go through, with the slot it writes and the slot's
+    // owner. A local binding wins a tie (ADR-030 §1). Foreign names are not
+    // alias-resolved: `cross_component_setters` already reads the converged
+    // value of every render binding, so an alias holds the same setter value.
+    let mut targets: HashMap<Var, (Option<ComponentId>, HookLabel)> =
+        labels.into_iter().map(|(v, l)| (v, (None, l))).collect();
+    for (v, prop) in foreign {
+        targets
+            .entry(v.clone())
+            .or_insert((Some(prop.component), prop.label));
+    }
+    let setter_vars: HashSet<Var> = targets.keys().cloned().collect();
     // Any local binding of a deferring global's name disables its summary,
     // wherever the call sits (fail-closed across every body, nested `FnLit`
     // scopes included).
@@ -1050,23 +1088,26 @@ pub(crate) fn collect_slot_writers(
         // resolving one in the region CFG answers about an unrelated block.
         // Only sync sites can co-execute within a tick — a deferred or handler
         // write is a separate turn by construction.
-        let mut sync_blocks: HashMap<HookLabel, Vec<BlockId>> = HashMap::new();
+        let mut sync_blocks: HashMap<(Option<ComponentId>, HookLabel), Vec<BlockId>> =
+            HashMap::new();
         for s in &sites {
             if s.class == WalkClass::Sync
-                && let (Some(&slot), Some(b)) = (labels.get(&s.var), s.prov_block)
+                && let (Some(&target), Some(b)) = (targets.get(&s.var), s.prov_block)
             {
-                sync_blocks.entry(slot).or_default().push(b);
+                sync_blocks.entry(target).or_default().push(b);
             }
         }
         let reach = Reachability::of(cfg);
         for site in sites {
-            let Some(&slot) = labels.get(&site.var) else {
+            let Some(&(owner, slot)) = targets.get(&site.var) else {
                 continue;
             };
             let same_tick = site.repeats
                 || match (site.class, site.prov_block) {
                     (WalkClass::Sync, Some(b)) => {
-                        let blocks = sync_blocks.get(&slot).map_or(&[][..], Vec::as_slice);
+                        let blocks = sync_blocks
+                            .get(&(owner, slot))
+                            .map_or(&[][..], Vec::as_slice);
                         // Co-execution is symmetric — "these two land in the
                         // same tick" does not care which runs first — so the
                         // question is reachability in EITHER direction, plus
@@ -1080,6 +1121,16 @@ pub(crate) fn collect_slot_writers(
                     _ => false,
                 };
             let updater = site.updater.clone();
+            // A position only a write that runs synchronously in this region,
+            // once per pass, can claim: a repeating site runs 0..N times and
+            // every other class runs on another turn or in another CFG.
+            let at = (site.class == WalkClass::Sync && !site.repeats)
+                .then_some(site.at)
+                .flatten();
+            let block = at.map(|(b, _)| b);
+            let written = written::classify(site.arg.as_ref(), &site.updater, |e| {
+                envs.eval(region, cfg, at, e)
+            });
             let via = {
                 let mut chain: Vec<Symbol> = hook_origin.into_iter().cloned().collect();
                 match site.prov_block {
@@ -1095,6 +1146,9 @@ pub(crate) fn collect_slot_writers(
                             via: WriteProvenance::Unknown,
                             updater,
                             same_tick,
+                            owner,
+                            block,
+                            written,
                         });
                         continue;
                     }
@@ -1121,6 +1175,9 @@ pub(crate) fn collect_slot_writers(
                 via,
                 updater,
                 same_tick,
+                owner,
+                block,
+                written,
             });
         }
     };
@@ -1310,14 +1367,14 @@ impl Found {
         &mut self,
         inner: Found,
         mode: WalkClass,
-        block_id: Option<BlockId>,
+        at: Option<(BlockId, usize)>,
         prov: Option<BlockId>,
     ) {
         for site in inner.setters {
             let sync = site.class == WalkClass::Sync;
             self.setters.push(FoundSite {
                 class: if sync { mode } else { site.class },
-                block_id: if sync { block_id } else { None },
+                at: if sync { at } else { None },
                 prov_block: prov,
                 ..site
             });
@@ -1359,10 +1416,12 @@ struct FoundSite {
     var: Var,
     class: WalkClass,
     span: Option<SourceRange>,
-    /// `Some` only for `Sync` rows, where it is meaningful for dominance.
-    /// NOT usable for reachability: a site inside a nested body records a
-    /// block of *that* body's CFG, and `BlockId` is per-CFG.
-    block_id: Option<BlockId>,
+    /// The statement the site runs in — block and statement index — `Some`
+    /// only for `Sync` rows, where it is meaningful for dominance and for
+    /// the env the argument is evaluated in. NOT usable for reachability: a
+    /// site inside a nested body records a block of *that* body's CFG, and
+    /// `BlockId` is per-CFG.
+    at: Option<(BlockId, usize)>,
     /// The top-level block the walk descended from — always a block of the
     /// walked root, which makes it the only id that means anything in the
     /// region's CFG. Region membership reads it (a nested callback defined
@@ -1375,6 +1434,8 @@ struct FoundSite {
     repeats: bool,
     /// Argument 0 of the call, classified where the walk still has it.
     updater: Updater,
+    /// Argument 0 as written, for the value the row stores (ADR-042 §2).
+    arg: Option<Expr>,
 }
 
 /// `Array.prototype` HOFs that call their function argument synchronously —
@@ -1637,11 +1698,12 @@ impl<'a> SetterWalk<'a> {
             let outer_repeating = self.repeating;
             self.repeating = outer_repeating || reach.reaches(bid, bid);
             if let Some(block) = cfg.blocks.get(&bid) {
-                for stmt in &block.stmts {
-                    self.stmt(
-                        stmt, block_id, depth, found, mode, at_root, prov_block, witness,
-                    );
+                for (i, stmt) in block.stmts.iter().enumerate() {
+                    let at = block_id.map(|b| (b, i));
+                    self.stmt(stmt, at, depth, found, mode, at_root, prov_block, witness);
                 }
+                // The terminator runs after every statement of the block.
+                let at = block_id.map(|b| (b, block.stmts.len()));
                 match &block.term {
                     Terminator::Return(expr) => {
                         // An effect body's returned function is its cleanup
@@ -1667,15 +1729,13 @@ impl<'a> SetterWalk<'a> {
                                 );
                             }
                         }
-                        self.expr(
-                            expr, witness, block_id, depth, found, mode, at_root, prov_block,
-                        );
+                        self.expr(expr, witness, at, depth, found, mode, at_root, prov_block);
                     }
                     Terminator::Branch { cond, span, .. } => {
                         self.expr(
                             cond,
                             span.or(witness),
-                            block_id,
+                            at,
                             depth,
                             found,
                             mode,
@@ -1736,7 +1796,7 @@ impl<'a> SetterWalk<'a> {
     fn stmt(
         &mut self,
         stmt: &'a Stmt,
-        block_id: Option<BlockId>,
+        at: Option<(BlockId, usize)>,
         depth: usize,
         found: &mut Found,
         mode: WalkClass,
@@ -1758,12 +1818,12 @@ impl<'a> SetterWalk<'a> {
         // `state.items.push(x)` reads `state`: the receiver of a member write
         // is the one read position the rhs does not carry.
         if let Stmt::MemberWrite { obj, key, .. } = stmt {
-            self.expr(obj, span, block_id, depth, found, mode, at_root, prov);
+            self.expr(obj, span, at, depth, found, mode, at_root, prov);
             if let crate::ir::stmt::MemberKey::Index(idx) = key {
-                self.expr(idx, span, block_id, depth, found, mode, at_root, prov);
+                self.expr(idx, span, at, depth, found, mode, at_root, prov);
             }
         }
-        self.expr(expr, span, block_id, depth, found, mode, at_root, prov);
+        self.expr(expr, span, at, depth, found, mode, at_root, prov);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1771,7 +1831,7 @@ impl<'a> SetterWalk<'a> {
         &mut self,
         expr: &'a Expr,
         stmt_span: Option<SourceRange>,
-        block_id: Option<BlockId>,
+        at: Option<(BlockId, usize)>,
         depth: usize,
         found: &mut Found,
         mode: WalkClass,
@@ -1802,9 +1862,7 @@ impl<'a> SetterWalk<'a> {
             }
         });
         for child in children {
-            self.expr(
-                child, stmt_span, block_id, depth, found, mode, at_root, prov,
-            );
+            self.expr(child, stmt_span, at, depth, found, mode, at_root, prov);
         }
         if let Expr::Call { fn_, args } = expr {
             if let Expr::Var(name) = fn_.as_ref() {
@@ -1813,10 +1871,11 @@ impl<'a> SetterWalk<'a> {
                         var: name.clone(),
                         class: mode,
                         span: stmt_span,
-                        block_id,
+                        at,
                         prov_block: prov,
                         repeats: self.repeating,
                         updater: self.updater_of(args),
+                        arg: args.first().map(|a| a.peel_ts().clone()),
                     });
                 }
                 // B6: direct call to a locally-bound function — its body runs
@@ -1840,7 +1899,7 @@ impl<'a> SetterWalk<'a> {
                         prov,
                         stmt_span,
                     );
-                    found.absorb(inner, mode, block_id, prov);
+                    found.absorb(inner, mode, at, prov);
                 }
             }
             // An immediately-invoked function expression runs NOW, at this
@@ -1862,7 +1921,7 @@ impl<'a> SetterWalk<'a> {
                     prov,
                     stmt_span,
                 );
-                found.absorb(inner, mode, block_id, prov);
+                found.absorb(inner, mode, at, prov);
             }
             // The listener `FnLit` of an effect-top-level `addEventListener`
             // is exactly what `extract_subscriptions` reified as a Handler

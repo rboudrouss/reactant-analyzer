@@ -37,14 +37,10 @@ use crate::ir::{ComponentId, QualifiedSlot};
 /// this module always used.
 pub(in crate::rules) type SlotNode = QualifiedSlot;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(in crate::rules) enum Freshness {
-    Not,
-    /// May store a fresh reference (opaque value, imprecise updater).
-    Maybe,
-    /// Must store a fresh reference every call (`PerRender` argument).
-    Fresh,
-}
+/// Moved to the engine (ADR-042 §2): the freshness verdict and the reference
+/// projection are columns of the writer row now. Re-exported so the two churn
+/// arms keep reading them here until they read the row itself.
+pub(in crate::rules) use crate::engine::written::{Freshness, reference_part};
 
 /// A `setX(arg)` call site found in an effect body. The target slot is
 /// qualified `(component, label)` so `ComponentSetter` props (writes into a
@@ -225,17 +221,6 @@ fn slot_member(
     rooted.then_some(first).flatten()
 }
 
-/// Projection of a written value onto its reference slot — what a
-/// reference-churn loop can actually carry across renders. Every primitive
-/// part (which cannot fail `Object.is` freshly) is dropped, so guard proofs
-/// don't lose to residual ⊤ noise. A ⊥ reference slot yields ⊥: no
-/// reference can ever be stored → the claimed reference churn is vacuous.
-pub(in crate::rules) fn reference_part(
-    written: &crate::domains::StateValue,
-) -> crate::domains::StateValue {
-    crate::domains::StateValue::reference(written.reference.clone())
-}
-
 /// Evaluate `expr` in the render exit environment (same pattern as
 /// `all_deps_provably_stable`).
 pub(in crate::rules) fn eval_in_exit_env(
@@ -244,78 +229,6 @@ pub(in crate::rules) fn eval_in_exit_env(
 ) -> crate::domains::StateValue {
     use super::ConvergedEval;
     comp_result.eval_in(&comp_result.exit_env(), expr)
-}
-
-/// Must the argument of a setter call store a fresh reference?
-fn arg_freshness(
-    arg: &Expr,
-    comp_result: &crate::engine::AnalysisResult<crate::domains::StateValue>,
-) -> Freshness {
-    match arg.peel_ts() {
-        // Functional updater: React stores the *return* value.
-        Expr::FnLit {
-            params, body_cfg, ..
-        } => {
-            let mut returns = Vec::new();
-            for block in body_cfg.blocks.values() {
-                if let crate::ir::cfg::Terminator::Return(e) = &block.term {
-                    returns.push(e.peel_ts());
-                }
-            }
-            if returns.is_empty() {
-                return Freshness::Maybe;
-            }
-            let fresh = returns
-                .iter()
-                .map(|e| classify_updater_return(e, params))
-                .collect::<Vec<_>>();
-            if fresh.iter().all(|f| *f == Freshness::Fresh) {
-                Freshness::Fresh
-            } else if fresh.iter().all(|f| *f == Freshness::Not) {
-                Freshness::Not
-            } else {
-                Freshness::Maybe
-            }
-        }
-        other => {
-            // Churn is about the REFERENCE kind only: a widened numeric value
-            // (`count + 1`) changes but never fails `Object.is` freshly.
-            let val = eval_in_exit_env(other, comp_result);
-            match &val.reference {
-                Stability::PerRender => {
-                    if val.is_unstable_reference_only() {
-                        Freshness::Fresh
-                    } else {
-                        Freshness::Maybe // joined with other kinds
-                    }
-                }
-                Stability::Unknown => Freshness::Maybe,
-                // Stable / Versioned / ⊥ reference; residual ⊤ stays Maybe.
-                _ if val.other => Freshness::Maybe,
-                _ => Freshness::Not,
-            }
-        }
-    }
-}
-
-/// Freshness of one return expression of a functional updater, without an
-/// environment (the updater runs in its own scope).
-fn classify_updater_return(e: &Expr, params: &[Var]) -> Freshness {
-    match e.peel_ts() {
-        Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::FnLit { .. } => Freshness::Fresh,
-        // Identity updater `o => o` and literal resets converge.
-        Expr::Var(v) if params.first().is_some_and(|p| p == v) => Freshness::Not,
-        Expr::Lit(_) => Freshness::Not,
-        // JS operators return primitives — except logical ops, which return
-        // an operand: never *must*-fresh, at most maybe.
-        Expr::BinOp { lhs, rhs, .. } => {
-            let l = classify_updater_return(lhs, params);
-            let r = classify_updater_return(rhs, params);
-            l.max(r).min(Freshness::Maybe)
-        }
-        Expr::UnaryOp { .. } => Freshness::Not,
-        _ => Freshness::Maybe,
-    }
 }
 
 /// Recursively collect `setX(arg)` calls with their argument freshness.
@@ -390,26 +303,22 @@ fn churn_calls_in_expr(
         Expr::Call { fn_, args } => {
             if let Expr::Var(name) = fn_.peel_ts() {
                 if let Some(node) = setter_nodes.get(name) {
-                    let freshness = args
-                        .first()
-                        .map(|a| arg_freshness(a, comp_result))
-                        .unwrap_or(Freshness::Not);
-                    let written = match args.first().map(Expr::peel_ts) {
-                        // A fresh-returning updater stores a fresh (truthy,
-                        // non-null) reference — enough for guard proofs.
-                        Some(Expr::FnLit { .. }) => {
-                            crate::domains::StateValue::reference(Stability::PerRender)
-                        }
-                        Some(a) => eval_in_exit_env(a, comp_result),
-                        None => crate::domains::StateValue::top(),
-                    };
+                    // The engine's classifier, fed the render exit env this
+                    // collector always used; the row's own env comes with the
+                    // row (ADR-042 slice 4). `Unknown` keeps a bound updater
+                    // on the value path, as before.
+                    let w = crate::engine::written::classify(
+                        args.first(),
+                        &crate::engine::setters::Updater::Unknown,
+                        |e| eval_in_exit_env(e, comp_result),
+                    );
                     out.push(ChurnSetterCall {
                         node: *node,
-                        freshness,
+                        freshness: w.fresh,
                         block_id,
                         span,
-                        written,
-                        written_expr: args.first().map(|a| a.peel_ts().clone()),
+                        written: w.value,
+                        written_expr: w.expr,
                     });
                 } else if depth > 0
                     && let Some(body) = fn_bindings.get(name)

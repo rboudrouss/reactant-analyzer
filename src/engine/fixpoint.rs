@@ -596,11 +596,33 @@ fn analyze_component_impl<T: Transfer<Domain = StateValue>>(
     let hook_calls = collect_hook_calls(&hooks, &render_cfg);
     let effect_info = collect_effect_info(&hooks);
     let handler_info = collect_handler_info(&hooks);
+    // A write through a parent's setter prop is a row too, owner-qualified
+    // (ADR-042 §2) — the same resolution `setter-in-render` reads.
+    let foreign: HashMap<Var, crate::engine::setters::SetterProp> =
+        crate::engine::setters::collect_component_setter_vars(&render_cfg, &block_states, &heap)
+            .into_iter()
+            .filter(|(_, prop)| prop.component != comp_id)
+            .collect();
+    // The envs each row's argument is evaluated in: the converged stores, and
+    // the per-block envs of the region the row sits in.
+    let site_envs = crate::engine::written::SiteEnvs {
+        component: comp_id,
+        state: &final_state,
+        memo: &memo_store,
+        heap: &heap,
+        render_entry: &initial_env,
+        render_exits: &block_states,
+        exit: &env_exit,
+        effect_exits: &effect_block_states,
+        handler_exits: &handler_block_states,
+    };
     let slot_writers = crate::engine::setters::collect_slot_writers(
         &render_cfg,
         &hooks,
         &inline_regions,
         &hook_provenance,
+        &foreign,
+        &site_envs,
     );
     // The seed relation rides the same slice: it folds `slot_writers` rows and
     // the effects' declared deps, so it must come after both (#106, ADR-031).
