@@ -65,9 +65,12 @@ summary.
 
 An element that resolves to no registered component counts as a use
 (ambiguous name, `memo` wrapper per #64, library, unresolved import). So do
-recursion, the depth cap and ⊤. Two assumptions are stated, not proven:
-- a call bound to a variable depends only on its callee and arguments;
-- a module-level mutable binding is not a render input.
+recursion, the depth cap and ⊤. A name the component does not bind reads as
+`Module(name)`, and a function value carries the module names it writes
+(`Deps::writes`); a slot's relevance takes in the names its writers write, so
+a render reading one is affected by the write (#147). One assumption stays: a
+call the analysis cannot see into neither reads nor writes a module binding,
+the opaque-callee limit (#51, #52).
 
 ### 3. Two rules, both Warning
 
@@ -125,6 +128,15 @@ a team's call, not the analyzer's.
   inline (`RenderDeps::any_context`). The granularity is the whole value.
   Members, and triggers through a context, come with
   `context-mixes-update-frequencies`, which needs them.
-- Still to do, as issues:
-  - the two stated assumptions (#147);
-  - #64 (`memo`), which turns today's opaque `memo` elements into barriers.
+- A handler that writes a module binding beside a state (#147) is followed
+  to the binding's readers. Every landing, and every effect that writes the
+  slot, contributes the module names it may write (`Writes`, accumulated
+  through the closures the setter is handed along with); the slot's relevance
+  takes them in as `Module(name)`, carried down the element tree untranslated
+  since a module name is the same in every frame. A writer whose written root
+  is ⊤ makes the trigger say nothing. Names match by spelling, across files:
+  a collision means fewer findings, never a wrong one. Both ends have to be
+  visible by name: a write or a read hidden behind an opaque call is the
+  limit stated in §2.
+- Still to do, as issues: #64 (`memo`), which turns today's opaque `memo`
+  elements into barriers.

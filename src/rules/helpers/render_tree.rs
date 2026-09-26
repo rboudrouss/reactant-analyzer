@@ -14,10 +14,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::engine::ProgramAnalysisResult;
 use crate::engine::render_deps::{
-    Deps, ElementSite, HostHandler, Relevance, RenderDeps, Source, render_deps,
+    Deps, ElementSite, HostHandler, Relevance, RenderDeps, Source, Writes, render_deps,
+    written_names,
 };
+use crate::engine::{ProgramAnalysisResult, WriterRegion};
 use crate::ir::{ComponentId, HookLabel, SourceRange, Symbol};
 use crate::lowering::hook_extractor::{is_event_prop, prop_to_event};
 
@@ -90,6 +91,9 @@ pub(in crate::rules) struct Landing {
     /// Some hop on the way calls the capability only behind a test of its
     /// event argument (`if (e.key === "Enter")`).
     pub keyed: bool,
+    /// The module names the handler, and every closure it was handed
+    /// through, may write beside the slot: what reads them changes too.
+    pub writes: Writes,
 }
 
 struct UseTree {
@@ -111,10 +115,17 @@ impl UseTree {
 
 impl RenderIndex {
     pub(in crate::rules) fn build(program: &ProgramAnalysisResult) -> Self {
+        // A free name is a channel only if something in the program writes
+        // it; the set is program-wide because names match across files.
+        let written: HashSet<String> = program
+            .components
+            .values()
+            .flat_map(written_names)
+            .collect();
         let summaries: HashMap<ComponentId, RenderDeps> = program
             .components
             .iter()
-            .map(|(id, c)| (*id, render_deps(c)))
+            .map(|(id, c)| (*id, render_deps(c, &written)))
             .collect();
         let mut mounts: HashMap<ComponentId, usize> = HashMap::new();
         for site in summaries.values().flat_map(|s| &s.sites) {
@@ -137,16 +148,65 @@ impl RenderIndex {
         self.mounts.get(&c).copied().unwrap_or(0)
     }
 
+    /// The module names the writers of `owner`'s slot `label` (its landings
+    /// and the effects writing it) may write beside it. `top`: some writer
+    /// may write anything, so no read is proven unaffected.
+    pub(in crate::rules) fn co_writes(
+        &self,
+        owner: ComponentId,
+        label: HookLabel,
+        program: &ProgramAnalysisResult,
+    ) -> Writes {
+        let mut out = Writes::default();
+        for l in self.landings(owner, label, program) {
+            out.union_with(&l.writes);
+        }
+        let effects = program
+            .components
+            .get(&owner)
+            .into_iter()
+            .flat_map(|r| &r.slot_writers)
+            .filter(|w| w.slot == label)
+            .filter_map(|w| match w.region {
+                WriterRegion::Effect(e) => Some(e),
+                _ => None,
+            });
+        for e in effects {
+            out.union_with(&self.effect_writes(owner, e));
+        }
+        out
+    }
+
+    /// The module names `owner`'s effect `effect` may write.
+    pub(in crate::rules) fn effect_writes(&self, owner: ComponentId, effect: HookLabel) -> Writes {
+        self.summaries
+            .get(&owner)
+            .and_then(|s| s.effect_writes.get(&effect))
+            .cloned()
+            .unwrap_or_else(Writes::top)
+    }
+
     /// The home of `owner`'s state slot `label`, or `None` when nothing uses
     /// the value or nothing writes it (then no write re-renders anything the
-    /// rule could speak about).
+    /// rule could speak about), or when a writer may write anything.
+    ///
+    /// A module name the writers also write is a use of the write wherever
+    /// it is read, so the home cannot sit above such a reader.
     pub(in crate::rules) fn home_of(
         &self,
         owner: ComponentId,
         label: HookLabel,
         program: &ProgramAnalysisResult,
     ) -> Option<Home> {
-        let both = Relevance::of([Source::Slot(label), Source::Setter(label)]);
+        let co = self.co_writes(owner, label, program);
+        if co.top {
+            return None;
+        }
+        let both = Relevance::of(
+            [Source::Slot(label), Source::Setter(label)]
+                .into_iter()
+                .chain(co.sources()),
+        );
         let reads = Relevance::of([Source::Slot(label)]);
         let writes = Relevance::of([Source::Setter(label)]);
         let mut visiting = HashSet::from([owner]);
@@ -196,22 +256,22 @@ impl RenderIndex {
         Some(Home { path, siblings })
     }
 
-    /// The elements `owner` builds whose inputs a write to `labels` (the
-    /// slots one trigger writes together) cannot change, yet which re-render on every such write because their parent
-    /// did: no prop, spread or mount condition of theirs depends on the slot,
-    /// nor does any element they are nested in (a provider could carry it to
-    /// them by context). Only resolved components are candidates: an element
-    /// the registry does not hold may be a `memo` barrier.
+    /// The elements `owner` builds whose inputs a write of `rel` (the slots
+    /// one trigger writes together, and the module names it writes beside
+    /// them) cannot change, yet which re-render on every such write because
+    /// their parent did: no prop, spread or mount condition of theirs depends
+    /// on it, nor does any element they are nested in (a provider could carry
+    /// it to them by context). Only resolved components are candidates: an
+    /// element the registry does not hold may be a `memo` barrier.
     pub(in crate::rules) fn wasted_siblings(
         &self,
         owner: ComponentId,
-        labels: &[HookLabel],
+        rel: &Relevance,
         program: &ProgramAnalysisResult,
     ) -> Vec<Wasted> {
         let Some(summary) = self.summaries.get(&owner) else {
             return Vec::new();
         };
-        let rel = Relevance::of(labels.iter().map(|l| Source::Slot(*l)));
         // A provider hands its `value` on by context, which is followed below
         // (`carried`), and renders its children unchanged: only its mount
         // condition reaches what it wraps.
@@ -219,9 +279,9 @@ impl RenderIndex {
             .sites
             .iter()
             .map(|s| {
-                s.guard.touches(&rel)
+                s.guard.touches(rel)
                     || (s.provides.is_none()
-                        && (s.spread.touches(&rel) || s.props.iter().any(|(_, d)| d.touches(&rel))))
+                        && (s.spread.touches(rel) || s.props.iter().any(|(_, d)| d.touches(rel))))
             })
             .collect();
         let reached = |mut i: usize| -> bool {
@@ -243,8 +303,13 @@ impl RenderIndex {
             let Some(child) = resolve(site, program) else {
                 continue;
             };
-            // A consumer of a context the write changes re-renders anyway.
-            let carried = Relevance::of(contexts_at(summary, i, &rel));
+            // A consumer of a context the write changes re-renders anyway,
+            // and so does a reader of a module name it writes.
+            let carried = Relevance::of(
+                contexts_at(summary, i, rel)
+                    .into_iter()
+                    .chain(rel.modules().cloned()),
+            );
             if self.summaries.get(&child).is_none_or(|s| s.uses(&carried)) {
                 continue;
             }
@@ -325,6 +390,7 @@ impl RenderIndex {
             &rel,
             None,
             false,
+            &Writes::default(),
             program,
             &mut visiting,
             0,
@@ -333,6 +399,9 @@ impl RenderIndex {
         out
     }
 
+    /// `writes`: what the closures the capability came through so far may
+    /// write when called. Module names are frame-free, so they accumulate
+    /// down the hops as they are.
     #[allow(clippy::too_many_arguments)]
     fn land(
         &self,
@@ -340,6 +409,7 @@ impl RenderIndex {
         rel: &Relevance,
         via: Option<SourceRange>,
         keyed: bool,
+        writes: &Writes,
         program: &ProgramAnalysisResult,
         visiting: &mut HashSet<ComponentId>,
         depth: usize,
@@ -351,6 +421,11 @@ impl RenderIndex {
         let host = |h: &HostHandler| HandlerTarget::Host {
             tag: h.tag.clone(),
             input_type: h.input_type.clone(),
+        };
+        let through = |d: &Deps| {
+            let mut w = writes.clone();
+            w.union_with(&d.writes);
+            w
         };
         for h in summary.handlers.iter().filter(|h| h.deps.touches(rel)) {
             let events = match &h.event {
@@ -365,6 +440,7 @@ impl RenderIndex {
                     .collect(),
             };
             let keyed = keyed || h.deps.gated_for(rel);
+            let writes = through(&h.deps);
             out.extend(events.into_iter().map(|event| Landing {
                 component: comp,
                 event,
@@ -372,41 +448,52 @@ impl RenderIndex {
                 span: h.span,
                 via,
                 keyed,
+                writes: writes.clone(),
             }));
         }
         for site in &summary.sites {
             let (props, all) = forwarded(site, rel);
             let via = via.or(site.span);
             let child = resolve(site, program).filter(|_| depth < MAX_DEPTH);
-            let mut descend = |child_rel: Relevance, keyed: bool, out: &mut Vec<Landing>| {
-                let Some(child) = child else { return };
-                if visiting.insert(child) {
-                    self.land(
-                        child,
-                        &child_rel,
-                        via,
-                        keyed,
-                        program,
-                        visiting,
-                        depth + 1,
-                        out,
-                    );
-                    visiting.remove(&child);
-                }
-            };
+            let mut descend =
+                |child_rel: Relevance, keyed: bool, writes: &Writes, out: &mut Vec<Landing>| {
+                    let Some(child) = child else { return };
+                    if visiting.insert(child) {
+                        self.land(
+                            child,
+                            &child_rel,
+                            via,
+                            keyed,
+                            writes,
+                            program,
+                            visiting,
+                            depth + 1,
+                            out,
+                        );
+                        visiting.remove(&child);
+                    }
+                };
             if all {
                 descend(
                     Relevance::any_prop(),
                     keyed || site.spread.gated_for(rel),
+                    &through(&site.spread),
                     out,
                 );
             }
             // One prop at a time: a prop that lands below must not hide one
             // that does not.
             for p in &props {
-                let keyed = keyed || site.props.iter().any(|(k, d)| k == p && d.gated_for(rel));
+                let deps = site.props.iter().find(|(k, _)| k == p).map(|(_, d)| d);
+                let keyed = keyed || deps.is_some_and(|d| d.gated_for(rel));
+                let writes = deps.map_or_else(|| writes.clone(), through);
                 let before = out.len();
-                descend(Relevance::of([Source::Prop(p.clone())]), keyed, out);
+                descend(
+                    Relevance::of([Source::Prop(p.clone())]),
+                    keyed,
+                    &writes,
+                    out,
+                );
                 if out.len() == before && is_event_prop(p) {
                     out.push(Landing {
                         component: comp,
@@ -417,6 +504,7 @@ impl RenderIndex {
                         span: site.span,
                         via,
                         keyed,
+                        writes,
                     });
                 }
             }
@@ -454,7 +542,8 @@ impl RenderIndex {
             }
             let (props, all) = forwarded(site, rel);
             let contexts = contexts_at(summary, i, rel);
-            if props.is_empty() && !all && contexts.is_empty() {
+            let modules: Vec<Source> = rel.modules().cloned().collect();
+            if props.is_empty() && !all && contexts.is_empty() && modules.is_empty() {
                 continue;
             }
             // One of many instances: the owner of the site holds the state.
@@ -483,6 +572,7 @@ impl RenderIndex {
                     .cloned()
                     .map(Source::Prop)
                     .chain(contexts)
+                    .chain(modules)
                     .collect(),
             };
             let sub = self.uses(child, &child_rel, program, visiting, depth + 1);

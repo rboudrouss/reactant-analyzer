@@ -25,10 +25,12 @@
 //!   with their sources: where a setter handed down lands.
 //!
 //! Over-approximation, in the direction the consumers need: a source missing
-//! from `genuine` is proven unused by the component, up to two stated
-//! assumptions. A call bound to a variable is taken to depend only on its
-//! callee and arguments (a module-level mutable read is not seen), and only a
-//! call in statement position counts as a render-phase side effect.
+//! from `genuine` is proven unused by the component. A name of the file's
+//! scope reads as [`Source::Module`], and a function value records the
+//! module names it writes ([`Deps::writes`]), so a handler that writes a
+//! module binding beside a state is followed to whatever reads that binding.
+//! What stays unseen is a write hidden behind a call the analysis cannot see
+//! into (an import, a utility in expression position: #51, #52).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -37,7 +39,7 @@ use crate::domains::AbstractDomain;
 use crate::engine::{AnalysisResult, HookKind};
 use crate::ir::{
     cfg::{CFG, Terminator},
-    expr::{CompOrigin, Expr, Prim, SPREAD_KEY_PREFIX},
+    expr::{CompOrigin, Expr, Prim, SPREAD_KEY_PREFIX, mutation_receiver},
     free_vars::{collect_used_vars, compute_free_vars},
     hooks::HookEntry,
     source_range::SourceRange,
@@ -70,6 +72,48 @@ pub enum Source {
     /// `useContext` reads from it. Its value comes from the nearest provider
     /// above, which the element tree pairs it with.
     Context(ContextId),
+    /// A name the component does not bind (a module binding, an import, a
+    /// global) that some function of the program writes: the one channel a
+    /// handler can change besides state (`cache.x = …`, `counter++`,
+    /// `seen.add(k)`), so a write to it travels with the write to the slot
+    /// ([`Writes`]). A name nothing writes is not a render input and reads
+    /// as nothing, which keeps the sets small. Frame-free: the same name in
+    /// every component, which is what lets it be carried down the element
+    /// tree untranslated.
+    Module(Var),
+}
+
+/// The module names a function value may write when called: an assignment,
+/// a member write, or a mutating method (the ADR-028 list) whose root reads
+/// as [`Source::Module`], nested closures included. `top`: a root the
+/// analysis could not place, so the function may write anything.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Writes {
+    pub top: bool,
+    pub names: BTreeSet<Var>,
+}
+
+impl Writes {
+    pub fn top() -> Self {
+        Writes {
+            top: true,
+            names: BTreeSet::new(),
+        }
+    }
+
+    pub fn union_with(&mut self, other: &Writes) {
+        self.top |= other.top;
+        if self.top {
+            self.names.clear();
+        } else {
+            self.names.extend(other.names.iter().cloned());
+        }
+    }
+
+    /// The sources a write to these names changes.
+    pub fn sources(&self) -> impl Iterator<Item = Source> + '_ {
+        self.names.iter().cloned().map(Source::Module)
+    }
 }
 
 /// May-set of sources. `top` is "may depend on anything".
@@ -82,6 +126,8 @@ pub struct Deps {
     /// has `f` here). A must-fact: one ungated contributor takes a source
     /// out.
     pub gated: BTreeSet<Source>,
+    /// For a function value: what calling it writes besides state.
+    pub writes: Writes,
 }
 
 impl Deps {
@@ -95,6 +141,7 @@ impl Deps {
     pub fn top() -> Self {
         Deps {
             top: true,
+            writes: Writes::top(),
             ..Deps::default()
         }
     }
@@ -105,6 +152,7 @@ impl Deps {
 
     pub fn union_with(&mut self, other: &Deps) {
         self.top |= other.top;
+        self.writes.union_with(&other.writes);
         if self.top {
             self.set.clear();
             self.gated.clear();
@@ -122,7 +170,10 @@ impl Deps {
     }
 
     /// The same sources, none of them gated: the value is no longer the
-    /// function whose calls the gating described.
+    /// function whose calls the gating described. Its writes stay: a call
+    /// may return a function that calls its arguments (`debounce(fn)`, a
+    /// hook handed a callback), and a may-fact survives what a must-fact
+    /// cannot.
     fn ungated(mut self) -> Self {
         self.gated.clear();
         self
@@ -188,6 +239,14 @@ impl Relevance {
             .iter()
             .filter(|s| matches!(s, Source::Context(_)))
     }
+
+    /// The module names it names: frame-free, so they reach every component
+    /// of the tree untranslated, whatever props it is handed.
+    pub fn modules(&self) -> impl Iterator<Item = &Source> {
+        self.sources
+            .iter()
+            .filter(|s| matches!(s, Source::Module(_)))
+    }
 }
 
 /// A component element built by the render (`<Child a={x} />`).
@@ -249,6 +308,9 @@ pub struct RenderDeps {
     /// `useContext` of an unproven object or reached through an inlined hook,
     /// or a hook of user code the engine could not see into.
     pub any_context: bool,
+    /// Per effect, the module names its body (callbacks it registers
+    /// included) may write: what a write it makes to a slot travels with.
+    pub effect_writes: BTreeMap<HookLabel, Writes>,
 }
 
 impl RenderDeps {
@@ -338,8 +400,24 @@ fn join_env(a: &mut Env, b: &Env) -> bool {
     changed
 }
 
-/// Compute the summary of one converged component.
-pub fn render_deps(result: &AnalysisResult<impl AbstractDomain>) -> RenderDeps {
+/// The names outside its bodies a component writes: the roots of the writes
+/// in its render and in every hook body, nested closures included. The union
+/// over the program is what [`render_deps`] reads a free name against.
+pub fn written_names(result: &AnalysisResult<impl AbstractDomain>) -> HashSet<Var> {
+    let mut out = written_roots(std::slice::from_ref(&result.param), &result.render_cfg);
+    for body in result.hooks.iter().filter_map(HookEntry::body_cfg) {
+        out.extend(written_roots(&[], body));
+    }
+    out
+}
+
+/// Compute the summary of one converged component. `written`: the names
+/// some function of the program writes ([`written_names`], joined over every
+/// component), the only free names that read as [`Source::Module`].
+pub fn render_deps(
+    result: &AnalysisResult<impl AbstractDomain>,
+    written: &HashSet<Var>,
+) -> RenderDeps {
     let hooks: HashMap<HookLabel, &HookEntry> =
         result.hooks.iter().map(|h| (h.label(), h)).collect();
     let kinds: HashMap<HookLabel, HookKind> = result
@@ -358,10 +436,12 @@ pub fn render_deps(result: &AnalysisResult<impl AbstractDomain>) -> RenderDeps {
         kinds: &kinds,
         consts: &result.module_consts,
         param: &result.param,
+        module_written: written,
         out: RenderDeps::default(),
         top: false,
         free: Default::default(),
         gated: Default::default(),
+        written: Default::default(),
         inline_hook: Default::default(),
     };
     let mut entry = Env::new();
@@ -400,6 +480,8 @@ pub fn render_deps(result: &AnalysisResult<impl AbstractDomain>) -> RenderDeps {
                         used.union_with(&a.eval(e, &env).deps);
                     }
                 }
+                let writes = a.writes_of(&[], body_cfg, &env);
+                a.out.effect_writes.insert(call.label, writes);
             }
             // Still present after expansion: the hook was not inlined, so
             // whatever it is handed may be used in any way.
@@ -425,6 +507,8 @@ struct Analyzer<'a> {
     kinds: &'a HashMap<HookLabel, HookKind>,
     consts: &'a HashMap<Var, ModuleConstInit>,
     param: &'a Var,
+    /// The free names some function of the program writes.
+    module_written: &'a HashSet<Var>,
     out: RenderDeps,
     /// Set when a cap was hit: the whole summary degrades to ⊤.
     top: bool,
@@ -433,6 +517,8 @@ struct Analyzer<'a> {
     free: std::cell::RefCell<HashMap<usize, Arc<HashSet<Var>>>>,
     /// [`param_gated_vars`] per body, by address, for the same reason.
     gated: std::cell::RefCell<HashMap<usize, Arc<HashSet<Var>>>>,
+    /// [`written_roots`] per body, by address, for the same reason.
+    written: std::cell::RefCell<HashMap<usize, Arc<HashSet<Var>>>>,
     /// The render calls a hook where lowering records none
     /// (`<p>{useTheme()}</p>`): it may read any context.
     inline_hook: std::cell::Cell<bool>,
@@ -484,7 +570,34 @@ impl<'a> Analyzer<'a> {
             }
             d.union_with(&c);
         }
+        d.writes.union_with(&self.writes_of(params, body, env));
         d
+    }
+
+    /// The module names `body` may write when run: the module sources of
+    /// the values its written roots may alias (`const c = cache; c.x = 1`
+    /// writes `cache`). A root whose value is ⊤ may be anything.
+    fn writes_of(&self, params: &[Var], body: &CFG, env: &Env) -> Writes {
+        let key = body as *const CFG as usize;
+        let cached = self.written.borrow().get(&key).cloned();
+        let roots = cached.unwrap_or_else(|| {
+            let r = Arc::new(written_roots(params, body));
+            self.written.borrow_mut().insert(key, r.clone());
+            r
+        });
+        let mut w = Writes::default();
+        for r in roots.iter() {
+            let d = self.var(env, r).deps;
+            if d.top {
+                w = Writes::top();
+                break;
+            }
+            w.names.extend(d.set.iter().filter_map(|s| match s {
+                Source::Module(m) => Some(m.clone()),
+                _ => None,
+            }));
+        }
+        w
     }
 
     fn var(&self, env: &Env, v: &Var) -> DVal {
@@ -494,14 +607,18 @@ impl<'a> Analyzer<'a> {
                 shape: Shape::Props,
             });
         }
-        // Not bound here: module scope, an import or a global. Never a render
-        // input (a module-level mutable binding is the stated blind spot),
-        // except a proven context object, whose value its provider sets.
+        // Not bound here: module scope, an import or a global. A proven
+        // context object reads as its context, whose value its provider
+        // sets; a name some function writes as the name itself; anything
+        // else is constant across renders and reads as nothing.
         env.get(v)
             .cloned()
             .unwrap_or_else(|| match self.consts.get(v) {
                 Some(ModuleConstInit::Context(id)) => {
                     DVal::of(Deps::one(Source::Context(id.clone())))
+                }
+                _ if self.module_written.contains(v) => {
+                    DVal::of(Deps::one(Source::Module(v.clone())))
                 }
                 _ => DVal::empty(),
             })
@@ -998,6 +1115,59 @@ fn root_var(e: &Expr) -> Option<Var> {
         Expr::FieldAccess { obj, .. } | Expr::IndexAccess { arr: obj, .. } => root_var(obj),
         _ => None,
     }
+}
+
+/// The names outside a function body its writes are rooted at: an assignment
+/// to a name the body does not bind, a member write or a mutating method
+/// ([`mutation_receiver`], the ADR-028 list) on something rooted at one. A
+/// nested closure runs as a consequence of the body, so its roots count, minus
+/// what the body binds.
+pub(crate) fn written_roots(params: &[Var], body: &CFG) -> HashSet<Var> {
+    fn exprs(e: &Expr, roots: &mut HashSet<Var>) {
+        if let Some(r) = mutation_receiver(e).and_then(root_var) {
+            roots.insert(r);
+        }
+        if let Expr::FnLit {
+            params, body_cfg, ..
+        } = e
+        {
+            roots.extend(written_roots(params, body_cfg));
+            return;
+        }
+        e.for_each_child(&mut |c| exprs(c, roots));
+    }
+    let mut bound: HashSet<&Var> = params.iter().collect();
+    let mut roots = HashSet::new();
+    for block in body.blocks.values() {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Let { var, rhs, .. } => {
+                    bound.insert(var);
+                    exprs(rhs, &mut roots);
+                }
+                Stmt::Assign { var, rhs, .. } => {
+                    roots.insert(var.clone());
+                    exprs(rhs, &mut roots);
+                }
+                Stmt::MemberWrite { obj, key, rhs, .. } => {
+                    if let Some(r) = root_var(obj) {
+                        roots.insert(r);
+                    }
+                    exprs(rhs, &mut roots);
+                    if let MemberKey::Index(i) = key {
+                        exprs(i, &mut roots);
+                    }
+                }
+                Stmt::ExprStmt(e, _) => exprs(e, &mut roots),
+            }
+        }
+        match &block.term {
+            Terminator::Return(e) | Terminator::Branch { cond: e, .. } => exprs(e, &mut roots),
+            _ => {}
+        }
+    }
+    roots.retain(|r| !bound.contains(r));
+    roots
 }
 
 /// The free variables a function body reaches only behind a test of its own

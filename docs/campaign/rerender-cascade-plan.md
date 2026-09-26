@@ -411,7 +411,9 @@ typing.
 The limits recorded in `docs/limitations.md`:
 - #145 (done): cascades through a context value (plan M5, whole value).
 - #146 (done): a setter called by a child as a trigger of the owner.
-- #147: the two stated assumptions of render dependence.
+- #147 (done): a module binding written beside a state is followed to its
+  readers by name; a write or read behind an opaque call is the assumption
+  that stays.
 - #148 (done): trigger frequency from the event name. The host element a
   handler lands on is followed down the tree, and a key handler that writes
   only behind a test of its event is discrete.
@@ -473,3 +475,26 @@ Added:
 
 `state-lifted-too-high` is unchanged. It shares `forwarded`, and prop names
 now survive a rest spread there too.
+
+### Corpus effect of module writes (#147, 2026-09-26, per repo)
+
+Byte-identical findings on the fourteen repositories: 1 510 before and after,
+0 removed, 0 added. No corpus handler writes a module binding that a sibling
+of the state's reader reads, which the 2026-09-24 sweep had already suggested.
+
+Two engine defects surfaced on the way and are fixed in the same change,
+each measured to change nothing on the corpus:
+- the utility splice bound a callee's result with an `Assign`, the IR's
+  spelling of a write to an outer binding, so an inlined `const loader =
+  f()` in a handler read as a module write (`HalftoneStudio`, three phantom
+  removals in a first measurement);
+- a `continue` edge was `Unconditional`, so a loop whose counter advances
+  only on that path was never widened. The deeper inlining the first fix
+  enables (a callee's `return g()` is now a call site) reached
+  `patchRemainNodes` in ai-chatbot's `lib/editor/diff.js`, whose `left += 1;
+  continue;` never converged.
+
+A free name reads as `Module(name)` only when some function of the program
+writes it; emitting it for every free name cost 70% on twenty (301 s to
+514 s). With the restriction, twenty measures 366 s and dub 87 s against 77 s,
+one run each; the rest of the corpus is within a second of HEAD.

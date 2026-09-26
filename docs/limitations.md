@@ -176,12 +176,15 @@ carries an Error.
 - **`same_tick`** reads mutually exclusive branch writes as co-executing once they sit in an inlined
   local helper, so a rule quantifying over same-tick writes fires on an if/else chain that can only
   take one arm [#123](https://github.com/rboudrouss/reactant-analyzer/issues/123).
-- **Render dependence assumes two things it does not prove**
-  ([ADR-041](adr/ADR-041-render-dependence.md) §2). A call bound to a variable is taken to depend
-  only on its callee and arguments, and a module-level mutable binding is not a render input. A
-  render that reads such a binding can therefore be reported as unaffected by a write that in fact
-  changes it [#147](https://github.com/rboudrouss/reactant-analyzer/issues/147). A custom hook
-  called inline in JSX (`<p>{useTheme()}</p>`) is such a call, so a context it reads is not seen.
+- **Render dependence follows a write to a module binding by name only**
+  ([ADR-041](adr/ADR-041-render-dependence.md) §2). A handler that writes a module-scope name
+  beside a state (`cache.x = …`, `counter++`, `seen.add(k)`) is followed to every render that
+  reads that name, in any file. A write or a read hidden behind a call the analysis cannot see into
+  (an imported function, a local utility called in expression position, #52) stays unseen, so a
+  render reading a binding only that way can be reported as unaffected by a write that changes it
+  (the residue of [#147](https://github.com/rboudrouss/reactant-analyzer/issues/147)). Names match
+  by spelling, so two files' unrelated `cache` bindings count as one: fewer findings, never a wrong
+  one.
 - **Trigger frequency is a ranking, not a proof.** `wasted-subtree-render` files an event as
   continuous from its name and the host element the handler lands on, with its literal `type`,
   followed down through the components it is handed to. For an element the analysis cannot see

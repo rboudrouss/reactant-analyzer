@@ -385,11 +385,15 @@ fn lower_stmt(stmt: &Statement, builder: &mut BlockBuilder) {
         // set (`ExitDominance`, `must_setter_on_all_paths`).
         Statement::BreakStatement(b) => {
             let target = builder.break_target(b.label.as_ref().map(|l| l.name.as_str()));
-            jump_out(builder, target);
+            jump_out(builder, target, EdgeKind::Unconditional);
         }
+        // A `continue` is a back edge of the loop it continues: the fixpoint
+        // widens only on `Back` edges, and a loop whose counter advances on
+        // the `continue` path alone (`left += 1; continue;`) never converged
+        // through an `Unconditional` one.
         Statement::ContinueStatement(c) => {
             let target = builder.continue_target(c.label.as_ref().map(|l| l.name.as_str()));
-            jump_out(builder, target);
+            jump_out(builder, target, EdgeKind::Back);
         }
         // Hoisted declarations: bind name but emit no CFG node
         Statement::FunctionDeclaration(func) => {
@@ -584,11 +588,11 @@ fn lower_if(
 /// target the statement is not valid JavaScript (a stray `break`, or a label
 /// that names no enclosing loop); keep the old `Unreachable` rather than invent
 /// an edge.
-fn jump_out(builder: &mut BlockBuilder, target: Option<BlockId>) {
+fn jump_out(builder: &mut BlockBuilder, target: Option<BlockId>, kind: EdgeKind) {
     match target {
         Some(to) => {
             let from = builder.seal_with(Terminator::Jump(to));
-            builder.add_edge(from, to, EdgeKind::Unconditional);
+            builder.add_edge(from, to, kind);
         }
         None => {
             builder.seal_with(Terminator::Unreachable);
@@ -1274,24 +1278,20 @@ mod tests {
         );
     }
 
-    /// `continue` skips a `switch` and reaches the loop.
+    /// `continue` skips a `switch` and reaches the loop, by a back edge: the
+    /// fixpoint widens only on those.
     #[test]
     fn continue_inside_a_switch_targets_the_loop() {
         let cfg = cfg_of("while (c) { switch (k) { case 1: continue; } g(); }");
-        let header = cfg
+        let back: Vec<_> = cfg
             .edges
             .iter()
-            .find(|e| matches!(e.kind, EdgeKind::Back))
-            .map(|e| e.to)
-            .expect("the loop has a back edge");
-        // The `continue` jumps to the loop header, not to the switch's exit.
-        assert!(
-            cfg.edges.iter().any(|e| e.to == header
-                && matches!(e.kind, EdgeKind::Unconditional)
-                && e.from != 0),
-            "no continue edge to the loop header: {:?}",
-            cfg.edges
-        );
+            .filter(|e| matches!(e.kind, EdgeKind::Back))
+            .collect();
+        // The loop's own back edge and the `continue`'s, both to the header.
+        assert_eq!(back.len(), 2, "{:?}", cfg.edges);
+        assert_eq!(back[0].to, back[1].to, "{:?}", cfg.edges);
+        assert_ne!(back[0].from, back[1].from, "{:?}", cfg.edges);
     }
 
     /// A labeled `break` leaves the loop it names, not the innermost one: it
