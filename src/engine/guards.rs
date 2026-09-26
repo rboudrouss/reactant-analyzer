@@ -10,9 +10,9 @@
 //!   ⊥, the branch is dead in every later run;
 //! - **relational** — the guard compares the slot against the very expression
 //!   the write stores there, so the two sides are equal next render whatever
-//!   they evaluate to ([`write_settles_comparison`]);
+//!   they evaluate to (`write_settles_comparison`);
 //! - **member** — the guard tests a member of the slot, and the literal the
-//!   write puts at that member contradicts it ([`write_settles_member_truth`]).
+//!   write puts at that member contradicts it (`write_settles_member_truth`).
 //!
 //! Two callers feed it different values — the churn graph the reference part
 //! of an effect write, `setter-in-render` the whole value of a render write —
