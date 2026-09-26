@@ -135,3 +135,22 @@ fn bounded_local_loop_is_precise() {
         "loop counter bounded by guard constant 5 → setter writes total ∈ [0, 5]"
     );
 }
+
+/// A `continue` is a back edge: a counter that advances only on the
+/// `continue` path is widened at the header like any other, so the fixpoint
+/// terminates (it did not when the edge was `Unconditional`) and the guard
+/// constant still bounds it.
+#[test]
+fn a_counter_advanced_only_on_continue_converges() {
+    let r = analyze_fixture();
+    assert_eq!(infinite_loop_hits(&r, "ContinueOnlyLoop"), 0);
+    assert_eq!(
+        state0(&r, "ContinueOnlyLoop"),
+        StateValue::number(Interval {
+            lo: 0.0,
+            hi: 5.0,
+            is_int: true
+        }),
+        "loop counter advanced on the continue path → total ∈ [0, 5]"
+    );
+}

@@ -47,3 +47,23 @@ export function BoundedLocalLoop() {
   }, []);
   return <div>{total}</div>;
 }
+
+// ── Counter advanced only on a `continue` path → still converges ─────────────
+// A `continue` is a back edge of its loop, so the header is widened through
+// it. Marked `Unconditional`, the join grew `i` by one per pass and the
+// fixpoint never terminated.
+export function ContinueOnlyLoop({ skip }: { skip: (i: number) => boolean }) {
+  const [total, setTotal] = useState(0);
+  useEffect(() => {
+    let i = 0;
+    while (i < 5) {
+      if (skip(i)) {
+        i = i + 1;
+        continue;
+      }
+      i = i + 1;
+    }
+    setTotal(i); // total = [0, 5]
+  }, [skip]);
+  return <div>{total}</div>;
+}
