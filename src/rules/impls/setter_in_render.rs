@@ -7,8 +7,9 @@ use crate::ir::{
     types::{BlockId, HookLabel, Var},
 };
 
+use crate::engine::guards::converges_once_written;
 use crate::engine::setters::SetterCallPhase;
-use crate::rules::helpers::churn::{converges_once_written, eval_in_exit_env};
+use crate::rules::helpers::eval_in_exit_env;
 use crate::rules::{
     Diagnostic, ExitDominance, MustResult, Rule, collect_setter_calls, resolve_setter_aliases,
     state_val_labels,
@@ -174,7 +175,8 @@ impl Rule for SetterInRender {
                         label,
                         &eval_in_exit_env(arg, comp_result),
                         Some(arg),
-                        comp_result,
+                        &comp_result.exit_env(),
+                        &mut |e| eval_in_exit_env(e, comp_result),
                     )
                 {
                     return None;

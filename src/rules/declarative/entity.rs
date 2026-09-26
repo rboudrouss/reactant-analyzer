@@ -27,8 +27,8 @@ use crate::ir::types::{BlockId, HookLabel, Var};
 use crate::rules::api::query::{
     Certified, CleanupVerdict, ConditionalHookCall, ExitDominance, RuleCtx,
 };
-use crate::rules::helpers::churn_graph::{CycleRow, collect_cycle_rows};
 use crate::rules::helpers::context_flow::{ConsumerRow, ProviderVerdict};
+use crate::rules::helpers::cycles::{CycleRow, collect_cycle_rows};
 use crate::rules::helpers::jsx::{
     JsxElementSite, JsxPropSite, collect_jsx_elements, collect_jsx_prop_sites, site_identity,
 };

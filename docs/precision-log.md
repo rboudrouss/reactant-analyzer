@@ -78,6 +78,7 @@ from that session survived, and they are left as they are.
 | 2026-09-04 | a directory is generated because the repository says so | #137 | 1,317 → 1,317 (0 removed, 0 added; **+88 files read**) |
 | 2026-09-04 | following a narrowed run's imports, behind a flag | #138 | 1,317 → 1,317 (default unchanged; see the entry) |
 | 2026-09-05 | a JSX callee is resolved by the file that writes it | #7 | 1,317 → **1,348** (29 removed, 60 added) |
+| 2026-09-27 | the churn graph is a fold over engine rows; a write's phase decides what it can sustain | #151, #26 | 1,493 → **1,494** (0 removed, 1 added) |
 
 ---
 
@@ -1267,3 +1268,57 @@ and it does not show.
 `LowerCtx` is the shape that made the threading affordable: `SourceMap`,
 `ExprIds` and the origin map travel as one value, so a nested `FnLit` body's
 builder inherits all three and the next per-file fact needs no pass of its own.
+
+## #151: the churn graph is a fold over engine rows (2026-09-27)
+
+[ADR-042](adr/ADR-042-relations-are-engine-products.md) slice 4. The churn
+graph used to be built by its own setter walk in `rules/helpers`; it is now a
+fold over the `slot_writers` and `effect_triggers` relations, in
+`engine/churn.rs`, and nothing in it walks syntax. The three slices before it
+(the evaluator and `on_all_paths` moved down; `owner`, `block` and `written`
+on the writer row; the trigger relation) change no behaviour by construction:
+nothing native read the new columns until this slice.
+
+The measurement is the whole corpus, one run each side against the CI artifact
+of `e257bcc`, the branch's base: **1,493 → 1,494, 0 removed, 1 added**. Memory
+was checked separately after a first run under the 8 GB scope limit was killed:
+`main` and this branch peak at 2.6 GB on dub and 6.6 / 6.7 GB on twenty, so the
+limit was the regression, not the code.
+
+### The claim
+
+A write's **phase** decides what it can sustain (ADR-042 §4). The old
+collector approximated "nested in a callback" as "never self-sustaining". The
+writer row knows better: a `Deferred` or `Cleanup` write runs on a later turn
+and, in an effect with no dependency array, re-runs after every render like the
+body does — a May self-edge, which is #26. A `Handler` write needs a user event
+per iteration — no edge, on the registrar proof of ADR-034. A write under an
+unresolved callee is ⊤ — a May edge, the fire-more direction.
+
+### Where the one addition comes from
+
+`twenty/.../ApiKeyNameInput.tsx:61`, `cross-component-infinite-loop`, Warning.
+The effect calls a `useCallback`-bound `useDebouncedCallback(async (name) =>
+{ onNameUpdate(apiKeyName); … })`; `onNameUpdate` is the parent's setter and
+`apiKeyName` a prop versioned by the parent's slot. The engine walk enters the
+callback body and classifies the write under the unresolved
+`useDebouncedCallback` as ⊤; the old collector never entered a `CallbackVal`
+body at all. That is the ⊤ cell of the table, and the row is a false positive
+for a reason the cell does not know: the write stores the slot's own value
+back (`onNameUpdate(apiKeyName)`), which React bails out of. An identity write
+is not a change; that is a precision fact about the written value, filed as
+the next step for the `written` column, not a reason to read ⊤ as silence.
+
+The #26 cell added nothing on this corpus and removed nothing; the `Handler`
+cell removed nothing. Both are pinned by `tests/effect_cycles.rs`.
+
+### Not fixed here, and not claimed
+
+The self-churn arm's convergence kill was applied per write site, where
+ADR-018 makes the kill sound only for a single-site slot. The relation keeps
+that per-site kill for the `self_slot` partition, because the site-count
+precondition would turn a real convergent corpus shape — two mutually
+exclusive branches of one effect, each settling its own guard — into a
+Warning. The multi-site proof that covers both is
+[#154](https://github.com/rboudrouss/reactant-analyzer/issues/154), a
+soundness bug on the record, not a fix.

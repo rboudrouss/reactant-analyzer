@@ -30,7 +30,7 @@ use super::schema::{EdgeName, ElseBehavior, OwnershipName, SeverityPin};
 use super::validate::{
     BindRef, CountCmp, MustKind, ResolvedAnchor, ResolvedGuard, ResolvedRule, Segment,
 };
-use crate::rules::helpers::churn_graph::CycleRow;
+use crate::rules::helpers::cycles::CycleRow;
 use crate::rules::helpers::jsx::JsxPropSite;
 use crate::rules::helpers::providers::ProviderSite;
 

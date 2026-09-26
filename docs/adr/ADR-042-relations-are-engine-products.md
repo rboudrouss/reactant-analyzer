@@ -176,9 +176,14 @@ its own slice, and the ratchet list records them:
   presents it as `must_on_all_paths`.
 - `converges_once_written`, `expand_guard`, `write_settles_comparison` and
   `write_settles_member_truth` move to `engine/guards.rs`. They are one
-  question — does a write settle its own dominating guards — and its
-  answer is a per-row fact `settles: bool` the graph reads under the
-  single-writer condition.
+  question — does a write settle its own dominating guards.
+  **Amended 2026-09-27 (slice 4):** the answer stays a function over a
+  row's facts rather than a `settles` column, because its two callers feed
+  it different values — the churn graph the reference part of an effect
+  write, `setter-in-render` the whole value of a render write. The graph
+  applies it under the single-writer condition to every edge but the
+  `self_slot` one, which keeps the per-site kill the self-churn arm always
+  had; the multi-site proof that would unify the two is #154.
 - `ConvergedEval` / `Eval` / `eval_in_stores` move to the engine. They wrap
   `StateValueTransfer` over converged stores and every relation above needs
   them.

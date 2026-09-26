@@ -438,3 +438,59 @@ export function C() {
         "all-stable deps gate the effect: no infinite-loop expected, got: {diags:?}"
     );
 }
+
+// ── #26: auto-run continuations in a no-deps effect ─────────────────────────
+
+#[test]
+fn a_deferred_fresh_write_in_a_no_deps_effect_is_a_self_sustaining_loop() {
+    // The effect re-runs after every render; the `.then` continuation runs
+    // after every run and stores a fresh reference, which is a render. The
+    // rules-layer collector classified the nested write as "never
+    // self-sustaining"; the writer row's phase says `Deferred`, which is
+    // exactly as self-sustaining as the body (ADR-042 §4).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [data, setData] = useState({});
+  useEffect(() => {
+    fetch("/api").then(() => setData({ loaded: true }));
+  });
+  return <div>{String(data.loaded)}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "a deferred fresh write in a no-deps effect must be reported: {diags:?}"
+    );
+    assert!(
+        diags.iter().all(|(_, sev, _)| *sev != Severity::Error),
+        "a deferred write is never on all paths of the body: {diags:?}"
+    );
+}
+
+#[test]
+fn a_listener_write_in_a_no_deps_effect_needs_an_event_and_is_not_a_loop() {
+    // The other nested shape: a write only a registered listener reaches
+    // fires once per user event, so the loop is not self-sustaining. The
+    // row's phase is `Handler` and the graph builds no edge from it.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [pos, setPos] = useState({ x: 0 });
+  useEffect(() => {
+    const h = (e) => setPos({ x: e.clientX });
+    window.addEventListener("mousemove", h);
+    return () => window.removeEventListener("mousemove", h);
+  });
+  return <div>{pos.x}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags.iter().all(|(rule, _, _)| rule != "infinite-loop"),
+        "a listener write needs a user event per iteration: {diags:?}"
+    );
+}

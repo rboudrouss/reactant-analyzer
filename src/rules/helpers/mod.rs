@@ -5,9 +5,8 @@
 //! ([`crate::rules::api`]). Post-fixpoint evaluation is the engine's
 //! ([`crate::engine::eval`], ADR-042 §6), re-exported here.
 
-pub mod churn;
-pub mod churn_graph;
 pub mod context_flow;
+pub mod cycles;
 pub mod jsx;
 pub mod mount;
 pub mod providers;
@@ -197,6 +196,15 @@ pub(crate) fn collect_callees<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
 /// convergence-time relation probes values with, so it lives below the rules
 /// layer. Re-exported here so rule-side paths keep reading `helpers::*`.
 pub(crate) use crate::engine::eval::{ConvergedEval, eval_in_stores};
+
+/// Evaluate `expr` in the render exit environment (same pattern as
+/// [`all_deps_provably_stable`]).
+pub(in crate::rules) fn eval_in_exit_env(
+    expr: &Expr,
+    comp_result: &AnalysisResult<StateValue>,
+) -> StateValue {
+    comp_result.eval_in(&comp_result.exit_env(), expr)
+}
 
 /// `true` when **every** dep in `deps` is provably `Stable` in the render-exit
 /// env — the only situation where a deps array genuinely gates an effect for

@@ -1000,10 +1000,10 @@ pub struct EffectCycleProof;
 /// owners + effect carriers per component), the point of knowledge — not
 /// trusted from caller-supplied booleans.
 pub(in crate::rules) fn must_effect_cycle(
-    edges: &[crate::rules::helpers::churn_graph::ChurnEdge],
-    cycle: &crate::rules::helpers::churn_graph::ChurnCycle,
+    edges: &[crate::engine::ChurnEdge],
+    cycle: &crate::engine::ChurnCycle,
 ) -> MustResult<EffectCycleProof> {
-    use crate::rules::helpers::churn_graph::EdgeStrength;
+    use crate::engine::EdgeStrength;
     let all_must = cycle
         .edge_idx
         .iter()

@@ -59,8 +59,10 @@ that writes it (see *Cross-file limits*).
   [#29](https://github.com/rboudrouss/reactant-analyzer/issues/29).
 - Per-rule residuals: `state-mutation` on an escaped alias [#23](https://github.com/rboudrouss/reactant-analyzer/issues/23), `stale-closure` when the
   callback does not resolve syntactically [#24](https://github.com/rboudrouss/reactant-analyzer/issues/24), `frozen-initial-state` on primitive props
-  and memo-chained seeds [#25](https://github.com/rboudrouss/reactant-analyzer/issues/25), the churn graph on auto-run async callbacks
-  [#26](https://github.com/rboudrouss/reactant-analyzer/issues/26), provider detection inside an inline arrow [#30](https://github.com/rboudrouss/reactant-analyzer/issues/30).
+  and memo-chained seeds [#25](https://github.com/rboudrouss/reactant-analyzer/issues/25), provider detection inside an inline arrow
+  [#30](https://github.com/rboudrouss/reactant-analyzer/issues/30).
+- The self-churn convergence kill is applied per write site, so two writes of one slot in one effect
+  that revive each other's guards go unreported [#154](https://github.com/rboudrouss/reactant-analyzer/issues/154).
 - Loop-carried values inside callbacks are computed without the loop-carried contribution
   [#21](https://github.com/rboudrouss/reactant-analyzer/issues/21).
 - By decision: `arr.slice()` and `arr.concat()` in a deps array are not proven fresh, because the same
