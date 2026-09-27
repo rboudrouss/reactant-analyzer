@@ -24,7 +24,7 @@ ne sont pas des décisions et vivent dans [`../precision-log.md`](../precision-l
 | [ADR-015](ADR-015-product-value-domain.md) | Product value domain over disjoint JS kinds — supersedes ADR-008's flat enum, TypedStateStore and the useState<T> hint | Accepted |
 | [ADR-016](ADR-016-cli-projects-json.md) | CLI subcommands + JSON output + project-kind detection (Vite, tsconfig paths) | Accepted |
 | [ADR-017](ADR-017-versioned-stability.md) | Versioned reference stability — may/must change bounds, read-side state conversion, churn arm of infinite-loop | Accepted |
-| [ADR-018](ADR-018-effect-cycle-graph.md) | Multi-effect churn cycle graph (F5b) — qualified-slot graph, must/may edges, single-writer convergence kill | Accepted |
+| [ADR-018](ADR-018-effect-cycle-graph.md) | Multi-effect churn cycle graph (F5b) — qualified-slot graph, must/may edges, convergence kill (single-writer condition replaced by the multi-site proof of ADR-042 §6) | Accepted |
 | [ADR-019](ADR-019-witness-chain.md) | Typed witness chains — FileId, engine provenance, closed `Step` vocabulary, shared witness library | Implemented |
 | [ADR-020](ADR-020-tech-debt-cleanup-decisions.md) | Technical-debt cleanup — deliberate non-changes (soundness-preserving) | Accepted |
 | [ADR-021](ADR-021-typed-query-surface.md) | Typed query surface — engine-certified severity, must/may/⊤ as types, `RuleCtx` (frontend deferred) | Accepted |

@@ -61,8 +61,6 @@ that writes it (see *Cross-file limits*).
   callback does not resolve syntactically [#24](https://github.com/rboudrouss/reactant-analyzer/issues/24), `frozen-initial-state` on primitive props
   and memo-chained seeds [#25](https://github.com/rboudrouss/reactant-analyzer/issues/25), provider detection inside an inline arrow
   [#30](https://github.com/rboudrouss/reactant-analyzer/issues/30).
-- The self-churn convergence kill is applied per write site, so two writes of one slot in one effect
-  that revive each other's guards go unreported [#154](https://github.com/rboudrouss/reactant-analyzer/issues/154).
 - Loop-carried values inside callbacks are computed without the loop-carried contribution
   [#21](https://github.com/rboudrouss/reactant-analyzer/issues/21).
 - By decision: `arr.slice()` and `arr.concat()` in a deps array are not proven fresh, because the same
@@ -102,7 +100,12 @@ carries an Error.
 - **Module-level constants** read as ⊤ when the initializer is a call (`const X = f()`)
   [#34](https://github.com/rboudrouss/reactant-analyzer/issues/34), or when the hook was inlined from another file [#36](https://github.com/rboudrouss/reactant-analyzer/issues/36).
 - **`state-mutation`** on a DOM-typed prop whose type is imported from another file [#38](https://github.com/rboudrouss/reactant-analyzer/issues/38).
-- **The churn graph** keeps a cycle edge on convergent multi-writer pairs [#39](https://github.com/rboudrouss/reactant-analyzer/issues/39).
+- **The churn graph** keeps a cycle edge on a convergent slot that another component also writes:
+  the other site's guards live in that component's bodies, which the proof does not read (the
+  residual of [#39](https://github.com/rboudrouss/reactant-analyzer/issues/39)). A convergence proof
+  also assumes a call over held inputs returns the same value on every run, so a fresh reference
+  hidden behind a call keeps a guard alive that the analyzer reads as dead
+  [#158](https://github.com/rboudrouss/reactant-analyzer/issues/158).
 - **The churn graph is slot-granular where a program is member-granular.** The self-churn arm reads
   the member (`[data.name]` is not re-triggered by `setData(prev => ({...prev, slug}))`, and a guard
   on `sheet.leadId` is answered by the `null` the write puts there), but the multi-effect graph

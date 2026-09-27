@@ -601,3 +601,101 @@ export function Parent() {
             .collect::<Vec<_>>()
     );
 }
+
+// ── #154: a guard dies under every write of the slot, or not at all ──────────
+
+#[test]
+fn two_writes_of_one_slot_that_revive_each_other_are_a_loop() {
+    // The fresh write's guard dies under its own write, and the `null` write
+    // beside it revives it on the next round: `s` = null → `{…}` → null → …
+    // The per-site kill read the first write as convergent and stayed silent.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ cond }: { cond: boolean }) {
+  const [s, setS] = useState(null);
+  useEffect(() => {
+    if (!s) setS({ fresh: true });
+    if (cond) setS(null);
+  }, [s, cond]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "the null write revives the guard: {diags:?}"
+    );
+}
+
+#[test]
+fn two_guarded_writers_of_one_slot_that_settle_each_others_guard_converge() {
+    // Two effects each fetch-once into `s`; either write leaves `s` truthy,
+    // so both guards are dead after whichever fires first. The single-site
+    // precondition kept both edges and reported the `s → b → s` cycle (#39).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState(null);
+  const [b, setB] = useState(null);
+  useEffect(() => { if (!s) setS({ from: 'e1' }); }, [b]);
+  useEffect(() => { if (!s) setS({ from: 'e2' }); }, [b]);
+  useEffect(() => { setB({ from: s }); }, [s]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .all(|(rule, sev, _)| rule != "infinite-loop" || *sev == Severity::Info),
+        "either write settles both guards: {diags:?}"
+    );
+}
+
+#[test]
+fn a_fact_of_another_body_is_read_only_through_names_neither_body_binds() {
+    // Both effects bind `flag`, to different props. The first fires while its
+    // `flag` is truthy, the second while its own is falsy — no contradiction:
+    // with `a` truthy and `b` falsy the pair loops (`{…}` → null → `{…}`).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ a, b }: { a: boolean; b: boolean }) {
+  const [s, setS] = useState(null);
+  useEffect(() => { const flag = a; if (flag) setS(null); }, [s, a]);
+  useEffect(() => { const flag = b; if (!flag && !s) setS({ x: 1 }); }, [s, b]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "`flag` is two different bindings: {diags:?}"
+    );
+}
+
+#[test]
+fn opposite_facts_on_one_prop_across_two_bodies_prove_convergence() {
+    // The same shape over one prop: the first effect fires only while `flag`
+    // is truthy, the second only while it is falsy, and a prop holds still
+    // across the automatic loop — whichever fires, the other never does.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ flag }: { flag: boolean }) {
+  const [s, setS] = useState(null);
+  useEffect(() => { if (flag) setS(null); }, [s, flag]);
+  useEffect(() => { if (!flag && !s) setS({ x: 1 }); }, [s, flag]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .all(|(rule, sev, _)| rule != "infinite-loop" || *sev == Severity::Info),
+        "a prop holds still, so the two branches exclude each other: {diags:?}"
+    );
+}

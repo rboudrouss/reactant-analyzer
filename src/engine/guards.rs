@@ -17,6 +17,18 @@
 //! Two callers feed it different values — the churn graph the reference part
 //! of an effect write, `setter-in-render` the whole value of a render write —
 //! which is why it is a function over a row's facts and not a column.
+//!
+//! **Under every write of the slot** (#154). A guard that dies under its own
+//! write can be revived by another write of the same slot on the next
+//! automatic round — `setS(null)` beside `if (!s) setS({…})`. So the churn
+//! graph asks the stronger question, [`converges_under_all_writes`]: the
+//! site's guards die under its own write and under every other site's, each
+//! taken with the facts that site ran under. Those facts are the conjuncts of
+//! its guards that hold still across the loop ([`Invariance`]): the `else if
+//! (!urlLeadId && sheet.leadId)` branch runs only while `urlLeadId` is falsy,
+//! which is what keeps the `if (urlLeadId && …)` branch from firing again
+//! after it. Two invariant conjuncts of opposite polarity on one spelling
+//! contradict outright; the rest narrow the env the arms run from.
 
 use std::collections::{HashMap, HashSet};
 
@@ -26,8 +38,8 @@ use crate::{
     ir::{
         bindings::local_bindings,
         cfg::{CFG, EdgeKind, Terminator},
-        expr::{Expr, UnaryOp},
-        free_vars::call_free_key,
+        expr::{Expr, UnaryOp, mutation_receiver},
+        free_vars::{call_free_key, collect_used_vars},
         stmt::Stmt,
         types::{BlockId, HookLabel, Var},
     },
@@ -49,6 +61,281 @@ pub fn converges_once_written(
     exit_env: &AbstractEnv<StateValue>,
     eval: &mut dyn FnMut(&Expr) -> StateValue,
 ) -> bool {
+    let guards = site_guards(cfg, call_block);
+    if guards.is_empty() {
+        return false;
+    }
+    let own = Rewrite {
+        value: written,
+        expr: written_expr,
+        scope: Some(cfg),
+    };
+    dead_once_written(&guards, state_vals, label, &own, exit_env, eval)
+}
+
+/// A write site of the slot, as the multi-site proof reads it (#154).
+pub struct WriteSite<'a> {
+    /// The body the write sits in.
+    pub cfg: &'a CFG,
+    /// Its block when it runs synchronously, once per pass. `None` for a
+    /// nested, deferred or repeating site, whose guards are unknown and
+    /// taken as none.
+    pub block: Option<BlockId>,
+    /// The value the write leaves in the slot.
+    pub value: &'a StateValue,
+    /// Argument 0 as written.
+    pub expr: Option<&'a Expr>,
+}
+
+/// True when the write at `site` fires at most once in the automatic loop:
+/// its guards die under its own write and under every other write of the
+/// slot (`others`), each taken with the invariant facts that site ran under.
+///
+/// `others` are sites of the same component. A site of another component
+/// has guards in bodies this component's env cannot read, so the caller
+/// answers `false` for such a slot before asking. `props_hold` is handed
+/// to [`Invariance::holds`].
+#[allow(clippy::too_many_arguments)]
+pub fn converges_under_all_writes(
+    site: &WriteSite<'_>,
+    others: &[WriteSite<'_>],
+    state_vals: &HashMap<Var, HookLabel>,
+    label: HookLabel,
+    invariance: &Invariance<'_>,
+    props_hold: bool,
+    exit_env: &AbstractEnv<StateValue>,
+    eval: &mut dyn FnMut(&Expr) -> StateValue,
+) -> bool {
+    let Some(block) = site.block else {
+        return false;
+    };
+    let guards = site_guards(site.cfg, block);
+    if guards.is_empty() {
+        return false;
+    }
+    let own = Rewrite {
+        value: site.value,
+        expr: site.expr,
+        scope: Some(site.cfg),
+    };
+    if !dead_once_written(&guards, state_vals, label, &own, exit_env, eval) {
+        return false;
+    }
+    let mine = let_bindings(site.cfg);
+    let held: Vec<(&Expr, bool)> = guards
+        .iter()
+        .copied()
+        .filter(|(c, _)| invariance.holds(c, &mine, props_hold))
+        .collect();
+    for other in others {
+        let same = std::ptr::eq(other.cfg, site.cfg);
+        let theirs = let_bindings(other.cfg);
+        let facts: Vec<(&Expr, bool)> = other
+            .block
+            .map(|b| site_guards(other.cfg, b))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(c, _)| invariance.holds(c, &theirs, props_hold))
+            // Across bodies a name means the same thing only when neither
+            // body binds it: both then read the closure.
+            .filter(|(c, _)| same || names_unbound(c, &mine, &theirs))
+            .collect();
+        if contradicts(&held, &facts) {
+            continue;
+        }
+        let mut env = exit_env.clone();
+        for &(c, t) in &facts {
+            env = narrow_env_for_branch(&env, c, t);
+        }
+        let rewrite = Rewrite {
+            value: other.value,
+            expr: other.expr,
+            scope: same.then_some(site.cfg),
+        };
+        if !dead_once_written(&guards, state_vals, label, &rewrite, &env, eval) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Two invariant conjuncts on one spelling with opposite polarities. The
+/// other site fired, so the spelling had its polarity in that run and, holding
+/// still, in every run: this site's guard never holds beside it.
+fn contradicts(held: &[(&Expr, bool)], facts: &[(&Expr, bool)]) -> bool {
+    held.iter().any(|(c, t)| {
+        let Some(k) = call_free_key(c) else {
+            return false;
+        };
+        facts
+            .iter()
+            .any(|(f, u)| t != u && call_free_key(f).as_deref() == Some(k.as_str()))
+    })
+}
+
+/// No name of `e` is bound in either body.
+fn names_unbound(
+    e: &Expr,
+    a: &HashMap<&str, Option<&Expr>>,
+    b: &HashMap<&str, Option<&Expr>>,
+) -> bool {
+    let mut used = HashSet::new();
+    collect_used_vars(e, &mut used);
+    used.iter()
+        .all(|v| !a.contains_key(v.as_str()) && !b.contains_key(v.as_str()))
+}
+
+/// What holds still across the automatic runs of one loop (#154).
+///
+/// The loop re-renders on state writes alone, so what moves from one run to
+/// the next is state, whatever is derived from it — a memo, a callback, a
+/// hook's result — a fresh allocation, and whatever a body mutates.
+/// Everything else holds: a literal; a name bound once, in the body or in the
+/// render, to something that holds; a name nothing binds — a prop, a module
+/// name — while props hold. A call over held inputs holds: the standard the
+/// relational arm has always applied to an effect-local const
+/// (`searchParams.get("leadId")`).
+pub struct Invariance<'a> {
+    /// The render's bindings ([`let_bindings`]).
+    pub render: &'a HashMap<&'a str, Option<&'a Expr>>,
+    pub state_vals: &'a HashMap<Var, HookLabel>,
+    pub memo_vals: &'a HashMap<Var, HookLabel>,
+    /// The names some body of the component writes or mutates.
+    pub mutated: &'a HashSet<Var>,
+}
+
+impl Invariance<'_> {
+    /// Does `e`, read in a body with `bindings`, denote the same value on
+    /// every run? `props_hold` is false across an edge from another
+    /// component's slot, whose change is what moves this component's props.
+    pub fn holds(
+        &self,
+        e: &Expr,
+        bindings: &HashMap<&str, Option<&Expr>>,
+        props_hold: bool,
+    ) -> bool {
+        self.go(e, Some(bindings), props_hold, 8)
+    }
+
+    fn go(
+        &self,
+        e: &Expr,
+        body: Option<&HashMap<&str, Option<&Expr>>>,
+        props_hold: bool,
+        depth: usize,
+    ) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        let next = depth - 1;
+        match e.peel_ts() {
+            Expr::Lit(_) => true,
+            Expr::Var(v) => {
+                if self.state_vals.contains_key(v)
+                    || self.memo_vals.contains_key(v)
+                    || self.mutated.contains(v)
+                {
+                    return false;
+                }
+                if let Some(b) = body
+                    && let Some(bound) = b.get(v.as_str())
+                {
+                    return bound.is_some_and(|rhs| self.go(rhs, body, props_hold, next));
+                }
+                match self.render.get(v.as_str()) {
+                    // A render name's right-hand side reads render names.
+                    Some(bound) => bound.is_some_and(|rhs| self.go(rhs, None, props_hold, next)),
+                    None => props_hold,
+                }
+            }
+            Expr::FieldAccess { obj, .. } => self.go(obj, body, props_hold, next),
+            Expr::IndexAccess { arr, idx } => {
+                self.go(arr, body, props_hold, next) && self.go(idx, body, props_hold, next)
+            }
+            Expr::BinOp { lhs, rhs, .. } => {
+                self.go(lhs, body, props_hold, next) && self.go(rhs, body, props_hold, next)
+            }
+            Expr::UnaryOp { arg, .. } => self.go(arg, body, props_hold, next),
+            Expr::Call { fn_, args } => {
+                self.go(fn_, body, props_hold, next)
+                    && args.iter().all(|a| self.go(a, body, props_hold, next))
+            }
+            // State, memos, callbacks, hooks, allocations, elements.
+            _ => false,
+        }
+    }
+}
+
+/// The names a body binds: `Some(rhs)` for a name bound by exactly one `let`
+/// and never assigned, `None` for one bound any other way — its value at a
+/// site depends on where the site is.
+pub fn let_bindings(cfg: &CFG) -> HashMap<&str, Option<&Expr>> {
+    let mut map: HashMap<&str, Option<&Expr>> = HashMap::new();
+    for block in cfg.blocks.values() {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Let { var, rhs, .. } => {
+                    map.entry(var.as_str())
+                        .and_modify(|b| *b = None)
+                        .or_insert(Some(rhs));
+                }
+                Stmt::Assign { var, .. } => {
+                    map.insert(var.as_str(), None);
+                }
+                _ => {}
+            }
+        }
+    }
+    map
+}
+
+/// The names a body mutates: the receivers of its member writes and of its
+/// mutating calls (the ADR-028 list), nested closures included.
+pub(crate) fn mutated_roots(body: &CFG) -> HashSet<Var> {
+    fn root(e: &Expr) -> Option<Var> {
+        match e.peel_ts() {
+            Expr::Var(v) => Some(v.clone()),
+            Expr::FieldAccess { obj, .. } | Expr::IndexAccess { arr: obj, .. } => root(obj),
+            _ => None,
+        }
+    }
+    fn exprs(e: &Expr, out: &mut HashSet<Var>) {
+        if let Some(r) = mutation_receiver(e).and_then(root) {
+            out.insert(r);
+        }
+        if let Expr::FnLit { body_cfg, .. } = e {
+            out.extend(mutated_roots(body_cfg));
+            return;
+        }
+        e.for_each_child(&mut |c| exprs(c, out));
+    }
+    let mut out = HashSet::new();
+    for block in body.blocks.values() {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => exprs(rhs, &mut out),
+                Stmt::MemberWrite { obj, rhs, .. } => {
+                    if let Some(r) = root(obj) {
+                        out.insert(r);
+                    }
+                    exprs(rhs, &mut out);
+                }
+                Stmt::ExprStmt(e, _) => exprs(e, &mut out),
+            }
+        }
+        match &block.term {
+            Terminator::Branch { cond, .. } => exprs(cond, &mut out),
+            Terminator::Return(e) => exprs(e, &mut out),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The conjunctive facts a site runs under: the branch constraints on the
+/// single-predecessor chain above `call_block`, expanded through the lowered
+/// short-circuit temps. Empty for an unguarded site.
+pub fn site_guards(cfg: &CFG, call_block: BlockId) -> Vec<(&Expr, bool)> {
     let mut guards: Vec<(&Expr, bool)> = Vec::new();
     let mut cur = call_block;
     loop {
@@ -71,9 +358,6 @@ pub fn converges_once_written(
             break;
         }
     }
-    if guards.is_empty() {
-        return false;
-    }
 
     // Compound booleans (`a || b`, `a && b`) lower to a short-circuit temp
     // (`__tN`) branched on directly — narrowing `__tN` alone proves nothing
@@ -83,11 +367,34 @@ pub fn converges_once_written(
     for (cond, taken) in guards {
         expand_guard(cfg, cond, taken, 4, &mut conjuncts);
     }
+    conjuncts
+}
 
-    let mut env = exit_env.clone();
+/// What a write leaves in the slot, as the arms read it.
+struct Rewrite<'a> {
+    value: &'a StateValue,
+    /// Argument 0 as written; the member arm reads a literal off it.
+    expr: Option<&'a Expr>,
+    /// The body the relational arm may read `expr`'s names against — `None`
+    /// when the write sits in another body, whose names mean something else
+    /// at the guard.
+    scope: Option<&'a CFG>,
+}
+
+/// True when `guards`, the conjuncts of one site, are all dead once
+/// `rewrite` sits in `label`, starting from `env`.
+fn dead_once_written(
+    guards: &[(&Expr, bool)],
+    state_vals: &HashMap<Var, HookLabel>,
+    label: HookLabel,
+    rewrite: &Rewrite<'_>,
+    env: &AbstractEnv<StateValue>,
+    eval: &mut dyn FnMut(&Expr) -> StateValue,
+) -> bool {
+    let mut env = env.clone();
     for (v, l) in state_vals {
         if *l == label {
-            env.extend(v.clone(), written.clone());
+            env.extend(v.clone(), rewrite.value.clone());
         }
     }
     let slots: HashSet<&Var> = state_vals
@@ -96,21 +403,21 @@ pub fn converges_once_written(
         .map(|(v, _)| v)
         .collect();
 
-    for (cond, taken) in conjuncts {
+    for &(cond, taken) in guards {
         // Relational arm: the guard compares the slot against an expression
         // the write puts *into* the slot, so the two sides are the same value
         // on the next render whatever that value is. An interval domain cannot
         // say that — `x < y` after `x := y` needs the two to be related, not
         // bounded — but the spellings can.
-        if let Some(arg) = written_expr
-            && write_settles_comparison(cond, taken, &slots, arg, cfg)
+        if let (Some(arg), Some(scope)) = (rewrite.expr, rewrite.scope)
+            && write_settles_comparison(cond, taken, &slots, arg, scope)
         {
             return true;
         }
         // Member arm: the guard tests a *member* of the slot, so the value
         // written at that member answers it — the whole-slot lookup below
         // cannot, since the slot is one abstract value (#90).
-        if let Some(arg) = written_expr
+        if let Some(arg) = rewrite.expr
             && write_settles_member_truth(cond, taken, &slots, arg, eval)
         {
             return true;

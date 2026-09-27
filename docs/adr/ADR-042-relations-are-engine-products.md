@@ -180,10 +180,17 @@ its own slice, and the ratchet list records them:
   **Amended 2026-09-27 (slice 4):** the answer stays a function over a
   row's facts rather than a `settles` column, because its two callers feed
   it different values — the churn graph the reference part of an effect
-  write, `setter-in-render` the whole value of a render write. The graph
-  applies it under the single-writer condition to every edge but the
-  `self_slot` one, which keeps the per-site kill the self-churn arm always
-  had; the multi-site proof that would unify the two is #154.
+  write, `setter-in-render` the whole value of a render write.
+  **Amended 2026-09-27 (#154):** the graph asks the stronger question,
+  `converges_under_all_writes`: the site's guards die under its own write
+  and under every other effect write of the slot in the component, each
+  taken with the conjuncts of that site's guards that hold still across the
+  automatic loop (`Invariance`: no state, nothing derived from it, no
+  allocation, nothing a body mutates; props hold unless the edge comes from
+  another component's slot). One proof for every edge, the `self_slot` one
+  included; the single-writer precondition and the per-site kill are gone.
+  A slot another component also writes is never killed: its guards live in
+  bodies this component's env cannot read.
 - `ConvergedEval` / `Eval` / `eval_in_stores` move to the engine. They wrap
   `StateValueTransfer` over converged stores and every relation above needs
   them.
@@ -243,6 +250,7 @@ with the pack typings.
      table applied. Baseline re-measured, the two decided cells reported
      in `docs/precision-log.md`.
   5. `chore`: the ratchet test and `docs/relations.md`.
-- Recorded weakening, unchanged from ADR-029: rows exist only for cycles the
-  graph sees; prop-mediated edges need the parent slot flowed top-down (#20);
-  convergent multi-writer FPs are inherited (#39).
+- Recorded weakening, from ADR-029: rows exist only for cycles the graph
+  sees; prop-mediated edges need the parent slot flowed top-down (#20). The
+  multi-writer FP of #39 is gone with the §6 proof of #154; what remains of
+  it is a convergent slot another component also writes.

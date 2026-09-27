@@ -142,10 +142,14 @@ of its edges. An all-must cycle inside one component is the certain
 `infinite-loop` Error; a cross-component cycle is capped at Warning because
 a prop dep is never the exact slot.
 
-What the graph does not see is recorded, not guessed: a prop-mediated edge
-needs the parent slot flowed top-down (#20), the convergence kill of a
-`self_slot` edge is per write site (#154), and convergent multi-writer pairs
-keep their edges (#39).
+An edge is dropped when its write provably fires at most once: the site's
+guards die under its own write and under every other effect write of the
+slot in the component, each taken with the facts that site ran under that
+hold still across the loop (`engine/guards.rs`, #154). What the graph does
+not see is recorded, not guessed: a prop-mediated edge needs the parent slot
+flowed top-down (#20), and a slot another component also writes is never
+killed, since that site's guards live in bodies this component's env cannot
+read.
 
 ## Still built by the rules layer
 

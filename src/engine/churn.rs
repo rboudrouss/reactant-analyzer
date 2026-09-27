@@ -23,13 +23,16 @@
 //! self-sustaining: no edge (ADR-034's registrar proof). ⊤ is May, the
 //! fire-more direction.
 //!
-//! **Convergence kill**: an edge is dropped when the write provably happens
-//! at most once — dominating guards narrow to ⊥ once the written value sits
-//! in the slot ([`converges_once_written`]) — but ONLY when the slot has a
-//! single effect write row program-wide. Another effect rewriting the slot
-//! can revive the guard on the next automatic round, so the proof would be
-//! unsound (FN); handler rows cannot and are not counted. One kill, one
-//! precondition, for the dep-driven same-slot edge too.
+//! **Convergence kill**: an edge is dropped when the write provably fires at
+//! most once in the automatic loop — its dominating guards die once the
+//! written value sits in the slot, under its own write and under every
+//! other effect write of the slot program-wide, each taken with the
+//! invariant facts that site ran under ([`converges_under_all_writes`],
+//! #154). A site in another component has guards this component's env
+//! cannot read, so such a slot is never killed; a handler row needs a user
+//! event and is not a site. One kill, one proof, for the dep-driven
+//! same-slot edge too. An edge from another component's slot takes the
+//! proof with the props free to move, since that slot is what moves them.
 //!
 //! **Two arms, one relation** (ADR-020 item 2). A dep-driven edge whose write
 //! lands in the very slot its deps read is `self_slot`: the self-churn arm's
@@ -43,8 +46,9 @@ use crate::{
         AnalysisResult, ConvergedEval, EffectTrigger, Freshness, ProgramAnalysisResult, SlotWriter,
         WriterPhase, WriterRegion,
         dominance::on_all_paths,
-        guards::converges_once_written,
-        setters::{resolve_setter_aliases, state_val_labels},
+        guards::{Invariance, WriteSite, converges_under_all_writes, let_bindings, mutated_roots},
+        render_deps::written_names,
+        setters::{memo_val_labels, resolve_setter_aliases, state_val_labels},
         triggers_of,
         written::reference_part,
     },
@@ -132,13 +136,20 @@ fn node_of(component: ComponentId, w: &SlotWriter) -> QualifiedSlot {
 
 /// Build all churn edges of the program.
 pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
-    // Per-effect facts, gathered first so write-site counts are global before
-    // any convergence kill is attempted (see module doc).
+    // Per-component facts the proofs read.
+    struct CompCtx<'a> {
+        state_vals: HashMap<Var, HookLabel>,
+        memo_vals: HashMap<Var, HookLabel>,
+        render_lets: HashMap<&'a str, Option<&'a Expr>>,
+        mutated: HashSet<Var>,
+    }
+    // Per-effect facts, gathered first so the write sites of every slot are
+    // known program-wide before any convergence kill is attempted (see
+    // module doc).
     struct EffectFacts<'a> {
         comp: ComponentId,
         comp_result: &'a AnalysisResult<crate::domains::StateValue>,
         body_cfg: &'a CFG,
-        state_vals: HashMap<Var, HookLabel>,
         effect_label: HookLabel,
         no_deps: bool,
         deps: &'a [Expr],
@@ -147,13 +158,33 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         versioned: HashSet<QualifiedSlot>,
         writes: Vec<&'a SlotWriter>,
     }
+    /// One effect write site of a slot, with the body it sits in.
+    struct SiteRef<'a> {
+        comp: ComponentId,
+        cfg: &'a CFG,
+        row: &'a SlotWriter,
+    }
 
-    let mut writer_sites: HashMap<QualifiedSlot, usize> = HashMap::new();
+    let mut sites: HashMap<QualifiedSlot, Vec<SiteRef>> = HashMap::new();
+    let mut ctxs: HashMap<ComponentId, CompCtx> = HashMap::new();
     let mut facts: Vec<EffectFacts> = Vec::new();
 
     for (&comp, comp_result) in &result.components {
         let cfg = &comp_result.render_cfg;
-        let state_vals = resolve_setter_aliases(cfg, &state_val_labels(cfg));
+        let mut mutated = written_names(comp_result);
+        mutated.extend(mutated_roots(cfg));
+        for body in comp_result.hooks.iter().filter_map(HookEntry::body_cfg) {
+            mutated.extend(mutated_roots(body));
+        }
+        ctxs.insert(
+            comp,
+            CompCtx {
+                state_vals: resolve_setter_aliases(cfg, &state_val_labels(cfg)),
+                memo_vals: resolve_setter_aliases(cfg, &memo_val_labels(cfg)),
+                render_lets: let_bindings(cfg),
+                mutated,
+            },
+        );
         for hook in &comp_result.hooks {
             let HookEntry::Effect {
                 label,
@@ -182,7 +213,11 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 continue;
             }
             for w in &writes {
-                *writer_sites.entry(node_of(comp, w)).or_default() += 1;
+                sites.entry(node_of(comp, w)).or_default().push(SiteRef {
+                    comp,
+                    cfg: body_cfg,
+                    row: w,
+                });
             }
             let triggers: Vec<&EffectTrigger> =
                 triggers_of(&comp_result.effect_triggers, *label).collect();
@@ -199,7 +234,6 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 comp,
                 comp_result,
                 body_cfg,
-                state_vals: state_vals.clone(),
                 effect_label: *label,
                 // An unreadable deps argument gates the effect by a list the
                 // engine cannot use, so it is read the same way as no list at
@@ -220,6 +254,13 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     let mut best: HashMap<(QualifiedSlot, QualifiedSlot, ComponentId, HookLabel), ChurnEdge> =
         HashMap::new();
     for f in &facts {
+        let ctx = &ctxs[&f.comp];
+        let invariance = Invariance {
+            render: &ctx.render_lets,
+            state_vals: &ctx.state_vals,
+            memo_vals: &ctx.memo_vals,
+            mutated: &ctx.mutated,
+        };
         let exit = f.comp_result.exit_env();
         let mut evaluator = f.comp_result.evaluator();
         let mut eval = |e: &Expr| evaluator.at(&exit, e);
@@ -228,29 +269,49 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 continue;
             }
             let node = node_of(f.comp, w);
-            // Convergence proof: once the written value sits in the slot, do
-            // the dominating guards kill this write? Edges claim reference
-            // churn, so the proof runs against the reference part of the
-            // written value only (references are truthy and non-nullish).
-            let settles = node.0 == f.comp
-                && w.block.is_some_and(|b| {
-                    converges_once_written(
-                        f.body_cfg,
-                        b,
-                        &f.state_vals,
+            // Convergence proof: once a written value sits in the slot, do the
+            // dominating guards kill this write — under its own write and
+            // under every other site's? Edges claim reference churn, so the
+            // own write is read as the reference part of its value
+            // (references are truthy and non-nullish); another site's write
+            // revives with whatever it stores, `null` included.
+            let own_value = reference_part(&w.written.value);
+            let own = WriteSite {
+                cfg: f.body_cfg,
+                block: w.block,
+                value: &own_value,
+                expr: w.written.expr.as_ref(),
+            };
+            let slot_sites = &sites[&node];
+            let foreign_site = slot_sites.iter().any(|s| s.comp != f.comp);
+            let others: Vec<WriteSite> = slot_sites
+                .iter()
+                .filter(|s| !std::ptr::eq(s.row, *w))
+                .map(|s| WriteSite {
+                    cfg: s.cfg,
+                    block: s.row.block,
+                    value: &s.row.written.value,
+                    expr: s.row.written.expr.as_ref(),
+                })
+                .collect();
+            let mut kill = |props_hold: bool| {
+                node.0 == f.comp
+                    && !foreign_site
+                    && converges_under_all_writes(
+                        &own,
+                        &others,
+                        &ctx.state_vals,
                         node.1,
-                        &reference_part(&w.written.value),
-                        w.written.expr.as_ref(),
+                        &invariance,
+                        props_hold,
                         &exit,
                         &mut eval,
                     )
-                });
-            // The kill of a graph edge is sound only for a single-effect-writer
-            // slot (see module doc). The self-slot edge keeps the per-site kill
-            // the self-churn arm always applied: two guarded writes of one
-            // slot in one effect can each settle their own guard, and the
-            // multi-site proof that would cover them is #154.
-            let killed = settles && writer_sites.get(&node) == Some(&1);
+            };
+            let killed_local = kill(true);
+            // Only an edge from another component's slot needs the proof with
+            // the props free to move.
+            let killed_foreign = f.versioned.iter().any(|x| x.0 != f.comp) && kill(false);
             let fresh_blocks: HashSet<BlockId> = f
                 .writes
                 .iter()
@@ -293,7 +354,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 // Re-runs after every render → its own write re-triggers it,
                 // whichever turn the write runs on (a handler row was dropped
                 // above).
-                if !killed {
+                if !killed_local {
                     push(node, strength, false);
                 }
                 continue;
@@ -301,11 +362,8 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             for &l in &f.exact_local {
                 let x: QualifiedSlot = (f.comp, l);
                 let self_slot = x == node;
-                let dropped = if self_slot {
-                    settles || !write_can_retrigger(f, node.1, w)
-                } else {
-                    killed
-                };
+                let dropped =
+                    killed_local || (self_slot && !write_can_retrigger(f, &ctx.state_vals, w));
                 if !dropped {
                     push(x, strength, self_slot);
                 }
@@ -315,11 +373,12 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     continue; // already pushed as exact
                 }
                 let self_slot = x == node && x.0 == f.comp;
-                let dropped = if self_slot {
-                    settles || !write_can_retrigger(f, node.1, w)
+                let killed = if x.0 == f.comp {
+                    killed_local
                 } else {
-                    killed
+                    killed_foreign
                 };
+                let dropped = killed || (self_slot && !write_can_retrigger(f, &ctx.state_vals, w));
                 if !dropped {
                     push(x, EdgeStrength::May, self_slot);
                 }
@@ -343,14 +402,19 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         s.map_or((u32::MAX, u32::MAX), |r| r.pos_key())
     }
 
-    /// Can a write of `w` into `label` change any dep of this effect? (#90)
-    fn write_can_retrigger(f: &EffectFacts<'_>, label: HookLabel, w: &SlotWriter) -> bool {
+    /// Can a write of `w` into its own slot change any dep of this effect?
+    /// (#90)
+    fn write_can_retrigger(
+        f: &EffectFacts<'_>,
+        state_vals: &HashMap<Var, HookLabel>,
+        w: &SlotWriter,
+    ) -> bool {
         can_retrigger(
             f.deps,
             &f.triggers,
             f.comp,
-            label,
-            &f.state_vals,
+            w.slot,
+            state_vals,
             w.written.expr.as_ref(),
         )
     }
