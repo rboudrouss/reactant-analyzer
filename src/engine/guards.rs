@@ -48,8 +48,9 @@ use crate::{
 /// True when the dominating guards of `call_block` provably kill the call
 /// once `written` sits in state slot `label` — the set fires at most once.
 ///
-/// `exit_env` is the env the guards are narrowed from; `eval` evaluates the
-/// literal the member arm reads, and nothing else.
+/// `exit_env` is the env the guards are narrowed from, and must be the env
+/// of `cfg` itself (a render site); `eval` evaluates the literal the member
+/// arm reads, and nothing else.
 #[allow(clippy::too_many_arguments)]
 pub fn converges_once_written(
     cfg: &CFG,
@@ -70,7 +71,8 @@ pub fn converges_once_written(
         expr: written_expr,
         scope: Some(cfg),
     };
-    dead_once_written(&guards, state_vals, label, &own, exit_env, eval)
+    // `exit_env` is this body's own env: nothing is shadowed.
+    dead_once_written(&guards, None, state_vals, label, &own, exit_env, eval)
 }
 
 /// A write site of the slot, as the multi-site proof reads it (#154).
@@ -119,10 +121,18 @@ pub fn converges_under_all_writes(
         expr: site.expr,
         scope: Some(site.cfg),
     };
-    if !dead_once_written(&guards, state_vals, label, &own, exit_env, eval) {
+    let mine = let_bindings(site.cfg);
+    if !dead_once_written(
+        &guards,
+        Some(&mine),
+        state_vals,
+        label,
+        &own,
+        exit_env,
+        eval,
+    ) {
         return false;
     }
-    let mine = let_bindings(site.cfg);
     let held: Vec<(&Expr, bool)> = guards
         .iter()
         .copied()
@@ -153,7 +163,15 @@ pub fn converges_under_all_writes(
             expr: other.expr,
             scope: same.then_some(site.cfg),
         };
-        if !dead_once_written(&guards, state_vals, label, &rewrite, &env, eval) {
+        if !dead_once_written(
+            &guards,
+            Some(&mine),
+            state_vals,
+            label,
+            &rewrite,
+            &env,
+            eval,
+        ) {
             return false;
         }
     }
@@ -384,8 +402,15 @@ struct Rewrite<'a> {
 
 /// True when `guards`, the conjuncts of one site, are all dead once
 /// `rewrite` sits in `label`, starting from `env`.
+///
+/// `shadowed` names what the site's body binds when `env` is not that
+/// body's env — the render exit env under an effect body. Those names read
+/// ⊤: the render may bind the same name to something else (a lowered
+/// short-circuit temp `__t0` most of all), and narrowing that value would
+/// pronounce a guard dead on a name it does not test (#162).
 fn dead_once_written(
     guards: &[(&Expr, bool)],
+    shadowed: Option<&HashMap<&str, Option<&Expr>>>,
     state_vals: &HashMap<Var, HookLabel>,
     label: HookLabel,
     rewrite: &Rewrite<'_>,
@@ -393,6 +418,9 @@ fn dead_once_written(
     eval: &mut dyn FnMut(&Expr) -> StateValue,
 ) -> bool {
     let mut env = env.clone();
+    for name in shadowed.into_iter().flat_map(HashMap::keys) {
+        env.extend((*name).to_string(), StateValue::top());
+    }
     for (v, l) in state_vals {
         if *l == label {
             env.extend(v.clone(), rewrite.value.clone());

@@ -813,6 +813,33 @@ export function Parent() {
 }
 
 #[test]
+fn a_render_binding_the_body_shadows_proves_nothing_about_the_body_name() {
+    // The render binds `flag` to `false`; the body binds its own `flag` to a
+    // prop. The value arm used to narrow the render's `false` and read the
+    // body's guard as dead — with `enabled` truthy the effect stores a fresh
+    // object on every run, a real loop.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ enabled }: { enabled: boolean }) {
+  const [s, setS] = useState(null);
+  const flag = false;
+  useEffect(() => {
+    const flag = enabled;
+    if (flag) setS({ x: 1 });
+  }, [s, enabled]);
+  return <div>{flag ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "the body's `flag` is not the render's: {diags:?}"
+    );
+}
+
+#[test]
 fn opposite_facts_on_one_prop_across_two_bodies_prove_convergence() {
     // The same shape over one prop: the first effect fires only while `flag`
     // is truthy, the second only while it is falsy, and a prop holds still
