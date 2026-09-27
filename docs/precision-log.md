@@ -79,6 +79,7 @@ from that session survived, and they are left as they are.
 | 2026-09-04 | following a narrowed run's imports, behind a flag | #138 | 1,317 → 1,317 (default unchanged; see the entry) |
 | 2026-09-05 | a JSX callee is resolved by the file that writes it | #7 | 1,317 → **1,348** (29 removed, 60 added) |
 | 2026-09-27 | the churn graph is a fold over engine rows; a write's phase decides what it can sustain | #151, #26 | 1,493 → **1,494** (0 removed, 1 added) |
+| 2026-09-27 | a convergence kill holds under every write of the slot; freshness is the reference kind's; a fresh spelling settles nothing | #154, #39, #155, #156 | 1,493 → **1,499** (0 removed, 6 added) |
 
 ---
 
@@ -1322,3 +1323,96 @@ exclusive branches of one effect, each settling its own guard — into a
 Warning. The multi-site proof that covers both is
 [#154](https://github.com/rboudrouss/reactant-analyzer/issues/154), a
 soundness bug on the record, not a fix.
+
+## #154, #39, #155, #156: a convergence kill holds under every write of the slot (2026-09-27)
+
+Same PR as #151, on top of it. Four commits and a review pass, measured once
+at the end against the CI artifact of `e257bcc` (run 36263786207, the
+branch's base; its own count is 1,493 against a committed baseline of 1,494,
+the chore that follows every merge): **1,493 → 1,499, 0 removed, 6 added**.
+Memory on twenty alone, the heaviest repo: 6.8 GB peak against 6.6 GB on
+`main` and 6.7 GB after #151 — the sites table and the per-component
+`Invariance` cost nothing measurable.
+
+### The claims
+
+- **#154, #39 — one proof for every edge.** The graph killed an edge on the
+  site's own guards alone: under a single-writer precondition for graph
+  edges, under none for the `self_slot` one. A second write of the slot can
+  revive the guard on the next round (`setS(null)` beside `if (!s)
+  setS({…})`), and that loop went unreported. `converges_under_all_writes`
+  (`engine/guards.rs`) asks the stronger question: the site's guards die
+  under its own write and under every other effect write of the slot in the
+  component, each other site taken with the conjuncts of its guards that
+  hold still across the automatic loop (`Invariance`). Two invariant
+  conjuncts of opposite polarity on one spelling contradict — dub's `if
+  (urlLeadId && …) / else if (!urlLeadId && …)` pair — and the rest narrow
+  the env the three arms run from. The single-writer precondition and the
+  per-site kill are gone, and with them the multi-writer FP of #39 (two
+  fetch-once effects into one slot are silent now).
+- **#155 — freshness is the reference kind's.** A state read of a ⊤ store
+  keeps the `other` residue beside the `Versioned` reference the read-side
+  conversion gives it, and the classifier read the residue as a possible
+  fresh reference. A value versioned by the written slot alone is that
+  slot's own content, whatever residue it carries; a copy of *another* ⊤
+  slot keeps its `Maybe`, since it moves with its source (#157 is the
+  precise account).
+- **#156 — a fresh spelling settles nothing.** The relational arm read `s
+  !== x` and `setS(x)` as two spellings of one value; bound to `{}` in the
+  body, or evaluated `PerRender` in the render, `x` is a new reference each
+  run and the guard holds again after every write.
+- **#162, its third shape.** Under the render exit env, every name the
+  site's body binds reads ⊤ before the arms run. Found on this corpus: the
+  `||` temp `__t0` of an effect in `use-feature-transition.ts` was narrowed
+  on the render's own `__t0`, and the multi-site proof killed a cycle the
+  single-writer condition had kept.
+
+### Where the six additions come from
+
+- `dub/.../leads/page.tsx:264`, `dub/.../submitted-lead-table.tsx:204`,
+  `infinite-loop`, Warning: the dub shape itself, with `searchParams` off
+  `useRouterStuff()`. `Invariance` reads a hook's result as moving, so the
+  `urlLeadId` / `!urlLeadId` contradiction is not available and neither
+  branch is proven convergent. The per-site kill accepted it without asking
+  where `urlLeadId` came from, which is #154. The refinement — a router hook
+  whose result moves only on navigation — is
+  [#161](https://github.com/rboudrouss/reactant-analyzer/issues/161).
+- `twenty/.../WorkflowDiagramEffect.tsx:125`, `infinite-loop`, Warning:
+  `setSeededVersionId(currentVersion.id)` settles its own guard
+  relationally; a deferred `setSeededVersionId(undefined)` in another effect
+  revives it. That writer fires once per external request (it resets the
+  flag that gates it), which the proof does not compose:
+  [#160](https://github.com/rboudrouss/reactant-analyzer/issues/160).
+- `twenty/.../ApiKeyNameInput.tsx:61`, `cross-component-infinite-loop`,
+  Warning: the #151 line, re-read. The debounced callback holds two writes
+  through the setter prop: the identity `onNameUpdate(apiKeyName)`, not
+  fresh after #155, and `onNameUpdate?.(updatedApiKey.name)` after the
+  `await`, a ⊤ member of the response, which keeps the May edge. The prop's
+  parameter type says `string`:
+  [#159](https://github.com/rboudrouss/reactant-analyzer/issues/159).
+- `twenty/.../use-feature-transition.ts:31`, `infinite-loop`, Warning (the
+  self-churn arm): the effect that stores `nextBullets` into
+  `queuedBullets` under a key comparison the engine cannot read. The
+  #162 fix above took away the bogus kill that hid it on `main` too; the
+  cycle lines of the same file, killed the same way for one run of this
+  branch, are back where `main` has them.
+- `mantine/.../use-did-update.ts:15`, `infinite-loop`, Warning: the no-deps
+  self-edge of ADR-042 §4 — `useEffect(fn, dependencies)` with a
+  parameter for a list is read as no list — on an effect whose kill also
+  rested on a render binding the body shadows. The hook gates itself on
+  its previous dependencies; the analyzer cannot read that, and the
+  fire-more direction is the one it takes.
+
+Nothing was removed. The two convergent shapes this PR silences on purpose
+(the multi-writer fetch-once pair of #39, the identity write of #155) have
+no occurrence on this corpus; both are pinned in `tests/effect_cycles.rs`.
+
+### Not fixed here, and filed
+
+[#157](https://github.com/rboudrouss/reactant-analyzer/issues/157) (a
+write of a value derived from the written slot reads as not fresh — a
+real loop, silent, whose naive fix is a Warning on every mirrored state),
+[#158](https://github.com/rboudrouss/reactant-analyzer/issues/158) (`new
+X()` lowers to a call), and the two shapes of #162 that remain: render
+writes are not sites, and a remounting child's mount-only effect fires per
+iteration.

@@ -193,7 +193,9 @@ its own slice, and the ratchet list records them:
   and the per-site kill are gone. A slot another component also writes is
   never killed: its guards live in bodies this component's env cannot read.
   Another site's functional updater is read as the join of its returns, so
-  a `prev => null` revives what it revives.
+  a `prev => null` revives what it revives. Under the render exit env, every
+  name the site's body binds reads ⊤: the render may bind the same name to
+  something else, and a guard is never dead on a name it does not test.
 - `ConvergedEval` / `Eval` / `eval_in_stores` move to the engine. They wrap
   `StateValueTransfer` over converged stores and every relation above needs
   them.
