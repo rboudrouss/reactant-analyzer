@@ -153,7 +153,12 @@ fn classify_updater_return(e: &Expr, params: &[Var]) -> Freshness {
 
 /// Freshness of a stored value. Churn is about the REFERENCE kind only: a
 /// widened numeric value (`count + 1`) changes but never fails `Object.is`
-/// freshly.
+/// freshly, and neither does the `other` residue — the kinds the domain does
+/// not model (symbol, bigint, …), which no transfer produces as a fresh
+/// identity: a ⊤ carries its freshness in `reference: Unknown`. What keeps
+/// the residue beside a settled reference kind is a state read of a ⊤ store,
+/// whose reference kind the read-side conversion sets to `Versioned`; written
+/// back into its slot that is the slot's own content, not a change (#155).
 fn value_freshness(val: &StateValue) -> Freshness {
     match &val.reference {
         Stability::PerRender => {
@@ -164,8 +169,8 @@ fn value_freshness(val: &StateValue) -> Freshness {
             }
         }
         Stability::Unknown => Freshness::Maybe,
-        // Stable / Versioned / ⊥ reference; residual ⊤ stays Maybe.
-        _ if val.other => Freshness::Maybe,
+        // Stable / Versioned / ⊥ reference: whatever else the value holds is
+        // a primitive or the residue, neither a new reference.
         _ => Freshness::Not,
     }
 }
@@ -327,5 +332,19 @@ mod tests {
         let top = classify(Some(&arg), &Updater::Unknown, |_| StateValue::top());
         assert_eq!(top.fresh, Freshness::Maybe);
         assert!(matches!(top.expr, Some(Expr::Var(v)) if v == "next"));
+    }
+
+    /// A state read of a ⊤ store: every kind ⊤ but the reference, which the
+    /// read-side conversion sets to `Versioned`. Written back, it is the
+    /// slot's own content — the residue is not a fresh reference (#155).
+    #[test]
+    fn a_versioned_read_with_a_top_residue_is_not_fresh() {
+        let arg = Expr::Var("name".into());
+        let read = classify(Some(&arg), &Updater::Unknown, |_| {
+            let mut v = StateValue::top();
+            v.reference = Stability::versioned_by(crate::test_support::C, 0);
+            v
+        });
+        assert_eq!(read.fresh, Freshness::Not);
     }
 }

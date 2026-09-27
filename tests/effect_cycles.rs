@@ -494,3 +494,62 @@ export function C() {
         "a listener write needs a user event per iteration: {diags:?}"
     );
 }
+
+// ── #155: an identity write is not a change ──────────────────────────────────
+
+#[test]
+fn writing_the_slots_own_value_back_is_not_a_loop() {
+    // The store goes ⊤ through the mount write, so the state read carries a
+    // `Versioned` reference beside a ⊤ residue. `setName(name)` stores the
+    // slot's own content: React bails out, nothing re-runs.
+    let src = r#"
+import { useState, useEffect } from 'react';
+declare function fetchName(): { name: string };
+export function C({ tick }: { tick: number }) {
+  const [name, setName] = useState('');
+  useEffect(() => { setName(fetchName().name); }, []);
+  useEffect(() => { setName(name); }, [name, tick]);
+  return <input value={name} />;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags.iter().all(|(rule, _, _)| rule != "infinite-loop"),
+        "an identity write is not a change: {diags:?}"
+    );
+}
+
+#[test]
+fn a_child_writing_the_parents_own_value_back_builds_no_edge() {
+    // The twenty shape: `<Child name={name} onNameUpdate={setName} />` and the
+    // child's effect calls `onNameUpdate(name)` — the parent's slot, written
+    // with the parent's own value for it. The graph used to carry a May edge
+    // from the parent's slot into itself, a length-1 cross-component cycle.
+    // (The older cross arm, which reads the parent's store rather than the
+    // written value, still fires on this shape when the call is direct: the
+    // exactness it would need is #157.)
+    let src = r#"
+import { useState, useEffect } from 'react';
+declare function fetchName(): { name: string };
+function Child({ name, onNameUpdate }: { name: string; onNameUpdate: (n: string) => void }) {
+  useEffect(() => { onNameUpdate(name); }, [name, onNameUpdate]);
+  return <input value={name} />;
+}
+export function Parent() {
+  const [name, setName] = useState('');
+  useEffect(() => { setName(fetchName().name); }, []);
+  return <Child name={name} onNameUpdate={setName} />;
+}
+"#;
+    let result = parse_and_analyze(src);
+    let graph = reactant::engine::ChurnGraph::build(&result);
+    assert!(
+        graph.edges.is_empty(),
+        "an identity write through a setter prop is not a change: {:?}",
+        graph
+            .edges
+            .iter()
+            .map(|e| (e.from, e.to, e.strength))
+            .collect::<Vec<_>>()
+    );
+}
