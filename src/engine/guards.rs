@@ -310,7 +310,7 @@ pub struct Invariance<'a> {
     /// The names some body of the component writes or mutates.
     pub mutated: &'a HashSet<Var>,
     /// Some effect, memo or callback body of the program visibly navigates
-    /// ([`navigates`]), so a navigation-held value may move inside the loop.
+    /// (`navigates`), so a navigation-held value may move inside the loop.
     pub navigates: bool,
 }
 
