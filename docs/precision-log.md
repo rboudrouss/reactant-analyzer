@@ -1422,12 +1422,17 @@ iteration.
 
 ## #162, #160, #158, #161: every write that runs is a site, and a reviver that fires once revives once (2026-09-27)
 
-One PR, measured once against the CI artifact of `548f922` (run
-36329437512, the branch's base, 1,499): **1,499 → 1,498, 3 removed, 2
+One PR, measured against the CI artifact of `548f922` (run 36329437512,
+the branch's base, 1,499). The final binary: **1,499 → 1,498, 3 removed, 2
 added**. Two of the three removals are the same two lines added back with a
-sharper message, so one location moved. Whole-tree memory peak 9.3 GB with
-3.9 GB of swap, measured while another session held 4 GB of the machine;
-not comparable to a per-repo figure, and to be re-read on the CI run.
+sharper message, so one location moved. Three whole-tree runs in all: the
+first cut gave the same three lines; the review pass then read every
+navigator as a stable reference and silenced three `missing-deps` on
+twenty's `navigate` (1,495), which is why `Navigator` carries its own
+`stable` claim and the third run is back to the first. Whole-tree memory
+peak 9.2 GB with 3.8 GB of swap, measured while another session held 4 GB
+of the machine; not comparable to a per-repo figure, and to be re-read on
+the CI run.
 
 ### The claims
 
