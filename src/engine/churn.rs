@@ -31,8 +31,10 @@
 //! #154). A site in another component has guards this component's env
 //! cannot read, so such a slot is never killed; a handler row needs a user
 //! event and is not a site. One kill, one proof, for the dep-driven
-//! same-slot edge too. An edge from another component's slot takes the
-//! proof with the props free to move, since that slot is what moves them.
+//! same-slot edge too. The proof reads facts over props only in a component
+//! no effect of which reacts to a parent slot: a loop can enter a component
+//! through its props only by such a dep, and then the props may move on any
+//! cycle through it, whichever edge the cycle takes.
 //!
 //! **Two arms, one relation** (ADR-020 item 2). A dep-driven edge whose write
 //! lands in the very slot its deps read is `self_slot`: the self-churn arm's
@@ -142,6 +144,12 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         memo_vals: HashMap<Var, HookLabel>,
         render_lets: HashMap<&'a str, Option<&'a Expr>>,
         mutated: HashSet<Var>,
+        /// No effect of the component reacts to another component's slot, so
+        /// no loop enters it through its props: they hold across every loop
+        /// its edges can be on. One dep versioned by a parent slot, and the
+        /// props may move on any cycle through the component — the proofs
+        /// then read no fact over them.
+        props_hold: bool,
     }
     // Per-effect facts, gathered first so the write sites of every slot are
     // known program-wide before any convergence kill is attempted (see
@@ -169,9 +177,14 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     let mut ctxs: HashMap<ComponentId, CompCtx> = HashMap::new();
     let mut facts: Vec<EffectFacts> = Vec::new();
 
+    // A module name any component writes moves between two runs of any
+    // component's effect: the union is program-wide, as `render_deps` reads
+    // it.
+    let module_written: HashSet<Var> = result.components.values().flat_map(written_names).collect();
+
     for (&comp, comp_result) in &result.components {
         let cfg = &comp_result.render_cfg;
-        let mut mutated = written_names(comp_result);
+        let mut mutated = module_written.clone();
         mutated.extend(mutated_roots(cfg));
         for body in comp_result.hooks.iter().filter_map(HookEntry::body_cfg) {
             mutated.extend(mutated_roots(body));
@@ -183,6 +196,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 memo_vals: resolve_setter_aliases(cfg, &memo_val_labels(cfg)),
                 render_lets: let_bindings(cfg),
                 mutated,
+                props_hold: comp_result.effect_triggers.iter().all(|t| t.slot.0 == comp),
             },
         );
         for hook in &comp_result.hooks {
@@ -294,24 +308,18 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     expr: s.row.written.expr.as_ref(),
                 })
                 .collect();
-            let mut kill = |props_hold: bool| {
-                node.0 == f.comp
-                    && !foreign_site
-                    && converges_under_all_writes(
-                        &own,
-                        &others,
-                        &ctx.state_vals,
-                        node.1,
-                        &invariance,
-                        props_hold,
-                        &exit,
-                        &mut eval,
-                    )
-            };
-            let killed_local = kill(true);
-            // Only an edge from another component's slot needs the proof with
-            // the props free to move.
-            let killed_foreign = f.versioned.iter().any(|x| x.0 != f.comp) && kill(false);
+            let killed = node.0 == f.comp
+                && !foreign_site
+                && converges_under_all_writes(
+                    &own,
+                    &others,
+                    &ctx.state_vals,
+                    node.1,
+                    &invariance,
+                    ctx.props_hold,
+                    &exit,
+                    &mut eval,
+                );
             let fresh_blocks: HashSet<BlockId> = f
                 .writes
                 .iter()
@@ -354,7 +362,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 // Re-runs after every render → its own write re-triggers it,
                 // whichever turn the write runs on (a handler row was dropped
                 // above).
-                if !killed_local {
+                if !killed {
                     push(node, strength, false);
                 }
                 continue;
@@ -362,8 +370,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             for &l in &f.exact_local {
                 let x: QualifiedSlot = (f.comp, l);
                 let self_slot = x == node;
-                let dropped =
-                    killed_local || (self_slot && !write_can_retrigger(f, &ctx.state_vals, w));
+                let dropped = killed || (self_slot && !write_can_retrigger(f, &ctx.state_vals, w));
                 if !dropped {
                     push(x, strength, self_slot);
                 }
@@ -373,11 +380,6 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                     continue; // already pushed as exact
                 }
                 let self_slot = x == node && x.0 == f.comp;
-                let killed = if x.0 == f.comp {
-                    killed_local
-                } else {
-                    killed_foreign
-                };
                 let dropped = killed || (self_slot && !write_can_retrigger(f, &ctx.state_vals, w));
                 if !dropped {
                     push(x, EdgeStrength::May, self_slot);

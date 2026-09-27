@@ -1128,9 +1128,12 @@ pub(crate) fn collect_slot_writers(
                 .then_some(site.at)
                 .flatten();
             let block = at.map(|(b, _)| b);
-            let written = written::classify(site.arg.as_ref(), &site.updater, |e| {
-                envs.eval(region, cfg, at, e)
-            });
+            let written = written::classify(
+                site.arg.as_ref(),
+                &site.updater,
+                (owner.unwrap_or(envs.component), slot),
+                |e| envs.eval(region, cfg, at, e),
+            );
             let via = {
                 let mut chain: Vec<Symbol> = hook_origin.into_iter().cloned().collect();
                 match site.prov_block {

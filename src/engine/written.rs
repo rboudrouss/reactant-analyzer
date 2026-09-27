@@ -27,7 +27,7 @@ use crate::{
         setters::{Updater, WriterRegion},
     },
     ir::{
-        ComponentId,
+        ComponentId, QualifiedSlot,
         cfg::{CFG, Terminator},
         expr::Expr,
         types::{BlockId, HookLabel, Var},
@@ -57,15 +57,16 @@ pub struct Written {
     pub expr: Option<Expr>,
 }
 
-/// Classify argument 0 of a write. `value_of` evaluates a value expression
-/// where the caller knows the env; it is not called for a function literal,
-/// whose returns are classified without one (the updater runs in its own
-/// scope). A bound updater the walk proved a function literal is read the
-/// same way; a bound name it could not prove stays on the value path, where
-/// a function value reads as an opaque reference.
+/// Classify argument 0 of a write into `target`. `value_of` evaluates a
+/// value expression where the caller knows the env; it is not called for a
+/// function literal, whose returns are classified without one (the updater
+/// runs in its own scope). A bound updater the walk proved a function
+/// literal is read the same way; a bound name it could not prove stays on
+/// the value path, where a function value reads as an opaque reference.
 pub fn classify(
     arg: Option<&Expr>,
     updater: &Updater,
+    target: QualifiedSlot,
     value_of: impl FnOnce(&Expr) -> StateValue,
 ) -> Written {
     let Some(arg) = arg else {
@@ -85,23 +86,39 @@ pub fn classify(
             _,
         ) => Written {
             fresh: returns_freshness(body_cfg, params),
-            value: StateValue::reference(Stability::PerRender),
+            value: returns_value(body_cfg),
             expr,
         },
         (_, Updater::Functional(body)) => Written {
             fresh: returns_freshness(body, &[]),
-            value: StateValue::reference(Stability::PerRender),
+            value: returns_value(body),
             expr,
         },
         (other, Updater::Unknown) => {
             let value = value_of(other);
             Written {
-                fresh: value_freshness(&value),
+                fresh: value_freshness(&value, target),
                 value,
                 expr,
             }
         }
     }
+}
+
+/// The value a functional updater stores: the join of what its returns are
+/// without an env — an allocation is a fresh reference, a literal is itself,
+/// anything else (its parameter included) is ⊤. A proof that reads another
+/// site's write must see the `null` a `prev => null` stores, not a
+/// placeholder reference.
+fn returns_value(body: &CFG) -> StateValue {
+    body.blocks
+        .values()
+        .filter_map(|b| match &b.term {
+            Terminator::Return(e) => Some(StateValue::from_init(e.peel_ts())),
+            _ => None,
+        })
+        .reduce(|acc, v| acc.join(&v))
+        .unwrap_or_else(StateValue::top)
 }
 
 /// Freshness of what a functional updater returns: `Fresh` when every return
@@ -151,15 +168,19 @@ fn classify_updater_return(e: &Expr, params: &[Var]) -> Freshness {
     }
 }
 
-/// Freshness of a stored value. Churn is about the REFERENCE kind only: a
-/// widened numeric value (`count + 1`) changes but never fails `Object.is`
-/// freshly, and neither does the `other` residue — the kinds the domain does
-/// not model (symbol, bigint, …), which no transfer produces as a fresh
-/// identity: a ⊤ carries its freshness in `reference: Unknown`. What keeps
-/// the residue beside a settled reference kind is a state read of a ⊤ store,
-/// whose reference kind the read-side conversion sets to `Versioned`; written
-/// back into its slot that is the slot's own content, not a change (#155).
-fn value_freshness(val: &StateValue) -> Freshness {
+/// Freshness of a value stored into `target`. Churn is about the REFERENCE
+/// kind only: a widened numeric value (`count + 1`) changes but never fails
+/// `Object.is` freshly.
+///
+/// A reference versioned by the target slot alone is that slot's own content
+/// — or something that moves only with it, the reading ADR-017 gives
+/// `Versioned` — whatever residue the value carries: a state read of a ⊤
+/// store keeps every kind ⊤ beside the `Versioned` reference the read-side
+/// conversion gives it, and written back it is not a change (#155). A value
+/// versioned by *another* slot with a ⊤ residue stays `Maybe`, the reading
+/// it had: copying slot X into slot Y changes Y whenever X moves, and #157 is
+/// the precise account of that.
+fn value_freshness(val: &StateValue, target: QualifiedSlot) -> Freshness {
     match &val.reference {
         Stability::PerRender => {
             if val.is_unstable_reference_only() {
@@ -169,8 +190,9 @@ fn value_freshness(val: &StateValue) -> Freshness {
             }
         }
         Stability::Unknown => Freshness::Maybe,
-        // Stable / Versioned / ⊥ reference: whatever else the value holds is
-        // a primitive or the residue, neither a new reference.
+        Stability::Versioned(by) if by.len() == 1 && by.contains(&target) => Freshness::Not,
+        // Stable / Versioned / ⊥ reference; residual ⊤ stays Maybe.
+        _ if val.other => Freshness::Maybe,
         _ => Freshness::Not,
     }
 }
@@ -283,9 +305,12 @@ mod tests {
         panic!("a function literal is classified without an env")
     }
 
+    /// The slot the tests write.
+    const T: QualifiedSlot = (crate::test_support::C, 0);
+
     #[test]
     fn no_argument_stores_nothing_fresh() {
-        let w = classify(None, &Updater::Unknown, opaque);
+        let w = classify(None, &Updater::Unknown, T, opaque);
         assert_eq!(w.fresh, Freshness::Not);
         assert!(w.expr.is_none());
     }
@@ -299,7 +324,7 @@ mod tests {
             },
             "p",
         );
-        let w = classify(Some(&e), &Updater::Unknown, opaque);
+        let w = classify(Some(&e), &Updater::Unknown, T, opaque);
         assert_eq!(w.fresh, Freshness::Fresh);
         assert_eq!(w.value.reference, Stability::PerRender);
     }
@@ -308,43 +333,65 @@ mod tests {
     fn the_identity_updater_and_a_literal_reset_are_not_fresh() {
         let id = updater(Expr::Var("p".into()), "p");
         assert_eq!(
-            classify(Some(&id), &Updater::Unknown, opaque).fresh,
+            classify(Some(&id), &Updater::Unknown, T, opaque).fresh,
             Freshness::Not
         );
         let reset = updater(Expr::Lit(Prim::Int(0)), "p");
         assert_eq!(
-            classify(Some(&reset), &Updater::Unknown, opaque).fresh,
+            classify(Some(&reset), &Updater::Unknown, T, opaque).fresh,
             Freshness::Not
+        );
+    }
+
+    /// The value an updater stores is what its returns are: a `null` reset
+    /// is `null`, which a proof reading the write from another site must
+    /// see as reviving `if (!s)`; the parameter is ⊤.
+    #[test]
+    fn an_updater_stores_what_it_returns() {
+        let reset = updater(Expr::Lit(Prim::Null), "p");
+        let w = classify(Some(&reset), &Updater::Unknown, T, opaque);
+        assert!(w.value.null);
+        assert_eq!(w.value.reference, Stability::Bottom);
+        let id = updater(Expr::Var("p".into()), "p");
+        assert!(
+            classify(Some(&id), &Updater::Unknown, T, opaque)
+                .value
+                .is_top_value()
         );
     }
 
     #[test]
     fn a_value_argument_takes_the_freshness_of_its_evaluated_reference() {
         let arg = Expr::Var("next".into());
-        let fresh = classify(Some(&arg), &Updater::Unknown, |_| {
+        let fresh = classify(Some(&arg), &Updater::Unknown, T, |_| {
             StateValue::reference(Stability::PerRender)
         });
         assert_eq!(fresh.fresh, Freshness::Fresh);
-        let stable = classify(Some(&arg), &Updater::Unknown, |_| {
+        let stable = classify(Some(&arg), &Updater::Unknown, T, |_| {
             StateValue::reference(Stability::Stable)
         });
         assert_eq!(stable.fresh, Freshness::Not);
-        let top = classify(Some(&arg), &Updater::Unknown, |_| StateValue::top());
+        let top = classify(Some(&arg), &Updater::Unknown, T, |_| StateValue::top());
         assert_eq!(top.fresh, Freshness::Maybe);
         assert!(matches!(top.expr, Some(Expr::Var(v)) if v == "next"));
     }
 
     /// A state read of a ⊤ store: every kind ⊤ but the reference, which the
-    /// read-side conversion sets to `Versioned`. Written back, it is the
-    /// slot's own content — the residue is not a fresh reference (#155).
+    /// read-side conversion sets to `Versioned`. Written back into its own
+    /// slot it is the slot's content — the residue is not a fresh reference
+    /// (#155). Written into another slot it keeps the `Maybe` it had: a copy
+    /// moves whenever its source does.
     #[test]
-    fn a_versioned_read_with_a_top_residue_is_not_fresh() {
+    fn a_versioned_read_with_a_top_residue_is_not_fresh_in_its_own_slot_only() {
         let arg = Expr::Var("name".into());
-        let read = classify(Some(&arg), &Updater::Unknown, |_| {
+        let read = || {
             let mut v = StateValue::top();
-            v.reference = Stability::versioned_by(crate::test_support::C, 0);
+            v.reference = Stability::versioned_by(T.0, T.1);
             v
-        });
-        assert_eq!(read.fresh, Freshness::Not);
+        };
+        let own = classify(Some(&arg), &Updater::Unknown, T, |_| read());
+        assert_eq!(own.fresh, Freshness::Not);
+        let copy = classify(Some(&arg), &Updater::Unknown, (T.0, 1), |_| read());
+        assert_eq!(copy.fresh, Freshness::Maybe);
     }
 }

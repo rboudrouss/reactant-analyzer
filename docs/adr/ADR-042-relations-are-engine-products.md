@@ -186,11 +186,14 @@ its own slice, and the ratchet list records them:
   and under every other effect write of the slot in the component, each
   taken with the conjuncts of that site's guards that hold still across the
   automatic loop (`Invariance`: no state, nothing derived from it, no
-  allocation, nothing a body mutates; props hold unless the edge comes from
-  another component's slot). One proof for every edge, the `self_slot` one
-  included; the single-writer precondition and the per-site kill are gone.
-  A slot another component also writes is never killed: its guards live in
-  bodies this component's env cannot read.
+  allocation, nothing any component's body mutates; props hold only in a
+  component no effect of which reacts to a parent slot, since that is the
+  only way a loop enters a component through its props). One proof for
+  every edge, the `self_slot` one included; the single-writer precondition
+  and the per-site kill are gone. A slot another component also writes is
+  never killed: its guards live in bodies this component's env cannot read.
+  Another site's functional updater is read as the join of its returns, so
+  a `prev => null` revives what it revives.
 - `ConvergedEval` / `Eval` / `eval_in_stores` move to the engine. They wrap
   `StateValueTransfer` over converged stores and every relation above needs
   them.

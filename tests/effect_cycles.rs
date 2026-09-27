@@ -523,6 +523,30 @@ export function C() {
 }
 
 #[test]
+fn a_render_level_allocation_is_a_fresh_spelling_too() {
+    // `empty` is bound in the render, not in the body, and is a new object on
+    // every render: the write changes `s`, the re-render makes a new `empty`,
+    // the re-run compares against it — a real loop the body's bindings alone
+    // cannot see. The converged env can: `empty` evaluates to `PerRender`.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState(null);
+  const empty = {};
+  useEffect(() => { if (s !== empty) setS(empty); }, [s]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "a render-level allocation is fresh every render: {diags:?}"
+    );
+}
+
+#[test]
 fn a_guard_compared_against_an_invariant_spelling_still_settles() {
     // The arm's own case stays: `next` is a prop, the same value on the next
     // run, so once written the guard is dead.
@@ -568,6 +592,32 @@ export function C({ tick }: { tick: number }) {
 }
 
 #[test]
+fn copying_a_top_store_slot_into_another_slot_is_still_a_change() {
+    // The same read written into *another* slot keeps its `Maybe`: `copy`
+    // takes a new value whenever `name` moves, and `name` moves on `copy` —
+    // a real loop that the identity reading must not silence.
+    let src = r#"
+import { useState, useEffect } from 'react';
+declare function fetchName(): { name: any };
+export function C() {
+  const [name, setName] = useState<any>('');
+  const [copy, setCopy] = useState<any>(null);
+  useEffect(() => { setName(fetchName().name); }, []);
+  useEffect(() => { setCopy(name); }, [name]);
+  useEffect(() => { setName({ copy }); }, [copy]);
+  return <div/>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev != Severity::Info),
+        "a copy of another slot moves with it: {diags:?}"
+    );
+}
+
+#[test]
 fn a_child_writing_the_parents_own_value_back_builds_no_edge() {
     // The twenty shape: `<Child name={name} onNameUpdate={setName} />` and the
     // child's effect calls `onNameUpdate(name)` — the parent's slot, written
@@ -607,15 +657,17 @@ export function Parent() {
 #[test]
 fn two_writes_of_one_slot_that_revive_each_other_are_a_loop() {
     // The fresh write's guard dies under its own write, and the `null` write
-    // beside it revives it on the next round: `s` = null → `{…}` → null → …
-    // The per-site kill read the first write as convergent and stayed silent.
+    // beside it revives it on the next round: with `cond` true, `s` = null →
+    // `{…}` (the last write of the run wins) → the re-run stores null → `{…}`
+    // → … The per-site kill read the fresh write as convergent and stayed
+    // silent.
     let src = r#"
 import { useState, useEffect } from 'react';
 export function C({ cond }: { cond: boolean }) {
   const [s, setS] = useState(null);
   useEffect(() => {
-    if (!s) setS({ fresh: true });
     if (cond) setS(null);
+    if (!s) setS({ fresh: true });
   }, [s, cond]);
   return <div>{s ? 'y' : 'n'}</div>;
 }
@@ -674,6 +726,89 @@ export function C({ a, b }: { a: boolean; b: boolean }) {
             .iter()
             .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
         "`flag` is two different bindings: {diags:?}"
+    );
+}
+
+#[test]
+fn a_null_returning_updater_at_another_site_revives_the_guard() {
+    // `prev => null` stores null, whatever placeholder a functional updater's
+    // value used to carry: `!s` holds again after it, and the pair loops.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState(null);
+  useEffect(() => { if (!s) setS({ fresh: true }); }, [s]);
+  useEffect(() => { if (s) setS(prev => null); }, [s]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "the updater stores null: {diags:?}"
+    );
+}
+
+#[test]
+fn a_module_name_another_component_writes_holds_nothing() {
+    // `D` toggles the module `let` on every change of `s`, so the facts
+    // `flag` / `!flag` of the two sites do not contradict across runs: the
+    // pair loops (`{…}` → null → `{…}`), and the kill must not read `flag`
+    // as a prop just because `C` never writes it.
+    let src = r#"
+import { useState, useEffect } from 'react';
+let flag = true;
+function D({ s }: { s: any }) {
+  useEffect(() => { flag = !flag; }, [s]);
+  return null;
+}
+export function C() {
+  const [s, setS] = useState(null);
+  useEffect(() => { if (flag) setS(null); }, [s]);
+  useEffect(() => { if (!flag && !s) setS({ x: 1 }); }, [s]);
+  return <D s={s} />;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "a module name another component writes moves: {diags:?}"
+    );
+}
+
+#[test]
+fn props_move_on_a_cycle_that_enters_through_another_edge() {
+    // The cycle is P → x → s → P: it enters `Child` through the prop `p`
+    // (versioned by the parent's slot) on the x-edge and leaves through the
+    // setter prop. The x → s edge is local, yet `p` moves along that cycle,
+    // so the facts `p` / `!p` of the two `s` sites prove nothing. Reading
+    // them as held killed the edge and lost the cycle.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ p, onChange }: { p: any; onChange: (v: any) => void }) {
+  const [x, setX] = useState(null);
+  const [s, setS] = useState(null);
+  useEffect(() => { setX({ p }); }, [p]);
+  useEffect(() => { if (p && !s) setS({ v: 1 }); }, [x]);
+  useEffect(() => { if (!p) setS(null); }, [x]);
+  useEffect(() => { onChange(s ? null : { k: 1 }); }, [s]);
+  return null;
+}
+export function Parent() {
+  const [p, setP] = useState<any>({ k: 1 });
+  return <Child p={p} onChange={setP} />;
+}
+"#;
+    let diags = infinite_loop_diags(src, "Child");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, _, _)| rule == "cross-component-infinite-loop"),
+        "the props move on the cycle through `x`: {diags:?}"
     );
 }
 

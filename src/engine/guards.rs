@@ -94,7 +94,8 @@ pub struct WriteSite<'a> {
 /// `others` are sites of the same component. A site of another component
 /// has guards in bodies this component's env cannot read, so the caller
 /// answers `false` for such a slot before asking. `props_hold` is handed
-/// to [`Invariance::holds`].
+/// to [`Invariance::holds`]: the caller says whether a loop can reach the
+/// component through its props at all.
 #[allow(clippy::too_many_arguments)]
 pub fn converges_under_all_writes(
     site: &WriteSite<'_>,
@@ -410,7 +411,7 @@ fn dead_once_written(
         // say that — `x < y` after `x := y` needs the two to be related, not
         // bounded — but the spellings can.
         if let (Some(arg), Some(scope)) = (rewrite.expr, rewrite.scope)
-            && write_settles_comparison(cond, taken, &slots, arg, scope)
+            && write_settles_comparison(cond, taken, &slots, arg, scope, eval)
         {
             return true;
         }
@@ -450,6 +451,7 @@ fn write_settles_comparison(
     slots: &HashSet<&Var>,
     written_expr: &Expr,
     cfg: &CFG,
+    eval: &mut dyn FnMut(&Expr) -> StateValue,
 ) -> bool {
     use crate::ir::expr::BinOp::*;
     let Expr::BinOp { op, lhs, rhs } = cond.peel_ts() else {
@@ -479,7 +481,7 @@ fn write_settles_comparison(
         // `const x = {}; if (s !== x) setS(x)` holds again after every write
         // (#156). The claim below is about two spellings being one value
         // across runs, so neither side may be one.
-        if fresh_spelling(at, cfg) || fresh_spelling(other, cfg) {
+        if fresh_spelling(at, cfg, eval) || fresh_spelling(other, cfg, eval) {
             return false;
         }
         let keys = value_keys(at, cfg);
@@ -487,17 +489,24 @@ fn write_settles_comparison(
     })
 }
 
-/// Is `e` a spelling of a fresh allocation — an object, array or function
-/// literal, or a name the body binds to one on any of its right-hand sides,
-/// or an operator that may return one (`a || {}`)? Fails closed past the
-/// alias depth. `new X()` lowers to a call and is not seen here (#158).
-fn fresh_spelling(e: &Expr, cfg: &CFG) -> bool {
+/// Is `e` a spelling of a fresh allocation? Syntactically: an object, array,
+/// function or element literal, a name the body binds to one on any of its
+/// right-hand sides, or an operator that may return one (`a || {}`); fails
+/// closed past the alias depth. Semantically: a spelling the converged env
+/// evaluates to a per-render reference — a render-level `const empty = {}`
+/// the body's bindings do not see. `new X()` lowers to a call and is seen by
+/// neither (#158).
+fn fresh_spelling(e: &Expr, cfg: &CFG, eval: &mut dyn FnMut(&Expr) -> StateValue) -> bool {
     fn go(e: &Expr, bindings: &HashMap<&str, Vec<&Expr>>, depth: usize) -> bool {
         if depth == 0 {
             return true;
         }
         match e.peel_ts() {
-            Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::FnLit { .. } => true,
+            Expr::ObjectLit { .. }
+            | Expr::ArrayLit { .. }
+            | Expr::FnLit { .. }
+            | Expr::NativeElem { .. }
+            | Expr::CompApp { .. } => true,
             Expr::Var(v) => bindings
                 .get(v.as_str())
                 .is_some_and(|rhss| rhss.iter().any(|r| go(r, bindings, depth - 1))),
@@ -507,7 +516,7 @@ fn fresh_spelling(e: &Expr, cfg: &CFG) -> bool {
             _ => false,
         }
     }
-    go(e, &local_bindings(cfg), 8)
+    go(e, &local_bindings(cfg), 8) || eval(e).reference == crate::domains::Stability::PerRender
 }
 
 /// The spellings that denote this expression's value: itself, and — when it is
