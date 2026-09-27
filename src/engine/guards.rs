@@ -24,6 +24,7 @@ use crate::{
     domains::{AbstractDomain, StateValue, stores::AbstractEnv},
     engine::cfg_analyzer::narrow_env_for_branch,
     ir::{
+        bindings::local_bindings,
         cfg::{CFG, EdgeKind, Terminator},
         expr::{Expr, UnaryOp},
         free_vars::call_free_key,
@@ -167,9 +168,39 @@ fn write_settles_comparison(
         let Some(at) = written_at(written_expr, &segs) else {
             return false;
         };
+        // A spelling of an allocation denotes a new reference on every run:
+        // `const x = {}; if (s !== x) setS(x)` holds again after every write
+        // (#156). The claim below is about two spellings being one value
+        // across runs, so neither side may be one.
+        if fresh_spelling(at, cfg) || fresh_spelling(other, cfg) {
+            return false;
+        }
         let keys = value_keys(at, cfg);
         !keys.is_empty() && value_keys(other, cfg).iter().any(|k| keys.contains(k))
     })
+}
+
+/// Is `e` a spelling of a fresh allocation — an object, array or function
+/// literal, or a name the body binds to one on any of its right-hand sides,
+/// or an operator that may return one (`a || {}`)? Fails closed past the
+/// alias depth. `new X()` lowers to a call and is not seen here (#158).
+fn fresh_spelling(e: &Expr, cfg: &CFG) -> bool {
+    fn go(e: &Expr, bindings: &HashMap<&str, Vec<&Expr>>, depth: usize) -> bool {
+        if depth == 0 {
+            return true;
+        }
+        match e.peel_ts() {
+            Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::FnLit { .. } => true,
+            Expr::Var(v) => bindings
+                .get(v.as_str())
+                .is_some_and(|rhss| rhss.iter().any(|r| go(r, bindings, depth - 1))),
+            Expr::BinOp { lhs, rhs, .. } => {
+                go(lhs, bindings, depth - 1) || go(rhs, bindings, depth - 1)
+            }
+            _ => false,
+        }
+    }
+    go(e, &local_bindings(cfg), 8)
 }
 
 /// The spellings that denote this expression's value: itself, and — when it is

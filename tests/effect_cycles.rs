@@ -495,6 +495,54 @@ export function C() {
     );
 }
 
+// ── #156: a fresh spelling settles nothing ───────────────────────────────────
+
+#[test]
+fn a_guard_compared_against_a_fresh_allocation_holds_again_after_the_write() {
+    // `x` is a new object on every run, so `s !== x` is true after every
+    // write: a real loop. The relational arm used to read `s !== x` and
+    // `setS(x)` as two spellings of one value and kill the edge.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState(null);
+  useEffect(() => {
+    const x = {};
+    if (s !== x) setS(x);
+  }, [s]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "a fresh spelling is a different reference each run: {diags:?}"
+    );
+}
+
+#[test]
+fn a_guard_compared_against_an_invariant_spelling_still_settles() {
+    // The arm's own case stays: `next` is a prop, the same value on the next
+    // run, so once written the guard is dead.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ next }: { next: { id: number } }) {
+  const [s, setS] = useState(null);
+  useEffect(() => {
+    if (s !== next) setS(next);
+  }, [s, next]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags.iter().all(|(rule, _, _)| rule != "infinite-loop"),
+        "an invariant spelling settles the guard: {diags:?}"
+    );
+}
+
 // ── #155: an identity write is not a change ──────────────────────────────────
 
 #[test]
