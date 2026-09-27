@@ -232,6 +232,16 @@ pub enum Expr {
         fn_: Box<Expr>,
         args: Vec<Expr>,
     },
+    /// `new X(args)`: a call that always allocates. The value domain reads it
+    /// as a fresh reference whose members are ⊤, and every syntactic proof
+    /// reads it where it reads an object literal — lowered to a plain `Call`
+    /// it was a value that "holds still" and that no freshness check could
+    /// see (#158). `id` is the allocation site, as for `ObjectLit`.
+    New {
+        id: ExprId,
+        fn_: Box<Expr>,
+        args: Vec<Expr>,
+    },
     CompApp {
         name: Symbol,
         props: Box<Expr>,
@@ -356,6 +366,19 @@ pub enum SummaryValue {
         id: ExprId,
         members: Arc<Vec<(Symbol, SummaryValue)>>,
     },
+    /// ⊤ that moves only on an event the automatic re-render loop cannot
+    /// raise: navigation, for a router hook's `searchParams`, `params`,
+    /// `pathname` or `location` (#161). The convergence proof reads the
+    /// value as holding still across the loop.
+    Held,
+    /// A function whose call navigates — `useNavigate()`'s result, the
+    /// `push`/`replace` of a router object, the setter of react-router's
+    /// `useSearchParams` tuple (#161). A call through it in a body the loop
+    /// can run moves every [`Self::Held`] value. `stable` is its own
+    /// identity across renders, a separate claim: Next documents the router
+    /// object's methods stable, react-router's `navigate` and
+    /// `setSearchParams` change with the location outside a data router.
+    Navigator { stable: bool },
 }
 
 impl Expr {
@@ -412,6 +435,7 @@ impl Expr {
             Expr::FieldAccess { obj, field } => format!("{}.{field}", obj.describe()),
             Expr::IndexAccess { arr, .. } => format!("{}[…]", arr.describe()),
             Expr::Call { fn_, .. } => format!("{}(…)", fn_.describe()),
+            Expr::New { fn_, .. } => format!("new {}(…)", fn_.describe()),
             Expr::ObjectLit { .. } => "{…}".to_string(),
             Expr::ArrayLit { .. } => "[…]".to_string(),
             Expr::FnLit { .. } => "() => …".to_string(),
@@ -467,7 +491,7 @@ impl Expr {
                 f(rhs);
             }
             Expr::UnaryOp { arg, .. } => f(arg),
-            Expr::Call { fn_, args } => {
+            Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
                 f(fn_);
                 for a in args {
                     f(a);
@@ -486,11 +510,15 @@ impl Expr {
         }
     }
 
-    /// Returns `true` iff the expression tree contains no `Call` or `CompApp` node.
-    /// `FnLit` bodies are not crossed (they are leaves for `for_each_child`).
+    /// Returns `true` iff the expression tree contains no `Call`, `New` or
+    /// `CompApp` node. `FnLit` bodies are not crossed (they are leaves for
+    /// `for_each_child`).
     pub fn is_call_free(&self) -> bool {
         match self {
-            Expr::Call { .. } | Expr::CompApp { .. } | Expr::NativeElem { .. } => false,
+            Expr::Call { .. }
+            | Expr::New { .. }
+            | Expr::CompApp { .. }
+            | Expr::NativeElem { .. } => false,
             _ => {
                 let mut free = true;
                 self.for_each_child(&mut |c| free &= c.is_call_free());

@@ -307,10 +307,15 @@ pub(super) fn lower_expr(expr: &Expression, builder: &mut BlockBuilder) -> Expr 
 
         // ── Calls ─────────────────────────────────────────────────────────────
         Expression::CallExpression(call) => lower_call(call, builder),
+        // `new` always allocates: an allocating node of its own, so the
+        // freshness every proof reads off an object literal is read here too
+        // (#158).
         Expression::NewExpression(new_) => {
+            let id = builder.next_expr_id();
             let fn_ = lower_expr(&new_.callee, builder);
             let args = lower_arguments(&new_.arguments, builder);
-            Expr::Call {
+            Expr::New {
+                id,
                 fn_: Box::new(fn_),
                 args,
             }

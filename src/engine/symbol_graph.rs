@@ -283,7 +283,7 @@ fn collect_callees_in_cfg(cfg: &CFG, out: &mut Vec<Callee>) {
 
 fn collect_callees_in_expr(expr: &Expr, out: &mut Vec<Callee>) {
     match expr {
-        Expr::Call { fn_, .. } => {
+        Expr::Call { fn_, .. } | Expr::New { fn_, .. } => {
             if let Expr::Var(name) = fn_.as_ref() {
                 out.push(Callee {
                     name: name.clone(),

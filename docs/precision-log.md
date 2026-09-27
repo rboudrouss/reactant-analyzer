@@ -80,6 +80,7 @@ from that session survived, and they are left as they are.
 | 2026-09-05 | a JSX callee is resolved by the file that writes it | #7 | 1,317 → **1,348** (29 removed, 60 added) |
 | 2026-09-27 | the churn graph is a fold over engine rows; a write's phase decides what it can sustain | #151, #26 | 1,493 → **1,494** (0 removed, 1 added) |
 | 2026-09-27 | a convergence kill holds under every write of the slot; freshness is the reference kind's; a fresh spelling settles nothing | #154, #39, #155, #156 | 1,493 → **1,499** (0 removed, 6 added) |
+| 2026-09-27 | every write that runs is a site; a reviver that fires once revives once; `new` allocates; the URL holds still | #162, #160, #158, #161 | 1,499 → **1,498** (3 removed, 2 added; two are one line reworded) |
 
 ---
 
@@ -1416,3 +1417,93 @@ real loop, silent, whose naive fix is a Warning on every mirrored state),
 X()` lowers to a call), and the two shapes of #162 that remain: render
 writes are not sites, and a remounting child's mount-only effect fires per
 iteration.
+
+---
+
+## #162, #160, #158, #161: every write that runs is a site, and a reviver that fires once revives once (2026-09-27)
+
+One PR, measured against the CI artifact of `548f922` (run 36329437512,
+the branch's base, 1,499). The final binary: **1,499 → 1,498, 3 removed, 2
+added**. Two of the three removals are the same two lines added back with a
+sharper message, so one location moved. Three whole-tree runs in all: the
+first cut gave the same three lines; the review pass then read every
+navigator as a stable reference and silenced three `missing-deps` on
+twenty's `navigate` (1,495), which is why `Navigator` carries its own
+`stable` claim and the third run is back to the first. Whole-tree memory
+peak 9.2 GB with 3.8 GB of swap, measured while another session held 4 GB
+of the machine; not comparable to a per-repo figure, and to be re-read on
+the CI run.
+
+### The claims
+
+- **#162 — what is a site.** The site list was built from effect rows
+  alone. A `setter-in-render` write revives what it revives, so every
+  non-handler row of a render or memo body is a site now. A mount-only
+  effect of a component that stays mounted fires once, but a child the loop
+  mounts and unmounts (`{s && <Child onReady={setS} />}`, or a `key` read
+  off the slot) fires its `[]` effect on every round: a foreign row of such
+  an effect is a site unless the owner renders the child under guards that
+  hold still, keyed by nothing that moves, outside any closure
+  (`stays_mounted`, `engine/churn.rs`). Both shapes are soundness, both
+  pinned in `tests/effect_cycles.rs`; neither occurs on this corpus.
+- **#160 — a reviver that fires once revives once.** Two things. A
+  deferred, nested or repeating row now carries `guard_block`, the block
+  of the statement that scheduled it: a continuation runs only if the run
+  that scheduled it took every branch above that statement. And a site's
+  guards die under the writes that run whenever it runs — its own and
+  every synchronous write of a local slot on the chain above it — so `if
+  (!req) return; setReq(false); refetch().then(() => setSeeded(undefined))`
+  is proven to fire once per request. The churn graph composes the proof by
+  least fixpoint over the sites of a component: a site proven convergent
+  is no longer a live reviver of the others. (The issue said greatest
+  fixpoint; that reads two sites reviving each other as convergent, which
+  is exactly a loop, and `two_writes_of_one_slot_that_revive_each_other`
+  is the test that says so.)
+- **#158 — `new` allocates.** `NewExpression` lowered to a plain `Call`,
+  which `Invariance` read as holding still and the relational arm as a
+  spelling it could compare across runs. `Expr::New` is an allocating node
+  with an id of its own: a fresh reference in the value domain, members
+  ⊤, and read as fresh wherever an object literal is — the relational arm
+  refuses `if (s !== m) setS(m)` over `const m = new Map()`, and `prev =>
+  new Map(prev)` is a must-fresh updater.
+- **#161 — the URL holds still.** A router hook's result moves only on
+  navigation. `useSearchParams`, `useParams`, `usePathname`, `useLocation`,
+  `useMatch` and the layout-segment hooks carry `SummaryValue::Held`, which
+  `Invariance` accepts unless some render, effect, memo or callback body of
+  the program visibly navigates. The navigators are summaries too
+  (`SummaryValue::Navigator`: `useNavigate()`'s result, `router.push` and
+  `replace`, the setter of react-router's `useSearchParams` tuple), resolved
+  through the bindings under whatever name the body calls them; `history.*`,
+  a `location` write, a bare `navigate()` and a `<Navigate/>` are read by
+  name. A member of an object literal, or of a shaped hook result, holds
+  when the member does, so a value an inlined custom hook hands back inside
+  `{ searchParams }` keeps what the hook knew. The review of this PR found
+  the first cut name-based only, which missed `setSearchParams` — a real
+  loop through the URL went silent — and the `.map`-rendered child of #162;
+  both are pinned as tests now.
+
+### The three lines
+
+- `dub/packages/stripe-app/src/views/AppSettings.tsx:121`, `infinite-loop`
+  Warning, **removed** (#160): `if (!oauthState && !workspace)
+  createOAuthState().then(({ state }) => setOAuthState(state))`. The
+  deferred write had no block and could never be killed; under the guards
+  of its scheduling statement a fresh reference stored into `oauthState`
+  makes `!oauthState` dead.
+- `dub/packages/ui/src/timestamp-tooltip.tsx:102`, `always-unstable-deps`,
+  **reworded** (#158): the memo's deps are `rows` *and* `date`, and `date`
+  is `new Date(timestamp)`, a fresh reference every render.
+- `twenty/.../hello-world.tsx:14`, `missing-deps`, **reworded** (#158):
+  `client` is `new CoreApiClient()`, recreated on every render rather than
+  "may change".
+
+### What did not move
+
+The two dub lines of #161 read `searchParams` off `useRouterStuff()`,
+imported from `@dub/ui` — a `workspace:*` package whose entry is a `dist/`
+the clone does not contain, so the hook is opaque
+([#48](https://github.com/rboudrouss/reactant-analyzer/issues/48)); the
+mechanism is pinned on the same shape with the hook in the file. The twenty
+line of #160 resets a jotai atom (`useAtomFamilyState`), not a state slot,
+so the co-executing write the proof needs is not a write it models. Both
+issues stay open on those residuals.

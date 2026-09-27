@@ -774,6 +774,13 @@ pub struct SlotWriter {
     /// synchronously in the region, once per pass — what `must_on_all_paths`
     /// takes. `None` for a nested, deferred, cleanup or repeating site.
     pub block: Option<BlockId>,
+    /// The block of the region's CFG whose dominating guards the write runs
+    /// under: `block` for a synchronous write, the statement that scheduled
+    /// it for a nested, deferred, cleanup or repeating one — a continuation
+    /// runs only if the run that scheduled it took every branch above the
+    /// scheduling statement (#160). `None` for a row with no placeable
+    /// block.
+    pub guard_block: Option<BlockId>,
     /// What the write stores (ADR-042 §2).
     pub written: Written,
 }
@@ -1151,6 +1158,7 @@ pub(crate) fn collect_slot_writers(
                             same_tick,
                             owner,
                             block,
+                            guard_block: site.prov_block,
                             written,
                         });
                         continue;
@@ -1180,6 +1188,7 @@ pub(crate) fn collect_slot_writers(
                 same_tick,
                 owner,
                 block,
+                guard_block: site.prov_block,
                 written,
             });
         }
@@ -1781,7 +1790,7 @@ impl<'a> SetterWalk<'a> {
                     span,
                 });
             }
-            Expr::Call { fn_, .. } if self.collect_calls => {
+            Expr::Call { fn_, .. } | Expr::New { fn_, .. } if self.collect_calls => {
                 if let Some((name, receiver)) = callee_name(fn_) {
                     found.calls.push(FoundCall {
                         name,
@@ -1867,7 +1876,10 @@ impl<'a> SetterWalk<'a> {
         for child in children {
             self.expr(child, stmt_span, at, depth, found, mode, at_root, prov);
         }
-        if let Expr::Call { fn_, args } = expr {
+        // `new X(cb)` runs its arguments through the same machinery: a
+        // `Promise` executor runs synchronously, and a class the body binds
+        // is a local helper like any other.
+        if let Expr::Call { fn_, args } | Expr::New { fn_, args, .. } = expr {
             if let Expr::Var(name) = fn_.as_ref() {
                 if self.setter_vars.contains(name) {
                     found.setters.push(FoundSite {

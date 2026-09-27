@@ -196,6 +196,24 @@ its own slice, and the ratchet list records them:
   a `prev => null` revives what it revives. Under the render exit env, every
   name the site's body binds reads ⊤: the render may bind the same name to
   something else, and a guard is never dead on a name it does not test.
+  **Amended 2026-09-27 (#158, #160, #161, #162):** a site is every
+  non-handler row of an effect, render or memo body, plus a mount-only
+  effect's rows that write another component's slot when that component
+  does not stay mounted across the loop (its elements sit under guards
+  that hold, keyed by nothing that moves, outside closures). A site's
+  guards die under the writes that run whenever it runs — its own and every
+  synchronous write of a local slot on the chain above it (`guard_block`,
+  the scheduling statement of a deferred write) — and under every other
+  live write of those slots; a site proven to fire at most once is not a
+  live reviver, by least fixpoint over the sites of a component (a greatest
+  fixpoint would read mutual revival as convergence). A router hook's
+  result is held (`SummaryValue::Held`) unless a body the loop can run
+  visibly navigates — a call through a `SummaryValue::Navigator`
+  (`useNavigate()`, `router.push`, the `useSearchParams` setter), resolved
+  through the bindings, or a router/history method by name; a member of an
+  object literal or of a shaped hook result holds when the member does.
+  `new X()` is an allocating node (`Expr::New`), read as fresh wherever an
+  object literal is.
 - `ConvergedEval` / `Eval` / `eval_in_stores` move to the engine. They wrap
   `StateValueTransfer` over converged stores and every relation above needs
   them.

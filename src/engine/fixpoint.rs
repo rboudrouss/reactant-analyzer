@@ -955,7 +955,13 @@ fn expand_custom_hooks(
                 // one per call, so two `useForm()`s are two objects. Drawn
                 // from the component's splice cursor, the same supply a graft
                 // uses (#134).
-                let sv = if summary.members().is_empty() {
+                let sv = if summary.navigates() {
+                    // Identity unpromised: react-router's `navigate` changes
+                    // with the location outside a data router.
+                    SummaryValue::Navigator { stable: false }
+                } else if summary.held_across_updates() {
+                    SummaryValue::Held
+                } else if summary.members().is_empty() {
                     state_value_to_summary_value(summary.summarize(&[]))
                 } else {
                     SummaryValue::Shape {
@@ -1394,7 +1400,7 @@ fn collect_hook_labels_expr(expr: &Expr, out: &mut Vec<HookLabel>) {
             collect_hook_labels_expr(rhs, out);
         }
         Expr::UnaryOp { arg, .. } => collect_hook_labels_expr(arg, out),
-        Expr::Call { fn_, args } => {
+        Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
             collect_hook_labels_expr(fn_, out);
             args.iter().for_each(|a| collect_hook_labels_expr(a, out));
         }

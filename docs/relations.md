@@ -46,6 +46,7 @@ params included. Two `setX(…)` calls in one body are two rows.
 | `updater` | argument 0 proven a function literal (`Functional`, body kept) or ⊤ | must for `Functional` |
 | `same_tick` | another write of the same slot in this region is CFG-reachable from this one | may, one-directional: `false` is not a promise |
 | `block` | the region block a write that runs synchronously, once per pass, sits in — what `must_on_all_paths` takes | exact; `None` for nested, deferred, cleanup and repeating sites |
+| `guard_block` | the region block whose dominating guards the write runs under: `block` for a synchronous write, the statement that scheduled it for a nested, deferred, cleanup or repeating one (#160) | exact; `None` for a row with no placeable block |
 | `written.fresh` | the stored value is a new reference every call (`Fresh`), maybe (`Maybe`), or never (`Not`) — read off the reference kind alone: primitives and the `other` residue never carry a fresh identity (#155) | must for `Fresh`, must for `Not` |
 | `written.value` | the abstract value stored, evaluated in the env of the row's own statement | may (an over-approximation of the value) |
 | `written.expr` | argument 0 as written | exact |

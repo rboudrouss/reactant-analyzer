@@ -297,9 +297,10 @@ impl StateValue {
             Expr::Lit(Prim::String(s)) => StateValue::str_singleton(s.to_string()),
             Expr::Lit(Prim::Null) => StateValue::null(),
             Expr::Lit(Prim::Unit) => StateValue::undefined(),
-            Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::FnLit { .. } => {
-                StateValue::reference(Stability::PerRender)
-            }
+            Expr::ObjectLit { .. }
+            | Expr::ArrayLit { .. }
+            | Expr::FnLit { .. }
+            | Expr::New { .. } => StateValue::reference(Stability::PerRender),
             _ => StateValue::top(),
         }
     }

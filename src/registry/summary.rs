@@ -29,6 +29,22 @@ pub trait HookSummary: Send + Sync {
     fn members(&self) -> &'static [(&'static str, SummaryValue)] {
         &[]
     }
+
+    /// The result is ⊤ and moves only on an event the automatic re-render
+    /// loop cannot raise — navigation, for a router hook — so a guard over
+    /// it holds still across that loop (#161). Read before
+    /// [`Self::members`] and [`Self::summarize`].
+    fn held_across_updates(&self) -> bool {
+        false
+    }
+
+    /// The result is a function whose call navigates (`useNavigate()`): a
+    /// call through it inside a body the loop can run moves everything the
+    /// URL decides (#161). Read before [`Self::members`] and
+    /// [`Self::summarize`].
+    fn navigates(&self) -> bool {
+        false
+    }
 }
 
 // ── SummaryRegistry ───────────────────────────────────────────────────────────
@@ -66,10 +82,30 @@ impl SummaryRegistry {
         r.register_many_for_package("next/navigation", NEXT_NAVIGATION_HOOKS);
         r.register_many_for_package("next/router", &["useRouter"]);
         r.register_many_for_package("next/compat/router", &["useRouter"]);
-        // The one Next hook whose *kind* is certain: App Router
-        // `usePathname()` is typed `string`, and a primitive is compared by
-        // value — so a `pathname` dep is never a per-render fresh reference.
-        r.register_for_package("next/navigation", Box::new(StrTopSummary("usePathname")));
+        // What the URL decides moves only on navigation (#161): the
+        // convergence proof reads it as holding still across the automatic
+        // loop.
+        for name in [
+            "useSearchParams",
+            "useParams",
+            "usePathname",
+            "useSelectedLayoutSegment",
+            "useSelectedLayoutSegments",
+        ] {
+            r.register_for_package("next/navigation", Box::new(HeldSummary(name)));
+        }
+        for pkg in ["react-router-dom", "react-router"] {
+            for name in ["useParams", "useLocation", "useMatch"] {
+                r.register_for_package(pkg, Box::new(HeldSummary(name)));
+            }
+            // `[searchParams, setSearchParams]`: the value moves on navigation
+            // only, and the setter is how a body navigates.
+            r.register_for_package(
+                pkg,
+                Box::new(ShapeSummary("useSearchParams", REACT_ROUTER_SEARCH_PARAMS)),
+            );
+            r.register_for_package(pkg, Box::new(NavigatorSummary("useNavigate")));
+        }
 
         // Per-member contracts (#94). Registering the *shape* is what lets a
         // destructured `const { setValue } = useForm()` resolve: the container
@@ -172,17 +208,27 @@ impl HookSummary for TopSummary {
     // summarize returns Top via default
 }
 
-/// A hook whose return is an unknown **string**. Narrower than ⊤ in the one
-/// way that matters downstream: a primitive is value-compared, so it can
-/// never read as a fresh reference in a deps array.
-struct StrTopSummary(&'static str);
+/// A hook whose return is ⊤ and moves only on navigation (#161).
+struct HeldSummary(&'static str);
 
-impl HookSummary for StrTopSummary {
+impl HookSummary for HeldSummary {
     fn name(&self) -> &str {
         self.0
     }
-    fn summarize(&self, _args: &[StateValue]) -> StateValue {
-        StateValue::str_top()
+    fn held_across_updates(&self) -> bool {
+        true
+    }
+}
+
+/// A hook whose return is a function whose call navigates (#161).
+struct NavigatorSummary(&'static str);
+
+impl HookSummary for NavigatorSummary {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn navigates(&self) -> bool {
+        true
     }
 }
 
@@ -239,13 +285,24 @@ const REACT_HOOK_FORM_MEMBERS: &[(&str, SummaryValue)] = &[
 
 /// Next.js App Router `useRouter()` — the router object and its methods are
 /// documented stable, and apps omit them from deps for exactly that reason.
+/// The methods that change the URL are navigators (#161): stable too, and a
+/// call through one moves everything the URL decides.
 const NEXT_ROUTER_MEMBERS: &[(&str, SummaryValue)] = &[
-    ("push", SummaryValue::StableRef),
-    ("replace", SummaryValue::StableRef),
+    ("push", SummaryValue::Navigator { stable: true }),
+    ("replace", SummaryValue::Navigator { stable: true }),
     ("refresh", SummaryValue::StableRef),
     ("prefetch", SummaryValue::StableRef),
-    ("back", SummaryValue::StableRef),
-    ("forward", SummaryValue::StableRef),
+    ("back", SummaryValue::Navigator { stable: true }),
+    ("forward", SummaryValue::Navigator { stable: true }),
+];
+
+/// react-router's `useSearchParams()` → `[searchParams, setSearchParams]`, a
+/// tuple contract keyed by position like jotai's (#37): the value moves on
+/// navigation only, the setter navigates (#161).
+const REACT_ROUTER_SEARCH_PARAMS: &[(&str, SummaryValue)] = &[
+    ("0", SummaryValue::Held),
+    // Memoized on the current params: no identity promised.
+    ("1", SummaryValue::Navigator { stable: false }),
 ];
 
 /// `@mantine/form`'s `useForm()`. One entry, and it is a timing claim, not a
@@ -477,13 +534,25 @@ mod tests {
         assert!(!r.contains("useSearchParams", Some("my-own-lib")));
     }
 
+    /// What the URL decides is held; the navigators are what moves it.
     #[test]
-    fn use_pathname_is_a_string_not_top() {
+    fn router_hooks_are_held_and_their_navigators_are_not() {
         let r = SummaryRegistry::new_with_common();
-        let s = r.get("usePathname", Some("next/navigation")).unwrap();
-        let v = s.summarize(&[]);
-        assert_eq!(v, StateValue::str_top());
-        assert!(!v.is_top_value(), "a string is narrower than ⊤");
+        for name in ["usePathname", "useSearchParams", "useParams"] {
+            let s = r.get(name, Some("next/navigation")).unwrap();
+            assert!(s.held_across_updates(), "{name} moves only on navigation");
+            assert!(!s.navigates());
+        }
+        let nav = r.get("useNavigate", Some("react-router-dom")).unwrap();
+        assert!(nav.navigates());
+        assert!(!nav.held_across_updates());
+        let sp = r.get("useSearchParams", Some("react-router-dom")).unwrap();
+        assert!(
+            sp.members()
+                .iter()
+                .any(|(k, v)| k == &"1" && matches!(v, SummaryValue::Navigator { .. })),
+            "the setter of the tuple navigates"
+        );
     }
 
     #[test]
