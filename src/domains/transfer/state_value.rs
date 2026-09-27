@@ -764,14 +764,37 @@ fn eval_binop(op: &BinOp, lhs: StateValue, rhs: StateValue) -> StateValue {
             _ => StateValue::top(),
         },
         BinOp::Div => StateValue::top(),
+        // `%` and `**` are exact on the numeric operands the interval domain
+        // can follow (`Interval::rem`, `Interval::pow`); where the result may
+        // be `NaN`, which no interval holds, they are ⊤ like `/`.
+        BinOp::Mod => match (as_arith(&lhs), as_arith(&rhs)) {
+            (Some(a), Some(b)) => a
+                .rem(&b)
+                .map(StateValue::number)
+                .unwrap_or_else(StateValue::top),
+            _ => StateValue::top(),
+        },
+        BinOp::Pow => match (as_arith(&lhs), as_arith(&rhs)) {
+            (Some(a), Some(b)) => a
+                .pow(&b)
+                .map(StateValue::number)
+                .unwrap_or_else(StateValue::top),
+            _ => StateValue::top(),
+        },
         BinOp::And | BinOp::Or => StateValue::top(),
-        BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Leq | BinOp::Geq => {
-            StateValue::boolean(BoolVal::Top)
-        }
+        // Always a boolean, whatever the operands: that alone keeps `num` and
+        // `str` at ⊥ so a guard over the result still narrows.
+        BinOp::Eq
+        | BinOp::Neq
+        | BinOp::Lt
+        | BinOp::Gt
+        | BinOp::Leq
+        | BinOp::Geq
+        | BinOp::In
+        | BinOp::InstanceOf => StateValue::boolean(BoolVal::Top),
         BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr | BinOp::UShr => {
             eval_bitwise(op, &lhs, &rhs)
         }
-        BinOp::Unknown => StateValue::top(),
     }
 }
 
@@ -1123,15 +1146,63 @@ mod tests {
         );
     }
 
+    /// `i % k` with a constant `k` is the index-cycling idiom: a non-negative
+    /// integer dividend lands in `[0, k-1]`.
     #[test]
-    fn eval_binop_unknown_is_top() {
-        let value = eval_binop(
-            &BinOp::Unknown,
-            StateValue::number(Interval::point(0.0)),
-            StateValue::number(Interval::point(2.0)),
+    fn eval_binop_mod_by_constant_cycles_the_index() {
+        assert_eq!(
+            eval_binop(&BinOp::Mod, num(0.0, f64::INFINITY), num(3.0, 3.0)),
+            num(0.0, 2.0)
         );
+        // Sign follows the dividend, and a small dividend bounds it further.
+        assert_eq!(
+            eval_binop(&BinOp::Mod, num(-5.0, 1.0), num(4.0, 4.0)),
+            num(-3.0, 1.0)
+        );
+    }
 
-        assert_eq!(value, StateValue::top());
+    /// A divisor that may be zero makes the result `NaN`, which no interval
+    /// holds: ⊤, not a number.
+    #[test]
+    fn eval_binop_mod_by_possible_zero_is_top() {
+        assert_eq!(
+            eval_binop(&BinOp::Mod, num(0.0, 9.0), num(0.0, 3.0)),
+            StateValue::top()
+        );
+        assert_eq!(
+            eval_binop(&BinOp::Mod, num(0.0, 9.0), StateValue::top()),
+            StateValue::top()
+        );
+    }
+
+    /// `**` on non-negative operands is exact from the corners; a negative base
+    /// (`NaN` with a fractional exponent) is ⊤.
+    #[test]
+    fn eval_binop_pow_is_exact_on_the_non_negative_quadrant() {
+        assert_eq!(
+            eval_binop(&BinOp::Pow, num(2.0, 3.0), num(2.0, 2.0)),
+            num(4.0, 9.0)
+        );
+        assert_eq!(
+            eval_binop(&BinOp::Pow, num(0.0, 1.0), num(0.0, 4.0)),
+            num(0.0, 1.0)
+        );
+        assert_eq!(
+            eval_binop(&BinOp::Pow, num(-2.0, 3.0), num(2.0, 2.0)),
+            StateValue::top()
+        );
+    }
+
+    /// `in` and `instanceof` are always booleans: nothing else is known, but
+    /// `num` and `str` stay ⊥, so a guard over them still narrows.
+    #[test]
+    fn eval_binop_in_and_instanceof_are_booleans() {
+        for op in [BinOp::In, BinOp::InstanceOf] {
+            assert_eq!(
+                eval_binop(&op, StateValue::str_top(), StateValue::top()),
+                StateValue::boolean(BoolVal::Top)
+            );
+        }
     }
 
     #[test]

@@ -1150,15 +1150,17 @@ fn lower_assignment_maybe_default(
     }
 }
 
-/// `IrBinOp` for a compound-assignment operator, restricted to those
-/// [`lower_binop`] maps faithfully. Returns `None` for `=` and for operators
-/// that would silently fall back to `Add` (%=, **=, logical).
+/// `IrBinOp` for a compound-assignment operator: `x op= e` lowers to
+/// `x = x op e`. Returns `None` for `=` and for the logical compounds
+/// (`&&=`, `||=`, `??=`), which are short-circuits, not binary operators.
 fn faithful_compound_binop(op: AssignmentOperator) -> Option<IrBinOp> {
     match op {
         AssignmentOperator::Addition => Some(IrBinOp::Add),
         AssignmentOperator::Subtraction => Some(IrBinOp::Sub),
         AssignmentOperator::Multiplication => Some(IrBinOp::Mul),
         AssignmentOperator::Division => Some(IrBinOp::Div),
+        AssignmentOperator::Remainder => Some(IrBinOp::Mod),
+        AssignmentOperator::Exponential => Some(IrBinOp::Pow),
         // Faithful since the bitwise operators became real `IrBinOp` variants:
         // `x &= mask` is now `x = x & mask` rather than a havoc to ⊤.
         AssignmentOperator::BitwiseAnd => Some(IrBinOp::BitAnd),
@@ -1183,15 +1185,21 @@ fn lower_binop(op: BinaryOperator) -> IrBinOp {
         BinaryOperator::GreaterThan => IrBinOp::Gt,
         BinaryOperator::LessEqualThan => IrBinOp::Leq,
         BinaryOperator::GreaterEqualThan => IrBinOp::Geq,
+        BinaryOperator::Remainder => IrBinOp::Mod,
+        BinaryOperator::Exponential => IrBinOp::Pow,
+        BinaryOperator::In => IrBinOp::In,
+        BinaryOperator::Instanceof => IrBinOp::InstanceOf,
         // Bitwise/shift: modelled as themselves so `eval_binop` can use the
-        // int32/uint32 range they guarantee (`IrBinOp::Unknown` erased it).
+        // int32/uint32 range they guarantee.
         BinaryOperator::BitwiseAnd => IrBinOp::BitAnd,
         BinaryOperator::BitwiseOR => IrBinOp::BitOr,
         BinaryOperator::BitwiseXOR => IrBinOp::BitXor,
         BinaryOperator::ShiftLeft => IrBinOp::Shl,
         BinaryOperator::ShiftRight => IrBinOp::Shr,
         BinaryOperator::ShiftRightZeroFill => IrBinOp::UShr,
-        _ => IrBinOp::Unknown, // keep unsupported operators soundly opaque.
+        // No wildcard: every operator says what is known about it, and a new
+        // one added to the language must be given a variant here, not fall
+        // through to an opaque one.
     }
 }
 
@@ -1456,9 +1464,10 @@ mod tests {
 
     #[test]
     fn exotic_compound_havocs_target() {
-        // `x %= 3`: `%` has no faithful IrBinOp → havoc to opaque ⊤,
-        // never silently aliased onto `Add`.
-        let cfg = build("function f() { let x = 9; x %= 3; }");
+        // `x ||= 3` is a short-circuit, not a binary operator: no IrBinOp is
+        // faithful to it, so the target is havocked to opaque ⊤ — never
+        // silently aliased onto `Add`.
+        let cfg = build("function f() { let x = 9; x ||= 3; }");
         let assigns = entry_assigns(&cfg);
         let (_, rhs) = assigns
             .iter()
@@ -1492,31 +1501,45 @@ mod tests {
         );
     }
 
+    /// `x %= k` and `x **= k` were havocs to ⊤ while `%` and `**` had no
+    /// `IrBinOp`. They have one now, so the compounds are exact too.
     #[test]
-    fn unsupported_binary_operators_remain_opaque() {
-        // `%` has no `IrBinOp` of its own: opaque, and above all never aliased
-        // onto `Add`.
-        let cfg = build("function f(n) { return n % 2; }");
-        let body = cfg.blocks.get(&0).expect("expected entry block");
-        assert!(
-            matches!(
-                body.term,
-                Terminator::Return(Expr::BinOp {
-                    op: IrBinOp::Unknown,
-                    ..
-                })
-            ),
-            "unsupported operators must not be modeled as addition: {:?}",
-            body.term
-        );
+    fn mod_and_pow_compound_assignments_are_faithful() {
+        for (source, expected) in [
+            ("function f() { let x = 9; x %= 4; }", IrBinOp::Mod),
+            ("function f() { let x = 9; x **= 2; }", IrBinOp::Pow),
+        ] {
+            let cfg = build(source);
+            let assigns = entry_assigns(&cfg);
+            let (_, rhs) = assigns
+                .iter()
+                .find(|(v, _)| v == "x")
+                .expect("expected Assign for x");
+            let Expr::BinOp { op, .. } = rhs else {
+                panic!("{source} must lower to a BinOp assignment, got {rhs:?}");
+            };
+            assert_eq!(
+                std::mem::discriminant(op),
+                std::mem::discriminant(&expected),
+                "{source} lowered to {op:?}"
+            );
+        }
     }
 
-    /// Bitwise and shift operators keep their identity through lowering. Folded
-    /// into `Unknown` they were sound but told the domain nothing, so the
-    /// int32 range they guarantee was unavailable.
+    /// Every operator keeps its identity through lowering. Folded into one
+    /// opaque variant they were sound but told the domain nothing — `%` lost
+    /// its range, `in` lost the fact that it is a boolean — and, before that,
+    /// `%` was even aliased onto `Add`.
     #[test]
-    fn bitwise_operators_keep_their_identity() {
+    fn binary_operators_keep_their_identity() {
         for (source, expected) in [
+            ("function f(n) { return n % 2; }", IrBinOp::Mod),
+            ("function f(n) { return n ** 2; }", IrBinOp::Pow),
+            ("function f(n) { return 'k' in n; }", IrBinOp::In),
+            (
+                "function f(n) { return n instanceof Date; }",
+                IrBinOp::InstanceOf,
+            ),
             ("function f(n) { return n & 3; }", IrBinOp::BitAnd),
             ("function f(n) { return n | 3; }", IrBinOp::BitOr),
             ("function f(n) { return n ^ 3; }", IrBinOp::BitXor),

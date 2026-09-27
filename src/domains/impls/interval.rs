@@ -197,6 +197,61 @@ impl Interval {
         }
     }
 
+    /// `self % other` with JS semantics: the result takes the dividend's sign
+    /// and is strictly smaller in magnitude than both the divisor and the
+    /// dividend. `None` when the divisor may be zero — the result may then be
+    /// `NaN`, which no interval holds.
+    pub fn rem(&self, other: &Self) -> Option<Self> {
+        if self.is_bottom() || other.is_bottom() {
+            return Some(Interval::bottom());
+        }
+        if other.lo <= 0.0 && other.hi >= 0.0 {
+            return None;
+        }
+        let is_int = self.is_int && other.is_int;
+        let magnitude = other.lo.abs().max(other.hi.abs());
+        // Strictly below the divisor's magnitude: one less on integers, the
+        // closed bound otherwise.
+        let bound = if is_int { magnitude - 1.0 } else { magnitude };
+        Some(Interval {
+            lo: if self.lo >= 0.0 {
+                0.0
+            } else {
+                self.lo.max(-bound)
+            },
+            hi: if self.hi <= 0.0 {
+                0.0
+            } else {
+                self.hi.min(bound)
+            },
+            is_int,
+        })
+    }
+
+    /// `self ** other`. On the non-negative quadrant the function is monotone
+    /// in each argument, so the extremes sit at the corners of the operand
+    /// box. `None` outside it: a negative base with a fractional exponent is
+    /// `NaN`, and a negative exponent of zero is infinite.
+    pub fn pow(&self, other: &Self) -> Option<Self> {
+        if self.is_bottom() || other.is_bottom() {
+            return Some(Interval::bottom());
+        }
+        if self.lo < 0.0 || other.lo < 0.0 {
+            return None;
+        }
+        let powers = [
+            self.lo.powf(other.lo),
+            self.lo.powf(other.hi),
+            self.hi.powf(other.lo),
+            self.hi.powf(other.hi),
+        ];
+        Some(Interval {
+            lo: powers.iter().cloned().fold(f64::INFINITY, f64::min),
+            hi: powers.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+            is_int: self.is_int && other.is_int,
+        })
+    }
+
     // Narrowing: restrict interval to satisfy a comparison against a literal `v`.
     //
     // For `<`/`>` the sound bound over reals is `v` itself (the excluded
@@ -346,6 +401,88 @@ mod tests {
         let h = a.hull(&b);
         assert_eq!(h.lo, 0.0);
         assert_eq!(h.hi, 1.0);
+    }
+
+    fn ints(lo: f64, hi: f64) -> Interval {
+        Interval {
+            lo,
+            hi,
+            is_int: true,
+        }
+    }
+
+    fn floats(lo: f64, hi: f64) -> Interval {
+        Interval {
+            lo,
+            hi,
+            is_int: false,
+        }
+    }
+
+    #[test]
+    fn rem_follows_the_dividend_sign_and_stays_below_the_divisor() {
+        // Integers: strictly below the divisor means `k - 1`.
+        assert_eq!(ints(0.0, 100.0).rem(&ints(7.0, 7.0)), Some(ints(0.0, 6.0)));
+        assert_eq!(
+            ints(-100.0, -1.0).rem(&ints(7.0, 7.0)),
+            Some(ints(-6.0, 0.0))
+        );
+        assert_eq!(
+            ints(-100.0, 100.0).rem(&ints(-7.0, -7.0)),
+            Some(ints(-6.0, 6.0))
+        );
+        // A dividend smaller than the divisor is its own bound.
+        assert_eq!(ints(0.0, 2.0).rem(&ints(7.0, 7.0)), Some(ints(0.0, 2.0)));
+        // Floats: the closed bound, and the result is not proven integer.
+        let r = floats(0.0, 100.0).rem(&floats(2.5, 2.5)).unwrap();
+        assert_eq!(r, floats(0.0, 2.5));
+        assert!(!r.is_int);
+        // A divisor interval that excludes zero bounds by its largest magnitude.
+        assert_eq!(ints(0.0, 100.0).rem(&ints(2.0, 5.0)), Some(ints(0.0, 4.0)));
+        // An unbounded divisor still fixes the sign.
+        assert_eq!(
+            ints(0.0, 100.0).rem(&ints(1.0, f64::INFINITY)),
+            Some(ints(0.0, 100.0))
+        );
+    }
+
+    #[test]
+    fn rem_by_a_possible_zero_is_unrepresentable() {
+        assert_eq!(ints(0.0, 9.0).rem(&ints(0.0, 3.0)), None);
+        assert_eq!(ints(0.0, 9.0).rem(&ints(-3.0, 3.0)), None);
+        assert_eq!(ints(0.0, 9.0).rem(&Interval::top()), None);
+        assert_eq!(
+            Interval::bottom().rem(&ints(3.0, 3.0)),
+            Some(Interval::bottom())
+        );
+    }
+
+    #[test]
+    fn pow_takes_the_corners_of_the_non_negative_box() {
+        assert_eq!(ints(2.0, 3.0).pow(&ints(2.0, 2.0)), Some(ints(4.0, 9.0)));
+        // Below one the power decreases with the exponent: the corners still
+        // hold both extremes.
+        assert_eq!(
+            floats(0.5, 2.0).pow(&ints(1.0, 2.0)),
+            Some(floats(0.25, 4.0))
+        );
+        assert_eq!(ints(0.0, 0.0).pow(&ints(0.0, 3.0)), Some(ints(0.0, 1.0)));
+        assert_eq!(
+            ints(2.0, f64::INFINITY).pow(&ints(1.0, 1.0)),
+            Some(ints(2.0, f64::INFINITY))
+        );
+        // Not proven integer once the exponent is not.
+        assert!(!ints(4.0, 4.0).pow(&floats(0.5, 0.5)).unwrap().is_int);
+    }
+
+    #[test]
+    fn pow_outside_the_non_negative_box_is_unrepresentable() {
+        assert_eq!(ints(-2.0, 3.0).pow(&ints(2.0, 2.0)), None);
+        assert_eq!(ints(0.0, 3.0).pow(&ints(-1.0, 2.0)), None);
+        assert_eq!(
+            ints(2.0, 2.0).pow(&Interval::bottom()),
+            Some(Interval::bottom())
+        );
     }
 
     #[test]

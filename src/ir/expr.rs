@@ -31,17 +31,28 @@ pub enum BinOp {
     Gt,
     Leq,
     Geq,
+    /// `%` — the result takes the dividend's sign and is smaller in magnitude
+    /// than the divisor; `NaN` when the divisor may be zero.
+    Mod,
+    /// `**` — exact from the corners of the operand box on the non-negative
+    /// quadrant, where the function is monotone in each argument.
+    Pow,
+    /// `in` — always a boolean.
+    In,
+    /// `instanceof` — always a boolean.
+    InstanceOf,
     /// Bitwise and shift: `&`, `|`, `^`, `<<`, `>>`, `>>>`.
     ///
     /// Real variants rather than one opaque `Unknown`, because they carry
-    /// information `Unknown` cannot express: JS coerces both operands to int32
-    /// (uint32 for `>>>`), so the result is *always* a number in a known range.
-    /// Folding them into `Unknown` erased which operator it was, and with it
-    /// every one of those guarantees.
+    /// information `Unknown` could not express: JS coerces both operands to
+    /// int32 (uint32 for `>>>`), so the result is *always* a number in a known
+    /// range. Folding them into `Unknown` erased which operator it was, and
+    /// with it every one of those guarantees.
     ///
-    /// This is the shared decision for every unmodelled operator: give it a
-    /// variant, never widen `Unknown`'s meaning. `Unknown` is for operators
-    /// nothing is known about at all.
+    /// This is the shared decision for every operator: give it a variant that
+    /// says what is known about it. There is no `Unknown` any more — every
+    /// binary operator of the language has its own variant, and `lower_binop`
+    /// is exhaustive so a new one cannot slip in silently.
     BitAnd,
     BitOr,
     BitXor,
@@ -49,8 +60,6 @@ pub enum BinOp {
     Shr,
     /// `>>>` — unsigned, so the result is a *uint32*, not an int32.
     UShr,
-    /// An operator whose concrete semantics are not modeled by the abstract domain.
-    Unknown,
 }
 
 #[derive(Debug, Clone)]
