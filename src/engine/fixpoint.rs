@@ -956,7 +956,12 @@ fn expand_custom_hooks(
                 // from the component's splice cursor, the same supply a graft
                 // uses (#134).
                 let sv = if summary.members().is_empty() {
-                    state_value_to_summary_value(summary.summarize(&[]))
+                    let sv = state_value_to_summary_value(summary.summarize(&[]));
+                    if summary.held_across_updates() {
+                        SummaryValue::Held(Box::new(sv))
+                    } else {
+                        sv
+                    }
                 } else {
                     SummaryValue::Shape {
                         id: salt.alloc_one(),

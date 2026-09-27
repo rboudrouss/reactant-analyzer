@@ -861,3 +861,224 @@ export function C({ flag }: { flag: boolean }) {
         "a prop holds still, so the two branches exclude each other: {diags:?}"
     );
 }
+
+// ── #162: a render write is a site; a remounting child's `[]` effect too ─────
+
+#[test]
+fn a_render_phase_write_revives_an_effect_guard() {
+    // The render body writes `null` behind `cond`, the effect refills behind
+    // `!s`: with `cond` true the pair loops (`{…}` → null → `{…}`). The site
+    // list used to be built from effect rows alone, so the render write
+    // revived nothing and the effect edge was killed.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ cond }: { cond: boolean }) {
+  const [s, setS] = useState(null);
+  if (cond && s) setS(null);
+  useEffect(() => { if (!s) setS({ fresh: true }); }, [s]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "the render write revives the guard: {diags:?}"
+    );
+}
+
+#[test]
+fn a_child_the_loop_remounts_fires_its_mount_effect_every_round() {
+    // `Child` is mounted only while `s` is truthy, and its mount-only effect
+    // writes the parent's slot back to `null`: unmount, refill, remount, …
+    // A mount-only effect of a component that stays mounted fires once, but
+    // a foreign `[]` row is a site of the slot it writes.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ onReady }: { onReady: (v: any) => void }) {
+  useEffect(() => { onReady(null); }, []);
+  return <span />;
+}
+export function Parent() {
+  const [s, setS] = useState(null);
+  useEffect(() => { if (!s) setS({ fresh: true }); }, [s]);
+  return <div>{s ? <Child onReady={setS} /> : null}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "Parent");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "the remounting child's `[]` effect revives the guard: {diags:?}"
+    );
+}
+
+#[test]
+fn a_mount_effect_of_a_component_that_stays_mounted_fires_once() {
+    // The same child, mounted behind a guard that holds still across the
+    // loop (`ready` is a prop): it mounts once, its `[]` effect writes `null`
+    // once, and the parent's refill settles. Not a site.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ onReady }: { onReady: (v: any) => void }) {
+  useEffect(() => { onReady(null); }, []);
+  return <span />;
+}
+export function Parent({ ready }: { ready: boolean }) {
+  const [s, setS] = useState(null);
+  useEffect(() => { if (!s) setS({ fresh: true }); }, [s]);
+  if (!ready) return null;
+  return <div><Child onReady={setS} /></div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "Parent");
+    assert!(
+        diags
+            .iter()
+            .all(|(rule, sev, _)| rule != "infinite-loop" || *sev == Severity::Info),
+        "a child mounted behind a held guard stays mounted: {diags:?}"
+    );
+}
+
+#[test]
+fn a_child_keyed_by_the_slot_remounts_with_it() {
+    // Mounted on every path, but its `key` reads the slot: React remounts
+    // it on every write, and its `[]` effect fires again each time.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ onReady }: { onReady: (v: any) => void }) {
+  useEffect(() => { onReady(null); }, []);
+  return <span />;
+}
+export function Parent() {
+  const [s, setS] = useState(null);
+  useEffect(() => { if (!s) setS({ fresh: true }); }, [s]);
+  return <div><Child key={s ? 'a' : 'b'} onReady={setS} /></div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "Parent");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "a key read off the slot remounts the child every round: {diags:?}"
+    );
+}
+
+// ── #158: `new` allocates ────────────────────────────────────────────────────
+
+#[test]
+fn a_guard_compared_against_a_new_expression_holds_again_after_the_write() {
+    // `new Map()` is a new reference on every run, exactly as `{}` is. Lowered
+    // to a plain call it was a spelling the relational arm read as one value
+    // across runs, and the loop was silent.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState(null);
+  useEffect(() => {
+    const m = new Map();
+    if (s !== m) setS(m);
+  }, [s]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "`new` allocates on every run: {diags:?}"
+    );
+}
+
+#[test]
+fn an_updater_returning_a_new_expression_is_fresh() {
+    // `prev => new Map(prev)` stores a fresh reference every call: a Must
+    // self-edge, where the plain-call lowering read it as maybe fresh.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState(new Map());
+  useEffect(() => { setS(prev => new Map(prev)); }, [s]);
+  return <div>{s.size}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Error),
+        "a `new` in every return of the updater is must-fresh: {diags:?}"
+    );
+}
+
+// ── #160: a reviver that fires once revives once ─────────────────────────────
+
+#[test]
+fn a_reviver_that_resets_its_own_flag_fires_once_per_request() {
+    // The twenty shape with state for the flag. The second effect settles
+    // its own guard relationally; the deferred `undefined` write revives it,
+    // but runs only while `req` holds, which the same pass resets: it fires
+    // once per external request, so the pair converges in two rounds.
+    let src = r#"
+import { useState, useEffect } from 'react';
+declare function refetch(): Promise<void>;
+export function C({ version }: { version: { id: string } }) {
+  const [req, setReq] = useState(false);
+  const [seeded, setSeeded] = useState<string | undefined>(undefined);
+  useEffect(() => {
+    if (!req) return;
+    setReq(false);
+    void refetch().then(() => { setSeeded(undefined); });
+  }, [req]);
+  useEffect(() => {
+    if (seeded === version.id) return;
+    setSeeded(version.id);
+  }, [version, seeded]);
+  return <div>{seeded}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .all(|(rule, sev, _)| rule != "infinite-loop" || *sev == Severity::Info),
+        "the reviver fires once per request: {diags:?}"
+    );
+}
+
+#[test]
+fn a_reviver_that_keeps_its_flag_still_revives() {
+    // The same pair without the reset: `req` stays true, the continuation is
+    // scheduled on every run of the first effect, and each run of the second
+    // re-triggers nothing — but the deferred write and the seeded write
+    // alternate for as long as `req` holds. The proof must not read the
+    // scheduling guard as dying under a write that never happens.
+    let src = r#"
+import { useState, useEffect } from 'react';
+declare function refetch(): Promise<void>;
+export function C({ version }: { version: { id: string } }) {
+  const [req] = useState(true);
+  const [seeded, setSeeded] = useState<string | undefined>(undefined);
+  useEffect(() => {
+    if (!req) return;
+    void refetch().then(() => { setSeeded(undefined); });
+  }, [req, seeded]);
+  useEffect(() => {
+    if (seeded === version.id) return;
+    setSeeded(version.id);
+  }, [version, seeded]);
+  return <div>{seeded}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "an unreset flag keeps the reviver alive: {diags:?}"
+    );
+}

@@ -888,7 +888,7 @@ impl<'a> Analyzer<'a> {
             Expr::UnaryOp { arg, .. } | Expr::TSAnnotated(arg) => {
                 DVal::of(self.eval(arg, env).deps)
             }
-            Expr::Call { fn_, args } => {
+            Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
                 let callee = match fn_.peel_ts() {
                     Expr::Var(v) => Some(v.as_str()),
                     Expr::FieldAccess { field, .. } => Some(field.as_str()),
@@ -997,7 +997,7 @@ impl<'a> Analyzer<'a> {
                 };
                 self.collect(props, env, &inner);
             }
-            Expr::Call { fn_, args } => {
+            Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
                 self.collect(fn_, env, ctx);
                 // The callback's parameters come from the receiver and the
                 // other arguments (a synchronous higher-order call).

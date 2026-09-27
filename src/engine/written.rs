@@ -152,7 +152,9 @@ fn returns_freshness(body: &CFG, params: &[Var]) -> Freshness {
 /// environment (the updater runs in its own scope).
 fn classify_updater_return(e: &Expr, params: &[Var]) -> Freshness {
     match e.peel_ts() {
-        Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::FnLit { .. } => Freshness::Fresh,
+        Expr::ObjectLit { .. } | Expr::ArrayLit { .. } | Expr::FnLit { .. } | Expr::New { .. } => {
+            Freshness::Fresh
+        }
         // Identity updater `o => o` and literal resets converge.
         Expr::Var(v) if params.first().is_some_and(|p| p == v) => Freshness::Not,
         Expr::Lit(_) => Freshness::Not,
@@ -321,6 +323,22 @@ mod tests {
             Expr::ObjectLit {
                 id: ExprId::fresh(),
                 fields: vec![],
+            },
+            "p",
+        );
+        let w = classify(Some(&e), &Updater::Unknown, T, opaque);
+        assert_eq!(w.fresh, Freshness::Fresh);
+        assert_eq!(w.value.reference, Stability::PerRender);
+    }
+
+    /// `prev => new Map(prev)` allocates on every call (#158).
+    #[test]
+    fn an_updater_returning_a_new_expression_is_fresh() {
+        let e = updater(
+            Expr::New {
+                id: ExprId::fresh(),
+                fn_: Box::new(Expr::Var("Map".into())),
+                args: vec![Expr::Var("p".into())],
             },
             "p",
         );

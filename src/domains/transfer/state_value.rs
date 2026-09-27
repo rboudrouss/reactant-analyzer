@@ -177,6 +177,8 @@ fn eval_state_value(
             StateValue::reference(Stability::PerRender)
         }
         Expr::Call { .. } => StateValue::top(),
+        // `new` allocates: a fresh reference, whose members stay ⊤ (#158).
+        Expr::New { .. } => StateValue::reference(Stability::PerRender),
 
         Expr::FieldAccess { obj, field } => eval_field_access(obj, field, env, ctx),
         Expr::IndexAccess { arr, idx } => eval_index_access(arr, idx, env, ctx),
@@ -206,6 +208,7 @@ fn summary_value(sv: &crate::ir::expr::SummaryValue) -> StateValue {
         // here would credit the object itself with a stability the library
         // only promises per member.
         crate::ir::expr::SummaryValue::Shape { .. } => StateValue::top(),
+        crate::ir::expr::SummaryValue::Held(inner) => summary_value(inner),
     }
 }
 

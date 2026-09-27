@@ -928,3 +928,106 @@ fn use_set_atom_is_stable() {
         "`useSetAtom` returns a stable setter: {fired:?}"
     );
 }
+
+// ── #161: what the URL decides holds still across the automatic loop ─────────
+
+/// dub `leads/page.tsx:264`: each branch settles its own guard, and the
+/// proof that neither revives the other needs `urlLeadId` to hold still.
+/// It reads off `useSearchParams()`, which moves only on navigation.
+#[test]
+fn a_guard_over_a_router_hooks_result_holds_across_the_loop() {
+    let fired = rules_fired(
+        r#"
+        import { useState, useEffect } from "react";
+        import { useSearchParams } from "next/navigation";
+        function C() {
+          const searchParams = useSearchParams();
+          const [sheet, setSheet] = useState({ leadId: null, open: false });
+          useEffect(() => {
+            const urlLeadId = searchParams.get("leadId");
+            if (urlLeadId && urlLeadId !== sheet.leadId) {
+              setSheet({ leadId: urlLeadId, open: true });
+            } else if (!urlLeadId && sheet.leadId) {
+              setSheet({ leadId: null, open: false });
+            }
+          }, [searchParams, sheet.leadId]);
+          return <div>{sheet.leadId}</div>;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        !fired.iter().any(|r| r == "infinite-loop"),
+        "`searchParams` moves only on navigation: {fired:?}"
+    );
+}
+
+/// The same value handed back by a custom hook inside an object literal,
+/// as dub's `useRouterStuff()` does: a member of a literal holds when the
+/// member does.
+#[test]
+fn a_router_hooks_result_keeps_holding_through_an_inlined_custom_hook() {
+    let fired = rules_fired(
+        r#"
+        import { useState, useEffect } from "react";
+        import { useSearchParams, usePathname } from "next/navigation";
+        function useRouterStuff() {
+          const pathname = usePathname();
+          const searchParams = useSearchParams();
+          return { pathname, searchParams };
+        }
+        function C() {
+          const { searchParams } = useRouterStuff();
+          const [sheet, setSheet] = useState({ leadId: null, open: false });
+          useEffect(() => {
+            const urlLeadId = searchParams.get("leadId");
+            if (urlLeadId && urlLeadId !== sheet.leadId) {
+              setSheet({ leadId: urlLeadId, open: true });
+            } else if (!urlLeadId && sheet.leadId) {
+              setSheet({ leadId: null, open: false });
+            }
+          }, [searchParams, sheet.leadId]);
+          return <div>{sheet.leadId}</div>;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        !fired.iter().any(|r| r == "infinite-loop"),
+        "`{{ searchParams }}` hands back what the hook knew: {fired:?}"
+    );
+}
+
+/// An effect that navigates can move the URL inside the loop, so nothing the
+/// URL decides holds: the pair is reported again.
+#[test]
+fn a_visible_navigation_in_an_effect_makes_the_router_result_move() {
+    let fired = rules_fired(
+        r#"
+        import { useState, useEffect } from "react";
+        import { useSearchParams, useRouter } from "next/navigation";
+        function C() {
+          const searchParams = useSearchParams();
+          const router = useRouter();
+          const [sheet, setSheet] = useState({ leadId: null, open: false });
+          useEffect(() => {
+            const urlLeadId = searchParams.get("leadId");
+            if (urlLeadId && urlLeadId !== sheet.leadId) {
+              setSheet({ leadId: urlLeadId, open: true });
+            } else if (!urlLeadId && sheet.leadId) {
+              setSheet({ leadId: null, open: false });
+            }
+          }, [searchParams, sheet.leadId]);
+          useEffect(() => {
+            if (sheet.open) router.replace("?leadId=");
+          }, [sheet.open]);
+          return <div>{sheet.leadId}</div>;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        fired.iter().any(|r| r == "infinite-loop"),
+        "an effect that navigates moves the URL inside the loop: {fired:?}"
+    );
+}

@@ -29,6 +29,14 @@ pub trait HookSummary: Send + Sync {
     fn members(&self) -> &'static [(&'static str, SummaryValue)] {
         &[]
     }
+
+    /// The result moves only on an event the automatic re-render loop
+    /// cannot raise — navigation, for a router hook — so a guard over it
+    /// holds still across that loop (#161). Read only for a hook without
+    /// per-member contract.
+    fn held_across_updates(&self) -> bool {
+        false
+    }
 }
 
 // ── SummaryRegistry ───────────────────────────────────────────────────────────
@@ -66,10 +74,24 @@ impl SummaryRegistry {
         r.register_many_for_package("next/navigation", NEXT_NAVIGATION_HOOKS);
         r.register_many_for_package("next/router", &["useRouter"]);
         r.register_many_for_package("next/compat/router", &["useRouter"]);
-        // The one Next hook whose *kind* is certain: App Router
-        // `usePathname()` is typed `string`, and a primitive is compared by
-        // value — so a `pathname` dep is never a per-render fresh reference.
-        r.register_for_package("next/navigation", Box::new(StrTopSummary("usePathname")));
+        // What the URL decides moves only on navigation (#161): the
+        // convergence proof reads it as holding still across the automatic
+        // loop. `usePathname()` is also the one Next hook whose *kind* is
+        // certain — typed `string`, and a primitive is compared by value, so
+        // a `pathname` dep is never a per-render fresh reference.
+        for name in ["useSearchParams", "useParams", "useSelectedLayoutSegment"] {
+            r.register_for_package("next/navigation", Box::new(HeldTopSummary(name)));
+        }
+        r.register_for_package(
+            "next/navigation",
+            Box::new(HeldTopSummary("useSelectedLayoutSegments")),
+        );
+        r.register_for_package("next/navigation", Box::new(HeldStrSummary("usePathname")));
+        for pkg in ["react-router-dom", "react-router"] {
+            for name in ["useParams", "useLocation", "useSearchParams", "useMatch"] {
+                r.register_for_package(pkg, Box::new(HeldTopSummary(name)));
+            }
+        }
 
         // Per-member contracts (#94). Registering the *shape* is what lets a
         // destructured `const { setValue } = useForm()` resolve: the container
@@ -172,17 +194,33 @@ impl HookSummary for TopSummary {
     // summarize returns Top via default
 }
 
-/// A hook whose return is an unknown **string**. Narrower than ⊤ in the one
-/// way that matters downstream: a primitive is value-compared, so it can
-/// never read as a fresh reference in a deps array.
-struct StrTopSummary(&'static str);
+/// A hook whose return is ⊤ and moves only on navigation (#161).
+struct HeldTopSummary(&'static str);
 
-impl HookSummary for StrTopSummary {
+impl HookSummary for HeldTopSummary {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn held_across_updates(&self) -> bool {
+        true
+    }
+}
+
+/// A hook whose return is an unknown **string** that moves only on
+/// navigation (#161). Narrower than ⊤ in the one way that matters
+/// downstream: a primitive is value-compared, so it can never read as a
+/// fresh reference in a deps array.
+struct HeldStrSummary(&'static str);
+
+impl HookSummary for HeldStrSummary {
     fn name(&self) -> &str {
         self.0
     }
     fn summarize(&self, _args: &[StateValue]) -> StateValue {
         StateValue::str_top()
+    }
+    fn held_across_updates(&self) -> bool {
+        true
     }
 }
 

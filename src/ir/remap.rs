@@ -49,7 +49,9 @@ pub fn alloc_id_span(cfg: &CFG) -> usize {
             return;
         }
         match e {
-            Expr::ObjectLit { id, .. } | Expr::ArrayLit { id, .. } => note(*id),
+            Expr::ObjectLit { id, .. } | Expr::ArrayLit { id, .. } | Expr::New { id, .. } => {
+                note(*id)
+            }
             Expr::FnLit { id, body_cfg, .. } => {
                 note(*id);
                 body_cfg.for_each_expr(&mut |inner| walk(inner, note, depth - 1));
@@ -129,6 +131,11 @@ pub fn remap_expr(expr: Expr, off: Offsets) -> Expr {
             arg: Box::new(remap_expr(*arg, off)),
         },
         Expr::Call { fn_, args } => Expr::Call {
+            fn_: Box::new(remap_expr(*fn_, off)),
+            args: args.into_iter().map(|a| remap_expr(a, off)).collect(),
+        },
+        Expr::New { id, fn_, args } => Expr::New {
+            id: shift(id),
             fn_: Box::new(remap_expr(*fn_, off)),
             args: args.into_iter().map(|a| remap_expr(a, off)).collect(),
         },

@@ -65,10 +65,15 @@ that writes it (see *Cross-file limits*).
   fresh, ADR-017's reading of `Versioned`; a loop carried by such a write is silent
   [#157](https://github.com/rboudrouss/reactant-analyzer/issues/157).
 - The convergence proof assumes a call over held inputs returns the same value on every run, and
-  `new X()` lowers to a call, so an allocation behind `new` keeps a guard alive the proof reads as
-  dead [#158](https://github.com/rboudrouss/reactant-analyzer/issues/158). It does not count
-  render-phase writes as sites, and reads a remounting child's mount-only effect as firing once
-  [#162](https://github.com/rboudrouss/reactant-analyzer/issues/162).
+  that a call it cannot see into does not navigate: a router hook's result (`useSearchParams`,
+  `useParams`, `usePathname`, `useLocation`) holds still across the loop unless some effect, memo
+  or callback body of the program visibly navigates — `router.push`/`replace`, `history.*`,
+  `location.assign`, a write to `location`, a bare `navigate()`/`redirect()`
+  [#161](https://github.com/rboudrouss/reactant-analyzer/issues/161).
+- A child's mount-only effect is read as firing once when the parent renders the child on every
+  path, or behind guards that hold still, without a `key` that moves. A child rendered from a
+  `.map` callback or reached through an intermediate component is read as remounting, the
+  fail-closed side [#162](https://github.com/rboudrouss/reactant-analyzer/issues/162).
 - Loop-carried values inside callbacks are computed without the loop-carried contribution
   [#21](https://github.com/rboudrouss/reactant-analyzer/issues/21).
 - By decision: `arr.slice()` and `arr.concat()` in a deps array are not proven fresh, because the same
@@ -113,11 +118,14 @@ carries an Error.
 - **The churn graph** keeps a cycle edge on a convergent slot when the proof cannot read what
   would settle it: a write site in another component, whose guards live in that component's
   bodies (the residual of [#39](https://github.com/rboudrouss/reactant-analyzer/issues/39)); a
-  guard over a hook's result, read as moving across the loop
-  [#161](https://github.com/rboudrouss/reactant-analyzer/issues/161); a reviving write that in
-  fact fires once per external event [#160](https://github.com/rboudrouss/reactant-analyzer/issues/160);
-  and a write through a setter prop typed to take a primitive, whose ⊤ value reads as a possible
-  fresh reference [#159](https://github.com/rboudrouss/reactant-analyzer/issues/159).
+  guard over a custom hook's result the engine could not inline, or over a store hook's (jotai,
+  Recoil), read as moving across the loop — only the router hooks are known to move on navigation
+  alone [#161](https://github.com/rboudrouss/reactant-analyzer/issues/161); a reviving write whose
+  once-per-request proof needs a flag the analyzer does not model as state — twenty's
+  `WorkflowDiagramEffect.tsx:125` resets a jotai atom
+  [#160](https://github.com/rboudrouss/reactant-analyzer/issues/160); and a write through a
+  setter prop typed to take a primitive, whose ⊤ value reads as a possible fresh reference
+  [#159](https://github.com/rboudrouss/reactant-analyzer/issues/159).
 - **The churn graph is slot-granular where a program is member-granular.** The self-churn arm reads
   the member (`[data.name]` is not re-triggered by `setData(prev => ({...prev, slug}))`, and a guard
   on `sheet.leadId` is answered by the `null` the write puts there), but the multi-effect graph

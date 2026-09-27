@@ -26,15 +26,28 @@
 //! **Convergence kill**: an edge is dropped when the write provably fires at
 //! most once in the automatic loop — its dominating guards die once the
 //! written value sits in the slot, under its own write and under every
-//! other effect write of the slot program-wide, each taken with the
-//! invariant facts that site ran under ([`converges_under_all_writes`],
-//! #154). A site in another component has guards this component's env
-//! cannot read, so such a slot is never killed; a handler row needs a user
-//! event and is not a site. One kill, one proof, for the dep-driven
-//! same-slot edge too. The proof reads facts over props only in a component
-//! no effect of which reacts to a parent slot: a loop can enter a component
-//! through its props only by such a dep, and then the props may move on any
-//! cycle through it, whichever edge the cycle takes.
+//! other write of the slot program-wide, each taken with the invariant
+//! facts that site ran under ([`converges_under_all_writes`], #154). A site
+//! in another component has guards this component's env cannot read, so
+//! such a slot is never killed; a handler row needs a user event and is not
+//! a site. One kill, one proof, for the dep-driven same-slot edge too. The
+//! proof reads facts over props only in a component no effect of which
+//! reacts to a parent slot: a loop can enter a component through its props
+//! only by such a dep, and then the props may move on any cycle through it,
+//! whichever edge the cycle takes.
+//!
+//! **What is a site** (#162): every non-handler row of an effect, render
+//! or memo body — a `setter-in-render` write revives what it revives — and,
+//! from a mount-only effect, only the rows that write another component's
+//! slot: the component itself stays mounted and fires it once, but a child
+//! the loop mounts and unmounts fires its `[]` effect on every round.
+//!
+//! **Sites converge by least fixpoint** (#160): a site proven to fire at
+//! most once revives nothing indefinitely, so it is excluded from the
+//! revivers of every other site, and the set grows until nothing more can
+//! be proven. The graph then kills an edge when its write's site is in the
+//! set, or when the site converges once its write is read as the reference
+//! part of its value — a `null` run stores no fresh reference.
 //!
 //! **Two arms, one relation** (ADR-020 item 2). A dep-driven edge whose write
 //! lands in the very slot its deps read is `self_slot`: the self-churn arm's
@@ -44,11 +57,15 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
+    domains::{AbstractEnv, StateValue},
     engine::{
         AnalysisResult, ConvergedEval, EffectTrigger, Freshness, ProgramAnalysisResult, SlotWriter,
         WriterPhase, WriterRegion,
         dominance::on_all_paths,
-        guards::{Invariance, WriteSite, converges_under_all_writes, let_bindings, mutated_roots},
+        guards::{
+            Invariance, WriteSite, converges_under_all_writes, let_bindings, mutated_roots,
+            navigates, site_guards,
+        },
         render_deps::written_names,
         setters::{memo_val_labels, resolve_setter_aliases, state_val_labels},
         triggers_of,
@@ -56,9 +73,10 @@ use crate::{
     },
     ir::{
         ComponentId, QualifiedSlot, SourceRange,
-        cfg::CFG,
-        expr::{Expr, SPREAD_KEY_PREFIX},
+        cfg::{CFG, Terminator},
+        expr::{CompOrigin, Expr, SPREAD_KEY_PREFIX, object_member},
         hooks::{Arity, HookEntry},
+        stmt::Stmt,
         types::{BlockId, HookLabel, Symbol, Var},
     },
 };
@@ -150,13 +168,15 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         /// props may move on any cycle through the component — the proofs
         /// then read no fact over them.
         props_hold: bool,
+        /// The render exit env: what the proofs narrow from.
+        exit: AbstractEnv<StateValue>,
     }
     // Per-effect facts, gathered first so the write sites of every slot are
     // known program-wide before any convergence kill is attempted (see
     // module doc).
     struct EffectFacts<'a> {
         comp: ComponentId,
-        comp_result: &'a AnalysisResult<crate::domains::StateValue>,
+        comp_result: &'a AnalysisResult<StateValue>,
         body_cfg: &'a CFG,
         effect_label: HookLabel,
         no_deps: bool,
@@ -166,14 +186,15 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         versioned: HashSet<QualifiedSlot>,
         writes: Vec<&'a SlotWriter>,
     }
-    /// One effect write site of a slot, with the body it sits in.
+    /// One write site of a slot, with the body it sits in (module doc,
+    /// "What is a site").
     struct SiteRef<'a> {
         comp: ComponentId,
         cfg: &'a CFG,
         row: &'a SlotWriter,
     }
 
-    let mut sites: HashMap<QualifiedSlot, Vec<SiteRef>> = HashMap::new();
+    let mut all_sites: Vec<SiteRef> = Vec::new();
     let mut ctxs: HashMap<ComponentId, CompCtx> = HashMap::new();
     let mut facts: Vec<EffectFacts> = Vec::new();
 
@@ -181,6 +202,15 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     // component's effect: the union is program-wide, as `render_deps` reads
     // it.
     let module_written: HashSet<Var> = result.components.values().flat_map(written_names).collect();
+    // A visible navigation in any body the loop can run moves every
+    // navigation-held value program-wide (#161).
+    let navigates = result.components.values().any(|c| {
+        c.hooks
+            .iter()
+            .filter(|h| !matches!(h, HookEntry::Handler { .. }))
+            .filter_map(HookEntry::body_cfg)
+            .any(navigates)
+    });
 
     for (&comp, comp_result) in &result.components {
         let cfg = &comp_result.render_cfg;
@@ -197,8 +227,61 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 render_lets: let_bindings(cfg),
                 mutated,
                 props_hold: comp_result.effect_triggers.iter().all(|t| t.slot.0 == comp),
+                exit: comp_result.exit_env(),
             },
         );
+    }
+
+    for (&comp, comp_result) in &result.components {
+        let cfg = &comp_result.render_cfg;
+        let hook = |label: HookLabel| comp_result.hooks.iter().find(|h| h.label() == label);
+        // Mount-only effects fire once for a component that stays mounted —
+        // but only an array the engine knows is empty says so.
+        let mount_only = |label: HookLabel| {
+            matches!(hook(label), Some(HookEntry::Effect { deps, .. })
+                if matches!(deps.list(), Some(d) if d.arity == Arity::Exact(0)))
+        };
+        // Does the owner of a slot this component writes from a mount-only
+        // effect keep this component mounted across the loop (#162)?
+        let stays_mounted = |owner: ComponentId| {
+            let Some(child) = result.component_table.origin(comp) else {
+                return false;
+            };
+            let (Some(parent), Some(pctx)) = (result.components.get(&owner), ctxs.get(&owner))
+            else {
+                return false;
+            };
+            stays_mounted(parent, pctx, &invariance_of(pctx, navigates), child)
+        };
+        for w in comp_result
+            .slot_writers
+            .iter()
+            .filter(|w| w.phase != WriterPhase::Handler)
+        {
+            let body = match w.region {
+                WriterRegion::Render => Some(cfg),
+                WriterRegion::Effect(l) if mount_only(l) => match w.owner {
+                    // The component itself stays mounted and fires it once.
+                    None => None,
+                    // A child the loop mounts and unmounts fires it every
+                    // round.
+                    Some(owner) if stays_mounted(owner) => None,
+                    Some(_) => hook(l).and_then(HookEntry::body_cfg),
+                },
+                WriterRegion::Effect(l) | WriterRegion::Memo(l) => {
+                    hook(l).and_then(HookEntry::body_cfg)
+                }
+                // A callback's writes are rows of the body that calls it.
+                WriterRegion::Callback(_) | WriterRegion::Handler(_) => None,
+            };
+            if let Some(body) = body {
+                all_sites.push(SiteRef {
+                    comp,
+                    cfg: body,
+                    row: w,
+                });
+            }
+        }
         for hook in &comp_result.hooks {
             let HookEntry::Effect {
                 label,
@@ -209,9 +292,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             else {
                 continue;
             };
-            // Mount-only effects fire once: no loop — but only an array the
-            // engine knows is empty says so.
-            if matches!(deps.list(), Some(d) if d.arity == Arity::Exact(0)) {
+            if mount_only(*label) {
                 continue;
             }
             // Every non-handler write row of the body, any freshness: a
@@ -225,13 +306,6 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                 .collect();
             if writes.is_empty() {
                 continue;
-            }
-            for w in &writes {
-                sites.entry(node_of(comp, w)).or_default().push(SiteRef {
-                    comp,
-                    cfg: body_cfg,
-                    row: w,
-                });
             }
             let triggers: Vec<&EffectTrigger> =
                 triggers_of(&comp_result.effect_triggers, *label).collect();
@@ -262,6 +336,144 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         }
     }
 
+    // A slot some other component also writes: its guards live in bodies
+    // this component's env cannot read, so it is never killed.
+    let foreign: HashSet<QualifiedSlot> = all_sites
+        .iter()
+        .map(|s| node_of(s.comp, s.row))
+        .zip(all_sites.iter())
+        .filter(|(node, s)| node.0 != s.comp)
+        .map(|(node, _)| node)
+        .collect();
+    let by_comp: HashMap<ComponentId, Vec<usize>> =
+        all_sites
+            .iter()
+            .enumerate()
+            .fold(HashMap::new(), |mut m, (i, s)| {
+                m.entry(s.comp).or_default().push(i);
+                m
+            });
+    fn invariance_of<'c>(ctx: &'c CompCtx<'_>, navigates: bool) -> Invariance<'c> {
+        Invariance {
+            render: &ctx.render_lets,
+            state_vals: &ctx.state_vals,
+            memo_vals: &ctx.memo_vals,
+            mutated: &ctx.mutated,
+            navigates,
+        }
+    }
+    /// Does `parent` mount `child` once and keep it mounted across the
+    /// loop? Every element of `child` in the parent's render sits under
+    /// guards that hold still, carries no `key` or one that holds, and is
+    /// outside any closure; a parent that renders no such element — the
+    /// child reached through another component, or from a `.map` — fails
+    /// closed.
+    fn stays_mounted(
+        parent: &AnalysisResult<StateValue>,
+        ctx: &CompCtx<'_>,
+        invariance: &Invariance<'_>,
+        child: &CompOrigin,
+    ) -> bool {
+        fn walk(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+            f(e);
+            e.for_each_child(&mut |c| walk(c, f));
+        }
+        let cfg = &parent.render_cfg;
+        let held = |e: &Expr| invariance.holds(e, &ctx.render_lets, ctx.props_hold);
+        let mut found = false;
+        let mut ok = true;
+        for block in cfg.blocks.values() {
+            let mut visit = |e: &Expr| {
+                walk(e, &mut |e| {
+                    if let Expr::CompApp {
+                        origin: Some(o),
+                        props,
+                        ..
+                    } = e
+                        && **o == *child
+                    {
+                        found = true;
+                        ok &= site_guards(cfg, block.id).iter().all(|(c, _)| held(c));
+                        if let Expr::ObjectLit { fields, .. } = props.peel_ts()
+                            && let Some(key) = object_member(fields, "key")
+                        {
+                            ok &= held(key);
+                        }
+                    }
+                });
+            };
+            for stmt in &block.stmts {
+                match stmt {
+                    Stmt::Let { rhs, .. }
+                    | Stmt::Assign { rhs, .. }
+                    | Stmt::MemberWrite { rhs, .. } => visit(rhs),
+                    Stmt::ExprStmt(e, _) => visit(e),
+                }
+            }
+            match &block.term {
+                Terminator::Return(e) => visit(e),
+                Terminator::Branch { cond, .. } => visit(cond),
+                _ => {}
+            }
+        }
+        found && ok
+    }
+    fn site_of<'a>(s: &SiteRef<'a>, convergent: bool) -> WriteSite<'a> {
+        WriteSite {
+            component: s.comp,
+            cfg: s.cfg,
+            slot: node_of(s.comp, s.row),
+            guard_block: s.row.guard_block,
+            block: s.row.block,
+            bounded: s.row.phase != WriterPhase::Unknown,
+            convergent,
+            value: &s.row.written.value,
+            expr: s.row.written.expr.as_ref(),
+        }
+    }
+    let invariance_of = |ctx| invariance_of(ctx, navigates);
+
+    // The sites that fire at most once in the automatic loop, by least
+    // fixpoint (module doc). Monotone — a proven site only removes
+    // revivers from the others — so the result does not depend on the
+    // order the components are visited in.
+    let mut convergent = vec![false; all_sites.len()];
+    loop {
+        let mut changed = false;
+        for (comp, idxs) in &by_comp {
+            let ctx = &ctxs[comp];
+            let invariance = invariance_of(ctx);
+            let mut evaluator = result.components[comp].evaluator();
+            let mut eval = |e: &Expr| evaluator.at(&ctx.exit, e);
+            let peers: Vec<WriteSite> = idxs
+                .iter()
+                .map(|&j| site_of(&all_sites[j], convergent[j]))
+                .collect();
+            for (k, &j) in idxs.iter().enumerate() {
+                if convergent[j] || all_sites[j].row.owner.is_some() {
+                    continue;
+                }
+                if converges_under_all_writes(
+                    &peers,
+                    k,
+                    peers[k].value,
+                    &foreign,
+                    &ctx.state_vals,
+                    &invariance,
+                    ctx.props_hold,
+                    &ctx.exit,
+                    &mut eval,
+                ) {
+                    convergent[j] = true;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
     // Deduplicate on (from, to, component, effect): keep the strongest, and
     // among equals the earliest write site, so the row a reader anchors on
     // does not depend on relation order.
@@ -269,15 +481,14 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         HashMap::new();
     for f in &facts {
         let ctx = &ctxs[&f.comp];
-        let invariance = Invariance {
-            render: &ctx.render_lets,
-            state_vals: &ctx.state_vals,
-            memo_vals: &ctx.memo_vals,
-            mutated: &ctx.mutated,
-        };
-        let exit = f.comp_result.exit_env();
+        let invariance = invariance_of(ctx);
         let mut evaluator = f.comp_result.evaluator();
-        let mut eval = |e: &Expr| evaluator.at(&exit, e);
+        let mut eval = |e: &Expr| evaluator.at(&ctx.exit, e);
+        let idxs = by_comp.get(&f.comp).map_or(&[][..], Vec::as_slice);
+        let peers: Vec<WriteSite> = idxs
+            .iter()
+            .map(|&j| site_of(&all_sites[j], convergent[j]))
+            .collect();
         for w in &f.writes {
             if w.written.fresh == Freshness::Not {
                 continue;
@@ -290,34 +501,20 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
             // (references are truthy and non-nullish); another site's write
             // revives with whatever it stores, `null` included.
             let own_value = reference_part(&w.written.value);
-            let own = WriteSite {
-                cfg: f.body_cfg,
-                block: w.block,
-                value: &own_value,
-                expr: w.written.expr.as_ref(),
-            };
-            let slot_sites = &sites[&node];
-            let foreign_site = slot_sites.iter().any(|s| s.comp != f.comp);
-            let others: Vec<WriteSite> = slot_sites
+            let k = idxs
                 .iter()
-                .filter(|s| !std::ptr::eq(s.row, *w))
-                .map(|s| WriteSite {
-                    cfg: s.cfg,
-                    block: s.row.block,
-                    value: &s.row.written.value,
-                    expr: s.row.written.expr.as_ref(),
-                })
-                .collect();
-            let killed = node.0 == f.comp
-                && !foreign_site
-                && converges_under_all_writes(
-                    &own,
-                    &others,
+                .position(|&j| std::ptr::eq(all_sites[j].row, *w))
+                .expect("every effect write is a site");
+            let killed = convergent[idxs[k]]
+                || converges_under_all_writes(
+                    &peers,
+                    k,
+                    &own_value,
+                    &foreign,
                     &ctx.state_vals,
-                    node.1,
                     &invariance,
                     ctx.props_hold,
-                    &exit,
+                    &ctx.exit,
                     &mut eval,
                 );
             let fresh_blocks: HashSet<BlockId> = f

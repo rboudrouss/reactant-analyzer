@@ -133,7 +133,9 @@ pub(crate) fn arg_is_call_free(
     seen: &mut HashSet<Var>,
 ) -> bool {
     match e {
-        Expr::Call { .. } | Expr::CompApp { .. } | Expr::NativeElem { .. } => false,
+        Expr::Call { .. } | Expr::New { .. } | Expr::CompApp { .. } | Expr::NativeElem { .. } => {
+            false
+        }
         Expr::Var(v) => match bindings.get(v.as_str()) {
             Some(rhss) => {
                 if !seen.insert(v.clone()) {
@@ -174,7 +176,7 @@ pub(in crate::rules) fn fn_lit_binding<'c>(
 /// primitive.
 pub(crate) fn collect_callees<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     match e {
-        Expr::Call { fn_, args } => {
+        Expr::Call { fn_, args } | Expr::New { fn_, args, .. } => {
             out.push(fn_);
             collect_callees(fn_, out);
             for a in args {
