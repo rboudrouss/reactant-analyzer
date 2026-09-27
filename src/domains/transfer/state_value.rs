@@ -209,9 +209,15 @@ fn summary_value(sv: &crate::ir::expr::SummaryValue) -> StateValue {
         // only promises per member.
         crate::ir::expr::SummaryValue::Shape { .. } => StateValue::top(),
         crate::ir::expr::SummaryValue::Held => StateValue::top(),
-        // A router's navigate function keeps its identity; what it does when
-        // called is the convergence proof's business, not the value's.
-        crate::ir::expr::SummaryValue::Navigator => StateValue::reference(Stability::Stable),
+        // What a navigator does when called is the convergence proof's
+        // business; value-wise it is a function, stable or not.
+        crate::ir::expr::SummaryValue::Navigator { stable } => {
+            if *stable {
+                StateValue::reference(Stability::Stable)
+            } else {
+                StateValue::top()
+            }
+        }
     }
 }
 

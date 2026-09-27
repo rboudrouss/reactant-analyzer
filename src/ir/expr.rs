@@ -373,10 +373,12 @@ pub enum SummaryValue {
     Held,
     /// A function whose call navigates — `useNavigate()`'s result, the
     /// `push`/`replace` of a router object, the setter of react-router's
-    /// `useSearchParams` tuple (#161). Value-wise a stable reference; a call
-    /// through it in a body the loop can run moves every [`Self::Held`]
-    /// value.
-    Navigator,
+    /// `useSearchParams` tuple (#161). A call through it in a body the loop
+    /// can run moves every [`Self::Held`] value. `stable` is its own
+    /// identity across renders, a separate claim: Next documents the router
+    /// object's methods stable, react-router's `navigate` and
+    /// `setSearchParams` change with the location outside a data router.
+    Navigator { stable: bool },
 }
 
 impl Expr {

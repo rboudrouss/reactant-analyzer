@@ -497,7 +497,7 @@ pub(crate) fn navigates(body: &CFG, render: &HashMap<&str, Vec<&Expr>>) -> bool 
             }
             match e.peel_ts() {
                 Expr::HookMarker(_, MarkerVal::Summary(sv)) | Expr::SummaryVal(sv) => {
-                    matches!(sv, SummaryValue::Navigator)
+                    matches!(sv, SummaryValue::Navigator { .. })
                 }
                 Expr::Var(v) => self
                     .body
@@ -507,12 +507,12 @@ pub(crate) fn navigates(body: &CFG, render: &HashMap<&str, Vec<&Expr>>) -> bool 
                 Expr::FieldAccess { obj, field } => {
                     matches!(
                         self.shape_member(obj, field, depth - 1),
-                        Some(SummaryValue::Navigator)
+                        Some(SummaryValue::Navigator { .. })
                     )
                 }
                 Expr::IndexAccess { arr, idx } => {
                     matches!(idx.peel_ts(), Expr::Lit(Prim::Int(i))
-                        if matches!(self.shape_member(arr, &i.to_string(), depth - 1), Some(SummaryValue::Navigator)))
+                        if matches!(self.shape_member(arr, &i.to_string(), depth - 1), Some(SummaryValue::Navigator { .. })))
                 }
                 _ => false,
             }

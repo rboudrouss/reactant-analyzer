@@ -288,19 +288,22 @@ const REACT_HOOK_FORM_MEMBERS: &[(&str, SummaryValue)] = &[
 /// The methods that change the URL are navigators (#161): stable too, and a
 /// call through one moves everything the URL decides.
 const NEXT_ROUTER_MEMBERS: &[(&str, SummaryValue)] = &[
-    ("push", SummaryValue::Navigator),
-    ("replace", SummaryValue::Navigator),
+    ("push", SummaryValue::Navigator { stable: true }),
+    ("replace", SummaryValue::Navigator { stable: true }),
     ("refresh", SummaryValue::StableRef),
     ("prefetch", SummaryValue::StableRef),
-    ("back", SummaryValue::Navigator),
-    ("forward", SummaryValue::Navigator),
+    ("back", SummaryValue::Navigator { stable: true }),
+    ("forward", SummaryValue::Navigator { stable: true }),
 ];
 
 /// react-router's `useSearchParams()` → `[searchParams, setSearchParams]`, a
 /// tuple contract keyed by position like jotai's (#37): the value moves on
 /// navigation only, the setter navigates (#161).
-const REACT_ROUTER_SEARCH_PARAMS: &[(&str, SummaryValue)] =
-    &[("0", SummaryValue::Held), ("1", SummaryValue::Navigator)];
+const REACT_ROUTER_SEARCH_PARAMS: &[(&str, SummaryValue)] = &[
+    ("0", SummaryValue::Held),
+    // Memoized on the current params: no identity promised.
+    ("1", SummaryValue::Navigator { stable: false }),
+];
 
 /// `@mantine/form`'s `useForm()`. One entry, and it is a timing claim, not a
 /// stability one: `onSubmit` is built as `(handler) => (event) => …`, a fresh
@@ -547,7 +550,7 @@ mod tests {
         assert!(
             sp.members()
                 .iter()
-                .any(|(k, v)| k == &"1" && *v == SummaryValue::Navigator),
+                .any(|(k, v)| k == &"1" && matches!(v, SummaryValue::Navigator { .. })),
             "the setter of the tuple navigates"
         );
     }

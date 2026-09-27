@@ -956,7 +956,9 @@ fn expand_custom_hooks(
                 // from the component's splice cursor, the same supply a graft
                 // uses (#134).
                 let sv = if summary.navigates() {
-                    SummaryValue::Navigator
+                    // Identity unpromised: react-router's `navigate` changes
+                    // with the location outside a data router.
+                    SummaryValue::Navigator { stable: false }
                 } else if summary.held_across_updates() {
                     SummaryValue::Held
                 } else if summary.members().is_empty() {
