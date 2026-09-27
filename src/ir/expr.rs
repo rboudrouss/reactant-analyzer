@@ -366,12 +366,17 @@ pub enum SummaryValue {
         id: ExprId,
         members: Arc<Vec<(Symbol, SummaryValue)>>,
     },
-    /// The inner summary, and the fact that the value moves only on an
-    /// event the automatic re-render loop cannot raise: navigation, for a
-    /// router hook's `searchParams`, `params`, `pathname` or `location`
-    /// (#161). Value-wise it is the inner summary; the convergence proof
-    /// reads the value as holding still across the loop.
-    Held(Box<SummaryValue>),
+    /// ⊤ that moves only on an event the automatic re-render loop cannot
+    /// raise: navigation, for a router hook's `searchParams`, `params`,
+    /// `pathname` or `location` (#161). The convergence proof reads the
+    /// value as holding still across the loop.
+    Held,
+    /// A function whose call navigates — `useNavigate()`'s result, the
+    /// `push`/`replace` of a router object, the setter of react-router's
+    /// `useSearchParams` tuple (#161). Value-wise a stable reference; a call
+    /// through it in a body the loop can run moves every [`Self::Held`]
+    /// value.
+    Navigator,
 }
 
 impl Expr {

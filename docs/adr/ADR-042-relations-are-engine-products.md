@@ -208,9 +208,12 @@ its own slice, and the ratchet list records them:
   live reviver, by least fixpoint over the sites of a component (a greatest
   fixpoint would read mutual revival as convergence). A router hook's
   result is held (`SummaryValue::Held`) unless a body the loop can run
-  visibly navigates; a member of an object literal holds when the member
-  does. `new X()` is an allocating node (`Expr::New`), read as fresh
-  wherever an object literal is.
+  visibly navigates — a call through a `SummaryValue::Navigator`
+  (`useNavigate()`, `router.push`, the `useSearchParams` setter), resolved
+  through the bindings, or a router/history method by name; a member of an
+  object literal or of a shaped hook result holds when the member does.
+  `new X()` is an allocating node (`Expr::New`), read as fresh wherever an
+  object literal is.
 - `ConvergedEval` / `Eval` / `eval_in_stores` move to the engine. They wrap
   `StateValueTransfer` over converged stores and every relation above needs
   them.

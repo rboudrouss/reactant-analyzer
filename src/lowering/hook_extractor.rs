@@ -875,6 +875,14 @@ fn rewrite_expr(expr: Expr, state_temps: &HashMap<String, HookLabel>) -> Expr {
                 .map(|a| rewrite_expr(a, state_temps))
                 .collect(),
         },
+        Expr::New { id, fn_, args } => Expr::New {
+            id,
+            fn_: Box::new(rewrite_expr(*fn_, state_temps)),
+            args: args
+                .into_iter()
+                .map(|a| rewrite_expr(a, state_temps))
+                .collect(),
+        },
         Expr::ArrayLit {
             id,
             elems,

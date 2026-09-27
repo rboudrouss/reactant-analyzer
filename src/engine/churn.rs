@@ -73,6 +73,7 @@ use crate::{
     },
     ir::{
         ComponentId, QualifiedSlot, SourceRange,
+        bindings::local_bindings,
         cfg::{CFG, Terminator},
         expr::{CompOrigin, Expr, SPREAD_KEY_PREFIX, object_member},
         hooks::{Arity, HookEntry},
@@ -205,11 +206,13 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
     // A visible navigation in any body the loop can run moves every
     // navigation-held value program-wide (#161).
     let navigates = result.components.values().any(|c| {
-        c.hooks
-            .iter()
-            .filter(|h| !matches!(h, HookEntry::Handler { .. }))
-            .filter_map(HookEntry::body_cfg)
-            .any(navigates)
+        let render = local_bindings(&c.render_cfg);
+        navigates(&c.render_cfg, &render)
+            || c.hooks
+                .iter()
+                .filter(|h| !matches!(h, HookEntry::Handler { .. }))
+                .filter_map(HookEntry::body_cfg)
+                .any(|b| navigates(b, &render))
     });
 
     for (&comp, comp_result) in &result.components {
@@ -374,9 +377,13 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         invariance: &Invariance<'_>,
         child: &CompOrigin,
     ) -> bool {
-        fn walk(e: &Expr, f: &mut dyn FnMut(&Expr)) {
-            f(e);
-            e.for_each_child(&mut |c| walk(c, f));
+        /// Every node under `e`, with whether it sits inside a closure.
+        fn walk(e: &Expr, closure: bool, f: &mut dyn FnMut(&Expr, bool)) {
+            f(e, closure);
+            if let Expr::FnLit { body_cfg, .. } = e {
+                body_cfg.for_each_expr(&mut |x| walk(x, true, f));
+            }
+            e.for_each_child(&mut |c| walk(c, closure, f));
         }
         let cfg = &parent.render_cfg;
         let held = |e: &Expr| invariance.holds(e, &ctx.render_lets, ctx.props_hold);
@@ -384,7 +391,7 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
         let mut ok = true;
         for block in cfg.blocks.values() {
             let mut visit = |e: &Expr| {
-                walk(e, &mut |e| {
+                walk(e, false, &mut |e, closure| {
                     if let Expr::CompApp {
                         origin: Some(o),
                         props,
@@ -393,6 +400,9 @@ pub fn build_edges(result: &ProgramAnalysisResult) -> Vec<ChurnEdge> {
                         && **o == *child
                     {
                         found = true;
+                        // An element a callback renders (`items.map(i =>
+                        // <Child/>)`) mounts once per item the loop may add.
+                        ok &= !closure;
                         ok &= site_guards(cfg, block.id).iter().all(|(c, _)| held(c));
                         if let Expr::ObjectLit { fields, .. } = props.peel_ts()
                             && let Some(key) = object_member(fields, "key")

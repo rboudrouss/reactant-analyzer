@@ -1082,3 +1082,31 @@ export function C({ version }: { version: { id: string } }) {
         "an unreset flag keeps the reviver alive: {diags:?}"
     );
 }
+
+#[test]
+fn a_child_also_rendered_from_a_callback_mounts_per_item() {
+    // One `Row` on every path, and one per item of a list the loop grows:
+    // each round mounts a new `Row`, whose `[]` effect resets `sel`. The
+    // direct instance must not vouch for the mapped ones.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Row({ setSel }: { setSel: (v: any) => void }) {
+  useEffect(() => { setSel(null); }, []);
+  return <span />;
+}
+export function Parent() {
+  const [sel, setSel] = useState(null);
+  const [list, setList] = useState<number[]>([]);
+  useEffect(() => { if (!sel) setSel({}); }, [sel]);
+  useEffect(() => { if (sel) setList(l => [...l, Date.now()]); }, [sel]);
+  return <><Row setSel={setSel} />{list.map(k => <Row key={k} setSel={setSel} />)}</>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "Parent");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "a mapped child mounts once per item the loop adds: {diags:?}"
+    );
+}

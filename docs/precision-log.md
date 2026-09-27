@@ -1464,11 +1464,18 @@ not comparable to a per-repo figure, and to be re-read on the CI run.
 - **#161 — the URL holds still.** A router hook's result moves only on
   navigation. `useSearchParams`, `useParams`, `usePathname`, `useLocation`,
   `useMatch` and the layout-segment hooks carry `SummaryValue::Held`, which
-  `Invariance` accepts unless some effect, memo or callback body of the
-  program visibly navigates (`router.push`, `history.*`, a `location`
-  write, a bare `navigate()`). A member of an object literal holds when
-  the member does, so a value an inlined custom hook hands back inside
-  `{ searchParams }` keeps what the hook knew.
+  `Invariance` accepts unless some render, effect, memo or callback body of
+  the program visibly navigates. The navigators are summaries too
+  (`SummaryValue::Navigator`: `useNavigate()`'s result, `router.push` and
+  `replace`, the setter of react-router's `useSearchParams` tuple), resolved
+  through the bindings under whatever name the body calls them; `history.*`,
+  a `location` write, a bare `navigate()` and a `<Navigate/>` are read by
+  name. A member of an object literal, or of a shaped hook result, holds
+  when the member does, so a value an inlined custom hook hands back inside
+  `{ searchParams }` keeps what the hook knew. The review of this PR found
+  the first cut name-based only, which missed `setSearchParams` — a real
+  loop through the URL went silent — and the `.map`-rendered child of #162;
+  both are pinned as tests now.
 
 ### The three lines
 

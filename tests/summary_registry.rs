@@ -1031,3 +1031,83 @@ fn a_visible_navigation_in_an_effect_makes_the_router_result_move() {
         "an effect that navigates moves the URL inside the loop: {fired:?}"
     );
 }
+
+/// react-router's tuple: the value at `[0]` is held, read through the
+/// destructuring temp.
+#[test]
+fn a_react_router_search_params_value_holds_across_the_loop() {
+    let fired = rules_fired(
+        r#"
+        import { useState, useEffect } from "react";
+        import { useSearchParams } from "react-router-dom";
+        function C() {
+          const [searchParams] = useSearchParams();
+          const [sheet, setSheet] = useState({ leadId: null, open: false });
+          useEffect(() => {
+            const urlLeadId = searchParams.get("leadId");
+            if (urlLeadId && urlLeadId !== sheet.leadId) {
+              setSheet({ leadId: urlLeadId, open: true });
+            } else if (!urlLeadId && sheet.leadId) {
+              setSheet({ leadId: null, open: false });
+            }
+          }, [searchParams, sheet.leadId]);
+          return <div>{sheet.leadId}</div>;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        !fired.iter().any(|r| r == "infinite-loop"),
+        "`[searchParams]` moves only on navigation: {fired:?}"
+    );
+}
+
+/// The setter of the same tuple navigates: with it in an effect, the URL
+/// moves inside the loop and nothing the URL decides holds. The pair below
+/// really loops (id → x → URL cleared → x null → URL set → …).
+#[test]
+fn the_search_params_setter_is_a_navigation_the_proof_sees() {
+    let fired = rules_fired(
+        r#"
+        import { useState, useEffect } from "react";
+        import { useSearchParams } from "react-router-dom";
+        function C() {
+          const [sp, setSp] = useSearchParams();
+          const id = sp.get("id");
+          const [x, setX] = useState(null);
+          useEffect(() => { if (id && !x) { setX({}); setSp({}); } }, [id, x]);
+          useEffect(() => { if (!id && x) { setX(null); setSp({ id: "1" }); } }, [id, x]);
+          return <div>{id}</div>;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        fired.iter().any(|r| r == "infinite-loop"),
+        "`setSp` navigates inside the loop: {fired:?}"
+    );
+}
+
+/// `useNavigate()`'s result under any name is a navigator.
+#[test]
+fn a_navigate_function_under_another_name_is_a_navigation() {
+    let fired = rules_fired(
+        r#"
+        import { useState, useEffect } from "react";
+        import { useParams, useNavigate } from "react-router-dom";
+        function C() {
+          const { id } = useParams();
+          const go = useNavigate();
+          const [x, setX] = useState(null);
+          useEffect(() => { if (id && !x) { setX({}); go("/"); } }, [id, x]);
+          useEffect(() => { if (!id && x) { setX(null); go("/1"); } }, [id, x]);
+          return <div>{id}</div>;
+        }
+        "#,
+        "C",
+    );
+    assert!(
+        fired.iter().any(|r| r == "infinite-loop"),
+        "`go` is `useNavigate()`'s result: {fired:?}"
+    );
+}

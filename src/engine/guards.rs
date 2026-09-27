@@ -50,7 +50,7 @@ use crate::{
         ComponentId, QualifiedSlot,
         bindings::local_bindings,
         cfg::{CFG, EdgeKind, Terminator},
-        expr::{Expr, MarkerVal, SummaryValue, UnaryOp, mutation_receiver, object_member},
+        expr::{Expr, MarkerVal, Prim, SummaryValue, UnaryOp, mutation_receiver, object_member},
         free_vars::{call_free_key, collect_used_vars},
         stmt::Stmt,
         types::{BlockId, HookLabel, Var},
@@ -353,12 +353,25 @@ impl Invariance<'_> {
                     None => props_hold,
                 }
             }
-            Expr::FieldAccess { obj, field } => match self.literal_member(obj, field, body) {
-                Some((member, scope)) => self.go(member, scope, props_hold, next),
+            Expr::FieldAccess { obj, field } => match self.member(obj, field, body) {
+                Some(Member::Expr(member, scope)) => self.go(member, scope, props_hold, next),
+                Some(Member::Summary(sv)) => matches!(sv, SummaryValue::Held) && !self.navigates,
                 None => self.go(obj, body, props_hold, next),
             },
             Expr::IndexAccess { arr, idx } => {
-                self.go(arr, body, props_hold, next) && self.go(idx, body, props_hold, next)
+                let member = match idx.peel_ts() {
+                    Expr::Lit(Prim::Int(i)) => self.member(arr, &i.to_string(), body),
+                    _ => None,
+                };
+                match member {
+                    Some(Member::Expr(member, scope)) => self.go(member, scope, props_hold, next),
+                    Some(Member::Summary(sv)) => {
+                        matches!(sv, SummaryValue::Held) && !self.navigates
+                    }
+                    None => {
+                        self.go(arr, body, props_hold, next) && self.go(idx, body, props_hold, next)
+                    }
+                }
             }
             Expr::BinOp { lhs, rhs, .. } => {
                 self.go(lhs, body, props_hold, next) && self.go(rhs, body, props_hold, next)
@@ -369,7 +382,7 @@ impl Invariance<'_> {
                     && args.iter().all(|a| self.go(a, body, props_hold, next))
             }
             Expr::HookMarker(_, MarkerVal::Summary(sv)) | Expr::SummaryVal(sv) => {
-                matches!(sv, SummaryValue::Held(_)) && !self.navigates
+                matches!(sv, SummaryValue::Held) && !self.navigates
             }
             // State, memos, callbacks, other hooks, allocations, elements.
             _ => false,
@@ -392,35 +405,57 @@ impl Invariance<'_> {
         self.render.get(v).map(|bound| (*bound, None))
     }
 
-    /// The member `field` of the object literal `obj` is a name bound to,
-    /// with the scope the literal was bound in.
-    fn literal_member<'e>(
+    /// The member `field` of what the name `obj` is bound to: an object
+    /// literal's member, with the scope the literal was bound in, or the
+    /// summary of a shaped hook result's member (a destructured
+    /// `useSearchParams()` tuple). `None` for a name that moves — state, a
+    /// memo, a mutated object — whatever it is bound to.
+    fn member<'e>(
         &'e self,
         obj: &'e Expr,
         field: &str,
         body: Option<&'e Bindings<'e>>,
-    ) -> Option<(&'e Expr, Option<&'e Bindings<'e>>)> {
+    ) -> Option<Member<'e>> {
         let Expr::Var(v) = obj.peel_ts() else {
             return None;
         };
+        if self.state_vals.contains_key(v)
+            || self.memo_vals.contains_key(v)
+            || self.mutated.contains(v)
+        {
+            return None;
+        }
         let (Some(rhs), scope) = self.binding(v, body)? else {
             return None;
         };
-        let Expr::ObjectLit { fields, .. } = rhs.peel_ts() else {
-            return None;
-        };
-        Some((object_member(fields, field)?, scope))
+        match rhs.peel_ts() {
+            Expr::ObjectLit { fields, .. } => {
+                object_member(fields, field).map(|m| Member::Expr(m, scope))
+            }
+            Expr::HookMarker(_, MarkerVal::Summary(SummaryValue::Shape { members, .. })) => members
+                .iter()
+                .find(|(k, _)| k == field)
+                .map(|(_, sv)| Member::Summary(sv)),
+            _ => None,
+        }
     }
 }
 
-/// Does `body` visibly navigate: call a router or history method, or write
-/// `location`? Nested closures included — a redirect sits in a continuation
-/// as often as in the body. By name, over the receivers a program spells
-/// (`router`, `history`, `navigation`, `location`, `window`, `document`)
-/// and the bare `navigate`/`redirect`; a navigation hidden in an opaque
-/// callee is not seen, the assumption [`Invariance`] already makes of every
-/// call.
-pub(crate) fn navigates(body: &CFG) -> bool {
+/// What [`Invariance::member`] resolves a member read to.
+enum Member<'e> {
+    Expr(&'e Expr, Option<&'e Bindings<'e>>),
+    Summary(&'e SummaryValue),
+}
+
+/// Does `body` visibly navigate: call a function a summary names a
+/// [`SummaryValue::Navigator`] (`useNavigate()`, `router.push`, the setter
+/// of `useSearchParams`), a router or history method by name, a bare
+/// `navigate`/`redirect`, render a `<Navigate/>`, or write `location`?
+/// Nested closures included — a redirect sits in a continuation as often as
+/// in the body. `render` is what the render binds: the navigator is bound
+/// there and called here. A navigation hidden in an opaque callee is not
+/// seen, the assumption [`Invariance`] already makes of every call.
+pub(crate) fn navigates(body: &CFG, render: &HashMap<&str, Vec<&Expr>>) -> bool {
     const RECEIVERS: &[&str] = &[
         "router",
         "history",
@@ -442,6 +477,7 @@ pub(crate) fn navigates(body: &CFG) -> bool {
         "go",
     ];
     const BARE: &[&str] = &["navigate", "redirect"];
+    const ELEMENTS: &[&str] = &["Navigate", "Redirect"];
     fn root(e: &Expr) -> Option<&str> {
         match e.peel_ts() {
             Expr::Var(v) => Some(v.as_str()),
@@ -449,27 +485,95 @@ pub(crate) fn navigates(body: &CFG) -> bool {
             _ => None,
         }
     }
-    fn expr(e: &Expr) -> bool {
-        match e {
-            Expr::Call { fn_, .. } => match fn_.peel_ts() {
-                Expr::Var(v) if BARE.contains(&v.as_str()) => return true,
-                Expr::FieldAccess { obj, field }
-                    if METHODS.contains(&field.as_str())
-                        && root(obj).is_some_and(|r| RECEIVERS.contains(&r)) =>
-                {
-                    return true;
-                }
-                _ => {}
-            },
-            Expr::FnLit { body_cfg, .. } => return navigates(body_cfg),
-            _ => {}
-        }
-        let mut found = false;
-        e.for_each_child(&mut |c| found |= expr(c));
-        found
+    struct Scan<'a> {
+        body: HashMap<&'a str, Vec<&'a Expr>>,
+        render: &'a HashMap<&'a str, Vec<&'a Expr>>,
     }
+    impl Scan<'_> {
+        /// Is `e` a spelling of a navigator, through the bindings?
+        fn navigator(&self, e: &Expr, depth: usize) -> bool {
+            if depth == 0 {
+                return false;
+            }
+            match e.peel_ts() {
+                Expr::HookMarker(_, MarkerVal::Summary(sv)) | Expr::SummaryVal(sv) => {
+                    matches!(sv, SummaryValue::Navigator)
+                }
+                Expr::Var(v) => self
+                    .body
+                    .get(v.as_str())
+                    .or_else(|| self.render.get(v.as_str()))
+                    .is_some_and(|rhss| rhss.iter().any(|r| self.navigator(r, depth - 1))),
+                Expr::FieldAccess { obj, field } => {
+                    matches!(
+                        self.shape_member(obj, field, depth - 1),
+                        Some(SummaryValue::Navigator)
+                    )
+                }
+                Expr::IndexAccess { arr, idx } => {
+                    matches!(idx.peel_ts(), Expr::Lit(Prim::Int(i))
+                        if matches!(self.shape_member(arr, &i.to_string(), depth - 1), Some(SummaryValue::Navigator)))
+                }
+                _ => false,
+            }
+        }
+        /// The summary of member `field` of the shaped hook result `e` names.
+        fn shape_member<'e>(
+            &'e self,
+            e: &'e Expr,
+            field: &str,
+            depth: usize,
+        ) -> Option<&'e SummaryValue> {
+            if depth == 0 {
+                return None;
+            }
+            match e.peel_ts() {
+                Expr::HookMarker(_, MarkerVal::Summary(SummaryValue::Shape { members, .. })) => {
+                    members.iter().find(|(k, _)| k == field).map(|(_, v)| v)
+                }
+                Expr::Var(v) => self
+                    .body
+                    .get(v.as_str())
+                    .or_else(|| self.render.get(v.as_str()))
+                    .and_then(|rhss| {
+                        rhss.iter()
+                            .find_map(|r| self.shape_member(r, field, depth - 1))
+                    }),
+                _ => None,
+            }
+        }
+        fn expr(&self, e: &Expr) -> bool {
+            match e {
+                Expr::Call { fn_, .. } => {
+                    if self.navigator(fn_, 8) {
+                        return true;
+                    }
+                    match fn_.peel_ts() {
+                        Expr::Var(v) if BARE.contains(&v.as_str()) => return true,
+                        Expr::FieldAccess { obj, field }
+                            if METHODS.contains(&field.as_str())
+                                && root(obj).is_some_and(|r| RECEIVERS.contains(&r)) =>
+                        {
+                            return true;
+                        }
+                        _ => {}
+                    }
+                }
+                Expr::CompApp { name, .. } if ELEMENTS.contains(&name.as_str()) => return true,
+                Expr::FnLit { body_cfg, .. } => return navigates(body_cfg, self.render),
+                _ => {}
+            }
+            let mut found = false;
+            e.for_each_child(&mut |c| found |= self.expr(c));
+            found
+        }
+    }
+    let scan = Scan {
+        body: local_bindings(body),
+        render,
+    };
     let mut found = false;
-    body.for_each_expr(&mut |e| found |= expr(e));
+    body.for_each_expr(&mut |e| found |= scan.expr(e));
     found
         || body.blocks.values().any(|b| {
             b.stmts.iter().any(|s| {

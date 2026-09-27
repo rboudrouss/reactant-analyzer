@@ -66,9 +66,12 @@ that writes it (see *Cross-file limits*).
   [#157](https://github.com/rboudrouss/reactant-analyzer/issues/157).
 - The convergence proof assumes a call over held inputs returns the same value on every run, and
   that a call it cannot see into does not navigate: a router hook's result (`useSearchParams`,
-  `useParams`, `usePathname`, `useLocation`) holds still across the loop unless some effect, memo
-  or callback body of the program visibly navigates — `router.push`/`replace`, `history.*`,
-  `location.assign`, a write to `location`, a bare `navigate()`/`redirect()`
+  `useParams`, `usePathname`, `useLocation`) holds still across the loop unless some render,
+  effect, memo or callback body of the program visibly navigates — a call through what a summary
+  names a navigator (`useNavigate()`'s result, `router.push`/`replace`, the setter of react-router's
+  `useSearchParams` tuple, under any name the bindings reach), `history.*`, `location.assign`, a
+  write to `location`, a bare `navigate()`/`redirect()`, a `<Navigate/>`. A navigation hidden in
+  an opaque callee, or through a router object handed down as a prop, is not seen
   [#161](https://github.com/rboudrouss/reactant-analyzer/issues/161).
 - A child's mount-only effect is read as firing once when the parent renders the child on every
   path, or behind guards that hold still, without a `key` that moves. A child rendered from a
