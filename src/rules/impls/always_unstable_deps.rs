@@ -65,7 +65,7 @@ impl Rule for AlwaysUnstableDeps {
         let mut diags = Vec::new();
         let transfer = StateValueTransfer;
         // One scratch heap for the whole component, not one per dep — see
-        // [`crate::rules::helpers::Eval`].
+        // [`crate::engine::eval::Eval`].
         let mut scratch = result.heap.clone();
 
         for hook in &result.hooks {

@@ -1,11 +1,15 @@
 pub mod analysis_result;
 pub mod cfg_analyzer;
+pub mod churn;
 pub mod component_cache;
 pub mod component_registry;
 pub mod dominance;
+pub mod eval;
 pub mod fixpoint;
 pub mod function_registry;
+pub mod guards;
 pub mod hook_registry;
+pub mod program_relations;
 pub mod program_result;
 pub mod registrations;
 pub mod render_deps;
@@ -13,20 +17,25 @@ pub mod root_detector;
 pub mod seeds;
 pub mod setters;
 pub mod symbol_graph;
+pub mod triggers;
+pub mod written;
 
 pub use analysis_result::{
     AnalysisResult, EffectInfo, HandlerInfo, HookCallInfo, HookKind, InlineKind, InlineOrigin,
     WidenEvent,
 };
 pub use cfg_analyzer::analyze_cfg;
+pub use churn::{ChurnCycle, ChurnEdge, ChurnGraph, EdgeStrength};
 pub use component_cache::ComponentCache;
 pub use component_registry::{ComponentKey, ComponentRegistry};
-pub use dominance::{DominatorTree, compute_dominators, dominates, rpo};
+pub use dominance::{DominatorTree, compute_dominators, dominates, on_all_paths, rpo};
+pub use eval::{ConvergedEval, Eval, eval_in_stores};
 pub use fixpoint::{
     Config, analyze_component, analyze_component_as, analyze_component_inter, analyze_program,
 };
 pub use function_registry::{FunctionKey, FunctionRegistry};
 pub use hook_registry::{HookKey, HookRegistry};
+pub use program_relations::ProgramRelations;
 pub use program_result::{AnalysisStats, CallSite, ComponentCallGraph, ProgramAnalysisResult};
 pub use registrations::{Firing, Pairing, Registrar, Registration, Timing};
 pub use root_detector::RootStrategy;
@@ -36,3 +45,5 @@ pub use setters::{
     collect_slot_reads,
 };
 pub use symbol_graph::{SymbolGraph, SymbolKind, SymbolNode};
+pub use triggers::{EffectTrigger, triggers_of};
+pub use written::{Freshness, SiteEnvs, Written};

@@ -110,7 +110,11 @@ pub(crate) fn collect_slot_seeds(
         // render-time write (the adjust-during-render pattern — a sync path
         // exists, its misuse is `setter-in-render`'s business), and an effect
         // with no readable deps list, which re-runs after every render.
-        let rows = || slot_writers.iter().filter(|w| w.slot == *label);
+        let rows = || {
+            slot_writers
+                .iter()
+                .filter(|w| w.owner.is_none() && w.slot == *label)
+        };
         // **Phase, not region.** `region` is lexical, and a callback literal
         // written inline in render lives in the render CFG — `useCallback(() =>
         // setValue(x), …)` would read as an adjust-during-render write and

@@ -965,9 +965,9 @@ fn catalogue() -> Vec<Entry> {
                 silent_on: Fixture::Multi(CYCLE_OK_FILES),
                 weakened: Some(
                     "rows exist only for cycles the churn graph sees — a prop-mediated edge \
-                     needs the parent slot flowed top-down (#20), auto-run async callbacks \
-                     are blind (#26), convergent multi-writer FPs are inherited (#39), and \
-                     a carrying edge with no write span yields no row (ADR-024 anchor \
+                     needs the parent slot flowed top-down (#20), a convergent slot another \
+                     component also writes keeps its edge (the residual of #39), and a \
+                     carrying edge with no write span yields no row (ADR-024 anchor \
                      identity). Only the graph arm is exposed: the self-churn arm's own \
                      coverage is invisible to packs (ADR-020 item 2). Cross-component rows \
                      are Warning-only — must-rerun through a `Versioned` prop dep is \

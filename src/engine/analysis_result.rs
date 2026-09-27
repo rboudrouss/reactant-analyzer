@@ -255,6 +255,11 @@ pub struct AnalysisResult<D: AbstractDomain> {
     /// at convergence in the same slice as `slot_writers`. Empty for
     /// hand-built IR.
     pub registrations: Vec<crate::engine::registrations::Registration>,
+    /// The effect-trigger relation (ADR-042 §3): one row per (effect, dep
+    /// index, qualified slot) with the must-rerun bit `exact`. Computed at
+    /// convergence in the same slice as `slot_writers`. Empty for hand-built
+    /// IR.
+    pub effect_triggers: Vec<crate::engine::triggers::EffectTrigger>,
     /// Number of outer fixpoint iterations before convergence.  Useful for
     /// --verbose output and for Info diagnostics about analysis depth.
     pub iterations: usize,

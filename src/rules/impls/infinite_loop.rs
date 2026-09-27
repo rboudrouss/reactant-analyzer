@@ -13,20 +13,14 @@ use crate::{
 };
 
 use crate::engine::setters::SetterCallPhase;
+use crate::engine::{ChurnEdge, ChurnGraph, EdgeStrength, Freshness, WriterRegion};
 use crate::ir::ComponentId;
 use crate::rules::api::query::must_effect_cycle;
-use crate::rules::helpers::churn::{
-    ChurnSetterCall, Freshness, classify_effect_deps, collect_churn_calls, converges_once_written,
-    reference_part, write_can_retrigger,
-};
-use crate::rules::helpers::churn_graph::{
-    ChurnEdge, ChurnGraph, NodeNames, cycle_path, node_display,
-};
+use crate::rules::helpers::cycles::{NodeNames, cycle_path, node_display};
 use crate::rules::{
     Certified, Diagnostic, MustResult, OnAllPaths, Rule, Severity, all_deps_provably_stable,
     all_setter_labels, collect_fn_bindings, collect_setter_calls, collect_setter_calls_with_extra,
-    memo_val_labels, must_on_all_paths, resolve_setter_aliases, setter_var_labels, state_slot_name,
-    state_val_labels,
+    must_on_all_paths, resolve_setter_aliases, state_slot_name, state_val_labels,
 };
 
 /// Fires when an effect causes an infinite render loop.
@@ -236,11 +230,12 @@ impl Rule for InfiniteLoop {
         // ── F5b: multi-effect churn cycles (see churn_graph.rs) ───────────────
         // The graph is whole-program data: read it from the ctx cache, which
         // builds it once for the run (issue #86).
+        let graph = ctx.cache().churn();
         let (cycle_diags, covered) =
-            check_multi_effect_cycles(ctx.cache().churn(), result, component, &reported_effects);
+            check_multi_effect_cycles(graph, result, component, &reported_effects);
         diags.extend(cycle_diags);
         // Self-churn arm last: its Info branch skips writes a cycle covers.
-        diags.extend(check_object_churn(result, component, &covered));
+        diags.extend(check_object_churn(graph, result, component, &covered));
 
         diags
     }
@@ -399,6 +394,7 @@ fn check_multi_effect_cycles(
 //            state — cross-effect cycles are not analyzed (FN-flavor limit)
 
 fn check_object_churn(
+    graph: &ChurnGraph,
     result: &ProgramAnalysisResult,
     component: ComponentId,
     covered: &HashSet<(HookLabel, HookLabel)>,
@@ -406,17 +402,6 @@ fn check_object_churn(
     let comp_result = &result.components[&component];
     let cfg = &comp_result.render_cfg;
     let state_vals = resolve_setter_aliases(cfg, &state_val_labels(cfg));
-    let setter_labels = resolve_setter_aliases(cfg, &setter_var_labels(cfg));
-    let memo_vals = resolve_setter_aliases(cfg, &memo_val_labels(cfg));
-    if setter_labels.is_empty() {
-        return vec![];
-    }
-    // This arm is single-effect/single-component: local setters only.
-    let setter_nodes: HashMap<Var, crate::rules::helpers::churn::SlotNode> = setter_labels
-        .iter()
-        .map(|(v, l)| (v.clone(), (component, *l)))
-        .collect();
-    let render_fn_bindings = collect_fn_bindings(cfg);
     let mut diags = Vec::new();
 
     for hook in &comp_result.hooks {
@@ -429,133 +414,79 @@ fn check_object_churn(
         else {
             continue;
         };
-        let Some(dep_exprs) = deps.list() else {
-            continue;
-        };
-        if dep_exprs.arity == Arity::Exact(0) {
-            continue; // mount-only
+        if deps.list().is_none() {
+            continue; // no dependency array: the graph arm's self-edge
         }
 
-        let (exact, versioned_qualified) =
-            classify_effect_deps(dep_exprs.as_slice(), comp_result, &state_vals, &memo_vals);
-        // Self-churn is intra-component: keep only own slots.
-        let versioned: HashSet<HookLabel> = versioned_qualified
-            .into_iter()
-            .filter(|(c, _)| *c == component)
-            .map(|(_, l)| l)
-            .collect();
-        if exact.is_empty() && versioned.is_empty() {
-            continue;
-        }
-
-        let mut calls: Vec<ChurnSetterCall> = Vec::new();
-        collect_churn_calls(
-            body_cfg,
-            &setter_nodes,
-            &render_fn_bindings,
-            comp_result,
-            1,
-            true,
-            &mut calls,
-        );
+        // This arm's partition of the relation (ADR-020 item 2, ADR-042 §4):
+        // the effect's dep-driven edges from this component's own slots into
+        // this component's own slots. A `self_slot` edge is the loop; every
+        // other one feeds the Info branch. Freshness, the convergence kill and
+        // the field-sensitive re-trigger test (#90) were applied by the engine
+        // when it built the edge.
+        let edges = graph.edges.iter().filter(|e| {
+            e.component == component
+                && e.effect_label == *eff_label
+                && !e.no_deps
+                && e.from.0 == component
+                && e.to.0 == component
+        });
 
         // Strongest verdict per state label.
         // Best object-churn finding per slot: (severity, call span, Error proof).
         type ChurnBest = (Severity, Option<SourceRange>, Option<Certified<OnAllPaths>>);
         let mut best: HashMap<HookLabel, ChurnBest> = HashMap::new();
-        for call in &calls {
-            let state_label = call.node.1;
-            if call.freshness == Freshness::Not {
-                continue;
-            }
-            // Convergence proof (fetch-once pattern): once the written value
-            // sits in the slot, do the dominating guards kill this call?
-            // `if (user === null) setUser({...})` → narrowing the written
-            // (non-null, truthy) value through the guard yields ⊥ → the set
-            // fires at most once, no loop.
-            //
-            // This arm claims REFERENCE churn, and only a stored reference —
-            // always truthy, never nullish — can sustain the loop. Project
-            // the written value onto its reference slot so an opaque `f()`
-            // result (⊤ elsewhere) stays provable: if the guard dies under
-            // every reference, the reference-churn loop cannot re-fire.
-            if let Some(b) = call.block_id
-                && converges_once_written(
-                    body_cfg,
-                    b,
-                    &state_vals,
-                    state_label,
-                    &reference_part(&call.written),
-                    call.written_expr.as_ref(),
-                    comp_result,
-                )
-            {
-                continue;
-            }
-            // The object-churn Error anchors on the fresh write being on all
-            // paths — routed through the must-primitive that mints the proof.
-            let (sev, churn_proof) =
-                if exact.contains(&state_label) || versioned.contains(&state_label) {
-                    // A functional update that spreads its own parameter leaves
-                    // every member it does not name `Object.is`-equal, so deps
-                    // reading only those cannot be re-triggered by it (#90).
-                    if !write_can_retrigger(
-                        dep_exprs.as_slice(),
-                        component,
-                        state_label,
-                        &state_vals,
-                        &memo_vals,
-                        call.written_expr.as_ref(),
-                        comp_result,
-                    ) {
-                        continue;
-                    }
-                    let fresh_blocks: HashSet<BlockId> = calls
-                        .iter()
-                        .filter(|c| c.node == call.node && c.freshness == Freshness::Fresh)
-                        .filter_map(|c| c.block_id)
-                        .collect();
-                    if exact.contains(&state_label)
-                        && call.freshness == Freshness::Fresh
-                        && !fresh_blocks.is_empty()
-                    {
-                        match must_on_all_paths(body_cfg, &fresh_blocks) {
-                            MustResult::All(c) => (Severity::Error, Some(c)),
-                            _ => (Severity::Warning, None),
-                        }
-                    } else {
-                        (Severity::Warning, None)
+        for e in edges {
+            let state_label = e.to.1;
+            let (sev, churn_proof) = if e.self_slot {
+                // The Error anchors on the fresh write being on all paths —
+                // re-derived from the writer rows and minted by the
+                // must-primitive, never trusted from the edge's own strength.
+                let fresh_blocks: HashSet<BlockId> = comp_result
+                    .slot_writers
+                    .iter()
+                    .filter(|w| w.owner.is_none() && w.slot == state_label)
+                    .filter(|w| w.region == WriterRegion::Effect(*eff_label))
+                    .filter(|w| w.written.fresh == Freshness::Fresh)
+                    .filter_map(|w| w.block)
+                    .collect();
+                if e.strength == EdgeStrength::Must && !fresh_blocks.is_empty() {
+                    match must_on_all_paths(body_cfg, &fresh_blocks) {
+                        MustResult::All(c) => (Severity::Error, Some(c)),
+                        _ => (Severity::Warning, None),
                     }
                 } else {
-                    // Sets a different object state freshly while depending on
-                    // object state: a multi-effect cycle candidate. The churn
-                    // graph (F5b) analyzes those; when it reported a cycle for
-                    // this write the Info would be a duplicate — skip. Otherwise
-                    // keep it: deps may be too imprecise to close a real cycle.
-                    if covered.contains(&(*eff_label, state_label)) {
-                        continue;
-                    }
-                    (Severity::Info, None)
-                };
+                    (Severity::Warning, None)
+                }
+            } else {
+                // Sets a different object state freshly while depending on
+                // object state: a multi-effect cycle candidate. The churn
+                // graph (F5b) analyzes those; when it reported a cycle for
+                // this write the Info would be a duplicate — skip. Otherwise
+                // keep it: deps may be too imprecise to close a real cycle.
+                if covered.contains(&(*eff_label, state_label)) {
+                    continue;
+                }
+                (Severity::Info, None)
+            };
             // Severity has no Ord: rank Error > Warning > Info manually.
             let rank = |s: Severity| match s {
                 Severity::Error => 2,
                 Severity::Warning => 1,
                 Severity::Info => 0,
             };
-            // Rank ties break on earliest source position: call collection
-            // follows HashMap block order, so "first collected" is not
-            // deterministic across runs.
+            // Rank ties break on earliest source position, so the row a
+            // finding anchors on does not depend on relation order.
             let pos = |s: Option<SourceRange>| s.map_or((u32::MAX, u32::MAX), |r| r.pos_key());
             let replace = match best.get(&state_label) {
                 None => true,
                 Some(entry) => {
                     rank(sev) > rank(entry.0)
-                        || (rank(sev) == rank(entry.0) && pos(call.span) < pos(entry.1))
+                        || (rank(sev) == rank(entry.0) && pos(e.write_span) < pos(entry.1))
                 }
             };
             if replace {
-                best.insert(state_label, (sev, call.span, churn_proof));
+                best.insert(state_label, (sev, e.write_span, churn_proof));
             }
         }
 
@@ -702,8 +633,8 @@ mod tests {
     /// phase quadratic in component count (dub/twenty never finished).
     #[test]
     fn churn_graph_is_built_once_per_program() {
+        use crate::engine::churn::BUILDS;
         use crate::rules::api::cache::ProgramCache;
-        use crate::rules::helpers::churn_graph::BUILDS;
 
         let eff_cfg = crate::test_support::single_block_cfg(vec![Stmt::ExprStmt(
             Expr::Call {

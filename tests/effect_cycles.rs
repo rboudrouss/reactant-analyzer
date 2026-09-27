@@ -438,3 +438,426 @@ export function C() {
         "all-stable deps gate the effect: no infinite-loop expected, got: {diags:?}"
     );
 }
+
+// ── #26: auto-run continuations in a no-deps effect ─────────────────────────
+
+#[test]
+fn a_deferred_fresh_write_in_a_no_deps_effect_is_a_self_sustaining_loop() {
+    // The effect re-runs after every render; the `.then` continuation runs
+    // after every run and stores a fresh reference, which is a render. The
+    // rules-layer collector classified the nested write as "never
+    // self-sustaining"; the writer row's phase says `Deferred`, which is
+    // exactly as self-sustaining as the body (ADR-042 §4).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [data, setData] = useState({});
+  useEffect(() => {
+    fetch("/api").then(() => setData({ loaded: true }));
+  });
+  return <div>{String(data.loaded)}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "a deferred fresh write in a no-deps effect must be reported: {diags:?}"
+    );
+    assert!(
+        diags.iter().all(|(_, sev, _)| *sev != Severity::Error),
+        "a deferred write is never on all paths of the body: {diags:?}"
+    );
+}
+
+#[test]
+fn a_listener_write_in_a_no_deps_effect_needs_an_event_and_is_not_a_loop() {
+    // The other nested shape: a write only a registered listener reaches
+    // fires once per user event, so the loop is not self-sustaining. The
+    // row's phase is `Handler` and the graph builds no edge from it.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [pos, setPos] = useState({ x: 0 });
+  useEffect(() => {
+    const h = (e) => setPos({ x: e.clientX });
+    window.addEventListener("mousemove", h);
+    return () => window.removeEventListener("mousemove", h);
+  });
+  return <div>{pos.x}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags.iter().all(|(rule, _, _)| rule != "infinite-loop"),
+        "a listener write needs a user event per iteration: {diags:?}"
+    );
+}
+
+// ── #156: a fresh spelling settles nothing ───────────────────────────────────
+
+#[test]
+fn a_guard_compared_against_a_fresh_allocation_holds_again_after_the_write() {
+    // `x` is a new object on every run, so `s !== x` is true after every
+    // write: a real loop. The relational arm used to read `s !== x` and
+    // `setS(x)` as two spellings of one value and kill the edge.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState(null);
+  useEffect(() => {
+    const x = {};
+    if (s !== x) setS(x);
+  }, [s]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "a fresh spelling is a different reference each run: {diags:?}"
+    );
+}
+
+#[test]
+fn a_render_level_allocation_is_a_fresh_spelling_too() {
+    // `empty` is bound in the render, not in the body, and is a new object on
+    // every render: the write changes `s`, the re-render makes a new `empty`,
+    // the re-run compares against it — a real loop the body's bindings alone
+    // cannot see. The converged env can: `empty` evaluates to `PerRender`.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState(null);
+  const empty = {};
+  useEffect(() => { if (s !== empty) setS(empty); }, [s]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "a render-level allocation is fresh every render: {diags:?}"
+    );
+}
+
+#[test]
+fn a_guard_compared_against_an_invariant_spelling_still_settles() {
+    // The arm's own case stays: `next` is a prop, the same value on the next
+    // run, so once written the guard is dead.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ next }: { next: { id: number } }) {
+  const [s, setS] = useState(null);
+  useEffect(() => {
+    if (s !== next) setS(next);
+  }, [s, next]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags.iter().all(|(rule, _, _)| rule != "infinite-loop"),
+        "an invariant spelling settles the guard: {diags:?}"
+    );
+}
+
+// ── #155: an identity write is not a change ──────────────────────────────────
+
+#[test]
+fn writing_the_slots_own_value_back_is_not_a_loop() {
+    // The store goes ⊤ through the mount write, so the state read carries a
+    // `Versioned` reference beside a ⊤ residue. `setName(name)` stores the
+    // slot's own content: React bails out, nothing re-runs.
+    let src = r#"
+import { useState, useEffect } from 'react';
+declare function fetchName(): { name: string };
+export function C({ tick }: { tick: number }) {
+  const [name, setName] = useState('');
+  useEffect(() => { setName(fetchName().name); }, []);
+  useEffect(() => { setName(name); }, [name, tick]);
+  return <input value={name} />;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags.iter().all(|(rule, _, _)| rule != "infinite-loop"),
+        "an identity write is not a change: {diags:?}"
+    );
+}
+
+#[test]
+fn copying_a_top_store_slot_into_another_slot_is_still_a_change() {
+    // The same read written into *another* slot keeps its `Maybe`: `copy`
+    // takes a new value whenever `name` moves, and `name` moves on `copy` —
+    // a real loop that the identity reading must not silence.
+    let src = r#"
+import { useState, useEffect } from 'react';
+declare function fetchName(): { name: any };
+export function C() {
+  const [name, setName] = useState<any>('');
+  const [copy, setCopy] = useState<any>(null);
+  useEffect(() => { setName(fetchName().name); }, []);
+  useEffect(() => { setCopy(name); }, [name]);
+  useEffect(() => { setName({ copy }); }, [copy]);
+  return <div/>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev != Severity::Info),
+        "a copy of another slot moves with it: {diags:?}"
+    );
+}
+
+#[test]
+fn a_child_writing_the_parents_own_value_back_builds_no_edge() {
+    // The twenty shape: `<Child name={name} onNameUpdate={setName} />` and the
+    // child's effect calls `onNameUpdate(name)` — the parent's slot, written
+    // with the parent's own value for it. The graph used to carry a May edge
+    // from the parent's slot into itself, a length-1 cross-component cycle.
+    // (The older cross arm, which reads the parent's store rather than the
+    // written value, still fires on this shape when the call is direct: the
+    // exactness it would need is #157.)
+    let src = r#"
+import { useState, useEffect } from 'react';
+declare function fetchName(): { name: string };
+function Child({ name, onNameUpdate }: { name: string; onNameUpdate: (n: string) => void }) {
+  useEffect(() => { onNameUpdate(name); }, [name, onNameUpdate]);
+  return <input value={name} />;
+}
+export function Parent() {
+  const [name, setName] = useState('');
+  useEffect(() => { setName(fetchName().name); }, []);
+  return <Child name={name} onNameUpdate={setName} />;
+}
+"#;
+    let result = parse_and_analyze(src);
+    let graph = reactant::engine::ChurnGraph::build(&result);
+    assert!(
+        graph.edges.is_empty(),
+        "an identity write through a setter prop is not a change: {:?}",
+        graph
+            .edges
+            .iter()
+            .map(|e| (e.from, e.to, e.strength))
+            .collect::<Vec<_>>()
+    );
+}
+
+// ── #154: a guard dies under every write of the slot, or not at all ──────────
+
+#[test]
+fn two_writes_of_one_slot_that_revive_each_other_are_a_loop() {
+    // The fresh write's guard dies under its own write, and the `null` write
+    // beside it revives it on the next round: with `cond` true, `s` = null →
+    // `{…}` (the last write of the run wins) → the re-run stores null → `{…}`
+    // → … The per-site kill read the fresh write as convergent and stayed
+    // silent.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ cond }: { cond: boolean }) {
+  const [s, setS] = useState(null);
+  useEffect(() => {
+    if (cond) setS(null);
+    if (!s) setS({ fresh: true });
+  }, [s, cond]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "the null write revives the guard: {diags:?}"
+    );
+}
+
+#[test]
+fn two_guarded_writers_of_one_slot_that_settle_each_others_guard_converge() {
+    // Two effects each fetch-once into `s`; either write leaves `s` truthy,
+    // so both guards are dead after whichever fires first. The single-site
+    // precondition kept both edges and reported the `s → b → s` cycle (#39).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState(null);
+  const [b, setB] = useState(null);
+  useEffect(() => { if (!s) setS({ from: 'e1' }); }, [b]);
+  useEffect(() => { if (!s) setS({ from: 'e2' }); }, [b]);
+  useEffect(() => { setB({ from: s }); }, [s]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .all(|(rule, sev, _)| rule != "infinite-loop" || *sev == Severity::Info),
+        "either write settles both guards: {diags:?}"
+    );
+}
+
+#[test]
+fn a_fact_of_another_body_is_read_only_through_names_neither_body_binds() {
+    // Both effects bind `flag`, to different props. The first fires while its
+    // `flag` is truthy, the second while its own is falsy — no contradiction:
+    // with `a` truthy and `b` falsy the pair loops (`{…}` → null → `{…}`).
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ a, b }: { a: boolean; b: boolean }) {
+  const [s, setS] = useState(null);
+  useEffect(() => { const flag = a; if (flag) setS(null); }, [s, a]);
+  useEffect(() => { const flag = b; if (!flag && !s) setS({ x: 1 }); }, [s, b]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "`flag` is two different bindings: {diags:?}"
+    );
+}
+
+#[test]
+fn a_null_returning_updater_at_another_site_revives_the_guard() {
+    // `prev => null` stores null, whatever placeholder a functional updater's
+    // value used to carry: `!s` holds again after it, and the pair loops.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C() {
+  const [s, setS] = useState(null);
+  useEffect(() => { if (!s) setS({ fresh: true }); }, [s]);
+  useEffect(() => { if (s) setS(prev => null); }, [s]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "the updater stores null: {diags:?}"
+    );
+}
+
+#[test]
+fn a_module_name_another_component_writes_holds_nothing() {
+    // `D` toggles the module `let` on every change of `s`, so the facts
+    // `flag` / `!flag` of the two sites do not contradict across runs: the
+    // pair loops (`{…}` → null → `{…}`), and the kill must not read `flag`
+    // as a prop just because `C` never writes it.
+    let src = r#"
+import { useState, useEffect } from 'react';
+let flag = true;
+function D({ s }: { s: any }) {
+  useEffect(() => { flag = !flag; }, [s]);
+  return null;
+}
+export function C() {
+  const [s, setS] = useState(null);
+  useEffect(() => { if (flag) setS(null); }, [s]);
+  useEffect(() => { if (!flag && !s) setS({ x: 1 }); }, [s]);
+  return <D s={s} />;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "a module name another component writes moves: {diags:?}"
+    );
+}
+
+#[test]
+fn props_move_on_a_cycle_that_enters_through_another_edge() {
+    // The cycle is P → x → s → P: it enters `Child` through the prop `p`
+    // (versioned by the parent's slot) on the x-edge and leaves through the
+    // setter prop. The x → s edge is local, yet `p` moves along that cycle,
+    // so the facts `p` / `!p` of the two `s` sites prove nothing. Reading
+    // them as held killed the edge and lost the cycle.
+    let src = r#"
+import { useState, useEffect } from 'react';
+function Child({ p, onChange }: { p: any; onChange: (v: any) => void }) {
+  const [x, setX] = useState(null);
+  const [s, setS] = useState(null);
+  useEffect(() => { setX({ p }); }, [p]);
+  useEffect(() => { if (p && !s) setS({ v: 1 }); }, [x]);
+  useEffect(() => { if (!p) setS(null); }, [x]);
+  useEffect(() => { onChange(s ? null : { k: 1 }); }, [s]);
+  return null;
+}
+export function Parent() {
+  const [p, setP] = useState<any>({ k: 1 });
+  return <Child p={p} onChange={setP} />;
+}
+"#;
+    let diags = infinite_loop_diags(src, "Child");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, _, _)| rule == "cross-component-infinite-loop"),
+        "the props move on the cycle through `x`: {diags:?}"
+    );
+}
+
+#[test]
+fn a_render_binding_the_body_shadows_proves_nothing_about_the_body_name() {
+    // The render binds `flag` to `false`; the body binds its own `flag` to a
+    // prop. The value arm used to narrow the render's `false` and read the
+    // body's guard as dead — with `enabled` truthy the effect stores a fresh
+    // object on every run, a real loop.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ enabled }: { enabled: boolean }) {
+  const [s, setS] = useState(null);
+  const flag = false;
+  useEffect(() => {
+    const flag = enabled;
+    if (flag) setS({ x: 1 });
+  }, [s, enabled]);
+  return <div>{flag ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .any(|(rule, sev, _)| rule == "infinite-loop" && *sev == Severity::Warning),
+        "the body's `flag` is not the render's: {diags:?}"
+    );
+}
+
+#[test]
+fn opposite_facts_on_one_prop_across_two_bodies_prove_convergence() {
+    // The same shape over one prop: the first effect fires only while `flag`
+    // is truthy, the second only while it is falsy, and a prop holds still
+    // across the automatic loop — whichever fires, the other never does.
+    let src = r#"
+import { useState, useEffect } from 'react';
+export function C({ flag }: { flag: boolean }) {
+  const [s, setS] = useState(null);
+  useEffect(() => { if (flag) setS(null); }, [s, flag]);
+  useEffect(() => { if (!flag && !s) setS({ x: 1 }); }, [s, flag]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+"#;
+    let diags = infinite_loop_diags(src, "C");
+    assert!(
+        diags
+            .iter()
+            .all(|(rule, sev, _)| rule != "infinite-loop" || *sev == Severity::Info),
+        "a prop holds still, so the two branches exclude each other: {diags:?}"
+    );
+}

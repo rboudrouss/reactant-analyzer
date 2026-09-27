@@ -27,8 +27,8 @@ use crate::ir::types::{BlockId, HookLabel, Var};
 use crate::rules::api::query::{
     Certified, CleanupVerdict, ConditionalHookCall, ExitDominance, RuleCtx,
 };
-use crate::rules::helpers::churn_graph::{CycleRow, collect_cycle_rows};
 use crate::rules::helpers::context_flow::{ConsumerRow, ProviderVerdict};
+use crate::rules::helpers::cycles::{CycleRow, collect_cycle_rows};
 use crate::rules::helpers::jsx::{
     JsxElementSite, JsxPropSite, collect_jsx_elements, collect_jsx_prop_sites, site_identity,
 };
@@ -360,10 +360,12 @@ impl<'a> EntityCtx<'a> {
     /// `writers`: the anchor slot's rows of the slot-writer relation, in the
     /// relation's (already deterministic) order.
     pub fn writers(&self, row: &HookRow<'a>) -> Vec<&'a SlotWriter> {
+        // Local rows only: a foreign row's label is the owner's (ADR-042 §2),
+        // and exposing it is a widening the pack has to name (ADR-030 §2).
         self.comp
             .slot_writers
             .iter()
-            .filter(|w| w.slot == row.info.label)
+            .filter(|w| w.owner.is_none() && w.slot == row.info.label)
             .collect()
     }
 
@@ -535,7 +537,7 @@ impl<'a> EntityCtx<'a> {
         self.comp
             .slot_writers
             .iter()
-            .filter(|w| w.slot == label)
+            .filter(|w| w.owner.is_none() && w.slot == label)
             .any(|w| w.phase == WriterPhase::Unknown || names.contains(&phase_name(w.phase)))
     }
 

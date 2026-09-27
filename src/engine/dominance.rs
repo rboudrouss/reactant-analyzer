@@ -66,6 +66,31 @@ pub fn dominates(cfg: &CFG, a: BlockId, b: BlockId) -> bool {
     DominatorTree::new(cfg).dominates(a, b)
 }
 
+/// True when every entry→exit path of `cfg` passes through one of `blocks` —
+/// the set post-dominates the entry. The must-reach fact behind
+/// `must_on_all_paths` and the churn graph's `Must` edges (ADR-042 §6).
+pub fn on_all_paths(cfg: &CFG, blocks: &HashSet<BlockId>) -> bool {
+    if blocks.contains(&cfg.entry) {
+        return true;
+    }
+    // BFS avoiding `blocks`; reaching an exit block means a path escapes.
+    let mut visited: HashSet<BlockId> = HashSet::new();
+    let mut queue = vec![cfg.entry];
+    visited.insert(cfg.entry);
+    while let Some(bid) = queue.pop() {
+        let succs = cfg.successors(bid);
+        if succs.is_empty() {
+            return false; // exit reached without hitting a block of the set
+        }
+        for succ in succs {
+            if !blocks.contains(&succ) && visited.insert(succ) {
+                queue.push(succ);
+            }
+        }
+    }
+    true
+}
+
 /// Precomputed dominator relation for one CFG. Build once, query in O(1)·set —
 /// the fix for `dominates()` driving per-rule quadratic recomputation.
 pub struct DominatorTree {

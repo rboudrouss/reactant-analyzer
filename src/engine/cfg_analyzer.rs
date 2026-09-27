@@ -88,27 +88,7 @@ pub fn analyze_cfg<'inter, T: Transfer>(
 
         exit_envs.insert(b, env_out.clone());
 
-        let outgoing: Vec<(BlockId, AbstractEnv<T::Domain>)> =
-            if let Some(block) = cfg.blocks.get(&b) {
-                match &block.term {
-                    Terminator::Branch {
-                        cond, then_, else_, ..
-                    } => {
-                        let then_env = narrow_env_for_branch(&env_out, cond, true);
-                        let else_env = narrow_env_for_branch(&env_out, cond, false);
-                        vec![(*then_, then_env), (*else_, else_env)]
-                    }
-                    Terminator::Jump(succ) => vec![(*succ, env_out.clone())],
-                    Terminator::Return(_) | Terminator::Unreachable => vec![],
-                }
-            } else {
-                cfg.successors(b)
-                    .into_iter()
-                    .map(|s| (s, env_out.clone()))
-                    .collect()
-            };
-
-        for (succ, outgoing_env) in outgoing {
+        for (succ, outgoing_env) in outgoing(cfg, b, &env_out) {
             let is_back = cfg
                 .edges
                 .iter()
@@ -141,6 +121,67 @@ pub fn analyze_cfg<'inter, T: Transfer>(
     }
 
     (exit_envs, state_out)
+}
+
+/// The env each successor of `b` receives when `b` exits with `env_out`: a
+/// branch narrows on its condition, a jump passes the env on unchanged.
+fn outgoing<D: AbstractDomain>(
+    cfg: &CFG,
+    b: BlockId,
+    env_out: &AbstractEnv<D>,
+) -> Vec<(BlockId, AbstractEnv<D>)> {
+    if let Some(block) = cfg.blocks.get(&b) {
+        match &block.term {
+            Terminator::Branch {
+                cond, then_, else_, ..
+            } => vec![
+                (*then_, narrow_env_for_branch(env_out, cond, true)),
+                (*else_, narrow_env_for_branch(env_out, cond, false)),
+            ],
+            Terminator::Jump(succ) => vec![(*succ, env_out.clone())],
+            Terminator::Return(_) | Terminator::Unreachable => vec![],
+        }
+    } else {
+        cfg.successors(b)
+            .into_iter()
+            .map(|s| (s, env_out.clone()))
+            .collect()
+    }
+}
+
+/// The entry env of `block`, read back from a finished pass: `initial` for
+/// the entry block, else the join of what each predecessor hands it from that
+/// predecessor's exit env (ADR-042 §2).
+///
+/// Joined, never widened. Every exit env over-approximates its block's
+/// concrete exits, so their join over-approximates the concrete entry; the
+/// widened entry the pass converged on is at least as large, never smaller.
+/// A predecessor with no exit env was unreachable and contributes nothing.
+pub(crate) fn entry_env_of<D: AbstractDomain>(
+    cfg: &CFG,
+    block: BlockId,
+    initial: &AbstractEnv<D>,
+    exits: &HashMap<BlockId, AbstractEnv<D>>,
+) -> AbstractEnv<D> {
+    if block == cfg.entry {
+        return initial.clone();
+    }
+    let mut env: Option<AbstractEnv<D>> = None;
+    for edge in cfg.edges.iter().filter(|e| e.to == block) {
+        let Some(exit) = exits.get(&edge.from) else {
+            continue;
+        };
+        for (succ, out) in outgoing(cfg, edge.from, exit) {
+            if succ != block {
+                continue;
+            }
+            env = Some(match env {
+                None => out,
+                Some(e) => e.join(&out),
+            });
+        }
+    }
+    env.unwrap_or_else(AbstractEnv::bottom)
 }
 
 // ── Branch narrowing ──────────────────────────────────────────────────────────

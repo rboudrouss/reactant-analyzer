@@ -24,7 +24,7 @@ ne sont pas des décisions et vivent dans [`../precision-log.md`](../precision-l
 | [ADR-015](ADR-015-product-value-domain.md) | Product value domain over disjoint JS kinds — supersedes ADR-008's flat enum, TypedStateStore and the useState<T> hint | Accepted |
 | [ADR-016](ADR-016-cli-projects-json.md) | CLI subcommands + JSON output + project-kind detection (Vite, tsconfig paths) | Accepted |
 | [ADR-017](ADR-017-versioned-stability.md) | Versioned reference stability — may/must change bounds, read-side state conversion, churn arm of infinite-loop | Accepted |
-| [ADR-018](ADR-018-effect-cycle-graph.md) | Multi-effect churn cycle graph (F5b) — qualified-slot graph, must/may edges, single-writer convergence kill | Accepted |
+| [ADR-018](ADR-018-effect-cycle-graph.md) | Multi-effect churn cycle graph (F5b) — qualified-slot graph, must/may edges, convergence kill (single-writer condition replaced by the multi-site proof of ADR-042 §6) | Accepted |
 | [ADR-019](ADR-019-witness-chain.md) | Typed witness chains — FileId, engine provenance, closed `Step` vocabulary, shared witness library | Implemented |
 | [ADR-020](ADR-020-tech-debt-cleanup-decisions.md) | Technical-debt cleanup — deliberate non-changes (soundness-preserving) | Accepted |
 | [ADR-021](ADR-021-typed-query-surface.md) | Typed query surface — engine-certified severity, must/may/⊤ as types, `RuleCtx` (frontend deferred) | Accepted |
@@ -48,3 +48,4 @@ ne sont pas des décisions et vivent dans [`../precision-log.md`](../precision-l
 | [ADR-039](ADR-039-a-synthetic-binding-is-synthetic-its-position-is-not.md) | A synthetic binding is synthetic, its position is not — the six spanless mint sites, the splice's call-site fallback, and a walk that stops discarding the position it is standing on (#131) | Accepted |
 | [ADR-040](ADR-040-component-identity-is-an-interned-id.md) | Component identity is an interned `ComponentId`, the display name a rendering — one resolution for a JSX callee, `Ambiguous` rather than a guess, and one spelling for every path (#7) | Accepted |
 | [ADR-041](ADR-041-render-dependence.md) | Render dependence: a separate forward analysis over a converged component, composed over the proven-origin element tree; `state-lifted-too-high` and `wasted-subtree-render`; typed options on built-in rules (amends ADR-022 §4) | Accepted |
+| [ADR-042](ADR-042-relations-are-engine-products.md) | Relations are products of the engine — the churn relation promoted out of `rules/helpers` (writer row gains `owner`/`block`/`written`, `effect_triggers`), `ProgramRelations` replaces `ProgramCache`, the walk-free rules boundary held by a ratchet test (fixes #26) | Accepted |

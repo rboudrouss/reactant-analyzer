@@ -31,4 +31,4 @@ pub use splice::{
     splice_callee_into_cfg, subst_vars_expr,
 };
 pub use stmt::Stmt;
-pub use types::{BlockId, HookLabel, Symbol, Var};
+pub use types::{BlockId, HookLabel, QualifiedSlot, Symbol, Var};

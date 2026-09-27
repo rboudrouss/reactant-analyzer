@@ -15,7 +15,7 @@ use crate::{
 };
 
 use crate::ir::ComponentId;
-use crate::rules::helpers::churn::eval_in_exit_env;
+use crate::rules::helpers::eval_in_exit_env;
 use crate::rules::{
     Certified, Diagnostic, EffectClass, MustResult, Rule, Severity, StaleCapture, Step, ValueClass,
     all_setter_labels, collect_fn_bindings, collect_setter_calls_with_extra, fn_lit_binding,
