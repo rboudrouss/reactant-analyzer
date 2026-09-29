@@ -1,0 +1,1240 @@
+% ---------------------------------------------------------------------------
+% Chapitre 22 — Les règles déclaratives et les packs
+% Sources : notes/12-declarative-packs.md (§1–§9) ; src/rules/declarative/*.rs ;
+% packs/guardrails.json, packs/community/*.json ; docs/custom-rules.md ;
+% docs/schemas/pack.schema.json ; ADR-022, 023, 027 §2, 030 ; issues #143, #68, #67, #101.
+% Sorties observées avec target/debug/reactant (commit e67b10a), fichiers /tmp/ch22/.
+% La distribution (WASM, npm, action GitHub) est traitée au chapitre 24.
+% ---------------------------------------------------------------------------
+\chapter{Les règles déclaratives et les packs}
+\label{chap:regles-declaratives}
+
+\begin{objectifs}
+  \item Comprendre pourquoi \reactant{} ouvre ses règles aux équipes par un langage \emph{déclaratif} ancré sur les relations du moteur, et pourquoi il refuse toute échappatoire syntaxique (\adr{22}).
+  \item Savoir lire et écrire une règle de pack : ancre, navigation \code{forEach}, gardes, paramètres, gabarit de message, documentation obligatoire.
+  \item Connaître le système de sortes qui type chaque arête, chaque garde et chaque champ, et savoir prédire le rejet d'un pack mal typé.
+  \item Suivre le chargement en trois étages (\code{load_pack}) jusqu'à la représentation résolue \code{ResolvedRule}, et connaître le catalogue des erreurs et des avertissements.
+  \item Suivre l'exécution d'une règle (\code{TierARule}, \code{EntityCtx}, conjonction court-circuitée) et le calcul de la sévérité effective \og pin $\meet$ polarité\fg{}.
+  \item Maîtriser les trois quantificateurs \code{any_of}, \code{every}, \code{none}, et la place qu'ils réservent à $\Top$.
+  \item Connaître l'histoire du vocabulaire (de 3/21 à 21/22 classes exprimables) et ses limites, dont la brèche de soundness ouverte \issue{143}.
+\end{objectifs}
+
+\prerequis{\cref{chap:api-regles} (trait \code{Rule}, \code{RuleCtx}, jeton \code{Certified}, \cref{def:certified} ; chaîne de témoins, \cref{def:witness} ; clamp du registre) ; \cref{chap:relations} (relations du moteur, \cref{def:relation} ; \relation{slot_writers}, \relation{registrations}, lectures et appels de corps) ; \cref{chap:regles-etat} et \cref{chap:regles-effets} pour comparer les règles de pack à leurs cousines natives. Les notions de fait must/may (\cref{def:must-may}), de soundness (\cref{def:soundness}) et de stabilité (\cref{def:stabilite}) sont supposées acquises.}
+
+Les chapitres précédents ont décrit les dix-neuf règles \emph{natives} de \reactant{}, écrites en Rust contre la surface typée du \cref{chap:api-regles}. Une équipe qui adopte l'outil veut pourtant très vite ajouter les siennes : bannir un hook retiré, fixer un budget de dépendances, repérer un motif maison. Ce chapitre décrit la réponse du projet, le \terme{Tier A} : un langage de règles \emph{déclaratif}, écrit en JSON, chargé au démarrage, validé par le cœur, puis exécuté exactement comme une règle native. Le module l'annonce dès son en-tête :
+
+\rustsnippet[label={lst:decl-mod-header}]{src/rules/declarative/mod.rs}{1}{16}{le contrat du sous-système}
+
+Tout le chapitre développe les quatre phrases de cet en-tête : le pack est \emph{inerte} (du JSON, pas du code) ; ses ancres sont des \emph{relations déjà résolues} par le moteur ; ses gardes sont des prédicats sur des verdicts \emph{polarisés} ; et il n'existe \emph{aucune position syntaxique} dans le schéma. La distribution des packs (paquet npm, cœur WASM, compilation JS/TS vers JSON, action GitHub) est laissée au \cref{chap:distribution}.
+
+% ===========================================================================
+\section{Pourquoi un langage de règles, et pourquoi pas ESLint}
+\label{sec:regles-declaratives-pourquoi}
+
+\subsection{Deux demandes d'équipe}
+
+Partons de deux demandes réalistes. La première : \og signaler tout effet qui écrit un état qu'il liste dans ses propres deps\fg{}. La seconde : \og interdire le hook \code{useLegacyStore}, retiré par l'équipe\fg{}. Chacune s'écrit en quelques lignes de règle ESLint : chercher un appel \code{setX(...)} dans le corps d'un \code{useEffect} dont le tableau contient \code{x} ; chercher un appel dont le callee s'appelle \code{useLegacyStore}. Voici deux programmes qui mettent ces règles syntaxiques en échec.
+
+\begin{lstlisting}[language=TypeScript,caption={Un setter aliasé (\file{/tmp/ch22/alias.tsx})},label={lst:decl-alias}]
+import { useEffect, useState } from "react";
+
+export function Ticker() {
+  const [count, setCount] = useState(0);
+  const bump = setCount;
+  useEffect(() => {
+    bump(count + 1);
+  }, [count]);
+  return <div>{count}</div>;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=TypeScript,caption={Un hook retiré caché derrière un wrapper (\file{/tmp/ch22/wrapper.tsx})},label={lst:decl-wrapper}]
+import { useLegacyStore } from "legacy";
+
+function useCartStore() {
+  return useLegacyStore();
+}
+
+export function Cart() {
+  const store = useCartStore();
+  return <div>{String(store)}</div>;
+}
+\end{lstlisting}
+
+Dans le premier, l'appel écrit \code{bump(count + 1)} : aucun motif \og \code{set} suivi d'une majuscule\fg{} ne le reconnaît, et reconnaître \code{bump} demande de suivre la liaison \code{const bump = setCount}. Dans le second, le composant \code{Cart} n'appelle jamais \code{useLegacyStore} par son nom ; il faut savoir que \code{useCartStore} l'appelle, c'est-à-dire inliner le wrapper. Les deux règles de pack \regle{guardrails/self-retriggering-effect} et \regle{guardrails/banned-hook}, que nous lirons en détail plus loin, trouvent les deux défauts (deux exécutions, chacune filtrée par \code{--rule} sur la règle concernée) :
+
+\begin{sortie}
+  Ticker  (2 hooks)  alias.tsx
+    error  guardrails/self-retriggering-effect  [hook:1]  (line 7:4)  this effect writes `count`, which is listed in its own dependency array
+
+  Cart  (1 hooks)  wrapper.tsx
+    warn   guardrails/banned-hook  [hook:1]  `useLegacyStore` is withdrawn by team policy
+\end{sortie}
+
+Elles n'ont rien fait de spécial pour cela : la résolution des alias, l'inlining des hooks personnalisés et le point fixe ont tourné \emph{avant} les règles (\cref{chap:splice-inlining,chap:point-fixe-composant}). Une règle qui part d'une relation du moteur hérite de ce travail ; une règle qui part de la syntaxe le perd.
+
+\begin{remarque}
+Le second finding n'a pas de position (\og \code{line} \fg{} vaut \code{null} dans la sortie JSON). La cause tient au corps de \code{useCartStore} : il ne lie pas l'appel par un \code{let}, il le \emph{retourne} nu, \code{return useLegacyStore();}. Ce site est un \code{Terminator::Return}, seul terminator à ne porter aucun champ \code{span} --- \code{Terminator::Branch}, lui, en a un (\src{src/ir/cfg.rs}{13}{31}). L'extracteur de hooks ne regarde jamais les terminators ; \code{hoist_terminator_hooks} déplace donc l'appel dans un \code{Stmt::Let} synthétique pour que l'extraction ordinaire le voie, mais ce \code{Let} hérite de \code{span: None} faute de mieux (\src{src/lowering/hook_extractor.rs}{321}{339}). La ligne de \code{hook_origins} ainsi produite --- puis recopiée telle quelle par l'inlining de \code{useCartStore} dans \code{Cart} --- porte donc \code{span: None}, et \code{Candidate::range} (\src{src/rules/declarative/exec.rs}{193}{219}, bras \code{Origin}) la restitue sans position. Le défaut est connu et suivi (\issue{140}) : donner un span à \code{Terminator::Return} est un changement mécanique mais qui touche une quarantaine de sites IR, jugé hors périmètre au moment du fix du terminator-hoist lui-même.
+\end{remarque}
+
+\subsection{Le principe de périmètre}
+
+La leçon est érigée en principe normatif par \adr{22} :
+
+\begin{quote}\small
+\og \emph{reactant does semantics only. It does not compete with ESLint or any syntax-level linter: a rule that cannot be expressed against the engine's semantic relations is \textbf{refused}, never emulated with a syntactic fallback.}\fg{}
+\end{quote}
+
+La justification tient en une phrase, que l'ADR donne telle quelle : \og \emph{the full pipeline --- alias resolution, inlining, fixpoint --- runs before rules, so every semantic anchor inherits the engine's soundness for free, while any AST escape hatch would forfeit it}\fg{}. Il suffit d'une seule ancre syntaxique pour réintroduire le \emph{plancher de faux négatifs} que toute la surface typée existe pour supprimer : un filtre de syntaxe ne voit pas l'alias, ne voit pas le wrapper, ne voit pas la prop qui transporte un setter, et il ne le saura jamais.
+
+\begin{decision}[ADR-22 §1 --- des ancres sémantiques, jamais de syntaxe]
+\textbf{Décision.} Une règle déclarative commence toujours par choisir une \emph{relation que le moteur a déjà résolue} (la table des appels de hooks, les écrivains d'un slot, les éléments JSX construits par le rendu\ldots) ; les noms n'y apparaissent que comme \emph{filtres sur des entités résolues}, jamais comme motifs textuels sur la syntaxe d'appel. Corollaire : le schéma est dérivable de \file{src/rules/api/} --- une relation sélectionnable est une sorte d'entité, une garde est une primitive publique.
+
+\textbf{Alternatives refusées.} Une échappatoire AST \og pour les cas simples\fg{} (elle réintroduit le plancher de FN) ; une règle \og bannir \code{moment()} dans les composants\fg{} formulée comme filtre d'import externe (refusée en v1, \adr{22} §Limitations) ; laisser l'outil concurrencer ESLint, qui fait très bien la syntaxe.
+\end{decision}
+
+\subsection{Trois tiers, un seul est livré}
+
+\adr{21} (\cref{chap:api-regles}) esquissait trois niveaux de frontends pour les règles. \adr{22} et \adr{23} les ont tranchés :
+\begin{itemize}
+  \item \textbf{Tier A} : des règles déclaratives JSON, livrées, objet de ce chapitre ;
+  \item \textbf{Tier B} : un frontend programmable. Starlark a été rejeté (\adr{23} §5 : la crate ne compile ni pour l'hôte ni pour \code{wasm32}, et elle alourdit une distribution de moins d'un mégaoctet) ; la voie retenue pour la communauté est d'\emph{écrire} un pack en JS ou TS, puis de le compiler en JSON committé (\cref{chap:distribution}) ;
+  \item \textbf{Tier C} : les règles Rust de première main, seules à pouvoir créer une primitive et donc une autorité \Error{}.
+\end{itemize}
+Le mot \og inerte\fg{} de l'en-tête a donc un sens précis : un pack ne contient \emph{aucun code}. Même écrit en JS, il est évalué une fois, sur la machine de l'auteur, et c'est le JSON résultant qui s'exécute en CI.
+
+\subsection{Place dans le pipeline}
+
+Le sous-système intervient à deux moments (\cref{fig:decl-flot}). \emph{Au chargement}, avant toute analyse, le texte JSON est désérialisé, validé et \og cuit\fg{} en une représentation typée \code{ResolvedRule}, emballée dans un objet \code{TierARule} qui implémente le trait \code{Rule}. \emph{À l'exécution des règles}, après le point fixe, le registre appelle \code{TierARule::check} pour chaque composant, comme il appelle une règle native ; la règle construit un adaptateur \code{EntityCtx} vers les relations, énumère les lignes de l'ancre, évalue les gardes et émet des \code{Diagnostic}.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=5mm and 11mm]
+  \node[bloc] (txt) {texte JSON\\\scriptsize \code{\&str}};
+  \node[bloc,right=of txt] (val) {\code{serde_json::Value}\\\scriptsize arbre brut};
+  \node[bloc,right=of val] (pf) {\code{PackFile}\\\scriptsize arbre typé};
+  \node[bloc,below=14mm of pf] (rr) {\code{Vec<ResolvedRule>}\\\scriptsize IR résolue, params cuits};
+  \node[bloc,left=of rr] (ta) {\code{TierARule}\\\scriptsize \code{Box<dyn Rule>} + \code{RuleDoc}};
+  \node[bloc,left=of ta] (reg) {\code{RuleRegistry}\\\scriptsize natives puis packs};
+  \node[bloc,below=14mm of reg] (ec) {\code{EntityCtx}\\\scriptsize lignes des relations};
+  \node[bloc,right=of ec] (ev) {\code{eval} / \code{eval_guard}\\\scriptsize conjonction};
+  \node[bloc,right=of ev] (dg) {\code{Diagnostic}\\\scriptsize pin $\meet$ polarité, clamp};
+  \draw[fleche] (txt) -- node[etiquette,above]{E1} (val);
+  \draw[fleche] (val) -- node[etiquette,above]{E2--E3} (pf);
+  \draw[fleche] (pf) -- node[etiquette,right]{\code{validate_pack} : E4--E25, W1--W4} (rr);
+  \draw[fleche] (rr) -- node[etiquette,above]{cuisson} (ta);
+  \draw[fleche] (ta) -- node[etiquette,above]{\code{register}} (reg);
+  \draw[fleche] (reg) -- node[etiquette,left]{\code{check}(composant)} (ec);
+  \draw[fleche] (ec) -- (ev);
+  \draw[fleche] (ev) -- node[etiquette,above]{\code{emit}} (dg);
+  \node[etiquette,above=1mm of val] {\textbf{chargement} (une fois)};
+  \node[etiquette,below=1mm of ev] {\textbf{exécution} (par règle et par composant, après le point fixe)};
+\end{tikzpicture}
+\caption{Le flot d'une règle déclarative, de son texte à son diagnostic. Les étiquettes E\textit{n} et W\textit{n} renvoient au catalogue des erreurs et avertissements de la \cref{sec:regles-declaratives-validation} : chaque étage rejette ce qu'il sait rejeter, avec un chemin JSON exact.}
+\label{fig:decl-flot}
+\end{figure}
+
+Côté CLI, le chargement est fait par \code{load_config_and_registry} (\src{src/cli/config_load.rs}{55}{89}), commun aux sous-commandes \code{check}, \code{rules} et \code{explain} : pour chaque pack, \emph{dans l'ordre de la configuration}, on résout le chemin, on lit le fichier, on appelle \code{declarative::load_pack}, on imprime les avertissements et on enregistre chaque règle. Tout échec est bruyant et termine avec le code de sortie 2. Le commentaire en donne la raison : \og \emph{ignoring a configured pack would run fewer rules than the config asks for --- the config-level analogue of a false negative}\fg{}. Le registre refuse en outre un nom sans \code{/}, un doublon et une documentation dont le nom ne coïncide pas avec l'identifiant (\src{src/rules/registry.rs}{142}{158}).
+
+% ===========================================================================
+\section{Anatomie d'une règle}
+\label{sec:regles-declaratives-anatomie}
+
+\subsection{La plus petite règle utile}
+
+Le pack \code{guardrails}, livré avec l'outil (\file{packs/guardrails.json}), contient cinq règles. La première signale un effet sans tableau de deps :
+
+\lstinputlisting[language=JSON,firstline=6,lastline=18,firstnumber=6,caption={\file{packs/guardrails.json}, l.~6--18 --- la règle \code{effect-without-deps-array}},label={lst:decl-ex1}]{\repoRoot/packs/guardrails.json}
+
+\begin{lstlisting}[language=TypeScript,caption={Un titre synchronisé après chaque rendu (\file{/tmp/ch22/ex1\_no\_deps.tsx})},label={lst:decl-ex1-tsx}]
+import { useEffect } from "react";
+
+export function Title({ title }: { title: string }) {
+  useEffect(() => {
+    document.title = title;
+  });
+  return <h1>{title}</h1>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  Title  (1 hooks)  ex1_no_deps.tsx
+    warn   guardrails/effect-without-deps-array  [hook:0]  (line 4:2)  this effect declares no dependency array — it re-runs after every render
+
+⚠  1 warning(s) across 1 file(s).
+\end{sortie}
+
+Lisons la règle champ par champ.
+\begin{itemize}
+  \item \code{id} : l'identifiant \emph{nu} de la règle ; elle est adressée \code{guardrails/effect-without-deps-array}, le nom du pack servant d'espace de noms.
+  \item \code{docs} : obligatoire. \code{description} devient le résumé affiché par \code{reactant rules}, \code{why} l'explication de \code{reactant explain}, \code{fix} le remède ; \code{example} est facultatif. Le commentaire du type l'impose sans détour : \og \emph{a custom rule without an explanation is exactly the diagnostic a team learns to ignore}\fg{} (\src{src/rules/declarative/schema.rs}{58}{73}).
+  \item \code{severity} : un \emph{plafond} (\code{error}, \code{warning} ou \code{info}), pas une sévérité. Nous verrons en \cref{sec:regles-declaratives-severite} que la sévérité effective se calcule par finding.
+  \item \code{anchor} : la relation dont chaque ligne est un candidat, ici \code{hook_calls} filtrée aux effets. Il y a une ligne par appel d'effet du composant.
+  \item \code{guards} : une liste de prédicats, lue comme une \emph{conjonction}. Ici une seule garde, \code{deps_declared} avec \code{eq: false} : \og l'appel n'a pas reçu de tableau de deps\fg{}.
+  \item \code{message} : un gabarit, ici sans champ interpolé.
+\end{itemize}
+À l'exécution, l'unique ligne est le \code{useEffect} de label 0 ; la garde évalue \code{row.effect.is_some_and(|i| i.has_deps_array()) == false}, vraie car l'argument est absent (\src{src/rules/declarative/exec.rs}{682}{687}) ; le plafond \code{warning} donne un \Warning{}, placé sur le site du hook (\og \code{[hook:0] (line 4:2)}\fg{}).
+
+\begin{react}[Le tableau de deps]
+Sans tableau, un effet se ré-exécute après \emph{chaque} commit ; avec \code{[]}, seulement au montage ; avec \code{[a, b]}, quand l'un des éléments n'est plus \code{Object.is}-égal à sa valeur du rendu précédent (\cref{chap:react-modele}). La garde \code{deps_declared} ne regarde que la présence de l'argument : \code{useEffect(f, rest)} (une variable), \code{[]} ou \code{[rest] as const} déclarent tous un tableau, ce que vérifie le test \code{deps_declared_asks_whether_an_argument_was_passed_at_all} (\src{tests/declarative.rs}{2047}{2091}).
+\end{react}
+
+\subsection{Le fichier de pack}
+
+Le modèle serde du fichier est la source unique du JSON Schema que publie le dépôt ; la commande \code{reactant schemas} en tire le fichier \file{docs/schemas/pack.schema.json}. Voici ce modèle :
+
+\rustsnippet[label={lst:decl-packfile}]{src/rules/declarative/schema.rs}{17}{56}{\code{PackFile} et \code{RuleDef}}
+
+\code{schemaVersion} doit valoir 1 ; \code{name} ne doit être ni vide, ni contenir \code{/}, ni coïncider avec un nom de diagnostic natif ; les identifiants de règles sont nus et uniques dans le pack ; l'ordre des règles est l'ordre d'enregistrement. Toutes les structures \og plates\fg{} portent \code{deny_unknown_fields} : une clef inconnue est une erreur, jamais un silence. Les deux énumérations à étiquette interne (\code{Anchor}, étiquetée par \code{relation}, et \code{Guard}, étiquetée par \code{kind}) ne le permettent pas avec serde ; le validateur refait donc la vérification sur le JSON brut (\code{check_keys}, \src{src/rules/declarative/validate.rs}{970}{990}).
+
+\begin{definition}{Pack, règle déclarative}{regles-declaratives-pack}
+Un \terme{pack} est un fichier JSON \code{\{schemaVersion, name, rules\}}. Une \terme{règle déclarative} y est la donnée d'une \emph{ancre} (une relation du moteur), d'une \emph{navigation} facultative le long d'au plus une arête typée (\code{forEach}), d'une conjonction de \emph{gardes}, d'un \emph{gabarit} de message, d'une documentation et d'un \emph{pin} de sévérité. Une ligne de l'ancre, éventuellement accompagnée de l'élément navigué, est un \terme{candidat} ; un candidat qui passe toutes les gardes produit un finding.
+\end{definition}
+
+\subsection{Une grammaire}
+
+Le JSON Schema publié compte près de deux mille lignes. Une grammaire abrégée, écrite à la main à partir de \file{schema.rs} (ce n'est pas un artefact du dépôt), en donne la structure :
+
+\begin{lstlisting}[language={},caption={Grammaire abrégée d'un pack (pseudo-EBNF, rédigée pour ce chapitre)},label={lst:decl-ebnf}]
+Pack    ::= { "schemaVersion": 1, "name": Ident, "rules": [ Rule* ] }
+Rule    ::= { "id": Ident, "docs": Docs, "severity": Pin,
+              "params"?: { Ident: { "type": PType, "default": Json }* },
+              "anchor": Anchor,
+              "forEach"?: { "edge": Edge, "as": Ident },
+              "guards"?: [ Guard* ],
+              "message": Template }
+Docs    ::= { "description": Str, "why": Str, "fix": Str, "example"?: Str }
+Pin     ::= "error" | "warning" | "info"
+PType   ::= "number" | "string" | "boolean" | "string[]"
+Anchor  ::= { "relation": "hook_calls", "kind"?: HookKind }
+          | { "relation": "jsx_props" | "elements", "elements"?: "component"|"host"|"any" }
+          | { "relation": "registrations", "firing"?: "repeating"|"once" }
+          | { "relation": "render_setter_calls" | "render_calls" | "hook_origins"
+                        | "context_providers" | "churn_cycles" | "context_consumers" }
+Edge    ::= "deps" | "body_setter_calls" | "args" | "writers"
+          | "calls" | "props" | "reads" | "seeds"
+Guard   ::= Filter                                   (24 kinds)
+          | Must                                     (5 kinds, "else"?: "keep"|"drop")
+          | { "kind": "any_of", "guards": [ Guard, Guard+ ] }
+          | { "kind": "every", "of": "anchor.deps", "as": Ident, "guards": [ Guard+ ] }
+          | { "kind": "none",  "of": "anchor." Edge, "as": Ident, "guards": [ Guard+ ] }
+Leaf    ::= Value | { "$param": Ident }             (leaf constant positions only)
+Template::= ( Text | "{" Ident "." Ident "}" | "{{" | "}}" )*
+\end{lstlisting}
+
+Trois traits de cette grammaire sont des décisions. Il n'y a \emph{qu'une} ancre et \emph{au plus une} arête : pas de seconde variable libre, pas de jointure (\adr{22} §2, qui constatait que toutes les règles natives de l'époque avaient cette forme, sauf le bras inter-composants de \regle{stale-closure}, d'où la limite \issue{68}). Les paramètres ne se glissent qu'aux feuilles : \og \emph{Parameters are values, not structure}\fg{} (\adr{22} §4). Enfin la liste de gardes est plate et conjonctive ; la disjonction et les quantificateurs sont des gardes comme les autres.
+
+\subsection{Paramètres et options du consommateur}
+
+Deux autres règles de \code{guardrails} montrent les paramètres. \regle{guardrails/oversized-effect} fixe un budget de deps, \regle{guardrails/banned-hook} une liste de hooks retirés :
+
+\lstinputlisting[language=JSON,firstline=65,lastline=71,firstnumber=65,caption={\file{packs/guardrails.json}, l.~65--71 --- \code{oversized-effect} (docs omises)},label={lst:decl-oversized}]{\repoRoot/packs/guardrails.json}
+
+\lstinputlisting[language=JSON,firstline=81,lastline=87,firstnumber=81,caption={\file{packs/guardrails.json}, l.~81--87 --- \code{banned-hook} (docs omises)},label={lst:decl-banned}]{\repoRoot/packs/guardrails.json}
+
+Un paramètre se déclare avec un type et un défaut \emph{obligatoire} ; il s'utilise par \code{\{"$param": "maxDeps"\}} en position de feuille, ou par \code{\{param.maxDeps\}} dans le gabarit. Le consommateur le surcharge dans \file{reactant.config.json}, sous la clef \code{rules}. La configuration de ce chapitre (\file{/tmp/ch22/reactant.config.json}) est :
+
+\begin{lstlisting}[language=JSON,caption={La configuration des exemples du chapitre},label={lst:decl-config}]
+{
+  "packs": [
+    "/home/rboudrouss/reactant-analyzer/packs/guardrails.json",
+    "/home/rboudrouss/reactant-analyzer/packs/community/wave2.json"
+  ],
+  "rules": {
+    "guardrails/banned-hook": { "options": { "banned": ["useLegacyStore"] } }
+  }
+}
+\end{lstlisting}
+
+Sur un composant qui importe le hook sous un alias et déclare sept deps,
+
+\begin{lstlisting}[language=TypeScript,caption={Un hook retiré importé sous alias, un effet trop large (\file{/tmp/ch22/ex4\_banned.tsx})},label={lst:decl-ex4}]
+import { useEffect } from "react";
+import { useLegacyStore as useStore } from "legacy";
+
+export function Cart({ a, b, c, d, e, f }: Record<string, number>) {
+  const store = useStore();
+  useEffect(() => {
+    console.log(store, a, b, c, d, e, f);
+  }, [store, a, b, c, d, e, f]);
+  return <div />;
+}
+\end{lstlisting}
+l'analyseur répond :
+\begin{sortie}
+  Cart  (2 hooks)  ex4_banned.tsx
+    warn   guardrails/banned-hook  [hook:0]  (line 5:8)  `useLegacyStore` is withdrawn by team policy
+    warn   guardrails/oversized-effect  [hook:1]  (line 6:2)  this effect declares more than 5 dependencies — split it by concern
+
+⚠  2 warning(s) across 1 file(s).
+\end{sortie}
+
+Trois faits sont à retenir. D'abord la \terme{cuisson} : les valeurs effectives des paramètres (défaut, écrasé par l'option) sont substituées \emph{au chargement} dans la représentation résolue et dans le gabarit ; \code{\{param.maxDeps\}} est devenu le littéral \og 5\fg{} avant la première analyse, et l'exécuteur ne voit plus jamais de paramètre. Ensuite, la ligne de \code{hook_origins} porte l'identité \emph{résolue} du hook, \code{useLegacyStore}, malgré l'alias \code{useStore} : la garde \code{name} filtre une entité, pas un texte. Enfin la validation des options est bruyante. Avec une option mal typée (\file{/tmp/ch22/opt/reactant.config.json}, \code{"maxDeps": "eight"}), tout le pack est refusé :
+
+\begin{sortie}
+[error] pack `/home/rboudrouss/reactant-analyzer/packs/guardrails.json` (/home/rboudrouss/reactant-analyzer/packs/guardrails.json): at `rules[3].options.maxDeps`: option value "eight" does not match declared type `number`
+exit=2
+\end{sortie}
+
+Le type générique qui porte ces positions est \code{PVal<T>}, \og valeur ou paramètre\fg{}, doté d'un \code{Deserialize} manuel :
+
+\rustsnippet[label={lst:decl-pval}]{src/rules/declarative/schema.rs}{899}{936}{\code{PVal}, une feuille qui accepte une valeur ou une référence de paramètre}
+
+\begin{piege}
+Le JSON Schema publié est \emph{plus permissif} que le validateur. Toutes les listes de noms de verdicts y sont typées \code{PVal<Vec<…Name>>}, si bien qu'un éditeur accepte \code{"is": \{"$param": "v"\}} dans une garde \code{stability}. Mais le validateur résout ces positions avec \code{expected = None} (\og cette position ne prend aucun paramètre\fg{}), et le chargement échoue : \og \code{this position does not accept a \{"$param": …\} reference}\fg{} (\src{src/rules/declarative/validate.rs}{1129}{1168}). Les positions réellement paramétrables sont les listes de noms (\code{one_of}, \code{origin.hook}, \code{provenance.through}), les préfixes, les booléens (\code{origin.direct}, \code{cycle.*}, \code{deps_declared.eq}) et les seuils de \code{count}. Un paramètre est une constante \og métier\fg{}, jamais un choix de polarité.
+\end{piege}
+
+\begin{piege}
+Un paramètre \code{number} accepte un négatif ou un flottant (\code{value_matches} ne teste que \code{is_number}), mais la position \code{count} désérialise en \code{u64}. Un défaut ou une option \code{-1} passe donc la déclaration puis échoue à la résolution (\og \code{param `n` value is unusable here: invalid value: integer `-1`, expected u64}\fg{}), ce qui rejette le pack entier.
+\end{piege}
+
+\subsection{Le gabarit de message}
+
+Le gabarit interpole des champs des entités liées, \code{\{anchor.name\}} ou \code{\{setter.slot\}}, et des paramètres, \code{\{param.maxDeps\}} ; \code{\{\{} et \code{\}\}} échappent les accolades. L'analyse du gabarit (\src{src/rules/declarative/validate.rs}{2392}{2484}) le parcourt caractère par caractère, exige la forme \code{liaison.champ}, substitue immédiatement les \code{param.x}, et type chaque couple (liaison, champ) contre la table des champs, que nous verrons en \cref{sec:regles-declaratives-sortes}. Le résultat est une liste de \code{Segment} : \code{Lit(String)} ou \code{Field(BindRef, Field)}. Un gabarit vide est refusé. Au rendu, les identifiants source sont mis entre backquotes, les mots de verdict restent nus, et une entité sans nom source reçoit une forme anonyme (\code{effect \#2}, \code{state \#0}) : \emph{jamais} de chaîne vide (\src{src/rules/declarative/entity.rs}{932}{961}).
+
+Le nom affiché passe toujours par une table de nommage résolue, jamais par un label brut. Quand plusieurs variables désignent le même slot, on prend la plus petite, et non la première, pour que la sortie ne dépende pas de l'ordre d'un \code{HashMap} :
+
+\rustsnippet[label={lst:decl-pickname}]{src/rules/declarative/entity.rs}{1069}{1078}{le nom affiché d'un label}
+
+% ===========================================================================
+\section{Le système de sortes}
+\label{sec:regles-declaratives-sortes}
+
+\subsection{Un pack qui compile en apparence}
+
+Un auteur veut signaler un hook personnalisé qui reçoit un argument recréé à chaque rendu. Il écrit, par analogie avec les deps :
+
+\lstinputlisting[language=JSON,firstline=5,lastline=13,firstnumber=5,caption={\file{/tmp/ch22/bad/bad-sort.json} --- une garde \code{stability} sur un argument},label={lst:decl-badsort}]{/tmp/ch22/bad/bad-sort.json}
+
+Le JSON est bien formé et chaque mot existe dans le schéma. Le chargement échoue pourtant :
+
+\begin{sortie}
+[error] pack `./bad-sort.json` (./bad-sort.json): at `rules[0].guards[0].of`: guard `stability` applies to a deps entry, but the subject binds a call-site argument
+exit=2
+\end{sortie}
+
+Le message dit ce qui était attendu (\og a deps entry\fg{}), ce qui a été obtenu (\og a call-site argument\fg{}) et où (\code{rules[0].guards[0].of}). Il est le produit d'un \emph{système de types} : chaque entité liée a une \emph{sorte}, et chaque arête, chaque garde et chaque champ est typé contre elle.
+
+\begin{definition}{Sorte}{regles-declaratives-sorte}
+La \terme{sorte} d'une entité liée est son type statique dans le langage de packs. L'ancre fixe la sorte de \code{anchor} ; une arête \code{forEach} fixe la sorte de la liaison ; une garde admet une ou plusieurs sortes pour son sujet \code{of} ; un champ de gabarit est porté par certaines sortes seulement. Un pack est bien typé si chacune de ces contraintes est satisfaite ; il est rejeté au chargement sinon.
+\end{definition}
+
+L'univers des sortes est une énumération de seize variantes :
+
+\rustsnippet[label={lst:decl-sort}]{src/rules/declarative/validate.rs}{59}{98}{les seize sortes}
+
+La sorte \code{Hook} est paramétrée par le filtre de genre de l'ancre : le genre est une information de \emph{typage}. La garde \code{cleanup}, par exemple, n'est admise que sur \code{Hook(Some(Effect))} ; une ancre \code{hook_calls} sans \code{kind} lie \code{Hook(None)}, qui ne l'admet pas.
+
+\subsection{Ancres et arêtes}
+
+Les dix ancres et la sorte qu'elles lient sont résumées au \cref{tab:decl-ancres}.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}l l X@{}}
+\toprule
+\code{relation} & sorte liée & une ligne représente\ldots \\
+\midrule
+\code{hook_calls} (\code{kind}?) & \code{Hook(kind)} & un appel de hook, joint à son \code{HookEntry} et à son \code{EffectInfo} par label ; \code{kind} parmi \code{state}, \code{effect}, \code{memo}, \code{callback}, \code{ref}, \code{custom}, \code{handler} \\
+\code{render_setter_calls} & \code{SetterRender} & un appel de setter du corps de rendu, résolu à travers les alias \\
+\code{render_calls} & \code{Call} & un appel non-hook du corps de rendu (garde \code{name} obligatoire) \\
+\code{hook_origins} & \code{HookOrigin} & une identité de hook résolue, qui \emph{survit à l'inlining} \\
+\code{context_providers} & \code{Provider} & un \code{<Ctx.Provider value=…>} prouvé \\
+\code{jsx_props} (\code{elements}?) & \code{JsxProp} & un prop d'un élément construit par le rendu \\
+\code{elements} (\code{elements}?) & \code{Element} & un élément construit par le rendu (arête \code{props}) \\
+\code{churn_cycles} & \code{ChurnCycle} & un cycle de rendu du graphe de churn programme, porté par un effet de ce composant \\
+\code{context_consumers} & \code{ContextConsumer} & un \code{useContext} dont toute l'ascendance a été vue \\
+\code{registrations} (\code{firing}?) & \code{Registration} & un enregistrement de callback dans un corps d'effet \\
+\bottomrule
+\end{tabularx}
+\caption{Les dix ancres (\src{src/rules/declarative/schema.rs}{106}{211}). Le filtre \code{elements} vaut \code{component} par défaut ; \code{handler} désigne un gestionnaire d'événement DOM passé en JSX, que le lowering modélise comme une entrée \code{HookEntry::Handler} (\cref{chap:lowering-cfg}).}
+\label{tab:decl-ancres}
+\end{table}
+
+Depuis l'ancre, la navigation \code{forEach} suit au plus une arête, sous un nom de liaison :
+
+\rustsnippet[label={lst:decl-foreach}]{src/rules/declarative/schema.rs}{238}{247}{\code{ForEach}, une arête et une liaison}
+
+Les huit arêtes ne partent que de certaines sortes, et chacune produit une sorte d'élément. La \cref{fig:decl-sortes} en donne le diagramme : c'est le \og schéma entité-relation\fg{} du langage. Une seule fonction, \code{edge_element_sort}, implémente ce typage ; son commentaire en fait un invariant : \og \emph{the one typing table the \code{forEach} navigation and the \code{none} quantifier both read, so an edge cannot be navigable in one and not the other}\fg{} (\src{src/rules/declarative/validate.rs}{138}{141}).
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[font=\small,
+    sorte/.style={bloc,minimum width=18mm},
+    elem/.style={draw=ra-gray,fill=white,rounded corners=2pt,align=center,inner sep=3pt,font=\small\ttfamily},
+    arete/.style={fleche,draw=ra-blue}]
+  % sortes d'ancre à arêtes
+  \node[sorte] (st) at (0,0) {\code{Hook(state)}};
+  \node[sorte] (emc) at (4.6,0) {\code{Hook(effect|memo|}\\\code{callback)}};
+  \node[sorte] (ha) at (8.6,0) {\code{Hook(handler)}};
+  \node[sorte] (cu) at (11.6,0) {\code{Hook(custom)}};
+  \node[sorte] (el) at (11.6,-4.2) {\code{Element}};
+  % éléments
+  \node[elem] (wr) at (-1.3,-2.3) {Writer};
+  \node[elem] (rd) at (0,-3.2) {Read};
+  \node[elem] (sd) at (1.3,-2.3) {Seed};
+  \node[elem] (dp) at (3.2,-2.5) {Dep};
+  \node[elem] (sb) at (5.6,-2.5) {SetterBody};
+  \node[elem] (ca) at (7.8,-2.5) {Call};
+  \node[elem] (ar) at (11.6,-2.1) {Arg};
+  \node[elem] (jp) at (9.2,-4.2) {JsxProp};
+  % arêtes
+  \draw[arete] (st) -- node[etiquette,left]{writers} (wr);
+  \draw[arete] (st) -- node[etiquette,right,pos=0.6]{reads} (rd);
+  \draw[arete] (st) -- node[etiquette,right]{seeds} (sd);
+  \draw[arete] (emc) -- node[etiquette,left]{deps} (dp);
+  \draw[arete] (emc) -- node[etiquette,right,pos=0.4]{body\_setter\_calls} (sb);
+  \draw[arete] (emc) -- node[etiquette,above right,pos=0.85]{calls} (ca);
+  \draw[arete] (ha) -- (sb);
+  \draw[arete] (ha) -- (ca);
+  \draw[arete] (cu) -- node[etiquette,right]{args} (ar);
+  \draw[arete] (el) -- node[etiquette,above]{props} (jp);
+  % ancres sans arête
+  \node[draw=ra-gray,dashed,rounded corners=2pt,align=left,inner sep=4pt,font=\scriptsize] (sans) at (3.2,-5.3)
+   {\textbf{ancres sans arête} (sorte liée) :\\
+    \code{render_setter_calls} (SetterRender)\quad \code{render_calls} (Call)\\
+    \code{hook_origins} (HookOrigin)\quad \code{context_providers} (Provider)\\
+    \code{jsx_props} (JsxProp)\quad \code{churn_cycles} (ChurnCycle)\\
+    \code{context_consumers} (ContextConsumer)\quad \code{registrations} (Registration)};
+\end{tikzpicture}
+\caption{Le diagramme entité-relation des sortes. En bleu, les sortes que lie l'ancre \code{hook_calls} (selon \code{kind}) ou \code{elements} ; en blanc, les sortes d'éléments ; chaque flèche est une arête navigable par \code{forEach} ou quantifiable par \code{none} (\code{every} ne quantifie que \code{deps}). Les sortes \code{Hook(ref)} et \code{Hook(None)} n'ont aucune arête. Une même sorte d'élément peut être atteinte par deux chemins : \code{Call} est aussi la sorte de l'ancre \code{render_calls}, \code{JsxProp} celle de \code{jsx_props}.}
+\label{fig:decl-sortes}
+\end{figure}
+
+Deux remarques sur ces arêtes. Les relations \code{calls}, \code{reads}, \code{body_setter_calls} viennent de marches du corps bornées en profondeur (budget 2, \src{src/rules/declarative/entity.rs}{385}{428}) : elles peuvent \emph{sous-énumérer}, ce qui comptera pour les quantificateurs (\cref{sec:regles-declaratives-quantificateurs}). Et \code{writers} lit la relation \relation{slot_writers} du moteur, une ligne par \emph{site} d'écriture du slot (\cref{def:site}), filtrée aux lignes non étrangères (\code{owner.is_none() \&\& slot == label}, \src{src/rules/declarative/entity.rs}{362}{370}).
+
+\subsection{Gardes}
+
+Le \code{Guard} du schéma compte trente-deux variantes : vingt-sept gardes \emph{filtrantes} et cinq gardes \emph{certifiantes}, préfixées \code{must_}. Le commentaire de l'énumération fixe la convention :
+
+\rustsnippet[label={lst:decl-guard-head}]{src/rules/declarative/schema.rs}{305}{308}{le préfixe \code{must_} rend la polarité visible}
+
+Le \cref{tab:decl-gardes} les range par sorte de sujet. La colonne \og polarité\fg{} dit ce que la garde affirme : un fait \emph{exact} (sans approximation), un fait \emph{may} (sur-approximé : la garde peut passer à tort, jamais échouer à tort), ou une \emph{certification} must.
+
+\begin{longtable}{@{}p{4.5cm} p{3.3cm} p{7.2cm}@{}}
+\caption{Les trente-deux gardes (\src{src/rules/declarative/schema.rs}{305}{727} ; typage dans \code{validate_guard}).}\label{tab:decl-gardes}\\
+\toprule
+\code{kind} & sujet admis & valeurs, polarité \\
+\midrule\endfirsthead
+\toprule \code{kind} & sujet admis & valeurs, polarité \\ \midrule\endhead
+\bottomrule\endfoot
+\code{stability} & \code{Dep} & \code{is}|\code{not} parmi \code{stable}, \code{versioned}, \code{per-render}, \code{unknown} ; verdict lu en sortie de rendu \\
+\code{returns} & \code{Arg} & ce que \emph{retourne} un argument fonctionnel : \code{stable}, \code{fresh-reference}, \code{unknown} \\
+\code{identity} & \code{Provider}, \code{JsxProp}, \code{Arg}, \code{Registration} & \code{fresh-every-render} (fait prouvé) ou \code{unknown} \\
+\code{cleanup} & \code{Hook(effect)} & \code{present}, \code{absent}, \code{unknown} ; seul \code{absent} est une affirmation \\
+\code{in_deps} & \code{SetterBody} & le slot écrit figure dans les deps de l'ancre ; \code{negate} facultatif \\
+\code{name}, \code{source}, \code{receiver}, \code{prop} & toute sorte portant le champ & \code{one_of}|\code{prefix} ; filtre textuel sur une entité résolue, \emph{positive-only} \\
+\code{origin} & \code{Hook(\_)}, \code{HookOrigin} & \code{hook}, \code{direct} : identité résolue, appel direct ou via wrapper \\
+\code{phase} & \code{Call}, \code{Read} & \code{is} parmi huit phases dont \code{unknown} ; may, positive-only \\
+\code{provenance} & \code{Writer} & \code{through}, \code{direct} : chaîne de wrappers exportés menant à l'écriture \\
+\code{writer_phases} & ancre \code{Hook(state)} & \code{includes} : existentiel may sur \emph{tous} les écrivains du slot ; $\Top$ satisfait \\
+\code{updater}, \code{updater_body} & \code{Writer} & \code{functional}|\code{unknown} ; \code{impure}|\code{unknown} \\
+\code{same_tick} & \code{Writer} & sans valeur : fait may à sens unique \\
+\code{provider} & \code{ContextConsumer} & \code{provider-seen}, \code{none-on-analyzed-paths} \\
+\code{teardown} & \code{Registration} & \code{paired}, \code{none-seen} \\
+\code{registers} & ancre \code{Hook(effect)} & \code{firing} : existentiel may sur les enregistrements \\
+\code{seed_sync} & \code{Seed} & \code{synced}, \code{none-seen} \\
+\code{slot_ownership} & \code{SetterRender} & \code{local}, \code{foreign} ; \emph{élargit} l'énumération \\
+\code{cycle} & \code{ChurnCycle} & \code{cross_component}, \code{all_must} : booléens exacts \\
+\code{count} & ancre à deps & \code{more_than}|\code{less_than}|\code{equals} sur \code{anchor.deps} \\
+\code{deps_declared} & ancre à deps & \code{eq} : un argument deps a-t-il été passé \\
+\code{any_of} & --- & disjonction d'au moins deux gardes \\
+\code{every} & ancre à deps & $\forall$ may sur \code{anchor.deps}, sans preuve \\
+\code{none} & ancre admettant l'arête & $\neg\exists$ sur \code{anchor.<edge>}, sans preuve \\
+\midrule
+\code{must_setter_on_all_paths} & \code{SetterBody} & certifie : le setter s'exécute sur tous les chemins du corps \\
+\code{must_dominates_all_exits} & \code{SetterRender} & certifie : l'appel domine toutes les sorties du rendu \\
+\code{must_init_calls_setter} & ancre \code{Hook(state|ref)} & certifie : l'initialiseur appelle un setter \\
+\code{must_hook_is_conditional} & ancre \code{Hook(\_)} & certifie : l'appel de hook est conditionnel \\
+\code{must_direct_write} & \code{Writer} & certifie : l'écriture est directe (aucun wrapper) \\
+\end{longtable}
+
+Chaque garde de verdict prend une liste de noms tirés d'une énumération qui \emph{miroite totalement} un verdict du moteur : $\Top$ y porte un nom, \code{unknown}, pour pouvoir être nommé mais jamais oublié. Les conversions moteur $\to$ schéma sont des \code{match} totaux dans \file{entity.rs} (\og \emph{a new phase is a compile error here}\fg{}, \src{src/rules/declarative/entity.rs}{1080}{1092}). Certaines sont volontairement asymétriques : le fait moteur \code{Pairing} a trois valeurs, mais \code{Unpaired} et \code{Unknown} se replient tous deux sur \code{none-seen} --- \og \emph{an absence of evidence, and the vocabulary says so}\fg{} (\src{src/rules/declarative/entity.rs}{1149}{1160}).
+
+\begin{definition}{Garde positive-only}{regles-declaratives-positive-only}
+Une garde est \terme{positive-only} si elle n'a pas de forme négative et échoue quand le champ qu'elle teste est absent. Les gardes textuelles, \code{phase}, \code{writer_phases}, \code{updater}, \code{same_tick}, \code{provider}, \code{teardown}, \code{registers}, \code{seed_sync} le sont. Seules les gardes dont le verdict est un miroir total incluant \code{unknown} admettent \code{not} (\code{stability}, \code{returns}, \code{identity}, \code{cleanup}).
+\end{definition}
+
+La raison est un argument de soundness d'\adr{23} : une négation sur un verdict may inverserait le sens de l'approximation. \og Pas dans le rendu\fg{} n'est pas le complément de \og peut-être dans le rendu\fg{} ; pour l'écrire, on énumère les phases acceptées, \code{unknown} compris si l'on veut rester du côté sûr. La ligne \code{(None, ..) => false} de \code{text_matches} (\src{src/rules/declarative/exec.rs}{907}{918}) est la forme exécutable de la règle \og absent $\Rightarrow$ échec\fg{}.
+
+\subsection{Champs}
+
+Un champ est ce que rend \code{\{liaison.champ\}} et ce que filtre une garde textuelle. Une seule énumération sert les deux :
+
+\rustsnippet[label={lst:decl-field}]{src/rules/declarative/validate.rs}{448}{477}{la table unique des champs}
+
+Trois projections sont des \code{match} totaux sur \code{Field} : \code{Field::token} (le mot du gabarit), \code{Field::admits} (quelles sortes portent le champ) et \code{EntityCtx::field_raw} (sa valeur). Un nouveau champ ne peut donc pas être ajouté à moitié. Le commentaire rappelle la dette que cette table a remboursée : deux fonctions distinctes, chacune terminée par un cas \og attrape-tout\fg{}, laissaient un champ valider puis se rendre comme la chaîne vide. La garde textuelle est typée par la \emph{même} table (\og \emph{a field can never be renderable but unguardable (or the reverse)}\fg{}, \src{src/rules/declarative/validate.rs}{1632}{1634}). Le \cref{tab:decl-champs} en donne la matrice.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}l X@{}}
+\toprule
+champ & sortes qui le portent \\
+\midrule
+\code{kind} & \code{Hook(\_)}, \code{JsxProp}, \code{Element} \\
+\code{name} & \code{Hook(None)}, \code{Hook(k)} pour $k \in \{$state, memo, callback, ref, custom$\}$, \code{HookOrigin}, \code{Provider}, \code{JsxProp}, \code{ContextConsumer}, \code{Registration}, \code{Call}, \code{Read}, \code{Element} \\
+\code{receiver} & \code{Call} \\
+\code{source} & \code{Hook(custom)}, \code{HookOrigin} \\
+\code{setter} & \code{SetterRender}, \code{SetterBody}, \code{Writer} \\
+\code{slot} & \code{SetterRender}, \code{SetterBody}, \code{Writer}, \code{Read} \\
+\code{path} & \code{Dep}, \code{Seed} \\
+\code{stability} & \code{Dep} \\
+\code{returns} & \code{Arg} \\
+\code{phase} & \code{Writer}, \code{Call}, \code{Read} \\
+\code{via} & \code{Writer} \\
+\code{region} & \code{Writer}, \code{Read} \\
+\code{identity} & \code{Provider}, \code{JsxProp}, \code{Arg}, \code{Registration} \\
+\code{prop} & \code{JsxProp} \\
+\code{cleanup} & \code{Hook(effect)} \\
+\code{firing} & \code{Registration} \\
+\code{owner} & \code{SetterRender} \\
+\code{cycle} & \code{ChurnCycle} \\
+\bottomrule
+\end{tabularx}
+\caption{La matrice champ $\times$ sorte, lue dans \code{Field::admits} (\src{src/rules/declarative/validate.rs}{530}{911}). Ni un effet ni un handler ne portent \code{name} : rien ne les nomme.}
+\label{tab:decl-champs}
+\end{table}
+
+\subsection{Le refus du point de programme}
+
+Revenons au pack rejeté du début. La matrice dit que \code{stability} est portée par \code{Dep} et par rien d'autre ; le commentaire de \code{Field::Path} en donne la raison :
+
+\rustsnippet[label={lst:decl-refus}]{src/rules/declarative/validate.rs}{669}{671}{là où le refus est appliqué}
+
+\begin{decision}[ADR-23 §2 --- un verdict se lit au point de programme de son entité]
+\textbf{Décision.} Un verdict n'est lisible que sur l'entité pour laquelle il a été calculé, au point de programme où il l'a été. La stabilité d'un dep est un verdict \emph{de sortie de rendu} (\code{RuleCtx::stability_verdict} sur l'environnement de sortie) ; un argument d'appel est évalué \emph{au point d'appel}. Dans \code{let x = \{\}; useThing(x); x = props.stable;}, \code{x} vaut \code{Stable} en sortie et \code{PerRender} à l'appel. Lire la stabilité de sortie pour un argument serait un faux négatif silencieux. L'ADR le dit : \og \emph{This is the single easiest way to introduce a silent false negative while believing the change is free, and it is why "just point the existing guard at a new edge" is refused.}\fg{}
+
+\textbf{Mise en œuvre.} Sur un argument, on utilise \code{returns} (ce que retourne un argument fonctionnel, calculé \emph{pendant} le point fixe, \adr{23} §3 amendé) ou \code{identity}, lue dans l'environnement convergé \emph{du bloc de l'appel} (\src{src/rules/declarative/entity.rs}{244}{271}).
+
+\textbf{Alternative refusée.} \og Pointer la garde existante vers une nouvelle arête\fg{}, qui semble gratuit et ne l'est pas.
+\end{decision}
+
+% ===========================================================================
+\section{La validation en trois étages}
+\label{sec:regles-declaratives-validation}
+
+\subsection{Le point d'entrée}
+
+Toute la surface publique du sous-système est une fonction, \code{load_pack} : du JSON en entrée, des règles exécutables et leur documentation en sortie.
+
+\rustsnippet[label={lst:decl-loadpack}]{src/rules/declarative/mod.rs}{47}{87}{\code{load_pack}, trois étages puis la cuisson}
+
+Les trois étages correspondent aux trois flèches du haut de la \cref{fig:decl-flot}.
+\begin{enumerate}
+  \item \textbf{Syntaxe JSON.} Le texte devient un \code{serde_json::Value} brut. Un échec donne une erreur sans chemin, \og \code{not valid JSON: …}\fg{}.
+  \item \textbf{Désérialisation typée.} Le brut devient un \code{PackFile} par \code{serde_path_to_error}, qui fournit le chemin exact de la faute. Sont rejetés ici un champ inconnu dans une structure \code{deny_unknown_fields}, une variante inconnue, un champ requis manquant, un mauvais type, une référence \code{$param} mal formée.
+  \item \textbf{Validation sémantique.} \code{validate_pack} reçoit à la fois le brut et le typé : le brut sert à vérifier les clefs inconnues à l'intérieur des ancres et des gardes, là où serde ne le peut pas. Il produit les \code{ResolvedRule} et une liste d'avertissements non bloquants.
+\end{enumerate}
+Vient enfin la \emph{cuisson} : chaque \code{ResolvedRule} est appariée à sa \code{RuleDef} source pour construire la \code{RuleDoc}, puis emballée dans un \code{TierARule}. Les options du consommateur ont été substituées pendant la validation : le \code{RuleConfig} que le registre passe au \code{RuleCtx} n'est jamais lu par une règle de pack (le registre ne valide d'ailleurs les options que des règles natives, \code{if !name.contains('/')}, \src{src/rules/registry.rs}{162}{200}).
+
+Une faute de frappe dans le nom d'une garde s'arrête au deuxième étage, avec la liste des noms possibles (\file{/tmp/ch22/rej/p\_typo.json}, \code{"kind": "stabilty"}) :
+
+\begin{sortie}
+[error] pack `./p_typo.json` (./p_typo.json): at `rules[0].guards[0].kind`: unknown variant `stabilty`, expected one of `stability`, `returns`, `origin`, `in_deps`, `name`, `receiver`, `phase`, `prop`, `source`, `identity`, `cleanup`, `provenance`, `writer_phases`, `updater`, `updater_body`, `same_tick`, `provider`, `teardown`, `registers`, `seed_sync`, `slot_ownership`, `cycle`, `every`, `none`, `count`, `deps_declared`, `must_setter_on_all_paths`, `must_dominates_all_exits`, `must_init_calls_setter`, `must_hook_is_conditional`, `must_direct_write`, `any_of`
+exit=2
+\end{sortie}
+
+\subsection{L'ordre des vérifications}
+
+\code{validate_pack} (\src{src/rules/declarative/validate.rs}{2489}{2544}) contrôle d'abord l'identité du pack --- \code{schemaVersion} égal à 1, nom non vide, sans \code{/}, sans collision avec un nom de diagnostic natif --- puis l'unicité des identifiants, et délègue chaque règle à \code{validate_rule} (\src{src/rules/declarative/validate.rs}{1195}{1435}), qui procède dans cet ordre :
+\begin{enumerate}
+  \item identifiant non vide et sans \code{/} ; \code{description}, \code{why}, \code{fix} non vides après \code{trim} ;
+  \item clefs de l'ancre (\code{check_keys}) : c'est ce qui rejette \code{\{"relation": "hook_origins", "kind": "custom"\}}, l'ancre des origines étant sans genre ;
+  \item ancre $\to$ (\code{ResolvedAnchor}, \code{Sort}) ;
+  \item \code{forEach} : nom de liaison interdit s'il vaut \code{anchor}, \code{param}, la chaîne vide ou contient un point, puis typage de l'arête par \code{edge_element_sort} ;
+  \item environnement de paramètres (\code{ParamEnv::build}) : types des défauts, options inconnues, types des options ;
+  \item gardes, dans l'ordre, par la fonction récursive \code{validate_guard} ;
+  \item contrôles transverses sur l'arbre de gardes résolu ;
+  \item gabarit du message ;
+  \item avertissements.
+\end{enumerate}
+
+La validation s'arrête à la \emph{première} faute (chaque étape est suivie d'un \code{?}) : un pack porte au plus une \code{PackError}. Chaque erreur est un couple \code{\{ path, message \}}, affiché \og \code{at `chemin`: message}\fg{}, et chaque message dit ce qui était attendu et ce qui a été obtenu. Ce format est pensé pour une boucle d'écriture itérative, humaine ou outillée : le dépôt livre une \emph{skill} pour agent (\file{skills/reactant-rules/SKILL.md}) qui repose sur ces messages pour converger.
+
+\subsection{Typer une garde}
+
+Toutes les branches de \code{validate_guard} suivent le même schéma : contrôle des clefs admises (ce qui rend \code{negate} sur \code{stability} aussi bruyant qu'un \code{deny_unknown_fields}), résolution du sujet \code{of} en (\code{BindRef}, \code{Sort}), test de sorte, arité des champs, résolution des \code{PVal} au type de la position, listes non vides. L'exemple canonique est \code{stability} :
+
+\rustsnippet[label={lst:decl-validate-stab}]{src/rules/declarative/validate.rs}{1514}{1539}{le typage de la garde \code{stability}}
+
+Le sujet se résout par \code{GuardCx::resolve_of} (\src{src/rules/declarative/validate.rs}{1481}{1498}) : \code{"anchor"} désigne l'ancre, le nom de la liaison \code{forEach} désigne l'élément lié, tout autre nom est une erreur qui liste les liaisons disponibles. La référence résolue, \code{BindRef}, n'a que deux valeurs, \code{Anchor} et \code{Bound} : il n'y a jamais plus de deux entités visibles.
+
+\subsection{Les contrôles transverses}
+
+Certaines contraintes ne portent pas sur une garde mais sur l'arbre entier :
+
+\rustsnippet[label={lst:decl-transverse}]{src/rules/declarative/validate.rs}{1321}{1366}{trois contrôles sur l'arbre de gardes résolu}
+
+Le premier interdit de combiner un quantificateur may et une garde certifiante (nous y reviendrons en \cref{sec:regles-declaratives-quantificateurs}) ; la fonction \code{quantifies} reconnaît \code{every} \emph{et} \code{none}, même si le message ne parle que d'\code{every} :
+
+\begin{sortie}
+[error] pack `./p_every_must.json` (./p_every_must.json): at `rules[0].guards`: a rule using `every` cannot also use a `must_*` guard: the quantifier is may-typed, so a row it selected cannot carry a certified claim
+exit=2
+\end{sortie}
+
+Le second exige une garde \code{name} au niveau supérieur sur toute ligne de la relation \code{calls} ou \code{render_calls}, la première relation \emph{non bornée} du langage : sans elle, la règle tirerait sur chaque appel du corps.
+
+\begin{sortie}
+[error] pack `./p_calls.json` (./p_calls.json): at `rules[0].guards`: a rule over `calls` needs a `name` guard on the call row: the relation enumerates every call in the body, so without one the rule fires on all of them. Put it at the top level, not inside `any_of`
+exit=2
+\end{sortie}
+
+Le troisième n'est pas un rejet : il pose le drapeau \code{foreign} de l'ancre \code{render_setter_calls} si et seulement si la règle nomme \code{slot_ownership} quelque part dans son arbre. Nous verrons en \cref{sec:regles-declaratives-vocabulaire} pourquoi l'énumération s'élargit \emph{sur la garde}.
+
+\subsection{Le catalogue des erreurs et des avertissements}
+
+Le \cref{tab:decl-erreurs} regroupe les classes d'erreurs par étage. La numérotation E1--E25 est celle du dossier de notes, pas celle du code, qui ne numérote rien ; les messages sont cités verbatim ou sous forme de gabarit.
+
+\begin{longtable}{@{}p{0.7cm} p{2.2cm} p{11.8cm}@{}}
+\caption{Les classes d'erreurs du chargement d'un pack (toutes fatales, code de sortie 2).}\label{tab:decl-erreurs}\\
+\toprule \# & étage & message (verbatim ou gabarit) \\ \midrule\endfirsthead
+\toprule \# & étage & message \\ \midrule\endhead
+\bottomrule\endfoot
+E1 & JSON & \code{not valid JSON: \{e\}} \\
+E2 & serde & \code{unknown field `bogus`, expected …} ; \code{unknown variant …} ; \code{missing field …} \\
+E3 & serde / \code{PVal} & \code{a \{"$param": …\} reference takes no other key} ; \code{expected a value or \{"$param": "<name>"\}: …} \\
+E4 & pack & \code{unsupported schemaVersion \{n\}, only 1 exists} \\
+E5 & pack & \code{pack name is empty} ; \code{… must not contain `/`} ; \code{… collides with a built-in diagnostic name} \\
+E6 & pack & \code{duplicate rule id `x` in this pack} \\
+E7 & règle & \code{rule id is empty} ; \code{rule id `a/b` contains `/`. The pack name is the namespace, ids are bare} \\
+E8 & docs & \code{docs are mandatory: `why` is empty} \\
+E9 & clefs & \code{\{what\} does not accept field `k`. Allowed: …} \\
+E10 & \code{forEach} & \code{`x` is not a usable binding name} \\
+E11 & arête & \code{edge `deps` needs an effect/memo/callback anchor, but the anchor binds …} (et sept variantes) \\
+E12 & params & \code{default \{v\} does not match declared type `t`} \\
+E13 & options & \code{unknown option `k`. Declared params: …} ; \code{option value \{v\} does not match declared type `t`} \\
+E14 & \code{$param} & \code{this position does not accept a \{"$param": …\} reference} ; \code{reference to undeclared param `p`} ; \code{param `p` has type `t`, but this position expects `u`} ; \code{param `p` value is unusable here: …} \\
+E15 & liaison & \code{unknown binding `x`. Available: anchor[, b]} \\
+E16 & sorte & \code{guard `k` applies to …, but the subject binds …} ; pour une garde textuelle, la liste des champs que la sorte porte \\
+E17 & ancre requise & \code{guard `in_deps` needs an anchor with a deps array …} ; idem \code{count}, \code{deps_declared}, \code{must_init_calls_setter}, \code{must_hook_is_conditional}, \code{writer_phases} \\
+E18 & arité & \code{… takes exactly one of `is` / `not`} ; \code{… one_of / prefix} ; \code{… more_than / less_than / equals} ; \code{… at least one of `hook` / `direct`} \\
+E19 & liste vide & \code{the verdict list must not be empty} et ses variantes \\
+E20 & sujet d'arête & \code{guard `count` counts `anchor.deps` (got `x`)} ; idem \code{every} ; \code{guard `none` quantifies over an edge of the anchor, spelled `anchor.<edge>`} \\
+E21 & composition & \code{guard `any_of` needs at least two alternatives} ; \code{guard `every` needs at least one guard to quantify} ; idem \code{none} \\
+E22 & polarité & \code{a `must_*` guard cannot appear inside `every`} (idem \code{none}) \\
+E23 & polarité & \code{a rule using `every` cannot also use a `must_*` guard …} \\
+E24 & \code{calls} & \code{a rule over `calls` needs a `name` guard on the call row …} \\
+E25 & gabarit & \code{unclosed `\{`} ; \code{template placeholder … must be `binding.field` or `param.name`} ; \code{unknown binding `x` in template} ; \code{… has no field `f`} ; \code{message template is empty} \\
+\end{longtable}
+
+Quatre avertissements (\code{LoadWarning}) n'empêchent pas le chargement ; ils sont imprimés sur la sortie d'erreur, préfixés \og \code{[warn] rule `pack/rule`:}\fg{}.
+\begin{description}
+  \item[W1] Un pin \code{error} sans aucune garde \code{must_*} : \og \code{severity is pinned "error" but no must_* guard is used, so findings can only emit as warnings}\fg{}. C'est \emph{le seul} contrôle statique de sévérité (\adr{22} §3, \src{src/rules/declarative/validate.rs}{1384}{1393}).
+  \item[W2] Un paramètre déclaré jamais référencé.
+  \item[W3] Une ancre \code{kind: "custom"} sans arête, dont toutes les gardes portent sur l'identité de l'ancre : elle ne voit que les hooks que le moteur n'a \emph{pas} su résoudre (\issue{6}) ; la règle devrait aller sur \code{hook_origins}.
+  \item[W4] Une branche \code{must_*} laissée en \code{"else": "keep"} dans un \code{any_of} : elle passe toujours, la disjonction est toujours vraie.
+\end{description}
+
+\begin{exemple}{Un pin inatteignable}{decl-w1}
+La règle \code{demo/no-deps} (\file{/tmp/ch22/rej/p\_error\_nomust.json}) reprend \code{effect-without-deps-array} en l'épinglant \code{error}. Elle se charge, avertit, et ne produit que des \Warning{} :
+\begin{sortie}
+[warn] rule `demo/no-deps`: severity is pinned "error" but no must_* guard is used, so findings can only emit as warnings
+  Title  (1 hooks)  ../ex1_no_deps.tsx
+    warn   demo/no-deps  [hook:0]  (line 4:2)  no deps array
+\end{sortie}
+\end{exemple}
+
+\begin{decision}[ADR-22 §3 et §6 --- une validation dynamique, refaite par le cœur]
+\textbf{Décision.} Aucun rejet statique ne compare le pin aux gardes : la sévérité est calculée par finding (\cref{sec:regles-declaratives-severite}), et la seule vérification statique est un avertissement (W1). Et le cœur Rust \emph{revalide} chaque pack qu'il reçoit, quel que soit l'hôte (\og \emph{from any host --- the core re-validates every pack it receives}\fg{}, \cref{lst:decl-mod-header}) : l'hôte npm est un transport, jamais une frontière de confiance.
+
+\textbf{Alternatives refusées.} Un rejet statique des conflits pin/polarité, qui aurait interdit la \emph{stratification} (une même règle \Error{} là où c'est prouvé, \Warning{} ailleurs) ; une validation confiée à l'hôte JS.
+\end{decision}
+
+\begin{piege}
+Le nom \code{as} d'un quantificateur \code{every} ou \code{none} n'est pas contrôlé comme celui d'un \code{forEach}. Comme \code{resolve_of} teste \code{"anchor"} en premier, un \code{"as": "anchor"} rend l'élément quantifié inaccessible : \code{"of": "anchor"} désigne toujours l'ancre, et une garde \code{stability} y est rejetée (E16). Le défaut est bruyant, donc sans danger.
+\end{piege}
+
+Deux tests gardent la documentation alignée sur le schéma : \file{tests/schemas.rs} exige que le schéma sur disque égale la sortie de \code{reactant schemas}, et \file{tests/docs\_drift.rs} que chaque ancre, arête et garde apparaisse dans \file{docs/custom-rules.md} et dans la référence de la skill.
+
+% ===========================================================================
+\section{L'exécution d'une règle}
+\label{sec:regles-declaratives-execution}
+
+\subsection{Ce que voit l'exécuteur}
+
+À la sortie du chargement, l'exécuteur ne connaît plus ni JSON ni paramètre. Il reçoit une représentation entièrement typée :
+
+\rustsnippet[label={lst:decl-resolved}]{src/rules/declarative/validate.rs}{953}{964}{l'IR résolue d'une règle}
+
+Le nom de la liaison \code{forEach} a disparu, seule l'arête survit : les références aux entités ont été résolues en \code{BindRef}. Les gardes forment un arbre \code{ResolvedGuard} de vingt-cinq variantes, plus compact que le schéma : les quatre gardes textuelles (\code{name}, \code{source}, \code{receiver}, \code{prop}) y fusionnent en une variante \code{Text \{ of, field, one_of, prefix \}} (\og \emph{the schema keeps a distinct kind per field so the JSON says what it matches, the executor runs one arm}\fg{}) et les cinq \code{must_*} en \code{Must \{ kind, of, els \}}. Le gabarit est une liste de \code{Segment} où les paramètres sont déjà des littéraux.
+
+La règle elle-même est un emballage minimal, accompagné de l'énumération des preuves qu'une garde certifiante peut détenir :
+
+\rustsnippet[label={lst:decl-tierarule}]{src/rules/declarative/exec.rs}{37}{50}{\code{TierARule} et \code{Proof}}
+
+\code{TierARule} implémente \code{Rule} : \code{name()} rend l'identifiant complet \code{pack/rule}, \code{check} fait le travail. Elle ne redéfinit pas \code{safe_check}, dont le défaut du trait s'applique (\og \emph{Custom rules have no \code{safe_check} in v1}\fg{}, \src{src/rules/declarative/exec.rs}{1}{11}). Surtout, le module vit sous \file{src/rules/} comme toute règle native : il ne peut pas frapper de \code{Certified} (constructeur privé à \code{api::query}) et ne peut construire une \Error{} que par \code{Diagnostic::error}, qui exige un tel jeton (\cref{chap:api-regles}).
+
+\subsection{L'adaptateur vers les relations}
+
+Pour chaque couple (règle, composant), \code{check} construit un \code{EntityCtx}, l'adaptateur entre les entités du schéma et les primitives du moteur :
+
+\rustsnippet[label={lst:decl-entityctx}]{src/rules/declarative/entity.rs}{123}{153}{\code{EntityCtx}}
+
+Les quatre premières tables sont calculées d'emblée par le constructeur : la relation setter $\to$ slot résolue à travers les alias (\code{all_setter_labels}), l'ensemble des variables setters, la table de nommage des slots (valeurs d'état et leurs alias) et celle des hooks (liaisons directes). Les autres relations sont des \code{OnceCell} \emph{paresseuses}, partagées entre les lignes et calculées au premier usage : dominance des sorties du rendu, carte des hooks conditionnels certifiés, index de provenance, setters étrangers, lectures de slot, appels de corps. Le commentaire de \code{slot_reads} explique l'intérêt : aucune règle native ne lit cette relation, si bien qu'un composant sur lequel aucun pack ne la demande ne la calcule jamais. Celui de \code{body_calls} en donne un autre : sans cache, une règle qui navigue \code{calls} puis demande \code{none of anchor.calls} re-marcherait le corps pour chaque ligne. Les relations globales au programme (graphe de churn, consommateurs de contexte) viennent du \code{ProgramCache} du \cref{chap:api-regles}, construites une fois par programme.
+
+Chaque ancre et chaque arête a sa méthode d'énumération sur \code{EntityCtx} : \code{hook_rows(kind)}, \code{render_setters(foreign)}, \code{origin_rows()}\ldots{} pour les ancres ; \code{deps(row)}, \code{body_setters(row)}, \code{writers(row)}, \code{reads(row)}\ldots{} pour les arêtes. Aucune ne marche la syntaxe : elles lisent les relations que le moteur a produites (\adr{42}) ou appellent les mêmes lecteurs que les règles natives (\code{collect_setter_calls}, \code{cleanup_verdict}, \code{ProgramCache::churn}).
+
+\subsection{Énumérer les candidats}
+
+\code{check} est un aiguillage sur l'ancre. Pour \code{hook_calls}, la boucle externe parcourt les lignes, la boucle interne l'arête du \code{forEach} :
+
+\rustsnippet[label={lst:decl-check}]{src/rules/declarative/exec.rs}{227}{245}{le début de \code{TierARule::check}}
+
+Chaque combinaison (ligne d'ancre, élément navigué éventuel) devient un \code{Candidate}, évalué par \code{eval}. \code{Candidate} a une variante par ancre, et \code{Hook \{ row, bound \}} porte l'élément lié sous forme d'un \code{Bound} (\code{Setter}, \code{Dep}, \code{Arg}, \code{Writer}, \code{Seed}, \code{Call}, \code{Read}). Le commentaire du type rappelle une dette réparée : \og \emph{The two anchors used to have a guard match each, so a guard could be handled on one and silently fall into an \code{unreachable!} catch-all on the other}\fg{} (\src{src/rules/declarative/exec.rs}{77}{112}). Un seul évaluateur récursif de gardes sert désormais toutes les ancres.
+
+\subsection{Une conjonction court-circuitée}
+
+\rustsnippet[label={lst:decl-eval}]{src/rules/declarative/exec.rs}{408}{428}{évaluer un candidat}
+
+La sémantique d'une règle tient dans ces vingt lignes. Les gardes sont évaluées \emph{dans l'ordre de l'auteur} et la première qui échoue arrête l'évaluation du candidat ; chaque garde certifiante qui certifie pousse sa \code{Proof} ; si toutes passent, le message est rendu et \code{emit} construit le diagnostic, avec le label et la position du candidat. \code{eval_guard} (\src{src/rules/declarative/exec.rs}{434}{787}) est un \code{match} exhaustif sur \code{ResolvedGuard} ; ses bras sont eux-mêmes exhaustifs sur \code{Bound} (\og \emph{a new edge would otherwise validate, load, and silently emit nothing}\fg{}), et les combinaisons que le validateur exclut aboutissent à des \code{unreachable!}.
+
+\begin{proposition}{Sémantique d'une règle}{decl-semantique}
+Soit $R$ une règle d'ancre $A$, d'arête facultative $e$ et de gardes $g_1, \ldots, g_n$. Pour un composant $C$, l'ensemble des findings de $R$ est
+\[
+  \{\, (a, b) \mid a \in A(C),\ b \in e(a) \text{ (ou } b = \varnothing \text{ sans arête)},\ \textstyle\bigwedge_{i=1}^{n} g_i(a, b) \,\}
+\]
+où $A(C)$ est l'énumération de l'ancre et $e(a)$ celle de l'arête depuis la ligne $a$. L'ordre des $g_i$ n'influe que sur le coût et sur les preuves collectées, jamais sur l'ensemble des findings : un $g_i$ est une fonction pure du candidat.
+\end{proposition}
+
+\subsection{Exemple : écrivains d'un même tick}
+
+La règle communautaire \regle{community-state/same-tick-slot-collapse} utilise l'arête \code{writers} et deux gardes may :
+
+\lstinputlisting[language=JSON,firstline=14,lastline=21,firstnumber=14,caption={\file{packs/community/state.json}, l.~14--21 --- \code{same-tick-slot-collapse} (docs omises)},label={lst:decl-sametick}]{\repoRoot/packs/community/state.json}
+
+\begin{lstlisting}[language=TypeScript,caption={Deux incréments qui n'en font qu'un (\file{/tmp/ch22/ex7\_same\_tick.tsx})},label={lst:decl-ex7}]
+import { useState } from "react";
+
+export function Qty() {
+  const [qty, setQty] = useState(0);
+  const addPair = () => {
+    setQty(qty + 1);
+    setQty(qty + 1);
+  };
+  const addPairOk = () => {
+    setQty((q) => q + 1);
+    setQty((q) => q + 1);
+  };
+  return (
+    <div>
+      <button onClick={addPair}>{qty}</button>
+      <button onClick={addPairOk}>ok</button>
+    </div>
+  );
+}
+\end{lstlisting}
+
+\begin{sortie}
+  Qty  (3 hooks)  ex7_same_tick.tsx
+    warn   community-state/same-tick-slot-collapse  [hook:0]  (line 6:4)  `setQty` writes `qty` in `handler` alongside another write of the same slot in the same tick, and its argument is not a proven functional updater — the writes collapse onto one snapshot
+    warn   community-state/same-tick-slot-collapse  [hook:0]  (line 7:4)  `setQty` writes `qty` in `handler` alongside another write of the same slot in the same tick, and its argument is not a proven functional updater — the writes collapse onto one snapshot
+\end{sortie}
+
+Déroulons. L'ancre lie une ligne, le \code{useState} de label 0. L'arête \code{writers} donne quatre lignes \code{SlotWriter}, une par site (\adr{28}) : lignes 6, 7, 10 et 11. Toutes sont \code{same_tick} : deux écritures synchrones du même slot, dans la même région, atteignables l'une depuis l'autre (\cref{chap:relations}). La garde \code{updater is ["unknown"]} échoue sur les deux updaters fonctionnels \code{q => q + 1} (\code{Updater::Functional}) et passe sur les deux \code{qty + 1}. Restent deux findings, placés sur le site de chaque écriture. Le gabarit rend \code{\{w.setter\}} et \code{\{w.slot\}} entre backquotes, et \code{\{w.region\}} nu, la règle ajoutant elle-même les backquotes. Le compte \og (3 hooks)\fg{} inclut les deux handlers \code{onClick}, que le lowering modélise comme des entrées de hook.
+
+\begin{react}[Mises à jour groupées et updater fonctionnel]
+Dans un handler, React \emph{groupe} les mises à jour d'état : les deux appels \code{setQty(qty + 1)} lisent le même instantané \code{qty} du rendu courant et écrivent la même valeur, si bien que le compteur n'avance que d'une unité. La forme fonctionnelle \code{setQty(q => q + 1)} reçoit la valeur en attente et compose. La règle ne dit pas \og cet argument lit le slot\fg{} : les positions d'argument de setter ne portent pas de verdict d'expression (\issue{67}) ; \code{updater} ne sait dire que \og pas un updater fonctionnel prouvé\fg{}.
+\end{react}
+
+\subsection{Position, label, ordre}
+
+La position d'un finding est celle du certificat quand il sort en \Error{} (la provenance \og voyage\fg{} avec la preuve passée à \code{Diagnostic::error}), sinon celle que donne \code{Candidate::range} : le site de l'élément navigué s'il en a un, sinon la ligne de l'ancre (\src{src/rules/declarative/exec.rs}{193}{219}). Le label de hook attaché est celui de l'ancre, ou celui de l'effet porteur pour un cycle ou un enregistrement ; un élément JSX n'en a pas, d'où l'absence de \code{[hook:N]} dans certaines sorties.
+
+\begin{piege}
+\og L'ordre des packs est l'ordre de sortie\fg{} (\adr{22} §8) vaut pour l'\emph{exécution} et pour \code{reactant rules}, pas pour l'affichage. Le registre trie les diagnostics d'un composant par (règle, sévérité, position, message, variable, label) (\src{src/rules/registry.rs}{316}{333}) : le nom de règle domine, si bien qu'une règle \code{community-effects/…} s'affiche avant la native \regle{missing-cleanup}. Le tri garantit le déterminisme, testé par \code{runs_are_deterministic}.
+\end{piege}
+
+% ===========================================================================
+\section{La sévérité : pin \texorpdfstring{$\meet$}{meet} polarité}
+\label{sec:regles-declaratives-severite}
+
+\subsection{Une règle, deux niveaux}
+
+La règle \regle{guardrails/self-retriggering-effect} est la seule du pack \code{guardrails} épinglée \code{error} :
+
+\lstinputlisting[language=JSON,firstline=48,lastline=55,firstnumber=48,caption={\file{packs/guardrails.json}, l.~48--55 --- \code{self-retriggering-effect} (docs omises)},label={lst:decl-selfretrig}]{\repoRoot/packs/guardrails.json}
+
+Appliquons-la à deux composants qui écrivent leur propre dep, l'un sans condition, l'autre sous une garde :
+
+\begin{lstlisting}[language=TypeScript,caption={Deux effets qui s'auto-relancent (\file{/tmp/ch22/ex2\_self\_retrigger.tsx})},label={lst:decl-ex2}]
+import { useEffect, useState } from "react";
+
+export function Unconditional() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(n + 1);
+  }, [n]);
+  return <div>{n}</div>;
+}
+
+export function Guarded() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    if (n < 5) setN(n + 1);
+  }, [n]);
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  Guarded  (2 hooks)  ex2_self_retrigger.tsx
+    warn   guardrails/self-retriggering-effect  [hook:1]  (line 14:15)  this effect writes `n`, which is listed in its own dependency array
+  Unconditional  (2 hooks)  ex2_self_retrigger.tsx
+    error  guardrails/self-retriggering-effect  [hook:1]  (line 6:4)  this effect writes `n`, which is listed in its own dependency array
+
+⚠  1 error(s), 1 warning(s) across 1 file(s).
+\end{sortie}
+(sortie filtrée par \code{--rule guardrails/self-retriggering-effect} ; sans filtre, la native \regle{infinite-loop} ajoute un \Warning{} sur \code{Unconditional}, \cref{chap:infinite-loop}).
+
+La même règle émet une \Error{} et un \Warning{}. Déroulons. Dans les deux composants, l'ancre est l'effet (label 1) et l'arête \code{body_setter_calls} lie un setter \code{setN} de slot 0. \code{in_deps} passe : le dep \code{n}, résolu par la table de nommage des slots, désigne le slot 0. Vient \code{must_setter_on_all_paths}, en \code{else: keep} par défaut. Dans \code{Unconditional}, la primitive rend \code{MustResult::All(c)} : le setter s'exécute sur tous les chemins du corps ; la garde pousse \code{Proof::Setter(c)} et passe. Dans \code{Guarded}, la primitive ne certifie pas ; en \code{keep}, la garde passe \emph{sans preuve}. À l'émission, le pin \code{error} avec une preuve donne une \Error{}, placée au site certifié \code{setN(...)} (6:4) ; le pin \code{error} sans preuve donne un \Warning{}, placé au site du setter lié (14:15).
+
+\begin{react}[Un effet qui écrit son dep]
+L'écriture change un élément du tableau de deps ; au commit suivant, React compare les deps par \code{Object.is}, constate le changement et relance l'effet, qui écrit à nouveau. Sans condition de sortie, le composant se re-rend indéfiniment ; avec \code{if (n < 5)}, la boucle s'arrête d'elle-même. La différence entre les deux programmes est exactement ce que certifie \code{must_setter_on_all_paths}.
+\end{react}
+
+\subsection{Garde certifiante, \texttt{keep} et \texttt{drop}}
+
+Le bras d'\code{eval_guard} qui traite les \code{must_*} tient en huit lignes :
+
+\rustsnippet[label={lst:decl-must}]{src/rules/declarative/exec.rs}{688}{695}{une garde certifiante}
+
+\code{certify} appelle la primitive du moteur qui correspond au genre de la garde, sur le sujet du candidat (\src{src/rules/declarative/exec.rs}{790}{866}) : \code{must_setter_on_all_paths} sur le CFG du corps de l'ancre et l'ensemble des alias du slot écrit ; la dominance des sorties du rendu pour \code{must_dominates_all_exits} ; \code{must_init_calls_setter} sur l'initialiseur d'un \code{useState} ou d'un \code{useRef} ; la carte des \code{Certified<ConditionalHookCall>} pour \code{must_hook_is_conditional} ; \code{must_direct_write} sur une ligne \code{writers}, qui certifie si et seulement si l'écriture est \code{Direct}. Ce sont les primitives du \cref{chap:api-regles}, pas des réimplémentations. Pour la première, le commentaire précise pourquoi l'exécuteur ne se contente pas du bloc du setter : \og \emph{the primitive's own must-forwarding handles multi-site/branchy writes, which the deduplicated \code{SetterCall.block_id} could not}\fg{}.
+
+Il en résulte deux usages très différents d'une même garde :
+\begin{itemize}
+  \item en \code{"else": "keep"} (le défaut), la garde \emph{ne filtre rien} : elle passe toujours, et ne fait qu'\emph{élever} le finding quand elle certifie. C'est la stratification de \code{self-retriggering-effect} ;
+  \item en \code{"else": "drop"}, elle se comporte comme un filtre \og certifié seulement\fg{} : un candidat non prouvé est abandonné. C'est le bon choix quand le critère de la règle \emph{est} la certification (\regle{community-state/effect-mirrors-render-value}).
+\end{itemize}
+
+\subsection{L'émission}
+
+\rustsnippet[label={lst:decl-emit}]{src/rules/declarative/exec.rs}{868}{904}{\code{emit}, pin $\meet$ polarité}
+
+\begin{definition}{Pin, polarité, sévérité effective}{regles-declaratives-severite}
+Le \terme{pin} d'une règle est la sévérité déclarée par son auteur. La \terme{polarité} d'un finding vaut \Error{} si au moins une garde certifiante a produit une preuve pour ce candidat, \Warning{} sinon. Sur la chaîne $\Info \lleq \Warning \lleq \Error$, la sévérité émise est $\mathit{pin} \meet \mathit{polarit\acute{e}}$ ; le registre lui applique ensuite le plafond du consommateur $c$ (\code{Diagnostic::clamp}), d'où la sévérité affichée
+\[ s \;=\; \mathit{pin} \meet \mathit{polarit\acute{e}} \meet c . \]
+\end{definition}
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}l l X@{}}
+\toprule
+pin & preuve détenue ? & sévérité émise \\
+\midrule
+\code{error} & oui & \Error{}, par \code{Diagnostic::error(id, Certified, msg)} : position, label et notes du certificat \\
+\code{error} & non & \Warning{} \\
+\code{warning} & indifférent & \Warning{} \\
+\code{info} & indifférent & \Info{} \\
+\bottomrule
+\end{tabularx}
+\caption{La table de \code{emit}. La première preuve détenue sert de certificat ; les suivantes n'ajoutent que leurs notes de témoin.}
+\label{tab:decl-severite}
+\end{table}
+
+Le plafond du consommateur ne peut que descendre :
+
+\rustsnippet[label={lst:decl-clamp}]{src/rules/api/diagnostic.rs}{104}{114}{\code{Diagnostic::clamp}}
+
+Avec l'entrée \code{"guardrails/self-retriggering-effect":} \code{"warning"} sous la clef \code{rules} de la configuration \file{/tmp/ch22/opt2/reactant.config.json}, l'\Error{} d'\code{Unconditional} sort en \Warning{} (\code{Guarded} était déjà un \Warning{}, inchangé) :
+\begin{sortie}
+  Guarded  (2 hooks)  ex2_self_retrigger.tsx
+    warn   guardrails/self-retriggering-effect  [hook:1]  (line 14:15)  this effect writes `n`, which is listed in its own dependency array
+  Unconditional  (2 hooks)  ex2_self_retrigger.tsx
+    warn   guardrails/self-retriggering-effect  [hook:1]  (line 6:4)  this effect writes `n`, which is listed in its own dependency array
+\end{sortie}
+Une demande de promotion (\code{"error"} sur une règle épinglée \code{warning}) est, symétriquement, sans effet.
+
+\begin{invariant}{Une Error de pack porte un certificat}{decl-error}
+Un diagnostic de pack est une \Error{} seulement si (i) la règle est épinglée \code{error}, (ii) une garde \code{must_*} a obtenu, pour \emph{ce} candidat, un \code{Certified<\_>} frappé par une primitive du moteur, et (iii) aucun plafond consommateur ne l'a abaissé. La condition (ii) n'est pas une politique : \code{emit} n'a pas d'autre chemin vers \code{Diagnostic::error}, et \code{Certified} ne se construit pas hors de \code{api::query}.
+\end{invariant}
+
+\begin{decision}[ADR-22 §3 --- la sévérité par finding, à l'émission]
+\textbf{Décision.} La sévérité est \code{pin ⊓ polarity}, calculée par finding et à l'émission. La \emph{stratification} en découle gratuitement : une règle épinglée \code{error} émet \Error{} là où la preuve existe et \Warning{} ailleurs, sans qu'on l'écrive deux fois. Le pin est un plafond, jamais une promesse ; la surcharge du consommateur est soumise au même $\meet$.
+
+\textbf{Alternatives refusées.} Un rejet statique d'une règle \code{error} \og insuffisamment prouvée\fg{} (qui aurait interdit la stratification) ; une sévérité prise telle quelle dans le JSON (qui aurait donné l'autorité \Error{} à un auteur de pack, en contradiction avec \adr{21}).
+\end{decision}
+
+\begin{remarque}
+La position de l'\Error{} vient du certificat, celle du \Warning{} du candidat. Dans l'exemple, les deux coïncident avec un site d'appel du setter, mais ce n'est pas une règle générale : une preuve peut désigner un autre site que la ligne navigée, et c'est elle qui fait foi. En JSON (\code{--format json}), les deux diagnostics ont \code{"notes": []} : la preuve de \code{must_setter_on_all_paths} ne porte pas ici de témoin à afficher.
+\end{remarque}
+
+% ===========================================================================
+\section{Les quantificateurs}
+\label{sec:regles-declaratives-quantificateurs}
+
+Une liste de gardes est une conjonction sur \emph{un} candidat. Trois gardes composées étendent ce pouvoir d'expression : \code{any_of} (une disjonction sur le même candidat), \code{every} (un $\forall$ sur les deps de l'ancre) et \code{none} (un $\neg\exists$ sur une arête de l'ancre). Chacune a été l'occasion d'une décision de soundness.
+
+\subsection{\texttt{any\_of} : toutes les branches sont évaluées}
+
+\rustsnippet[label={lst:decl-anyof}]{src/rules/declarative/exec.rs}{696}{707}{la disjonction}
+
+On attendrait \code{children.iter().any(…)}. Ce serait faux : \code{any} court-circuite, et chaque appel peut pousser une preuve. Selon l'ordre dans lequel l'auteur a écrit les branches, une branche \code{must_*} contribuerait ou non sa preuve, et le finding atteindrait ou non l'\Error{}. L'évaluation complète rend la sévérité indépendante de l'ordre des branches (test \code{any_of_severity_is_branch_order_independent}). Les preuves d'une branche certifiante sont gardées même si la disjonction échoue --- sans effet, puisque \code{eval} abandonne alors le candidat.
+
+\begin{exemple}{Une branche \texttt{must\_*} qui rend la disjonction toujours vraie}{decl-w4}
+La règle de sonde \code{chk5/w4} (\file{/tmp/ch22/w4/p\_w4.json}), épinglée \code{error}, lie les setters du corps d'un effet et exige \code{any_of [must_setter_on_all_paths of s, in_deps of s]}, la branche certifiante étant laissée en \code{keep}. Sur le programme du \cref{lst:decl-ex2} :
+\begin{sortie}
+[warn] rule `chk5/w4`: at `rules[0].guards[0].guards[0]`: a `must_*` branch of `any_of` with the default `"else": "keep"` always passes, so the disjunction is always true. Add `"else": "drop"` if the branch is meant to be a condition
+  Guarded  (2 hooks)  ../ex2_self_retrigger.tsx
+    warn   chk5/w4  [hook:1]  (line 14:15)  writes `n`
+  Unconditional  (2 hooks)  ../ex2_self_retrigger.tsx
+    error  chk5/w4  [hook:1]  (line 6:4)  writes `n`
+\end{sortie}
+(sortie filtrée par \code{--rule chk5/w4} ; sans filtre, la native \regle{infinite-loop} ajoute un \Warning{} sur \code{Unconditional}, \cref{chap:infinite-loop}.)
+
+Trois faits en une sortie. L'avertissement W4 est émis au chargement, avec le chemin de la branche fautive. La disjonction passe sur \emph{tout} setter du corps, la branche \code{in_deps} étant morte. Et parce que toutes les branches sont évaluées, la preuve est collectée quand elle existe : \Error{} pour \code{Unconditional}, \Warning{} pour \code{Guarded}.
+\end{exemple}
+
+\begin{piege}
+La liste des genres qui déclenchent W4 (\src{src/rules/declarative/validate.rs}{2169}{2173}) omet \code{MustDirectWrite}. Un \code{must_direct_write} laissé en \code{keep} dans un \code{any_of} rend lui aussi la disjonction toujours vraie, sans avertissement : le dossier de notes l'a vérifié par une sonde où chaque écrivain direct tire en \Error{} alors que l'autre branche, \code{same_tick}, n'est jamais vraie. Ce n'est pas une brèche de soundness --- la disjonction \emph{est} prouvée par sa branche certifiée --- mais un défaut de diagnostic d'auteur.
+\end{piege}
+
+\subsection{\texttt{every} : un refus, puis un amendement}
+
+La règle \regle{guardrails/inert-single-dep} signale un effet dont toutes les deps sont prouvées stables : il ne se relancera jamais après le montage.
+
+\lstinputlisting[language=JSON,firstline=27,lastline=38,firstnumber=27,caption={\file{packs/guardrails.json}, l.~27--38 --- \code{inert-single-dep} (docs omises)},label={lst:decl-inert}]{\repoRoot/packs/guardrails.json}
+
+\begin{lstlisting}[language=TypeScript,caption={Des deps prouvées stables, et une dep inconnue (\file{/tmp/ch22/ex3\_every.tsx})},label={lst:decl-ex3}]
+import { useEffect, useRef, useState } from "react";
+import { useOpaque } from "some-uninstalled-pkg";
+
+export function Inert() {
+  const ref = useRef<HTMLDivElement>(null);
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    console.log(ref.current, n);
+  }, [ref, setN]);
+  return <div ref={ref}>{n}</div>;
+}
+
+export function Opaque() {
+  const ref = useRef<HTMLDivElement>(null);
+  const thing = useOpaque();
+  useEffect(() => {
+    console.log(ref.current, thing);
+  }, [ref, thing]);
+  return <div ref={ref} />;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  Inert  (3 hooks)  ex3_every.tsx
+    warn   guardrails/inert-single-dep  [hook:2]  (line 7:2)  every dependency of this effect is provably stable — it can never re-run after mount
+   1 clean component(s) hidden, rerun with --show-clean
+\end{sortie}
+
+Dans \code{Inert}, le conteneur \code{useRef} et le setter sont \code{Stable} (\cref{chap:statevalue-stabilite}) : \code{every} passe. Dans \code{Opaque}, \code{thing} vient d'un hook non résolu, dont le verdict est $\Top$ (\code{unknown}) ; \code{is: ["stable"]} échoue sur cet élément, \code{every} échoue, la règle se tait. Ce silence est une \emph{décision}, et elle a une histoire.
+
+\begin{decision}[ADR-23 §4 et son amendement --- le quantificateur universel]
+\textbf{Refus initial.} \adr{23} §4 refusait tout $\forall$ en v1, pour deux raisons. (1) \og $\Top$ \emph{folds to "violates"}\fg{} : un pli booléen ferait d'un seul \code{unknown} la suppression du finding pour toute la ligne. (2) \og $\forall$ \emph{is vacuously true over an edge we cannot enumerate exactly}\fg{} : spreads et élisions perdus, deps non littéraux lus comme \code{[]}.
+
+\textbf{Amendement (2026-09-01) : \og the condition is discharged; \code{every} ships\fg{}.} Le tableau littéral porte désormais un bit \code{exact}, et un deps non littéral ne donne plus de liste du tout : la raison (2) tombe. Pour la raison (1), la solution proposée --- faire satisfaire $\Top$ par le quantificateur --- a été \emph{essayée et rejetée à la mesure} : \code{inert-single-dep} tirait alors sur tout effet dépendant d'une prop, les props d'une racine étant $\Top$. Réponse retenue : \og \emph{Whether $\Top$ satisfies is the body's decision, not the quantifier's}\fg{}. Une règle qui accepte les listes \emph{qui pourraient} convenir l'écrit \code{is: ["stable", "unknown"]}.
+
+\textbf{Alternative refusée.} Épingler l'arité (\code{count equals 1}, puis 2, puis\ldots) pour simuler le $\forall$ : \og \emph{exactly the per-rule hack the project forbids}\fg{}.
+\end{decision}
+
+L'implémentation reflète ces trois points :
+
+\rustsnippet[label={lst:decl-every}]{src/rules/declarative/exec.rs}{757}{785}{\code{every}}
+
+Un domaine est requis : un argument absent ou illisible ne fournit aucun élément, et \og \emph{a claim about nothing is not a claim the engine may make}\fg{}, d'où l'échec. Un tableau écrit fournit un domaine même quand un spread en cache une partie : un seul élément visible qui viole réfute le $\forall$. Une liste \emph{connue vide} quantifie vacuement vrai --- d'où le \code{count more_than 0} en tête de \code{inert-single-dep}. Enfin \code{every} n'a aucune autorité \Error{}.
+
+\begin{invariant}{Aucune preuve ne sort d'un quantificateur}{decl-quantif}
+Un finding sélectionné par \code{every} ou \code{none} ne peut pas être une \Error{}. Deux verrous l'assurent. Le validateur rejette un \code{must_*} à l'intérieur du quantificateur (E22) et dans toute règle qui en utilise un (E23). À l'exécution, le corps du quantificateur écrit dans un vecteur \code{scratch} jamais fusionné dans \code{proofs} ; pour \code{every}, un \code{debug_assert!} vérifie qu'il reste vide.
+\end{invariant}
+
+La garde \code{count}, qui accompagne souvent \code{every}, répond sur une borne inférieure ce qu'elle \emph{réfute} :
+
+\rustsnippet[label={lst:decl-count}]{src/rules/declarative/exec.rs}{649}{681}{\code{count} sur une arité exacte ou minorée}
+
+Une règle de sonde \code{count equals 2} (\file{/tmp/ch22/count/}) le montre sur cinq effets de deps respectives \code{[a, ...rest]}, \code{[a, b, c, ...rest]}, \code{[a, ,]}, \code{rest} et \code{[a, b]} (lignes 4 à 8) :
+\begin{sortie}
+  Deps  (5 hooks)  count.tsx
+    warn   demo/two-deps  [hook:0]  (line 4:2)  this effect has exactly two deps
+    warn   demo/two-deps  [hook:2]  (line 6:2)  this effect has exactly two deps
+    warn   demo/two-deps  [hook:4]  (line 8:2)  this effect has exactly two deps
+\end{sortie}
+\code{[a, ...rest]} est au moins 1, ce qui ne réfute pas \og égal à 2\fg{} : la garde passe (faux positif accepté). \code{[a, b, c, ...rest]} est au moins 3 : réfuté. L'élision de \code{[a, ,]} compte comme un élément, l'arité exacte est 2. La variable \code{rest} n'a pas d'arité : échec (c'est \code{deps_declared} qui en parle). Refuser toute borne inférieure, comme le faisait une version antérieure, supprimait des findings : l'arité de \code{[a, …, g, ...rest]} dépasse prouvablement tout budget que ses éléments visibles dépassent déjà.
+
+\begin{piege}
+Deux commentaires du code décrivent encore l'ancien \code{count} qui \og refuse\fg{} sur un tableau aplati (\src{src/rules/declarative/exec.rs}{640}{644} et le doc-commentaire de \code{EntityCtx::deps}, \src{src/rules/declarative/entity.rs}{430}{434}). Le bras \code{Arity::AtLeast} les contredit : c'est lui qui fait foi.
+\end{piege}
+
+\subsection{\texttt{none} : la négation d'un existentiel}
+
+Un \code{forEach} est un existentiel : la règle tire s'il existe un élément de l'arête qui passe les gardes. Ce que les auteurs demandaient sans pouvoir l'écrire, c'est l'inverse : \og acquiert une ressource et n'en libère aucune\fg{}, \og a un prop \code{value} et pas de \code{onChange}\fg{}. Le commentaire de la garde, livrée avec la relation des appels (\adr{36}), en fait l'argument de soundness :
+
+\rustsnippet[label={lst:decl-none-doc}]{src/rules/declarative/schema.rs}{641}{659}{\code{none} : la direction non sûre est ici la bonne}
+
+\begin{definition}{Quantificateur \texttt{none}}{regles-declaratives-none}
+La garde \code{\{"kind": "none", "of": "anchor.e", "as": "q", "guards": [h1, …, hm]\}} passe sur un candidat d'ancre $a$ si et seulement si aucun élément $q \in e(a)$ ne satisfait $h_1 \wedge \cdots \wedge h_m$. L'arête $e$ est typée par la même table que \code{forEach}. Si l'énumération $e(a)$ \emph{sous-estime} les éléments concrets, \code{none} peut passer à tort : c'est un faux positif, jamais un faux négatif ; et comme la garde ne produit aucune preuve, le finding est au plus un \Warning{}.
+\end{definition}
+
+\rustsnippet[label={lst:decl-none}]{src/rules/declarative/exec.rs}{727}{756}{\code{none} sur une arête d'une ligne de hook}
+
+Un candidat interne remplace la liaison : la ligne ancre reste la même, l'élément lié devient la ligne quantifiée. Le bras précédent (\src{src/rules/declarative/exec.rs}{708}{726}) traite de la même façon \code{none of anchor.props} pour l'ancre \code{elements}.
+
+\begin{exemple}{Un input contrôlé sans écrivain}{decl-controlled}
+\lstinputlisting[language=JSON,firstline=349,lastline=388,firstnumber=349,caption={\file{packs/community/wave2.json}, l.~349--388 --- \code{controlled-input-without-a-writer} (docs et params omis)},label={lst:decl-controlled}]{\repoRoot/packs/community/wave2.json}
+Les paramètres omis valent \code{tags = ["input", "textarea", "select"]} et \code{writers = ["onChange", "onInput", "readOnly", "disabled", "defaultValue"]}. Sur
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch22/ex5\_input.tsx}}]
+import { useState } from "react";
+
+export function Broken() {
+  const [name] = useState("");
+  return <input value={name} />;
+}
+
+export function Fine() {
+  const [name, setName] = useState("");
+  return <input value={name} onChange={(e) => setName(e.target.value)} />;
+}
+\end{lstlisting}
+l'analyseur répond :
+\begin{sortie}
+  Broken  (1 hooks)  ex5_input.tsx
+    warn   community-wave2/controlled-input-without-a-writer  (line 5:9)  <`input`> is driven by `value` with nothing on the same element that can change it
+   1 clean component(s) hidden, rerun with --show-clean
+\end{sortie}
+L'ancre \code{elements} (filtre \code{host}) lie l'élément \code{<input>} ; \code{forEach props as p} lie son prop \code{value} ; \code{none of anchor.props as q} parcourt les props du \emph{même} élément et n'en trouve aucun parmi \code{writers} dans \code{Broken}. Le gabarit \code{<\{anchor.name\}>} donne \code{<`input`>}, les noms source étant rendus entre backquotes. Pas de \code{[hook:N]} : un élément n'a pas de label de hook.
+\end{exemple}
+
+\begin{exemple}{Une ressource acquise et jamais rendue}{decl-resource}
+\lstinputlisting[language=JSON,firstline=93,lastline=131,firstnumber=93,caption={\file{packs/community/wave2.json}, l.~93--131 --- \code{acquired-resource-not-released} (docs et params omis)},label={lst:decl-resource}]{\repoRoot/packs/community/wave2.json}
+Par défaut \code{acquire} vaut \code{["observe", "createObjectURL", "lock", "acquire"]} et \code{release} liste \code{disconnect}, \code{unobserve}, \code{revokeObjectURL}, \code{leave}, \code{unlock}, \code{release}, \code{stop}, \code{abort}, \code{close}. Sur un composant qui observe un élément sans jamais se déconnecter, et sur son jumeau correct (\file{/tmp/ch22/ex6\_resource.tsx}, \code{--show-clean}) :
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch22/ex6\_resource.tsx}}]
+export function LeakFires({ cb }: { cb: ResizeObserverCallback }) {
+  const el = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const ro = new ResizeObserver(cb);
+    ro.observe(el.current!);
+  }, [cb]);
+  return <div ref={el} />;
+}
+
+export function ReleaseSilent({ cb }: { cb: ResizeObserverCallback }) {
+  const el = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const ro = new ResizeObserver(cb);
+    ro.observe(el.current!);
+    return () => ro.disconnect();
+  }, [cb]);
+  return <div ref={el} />;
+}
+\end{lstlisting}
+\begin{sortie}
+  LeakFires  (2 hooks)  ex6_resource.tsx
+    warn   community-wave2/acquired-resource-not-released  [hook:1]  (line 7:4)  this effect calls `observe` and nothing in it gives that back — no release call appears anywhere in the effect or its cleanup
+  ReleaseSilent  (2 hooks)  ex6_resource.tsx  ✓
+\end{sortie}
+(la ligne d'import de \code{react} est omise du listing ; les numéros de ligne de la sortie sont ceux du fichier). Les appels du corps (\code{BodyCall}) portent un nom, un receveur et une phase : \code{ro.observe(...)} est de phase \code{effect}, \code{ro.disconnect()} de phase \code{cleanup}, puisqu'il est dans la fonction retournée. La garde \code{phase} restreint l'acquisition au corps de l'effet ; le \code{none} ne filtre pas la phase, si bien que la libération dans le cleanup est vue. La règle exige un \code{name} au niveau supérieur sur \code{c} (E24). Sa limite, documentée dans son \code{why} : sans valeur des arguments (\issue{67}), elle ne peut pas vérifier que c'est la \emph{même} ressource qui est libérée.
+\end{exemple}
+
+\begin{react}[Ce que React ne libère pas]
+Au démontage, React exécute la fonction de cleanup de chaque effet, et rien d'autre. Un \code{ResizeObserver}, une URL d'objet, un verrou, une socket restent vivants tant que le code ne les libère pas explicitement ; en Strict Mode, le double montage de développement rend la fuite visible deux fois.
+\end{react}
+
+La règle \regle{community-wave2/state-never-read-during-render} combine \code{writer_phases} et \code{none} sur l'arête \code{reads} : \og le slot a au moins un écrivain, dans n'importe quelle phase, et aucune lecture de phase \code{render}, \code{memo} ou \code{unknown} n'est visible\fg{} (\src{packs/community/wave2.json}{282}{318}). Sur la fixture \file{tests/fixtures/community\_wave2/state7.tsx}, où un \code{scrollY} est écrit à chaque défilement sans jamais être rendu :
+\begin{sortie}
+  State7Fires  (2 hooks)  state7.tsx
+    warn   community-wave2/state-never-read-during-render  [hook:0]  (line 4:8)  state `scrollY` is written but no render-phase read of it is visible — every write costs a render that changes nothing
+   1 clean component(s) hidden, rerun with --show-clean
+\end{sortie}
+Le \code{unknown} de la liste des phases de lecture est essentiel : une lecture de phase $\Top$ \emph{pourrait} être une lecture de rendu, elle doit donc suffire à faire taire la règle. La doc de l'arête le rappelle : \og \emph{the ABSENCE of rows is not a proof that the slot is unread}\fg{} (\src{src/rules/declarative/schema.rs}{286}{295}).
+
+% ===========================================================================
+\section{La croissance du vocabulaire}
+\label{sec:regles-declaratives-vocabulaire}
+
+\subsection{Mesurer ce qu'on sait dire}
+
+À sa naissance (\adr{22}), le langage était beaucoup plus petit qu'aujourd'hui. \adr{23} a mesuré sa portée sur un catalogue de vingt et une classes de règles tirées de huit corpus : trois seulement étaient exprimables, et encore sous une forme affaiblie. Les bloqueurs se rangeaient en cinq classes : entités de position d'expression manquantes (8 classes), ancre unique (4), faits que le moteur ne calcule pas (5), programme entier (3), identité de hook (1). La conclusion tient en une phrase : \og \emph{No rule language can invent a fact the engine never computed}\fg{}.
+
+\begin{decision}[ADR-23 §1 et §5 --- croître par les entités, rester déclaratif]
+\textbf{Décision.} (§1) Le langage grandit par les \emph{entités}, pas par les gardes : une entité est admissible si elle nomme une position dans une relation déjà résolue ; \og \emph{Entities add positions, never verdicts}\fg{}. (§5) La voie communautaire est l'écriture de packs en JS/TS compilés en JSON committé : \og \emph{a JS pack is arbitrary code execution at analysis time, as it is for ESLint. Committing the generated JSON confines that to the authoring machine[\ldots]}\fg{}
+
+\textbf{Alternatives refusées.} Starlark comme Tier B (crate non compilable pour \code{wasm32}, arbre de dépendances contre une distribution légère, alors qu'un parseur JS, oxc, est déjà embarqué) ; des gardes génériques qui \og pointent\fg{} un verdict existant vers une nouvelle position (\adr{23} §2).
+\end{decision}
+
+Le test \file{tests/catalogue.rs} matérialise ce catalogue (rebasé à vingt-deux classes par \adr{27} §6) : une entrée \code{Expressible} est \emph{prouvée} (sa règle de pack se charge, tire sur une fixture fautive, se tait sur une fixture conforme) ; une entrée \code{Blocked} nomme le vocabulaire manquant. La constante \code{EXPRESSIBLE_NOW} vaut 21 (\srcline{tests/catalogue.rs}{1094}). L'en-tête du fichier retrace la courbe : 3/21 (\adr{22}) $\to$ 5/21 (provenance des hooks et garde \code{origin}, arête \code{args} et garde \code{returns}) $\to$ 6/21 (arête \code{writers}, \code{writer_phases}) $\to$ 7/22 (provenance des écritures, \code{must_direct_write}, rebasage) $\to$ 8/22 (\code{context_providers}, \code{identity}) $\to$ \ldots{} $\to$ 21/22 (\code{registrations}). Le \cref{tab:decl-adr} résume les ADR qui ont fait grandir le langage.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}l X@{}}
+\toprule
+ADR & apport au langage \\
+\midrule
+\adr{27} & arête \code{writers}, \code{writer_phases}, \code{provenance}, \code{must_direct_write}, ancre \code{hook_origins} (réparation de \issue{6}) \\
+\adr{28} & une ligne \code{writers} par site ; \code{updater}, \code{updater_body}, \code{same_tick} \\
+\adr{29} & ancre \code{churn_cycles}, garde \code{cycle} (booléens exacts, jamais de \code{Certified}) \\
+\adr{30} & lignes de setters de rendu qualifiées par propriétaire, \code{slot_ownership} \\
+\adr{31} & arête \code{seeds}, \code{seed_sync} \\
+\adr{32} & ancre \code{context_consumers}, \code{provider} \\
+\adr{34} & ancre \code{registrations}, \code{teardown}, \code{registers} \\
+\adr{35} & phase \code{deferred} après un \code{await} \\
+\adr{36} & \code{calls}, \code{render_calls}, \code{receiver}, \code{phase}, \code{none}, \code{elements}/\code{props}, filtre \code{host} \\
+\adr{37} & arête \code{reads} \\
+\adr{42} & les relations sont des produits du moteur ; la couche règles ne marche aucune syntaxe \\
+\bottomrule
+\end{tabularx}
+\caption{Les ADR qui ont étendu le vocabulaire du Tier A après \adr{22} et \adr{23}.}
+\label{tab:decl-adr}
+\end{table}
+
+\subsection{L'élargissement nommé}
+
+Chaque extension pose la même question : que devient un pack déjà publié ? \adr{27} a formulé l'argument de séquencement : changer ce qu'une sorte déjà livrée énumère, ou affiner un $\Top$ après que des packs existent, change les findings que ces packs émettent. D'où une règle de conception, appliquée par \adr{30} §2 aux setters étrangers (un setter de parent reçu en prop) :
+
+\begin{quote}\small
+\og \emph{The enumeration widens on the GUARD, never on the sort. [\ldots] naming ownership is what makes owner-qualified rows exist.}\fg{}
+\end{quote}
+
+L'ancre \code{render_setter_calls} n'énumère les lignes étrangères que si la règle nomme \code{slot_ownership} quelque part, \code{any_of} compris (\cref{lst:decl-transverse}) : un pack écrit avant l'extension lie exactement les lignes qu'il liait. Le filtre \code{elements: host} de l'ancre \code{elements}, dont le défaut reste \code{component}, suit le même principe. Et le nom d'un slot étranger est cherché dans le composant \emph{propriétaire} (\src{src/rules/declarative/entity.rs}{969}{977}) : les labels sont locaux à un composant et entreraient en collision.
+
+\subsection{Les packs livrés}
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}l l X@{}}
+\toprule
+fichier & pack & règles \\
+\midrule
+\file{packs/guardrails.json} & \code{guardrails} & 5 : les règles de ce chapitre \\
+\file{packs/community/async.json} & \code{community-async} & 5 (continuations asynchrones, listeners, sélecteurs de store) \\
+\file{packs/community/effects.json} & \code{community-effects} & 4 (enregistrements sans teardown, liens d'effets) \\
+\file{packs/community/render.json} & \code{community-render} & 3 (props instables, snapshots de store) \\
+\file{packs/community/state.json} & \code{community-state} & 3 (\code{same-tick-slot-collapse}\ldots) \\
+\file{packs/community/wave2.json} & \code{community-wave2} & 8 (ressources, navigation en rendu, inputs contrôlés\ldots) \\
+\bottomrule
+\end{tabularx}
+\caption{Les packs livrés au commit \snapshotCommit.}
+\label{tab:decl-packs}
+\end{table}
+
+Les packs communautaires ont un statut particulier, fixé par l'en-tête de \file{tests/community\_packs.rs} : \og \emph{These are NOT first-party rules. Several are proxies with known false positives --- the campaign's point was to measure the vocabulary against demand, and a proxy that had to stand in for a missing fact is evidence, not a recommendation.}\fg{} Aucun n'est épinglé \code{error} (test \code{no_community_rule_claims_an_error}). Les docs de \code{controlled-input-without-a-writer} le disent crûment : sur un corpus de 34\,730 fichiers, tous les hits étaient des \code{<input type="hidden" value=…/>}, que la règle ne peut exclure faute de voir la \emph{valeur} du prop \code{type} (\issue{67}) ; c'est \og une démonstration que la forme est exprimable, pas une règle à activer telle quelle\fg{}.
+
+% ===========================================================================
+\section{Limites, et une brèche ouverte}
+\label{sec:regles-declaratives-limites}
+
+\subsection{La brèche de conjonction (\#143)}
+
+Reprenons l'issue ouverte \issue{143}, étiquetée \code{soundness-bug}. Un auteur veut une règle \Error{} \og état écrit pendant le rendu\fg{} et l'écrit ainsi :
+
+\lstinputlisting[language=JSON,firstline=5,lastline=16,firstnumber=5,caption={\file{/tmp/ch22/i143/pack.json} --- la règle de l'issue \#143},label={lst:decl-i143}]{/tmp/ch22/i143/pack.json}
+
+\begin{lstlisting}[language=TypeScript,caption={Un setter confié à une bibliothèque, un autre à un handler (\file{/tmp/ch22/i143/form.tsx})},label={lst:decl-i143-tsx}]
+import { useState } from "react";
+import { handleSubmit } from "some-form-lib";
+
+export function Form() {
+  const [n, setN] = useState(0);
+  return (
+    <form onSubmit={handleSubmit(() => setN(1))}>
+      <button onClick={() => setN(2)}>{n}</button>
+    </form>
+  );
+}
+\end{lstlisting}
+
+\begin{sortie}
+  Form  (2 hooks)  i143/form.tsx
+    error  demo/render-writer  [hook:0]  (line 5:8)  state `n` is written during render (handler, phase handler, via direct)
+    error  demo/render-writer  [hook:0]  (line 7:4)  state `n` is written during render (render, phase unknown, via direct)
+    warn   setter-in-render  [hook:0]  (line 7:4)  setter `setN` is handed to a callee with no timing summary. If that callee runs it during render, this re-renders on every render
+       (1 trace step(s), rerun with --trace)
+
+⚠  2 error(s), 1 warning(s) across 1 file(s).
+\end{sortie}
+
+Deux \Error{}, dont l'une sur une écriture de handler, là où la règle native \regle{setter-in-render} n'émet qu'un \Warning{}. Suivons l'évaluation. \code{writer_phases} a pour sujet l'\emph{ancre} : c'est un existentiel sur \emph{tous} les écrivains du slot, qui passe grâce à la ligne $\Top$ (le callback confié à \code{handleSubmit}, de phase \code{unknown}, qui satisfait toute requête de phase). Il ne restreint donc pas la ligne liée \code{w}. \code{must_direct_write} certifie ensuite chaque ligne, y compris celle du \code{onClick}, de phase \code{handler}. La preuve détenue dit \og cette écriture est directe\fg{}, pas \og cette écriture a lieu pendant le rendu\fg{} : elle prouve un conjoint, pas la conclusion. C'est exactement ce que la définition d'\Error{} du projet exclut (\og preuve de \emph{toute} la conclusion, pas d'un seul conjoint\fg{}, \cref{def:soundness}). Détail annexe : la première ligne (5:8) est l'écriture \code{setN(2)} du handler, dont la ligne \code{writers} n'a pas de position propre et retombe sur le site du \code{useState}.
+
+\begin{proposition}{Ce que prouve réellement une Error de pack}{decl-conjonction}
+Si une règle épinglée \code{error} émet une \Error{} sur un candidat, alors la garde certifiante qui a fourni la preuve est vraie de ce candidat \emph{dans toutes les exécutions}. Si de plus chaque autre garde de la conjonction de premier niveau est \emph{exacte} ou certifiante, la conjonction entière est prouvée. Sans cette hypothèse, une garde may de la conjonction peut être vraie par sur-approximation seulement, et l'\Error{} excède ce qui est prouvé.
+\end{proposition}
+
+\begin{proof}[Esquisse]
+La première partie est l'\cref{inv:decl-error} : le \code{Certified} est frappé par une primitive must sur le sujet du candidat. Une garde exacte (\code{name}, \code{prop}, \code{count} sur arité exacte, \code{cycle}\ldots) est vraie du candidat concret si elle l'est de l'abstrait ; une garde certifiante l'est par construction ; la conjonction de faits vrais sur toutes les exécutions l'est aussi. L'exemple ci-dessus fournit le contre-exemple quand une garde may (\code{writer_phases}) s'y mêle.
+\end{proof}
+
+La direction de correctif proposée par l'issue est une \emph{polarité par garde} calculée à la validation : exacte (\code{name}, \code{source}, \code{prop}, \code{count}, \code{cycle}\ldots), must (\code{must_*}, \code{identity is fresh-every-render}, \code{stability is stable}\ldots) ou may (\code{phase}, \code{writer_phases}, \code{provider}, \code{registers}, \code{same_tick}, toute liste de valeurs contenant \code{unknown}\ldots). Une règle mêlant une garde may à un \code{must_*} serait plafonnée à \Warning{}, avec un avertissement de chargement semblable à W1. Le correctif exige un amendement d'\adr{22} §3, qui supposait que le verdict certifié \emph{est} celui du finding. La cause est la même que celle de \issue{142} dans les règles natives (\cref{chap:api-regles}) : c'est au niveau central, dans la sémantique de la conjonction, qu'elle se corrige, pas par une interdiction ad hoc de la paire \code{writer_phases}/\code{must_direct_write}.
+
+\begin{piege}
+\code{writer_phases} porte sur le slot, pas sur la ligne navigée. Combiné à un \code{forEach writers}, il ne restreint pas l'écrivain lié ; pour filtrer la phase d'\emph{un} écrivain, il n'existe pas aujourd'hui de garde \code{phase} sur la sorte \code{Writer} (elle n'admet que \code{Call} et \code{Read}, \cref{tab:decl-gardes}), seul le champ \code{\{w.phase\}} peut être affiché.
+\end{piege}
+
+\subsection{Les limites connues}
+
+\begin{itemize}
+  \item \textbf{Ancre unique} (\issue{68}, ouverte) : une règle ne joint pas deux entités indépendantes, donc les règles inter-composants restent inexprimables, \og \emph{never by a syntactic bypass}\fg{}. Les relations programme (churn, consommateurs de contexte) sont contournées par \emph{projection} sur le composant ancré.
+  \item \textbf{Peu de verdicts d'expression} (\issue{67}, ouverte) : seuls les deps et les arguments de hooks personnalisés portent un verdict ; ni la valeur d'un prop, ni celle d'un provider, ni l'argument d'un setter. D'où les proxies des packs communautaires.
+  \item \textbf{Pas de verdict d'atteignabilité du rendu} (\issue{132}, ouverte) : une lecture pendant le rendu n'est pas une preuve que la valeur atteint la sortie ; \code{state-never-read-during-render} se tait sur un slot lu puis jeté.
+  \item \textbf{Un plafond de 21/22} (\issue{101}, fermée \code{wontfix}) : la classe \code{nullable-return-unguarded} est exclue par conception. Son ancre serait un site de déréférencement, une entité de forme syntaxique, inadmissible par \adr{23} §1 ; et \adr{20} refuse de câbler les types TypeScript dans le domaine. Réponse à l'équipe qui la réclame : activer \code{strictNullChecks}.
+  \item \textbf{\code{kind: "custom"} ne voit que les hooks non résolus} (\issue{6}, fermée) : un hook inliné perd sa ligne \code{custom}. Les règles d'identité vont sur \code{hook_origins} (d'où W3).
+  \item \textbf{Relations may} : \code{calls}, \code{render_calls}, \code{reads} et \code{registrations} sont des correspondances de noms résolus, jamais des preuves de primitive hôte ; aucune garde \code{must_*} n'accepte ces sortes, leur plafond \Warning{} est structurel (\adr{36} §4, dans l'esprit de la décision \issue{42}).
+\end{itemize}
+
+\subsection{Écarts constatés entre documentation et code}
+
+Au commit photographié, plusieurs textes sont en retard sur le code ; le lecteur qui les croise doit suivre le code. \file{skills/reactant-rules/SKILL.md} parle encore de deux ancres et affirme qu'aucun quantificateur universel n'existe ; \file{docs/custom-rules.md} dit qu'une collision d'\emph{identifiant} avec un nom natif rejette le pack, alors que c'est le \emph{nom du pack} qui est comparé, et décrit le refus du $\forall$ sans mentionner \code{every} ; le \code{fix} de \code{community-render/unstable-prop-to-child} affirme qu'aucune garde ne porte sur le nom d'un prop, alors que \code{prop} existe (\adr{36} §9) ; le commentaire de tête de \file{schema.rs} nomme une fonction \code{validate::check_unknown_keys} qui s'appelle \code{check_keys} ; \code{Sort::describe} produit \og \code{a effect hook call}\fg{} ; et la section \og What a pack can name in a body\fg{} de \file{docs/limitations.md} tient pour inécrivable \og un élément hôte avec un prop \code{value} et pas de \code{onChange}\fg{}, que \code{controlled-input-without-a-writer} exprime désormais. Les six écarts ont été relus au commit \snapshotCommit{} : aucun n'était corrigé.
+
+% ===========================================================================
+\begin{resume}
+\begin{itemize}
+  \item Un \textbf{pack} est un fichier JSON inerte de règles déclaratives (Tier A). Une règle est une \textbf{ancre} (une relation déjà résolue par le moteur, jamais un motif syntaxique), au plus une \textbf{arête} \code{forEach}, une conjonction de \textbf{gardes}, un \textbf{gabarit}, une doc obligatoire et un \textbf{pin} de sévérité. Parce qu'alias, inlining et point fixe ont tourné avant, une règle de pack voit ce qu'un linter syntaxique ne voit pas (\adr{22}).
+  \item Un \textbf{système de seize sortes} type chaque arête (\code{edge_element_sort}, partagé par \code{forEach} et \code{none}), chaque garde et chaque champ (la table unique \code{Field}). Un verdict ne se lit qu'au point de programme de son entité (\adr{23} §2).
+  \item \code{load_pack} charge en \textbf{trois étages} (JSON, serde typé, validation sémantique), s'arrête à la première faute avec un chemin exact, et cuit paramètres et options dans une \code{ResolvedRule} ; le cœur revalide tout pack, quel que soit l'hôte.
+  \item L'exécuteur \code{TierARule} construit un \code{EntityCtx} par (règle, composant), énumère les candidats et évalue une \textbf{conjonction court-circuitée} ; \code{any_of} évalue toutes ses branches.
+  \item La sévérité est \textbf{pin $\meet$ polarité $\meet$ plafond consommateur} : \Error{} seulement avec un \code{Certified} frappé par une primitive \code{must_*} ; \code{keep} stratifie, \code{drop} filtre.
+  \item \code{every} et \code{none} sont may, sans preuve (deux verrous) ; $\Top$ est l'affaire du corps, pas du quantificateur ; \code{none} transforme une sous-énumération en faux positif, jamais en faux négatif.
+  \item Le vocabulaire a crû par les entités de 3/21 à 21/22 classes exprimables ; toute extension élargit une énumération seulement si la règle la nomme.
+  \item Une brèche reste ouverte : une \Error{} de pack peut ne prouver qu'un conjoint (\issue{143}).
+\end{itemize}
+Fichiers rencontrés : les cinq fichiers de \file{src/rules/declarative/} (\file{mod.rs}, \file{schema.rs}, \file{validate.rs}, \file{entity.rs}, \file{exec.rs}), \file{packs/guardrails.json}, \file{packs/community/*.json}, \file{src/cli/config\_load.rs}, \file{tests/declarative.rs}, \file{tests/catalogue.rs}. Le \cref{chap:projet-cli-driver} montre comment la configuration et le registre s'insèrent dans la commande \code{check} ; le \cref{chap:distribution} décrit la distribution des packs (npm, WASM, \code{packs build}, action GitHub).
+\end{resume}
+
+% ===========================================================================
+\section*{Exercices}
+\addcontentsline{toc}{section}{Exercices}
+
+\begin{exercice}{Un mémo qui dépend d'une valeur recréée}{decl-memo}
+Écrire une règle qui signale un \code{useMemo} dont un dep est \code{per-render}, avec le chemin du dep dans le message.
+\end{exercice}
+\begin{solution}
+Ancre \code{\{"relation": "hook_calls", "kind": "memo"\}}, \code{"forEach": \{"edge": "deps", "as": "d"\}}, garde \code{\{"kind": "stability", "of": "d", "is": ["per-render"]\}}, message \code{"\{d.path\} is recreated on every render"}. C'est, à la formulation près, la règle \code{team/no-per-render-memo-dep} de la fixture \file{tests/fixtures/packs/team.json}. Le pin \code{warning} suffit : aucune garde n'est certifiante.
+\end{solution}
+
+\begin{exercice}{Deux quantificateurs, un même fait}{decl-top}
+Sur le composant \code{Opaque} du \cref{lst:decl-ex3}, que répondent \code{every … is ["stable"]} et \code{every … is ["stable", "unknown"]} ? Pourquoi \adr{23} a-t-il laissé ce choix au corps ?
+\end{exercice}
+\begin{solution}
+Le premier échoue (\code{thing} est $\Top$), le second passe. Faire satisfaire $\Top$ par le quantificateur lui-même aurait fait tirer \code{inert-single-dep} sur tout effet dépendant d'une prop de racine (mesuré puis rejeté), et aurait donné à \code{every} et à \code{forEach} deux lectures différentes du même verdict.
+\end{solution}
+
+\begin{exercice}{Compter sur une borne}{decl-count}
+Que répond \code{count less_than 3} sur \code{[a, ...rest]}, \code{[a, b, c, ...rest]}, \code{[a, ,]} et \code{rest} ? Et \code{more_than 1} ?
+\end{exercice}
+\begin{solution}
+\code{less_than 3} : passe ($1 < 3$), échoue ($3 \not< 3$), passe (arité exacte 2), échoue (pas d'arité). \code{more_than 1} : passe (une borne inférieure ne réfute jamais \og $> n$\fg{}), passe, passe ($2 > 1$), échoue (\cref{lst:decl-count}).
+\end{solution}
+
+\begin{exercice}{Le W4 manquant}{decl-w4b}
+Une règle épinglée \code{error}, ancre \code{state}, \code{forEach writers as w}, gardes \code{any_of [must_direct_write of w, same_tick of w]} (branche certifiante en \code{keep}). Prédire, sur un composant dont l'unique écrivain est direct et non \code{same_tick}, les avertissements de chargement et les diagnostics.
+\end{exercice}
+\begin{solution}
+Aucun avertissement : la liste de W4 omet \code{MustDirectWrite}. La branche \code{keep} passe toujours, la disjonction est vraie ; la preuve de l'écriture directe est collectée, et le pin \code{error} donne une \Error{} sur l'écrivain, alors que \code{same_tick} est faux. L'\Error{} est justifiée par la disjonction telle qu'elle est écrite ; l'auteur, lui, n'a pas été prévenu que sa seconde branche est morte.
+\end{solution}
+
+\begin{exercice}{Réparer \#143}{decl-143}
+Attribuer une polarité (exacte, must, may) à chacune des gardes \code{writer_phases}, \code{must_direct_write}, \code{name}, \code{stability is ["stable"]}, \code{stability is ["stable", "unknown"]}, \code{identity is ["fresh-every-render"]}. Appliquer la règle \og une garde may à côté d'un \code{must_*} plafonne à \Warning{}\fg{} à la \cref{lst:decl-i143} ; que devient la sortie ?
+\end{exercice}
+\begin{solution}
+may, must, exacte, must, may (la liste contient \code{unknown}), must. La règle de l'issue mêle \code{writer_phases} (may) et \code{must_direct_write} : elle serait plafonnée à \Warning{} et le chargement avertirait ; les deux findings sortiraient en \Warning{}, comme la native \regle{setter-in-render}. Le correctif est central (la polarité de la conjonction), pas propre à cette règle.
+\end{solution}
+
+\begin{exercice}{Élargir sur la garde}{decl-ownership}
+Pourquoi \code{slot_ownership} \emph{élargit}-il l'énumération de \code{render_setter_calls} au lieu d'être un simple filtre sur une énumération qui contiendrait toujours les setters étrangers ?
+\end{exercice}
+\begin{solution}
+Si l'énumération contenait toujours les lignes étrangères, tout pack écrit avant \adr{30} lierait soudain de nouvelles lignes et émettrait de nouveaux findings sans que son auteur ait rien changé. En n'élargissant que pour une règle qui nomme la propriété, un pack publié garde exactement son comportement (\adr{30} §2, argument de séquencement d'\adr{27}).
+\end{solution}
+
+\begin{exercice}{Un schéma trop accueillant}{decl-pval}
+Pourquoi \code{\{"kind": "stability", "of": "d", "is": \{"$param": "v"\}\}} est-il accepté par un éditeur qui lit \file{docs/schemas/pack.schema.json}, mais rejeté au chargement ? Quelle décision de conception le rejet protège-t-il ?
+\end{exercice}
+\begin{solution}
+Le schéma est généré depuis les types serde, où toute liste de verdicts est un \code{PVal<Vec<…>>} ; le validateur, lui, résout ces positions avec \code{expected = None}. Le rejet protège \og \emph{parameters are values, not structure}\fg{} : un paramètre de consommateur ne doit pas pouvoir changer la polarité d'une garde (par exemple ajouter \code{unknown} à une liste).
+\end{solution}

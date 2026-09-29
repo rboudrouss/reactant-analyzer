@@ -1,0 +1,1775 @@
+\chapter{Le graphe de churn et la preuve multi-site}
+\label{chap:churn}
+
+\begin{objectifs}
+  \item Comprendre pourquoi une boucle de rendu répartie sur plusieurs effets échappe
+        au point fixe d'un composant et au bras \og self-churn\fg{} de \regle{infinite-loop}.
+  \item Savoir lire et construire le \terme{graphe de churn} : slots qualifiés, arêtes
+        \code{Must} / \code{May}, auto-arêtes des effets sans deps, partition \code{self_slot}.
+  \item Suivre la recherche de cycles (Tarjan en deux passes) et la stratification
+        \Error{} / \Warning{} qu'elle induit.
+  \item Maîtriser le \emph{kill de convergence} : de la condition \og un seul écrivain\fg{}
+        (\adr{18}) à la preuve multi-site \code{converges_under_all_writes} (\adr{42}), puis
+        aux \emph{sites} et aux \emph{revivers} du commit \snapshotCommit.
+  \item Comprendre pourquoi l'ensemble des sites convergents est un \emph{plus petit} point
+        fixe, et pourquoi le plus grand serait insound.
+  \item Situer la frontière de certification : ce que le moteur affirme (\code{Must}/\code{May})
+        et ce que la règle re-dérive avant de frapper une \Error.
+\end{objectifs}
+
+\prerequis{\cref{chap:relations} (la relation \relation{slot_writers}, ses colonnes
+\code{owner}, \code{block}, \code{guard_block}, \code{written} ; la relation
+\relation{effect_triggers} ; la preuve mono-site \code{converges_once_written}, ses gardes et
+ses trois bras), \cref{chap:statevalue-stabilite} (le treillis \code{Stability},
+\code{PerRender} et \code{Versioned}), \cref{chap:point-fixe-composant} (environnements
+convergés, tranche finale du point fixe), \cref{chap:interpretation-abstraite} (must / may,
+dominance, plus petit point fixe).}
+
+Ce chapitre est le plus difficile de la partie moteur. Il traite d'une question qu'aucun
+des mécanismes vus jusqu'ici ne sait trancher seul : \emph{deux} effets, chacun anodin,
+peuvent former ensemble une boucle de rendu infinie ; et, symétriquement, un effet qui
+\emph{a l'air} de boucler peut converger parce qu'une garde meurt une fois sa propre
+écriture posée dans le slot. Le premier problème demande un graphe ; le second une preuve.
+Et les deux se rencontrent : une preuve de convergence peut être \emph{ranimée} par une
+écriture voisine, si bien que la preuve doit connaître \emph{tous} les sites qui écrivent
+le slot, et savoir lesquels ne tirent qu'une fois. Nous suivrons l'ordre historique, qui
+est aussi l'ordre de difficulté : le graphe sans kill, le kill mono-écrivain, la preuve
+multi-site, les sites, les revivers et le plus petit point fixe.
+
+Tout ce chapitre vit dans deux fichiers du moteur, \file{src/engine/churn.rs}
+(927 lignes) et \file{src/engine/guards.rs} (1\,058 lignes), tous deux nés au commit
+\code{05d3573} (\adr{42}) et profondément remaniés au commit \snapshotCommit. Les tests
+d'intégration sont dans \file{tests/effect_cycles.rs}. Toutes les sorties d'analyseur
+montrées ici ont été observées sur des fichiers de \file{/tmp/ch15/} avec
+\code{reactant check <fichier> --rule infinite-loop --rule cross-component-infinite-loop --info --show-clean --trace} ;
+les tables de relations et d'arêtes proviennent d'une petite sonde qui appelle
+\code{analyze_program} puis \code{ProgramRelations::new(&result).churn()} et imprime les
+lignes (colonnes élaguées à l'affichage, jamais modifiées).
+
+% ---------------------------------------------------------------------------
+\section{Le problème : deux effets qui se relancent}
+\label{sec:churn-probleme}
+
+\subsection{Un programme de huit lignes}
+
+\begin{exemple}{Deux effets miroirs}{churn-two-effects}
+Chaque effet recopie dans \emph{son} slot un champ de l'\emph{autre} slot, dans un objet
+littéral neuf.
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch15/two_effects.tsx}},label={lst:churn-two-effects}]
+import { useState, useEffect } from 'react';
+export function TwoEffects() {
+  const [a, setA] = useState({ n: 0 });
+  const [b, setB] = useState({ n: 0 });
+  useEffect(() => { setB({ from: a.n }); }, [a]);
+  useEffect(() => { setA({ from: b.n }); }, [b]);
+  return <div>{a.n + b.n}</div>;
+}
+\end{lstlisting}
+\end{exemple}
+
+Déroulons ce que fait React. Au montage, les deux effets tournent : \code{setB({...})}
+place une référence neuve dans \code{b}, \code{setA({...})} une référence neuve dans
+\code{a}. Le composant re-rend. Le premier effet compare son dep \code{a} par
+\code{Object.is} avec la valeur précédente : ce sont deux objets distincts, il re-tourne
+et écrit un \emph{nouveau} \code{b}. Le second effet fait de même et écrit un nouveau
+\code{a}. Rien ne converge jamais : c'est une boucle de rendu infinie, que React
+interrompt avec l'erreur \og Maximum update depth exceeded\fg.
+
+\begin{react}[\code{Object.is} sur les deps]
+Après un commit, React ré-exécute un effet si l'un de ses deps a changé au sens de
+\code{Object.is} par rapport au rendu précédent. Un objet littéral \code{{...}} évalué dans
+un effet est une référence neuve à chaque exécution : \code{Object.is} échoue
+\emph{toujours}. Une écriture d'état qui stocke une telle référence relance donc tout effet
+dont un dep \emph{est} ce slot. Voir \cref{chap:react-modele}.
+\end{react}
+
+Voici ce que dit \reactant{} sur ce fichier.
+
+\begin{sortie}
+  TwoEffects  (4 hooks)  /tmp/ch15/two_effects.tsx
+    error  infinite-loop  [hook:2]  (line 5:2)  these effects form a state-update cycle (`a` → `b` → `a`) where each step stores a fresh reference that re-runs the next effect: infinite render loop
+       → a fresh value is written to state `b` here [hook:2] (line 5:20)
+       → cycle continues: this effect freshly stores state `a` [hook:3] (line 6:20)
+    error  infinite-loop  [hook:3]  (line 6:2)  these effects form a state-update cycle (`a` → `b` → `a`) where each step stores a fresh reference that re-runs the next effect: infinite render loop
+       → a fresh value is written to state `a` here [hook:3] (line 6:20)
+       → cycle continues: this effect freshly stores state `b` [hook:2] (line 5:20)
+
+⚠  2 error(s) across 1 file(s).
+\end{sortie}
+
+Deux \Error, une par effet porteur, et un chemin \code{`a`}~→ \code{`b`}~→ \code{`a`}. C'est le résultat
+que ce chapitre explique.
+
+\subsection{Pourquoi les autres bras sont aveugles}
+
+La règle \regle{infinite-loop} (\cref{chap:infinite-loop}) a quatre bras. Deux d'entre
+eux ne peuvent \emph{pas} voir ce programme, et comprendre pourquoi motive le graphe.
+
+\paragraph{Le bras point fixe ne voit aucune divergence.} Le point fixe d'un composant
+(\cref{chap:point-fixe-composant}) détecte une boucle par le \emph{widening} : un compteur
+\code{setN(n + 1)} fait croître l'intervalle jusqu'au seuil, et l'événement de widening
+est le signal. Ici la valeur abstraite d'un slot objet est une \emph{stabilité}
+(\cref{def:stabilite}) ; la référence stockée est \code{PerRender}, et
+\code{PerRender} $\join$ \code{PerRender} $=$ \code{PerRender}. Rien ne croît, rien ne
+s'élargit : le point fixe converge en deux tours et ne dit rien. La sémantique de
+\emph{valeur} ne distingue pas \og $0 \to 1 \to 0 \to 1$\fg{} de \og atteint
+$\{0, 1\}$\fg{} ; le churn est une abstraction de \emph{transition}, et c'est l'argument
+d'\adr{42} (contexte) pour ne pas en faire un champ de \code{StateValue}.
+
+\paragraph{Le bras self-churn exige le même slot.} Le bras d'\adr{17} prouve
+\code{useEffect(() => setObj({...obj}), [obj])} : le slot écrit \emph{est} un dep du
+même effet (must-rerun), l'écriture est sur tous les chemins (must-reach), la valeur est
+\code{PerRender} (must-change). Dans l'\cref{ex:churn-two-effects} chaque effet écrit un slot
+qu'il ne lit \emph{pas} : \code{setB} sous \code{[a]}, \code{setA} sous \code{[b]}. La
+conjonction ne se referme qu'en composant les deux effets.
+
+\subsection{Les trois jambes d'une arête}
+
+Le graphe compose exactement les trois must du bras self-churn, mais \emph{par arête}
+plutôt que par effet. Une arête $x \to y$ signifie : \og un changement de $x$ relance un
+effet qui stocke une référence fraîche dans $y$\fg{} (doc de module,
+\src{src/engine/churn.rs}{3}{6}). Pour qu'elle soit certaine, il faut :
+\begin{enumerate}
+  \item \textbf{must-rerun} : un dep de l'effet \emph{est} le slot $x$ (ligne
+        \relation{effect_triggers} avec \code{exact = true}) ;
+  \item \textbf{must-reach} : l'écriture dans $y$ est dans un bloc sur tous les chemins du
+        corps (\code{on_all_paths}) ;
+  \item \textbf{must-change} : la valeur écrite est \code{Fresh}, c'est-à-dire
+        \code{PerRender} (colonne \code{written.fresh} de \relation{slot_writers}).
+\end{enumerate}
+Un cycle dont \emph{toutes} les arêtes sont certaines est une boucle certaine : c'est la
+preuve d'\Error. Une arête où l'une des jambes manque est \code{May} ; un cycle qui en
+contient une est un \Warning. Le reste du chapitre déplie cette phrase.
+
+% ---------------------------------------------------------------------------
+\section{Le graphe : slots qualifiés, arêtes Must et May}
+\label{sec:churn-graphe}
+
+\subsection{Les nœuds : des slots qualifiés}
+
+Un nœud du graphe n'est pas un slot mais un \terme{slot qualifié} : le couple
+\code{(ComponentId, HookLabel)}, type \code{QualifiedSlot}
+(\srcline{src/ir/types.rs}{9}). La qualification est indispensable dès qu'un effet écrit
+le slot d'un \emph{autre} composant à travers un setter passé en prop : la ligne
+\relation{slot_writers} porte alors \code{owner = Some(parent)} et son \code{slot} est le
+label \emph{du propriétaire} (\cref{def:slot-writer}). La fonction \code{node_of}
+(\src{src/engine/churn.rs}{153}{156}) fait cette traduction en une ligne :
+\code{(w.owner.unwrap_or(component), w.slot)}.
+
+\subsection{Les types}
+
+\rustsnippet[label={lst:churn-types}]{src/engine/churn.rs}{85}{129}{les quatre types publics du graphe}
+
+Quatre types, dont on retiendra :
+\begin{itemize}
+  \item \code{EdgeStrength} dérive \code{Ord} avec \code{May < Must} : la déduplication
+        garde \og la plus forte\fg{} par simple comparaison ;
+  \item \code{ChurnEdge} porte, outre ses extrémités et sa force, le \emph{porteur}
+        (\code{component}, \code{effect_label}), le span de l'écriture pour le témoin, et
+        deux booléens de \emph{partition} : \code{no_deps} (l'effet n'a pas de tableau de
+        deps) et \code{self_slot} (arête guidée par deps d'un slot vers lui-même, réservée au
+        bras self-churn) ;
+  \item \code{ChurnCycle} est une liste d'indices d'arêtes \emph{en ordre de cycle}
+        (\code{edges[i].to == edges[i+1].from}, la dernière rebouclant sur la première) et
+        deux faits exacts, \code{all_must} et \code{cross_component} ;
+  \item \code{ChurnGraph} est une donnée \emph{programme-entier}, construite une fois par
+        programme et partagée par toutes les passes de règles via \code{ProgramRelations}
+        (\cref{chap:relations}) ; le compteur \code{BUILDS} (\src{src/engine/churn.rs}{131}{137})
+        n'existe qu'en test pour le garantir (\issue{86}).
+\end{itemize}
+
+\begin{definition}{Graphe de churn}{churn-graph}
+Soit un programme dont les composants sont convergés. Le \emph{graphe de churn} est le
+graphe orienté dont les nœuds sont les slots qualifiés $(c, \ell)$ et dont les arêtes
+$x \xrightarrow{e} y$ sont portées par un effet $e$ (non mount-only, voir
+\cref{sec:churn-sites}) tel que : $e$ possède une ligne d'écriture de $y$ de phase
+autre que \code{Handler} et de fraîcheur autre que \code{Not} ; et soit $e$ n'a pas de
+tableau de deps et $x = y$ (\emph{auto-arête}), soit une ligne \relation{effect_triggers}
+de $e$ nomme $x$. L'arête est \code{Must} quand la ligne de déclencheur est exacte, que
+l'écriture est \code{Fresh}, synchrone (\code{block = Some}) et que l'ensemble des blocs
+d'écritures fraîches de $y$ dans le corps de $e$ est sur tous les chemins ; elle est
+\code{May} sinon. Une arête tuée par la preuve de convergence
+(\cref{sec:churn-preuve}) n'existe pas. Un \emph{cycle} est un cycle simple de ce graphe
+ne passant par aucune arête \code{self_slot}.
+\end{definition}
+
+La définition emprunte deux notions qui seront précisées plus loin (les sites et le kill) ;
+pour l'instant, on lit le graphe \emph{sans kill}. Le sens d'une arête est celui de la doc
+de module : $x \to y$ dit qu'un \emph{changement} de $x$ relance un effet qui stocke une
+référence \emph{fraîche} dans $y$. Le graphe parle donc de transitions, pas de valeurs.
+
+\subsection{La force d'une arête}
+
+\rustsnippet[label={lst:churn-strength}]{src/engine/churn.rs}{530}{543}{la jambe must-reach et la force}
+
+La force se décide en trois conjoints, dans l'ordre de la définition :
+\begin{enumerate}
+  \item \code{w.written.fresh == Freshness::Fresh} : la colonne \code{written}
+        (\cref{chap:relations}) dit que l'argument 0 est une référence \code{PerRender}
+        à chaque appel ; \code{Maybe} (valeur opaque, updater imprécis) ne suffit pas ;
+  \item \code{w.block.is_some()} : la ligne porte un bloc, ce qui n'arrive que pour une
+        écriture \emph{synchrone, une fois par passe} de la région
+        (\cref{def:slot-writer}) ; une écriture imbriquée dans une closure, différée,
+        de cleanup ou répétée (\code{forEach}) a \code{block = None} et ne peut être que
+        \code{May} ;
+  \item \code{on_all_paths(f.body_cfg, &fresh_blocks)} : l'ensemble de \emph{tous} les blocs
+        d'écritures fraîches du même nœud dans ce corps post-domine l'entrée. Prendre
+        l'ensemble plutôt que le seul bloc courant est ce qui rend \code{Must} un
+        \code{if (p) setX({...}) else setX({...})} : aucun des deux blocs n'est sur tous les
+        chemins, mais leur union l'est.
+\end{enumerate}
+
+\rustsnippet[label={lst:churn-on-all-paths}]{src/engine/dominance.rs}{72}{92}{\code{on_all_paths}, la primitive must-reach}
+
+\code{on_all_paths} est un parcours depuis l'entrée qui \emph{évite} les blocs
+de l'ensemble : si l'on atteint un bloc sans successeur (une sortie), un chemin s'échappe et
+la réponse est \code{false}. Le commentaire parle de BFS, mais la \og file\fg{} est un
+\code{Vec} dont on retire le dernier élément (\code{queue.pop()}) : le parcours est en
+profondeur. L'ordre de visite est sans effet sur la réponse, qui ne dépend que de
+l'ensemble des blocs atteignables. C'est la même primitive que \code{must_on_all_paths} côté
+règles (\cref{chap:cfg-analyzer-dominance}), déplacée dans le moteur par \adr{42} \S6
+(\og les preuves suivent les données\fg).
+
+La jambe must-rerun, elle, n'apparaît pas dans cet extrait : elle est lue dans les lignes
+\relation{effect_triggers} du porteur, partitionnées en \code{exact_local} (le dep
+\emph{est} le slot local, \code{exact = true}) et \code{versioned} (le dep est seulement
+\emph{versionné} par le slot qualifié, \code{exact = false}) à
+\src{src/engine/churn.rs}{313}{323}. Une arête issue de \code{versioned} est \code{May}
+quelle que soit sa force d'écriture (\srcline{src/engine/churn.rs}{592}).
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{42mm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X}
+\toprule
+Phase de la ligne & Arête guidée par deps & Auto-arête (effet sans deps) \\
+\midrule
+\code{Effect} (synchrone, porte un bloc) & \code{Must} si exact $\wedge$ \code{Fresh} $\wedge$ tous les chemins, sinon \code{May} & idem, sans dep à tester \\
+\code{Deferred}, \code{Cleanup} & \code{May} & \code{May} (\issue{26}) \\
+\code{Handler} & aucune arête & aucune arête \\
+\code{Unknown} ($\Top$) & \code{May} & \code{May} \\
+\bottomrule
+\end{tabularx}
+\caption{La table des phases d'\adr{42} \S4 : ce qu'une écriture de corps d'effet peut soutenir selon sa colonne \code{phase}. Le filtre \code{Handler} est à \src{src/engine/churn.rs}{304}{309}, le reste découle de \code{block} (\cref{lst:churn-strength}).}
+\label{tab:churn-phases}
+\end{table}
+
+Le \cref{tab:churn-phases} n'est pas codé comme une table : il \emph{découle} de deux
+faits. Une ligne de phase \code{Handler} est filtrée à la collecte des écritures de l'effet
+(\src{src/engine/churn.rs}{304}{309}) : une écriture qu'un listener seul atteint demande un
+événement utilisateur par itération, la boucle n'est pas auto-entretenue (preuve par la table
+des registrars, \adr{34}). Toute autre ligne entre, et sa colonne \code{block} décide
+seule si elle peut être \code{Must}. Le $\Top$ (\code{Unknown}) est donc \code{May} : la
+direction \og tirer plus\fg.
+
+\subsection{L'effet sans deps et son auto-arête}
+
+\begin{exemple}{Écriture fraîche sans tableau de deps}{churn-nodeps}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch15/nodeps.tsx}},label={lst:churn-nodeps}]
+import { useState, useEffect } from 'react';
+export function NoDeps() {
+  const [obj, setObj] = useState({ a: 1 });
+  useEffect(() => {
+    setObj({ a: 2 });
+  });
+  return <p>{obj.a}</p>;
+}
+export function NoDepsThen() {
+  const [obj, setObj] = useState({ a: 1 });
+  useEffect(() => {
+    Promise.resolve().then(() => setObj({ a: 2 }));
+  });
+  return <p>{obj.a}</p>;
+}
+\end{lstlisting}
+\begin{sortie}
+  NoDeps  (2 hooks)  /tmp/ch15/nodeps.tsx
+    error  infinite-loop  [hook:1]  (line 4:2)  this effect has no dependency array and stores a fresh reference into state `obj`, so it re-runs after every render and re-triggers itself: infinite render loop
+       → a fresh value is written to state `obj` here [hook:1] (line 5:4)
+  NoDepsThen  (2 hooks)  /tmp/ch15/nodeps.tsx
+    warn   infinite-loop  [hook:1]  (line 11:2)  this effect has no dependency array and may store a fresh reference into state `obj`, so it re-runs after every render and can re-trigger itself: possible infinite render loop
+       → a fresh value is written to state `obj` here [hook:1] (line 12:4)
+\end{sortie}
+\end{exemple}
+
+Un effet sans tableau de deps re-tourne après \emph{chaque} rendu, y compris celui que sa
+propre écriture provoque : il n'y a pas de dep à tester, l'auto-arête $y \to y$ est posée
+d'office.
+
+\rustsnippet[label={lst:churn-nodeps-edge}]{src/engine/churn.rs}{569}{576}{l'auto-arête d'un effet sans deps}
+
+Dans \code{NoDeps}, l'écriture est synchrone (\code{block = Some(0)}, l'entrée) et
+\code{Fresh} : l'arête est \code{Must}, le cycle de longueur 1 est tout-Must, \Error.
+Dans \code{NoDepsThen}, la ligne a la phase \code{Deferred} (la table des registrars
+connaît \code{.then}) et donc \code{block = None} : l'arête est \code{May}, \Warning.
+C'est la cellule \og \code{Deferred} / auto-arête = \code{May}\fg{} du
+\cref{tab:churn-phases}, et elle est une décision.
+
+\begin{decision}[ADR-42 \S4]
+Avant \adr{42}, le graphe vivait dans \file{rules/helpers} avec sa propre marche des setters,
+sans classification de phase : une écriture imbriquée dans \code{.then} était lue \og jamais
+auto-entretenue\fg{} et la boucle de \code{NoDepsThen} était silencieuse (\issue{26}, un
+FN). Plutôt que de corriger le second walker, \adr{42} le supprime : le graphe devient un
+\emph{pli} sur \relation{slot_writers} et \relation{effect_triggers}, et la colonne
+\code{phase} décide. Deux cellules de la table changent le comportement : les auto-arêtes
+\code{Deferred}/\code{Unknown} apparaissent (côté \og tirer plus\fg) et les arêtes guidées
+par deps d'une ligne \code{Handler} disparaissent (appuyées sur la preuve de la table des
+registrars). Mesure (\file{docs/precision-log.md}) : 1\,493 $\to$ 1\,494 sur le corpus,
+aucune ligne retirée, une ajoutée --- un \Warning{} FP de la cellule $\Top$ (une écriture
+sous un \code{useDebouncedCallback} non résolu, dans \code{twenty}) ; la cellule
+\issue{26} n'a rien changé sur ce corpus, elle est épinglée par \file{tests/effect_cycles.rs}.
+\end{decision}
+
+Le champ \code{no_deps} est \code{deps.list().is_none()}
+(\srcline{src/engine/churn.rs}{332}) : un tableau de deps que le moteur ne sait pas lire
+(un spread, une variable) est traité comme \emph{absent}, direction \og tirer plus\fg.
+
+\subsection{Deux bras, une relation : \code{self_slot}}
+
+\rustsnippet[label={lst:churn-dep-edges}]{src/engine/churn.rs}{577}{594}{les arêtes guidées par deps, exactes puis versionnées}
+
+Pour chaque slot local exact $x$ des deps, une arête $x \to y$ de la force calculée ; pour
+chaque slot qualifié versionné, une arête \code{May} (sauf s'il a déjà été poussé en exact).
+Le booléen \code{self_slot} marque l'arête $x \to x$ d'un effet \emph{avec} deps : c'est le
+motif \code{setObj({...obj})} sous \code{[obj]} du bras self-churn (\adr{17}), et le graphe
+la construit mais ne la cherche jamais dans un cycle.
+
+\begin{decision}[ADR-20 item 2]
+Fusionner les deux bras (self-churn et graphe) a été proposé et refusé : le bras self-churn
+lit les \emph{membres} du slot (\code{can_retrigger}, bras membre de la preuve) et produit
+un diagnostic ancré sur le slot avec sa propre stratification \Error/\Warning/\Info ; le
+bras graphe ne le peut pas (savoir si l'écriture de $y$ par $A$ change un dep de $B$ est une
+propriété d'une \emph{paire} d'arêtes). La partition est donc explicite : \code{self_slot}
+pour \og même slot, avec deps\fg{} (bras self-churn), tout le reste (auto-arêtes sans deps
+comprises, poussées avec \code{self_slot = false} dans l'\cref{lst:churn-nodeps-edge}) pour le
+graphe. Une relation, deux lecteurs disjoints : aucun double rapport.
+\end{decision}
+
+L'arête \code{self_slot} est abandonnée quand \code{write_can_retrigger} répond \code{false}
+(\issue{90}, \src{src/engine/churn.rs}{828}{852}) : un updater fonctionnel
+\code{prev => ({ ...prev, slug: f(prev) })} laisse chaque membre non nommé
+\code{Object.is}-égal, et un dep qui ne lit que ces membres ne peut pas relancer l'effet.
+La preuve est syntaxique et \emph{ferme par défaut} : \code{literal_overwrites}
+(\src{src/engine/churn.rs}{882}{899}) n'accepte que \code{{ ...prev, a: x, ... }} avec le
+spread \emph{en premier} et des clés nommées ; toute autre forme répond \og peut
+relancer\fg.
+
+\subsection{Déduplication et déterminisme}
+
+Une clé \code{(from, to, component, effect_label)} identifie une arête. Deux écritures du
+même nœud dans le même effet donnent deux candidates ; on garde la plus forte, puis la plus
+tôt dans la source (\code{(strength, Reverse(pos))}, \src{src/engine/churn.rs}{545}{566}),
+de sorte que la ligne sur laquelle un lecteur s'ancre ne dépende pas de l'ordre de la
+relation. Les arêtes sont enfin triées par \code{(component, effect_label, from, to)}
+(\src{src/engine/churn.rs}{598}{606}) : \code{result.components} est une \code{HashMap} et
+l'ordre de visite varie d'une exécution à l'autre.
+
+\subsection{Trois graphes}
+
+Revenons à l'\cref{ex:churn-two-effects}. La sonde donne les deux lignes d'écriture, les
+deux déclencheurs et le graphe (colonnes élaguées) :
+
+\begin{sortie}
+-- slot_writers
+  slot=0 setter=setA line=Some(6) region=Effect(3) phase=Effect block=Some(0) guard_block=Some(0) fresh=Fresh value.ref=PerRender
+  slot=1 setter=setB line=Some(5) region=Effect(2) phase=Effect block=Some(0) guard_block=Some(0) fresh=Fresh value.ref=PerRender
+-- effect_triggers
+  hook=2 dep=0 slot=(TwoEffects, 0) exact=true
+  hook=3 dep=0 slot=(TwoEffects, 1) exact=true
+=== churn graph
+  edge#0 (TwoEffects, 0) -> (TwoEffects, 1) strength=Must carrier=TwoEffects effect=2 line=Some(5) no_deps=false self_slot=false
+  edge#1 (TwoEffects, 1) -> (TwoEffects, 0) strength=Must carrier=TwoEffects effect=3 line=Some(6) no_deps=false self_slot=false
+  cycle edges=[0, 1] all_must=true cross_component=false
+\end{sortie}
+
+Le dep \code{a} de l'effet 2 \emph{est} le slot 0 (\code{exact=true}) ; l'écriture de
+\code{b} est \code{Fresh} et dans le bloc 0, l'entrée, donc sur tous les chemins : arête
+$a \to b$ \code{Must}. Symétriquement $b \to a$. La \cref{fig:churn-two-effects} dessine ce
+graphe et deux voisins.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=14mm and 22mm]
+  % --- graphe 1 : two_effects
+  \begin{scope}[on background layer]
+    \node[fill=ra-bg,rounded corners=6pt,fit={(-1,-0.9) (2.6,0.9)},inner sep=0pt] {};
+  \end{scope}
+  \node[noeud] (a1) at (0,0) {$a$};
+  \node[noeud] (b1) at (1.8,0) {$b$};
+  \draw[flechemust] (a1) to[bend left=30] node[etiquette,above] {\code{e2}} (b1);
+  \draw[flechemust] (b1) to[bend left=30] node[etiquette,below] {\code{e3}} (a1);
+  \node[etiquette] at ($(a1)!0.5!(b1) + (0,-1.3)$) {\code{TwoEffects} : une SCC tout-Must, \Error};
+  % --- graphe 2 : three
+  \begin{scope}[xshift=52mm]
+  \begin{scope}[on background layer]
+    \node[fill=ra-bg,rounded corners=6pt,fit={(-1,-0.9) (4.4,1.9)},inner sep=0pt] {};
+  \end{scope}
+  \node[noeud] (a2) at (0,0) {$a$};
+  \node[noeud] (b2) at (1.8,0) {$b$};
+  \node[noeud] (c2) at (3.6,0) {$c$};
+  \draw[flechemust] (a2) -- node[etiquette,above] {\code{e3}} (b2);
+  \draw[flechemust] (b2) -- node[etiquette,above] {\code{e4}} (c2);
+  \draw[flechemay] (c2) to[bend right=45] node[etiquette,above] {\code{e5}, sous \code{c.n > 3}} (a2);
+  \node[etiquette,below=9mm of b2] {\code{Three} : une SCC, une arête May, \Warning};
+  \end{scope}
+  % --- graphe 3 : dag
+  \begin{scope}[yshift=-32mm]
+  \node[noeud] (a3) at (0,0) {$a$};
+  \node[noeud] (b3) at (1.8,0) {$b$};
+  \node[noeud] (c3) at (3.6,0) {$c$};
+  \draw[flechemust] (a3) -- node[etiquette,above] {\code{e3}} (b3);
+  \draw[flechemust] (b3) -- node[etiquette,above] {\code{e4}} (c3);
+  \node[etiquette,below=7mm of b3] {\code{Dag} : trois SCC triviales, aucun cycle ; \code{onClick} ne porte rien};
+  \end{scope}
+  % légende
+  \begin{scope}[xshift=62mm,yshift=-32mm]
+  \draw[flechemust] (0,0.3) -- (1,0.3) node[etiquette,right,text=black] {arête \code{Must}};
+  \draw[flechemay] (0,-0.3) -- (1,-0.3) node[etiquette,right,text=black] {arête \code{May}};
+  \node[fill=ra-bg,rounded corners=3pt,minimum width=9mm,minimum height=5mm] at (0.5,-0.95) {};
+  \node[etiquette,right,text=black] at (1,-0.95) {SCC cyclique};
+  \end{scope}
+\end{tikzpicture}
+\caption{Trois graphes de churn (\file{two_effects.tsx}, \file{three.tsx}, \file{dag.tsx}). Les nœuds sont des slots qualifiés du même composant ; \code{eN} est le label du hook porteur. Une arête pleine est \code{Must}, une arête pointillée \code{May}.}
+\label{fig:churn-two-effects}
+\end{figure}
+
+\begin{exemple}{Un cycle à trois, une garde}{churn-three}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch15/three.tsx}},label={lst:churn-three}]
+import { useState, useEffect } from 'react';
+export function Three() {
+  const [a, setA] = useState({ n: 0 });
+  const [b, setB] = useState({ n: 0 });
+  const [c, setC] = useState({ n: 0 });
+  useEffect(() => { setB({ from: a.n }); }, [a]);
+  useEffect(() => { setC({ from: b.n }); }, [b]);
+  useEffect(() => { if (c.n > 3) setA({ from: c.n }); }, [c]);
+  return <div>{a.n + b.n + c.n}</div>;
+}
+\end{lstlisting}
+La sonde montre \code{block=Some(1)} pour \code{setA} (le bloc de la branche vraie, pas
+l'entrée) : \code{on_all_paths} échoue, l'arête $c \to a$ est \code{May}, le cycle n'est
+pas \code{all_must}. Trois \Warning{} \og may form a state-update cycle
+(\code{`a`}~→ \code{`b`}~→ \code{`c`}~→ \code{`a`})\fg, un par effet porteur. Le même programme sans la garde
+(\file{three_must.tsx}) donne trois \Error. Le lecteur notera que la garde \code{c.n > 3}
+ne \emph{meurt} pas sous l'écriture \code{setA({...})} : elle teste \code{c}, pas
+\code{a} ; le kill de convergence de la \cref{sec:churn-preuve} n'a rien à dire ici.
+\end{exemple}
+
+\begin{exemple}{Une chaîne dérivée est un DAG}{churn-dag}
+Dans \file{dag.tsx}, $a \to b \to c$ sans retour, et \code{setA} n'est appelé que dans
+\code{onClick}. Le graphe a deux arêtes \code{Must} et aucun cycle ; la ligne de
+\code{setA} a \code{region=Handler(5) phase=Handler} et n'entre pas. La règle n'émet que
+deux \Info{} (bras self-churn : \og freshly recreates state \code{`b`} outside its deps.
+No update cycle was found\fg), le marqueur d'imprécision résiduelle de la
+\cref{sec:churn-certification}.
+\end{exemple}
+
+% ---------------------------------------------------------------------------
+\section{Trouver les cycles : Tarjan en deux passes}
+\label{sec:churn-tarjan}
+
+\subsection{Pourquoi deux passes}
+
+Le graphe une fois construit, il faut en extraire les cycles et leur attribuer une force.
+Une idée naïve serait de chercher les cycles dans le graphe entier et de déclarer
+\code{all_must} ceux dont toutes les arêtes sont \code{Must}. Elle rate un cas : un cycle
+tout-Must $a \to b \to a$ noyé dans une composante fortement connexe plus grande qui
+contient aussi une arête \code{May} $b \to c \to a$. Un seul cycle simple étant reconstruit
+par composante, on risquerait de ne rapporter que le \code{May}. D'où deux passes.
+
+\rustsnippet[label={lst:churn-find-cycles}]{src/engine/churn.rs}{635}{662}{\code{find_cycles} : sous-graphe Must d'abord, puis tout}
+
+\begin{enumerate}
+  \item \textbf{Passe Must.} On ne garde que les arêtes \code{Must} non \code{self_slot}
+        (\code{must_idx}) et l'on cherche les composantes fortement connexes (SCC)
+        cycliques ; chacune donne un cycle \code{all_must = true}, et ses nœuds sont
+        marqués \code{covered_nodes}.
+  \item \textbf{Passe complète.} On reprend toutes les arêtes non \code{self_slot}
+        (\code{all_idx}) ; un cycle dont un nœud est déjà couvert est \emph{sauté} : l'\Error{}
+        signale déjà cette région, on ne rapporte pas un cycle plus faible qui la recoupe. Les
+        autres donnent des cycles \code{all_must = false}.
+\end{enumerate}
+
+\begin{piege}
+La seconde passe saute un cycle \code{May} dès qu'\emph{un} de ses nœuds est dans une SCC
+tout-Must. Un cycle $a \to b \to a$ tout-Must et un cycle $b \to d \to b$ \code{May}
+partagent $b$ : seul le premier est rapporté. Ce n'est pas un FN, la boucle certaine
+couvre la région ; mais un lecteur qui compte les cycles de \code{graph.cycles} doit savoir
+qu'il ne compte pas tous les cycles du graphe.
+\end{piege}
+
+\subsection{Composantes et reconstruction}
+
+\code{cycles_in} (\src{src/engine/churn.rs}{680}{713}) construit une table de nœuds
+\emph{triée} (déterminisme), une liste d'adjacence nœud $\to$ indices d'arêtes, puis
+appelle \code{tarjan_sccs} (\src{src/engine/churn.rs}{716}{779}), un Tarjan récursif
+classique — \og les graphes sont minuscules\fg, dit le commentaire. Une SCC est cyclique
+si elle a au moins deux nœuds ou si un de ses nœuds porte une auto-arête
+(\src{src/engine/churn.rs}{700}{703}). Pour chaque SCC cyclique, \code{find_cycle_from}
+(\src{src/engine/churn.rs}{783}{814}) reconstruit \emph{un} cycle simple par un parcours en
+profondeur itératif depuis le plus petit nœud de la composante, en restant dans la SCC : il
+existe toujours, et son chemin d'arêtes devient \code{edge_idx}. Enfin \code{make_cycle}
+(\src{src/engine/churn.rs}{664}{676}) pose \code{cross_component} : l'ensemble des
+composants impliqués (propriétaires de \code{from}, de \code{to}, et porteurs) a plus d'un
+élément.
+
+Le coût est linéaire : $O(V + E)$ pour Tarjan, un parcours par SCC pour la reconstruction,
+le tout \emph{une fois par programme}.
+
+\subsection{Ce que prouve un cycle tout-Must}
+
+\begin{lemme}{Composition des arêtes Must}{churn-must-cycle}
+Soit $x_0 \to x_1 \to \dots \to x_{n-1} \to x_0$ un cycle du graphe dont toutes les arêtes
+sont \code{Must}, portées par des effets $e_0, \dots, e_{n-1}$ d'un même composant. Dès que
+le composant est monté et que $e_0$ s'exécute une fois, chaque tour de rendu ré-exécute
+$e_0, \dots, e_{n-1}$ et pose une référence neuve dans chacun de $x_1, \dots, x_0$ : la
+boucle de rendu est infinie.
+\end{lemme}
+\begin{proof}
+Par récurrence sur les tours. Au montage, React exécute tous les effets, donc $e_0$
+s'exécute. Supposons $e_i$ exécuté au tour $t$. Son écriture de $x_{i+1}$ est sur tous les
+chemins du corps (must-reach) : elle a lieu. Sa valeur est \code{PerRender} (must-change) :
+c'est une référence que \code{Object.is} distingue de la précédente, React planifie un
+rendu. Au tour $t+1$, un dep de $e_{i+1}$ \emph{est} le slot $x_{i+1}$ (must-rerun) :
+$e_{i+1}$ s'exécute. La chaîne se referme sur $e_0$ au tour $t+n$.
+\end{proof}
+
+C'est la version composée du triple must d'\adr{17} \S3, et l'argument de soundness 1
+d'\adr{18}. Le lemme énonce une propriété du programme \emph{concret} : c'est pourquoi la
+règle peut frapper une \Error{} (\og défaut certain dès que le code s'exécute\fg). Deux
+réserves, traitées plus loin : la preuve suppose que les jambes sont vraiment must (la
+\cref{sec:churn-cross} montre pourquoi c'est faux au travers d'un prop), et qu'aucune
+garde ne meurt (\cref{sec:churn-preuve}).
+
+Voici la sortie observée pour \file{three_must.tsx}, la version sans garde de
+l'\cref{ex:churn-three} :
+
+\begin{sortie}
+  ThreeMust  (6 hooks)  three_must.tsx
+    error  infinite-loop  [hook:3]  (line 6:2)  these effects form a state-update cycle (`a` → `b` → `c` → `a`) where each step stores a fresh reference that re-runs the next effect: infinite render loop
+       → a fresh value is written to state `b` here [hook:3] (line 6:20)
+       → cycle continues: this effect freshly stores state `c` [hook:4] (line 7:20)
+       → cycle continues: this effect freshly stores state `a` [hook:5] (line 8:20)
+    error  infinite-loop  [hook:4]  (line 7:2)  these effects form a state-update cycle (`a` → `b` → `c` → `a`) …
+    error  infinite-loop  [hook:5]  (line 8:2)  these effects form a state-update cycle (`a` → `b` → `c` → `a`) …
+
+⚠  3 error(s) across 1 file(s).
+\end{sortie}
+
+Le chemin affiché part toujours du plus petit nœud de la SCC (\code{find_cycle_from} démarre
+en \code{scc.iter().min()}), quel que soit l'effet porteur du diagnostic : les trois
+messages disent \code{`a`}~→ \code{`b`}~→ \code{`c`}~→ \code{`a`}, et seule la première note (\og a fresh value
+is written … here\fg) change.
+
+% ---------------------------------------------------------------------------
+\section{Le kill de convergence, première époque : un seul écrivain}
+\label{sec:churn-kill-histoire}
+
+\subsection{Le motif \og fetch once\fg{} en paire}
+
+Le graphe de la section précédente a un défaut immédiat : il voit des boucles là où le
+programme converge. Le motif le plus courant est la garde \og si vide, remplir\fg.
+
+\begin{exemple}{Deux chargements gardés}{churn-fetch-once}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch15/fetch_once_pair.tsx}},label={lst:churn-fetch-once}]
+import { useState, useEffect } from 'react';
+export function FetchOncePair() {
+  const [a, setA] = useState(null);
+  const [b, setB] = useState(null);
+  useEffect(() => { if (!b) setB({ src: 'e1' }); }, [a]);
+  useEffect(() => { if (!a) setA({ src: 'e2' }); }, [b]);
+  return <div>{a && b ? 'ok' : 'loading'}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+  FetchOncePair  (4 hooks)  /tmp/ch15/fetch_once_pair.tsx  ✓
+    verified  infinite-loop  no effect diverges into an infinite render loop
+\end{sortie}
+\end{exemple}
+
+Concrètement : au montage \code{b} est \code{null}, le premier effet écrit \code{{...}}
+dans \code{b} ; \code{a} est \code{null}, le second écrit \code{{...}} dans \code{a}. Au
+rendu suivant, les deux effets re-tournent (leurs deps ont changé) mais les deux gardes sont
+fausses : plus aucune écriture, le composant est stable en deux rendus. Sans kill, le graphe
+aurait pourtant deux arêtes \code{May} (les écritures sont sous une garde,
+\code{block=Some(1)} n'est pas sur tous les chemins) et un cycle $a \to b \to a$ : un
+\Warning{} faux positif sur l'idiome le plus banal de React. La sonde confirme que le graphe
+est \emph{vide} :
+
+\begin{sortie}
+-- slot_writers
+  slot=0 setter=setA line=Some(6) region=Effect(3) phase=Effect block=Some(1) guard_block=Some(1) fresh=Fresh value.ref=PerRender
+  slot=1 setter=setB line=Some(5) region=Effect(2) phase=Effect block=Some(1) guard_block=Some(1) fresh=Fresh value.ref=PerRender
+-- effect_triggers
+  hook=2 dep=0 slot=(FetchOncePair, 0) exact=true
+  hook=3 dep=0 slot=(FetchOncePair, 1) exact=true
+=== churn graph
+\end{sortie}
+
+\subsection{Pourquoi la garde meurt}
+
+L'argument est celui de la preuve mono-site du \cref{chap:relations}
+(\code{converges_once_written}, section sur la preuve mono-site), que nous rappelons
+sur ce cas. Le corps du premier effet est abaissé en un bloc 0 terminé par
+\code{Branch { cond: !b }}, dont l'arête \code{IfTrue} mène au bloc 1 qui contient
+\code{setB({...})}. \code{guard_chain(cfg, 1)} remonte la chaîne des prédécesseurs uniques :
+$[1, 0]$. \code{site_guards} lit la condition et la polarité de l'arête : $(\code{!b},
+\code{true})$, que \code{expand_guard} réécrit en $(\code{b}, \code{false})$. Le bras
+\emph{valeur} de \code{dead_once_written} ré-lie alors \code{b} à la valeur écrite --- une
+référence \code{PerRender}, donc \emph{truthy} et non nulle --- et applique le
+rétrécissement de branche \og \code{b} falsy\fg{} : $\Bot$. La garde est morte sous sa
+propre écriture : une fois \code{{...}} posé dans \code{b}, ce site ne peut plus tirer.
+
+\begin{remarque}
+Le kill porte sur le slot \emph{écrit}, pas sur le slot lu par les deps. La garde
+\code{!b} du premier effet parle de \code{b}, que ce même effet écrit ; le dep \code{a}
+est sans importance pour la preuve. C'est ce qui permet de tuer l'arête $a \to b$ : elle
+est \og une écriture de $b$ qui ne tire qu'une fois\fg, d'où qu'elle soit déclenchée.
+\end{remarque}
+
+\subsection{Le reviver : une écriture voisine ranime la garde}
+
+\begin{exemple}{Un troisième effet remet \code{null}}{churn-multi-writer}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch15/multi_writer.tsx}},label={lst:churn-multi-writer}]
+import { useState, useEffect } from 'react';
+export function MultiWriter() {
+  const [a, setA] = useState(null);
+  const [b, setB] = useState(null);
+  useEffect(() => { if (!b) setB({ src: 'e1' }); }, [a]);
+  useEffect(() => { setA({ src: 'e2' }); }, [b]);
+  useEffect(() => { setB(null); }, [a]);
+  return <div/>;
+}
+\end{lstlisting}
+\begin{sortie}
+  MultiWriter  (5 hooks)  /tmp/ch15/multi_writer.tsx
+    warn   infinite-loop  [hook:2]  (line 5:2)  these effects may form a state-update cycle (`a` → `b` → `a`) where each step may store a fresh reference that re-runs the next effect: possible infinite render loop
+       → a fresh value is written to state `b` here [hook:2] (line 5:28)
+       → cycle continues: this effect freshly stores state `a` [hook:3] (line 6:20)
+    warn   infinite-loop  [hook:3]  (line 6:2)  these effects may form a state-update cycle (`a` → `b` → `a`) …
+\end{sortie}
+\end{exemple}
+
+La garde \code{!b} meurt toujours sous sa propre écriture. Mais le troisième effet,
+lui aussi relancé par \code{a}, remet \code{null} dans \code{b} au tour automatique
+suivant : la garde \emph{tient de nouveau}, le premier effet peut réécrire \code{{...}}, et
+la boucle vit. La sonde le montre : trois lignes d'écriture, dont \code{setB(null)} avec
+\code{fresh=Not value.null=true}, et le graphe garde ses deux arêtes.
+
+\begin{sortie}
+  slot=0 setter=setA line=Some(6) region=Effect(3) phase=Effect block=Some(0) fresh=Fresh value.ref=PerRender
+  slot=1 setter=setB line=Some(5) region=Effect(2) phase=Effect block=Some(1) fresh=Fresh value.ref=PerRender
+  slot=1 setter=setB line=Some(7) region=Effect(4) phase=Effect block=Some(0) fresh=Not value.ref=Bottom value.null=true
+=== churn graph
+  edge#0 (MultiWriter, 0) -> (MultiWriter, 1) strength=May carrier=MultiWriter effect=2 line=Some(5) no_deps=false self_slot=false
+  edge#1 (MultiWriter, 1) -> (MultiWriter, 0) strength=Must carrier=MultiWriter effect=3 line=Some(6) no_deps=false self_slot=false
+  cycle edges=[0, 1] all_must=false cross_component=false
+\end{sortie}
+
+L'écriture \code{setB(null)} n'est pas fraîche : elle ne porte \emph{aucune} arête (le
+\code{continue} de \src{src/engine/churn.rs}{503}{504}). Elle compte pourtant : c'est un
+\terme{reviver}, un site qui ranime une garde qu'une autre écriture avait éteinte. Une
+preuve de convergence qui l'ignorerait serait insound.
+
+\subsection{La réponse d'ADR-018 : un seul écrivain}
+
+\begin{decision}[ADR-18]
+Le graphe de churn naît le 16 juillet avec un kill de convergence \emph{conditionnel} : la
+preuve mono-site est appliquée à une arête seulement si le slot écrit a \textbf{un unique
+site d'écriture d'effet programme-entier}, quelle que soit la fraîcheur des autres (une
+écriture stable ranime aussi une garde). Les handlers ne sont pas comptés (ils demandent un
+événement). Argument de soundness (\adr{18}, point 2) : le kill est appliqué strictement
+\emph{moins} souvent qu'une preuve naïve, et retirer un kill ne peut qu'ajouter des
+arêtes, jamais perdre un cycle réel. Prix : un slot à plusieurs écrivains garde toutes ses
+arêtes, au pire un \Warning{} faux positif (\issue{39}).
+\end{decision}
+
+Le faux positif de \issue{39} est réel et fréquent : deux effets qui chargent chacun
+\emph{le même} slot derrière la \emph{même} garde.
+
+\begin{exemple}{Deux écrivains gardés qui s'éteignent l'un l'autre}{churn-settle}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch15/settle_each_other.tsx}},label={lst:churn-settle}]
+import { useState, useEffect } from 'react';
+export function SettleEachOther() {
+  const [s, setS] = useState(null);
+  const [b, setB] = useState(null);
+  useEffect(() => { if (!s) setS({ from: 'e1' }); }, [b]);
+  useEffect(() => { if (!s) setS({ from: 'e2' }); }, [b]);
+  useEffect(() => { setB({ from: s }); }, [s]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+\end{lstlisting}
+Quelle que soit l'écriture qui tire la première, \code{s} devient truthy et \emph{les deux}
+gardes meurent. Sous \adr{18}, le slot \code{s} a deux écrivains : aucun kill, deux
+arêtes \code{May} $b \to s$, une arête \code{Must} $s \to b$, un cycle, deux \Warning.
+Au commit \snapshotCommit, la sonde ne garde que l'arête $s \to b$ (aucun cycle) et la
+règle n'émet qu'un \Info{} sur l'écriture de \code{b} hors deps. C'est le programme du test
+\code{two_guarded_writers_of_one_slot_}\allowbreak\code{that_settle_each_others_guard_converge}
+de \file{tests/effect_cycles.rs}.
+\end{exemple}
+
+Résoudre \issue{39} exige de poser la \emph{bonne} question : non pas \og combien
+d'écrivains ?\fg{} mais \og sous \emph{chaque} écriture du slot, la garde meurt-elle ?\fg.
+C'est la preuve multi-site de la \cref{sec:churn-preuve}. Avant de l'écrire, il faut
+savoir de quelles écritures on parle.
+
+% ---------------------------------------------------------------------------
+\section{Qu'est-ce qu'un site ?}
+\label{sec:churn-sites}
+
+\subsection{Qui peut ranimer une garde ?}
+
+\adr{18} ne comptait que les \emph{écritures d'effet}. Mais tout ce que la boucle
+automatique exécute peut ranimer une garde : une écriture pendant le rendu, une écriture
+dans un \code{useMemo}, et même l'effet de montage d'un \emph{enfant} que la boucle démonte
+et remonte. Trois faux négatifs de \issue{162}.
+
+\begin{exemple}{Une écriture au rendu ranime une garde d'effet}{churn-render-write}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch15/render_write.tsx}},label={lst:churn-render-write}]
+import { useState, useEffect } from 'react';
+export function RenderWrite({ cond }: { cond: boolean }) {
+  const [s, setS] = useState(null);
+  if (cond && s) setS(null);
+  useEffect(() => { if (!s) setS({ fresh: true }); }, [s]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+\end{lstlisting}
+Avec \code{cond} vrai : \code{{...}} $\to$ rendu $\to$ \code{null} $\to$ effet $\to$
+\code{{...}} $\to$ … La sonde montre la ligne \code{region=Render phase=Render
+block=Some(3) fresh=Not value.null=true} à côté de la ligne d'effet, et l'arête
+\code{self_slot} $s \to s$ \code{May} survit ; la règle émet un \Warning{}
+\og may store a fresh reference into state \code{`s`} which its deps react to\fg. Avant
+\snapshotCommit, la liste des sites n'était construite que sur les lignes d'effet : l'écriture
+du rendu ne ranimait rien et l'arête était tuée. Test :
+\code{a_render_phase_write_revives_an_effect_guard}.
+\end{exemple}
+
+\begin{definition}{Site de convergence}{churn-site}
+Un \emph{site} (au sens du graphe de churn) est une ligne \relation{slot_writers} d'un
+composant, de phase autre que \code{Handler}, prise avec le corps (CFG) dans lequel elle
+s'exécute :
+\begin{itemize}
+  \item région \code{Render} : le CFG de rendu ;
+  \item région \code{Effect(l)} d'un effet \emph{non} mount-only, ou \code{Memo(l)} : le
+        corps du hook $l$ ;
+  \item région \code{Effect(l)} d'un effet \emph{mount-only} (deps d'arité exactement 0) :
+        seulement si la ligne est \emph{étrangère} (\code{owner = Some}) \emph{et} que le
+        propriétaire ne garde pas ce composant monté à travers la boucle
+        (\code{stays_mounted} faux) ; le corps du hook $l$ ;
+  \item régions \code{Callback(_)} et \code{Handler(_)} : jamais (les écritures d'un
+        callback sont des lignes du corps qui l'appelle, la marche les a réifiées).
+\end{itemize}
+L'ensemble \code{foreign} est celui des slots qualifiés qu'un site d'un \emph{autre}
+composant écrit.
+\end{definition}
+
+Ce \og site\fg{} n'est pas le site d'écriture de l'IR (\cref{def:site}, un \code{ExprId}) :
+c'est une ligne de relation \emph{située} dans un corps, l'unité sur laquelle la preuve de
+convergence raisonne. Le code qui les collecte suit la définition mot pour mot.
+
+\rustsnippet[label={lst:churn-sites}]{src/engine/churn.rs}{259}{287}{la collecte des sites}
+
+Deux filtres distincts jouent ici, et il faut les distinguer (\cref{chap:relations},
+région $\neq$ phase) : le filtre sur la \emph{phase} (\code{!= Handler}) écarte une écriture
+qu'un listener non réifié atteint, où qu'elle soit écrite ; le filtre sur la \emph{région}
+écarte les lignes de région \code{Callback}/\code{Handler} (un \code{setTimeout} dans un
+\code{onClick} est de phase \code{Deferred} mais de région \code{Handler} : exclu par la
+région). Le \code{expect("every effect write is a site")} de
+\srcline{src/engine/churn.rs}{517} est l'invariant qui en découle : toute écriture non-handler
+d'un effet non mount-only est dans \code{all_sites}.
+
+\subsection{L'effet de montage d'un enfant}
+
+Un effet à deps \code{[]} tourne une fois par \emph{montage}. Pour le composant lui-même,
+qui reste monté pendant la boucle, il ne peut rien ranimer indéfiniment : ses lignes ne sont
+pas des sites (cas \code{None => None}). Mais un enfant que le parent rend
+\emph{conditionnellement} est démonté et remonté à chaque tour de la boucle, et son effet
+\code{[]} tire à chaque tour.
+
+\begin{exemple}{Un enfant qui remonte}{churn-remount}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch15/remount.tsx}},label={lst:churn-remount}]
+import { useState, useEffect } from 'react';
+function Child({ onReady }: { onReady: (v: any) => void }) {
+  useEffect(() => { onReady(null); }, []);
+  return <span />;
+}
+export function Parent() {
+  const [s, setS] = useState(null);
+  useEffect(() => { if (!s) setS({ fresh: true }); }, [s]);
+  return <div>{s ? <Child onReady={setS} /> : null}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+  Child  (1 hooks)  /tmp/ch15/remount.tsx  ✓
+  Parent  (2 hooks)  /tmp/ch15/remount.tsx
+    warn   infinite-loop  [hook:0]  (line 8:2)  this effect may store a fresh reference into state `s` which its deps react to: possible infinite render loop
+       → a fresh value is written to state `s` here [hook:1] (line 8:28)
+\end{sortie}
+\code{s} vide $\to$ le parent écrit \code{{...}} $\to$ \code{<Child/>} monte $\to$ son
+effet écrit \code{null} dans le slot du parent $\to$ \code{<Child/>} démonte, \code{s} vide,
+et ainsi de suite. La ligne de \code{Child} est étrangère (\code{owner=Some("Parent")},
+\code{fresh=Not}) ; \code{stays_mounted(Parent)} échoue car l'élément \code{<Child/>}
+est sous la garde \code{s} --- le ternaire JSX est abaissé en \code{Branch} et l'élément
+vit dans le bloc \code{IfTrue} (\code{lower_ternary},
+\src{src/lowering/expr_lower.rs}{675}{724}) --- et \code{s}, un état, ne \emph{tient} pas ; la ligne est un site, donc
+\code{(Parent, 0)} est dans \code{foreign} et la preuve pour \code{setS({...})} répond
+\code{false} : l'arête \code{self_slot} reste, le bras self-churn émet un \Warning. Test :
+\code{a_child_the_loop_remounts_}\allowbreak\code{fires_its_mount_effect_every_round}.
+\end{exemple}
+
+La fonction \code{stays_mounted} (\src{src/engine/churn.rs}{374}{430}) répond
+\og oui\fg{} seulement si le parent rend au moins un élément de l'enfant, et si
+\emph{chaque} occurrence est hors de toute closure (un \code{items.map(i => <Child/>)}
+monte un enfant par élément que la boucle peut ajouter), sous des gardes qui \emph{tiennent}
+(\code{Invariance::holds}, \cref{sec:churn-preuve}) et sans \code{key}, ou avec une
+\code{key} qui tient. Un parent qui ne rend aucun tel élément --- l'enfant est atteint via
+un composant intermédiaire --- \emph{échoue fermé}. Deux variantes du test le montrent :
+\file{stays_mounted.tsx}, où \code{<Child/>} est derrière \code{if (!ready) return null}
+avec \code{ready} un prop, est silencieuse (\og verified\fg) ; \file{keyed.tsx}, où
+\code{<Child key={s ? 'a' : 'b'}/>} est rendu sur tous les chemins mais avec une clé qui
+lit le slot, est un \Warning{} : React remonte l'enfant à chaque écriture.
+
+\begin{react}[Montage, \code{key}, effets \code{[]}]
+React identifie un enfant par sa position dans l'arbre et sa \code{key}. Si l'élément
+disparaît d'un rendu (branche \code{null}) ou change de \code{key}, l'instance est démontée
+(ses cleanups tournent) et une nouvelle est montée au rendu suivant : tous ses effets,
+\code{[]} compris, s'exécutent de nouveau. Un effet \og mount-only\fg{} ne l'est donc que
+pour une instance qui reste montée.
+\end{react}
+
+\begin{piege}
+L'étiquette du diagnostic ci-dessus est \code{[hook:0]} alors que l'effet a le label 1 :
+le bras self-churn ancre son diagnostic sur le \emph{slot} (\code{.with_label(state_label)},
+\srcline{src/rules/impls/infinite_loop.rs}{524}) et seule l'étape \code{Write} du témoin
+porte le label de l'effet. Le bras graphe, lui, ancre sur l'effet porteur.
+\end{piege}
+
+\subsection{La vue du site pour la preuve : \code{WriteSite}}
+
+La preuve ne lit pas les lignes brutes mais une projection, \code{WriteSite}, construite par
+\code{site_of} (\src{src/engine/churn.rs}{431}{443}).
+
+\rustsnippet[label={lst:churn-writesite}]{src/engine/guards.rs}{92}{121}{\code{WriteSite}, la vue d'un site pour la preuve}
+
+Champ par champ :
+\begin{description}
+  \item[\code{component}, \code{cfg}, \code{slot}] le composant dont le corps contient
+        l'écriture, ce corps, et le slot \emph{qualifié} écrit (\code{node_of}).
+  \item[\code{guard_block}] le bloc dont les gardes dominantes conditionnent l'écriture :
+        son propre bloc pour une écriture synchrone, \emph{l'instruction qui l'a planifiée}
+        pour une écriture imbriquée, différée ou répétée (une continuation \code{.then} ne
+        tourne que si la passe qui l'a planifiée a pris toutes les branches au-dessus,
+        \issue{160}). C'est la colonne \code{guard_block} de la ligne
+        (\cref{def:slot-writer}).
+  \item[\code{block}] le bloc de l'écriture quand elle est synchrone, une fois par passe : ce
+        qui la fait \emph{co-exécuter} avec les sites qu'elle domine. \code{None} sinon.
+  \item[\code{bounded}] \code{phase != Unknown} : l'écriture tourne au plus une fois par
+        exécution de l'instruction qui la planifie, ou sur son propre timer (les ticks
+        suivants d'un \code{setInterval} sont des événements externes, pas des tours de
+        boucle). Un callback confié à un callee inconnu peut être rappelé indéfiniment : ses
+        gardes disent quand il a été \emph{remis}, pas combien de fois il tourne.
+  \item[\code{convergent}] déjà prouvé \og tire au plus une fois dans la boucle
+        automatique\fg{} : il ne ranime rien indéfiniment (\cref{sec:churn-point-fixe}).
+  \item[\code{value}, \code{expr}] la valeur abstraite laissée dans le slot et l'argument 0
+        tel qu'écrit (colonne \code{written}).
+\end{description}
+
+L'ensemble \code{foreign} (\src{src/engine/churn.rs}{344}{350}) se déduit des sites : un
+slot qualifié dont le propriétaire n'est pas le composant du site. Un tel slot n'est
+\emph{jamais} tué : les gardes de l'autre site vivent dans des corps que l'environnement de
+ce composant ne sait pas lire.
+
+% ---------------------------------------------------------------------------
+\section[La preuve multi-site]{La preuve multi-site : \code{converges_under_all_writes}}
+\label{sec:churn-preuve}
+
+\subsection{La question, en une phrase}
+
+Un site \emph{converge} s'il tire au plus une fois dans la boucle automatique --- la suite
+de rendus que les seules écritures d'état entretiennent, sans événement utilisateur. Pour
+le prouver, ses gardes doivent mourir :
+\begin{enumerate}
+  \item[(a)] sous \emph{l'ensemble tueur} : sa propre écriture et toute écriture synchrone
+        d'un slot local située sur sa chaîne de gardes, car ces écritures s'exécutent à
+        \emph{chaque} passe où lui-même s'exécute ;
+  \item[(b)] sous \emph{chaque autre écriture vivante} des slots de cet ensemble, prise avec
+        les \emph{faits invariants} sous lesquels cet autre site a tiré.
+\end{enumerate}
+La condition (a) généralise la preuve mono-site ; la condition (b) est ce qui manquait à
+\adr{18} : au lieu de compter les écrivains, on les \emph{interroge} un par un.
+
+\begin{definition}{Ensemble tueur, reviver vivant, faits invariants}{churn-kill-set}
+Soit $p$ un site de composant $C$, de bloc de garde $g$ et de chaîne
+$\mathrm{chain}(g)$ (les blocs à prédécesseur unique au-dessus de $g$, lui compris).
+\begin{itemize}
+  \item L'\emph{ensemble tueur} de $p$ est la famille de réécritures
+        $\{\ell \mapsto v\}$ formée de la propre écriture de $p$ et de celle de tout site $q$
+        du \emph{même corps}, écrivant un slot \emph{local} de $C$, dont \code{block} est dans
+        $\mathrm{chain}(g)$. Deux écritures du même slot donnent le join de leurs valeurs.
+  \item Un \emph{reviver vivant} d'un slot $\ell$ de l'ensemble tueur est un site $q \neq p$
+        de $C$, hors ensemble tueur, écrivant $(C, \ell)$, et non déjà prouvé convergent.
+  \item Les \emph{faits} d'un site $q$ sont les conjoints de ses gardes qui
+        \emph{tiennent} à travers la boucle (\cref{def:churn-invariance}).
+\end{itemize}
+$p$ \emph{converge} si ses gardes sont mortes sous l'ensemble tueur et, pour chaque reviver
+vivant $q$ d'un slot $\ell$ de l'ensemble tueur, mortes sous l'environnement rétréci par
+les faits de $q$ dans lequel $\ell$ reçoit la valeur écrite par $q$ et les autres slots de
+l'ensemble tueur gardent leur valeur tueuse s'ils n'ont aucun reviver vivant, $\Top$ sinon.
+Si un slot de l'ensemble tueur est dans \code{foreign}, $p$ ne converge pas.
+\end{definition}
+
+\subsection{Première moitié : préconditions et ensemble tueur}
+
+\rustsnippet[label={lst:churn-proof-1}]{src/engine/guards.rs}{137}{197}{\code{converges_under_all_writes} : signature et première moitié}
+
+La signature dit déjà tout le contrat : le site est désigné par son indice \code{i} dans
+\code{peers} (les sites d'\emph{un} composant), sa valeur propre \code{own_value} est
+fournie par l'appelant, et \code{foreign}, \code{invariance}, \code{props_hold} sont les
+faits de contexte calculés une fois par \code{build_edges}. Les préconditions \emph{échouent fermées} : pas de \code{guard_block} (ligne sans position
+plaçable), site non borné (\code{Unknown} : un callee inconnu peut rappeler le callback),
+slot étranger (\code{site.slot.0 != site.component}), aucune garde --- dans les quatre cas la
+réponse est \code{false} et l'arête reste. Puis :
+\begin{itemize}
+  \item \code{co} : les pairs du même corps (\code{ptr::eq(p.cfg, site.cfg)}), d'un slot
+        local, dont \code{block} est sur la chaîne. Ils \emph{co-exécutent} avec le site :
+        toute passe qui atteint $g$ traverse leur bloc.
+  \item \code{kill} : la réécriture propre (avec \code{own_value}, la valeur que
+        \emph{l'appelant} attribue au site, voir \cref{sec:churn-point-fixe}) puis celles des
+        \code{co} ; un slot écrit deux fois sur la chaîne prend le join et perd son
+        \code{expr} (le bras relationnel n'a plus d'orthographe unique à comparer).
+  \item \code{mine = let_bindings(site.cfg)} : les noms que le corps lie. Sous l'environnement
+        de sortie du rendu, ils lisent $\Top$ (\code{shadowed}, \issue{162}) : le rendu peut
+        lier le même nom --- un temporaire \code{__t0} surtout --- à autre chose, et une garde
+        n'est jamais morte sur un nom qu'elle ne teste pas.
+\end{itemize}
+Le premier \code{dead_once_written} (\cref{chap:relations}, trois bras : valeur, relationnel,
+membre) répond à la condition (a). S'il échoue, inutile d'aller plus loin.
+
+\subsection{Seconde moitié : les revivers}
+
+\rustsnippet[label={lst:churn-proof-2}]{src/engine/guards.rs}{198}{258}{\code{converges_under_all_writes}, seconde moitié}
+
+\begin{itemize}
+  \item \code{held} : les gardes du site qui \emph{tiennent} (\code{Invariance::holds}) ;
+        ce sont les faits sous lesquels \emph{ce} site tire.
+  \item \code{live(label)} : les revivers vivants du slot \code{label} --- ni le site, ni un
+        \code{co}, du même slot qualifié, non convergents.
+  \item Pour chaque slot $k$ de l'ensemble tueur : s'il est \code{foreign}, \code{false}.
+        Pour chaque reviver \code{other} :
+        \begin{enumerate}
+          \item ses \code{facts} : ses gardes qui tiennent, et, si les deux corps diffèrent,
+                dont \emph{aucun} nom n'est lié dans l'un ou l'autre corps
+                (\code{names_unbound}) : un nom ne signifie la même chose dans deux corps
+                que si tous deux le lisent dans la closure ;
+          \item \code{contradicts(held, facts)} : un même conjoint (clé
+                \code{call_free_key}) avec des polarités opposées --- l'autre site a tiré
+                sous \code{!p}, \code{p} tient, donc le nôtre (sous \code{p}) ne tire jamais à
+                côté de lui : ce reviver est \emph{sans objet}, on passe au suivant ;
+          \item sinon on rétrécit l'environnement de sortie par les faits de \code{other},
+                on réécrit : les slots de l'ensemble tueur \emph{autres} que $k$ gardent leur
+                valeur tueuse \emph{s'ils n'ont aucun reviver vivant} (sinon ils lisent
+                $\Top$, par absence de réécriture), et $k$ reçoit la valeur de \code{other}
+                --- son \code{expr} n'étant lisible par le bras relationnel que si les corps
+                sont les mêmes (\code{scope}) ;
+          \item si les gardes ne sont pas mortes dans cet environnement, \code{false}.
+        \end{enumerate}
+\end{itemize}
+
+\rustsnippet[label={lst:churn-contradicts}]{src/engine/guards.rs}{264}{273}{\code{contradicts}}
+
+\begin{piege}
+Le test de contradiction n'est sûr que parce qu'il porte sur des faits \emph{invariants}.
+Deux gardes \code{s} et \code{!s} sur un état ne se contredisent pas d'un tour à l'autre :
+c'est justement \code{s} qui bouge. \code{held} et \code{facts} sont filtrés par
+\code{Invariance::holds} \emph{avant} \code{contradicts}, et un état n'y entre jamais.
+\end{piege}
+
+\subsection{Ce qui tient à travers la boucle : \code{Invariance}}
+
+\rustsnippet[label={lst:churn-invariance}]{src/engine/guards.rs}{305}{315}{les faits d'invariance d'un composant}
+
+\begin{definition}{Invariance à travers la boucle automatique}{churn-invariance}
+La boucle re-rend sur les seules écritures d'état. \emph{Bouge} d'un tour à l'autre : un
+état, ce qui en dérive (un memo, un callback, le résultat d'un hook), une allocation
+fraîche, et tout nom qu'un corps du composant mute. \emph{Tient} : un littéral ; un nom lié
+une fois (dans le corps ou dans le rendu) à quelque chose qui tient ; un nom que rien ne
+lie --- un prop, un nom de module --- \emph{tant que les props tiennent}
+(\code{props_hold}) ; un appel sur des entrées qui tiennent ; un résultat de hook dont le
+résumé dit qu'il ne bouge que sur navigation (\code{SummaryValue::Held}), sauf si un corps
+du programme navigue visiblement (\code{navigates}) ; un membre de littéral objet quand le
+membre tient. Profondeur bornée à 8, au-delà : ne tient pas.
+\end{definition}
+
+La fonction \code{Invariance::holds} (\src{src/engine/guards.rs}{321}{390}) suit cette
+définition cas par cas : \code{Lit} tient ; \code{Var} ne tient pas s'il est dans
+\code{state_vals}, \code{memo_vals} ou \code{mutated}, sinon on suit sa liaison
+(\code{binding}, corps puis rendu), et un nom que rien ne lie répond \code{props_hold} ;
+\code{FieldAccess}/\code{IndexAccess} sont résolus à travers un littéral objet ou un
+résultat de hook \og shaped\fg ; \code{BinOp}, \code{UnaryOp}, \code{Call} tiennent si
+leurs entrées tiennent ; tout le reste (allocation, élément, autre hook) bouge.
+\code{mutated} est l'union des racines mutées de tous les corps du composant
+(\code{mutated_roots}) et des noms de module écrits par \emph{n'importe quel} composant
+(\src{src/engine/churn.rs}{202}{224}). \code{navigates} est calculé une fois,
+programme-entier, sur les rendus et tous les corps de hook \emph{sauf} les handlers
+(\src{src/engine/churn.rs}{206}{216}) : une navigation depuis un handler exige un événement
+utilisateur, elle n'est pas dans la boucle.
+
+\begin{piege}
+\og Un appel sur des entrées qui tiennent tient\fg{} (\srcline{src/engine/guards.rs}{294})
+est une \emph{hypothèse}, pas une preuve : un callee opaque peut lire une horloge ou
+naviguer. Elle est documentée dans \file{docs/limitations.md} et portée par \issue{161}.
+C'est le seul point de la preuve où la soundness repose sur une hypothèse assumée plutôt
+que sur une sur-approximation (\cref{sec:churn-limites}).
+\end{piege}
+
+\subsection{Retour sur les exemples}
+
+\paragraph{\file{multi_writer.tsx} (\cref{ex:churn-multi-writer}).} Site
+\code{setB({...})} de l'effet 2 : gardes $[(\code{b}, \code{false})]$, aucun \code{co}
+(le corps n'a qu'une écriture), \code{kill} $= \{b \mapsto \text{réf. } \code{PerRender}\}$ :
+morte, condition (a) satisfaite. \code{held} $= []$ (\code{b} est un état).
+\code{live(b)} $= \{\code{setB(null)}\}$ de l'effet 4 : non gardé, \code{facts} $= []$ ;
+\code{rewrites} $= \{b \mapsto \code{null}\}$ ; la garde \og \code{b} falsy\fg{} sur une
+valeur \code{null} n'est pas $\Bot$ : \code{false}. L'arête $a \to b$ reste, le cycle est
+rapporté.
+
+\paragraph{\file{null_updater.tsx} (test \code{a_null_returning_updater_at_another_site_revives_the_guard}).}
+Même schéma avec \code{if (s) setS(prev => null)} pour reviver : la sonde montre
+\code{updater=Functional fresh=Not value.null=true}. Un updater fonctionnel est lu comme le
+\emph{join de ses retours} (\cref{chap:relations}, \code{written::classify}), ici
+\code{null} : la garde \code{!s} revit, l'arête \code{self_slot} reste, \Warning.
+
+\paragraph{\file{settle_each_other.tsx} (\cref{ex:churn-settle}).} Site \code{setS} de
+l'effet 2 : (a) morte sous $s \mapsto$ réf. \code{live(s)} $= \{\code{setS} \text{ de
+l'effet 3}\}$ : sa garde \code{!s} ne tient pas (état), \code{facts} $= []$ ; réécriture
+$s \mapsto$ réf. \code{PerRender} de l'autre site : \og \code{s} falsy\fg{} donne $\Bot$,
+morte. \code{true}. Symétriquement pour l'effet 3. Les deux arêtes $b \to s$ sont tuées ;
+seule $s \to b$ subsiste, sans cycle.
+
+\subsection{Ce que la preuve garantit}
+
+\begin{lemme}{Soundness du kill}{churn-kill-sound}
+Supposons les hypothèses d'invariance de la \cref{def:churn-invariance} vraies du programme
+concret, et supposons que tout site marqué \code{convergent} parmi les pairs tire un nombre
+fini de fois dans la boucle automatique. Si \code{converges_under_all_writes} répond
+\code{true} pour un site $p$, alors $p$ tire au plus une fois, puis un nombre fini de fois
+supplémentaires au plus égal au nombre de tirs des sites convergents, dans toute boucle
+automatique.
+\end{lemme}
+\begin{proof}[Esquisse]
+Les gardes de $p$ sont conjonctives : il suffit qu'une soit fausse pour que $p$ ne tire pas.
+Considérons un tour $t$ après le premier tir de $p$ et regardons, pour chaque slot $\ell$ de
+l'ensemble tueur, la dernière écriture de $\ell$ avant $t$. Trois cas. (i) C'est $p$
+lui-même ou un \code{co} : $\ell$ tient sa valeur tueuse, et les gardes sont mortes par (a).
+(ii) C'est un reviver vivant $q$ : $q$ a tiré, donc ses faits invariants étaient vrais lors
+de ce tir, et tiennent encore en $t$ ; si l'un contredit un fait de $p$, $p$ ne tire pas ;
+sinon l'environnement de $t$ est inclus dans celui que la preuve a construit pour $q$
+(faits de $q$, valeur de $q$ dans $\ell$, valeur tueuse ou $\Top$ ailleurs), où les gardes
+sont mortes. (iii) C'est un site convergent : cela n'arrive qu'un nombre fini de fois, et
+après chaque tel tir un tir de $p$ restaure la valeur tueuse. Un site étranger n'écrit
+jamais un slot tueur (\code{foreign} exclu). Donc $p$ ne tire, hors les cas (iii), plus
+jamais.
+\end{proof}
+
+Le lemme est conditionnel, et c'est voulu : la seconde hypothèse est \emph{discharged} par
+le plus petit point fixe de la section suivante, la première reste une hypothèse du
+projet.
+
+% ---------------------------------------------------------------------------
+\section{Revivers et plus petit point fixe des sites convergents}
+\label{sec:churn-point-fixe}
+
+\subsection{Un reviver qui tire une fois par requête}
+
+La preuve de la section précédente traite un reviver \emph{vivant} comme éternel : s'il peut
+ranimer la garde une fois, il pourra la ranimer toujours. C'est faux pour un reviver qui,
+lui aussi, converge. Le motif vient du dépôt \code{twenty} (\issue{160}).
+
+\begin{exemple}{Un drapeau de requête et sa continuation}{churn-reviver}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch15/reviver.tsx}},label={lst:churn-reviver}]
+import { useState, useEffect } from 'react';
+declare function refetch(): Promise<void>;
+export function Reviver({ version }: { version: { id: string } }) {
+  const [req, setReq] = useState(false);
+  const [seeded, setSeeded] = useState<string | undefined>(undefined);
+  useEffect(() => {
+    if (!req) return;
+    setReq(false);
+    void refetch().then(() => { setSeeded(undefined); });
+  }, [req]);
+  useEffect(() => {
+    if (seeded === version.id) return;
+    setSeeded(version.id);
+  }, [version, seeded]);
+  return <div>{seeded}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+  Reviver  (4 hooks)  /tmp/ch15/reviver.tsx  ✓
+    verified  infinite-loop  no effect diverges into an infinite render loop
+\end{sortie}
+Test : \code{a_reviver_that_resets_its_own_flag_}\allowbreak\code{fires_once_per_request}.
+\end{exemple}
+
+Le second effet s'éteint \emph{relationnellement} : la garde compare \code{seeded} à
+\code{version.id}, l'écriture pose \code{version.id} dans \code{seeded}, les deux côtés sont
+égaux au rendu suivant. Mais la continuation \code{.then} du premier effet remet
+\code{undefined} dans \code{seeded} : un reviver. Il n'est pourtant planifié que si
+\code{req} est vrai, et la \emph{même passe} remet \code{req} à \code{false} : il tire une
+fois par requête externe, la paire converge en deux tours. Pour le voir, il faut trois
+choses.
+
+\begin{sortie}
+  slot=0 setter=setReq    line=Some(8)  region=Effect(2) phase=Effect   block=Some(3) guard_block=Some(3) fresh=Not
+  slot=1 setter=setSeeded line=Some(9)  region=Effect(2) phase=Deferred block=None    guard_block=Some(3) fresh=Not
+  slot=1 setter=setSeeded line=Some(13) region=Effect(3) phase=Effect   block=Some(3) guard_block=Some(3) fresh=Maybe value.ref=Unknown
+-- effect_triggers
+  hook=2 dep=0 slot=(Reviver, 0) exact=true
+  hook=3 dep=1 slot=(Reviver, 1) exact=true
+-- registrations
+  effect=2 display=.then registrar=then firing=Once timing=Deferred block_id=Some(3) line=Some(9) pairing=Unpaired
+=== churn graph
+\end{sortie}
+
+\begin{enumerate}
+  \item \textbf{Une écriture différée a des gardes.} La ligne \code{setSeeded(undefined)}
+        est \code{Deferred} (\code{block=None}) mais porte \code{guard_block=Some(3)} : le bloc
+        de l'instruction \code{refetch().then(...)} qui l'a planifiée. La continuation ne
+        tourne que si la passe qui l'a planifiée a pris toutes les branches au-dessus ;
+        ses gardes sont donc celles du bloc 3 : \code{guard_chain(3)} $= [3, 2, 0]$,
+        \code{site_guards} $= [(\code{req}, \code{true})]$ (la \cref{fig:churn-kill-set}).
+  \item \textbf{L'ensemble tueur contient \code{setReq(false)}.} Cette écriture est
+        synchrone, locale, dans le bloc 3 qui est sur la chaîne : c'est un \code{co}. Sous
+        $\code{req} \mapsto \code{false}$, la garde $(\code{req}, \code{true})$ est $\Bot$ :
+        le reviver \emph{converge}.
+  \item \textbf{Un reviver convergent n'est pas vivant.} Une fois \code{setSeeded(undefined)}
+        prouvé, il sort de \code{live(seeded)} pour le site \code{setSeeded(version.id)}, qui
+        converge à son tour.
+\end{enumerate}
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=7mm and 16mm]
+  \node[cfgbloc,fill=ra-bg] (b0) {bloc 0\\Branch \{ cond: !req \}};
+  \node[cfgbloc,below left=of b0] (b1) {bloc 1\\Return};
+  \node[cfgbloc,fill=ra-bg,below right=of b0] (b2) {bloc 2\\Jump(3)};
+  \node[cfgbloc,fill=ra-bg,draw=ra-blue,very thick,below=of b2] (b3) {bloc 3\\setReq(false)\\refetch().then(() => \{ setSeeded(undefined) \})};
+  \draw[fleche] (b0) -- node[etiquette,left] {IfTrue} (b1);
+  \draw[fleche] (b0) -- node[etiquette,right] {IfFalse} (b2);
+  \draw[fleche] (b2) -- (b3);
+  \coordinate (mid) at ($(b1.south)!0.5!(b3.south)$);
+  \coordinate (anch) at (mid |- b3.south);
+  \node[etiquette,text width=112mm,align=left,below=5mm of anch,anchor=north] {%
+    \code{guard_chain(cfg, 3) = [3, 2, 0]} (blocs grisés) ;\\
+    \code{site_guards(cfg, 3) = [(req, true)]} : l'arête $0 \to 2$ est \code{IfFalse} sur \code{!req}, dépliée en \code{req} vrai ;\\
+    ensemble tueur du site \code{setSeeded(undefined)} : $\{\code{seeded} \mapsto \code{undefined},\ \code{req} \mapsto \code{false}\}$ ---
+    \code{setReq(false)} est un \code{co} (même corps, slot local, \code{block = Some(3)} sur la chaîne).};
+\end{tikzpicture}
+\caption{Le corps du premier effet de l'\cref{ex:churn-reviver} après lowering (blocs de la sonde IR), la chaîne de gardes du bloc 3 et l'ensemble tueur de l'écriture différée. Le site différé n'a pas de \code{block} mais hérite du \code{guard_block} de l'instruction qui le planifie.}
+\label{fig:churn-kill-set}
+\end{figure}
+
+\subsection{Le point fixe des sites convergents}
+
+\rustsnippet[label={lst:churn-fixpoint}]{src/engine/churn.rs}{450}{485}{le plus petit point fixe des sites convergents}
+
+Le vecteur \code{convergent} part de \og aucun\fg. À chaque tour, pour chaque composant, on
+projette les sites en \code{peers} \emph{avec le drapeau courant}, puis on tente la preuve sur
+chaque site local non encore prouvé, avec sa \emph{valeur entière} (\code{peers[k].value}).
+On s'arrête quand un tour ne marque plus rien. Les lignes étrangères
+(\code{owner.is_some()}) ne sont jamais tentées.
+
+\begin{theoreme}{Le plus petit point fixe des sites convergents}{churn-lfp}
+Soit $S$ l'ensemble des sites d'un programme et, pour $X \subseteq S$, $F(X)$ l'ensemble des
+sites $p$ tels que \code{converges_under_all_writes} répond \code{true} quand les pairs
+marqués convergents sont exactement ceux de $X$. Alors $F$ est monotone
+($X \subseteq Y \Rightarrow F(X) \subseteq F(Y)$), l'itération $X_0 = \emptyset$,
+$X_{n+1} = X_n \cup F(X_n)$ stationne en au plus $|S| + 1$ tours sur
+$\lfp(X \mapsto X \cup F(X))$, et le résultat ne dépend pas de l'ordre de visite des
+composants ni des sites.
+\end{theoreme}
+\begin{proof}
+Marquer un site convergent ne fait que \emph{retirer} des éléments de \code{live(label)}
+pour les autres : moins de revivers à réfuter, chaque condition de la preuve est
+monotone décroissante en \code{live}, donc $F$ est monotone. La suite $X_n$ est croissante
+dans un ensemble fini, d'où la terminaison ; un tour utile marque au moins un site, d'où la
+borne. L'indépendance de l'ordre est celle de tout plus petit point fixe d'un opérateur
+monotone sur un treillis fini (\cref{def:point-fixe}) ; le code le note à
+\src{src/engine/churn.rs}{446}{449}.
+\end{proof}
+
+\begin{remarque}
+L'itération est \emph{à la Jacobi} : \code{peers} est construit une fois au début de chaque
+tour à partir de \code{convergent}, avant la boucle interne. Un site prouvé au tour $n$
+n'est vu convergent par ses pairs qu'au tour $n+1$. Le résultat n'en dépend pas (théorème),
+mais un déroulé à la main doit compter les tours ainsi.
+\end{remarque}
+
+\begin{table}[htbp]\centering\footnotesize
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{36mm}>{\raggedright\arraybackslash}p{30mm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X}
+\toprule
+Site & Gardes & Tour 1 & Tour 2 \\
+\midrule
+\code{setReq(false)} (effet 2, bloc 3) & $(\code{req}, \top)$ & \checkmark{} (a) : $\code{req} \mapsto \code{false}$ tue ; aucun reviver de \code{req} & --- \\
+\addlinespace
+\code{setSeeded(undefined)} (effet 2, \code{.then}) & $(\code{req}, \top)$ & \checkmark{} (a) : \code{co} $= \{\code{setReq}\}$ tue ; (b) : le reviver \code{setSeeded(version.id)} réécrit \code{seeded}, \code{req} garde \code{false} & --- \\
+\addlinespace
+\code{setSeeded(version.id)} (effet 3, bloc 3) & $(\code{seeded} \equiv$ \newline $\code{version.id}, \bot)$ & $\times$ (a) tient ; (b) : le reviver \code{setSeeded(undefined)} est encore vivant dans le snapshot & \checkmark{} \code{live(seeded)} $= \emptyset$ \\
+\midrule
+\code{changed} & & \code{true} & \code{true} ; tour 3 : \code{false}, sortie \\
+\bottomrule
+\end{tabularx}
+\caption{Les tours du point fixe des sites sur l'\cref{ex:churn-reviver}. $(c, \top)$ note une garde $c$ prise vraie, $(c, \bot)$ prise fausse ; (a) et (b) renvoient aux deux conditions de la \cref{def:churn-kill-set}. Le déroulé a été observé en instrumentant une copie de \code{ChurnGraph::build} (une trace par site et par tour) : les deux premiers sites sont marqués au tour 1, le troisième au tour 2, et le tour 3 ne change rien. Sur \file{reviver_unreset.tsx}, le même instrument montre un seul tour, sans aucun site marqué.}
+\label{tab:churn-iterations}
+\end{table}
+
+Détaillons la case $\times$ du tour 1, la seule subtile. Le site \code{setSeeded(version.id)}
+satisfait (a) par le bras relationnel : la garde est
+\code{BinOp { Eq, seeded, version.id }} prise fausse, l'écriture pose \emph{verbatim}
+\code{version.id} dans \code{seeded}, ni l'un ni l'autre n'est une orthographe fraîche
+(\code{version.id} est un membre de prop) : après l'écriture l'égalité est vraie, la
+branche fausse est morte. Pour (b), \code{live(seeded)} contient \code{setSeeded(undefined)}
+tant qu'il n'est pas marqué. Ses faits : $(\code{req}, \top)$, mais \code{req} est un état,
+il ne tient pas, \code{facts} $= []$. On réécrit $\code{seeded} \mapsto \code{undefined}$
+avec \code{scope = None} (autre corps) : le bras relationnel est inapplicable, le bras
+membre aussi (le chemin est le slot nu), et le bras valeur rétrécit
+\code{seeded === version.id} --- dont le côté droit n'est pas un littéral : l'environnement
+est inchangé, rien n'est $\Bot$. Échec. Au tour 2, le snapshot marque le reviver
+convergent : \code{live(seeded)} est vide, la boucle sur les revivers ne tourne pas,
+\code{true}.
+
+\subsection{Pourquoi pas le plus grand point fixe}
+
+On pourrait partir de \og tous convergents\fg{} et retirer les sites que la preuve réfute.
+Ce plus grand point fixe est \emph{insound}, et le contre-exemple est court.
+
+\begin{exemple}{Deux écritures qui se raniment l'une l'autre}{churn-mutual}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch15/null_updater.tsx}},label={lst:churn-null-updater}]
+import { useState, useEffect } from 'react';
+export function NullUpdater() {
+  const [s, setS] = useState(null);
+  useEffect(() => { if (!s) setS({ fresh: true }); }, [s]);
+  useEffect(() => { if (s) setS(prev => null); }, [s]);
+  return <div>{s ? 'y' : 'n'}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+  NullUpdater  (3 hooks)  null_updater.tsx
+    warn   infinite-loop  [hook:0]  (line 4:2)  this effect may store a fresh reference into state `s` which its deps react to: possible infinite render loop
+       → a fresh value is written to state `s` here [hook:1] (line 4:28)
+\end{sortie}
+\end{exemple}
+
+Appelons $A$ le site \code{setS({...})} (garde \code{!s}) et $B$ le site
+\code{setS(prev => null)} (garde \code{s}). Chacun meurt sous sa propre écriture : $A$ pose
+une référence truthy, $B$ pose \code{null}. Chacun est ranimé par l'autre : $B$ remet
+\code{s} falsy, $A$ le remet truthy. \emph{Si l'on suppose $B$ convergent}, $A$ n'a plus de
+reviver vivant et est prouvé ; \emph{si l'on suppose $A$ convergent}, $B$ est prouvé. Le
+plus grand point fixe contient donc $\{A, B\}$ : les deux arêtes seraient tuées et le
+programme --- qui boucle \code{{...}} $\to$ \code{null} $\to$ \code{{...}} $\to$ … dès le
+montage --- serait silencieux. Le plus petit point fixe ne marque ni l'un ni l'autre : au
+tour 1, chacun voit l'autre vivant et échoue ; rien ne change ; sortie. L'arête
+\code{self_slot} $s \to s$ reste et le bras self-churn émet le \Warning{} observé.
+
+\begin{theoreme}{Soundness du plus petit point fixe}{churn-lfp-sound}
+Sous les hypothèses d'invariance, tout site de $\lfp$ tire un nombre fini de fois dans
+toute boucle automatique. Le plus grand point fixe de $F$ n'a pas cette propriété.
+\end{theoreme}
+\begin{proof}
+Par récurrence sur le tour $n$ où un site $p$ entre dans $X_n$. Les pairs que la preuve
+de $p$ tient pour convergents sont dans $X_{n-1}$ et, par hypothèse de récurrence, tirent
+un nombre fini de fois ; le \cref{lem:churn-kill-sound} conclut pour $p$. Pour la
+seconde partie, l'\cref{ex:churn-mutual} exhibe $\{A, B\} \subseteq \mathrm{gfp}$ avec une
+boucle infinie.
+\end{proof}
+
+\begin{decision}[ADR-42 \S6, amendement \issue{160}]
+Le point fixe \emph{minimal} est un choix argumenté en une phrase dans le code même :
+\og a greatest fixpoint would read two sites that revive each other as convergent, which
+is exactly a loop\fg{} (\src{src/engine/guards.rs}{41}{42}). L'alternative --- une colonne
+\code{settles} sur la ligne, calculée une fois --- avait déjà été refusée à la tranche 4 :
+deux appelants demandent deux valeurs (voir ci-dessous), et désormais la réponse dépend
+aussi de l'état des autres sites, ce qu'une colonne ne peut porter. Mesure du commit
+\snapshotCommit{} (\file{docs/precision-log.md}) : 1\,499 $\to$ 1\,498 sur le corpus, trois
+lignes retirées et deux ajoutées, dont deux sont une même ligne reformulée.
+\end{decision}
+
+Le programme frère \file{reviver_unreset.tsx} (test
+\code{a_reviver_that_keeps_its_flag_still_revives}), où \code{setReq(false)} est retiré et
+\code{req} vaut \code{true} pour toujours, donne un \Warning{} sur \code{seeded} : le
+reviver différé n'a plus de \code{co} qui tue sa garde $(\code{req}, \top)$, il reste vivant,
+et \code{setSeeded(version.id)} n'est jamais prouvé. La preuve ne lit pas une garde comme
+mourant sous une écriture qui n'a pas lieu.
+
+\subsection{Le kill des arêtes : la partie référence}
+
+Le point fixe des sites fait, l'étape des arêtes réutilise la même preuve, mais avec une
+autre valeur propre.
+
+\rustsnippet[label={lst:churn-killed}]{src/engine/churn.rs}{502}{529}{le kill d'une arête}
+
+\rustsnippet[label={lst:churn-reference-part}]{src/engine/written.rs}{202}{209}{\code{reference_part}}
+
+Une arête affirme un churn de \emph{référence} : ce qu'elle transporte d'un rendu à l'autre
+est la partie référence de la valeur écrite. Le site est donc lu, pour sa propre écriture,
+comme \code{reference_part(w.written.value)} --- les parties primitives, qui ne peuvent
+pas échouer \code{Object.is} fraîchement, sont abandonnées, ce qui évite de perdre la
+preuve à un $\Top$ résiduel ; une partie référence $\Bot$ donne $\Bot$ (aucune référence
+ne peut être stockée, le churn prétendu est vide). Les \emph{autres} sites, eux, raniment avec
+tout ce qu'ils stockent, \code{null} compris : dans la preuve, \code{other.value} est la
+valeur entière. Le point fixe des sites, à l'inverse, lit la valeur entière du site propre
+(\code{peers[k].value}) : il répond à la question \og ce site tire-t-il une fois ?\fg{} et
+non \og cette arête est-elle un churn ?\fg. Deux appelants, deux valeurs : c'est
+l'argument d'\adr{42} \S6 (tranche 4) pour une fonction plutôt qu'une colonne.
+
+\begin{piege}
+Le \code{killed} de l'\cref{lst:churn-killed} est une disjonction :
+\code{convergent[idxs[k]] || converges_under_all_writes(..., &own_value, ...)}. Un site que le
+point fixe n'a pas marqué (parce que sa valeur \emph{entière}, \code{null} compris, ne tue
+pas ses gardes) peut encore voir son \emph{arête} tuée, parce que la partie référence de sa
+valeur, elle, les tue. Le premier disjoint, lui, est un raccourci : un site déjà prouvé
+convergent n'a pas besoin d'une seconde preuve, puisque ne pas tirer implique ne pas
+churner. Ne pas confondre les deux questions en lisant une trace : \og site non
+convergent\fg{} n'implique pas \og arête présente\fg.
+\end{piege}
+
+% ---------------------------------------------------------------------------
+\section[Plusieurs composants]{Plusieurs composants : lignes étrangères, \code{props_hold}, plafond Warning}
+\label{sec:churn-cross}
+
+\subsection{Un setter passé en prop}
+
+\begin{exemple}{Un enfant qui réécrit l'état de son parent}{churn-cross}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch15/cross.tsx}},label={lst:churn-cross}]
+import { useState, useEffect } from 'react';
+export function Parent() {
+  const [data, setData] = useState({ n: 0 });
+  return <Child value={data} onUpdate={setData} />;
+}
+function Child({ value, onUpdate }) {
+  useEffect(() => { onUpdate({ n: value.n, seen: true }); }, [value]);
+  return <div/>;
+}
+\end{lstlisting}
+\begin{sortie}
+  Child  (1 hooks)  /tmp/ch15/cross.tsx
+    warn   cross-component-infinite-loop  [hook:0]  (line 7:2)  this effect calls `onUpdate`, a state setter of parent `Parent` (its deps do not provably gate it, so the effect can re-run every render). Parent re-renders → child re-renders → effect fires again: infinite loop
+  Parent  (1 hooks)  /tmp/ch15/cross.tsx  ✓
+\end{sortie}
+\begin{sortie}
+=== component Child (ComponentId(0))
+  slot=0 owner=Some("Parent") setter=onUpdate line=Some(7) region=Effect(0) phase=Effect block=Some(0) fresh=Fresh value.ref=PerRender
+-- effect_triggers
+  hook=0 dep=0 slot=(Parent, 0) exact=false
+=== churn graph
+  edge#0 (Parent, 0) -> (Parent, 0) strength=May carrier=Child effect=0 line=Some(7) no_deps=false self_slot=false
+  cycle edges=[0] all_must=false cross_component=true
+\end{sortie}
+\end{exemple}
+
+Dans l'environnement de \code{Child}, \code{onUpdate} vaut
+\code{ComponentSetter(Parent, 0)} (passe descendante, \cref{chap:inter-composants}) : la
+ligne d'écriture est \emph{étrangère}, \code{owner=Some("Parent")}, et \code{node_of} la
+place sur le nœud \code{(Parent, 0)}. Le dep \code{value} est un prop dont la valeur est
+\code{Versioned({(Parent, 0)})} : le déclencheur est \code{exact=false}. Trois
+conséquences s'enchaînent :
+\begin{enumerate}
+  \item l'arête est \code{May} (\code{versioned}, \srcline{src/engine/churn.rs}{592}) ;
+  \item elle n'est pas \code{self_slot} : la condition \code{x == node && x.0 == f.comp}
+        (\srcline{src/engine/churn.rs}{589}) échoue car le slot appartient à \code{Parent}
+        et l'effet à \code{Child} ; elle entre donc dans la recherche de cycles, où elle
+        forme un cycle de longueur 1 ;
+  \item \code{make_cycle} compte deux composants (propriétaire du nœud et porteur) :
+        \code{cross_component = true}.
+\end{enumerate}
+
+\begin{decision}[ADR-18, plafond Warning]
+Un cycle qui traverse deux composants est plafonné à \Warning{} et nommé
+\regle{cross-component-infinite-loop}. La raison est structurelle : le must-rerun
+à travers un prop est \emph{indémontrable} au commit \snapshotCommit, parce qu'un dep
+qui est un prop est \code{Versioned}, jamais le slot exact --- le composant enfant ne voit
+pas \emph{quel} champ du parent a bougé. \adr{18} note la voie d'amélioration (une
+provenance de prop entier au site d'appel JSX) sans la prendre.
+\end{decision}
+
+Le diagnostic observé ci-dessus n'est pourtant pas celui du bras graphe : c'est le
+\emph{bras cross-component historique} de \regle{infinite-loop} qui parle (\og this effect
+calls \code{`onUpdate`}, a state setter of parent\fg). L'effet étant déjà dans
+\code{reported_effects}, le bras graphe le saute
+(\src{src/rules/impls/infinite_loop.rs}{277}{279}) : un rapport par effet et par classe de
+panne.
+
+\subsection{Quand les props bougent : \code{props_hold}}
+
+La preuve de convergence lit des faits sur les props (\og \code{p} tient\fg) : un prop n'est
+pas un état du composant. Mais un prop \emph{est} un état du parent, et si la boucle passe
+par le parent, il bouge.
+
+\begin{exemple}{Un cycle qui entre par les props}{churn-props-move}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch15/props_move.tsx}},label={lst:churn-props-move}]
+import { useState, useEffect } from 'react';
+function Child({ p, onChange }: { p: any; onChange: (v: any) => void }) {
+  const [x, setX] = useState(null);
+  const [s, setS] = useState(null);
+  useEffect(() => { setX({ p }); }, [p]);
+  useEffect(() => { if (p && !s) setS({ v: 1 }); }, [x]);
+  useEffect(() => { if (!p) setS(null); }, [x]);
+  useEffect(() => { onChange(s ? null : { k: 1 }); }, [s]);
+  return null;
+}
+export function Parent() {
+  const [p, setP] = useState<any>({ k: 1 });
+  return <Child p={p} onChange={setP} />;
+}
+\end{lstlisting}
+\begin{sortie}
+  Child  (6 hooks)  props_move.tsx
+    warn   cross-component-infinite-loop  [hook:2]  (line 5:2)  these effects may form a state-update cycle (`x` → `s` → `p` of `Parent` → `x`) where each step may store a fresh reference that re-runs the next effect: possible infinite render loop
+       → a fresh value is written to state `x` here [hook:2] (line 5:20)
+       → cycle continues: this effect freshly stores state `s` [hook:3] (line 6:33)
+       → cycle continues: this effect freshly stores state `p` of `Parent` [hook:5] (line 8:20)
+    warn   cross-component-infinite-loop  [hook:3]  (line 6:2)  these effects may form a state-update cycle (`x` → `s` → `p` of `Parent` → `x`) …
+    warn   cross-component-infinite-loop  [hook:5]  (line 8:2)  this effect calls `onChange`, a state setter of parent `Parent` (its deps do not provably gate it, so the effect can re-run every render). …
+\end{sortie}
+Test : \code{props_move_on_a_cycle_}\allowbreak\code{that_enters_through_another_edge}.
+\end{exemple}
+
+Le cycle est $(\code{Parent}, p) \to x \to s \to (\code{Parent}, p)$ : il \emph{entre} dans
+\code{Child} par le prop \code{p} (arête versionnée vers \code{x}) et en \emph{sort} par le
+setter-prop \code{onChange}. L'arête $x \to s$ est locale, et les deux sites de \code{s}
+tirent sous \code{p} et \code{!p} : si ces faits \emph{tenaient}, ils se contrediraient et
+la garde \code{!s} mourrait --- l'arête serait tuée et le cycle perdu. Or \code{p} bouge le
+long du cycle. La \cref{fig:churn-props-move} dessine le graphe.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=12mm and 20mm]
+  \node[noeud] (x) at (0,0) {$x$};
+  \node[noeud,right=of x] (s) {$s$};
+  \node[noeud] (p) at (2.2,-2.2) {$p$};
+  \begin{scope}[on background layer]
+    \node[draw=ra-gray,dashed,rounded corners=4pt,fit={(x) (s)},inner sep=6mm,label={[etiquette]above left:\code{Child}}] {};
+    \node[draw=ra-gray,dashed,rounded corners=4pt,fit={(p)},inner sep=5mm,label={[etiquette]below:\code{Parent}}] {};
+  \end{scope}
+  \draw[flechemay] (x) -- node[etiquette,above] {\code{e3}, sous \code{p && !s}} (s);
+  \draw[flechemay] (s) -- node[etiquette,right,xshift=1mm] {\code{e5}, via \code{onChange}} (p);
+  \draw[flechemay] (p) -- node[etiquette,left,xshift=-1mm] {\code{e2}, dep \code{p} versionné} (x);
+\end{tikzpicture}
+\caption{Le graphe de \file{props_move.tsx} : un cycle de trois arêtes \code{May} dont un nœud appartient à \code{Parent} (\code{cross_component}). \code{Child} porte les trois arêtes ; comme un de ses déclencheurs nomme un slot du parent, \code{props_hold} est faux et les faits sur \code{p} ne sont pas lus.}
+\label{fig:churn-props-move}
+\end{figure}
+
+La solution est un fait par composant, calculé avant toute preuve
+(\srcline{src/engine/churn.rs}{232}) :
+\code{props_hold = effect_triggers.iter().all(|t| t.slot.0 == comp)}. Aucun effet du
+composant ne réagit au slot d'un autre composant $\Rightarrow$ aucune boucle n'y entre par
+ses props $\Rightarrow$ ses props tiennent le long de toute boucle qui passe par ses arêtes.
+Un seul dep versionné par un slot du parent, et les props peuvent bouger sur \emph{tout}
+cycle qui traverse le composant, quelle que soit l'arête empruntée : les preuves ne lisent
+alors plus aucun fait sur eux (\code{Invariance::holds} rend \code{props_hold} pour un
+nom que rien ne lie, \srcline{src/engine/guards.rs}{353}). Ici \code{Child} a un
+déclencheur sur \code{(Parent, 0)}, donc \code{props_hold = false}, les faits \code{p} et
+\code{!p} sont écartés, aucune contradiction, l'arête $x \to s$ survit, le cycle est
+rapporté.
+
+\begin{remarque}
+Le programme reçoit \emph{trois} \Warning{} pour une seule boucle : deux du bras graphe
+(effets 2 et 3, porteurs d'arêtes) et un du bras cross-component historique (effet 5, qui
+appelle le setter du parent). La déduplication de \srcline{src/rules/impls/infinite_loop.rs}{277}
+ne joue que par effet : l'effet 5 est sauté par le bras graphe parce que déjà rapporté, les
+effets 2 et 3 ne le sont pas. C'est un choix de \adr{18} (\og un rapport par effet
+porteur\fg), pas un défaut.
+\end{remarque}
+
+\subsection{Ce qui ne remonte pas}
+
+Le graphe ne voit une écriture étrangère que si le parent a été analysé \emph{descendant}
+et que \code{ComponentSetter} a coulé jusqu'à l'enfant. Un parent analysé seulement en intra
+laisse l'enfant sans ligne étrangère, donc sans arête et sans
+\regle{cross-component-infinite-loop} (\issue{20}, \code{precision-fn}). Les Consequences
+d'\adr{42} l'enregistrent, en reprenant \adr{29}, comme affaiblissement connu : \og rows
+exist only for cycles the graph sees; prop-mediated edges need the parent slot flowed
+top-down (\#20)\fg.
+
+% ---------------------------------------------------------------------------
+\section{De l'arête au diagnostic : la frontière de certification}
+\label{sec:churn-certification}
+
+Le graphe dit \code{Must} ou \code{May} ; il ne \emph{frappe} rien. La sévérité est
+décidée côté règles, et jamais en faisant confiance à un booléen fourni par le graphe :
+elle est \emph{re-dérivée} au point de connaissance (\cref{chap:api-regles},
+\cref{def:certified}).
+
+\subsection{Le bras graphe et \code{must_effect_cycle}}
+
+\rustsnippet[label={lst:churn-arm3}]{src/rules/impls/infinite_loop.rs}{281}{292}{le bras multi-effets choisit la règle et demande la preuve}
+
+\rustsnippet[label={lst:churn-must-effect-cycle}]{src/rules/api/query.rs}{1002}{1031}{\code{must_effect_cycle} re-dérive les deux faits}
+
+\code{must_effect_cycle} recalcule depuis les arêtes brutes ce que \code{ChurnCycle} porte
+déjà : toutes les arêtes \code{Must} \emph{et} un seul composant impliqué. Si les deux
+tiennent, il \emph{frappe} (\code{Certified::mint}) une preuve \code{EffectCycleProof} dont
+la provenance est la première arête du cycle --- l'écriture qui relance l'effet porteur.
+Sinon \code{MustResult::None}, et le diagnostic est un \Warning. La règle choisit le nom
+selon \code{cycle.cross_component} et la sévérité selon la \emph{preuve} : un cycle
+cross-component tout-Must est possible (deux arêtes \code{Must} locales et une auto-arête
+étrangère, par exemple) et reste un \Warning, et sa formulation suit la preuve (\og may
+form\fg), pas \code{all_must} (\src{src/rules/impls/infinite_loop.rs}{294}{296}).
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{cccX}
+\toprule
+$|$cycle$|$ & \code{no_deps} & preuve & message (début) \\
+\midrule
+1 & oui & oui & \og this effect has no dependency array and stores a fresh reference … infinite render loop\fg \\
+1 & oui & non & \og … and may store a fresh reference … possible infinite render loop\fg \\
+1 & non & oui & \og this effect stores a fresh reference into state … which its own deps react to\fg \\
+1 & non & non & \og this effect may store a fresh reference … which its own deps react to\fg \\
+$\geq 2$ & --- & oui & \og these effects form a state-update cycle (\emph{chemin}) …\fg \\
+$\geq 2$ & --- & non & \og these effects may form a state-update cycle (\emph{chemin}) …\fg \\
+\bottomrule
+\end{tabularx}
+\caption{Les six formulations du bras graphe (\src{src/rules/impls/infinite_loop.rs}{298}{334}). La colonne \og preuve\fg{} est \code{cycle_proof.is_some()}, jamais \code{all_must}.}
+\label{tab:churn-messages}
+\end{table}
+
+Le témoin (\cref{def:witness}) est une étape \code{Write} (valeur \code{Fresh}) au
+\code{write_span} de l'arête portée, puis une étape \code{CycleEdge} par autre arête du cycle
+portée par le même composant : c'est la liste \og cycle continues\fg{} des sorties de ce
+chapitre. Le chemin \code{`a`}~→ \code{`b`}~→ \code{`a`} est rendu par \code{cycle_path}
+(\src{src/rules/helpers/cycles.rs}{54}{70}), qui nomme un slot étranger
+\code{`p` of `Parent`} (\code{node_display}) ; ces deux fonctions vivent côté règles
+\og parce qu'un nom d'affichage est un rendu, pas un fait\fg{} (doc de module,
+\src{src/rules/helpers/cycles.rs}{1}{8}).
+
+\subsection{Le bras self-churn re-dérive must-reach}
+
+\rustsnippet[label={lst:churn-arm4}]{src/rules/impls/infinite_loop.rs}{441}{460}{le bras self-churn ne fait pas confiance à \code{e.strength}}
+
+Le bras self-churn (\cref{chap:infinite-loop}) lit sa partition --- les arêtes du composant,
+de l'effet, non \code{no_deps}, de slot local vers slot local
+(\src{src/rules/impls/infinite_loop.rs}{427}{433}) --- et, pour une arête \code{self_slot},
+\emph{recalcule} l'ensemble des blocs d'écritures fraîches depuis \relation{slot_writers} et
+demande \code{must_on_all_paths}. \code{e.strength == Must} est une condition nécessaire
+(elle évite un calcul inutile), jamais suffisante : la preuve est frappée par la
+must-primitive. Les arêtes non \code{self_slot} de la partition alimentent l'\Info{}
+\og freshly recreates state … outside its deps\fg, supprimée pour les écritures
+\code{covered} par un cycle rapporté (\cref{ex:churn-dag}).
+
+\subsection{L'ancre \code{churn_cycles} des règles déclaratives}
+
+\rustsnippet[label={lst:churn-cyclerow}]{src/rules/helpers/cycles.rs}{72}{93}{une ligne \code{churn_cycles}}
+
+\begin{decision}[ADR-29]
+Les règles déclaratives (\cref{chap:regles-declaratives}) sont \emph{mono-ancre} : une règle
+parle d'un composant. Le graphe étant programme-entier, \adr{29} le \emph{projette} : une
+ligne par arête de cycle \emph{portée par un effet de ce composant}
+(\code{collect_cycle_rows}, \src{src/rules/helpers/cycles.rs}{101}{135}), avec le chemin
+rendu, deux booléens exacts (\code{cross_component}, \code{all_must} --- le may vit dans le
+graphe, pas dans la ligne) et le span de l'écriture comme identité (\adr{24}). Une arête
+sans span ne donne \emph{aucune} ligne : un canal de findings manqués enregistré, jamais
+un finding pointant nulle part. Refusés : un statut \og couvert nativement, ne compte
+pas\fg{} ; fusionner les deux bras (\adr{20} item 2). L'ancre est plafonnée à \Warning{}
+structurellement : seule la règle native atteint \Error, via \code{must_effect_cycle}.
+\end{decision}
+
+\subsection{Construit une fois}
+
+\code{ChurnGraph::build} lit tous les composants ; il est appelé une fois par programme,
+paresseusement, par l'accesseur \code{ProgramRelations::churn} : un \code{OnceLock} rempli
+à la première demande par \code{get_or_init}
+(\src{src/engine/program_relations.rs}{39}{40}, \cref{chap:relations}). Il est ensuite
+partagé par toutes les passes de règles. Un test le garantit par le compteur \code{BUILDS} :
+\code{churn_graph_is_built_once_per_program}
+(\src{src/rules/impls/infinite_loop.rs}{631}{684}). C'est la correction de \issue{86}, où le
+graphe était reconstruit par composant et la phase des règles devenait quadratique en nombre
+de composants.
+
+% ---------------------------------------------------------------------------
+\section{Limites connues au commit \snapshotCommit}
+\label{sec:churn-limites}
+
+\subsection{Faux négatifs connus}
+
+\begin{description}
+  \item[\issue{157}, valeur dérivée du slot écrit.] \code{const d = useMemo(() => ({...s}), [s]);
+        useEffect(() => setS(d), [d])} : la valeur écrite est \code{Versioned({s})}, que
+        \code{written::classify} lit \code{Not} frais (lecture d'\adr{17}) ; aucune arête,
+        boucle silencieuse. Le correctif naïf (\code{Versioned} $\Rightarrow$ \code{Maybe})
+        transforme le motif \og mirror state\fg{} --- recopier un prop dans un état --- en
+        \Warning{} massif ; l'issue reste ouverte, étiquetée \code{soundness-bug}.
+  \item[\issue{161}, l'hypothèse d'invariance.] Un appel sur des entrées qui tiennent est
+        supposé rendre la même valeur ; une navigation cachée dans un callee opaque ou dans
+        un objet routeur passé en prop n'est pas vue (\file{docs/limitations.md}).
+  \item[\issue{20}, parent analysé en intra.] Voir \cref{sec:churn-cross}.
+\end{description}
+
+\subsection{Faux positifs assumés (Warning au plus)}
+
+Un slot convergent que \emph{un autre composant} écrit aussi (résidu de \issue{39} :
+\code{foreign} n'est jamais tué) ; une garde sur le résultat d'un hook non inliné ou d'un
+store externe, lu comme bougeant (\issue{161}) ; un setter-prop typé primitif dont
+l'argument $\Top$ est lu comme référence possible (\issue{159}) ; une garde disjonctive ou
+arithmétique sur la valeur comparée (\issue{91}) ; un enfant rendu depuis un \code{.map} ou
+atteint via un composant intermédiaire, lu comme remontant (\issue{162}, côté fail-closed).
+
+\subsection{Granularité et forme du résultat}
+
+Le graphe est granulaire \emph{au slot} : savoir si l'écriture de $y$ par l'effet $A$ change
+le \emph{membre} de $y$ que lit le dep de l'effet $B$ est une propriété d'une paire
+d'arêtes, que ni une arête ni le kill ne portent ; seul le bras self-churn lit les membres
+(\code{can_retrigger}, bras membre de la preuve). Un seul cycle simple est reconstruit par
+SCC, et un cycle \code{May} qui recoupe une SCC tout-Must n'est pas rapporté
+(\cref{sec:churn-tarjan}).
+
+\subsection{Dette documentaire}
+
+Le code fait foi ; trois textes sont en retard sur lui. Les \og Consequences\fg{} d'\adr{42}
+disent encore que la condition d'écrivain unique est inchangée, alors que le dernier
+paragraphe et le \S6 amendé la déclarent remplacée. Le paragraphe de kill de
+\file{docs/relations.md} (\og under every other effect write of the slot in the
+component\fg) date de l'amendement \issue{154} : il ignore les sites de rendu et de memo et
+l'exclusion des revivers convergents. Enfin le commentaire d'en-tête du bras self-churn
+(\src{src/rules/impls/infinite_loop.rs}{393}{394}) dit de l'\Info{} que \og cross-effect
+cycles are not analyzed\fg, ce qui est faux depuis \adr{18} : l'\Info{} n'est plus émise que
+lorsqu'aucun cycle ne couvre l'écriture. Ordre de confiance : le code au commit
+\snapshotCommit, puis les doc-comments de module de \file{churn.rs} et \file{guards.rs}
+(réécrits dans ce commit), puis le dernier amendement d'\adr{42} \S6.
+
+% ---------------------------------------------------------------------------
+\begin{resume}
+\begin{itemize}
+  \item Le \textbf{graphe de churn} (\cref{def:churn-graph}) est un pli sur
+        \relation{slot_writers} et \relation{effect_triggers} : nœuds = slots qualifiés,
+        arête $x \to y$ = \og un changement de $x$ relance un effet qui stocke une référence
+        fraîche dans $y$\fg. \code{Must} = dep exact $\wedge$ \code{Fresh} $\wedge$ bloc
+        synchrone sur tous les chemins ; \code{May} sinon ; la colonne \code{phase} décide
+        (\cref{tab:churn-phases}), \code{Handler} ne porte rien. Un effet sans deps porte une
+        auto-arête ; \code{self_slot} isole le bras self-churn (\adr{20} item 2).
+  \item \textbf{Tarjan en deux passes} : sous-graphe \code{Must} (cycles \code{all_must},
+        \Error{} via \cref{lem:churn-must-cycle}) puis graphe entier (\Warning), en sautant
+        les régions couvertes ; un cycle simple par SCC.
+  \item Le \textbf{kill de convergence} retire une arête dont l'écriture tire au plus une fois.
+        \adr{18} l'autorisait sous condition d'écrivain unique (FP \issue{39}) ; \adr{42} \S6
+        le remplace par \code{converges_under_all_writes} : gardes mortes sous
+        l'\emph{ensemble tueur} (écriture propre et écritures synchrones co-exécutées sur la
+        chaîne) et sous chaque \emph{reviver vivant}, pris avec ses faits
+        \emph{invariants} (\cref{def:churn-kill-set,def:churn-invariance}).
+  \item Un \textbf{site} (\cref{def:churn-site}) est toute ligne non-handler d'un corps de
+        rendu, d'effet non mount-only ou de memo, plus les lignes étrangères d'un effet
+        mount-only d'un enfant que la boucle remonte (\code{stays_mounted}). Un slot
+        \code{foreign} n'est jamais tué.
+  \item Les sites convergents forment un \textbf{plus petit point fixe}
+        (\cref{thm:churn-lfp}) : un reviver prouvé n'est plus vivant. Le plus grand point
+        fixe lirait deux sites qui se raniment comme convergents (\cref{thm:churn-lfp-sound},
+        \cref{ex:churn-mutual}). L'arête est ensuite jugée sur la \emph{partie référence} de
+        sa valeur (\code{reference_part}).
+  \item \textbf{Cross-component} : lignes \code{owner = Some}, deps \code{Versioned} donc
+        jamais \code{Must}, \code{cross_component} plafonné à \Warning{} ; \code{props_hold}
+        interdit de lire des faits sur les props d'un composant où une boucle peut entrer.
+  \item \textbf{Frontière} : le graphe ne frappe rien ; \code{must_effect_cycle} et
+        \code{must_on_all_paths} re-dérivent la preuve ; l'ancre \code{churn_cycles}
+        (\adr{29}) projette le graphe par composant.
+  \item Fichiers : \file{src/engine/churn.rs} (\code{ChurnGraph::build}, \code{build_edges},
+        \code{find_cycles}, \code{stays_mounted}, \code{can_retrigger}),
+        \file{src/engine/guards.rs} (\code{WriteSite}, \code{converges_under_all_writes},
+        \code{Invariance}, \code{contradicts}), \file{src/engine/written.rs}
+        (\code{reference_part}), \file{src/rules/helpers/cycles.rs} (\code{CycleRow}),
+        \file{tests/effect_cycles.rs}.
+\end{itemize}
+Le \cref{chap:inter-composants} explique d'où viennent les lignes étrangères et les valeurs
+\code{Versioned} des props que ce chapitre a supposées ; le \cref{chap:infinite-loop}
+assemble les quatre bras de \regle{infinite-loop}.
+\end{resume}
+
+\section{Exercices}
+\label{sec:churn-exercices}
+
+\begin{exercice}{Prédire le graphe}{churn-predire}
+Sans lancer l'analyseur, donner les arêtes (extrémités, force, \code{self_slot},
+\code{no_deps}) et les cycles du programme suivant, puis la sévérité attendue.
+\begin{lstlisting}[language=TypeScript]
+export function Q({ p }: { p: boolean }) {
+  const [a, setA] = useState({});
+  const [b, setB] = useState({});
+  useEffect(() => { if (p) setB({ a }); else setB({}); }, [a]);
+  useEffect(() => { setA({ ...a, b }); }, [b, a]);
+  return null;
+}
+\end{lstlisting}
+\end{exercice}
+\begin{solution}
+$a \to b$ : deux écritures \code{Fresh} de \code{b} dans deux blocs dont l'union est sur tous
+les chemins, dep exact : \code{Must}. $b \to a$ : \code{Must} (écriture à l'entrée, dep
+exact). $a \to a$ : dep \code{a} exact et écriture de \code{a} : \code{Must},
+\code{self_slot = true}, et \code{write_can_retrigger} répond \code{true} (l'argument n'est
+pas un updater fonctionnel). Le cycle $a \to b \to a$ est tout-Must, mono-composant :
+\Error{} sur les deux effets par le bras graphe ; l'arête \code{self_slot} donne en plus une
+\Error{} du bras self-churn sur le second effet.
+\end{solution}
+
+\begin{exercice}{Un reviver stable}{churn-reviver-stable}
+Dans l'\cref{ex:churn-multi-writer}, remplacer \code{setB(null)} par \code{setB(CONST)}
+où \code{CONST} est un objet de module. L'arête $a \to b$ est-elle tuée ? Quelle ligne de
+\code{converges_under_all_writes} décide ?
+\end{exercice}
+\begin{solution}
+Oui, elle est tuée. Le reviver est vivant (non gardé, non convergent) ; mais sa valeur est
+une référence \code{Stable}, truthy, et la garde \og \code{b} falsy\fg{} devient bien $\Bot$
+sous cette réécriture : le second \code{dead_once_written}
+(\srcline{src/engine/guards.rs}{253}) réussit. Observé sur \file{/tmp/ch15/const_reviver.tsx}
+(\code{const CONST = { src: 'const' }} au niveau du module) : plus aucun cycle, seule
+reste l'\Info{} \og freshly recreates state \code{`a`} outside its deps\fg{} sur l'effet
+qui écrit \code{a}. Piège inversé : l'exercice teste que le lecteur
+n'applique pas la condition d'écrivain unique d'\adr{18}, qui aurait gardé l'arête ; la
+preuve multi-site l'enlève, à raison, puisque \code{CONST} ne remet jamais \code{b} à vide.
+\end{solution}
+
+\begin{exercice}{Plus grand point fixe}{churn-gfp}
+Dérouler l'itération \og tous convergents, puis retirer\fg{} sur \file{mutual.tsx}
+(\code{if (cond) setS(null); if (!s) setS({...})} dans un seul effet) et sur
+\file{null_updater.tsx}. Sur lequel des deux le plus grand point fixe diffère-t-il du plus
+petit ? Pourquoi ?
+\end{exercice}
+\begin{solution}
+Sur \file{null_updater.tsx} seulement : chacun des deux sites y meurt sous sa propre
+écriture et n'est réfuté que par l'autre, donc $\mathrm{gfp} = \{A, B\}$ et
+$\lfp = \emptyset$. Dans \file{mutual.tsx}, la garde \code{cond} du site
+\code{setS(null)} est un prop qui tient : elle ne meurt sous aucune écriture de \code{s},
+le site est réfuté quel que soit l'état de l'autre, puis il ranime l'autre ; les deux
+points fixes sont vides.
+\end{solution}
+
+\begin{exercice}{Pourquoi jamais Must}{churn-jamais-must}
+Expliquer, à partir de l'\cref{lst:churn-dep-edges}, pourquoi l'arête de
+l'\cref{ex:churn-cross} ne peut pas être \code{Must} ni \code{self_slot}, puis proposer ce
+qu'il faudrait au moteur pour prouver un must-rerun à travers un prop.
+\end{exercice}
+\begin{solution}
+Le dep \code{value} est un prop : sa valeur est \code{Versioned({(Parent, 0)})}, la ligne
+\relation{effect_triggers} est \code{exact = false}, le slot entre donc dans
+\code{f.versioned} et la seule poussée possible est \code{push(x, EdgeStrength::May, ...)}
+(\srcline{src/engine/churn.rs}{592}). \code{self_slot} exige \code{x.0 == f.comp}
+(\srcline{src/engine/churn.rs}{589}) : le nœud appartient à \code{Parent}, l'effet à
+\code{Child}. Pour un must-rerun, il faudrait savoir que le prop \emph{est} le slot entier
+du parent, et non une valeur seulement versionnée par lui : la voie qu'\adr{18} nomme sans
+la prendre, une provenance de prop entier au site d'appel JSX.
+\end{solution}
+
+\begin{exercice}{Un enfant dans une liste}{churn-map}
+Modifier \file{stays_mounted.tsx} pour rendre \code{<Child/>} depuis
+\code{items.map(i => <Child key={i} onReady={setS}/>)} avec \code{items} un prop. Que
+répond \code{stays_mounted} et pourquoi ? Est-ce un FP ou un FN potentiel ?
+\end{exercice}
+\begin{solution}
+\code{false} : l'élément est dans une closure (\code{ok &= !closure},
+\srcline{src/engine/churn.rs}{405}) --- la boucle peut ajouter un élément et monter un
+nouvel enfant. La ligne étrangère devient un site, \code{(Parent, 0)} est \code{foreign},
+l'arête \code{self_slot} survit : \Warning. Côté fail-closed de \issue{162}, un FP possible,
+jamais un FN. Observé (\file{/tmp/ch15/map_child.tsx}) : le \Warning{} \og this effect may
+store a fresh reference into state \code{`s`} which its deps react to\fg{}, là où
+\file{stays_mounted.tsx} est \og verified\fg.
+\end{solution}
+
+\begin{exercice}{Mirror state}{churn-mirror}
+(Avancé.) Proposer une approche de \issue{157} qui rende \code{setS(derived)} avec
+\code{derived = useMemo(() => ({...}), [s])} visible du graphe sans transformer
+\code{setLocal(propValue)} en \Warning. Indication : distinguer \code{Versioned} par un
+slot \emph{du même composant} écrit par l'effet, et s'appuyer sur la preuve de convergence
+plutôt que sur la fraîcheur.
+\end{exercice}

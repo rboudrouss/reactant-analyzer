@@ -1,0 +1,1043 @@
+% Chapitre 05 — Le front-end : oxc et la détection des composants, hooks et utilitaires
+% Dossier source : notes/01-lowering-detection.md (intégral), code au commit e67b10a.
+% Sorties observées avec target/debug/reactant (commit e67b10a) sur des fichiers
+% placés sous /tmp/ch05/ et /tmp/ra-ex/ (exemples du dossier, rejoués).
+\chapter{Le front-end : oxc et la détection des composants, hooks et utilitaires}
+\label{chap:frontend-detection}
+
+\begin{objectifs}
+  \item Savoir ce que le parseur oxc livre au projet (arène, \code{Program<'a>}, spans, \code{ParserReturn}) et pourquoi un fichier dont le parseur a récupéré une erreur est quand même analysé.
+  \item Connaître le contrat du front-end : ce qui entre (un AST par fichier), ce qui sort (des IR possédées et des faits de module), et la frontière \og aucun domaine ne voit l'AST\fg{}.
+  \item Lire le marcheur commun \code{detect_fns}, le type \code{Candidate} et les trois prédicats qui définissent un \terme{composant}, un \terme{hook custom} et un \terme{utilitaire}.
+  \item Comprendre deux faux négatifs corrigés (\issue{5}, \issue{122}) et la leçon qu'ils portent : au front-end, une détection trop étroite est un défaut de soundness.
+  \item Suivre la provenance d'un appel de hook (\code{HookOrigin}, \code{ImportCtx}, \code{classify_callee}), les faits de module (constantes, contextes, directives, arêtes d'import) et l'identité d'un callee JSX (\code{CompOrigin}, \code{resolve_child}).
+  \item Savoir énumérer les formes que le front-end ne voit pas, et dire pour chacune si l'utilisateur en est averti.
+\end{objectifs}
+
+\prerequis{\cref{chap:tour-architecture} (le pipeline et ses couches), \cref{chap:react-modele} (composant, règles des hooks, Context, Server Components), \cref{chap:interpretation-abstraite} (soundness, \cref{def:soundness} ; fait must / may, \cref{def:must-may}).}
+
+Tout commence par une question qui semble triviale : dans ce fichier, quelles fonctions sont des composants ? Considérons le programme suivant.
+
+\begin{lstlisting}[language=TypeScript,caption={Quatre fonctions de niveau supérieur (\file{/tmp/ch05/classes/App.tsx})},label={lst:frontend-classes}]
+import { useState, useEffect } from "react";
+
+export function formatCount(n: number) {
+  return `count: ${n}`;
+}
+
+export function useCounter(initial: number) {
+  const [n, setN] = useState(initial);
+  return { n, inc: () => setN(n + 1) };
+}
+
+export function Counter() {
+  const { n, inc } = useCounter(0);
+  return <button onClick={inc}>{formatCount(n)}</button>;
+}
+
+export function Beacon({ id }: { id: string }) {
+  const [n, setN] = useState(0);
+  useEffect(() => { setN(n + 1); });
+  return null;
+}
+
+function helper() {
+  return <span />;
+}
+\end{lstlisting}
+
+Un lecteur React répond sans hésiter : \code{Counter} et \code{Beacon} sont des composants, \code{useCounter} est un hook custom, \code{formatCount} et \code{helper} sont des fonctions ordinaires. Mais sur quoi repose cette réponse ? \code{Beacon} ne renvoie jamais de JSX ; \code{helper} en renvoie, mais son nom commence par une minuscule ; rien, dans JavaScript, ne distingue une fonction \og composant\fg{} d'une autre. React lui-même n'en sait rien avant de l'appeler : c'est le site d'usage \code{<Beacon/>} qui en fait un composant. Un analyseur statique, lui, doit trancher \emph{avant} toute exécution, fichier par fichier, et sa réponse décide de ce qui sera analysé. Voici ce que \reactant{} répond :
+
+\begin{sortie}
+$ reactant check /tmp/ch05/classes --no-color --show-clean
+  Beacon  (2 hooks)  /tmp/ch05/classes/App.tsx
+    warn   infinite-loop  [hook:0]  (line 19:2)  this effect keeps pushing state `n` to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
+  Counter  (1 hooks)  /tmp/ch05/classes/App.tsx  ✓
+
+⚠  1 warning(s) across 1 file(s).
+\end{sortie}
+
+\noindent et, avec \code{--verbose}, le graphe de symboles construit sur les IR abaissées :
+
+\begin{sortie}
+[verbose] symbol graph: 3 nodes, topo order = [useCounter@/tmp/ch05/classes/App.tsx, Counter@/tmp/ch05/classes/App.tsx, Beacon@/tmp/ch05/classes/App.tsx]
+[verbose] 2 components analyzed
+\end{sortie}
+
+Deux composants, un hook ; \code{helper} n'apparaît nulle part. Le reste du chapitre explique pourquoi, et pourquoi ce \og nulle part\fg{} est la décision la plus lourde de conséquences de tout le pipeline : une fonction que le front-end ne reconnaît pas n'est pas analysée approximativement, elle n'est \emph{pas analysée du tout}.
+
+Le sous-système tient dans dix fichiers de \file{src/lowering/} : \file{mod.rs} (565 lignes, la façade et les deux lowerers principaux), \file{detector.rs} (169, le marcheur commun), \file{component_detector.rs} (352), \file{hook_detector.rs} (162), \file{utility_detector.rs} (114), \file{jsx_detect.rs} (63), \file{hook_call_detect.rs} (109), \file{module_facts.rs} (163), \file{import_resolution.rs} (262) et \file{utility_lowerer.rs} (62). Le lowering des \emph{corps} (\file{cfg_builder.rs}, \file{expr_lower.rs}, \file{hook_extractor.rs}) est l'objet du \cref{chap:lowering-cfg} ; nous le traitons ici comme une boîte noire, sauf là où le front-end lui transmet une information.
+
+% ---------------------------------------------------------------------------
+\section{oxc en quelques pages}
+\label{sec:frontend-oxc}
+
+\subsection{Une arène par fichier}
+
+Le projet ne contient pas de parseur : il utilise oxc~\cite{oxc}, un ensemble de crates Rust pour l'outillage JavaScript et TypeScript. Quatre crates sont déclarées dans \file{Cargo.toml}, toutes en version 0.138.0 : \code{oxc_allocator}, \code{oxc_parser}, \code{oxc_ast} et \code{oxc_span}. Le projet \emph{n'utilise pas} \code{oxc_semantic} : il n'a ni table de symboles ni analyse de portées fournies par oxc. Toutes les résolutions de noms que ce chapitre décrit sont donc \emph{syntaxiques} et limitées au niveau supérieur du module ; nous verrons ce que cela coûte.
+
+\code{oxc_allocator::Allocator} est une \terme{arène} (allocateur \og bump\fg{}) : tous les nœuds de l'AST y sont alloués, et libérés d'un bloc quand l'arène est détruite. D'où la durée de vie \code{'a} qui décore tous les types d'oxc : \code{Program<'a>}, \code{Statement<'a>}, \code{Expression<'a>}, \code{FunctionBody<'a>}, \code{FormalParameters<'a>}. Un nœud emprunte l'arène et ne peut pas lui survivre. Voici la boucle qui, dans \file{src/resolver/mod.rs}, parse chaque fichier de l'analyse :
+
+\rustsnippet[label={lst:frontend-parse}]{src/resolver/mod.rs}{289}{312}{le parse d'un fichier et le traitement des erreurs}
+
+L'arène est créée \emph{dans} la boucle (\srcline{src/resolver/mod.rs}{289}) : l'AST d'un fichier ne survit pas à son itération, et la mémoire de pointe consacrée à l'AST est celle d'un seul fichier. Tout ce que le front-end veut garder doit donc être recopié dans des structures \emph{possédées} (\code{String}, \code{PathBuf}, \code{Arc}) avant la fin de l'itération. C'est exactement ce que font les IR : \code{ComponentIR}, \code{HookIR}, \code{FunctionIR}, \code{ModuleFacts} n'ont aucun paramètre de durée de vie.
+
+\subsection{\code{ParserReturn} : \code{panicked} n'est pas \code{diagnostics}}
+
+\code{Parser::new(&alloc, source, source_type).with_options(ParseOptions::default()).parse()} renvoie un \code{ParserReturn}, dont le projet lit trois champs : \code{program}, \code{diagnostics} et \code{panicked}. La documentation d'oxc précise le sens du dernier : il vaut \code{false} si le parse a réussi \emph{ou si le parseur a pu récupérer d'une erreur de syntaxe} ; quand il vaut \code{true}, \code{program} est vide et \code{diagnostics} contient au moins une erreur.
+
+La distinction est décisive, et le commentaire de \src{src/resolver/mod.rs}{293}{298} (\cref{lst:frontend-parse}) en donne la raison : sauter un fichier dès que la liste de diagnostics est non vide ferait disparaître des fichiers entiers de l'analyse, alors que le programme récupéré est parfaitement abaissable. Ce serait un faux négatif, le seul type d'erreur que le projet s'interdit (\cref{def:soundness}), et un faux négatif croissant, puisqu'oxc déplace progressivement des vérifications sémantiques de TypeScript dans le parseur. Le projet ne saute donc que les fichiers \code{panicked}, et garde la trace des deux cas dans \code{ParseError} (\src{src/resolver/mod.rs}{164}{178}), dont le drapeau \code{analyzed} vaut \code{true} quand le parseur a récupéré et que le fichier a quand même été abaissé : \og a recovered syntax error is noise, while a dropped file means every finding it held is a silent false negative\fg{}.
+
+\begin{exemple}{Erreur récupérée contre fichier abandonné}{frontend-parse-errors}
+Le fichier \file{/tmp/ch05/parse/Broken.tsx} contient, au-dessus d'un composant \code{Loop} qui boucle, la ligne \code{function helper(a?: number = 1) { return a; }}, qu'oxc refuse (un paramètre ne peut être à la fois optionnel et initialisé) mais dont il récupère :
+\begin{sortie}
+[parse error] /tmp/ch05/parse/Broken.tsx: A parameter cannot have a question mark and an initializer.
+  Loop  (2 hooks)  /tmp/ch05/parse/Broken.tsx
+    warn   infinite-loop  [hook:0]  (line 7:2)  this effect keeps pushing state `n` to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
+
+⚠  1 warning(s) across 1 file(s).
+\end{sortie}
+Le fichier est signalé \emph{et} analysé : le défaut de \code{Loop} est trouvé. À l'inverse, \file{/tmp/ch05/parse2/Dead.tsx} (un JSX tronqué, \texttt{return <p>\{</p>;} sans accolade fermante) fait paniquer le parseur :
+\begin{sortie}
+[skipped] /tmp/ch05/parse2/Dead.tsx: Unexpected token, the file was not analyzed
+⚠  0 file(s), no components detected, and parts of this run were not analyzed.
+   not analyzed:
+     • 1 file(s) could not be parsed and were dropped, so nothing in them was analysed
+\end{sortie}
+Le fichier perdu devient un \emph{blind spot} (\og not analyzed\fg{}), et le rapport refuse de se déclarer propre.
+\end{exemple}
+
+\begin{piege}
+Un fichier récupéré est abaissé depuis un AST \emph{partiel} : oxc a pu sauter une partie du texte pour se resynchroniser, et les fonctions de cette partie manquent sans autre signal que la ligne \code{[parse error]} du canal humain. En JSON, seuls les fichiers \emph{sautés} deviennent un blind spot \code{unparsed-files} (\src{src/driver/mod.rs}{239}{259}). Un fichier \code{[parse error]} n'est donc pas une garantie de couverture complète.
+\end{piege}
+
+\subsection{Le type de source se choisit par extension}
+
+Le troisième argument du parseur est un \code{oxc_span::SourceType} : TypeScript ou JavaScript, JSX ou non, module ou script. Le projet le choisit sur la seule extension du fichier :
+
+\rustsnippet{src/resolver/mod.rs}{193}{200}{\code{source_type_for}}
+
+Deux décisions s'y lisent, que le commentaire de la fonction explique (\src{src/resolver/mod.rs}{180}{192}). D'abord, \file{.js} et \file{.jsx} sont \emph{tous deux} JSX-activés : du JSX dans un fichier non-JSX fait paniquer le parseur, et le commentaire rappelle que trois composants réels d'excalidraw ont été perdus ainsi. Ensuite, \file{.ts} ne peut pas partager ce drapeau, parce que \code{<T>expr} est une assertion de type en \file{.ts} et un élément JSX en \file{.tsx}. La fonction est publique pour une raison que son commentaire énonce : elle décide si un fichier est analysé, aucun appelant ne doit en garder une copie privée qui dériverait.
+
+\subsection{Spans et positions}
+
+Un \code{oxc_span::Span} est un couple \code{{ start: u32, end: u32 }} d'offsets d'octets. Le projet n'en utilise que \code{start}, qu'il convertit en position \code{(file, line, col)} grâce à une table des débuts de ligne calculée une fois par fichier :
+
+\rustsnippet{src/ir/source_range.rs}{51}{57}{\code{SourceMap}}
+
+\noindent La table est construite par \code{compute_line_starts} (\src{src/ir/source_range.rs}{84}{92}), qui note l'offset suivant chaque \code{\textbackslash n}, et \code{SourceMap::span_at} convertit un offset par recherche dans cette table (\src{src/ir/source_range.rs}{76}{80}).
+
+La ligne est comptée à partir de 1, la colonne à partir de 0 (\srcline{src/ir/source_range.rs}{36}) : dans la sortie de l'introduction, \code{(line 19:2)} désigne le \code{useEffect} de \code{Beacon}, indenté de deux espaces. Le \code{FileId} est un identifiant interné dans une \code{FileTable} (\adr{19}) ; \code{FileTable::intern} est une recherche linéaire idempotente, si bien que les trois lowerers d'un même fichier obtiennent le même identifiant.
+
+\subsection{Ce que le front-end lit dans l'AST}
+
+Le front-end parcourt un petit sous-ensemble de l'AST d'oxc : \code{Program::directives} (le prologue de directives, qu'oxc range à part de \code{body}), \code{Program::body} et ses \code{Statement}, \code{Declaration}, \code{Expression}, \code{ExportDefaultDeclarationKind}, \code{ImportDeclarationSpecifier}, \code{ImportOrExportKind}, les types TypeScript \code{TSType}, \code{TSTypeName}, \code{TSSignature}, et les enfants JSX \code{JSXChild}. Deux détails d'oxc gouvernent des comportements que nous rencontrerons :
+\begin{itemize}
+  \item \code{ArrowFunctionExpression::expression: bool} (\og Is the function body an arrow expression? i.e. \code{() => expr} instead of \code{() => {}}\fg{}, dans \file{oxc_ast-0.138.0/src/ast/js.rs}) est le \emph{seul} moyen de distinguer une flèche concise d'une flèche à corps bloc : oxc range l'expression d'une flèche concise dans un \code{FunctionBody} d'une seule \code{ExpressionStatement}. C'est l'origine de \issue{5} (\cref{sec:frontend-fn-corriges}).
+  \item \code{ParseOptions::default()} a \code{preserve_parens: true} : les parenthèses deviennent des nœuds \code{ParenthesizedExpression}. Tout code qui filtre une forme d'expression doit donc les \og peler\fg{}. Certains le font, d'autres non (\cref{sec:frontend-limites}).
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\section{Le contrat du front-end}
+\label{sec:frontend-contrat}
+
+\subsection{Ce qui entre, ce qui sort}
+
+Le \cref{chap:tour-architecture} a présenté le pipeline d'ensemble. Le front-end en est la première couche qui \emph{comprend} React : il lit l'AST oxc pour décider \emph{quoi} abaisser (quelles fonctions sont des composants, des hooks custom, des utilitaires) et pour extraire des \terme{faits syntaxiques de module} (directives, arêtes d'import, constantes de module, origines des imports et des callees JSX). La \cref{fig:frontend-pipeline} montre ce qui se passe pour un fichier.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=4mm and 6mm]
+  \node[bloc] (src) {fichier source\\\scriptsize chemin normalisé};
+  \node[bloc,below=of src] (parse) {parse oxc\\\scriptsize \texttt{Program<'a>} dans une arène};
+  \node[bloc,below left=8mm and -2mm of parse,anchor=north east] (comp) {\scriptsize\texttt{lower\_program\_with\_resolver}\\\scriptsize$\to$ \texttt{Vec<ComponentIR>}};
+  \node[bloc,below=of comp] (hook) {\scriptsize\texttt{lower\_custom\_hooks\_with\_resolver}\\\scriptsize$\to$ \texttt{Vec<HookIR>}};
+  \node[bloc,below=of hook] (util) {\scriptsize\texttt{lower\_utilities\_with\_resolver}\\\scriptsize$\to$ \texttt{Vec<FunctionIR>}};
+  \node[bloc,below right=8mm and -2mm of parse,anchor=north west] (facts) {\scriptsize\texttt{collect\_module\_facts}\\\scriptsize$\to$ \texttt{ModuleFacts}};
+  \node[bloc,below=of facts] (ctx) {\scriptsize\texttt{scan\_context\_names}\\\scriptsize$\to$ contextes prouvés};
+  \node[bloc,below=of ctx] (imp) {\scriptsize\texttt{build\_resolved\_imports}\\\scriptsize$\to$ imports résolus};
+  \node[bloc,anchor=north] (pass) at ($(util.south)!0.5!(imp.south)+(0,-10mm)$) {passe inter-fichiers\\\scriptsize\texttt{resolve\_imported\_contexts}, \texttt{resolve\_imported\_utilities}};
+  \node[bloc,below=of pass] (lp) {\texttt{LoweredProgram}\\\scriptsize registres, inlining, point fixe (moteur)};
+  \draw[fleche] (src) -- (parse);
+  \foreach \n in {comp,facts} \draw[fleche] (parse.south) -- (\n.north);
+  \draw[fleche] (parse.south) to[out=-150,in=0] (hook.east);
+  \draw[fleche] (parse.south) to[out=-140,in=0] (util.east);
+  \draw[fleche] (parse.south) to[out=-30,in=180] (ctx.west);
+  \draw[fleche] (parse.south) to[out=-40,in=180] (imp.west);
+  \draw[fleche] (util.south) -- (pass);
+  \draw[fleche] (imp.south) -- (pass);
+  \draw[fleche] (pass) -- (lp);
+  \node[etiquette,right=2mm of parse] {une itération par fichier};
+  \node[etiquette,left=2mm of pass] {une fois, tous fichiers lus};
+\end{tikzpicture}
+\caption{Le front-end d'un fichier. Les six fonctions d'entrée lisent le même \texttt{Program} indépendamment ; l'AST est libéré à la fin de l'itération. La passe inter-fichiers ne voit plus que des structures possédées.}\label{fig:frontend-pipeline}
+\end{figure}
+
+Les six appels sont faits, dans cet ordre, par la boucle de \code{lower_files_with} (\src{src/resolver/mod.rs}{313}{345}) ; le \cref{tab:frontend-entrees} les récapitule.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{5.2cm} >{\raggedright\arraybackslash}p{2.8cm} X}
+\toprule
+Fonction d'entrée & Sortie & Consommateur \\
+\midrule
+\code{lower_program_with_resolver} (\srcline{src/lowering/mod.rs}{437}) & \code{Vec<ComponentIR>} & \code{ComponentRegistry} \\
+\code{lower_custom_hooks_with_resolver} (\srcline{src/lowering/mod.rs}{373}) & \code{Vec<HookIR>} & \code{HookRegistry} (inlining des hooks custom) \\
+\code{lower_utilities_with_resolver} (\srcline{src/lowering/utility_lowerer.rs}{38}) & \code{Vec<FunctionIR>} & \code{FunctionRegistry} (inlining des utilitaires) \\
+\code{collect_module_facts} (\srcline{src/lowering/module_facts.rs}{17}) & \code{ModuleFacts} & \code{ModuleTable} : blind spot \code{unread-imports}, \regle{server-component-hook}, \code{--follow-imports} \\
+\code{scan_context_names} (\srcline{src/lowering/mod.rs}{197}) & \code{HashSet<String>} & \code{resolve_imported_contexts} \\
+\code{build_resolved_imports} (\srcline{src/lowering/import_resolution.rs}{140}) & \code{HashMap<String,} \code{ResolvedImport>} & \code{resolve_imported_contexts}, \code{resolve_imported_utilities} \\
+\bottomrule
+\end{tabularx}
+\caption{Les fonctions d'entrée du front-end, par fichier.}\label{tab:frontend-entrees}
+\end{table}
+
+Les variantes sans suffixe (\code{lower_program}, \code{lower_custom_hooks}, \code{lower_utilities}) appellent les précédentes avec \code{DefaultImportResolver::default()}, qui lit le système de fichiers réel ; elles servent aux tests et aux intégrations simples. Le suffixe \code{_with_resolver} existe pour l'interface \og plugin\fg{} : le résolveur d'imports est un trait (\code{ImportResolver}, \adr{13} §2), que le driver instancie selon le type de projet (alias \file{tsconfig}, Vite, Next.js ; voir \cref{chap:projet-cli-driver}).
+
+\subsection{L'invariant de frontière}
+
+\begin{invariant}{Les domaines ne voient jamais l'AST}{frontend-frontiere}
+Aucune structure produite par le front-end ne contient de référence dans l'arène d'oxc. \code{ComponentIR}, \code{HookIR}, \code{FunctionIR}, \code{ModuleFacts}, \code{ResolvedImport} ne portent que des données possédées ; les emprunts (\code{Candidate<'a>}, \code{FnItem<'a>}) ne vivent que le temps d'un fichier. Au-delà du front-end et du lowering des corps, plus rien ne parle d'oxc.
+\end{invariant}
+
+C'est la conséquence directe d'\adr{3} (\og Abstract domains never see the Oxc AST, only the IR\fg{}), et c'est ce qui rend possible une arène par fichier. L'IR la plus riche est celle d'un composant :
+
+\rustsnippet[label={lst:frontend-componentir}]{src/ir/component.rs}{59}{83}{\code{ComponentIR}}
+
+Champ par champ, du point de vue du front-end :
+\begin{itemize}
+  \item \code{file} est le chemin normalisé du fichier ; avec \code{name}, il forme la clé \code{(file, name)} des registres (\adr{13} §1), qui empêche deux \code{Page} de fichiers différents de se confondre ; le moteur l'interne ensuite en \code{ComponentId} (\adr{40}).
+  \item \code{name} est le nom de liaison trouvé par le détecteur (\cref{sec:frontend-marcheur}), ou \code{DefaultExport} pour un \code{export default} anonyme.
+  \item \code{param} est le premier nom de paramètre renvoyé par le lowering du corps, ou \code{"props"} si le composant n'a pas de paramètre ; un paramètre déstructuré reçoit le nom synthétique \code{__p0}.
+  \item \code{dom_props} est calculé par \code{collect_dom_props} (\cref{sec:frontend-faits-module}).
+  \item \code{render_cfg}, \code{hooks} et \code{hook_provenance} viennent du lowering du corps et de l'extraction des hooks (\cref{chap:lowering-cfg}) ; le front-end leur fournit la table de provenance des imports (\cref{sec:frontend-provenance}).
+  \item \code{module_consts} est la table des constantes de module du fichier, partagée par un \code{Arc} entre tous ses composants.
+\end{itemize}
+\code{HookIR} (\src{src/ir/hook_ir.rs}{9}{24}) a la même forme, sans \code{dom_props} ni \code{module_consts} et avec tous les paramètres ; \code{FunctionIR} (\src{src/ir/function_ir.rs}{15}{22}) n'a même pas de table de hooks, parce qu'un utilitaire ne peut légalement en appeler aucun (\og utilities cannot contain hook calls\fg{}, \src{src/ir/function_ir.rs}{1}{6}).
+
+\subsection{Un lowerer, pas à pas}
+
+Voici le lowerer des composants, que celui des hooks reproduit presque ligne pour ligne (\src{src/lowering/mod.rs}{373}{414}) :
+
+\rustsnippet[label={lst:frontend-lower-program}]{src/lowering/mod.rs}{437}{491}{\code{lower_program_with_resolver}}
+
+La fonction se lit en deux temps. D'abord, elle construit les tables \emph{par fichier} : le contexte de lowering \code{LowerCtx} (table des lignes, compteur de sites d'allocation, origines des callees JSX, \cref{sec:frontend-jsx}), la provenance des imports de hooks (\code{origins}), les liaisons locales du module \code{react} (\code{react_ns}), les constantes de module, et l'ensemble \code{local_hooks} des hooks custom définis dans le fichier. Ensuite, pour chaque candidat que \code{detect_components} a retenu, en ordre source : abaisser le corps en CFG (\code{build_cfg}), en extraire les hooks, les handlers et les abonnements, choisir \code{param}, calculer \code{dom_props}, émettre l'IR.
+
+\begin{remarque}
+Les trois lowerers sont appelés \emph{indépendamment} sur le même \code{Program}, et chacun reconstruit ses propres tables : \code{detect_custom_hooks} tourne deux fois par fichier, \code{build_jsx_origins} trois fois, et chaque déclaration d'import est résolue au moins cinq fois. Chacun crée aussi son propre \code{LowerCtx}, donc son propre compteur de sites (le commentaire \og One context per file\fg{} doit se lire \og un par fichier et par lowerer\fg{}) ; les collisions d'identifiants entre un composant et le hook qu'il inline sont neutralisées au moment du splice par les décalages de \file{src/ir/remap.rs} (\cref{chap:splice-inlining}). Au commit \snapshotCommit{}, aucun de ces coûts redondants n'est mesuré : ni le driver ni les ADR ne rapportent de décomposition du temps d'un run par phase, et le projet n'a pas de banc de performance dédié au front-end. L'affirmation \og le moteur domine\fg{} est donc une hypothèse de conception, pas une mesure ; le \cref{chap:tests-corpus} indique si la méthode de mesure du projet permet de la trancher.
+\end{remarque}
+
+% ---------------------------------------------------------------------------
+\section{Le marcheur commun et le candidat}
+\label{sec:frontend-marcheur}
+
+\subsection{Le problème : combien de façons d'écrire une fonction ?}
+
+JavaScript offre de nombreuses façons de lier un nom à une fonction au niveau supérieur d'un module : \code{function F() {}}, \code{const F = () => ...}, \code{const F = function () {}}, les mêmes précédées d'\code{export}, \code{export default function F() {}}, \code{export default () => ...}, sans compter les formes enveloppées (\code{memo(...)}, \code{forwardRef(...)}), les classes, les déstructurations et les fonctions imbriquées. Les trois détecteurs (composants, hooks, utilitaires) doivent tous énumérer ces formes, et ne diffèrent que par le \emph{critère} qu'ils appliquent à chaque fonction trouvée. Jusqu'au commit \code{b39ee0e} (\og shared detector walker, drop triplicated scaffolding\fg{}, recensé par \adr{20}), cette énumération était recopiée trois fois ; elle vit désormais dans \file{src/lowering/detector.rs}.
+
+\subsection{L'interface du marcheur}
+
+\rustsnippet[label={lst:frontend-fnitem}]{src/lowering/detector.rs}{15}{35}{\code{FnItem}, \code{Classify}, \code{DefaultHandler}}
+
+Un \code{FnItem} est la vue qu'a un détecteur d'une fonction trouvée : son nom de liaison, ses paramètres, son corps (tous empruntés à l'arène), son annotation de type de retour \emph{repliée}, et le drapeau \code{expression}. Le repli mérite un mot : \code{return_type} vaut l'annotation de retour de la fonction si elle en a une, sinon celle du \code{const} qui la reçoit (\code{const Foo: React.FC = ...}). Les deux ne désignent pas la même chose (le type de ce que la fonction renvoie, le type de la fonction elle-même), mais toutes deux alimentent la même règle 3 du détecteur de composants (\cref{sec:frontend-classes}).
+
+Un détecteur est entièrement décrit par deux pointeurs de fonction : un prédicat \code{Classify} et, facultativement, un traitement de l'\code{export default}. Ni trait ni objet dynamique : c'est la forme la plus simple qui laisse les trois détecteurs diverger là où ils divergent vraiment.
+
+\subsection{La marche}
+
+\rustsnippet[label={lst:frontend-detect-fns}]{src/lowering/detector.rs}{41}{71}{\code{detect_fns}, le marcheur commun}
+
+La marche est \emph{linéaire} sur \code{program.body} : elle ne descend jamais dans un corps de fonction, une classe ou un bloc. Quatre formes d'instruction sont reconnues ; toute autre (\code{ClassDeclaration}, \code{ExpressionStatement}, déclarations TypeScript, imports) tombe dans le \code{_ => {}}. Une déclaration de variable est examinée déclarateur par déclarateur :
+
+\rustsnippet{src/lowering/detector.rs}{85}{106}{\code{consider_var}}
+
+Trois filtres s'y succèdent : le motif doit être un identifiant nu (une déstructuration \code{const [A, B] = ...} est ignorée), l'initialiseur doit exister, et il doit être \emph{directement} une flèche ou une expression de fonction. Le \code{kind} de la déclaration n'est pas testé : \code{var} et \code{let} sont acceptés comme \code{const}. \code{consider_fn} (\src{src/lowering/detector.rs}{108}{136}) prend le nom de la fonction ou un nom imposé (celui du \code{const}, ou \code{DefaultExport}), replie l'annotation, et saute les fonctions sans corps, c'est-à-dire les déclarations ambiantes et les signatures de surcharge TypeScript (\code{let Some(body) = func.body.as_deref() else { return; };}). \code{consider_arrow} (\src{src/lowering/detector.rs}{140}{158}) fait de même pour une flèche et recopie son drapeau \code{expression}. \code{push_if} applique le prédicat et, s'il accepte, construit le candidat (\src{src/lowering/detector.rs}{160}{169}). La sortie est en ordre source ; son coût est linéaire en nombre d'instructions de niveau supérieur, plus celui des prédicats.
+
+\begin{exemple}{Les formes que le marcheur voit, et les autres}{frontend-walker-forms}
+Le fichier \file{/tmp/ch05/walker/A.tsx} rassemble des formes limites, toutes capitalisées et toutes renvoyant du JSX ou annotées :
+\begin{lstlisting}[language=TypeScript,caption={Formes limites du marcheur (\file{/tmp/ch05/walker/A.tsx})}]
+import React, { useState, useEffect, memo } from "react";
+
+const Paren = (() => <div />);
+const Typed: React.FC = () => { return null as any; };
+var VarComp = function () { return <p />; };
+declare function Ambient(): JSX.Element;
+function Over(a: number): JSX.Element;
+function Over(a: any) { return <b />; }
+const [Left, Right] = [() => <i />, () => <u />];
+export const Memo = memo(function Inner() { return <i />; });
+export function Outer() {
+  function Nested() { return <s />; }
+  return <Nested />;
+}
+export default () => <main />;
+\end{lstlisting}
+\begin{sortie}
+$ reactant check /tmp/ch05/walker --no-color --verbose --info --show-clean
+[verbose] symbol graph: 5 nodes, topo order = [VarComp@/tmp/ch05/walker/A.tsx, Typed@/tmp/ch05/walker/A.tsx, Over@/tmp/ch05/walker/A.tsx, Outer@/tmp/ch05/walker/A.tsx, DefaultExport@/tmp/ch05/walker/A.tsx]
+[verbose] 5 components analyzed
+…
+  Outer  (0 hooks)  /tmp/ch05/walker/A.tsx
+    info   analysis-limit  component `Nested` was not found in the analysis registry. Pass its file on the command line to analyse it (FN possible)
+
+✓  1 file(s) no issues found.
+\end{sortie}
+Cinq composants sur onze liaisons. \code{VarComp} est retenu (le \code{var} n'est pas un obstacle) ; \code{Typed} l'est grâce à l'annotation du \code{const} repliée dans \code{return_type} ; \code{Over} n'apparaît qu'une fois (la signature sans corps est sautée) ; la flèche par défaut devient \code{DefaultExport}. Sont absents : \code{Ambient} (pas de corps), \code{Paren} (l'initialiseur est une \code{ParenthesizedExpression}, que \code{consider_var} ne pèle pas), \code{Left} et \code{Right} (déstructuration), \code{Memo} et \code{Inner} (enveloppe \code{memo}, \issue{64}), \code{Nested} (fonction imbriquée, \issue{56}). Seul le dernier est signalé, en \Info{}, parce qu'un composant détecté le rend.
+\end{exemple}
+
+\subsection{Le candidat}
+
+Le marcheur rend des \code{Candidate}, la sortie commune des trois détecteurs :
+
+\rustsnippet[label={lst:frontend-candidate}]{src/lowering/mod.rs}{128}{160}{\code{Candidate} et son unique point de dispatch}
+
+\code{name} est possédé, parce qu'il part dans l'IR ; \code{params} et \code{body} sont des emprunts dans l'arène ; \code{expression} vaut toujours \code{false} pour une \code{function} (\srcline{src/lowering/detector.rs}{130}) et recopie le drapeau d'oxc pour une flèche (\srcline{src/lowering/detector.rs}{153}). Les alias \code{ComponentCandidate}, \code{HookCandidate} et \code{UtilityCandidate} ne sont que des \code{pub type ... = Candidate<'a>}. La méthode \code{build_cfg} est l'unique endroit où le corps d'un candidat est abaissé ; nous verrons au \cref{sec:frontend-fn-corriges} pourquoi cette unicité est une décision, et non une commodité.
+
+% ---------------------------------------------------------------------------
+\section{Trois classes de fonctions}
+\label{sec:frontend-classes}
+
+\begin{react}[ce que React impose, et ce qu'il n'impose pas]
+Pour React, un composant fonction est une fonction appelée avec un objet \code{props} et qui renvoie un nœud (JSX, \code{null}, une chaîne, un tableau, un portail…). React n'exige \emph{aucun} nom particulier de la fonction ; c'est JSX qui impose la casse, au \emph{site d'usage} : \code{<foo/>} désigne un élément hôte (la chaîne \code{"foo"}), \code{<Foo/>} et \code{<ns.Foo/>} des références de variables. Le lowering applique la même règle (\srcline{src/lowering/expr_lower.rs}{808}). Les règles des hooks~\cite{ReactRulesOfHooks} ajoutent deux conventions : un hook ne s'appelle qu'au niveau supérieur d'un composant fonction ou d'un hook custom ; un hook custom est une fonction dont le nom commence par \code{use} suivi d'une majuscule. Le linter \code{eslint-plugin-react-hooks}~\cite{EslintReactHooks} s'appuie sur ces conventions, et le front-end de \reactant{} en fait des critères de détection.
+\end{react}
+
+\subsection{Le hook custom : un critère purement nominal}
+
+Le plus simple des trois détecteurs ne regarde que le nom.
+
+\rustsnippet[label={lst:frontend-is-hook-name}]{src/lowering/mod.rs}{46}{61}{\code{is_hook_name}, la frontière hook / utilitaire}
+
+Un nom de hook commence par \code{use} et son quatrième caractère est une majuscule ASCII ou un chiffre : \code{useCounter}, \code{use2FA} sont des hooks ; \code{useful}, \code{userId}, et \code{use} tout court n'en sont pas. Le commentaire raconte une dette soldée : les détecteurs de hooks et d'utilitaires codaient autrefois deux règles divergentes (\code{starts_with("use") && len > 3} d'un côté), si bien que \code{useful} était classée \emph{à la fois} hook et utilitaire. Il n'y a plus qu'un prédicat, partagé par les détecteurs, par la règle 4 des composants, par l'extracteur de hooks et jusque par le moteur (\srcline{src/engine/render_deps.rs}{51}) ; c'est le principe 3 de \file{CLAUDE.md} (\og modulaire et général d'abord\fg{}) appliqué.
+
+Le prédicat du détecteur de hooks se réduit à \code{is_custom_hook(item.name)}, qui n'est lui-même qu'un appel à \code{is_hook_name} (\file{hook_detector.rs}, l.~15--19 et 46--48) : le corps n'importe pas, un hook peut renvoyer du JSX ou non. Un \code{export default} n'est retenu que s'il est une déclaration de fonction \emph{nommée} (\src{src/lowering/hook_detector.rs}{21}{32}), puisqu'une flèche anonyme n'a pas de nom à confronter à la convention. Point subtil, documenté par le commentaire de \code{is_custom_hook} (\src{src/lowering/hook_detector.rs}{36}{48}) : une fonction locale nommée comme un hook de React (\code{function useMemo(name, options)}) \emph{est} un hook custom. La portée lexicale de JavaScript fait qu'elle masque l'import ; le \cref{sec:frontend-provenance} montre comment cette information est exploitée. (Le commentaire renvoie à \code{ImportCtx::callee_is_react}, nom obsolète : la méthode s'appelle aujourd'hui \code{classify_callee}.)
+
+\subsection{L'utilitaire : une double négation}
+
+\rustsnippet[label={lst:frontend-utility}]{src/lowering/utility_detector.rs}{17}{47}{le détecteur d'utilitaires}
+
+Un utilitaire est une fonction de niveau supérieur dont le nom n'est ni un nom de hook ni capitalisé, et dont aucun chemin de retour n'est JSX ; l'\code{export default} n'est jamais visité (\code{None} à la place du traitement), au motif qu'une fonction exportée par défaut est, par convention React, un composant. Les utilitaires sont abaissés en \code{FunctionIR} (\src{src/lowering/utility_lowerer.rs}{38}{62}) sans extraction de hooks, pour être inlinés par le moteur aux sites d'appel en position d'instruction (\adr{13} §5, \cref{chap:splice-inlining}).
+
+\subsection{Le composant : quatre règles}
+
+Le détecteur de composants est le seul dont le critère combine le nom, le corps et le type :
+
+\rustsnippet[label={lst:frontend-is-component}]{src/lowering/component_detector.rs}{47}{73}{\code{is_component}}
+
+La \cref{fig:frontend-is-component} en donne l'arbre de décision. L'évaluation est court-circuitante : le test JSX, le plus fréquent, passe avant l'annotation, et la marche des appels de hooks, la plus coûteuse, en dernier.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=5mm and 12mm,
+  q/.style={bloc,font=\scriptsize,text width=46mm},
+  oui/.style={bloc,font=\scriptsize,fill=white,draw=ra-blue,text width=22mm},
+  non/.style={bloc,font=\scriptsize,fill=white,draw=ra-gray,text width=22mm}]
+  \node[q] (r1) {règle 1 : le nom commence par \texttt{use} ?};
+  \node[q,below=of r1] (maj) {la première lettre est majuscule\\(\texttt{char::is\_uppercase}) ?};
+  \node[q,below=of maj] (r2) {règle 2 : un chemin de retour est JSX\\(\texttt{body\_returns\_jsx}) ?};
+  \node[q,below=of r2] (r3) {règle 3 : annotation de type composant\\(\texttt{ts\_type\_is\_component}) ?};
+  \node[q,below=of r3] (r4) {règle 4 : le corps appelle un hook\\(\texttt{body\_calls\_hook}) ?};
+  \node[non,right=of r1] (n1) {pas un composant};
+  \node[non,right=of maj] (n2) {pas un composant};
+  \node[oui,right=of r2] (y2) {\textbf{composant}};
+  \node[oui,right=of r3] (y3) {\textbf{composant}};
+  \node[oui,right=of r4] (y4) {\textbf{composant}};
+  \node[non,below=of r4] (n4) {pas un composant};
+  \draw[fleche] (r1) -- node[etiquette,above]{oui} (n1);
+  \draw[fleche] (r1) -- node[etiquette,right]{non} (maj);
+  \draw[fleche] (maj) -- node[etiquette,above]{non} (n2);
+  \draw[fleche] (maj) -- node[etiquette,right]{oui} (r2);
+  \draw[flechemust] (r2) -- node[etiquette,above]{oui} (y2);
+  \draw[fleche] (r2) -- node[etiquette,right]{non} (r3);
+  \draw[flechemust] (r3) -- node[etiquette,above]{oui} (y3);
+  \draw[fleche] (r3) -- node[etiquette,right]{non} (r4);
+  \draw[flechemust] (r4) -- node[etiquette,above]{oui} (y4);
+  \draw[fleche] (r4) -- node[etiquette,right]{non} (n4);
+\end{tikzpicture}
+\caption{Arbre de décision de \texttt{is\_component} (\texttt{component\_detector.rs}, l.~47--73). La règle 1 est subsumée par le test de majuscule ; la règle 4 est postérieure à \adr{3} (\issue{122}).}\label{fig:frontend-is-component}
+\end{figure}
+
+\paragraph{Règle 1 et majuscule.} \code{name.starts_with("use")} exclut les hooks. Elle est logiquement \emph{subsumée} par le test suivant (un nom qui commence par \code{use} commence par un \code{u} minuscule) : elle documente l'intention, héritée de la \og Priority 0\fg{} d'\adr{3}. Le test de majuscule utilise \code{char::is_uppercase}, qui est Unicode (\texttt{Élan} est accepté), alors que \code{is_hook_name} teste l'ASCII ; l'asymétrie est sans conséquence connue.
+
+\paragraph{Règle 2 : un chemin de retour est JSX.} La marche est structurelle sur les instructions :
+
+\rustsnippet[label={lst:frontend-jsx-stmt}]{src/lowering/jsx_detect.rs}{14}{45}{\code{stmt_has_jsx_return}}
+
+\rustsnippet[label={lst:frontend-jsx-expr}]{src/lowering/jsx_detect.rs}{47}{63}{\code{expr_contains_jsx}}
+
+Il suffit d'\emph{un} chemin (disjonction sur les branches d'un \code{if}, d'un \code{try}, d'une conditionnelle ou d'un opérateur logique) ; les enveloppes TypeScript et les parenthèses sont traversées. La marche ne descend pas dans les fonctions imbriquées (une \code{FunctionDeclaration} tombe dans \code{_ => false}). Le bras \code{ExpressionStatement} sert les flèches concises, dont oxc range l'expression dans une instruction ; il accepte au passage une instruction JSX isolée dans un corps bloc, ce qui est inoffensif. Retenons dès maintenant ce qui \emph{manque} : \code{SwitchStatement}, \code{DoWhileStatement}, \code{for...in}, \code{for...of} parmi les instructions ; les appels (\code{items.map(i => <li/>)}, \code{createPortal(<div/>, el)}), les tableaux et les séquences parmi les expressions. Le \cref{sec:frontend-limites} mesure ce que ces trous coûtent.
+
+\paragraph{Règle 3 : une annotation de type composant.} Seules les références de type nommées sont examinées (\code{ts_type_is_component} et \code{ts_type_name_is_component}, \src{src/lowering/component_detector.rs}{77}{109}) : \code{React.FC}, \code{React.FunctionComponent}, \code{React.ReactElement}, \code{React.ReactNode}, \code{JSX.Element}, et les noms nus \code{ReactElement}, \code{FC}, \code{FunctionComponent}. Une union (\code{JSX.Element | null}) n'est pas une \code{TSTypeReference} et n'est pas reconnue ; \code{ReactNode} nu n'est pas dans la liste. La règle est surtout utile pour les composants qui ne renvoient pas de JSX syntaxique (\code{return null as any}, retour délégué), et pour le repli de l'annotation du \code{const}.
+
+\paragraph{Règle 4 : le corps appelle un hook.} Elle fait l'objet du \cref{sec:frontend-fn-corriges}.
+
+\paragraph{L'export par défaut.} Le traitement propre aux composants (\src{src/lowering/component_detector.rs}{22}{43}) nomme les formes anonymes : \code{export default function App()} est enregistré sous \code{App} ; une fonction ou une flèche anonyme sous \code{DefaultExport}. \code{export default memo(Foo)}, \code{export default Foo;} et \code{export default class} tombent dans le \code{_ => {}} ; si \code{Foo} est déclaré dans le fichier, il est détecté sous son propre nom.
+
+\begin{decision}[\issue{65}, wontfix : le nom générique des exports par défaut anonymes]
+\og \code{export default () => <div/>} is mapped to \code{"DefaultExport"}. Multi-file collisions are possible … mitigated by \code{(file, name)} keying, but the user-visible name stays generic. The \emph{identity} half is handled; what remains is cosmetic naming.\fg{} Le projet ne cherche donc pas de meilleur nom : la clé \code{(file, name)} d'\adr{13} §1 suffit à l'identité, et seul l'affichage reste générique. Le nom \code{DefaultExport} ne peut être écrit par aucun JSX (\src{src/lowering/mod.rs}{97}{100}) ; un tel composant n'est donc atteint que comme racine.
+\end{decision}
+
+\subsection{Les trois classes, formellement}
+
+Rassemblons les trois critères.
+
+\begin{definition}{Composant, hook custom, utilitaire}{composant-hook-utilitaire}
+Soit $f$ une fonction liée au niveau supérieur d'un module sous une forme que reconnaît \code{detect_fns} (déclaration de fonction ; \code{const}, \code{let} ou \code{var} à motif identifiant, initialisé \emph{directement} par une flèche ou une expression de fonction ; l'une des deux précédée d'\code{export} ; et, selon le détecteur, \code{export default}), munie d'un corps. On note $n$ son nom de liaison.
+\begin{itemize}
+  \item $f$ est un \terme{hook custom} si \code{is_hook_name}$(n)$ : $n$ commence par \code{use} suivi d'une majuscule ASCII ou d'un chiffre.
+  \item $f$ est un \terme{composant} si $n$ ne commence pas par \code{use}, si sa première lettre est majuscule, et si au moins l'une des conditions suivantes est vraie : (règle 2) un chemin de retour du corps est syntaxiquement JSX ; (règle 3) la fonction ou le \code{const} qui la reçoit porte une annotation de type composant ; (règle 4) le corps appelle directement un hook.
+  \item $f$ est un \terme{utilitaire} si elle n'est pas un \code{export default}, si $n$ n'est ni un nom de hook ni capitalisé, et si aucun chemin de retour de son corps n'est JSX.
+\end{itemize}
+Une fonction qui n'appartient à aucune des trois classes n'est pas abaissée.
+\end{definition}
+
+\begin{proposition}{Partition non exhaustive}{frontend-partition}
+Les trois classes sont deux à deux disjointes, mais leur union ne couvre pas l'ensemble des fonctions de niveau supérieur, même parmi celles que rend React.
+\end{proposition}
+
+\noindent\emph{Démonstration.} Un composant a une première lettre majuscule, un hook commence par un \code{u} minuscule, un utilitaire n'a ni l'un ni l'autre : les trois conditions sur le nom s'excluent. Pour la non-exhaustivité, trois témoins suffisent : \code{function helper() { return <span/>; }} (minuscule et JSX : ni composant, ni utilitaire) ; \code{function useful() { return <u/>; }} (\code{use} suivi d'une minuscule et JSX : ni hook, ni utilitaire, ni composant) ; \code{function List() { return items.map(...); }} (majuscule, mais aucune des règles 2 à 4). Le troisième est un composant React parfaitement valide. $\square$
+
+La \cref{fig:frontend-classes} dessine cette partition sur deux axes : ce que dit le nom, et ce que disent le corps et le type.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[cell/.style={draw=ra-gray,minimum width=33mm,minimum height=11mm,align=center,font=\scriptsize,text width=31mm},
+  hd/.style={font=\scriptsize\bfseries,align=center,text width=31mm}]
+  \node[hd] at (0,0) {\texttt{use}[A-Z0-9]…};
+  \node[hd] at (3.5,0) {majuscule initiale};
+  \node[hd] at (7,0) {autre nom\\(y compris \texttt{use}+minuscule)};
+  \node[font=\scriptsize,align=right,anchor=east] at (-1.9,-1.0) {retour JSX\\détecté};
+  \node[font=\scriptsize,align=right,anchor=east] at (-1.9,-2.2) {pas de JSX, mais\\annotation ou hook};
+  \node[font=\scriptsize,align=right,anchor=east] at (-1.9,-3.4) {rien de\\tout cela};
+  \node[cell,fill=ra-bg,minimum height=35mm] at (0,-2.2) {\textbf{hook custom}\\(le corps n'importe pas)};
+  \node[cell,fill=ra-bg] at (3.5,-1.0) {\textbf{composant} (règle 2)};
+  \node[cell,fill=ra-bg] at (3.5,-2.2) {\textbf{composant} (règles 3, 4)};
+  \node[cell,fill=ra-amber!15,dashed] at (3.5,-3.4) {non abaissé\\\texttt{List}, \texttt{Switchy}, \texttt{Portal}};
+  \node[cell,fill=ra-amber!15,dashed] at (7,-1.0) {non abaissé\\\texttt{helper}, \texttt{useful}};
+  \node[cell,fill=white] at (7,-2.2) {\textbf{utilitaire}};
+  \node[cell,fill=white] at (7,-3.4) {\textbf{utilitaire}\\(sauf \texttt{export default})};
+\end{tikzpicture}
+\caption{Les trois classes du front-end. Colonnes : le nom ; lignes : ce que les règles 2 à 4 trouvent dans le corps et le type. Les cases en tirets ne sont vues par aucun détecteur.}\label{fig:frontend-classes}
+\end{figure}
+
+\begin{exemple}{Les classes du programme d'ouverture}{frontend-classes-ouverture}
+Reprenons le \cref{lst:frontend-classes}. \code{Counter} est un composant par la règle 2 (il renvoie un \code{<button>}), avec \code{param = "props"} faute de paramètre. \code{Beacon} ne renvoie que \code{null} et ne porte pas d'annotation : il est composant par la règle 4, parce qu'il appelle \code{useState} ; son paramètre déstructuré devient \code{__p0}. \code{useCounter} est un hook custom. \code{formatCount} est un utilitaire (minuscule, pas de JSX). \code{helper}, minuscule et JSX, tombe dans la case en tirets de droite : aucun détecteur ne le retient, et le graphe de symboles de l'introduction ne le mentionne pas. L'avertissement \regle{infinite-loop} de \code{Beacon} n'existerait pas sans la règle 4.
+\end{exemple}
+
+\begin{piege}
+Le test unitaire \code{utility_that_returns_jsx_indirectly_is_component_not_utility} (\src{src/lowering/utility_detector.rs}{109}{112}) porte un nom trompeur. Il vérifie seulement que \code{function widget() { return <div/>; }} n'est pas un utilitaire ; or \code{widget}, minuscule, n'est pas non plus un composant. La fonction n'est abaissée par personne, contrairement à ce que suggère le nom du test.
+\end{piege}
+
+% ---------------------------------------------------------------------------
+\section{Deux faux négatifs corrigés}
+\label{sec:frontend-fn-corriges}
+
+Deux corrections récentes ont façonné le front-end. Elles portent sur des objets différents (la \emph{forme} du corps pour l'une, la \emph{classification} pour l'autre) mais elles ont la même nature : une fonction que l'utilisateur a écrite disparaissait de l'analyse, ou en ressortait vidée de son sens, sans aucun signal.
+
+\subsection{La flèche concise perdait sa valeur de retour (\issue{5})}
+
+Soit \code{const useFlag = (init: boolean) => useState(init);}. oxc range le corps de cette flèche comme un \code{FunctionBody} contenant \emph{une} \code{ExpressionStatement} : exactement la même forme que \code{(init) => { useState(init); }}. Seul le drapeau \code{ArrowFunctionExpression::expression} distingue les deux, et la différence est toute la valeur de retour. Avant le commit \code{30a00c5} (\og a hook in a terminator is still a hook (\#4, \#5)\fg{}), \code{Candidate} ne portait pas ce drapeau : le corps était abaissé comme une instruction, la fonction renvoyait \code{unit}, et chaque consommateur de \code{useFlag} se retrouvait avec un hook sans valeur. L'issue s'intitule \og Concise-arrow bodies lose their return value, so the component or hook disappears\fg{}.
+
+La correction tient en trois pièces. Le marcheur recopie le drapeau dans \code{FnItem} puis dans \code{Candidate} (\cref{lst:frontend-candidate}) ; \code{Candidate::build_cfg} choisit entre deux constructeurs de CFG ; le constructeur des corps concis scelle le bloc d'entrée par un \code{Return} de l'expression :
+
+\rustsnippet{src/lowering/cfg_builder.rs}{985}{1001}{le CFG d'une flèche concise}
+
+La fixture \file{tests/fixtures/concise_arrow/App.tsx} vérifie la \emph{parité} entre les deux orthographes :
+
+\tsxsnippet{tests/fixtures/concise_arrow/App.tsx}{8}{17}{une fabrique concise d'objets frais}
+
+\tsxsnippet{tests/fixtures/concise_arrow/App.tsx}{30}{42}{le témoin à corps bloc}
+
+\begin{sloppypar}\noindent Le fichier contient encore \code{UsesFunction}, une fabrique concise de fonctions (\src{tests/fixtures/concise_arrow/App.tsx}{19}{28}), et \code{UsesMemo}, dont le hook concis \code{useThing} renvoie un \code{useMemo} et doit rester silencieux (\src{tests/fixtures/concise_arrow/App.tsx}{44}{54}).\end{sloppypar}
+
+\begin{sortie}
+$ reactant check tests/fixtures/concise_arrow/App.tsx --no-color --show-clean
+  UsesFunction  (1 hooks)  tests/fixtures/concise_arrow/App.tsx
+    warn   always-unstable-deps  [hook:0]  (line 24:2)  this effect depends on `h`, a new reference every render, so `Object.is` always differs and the effect re-runs on every render regardless of the other deps
+       (1 trace step(s), rerun with --trace)
+  UsesMemo  (2 hooks)  tests/fixtures/concise_arrow/App.tsx  ✓
+  UsesObject  (1 hooks)  tests/fixtures/concise_arrow/App.tsx
+    warn   always-unstable-deps  [hook:0]  (line 13:2)  this effect depends on `cfg`, a new reference every render, so `Object.is` always differs and the effect re-runs on every render regardless of the other deps
+       (1 trace step(s), rerun with --trace)
+  UsesObjectBlock  (1 hooks)  tests/fixtures/concise_arrow/App.tsx
+    warn   always-unstable-deps  [hook:0]  (line 38:2)  this effect depends on `cfg`, a new reference every render, so `Object.is` always differs and the effect re-runs on every render regardless of the other deps
+       (1 trace step(s), rerun with --trace)
+
+⚠  3 warning(s) across 1 file(s).
+\end{sortie}
+
+\code{UsesObject} (fabrique concise) et \code{UsesObjectBlock} (fabrique à corps bloc) reçoivent le même verdict ; \code{UsesMemo}, dont le hook concis renvoie un \code{useMemo}, reste silencieux : la correction ne doit pas rendre instable toute valeur de corps concis. (Les fabriques \code{makeConfig} et \code{makeHandler}, minuscules et sans JSX, sont des utilitaires inlinés ; c'est leur valeur de retour qui porte l'objet frais.)
+
+\begin{decision}[Principe 1 de \file{CLAUDE.md} : un seul point de dispatch]
+Le drapeau aurait pu être testé par chacun des trois lowerers. Il est au contraire porté par \code{Candidate} et consulté en un seul lieu, \code{Candidate::build_cfg} : \og The single place that dispatch happens, so a new consumer of \code{Candidate} cannot forget it — which is how the flag came to be dropped in the first place\fg{} (\src{src/lowering/mod.rs}{147}{152}). Corriger chaque consommateur aurait été un contournement ; corriger le type qu'ils partagent supprime la classe de bogues.
+\end{decision}
+
+\subsection{Le composant toujours \code{null} n'était pas détecté (\issue{122})}
+
+Revenons à \code{Beacon} (\cref{lst:frontend-classes}). Il renvoie \code{null} sur tous ses chemins, ne porte aucune annotation : les règles 2 et 3 le manquent toutes deux. Or ce genre de composant n'est pas rare : un montage d'analytics, un hôte de portail, un enregistreur de raccourcis clavier. Et c'est précisément là que vivent les bogues de cycle de vie (effets sans cleanup, boucles d'écriture). L'issue \issue{122}, étiquetée \code{soundness-bug} et \code{precision-fn}, l'énonce sans détour : \og a component that returns \code{null} on every path is not detected at all\fg{}.
+
+La correction ajoute la règle 4, justifiée en une phrase par le module qui l'implémente :
+
+\rustsnippet{src/lowering/hook_call_detect.rs}{1}{12}{le principe de la règle 4}
+
+\og The Rules of Hooks read backwards\fg{} : puisque seuls un composant ou un hook custom peuvent appeler un hook, et que la règle 1 a déjà écarté les hooks custom par leur nom, une fonction capitalisée qui appelle un hook \emph{est} un composant. Le test de référence reprend \code{Beacon} :
+
+\rustsnippet{src/lowering/component_detector.rs}{248}{264}{le test de \issue{122}}
+
+La marche des appels suit le même schéma structurel que celle du JSX, avec davantage de formes, parce qu'un appel de hook peut se nicher partout où une expression est évaluée au rendu. Au niveau des instructions (\src{src/lowering/hook_call_detect.rs}{22}{58}), elle visite les expressions, les \code{return}, les initialiseurs de variables, les blocs, les \code{if} (y compris leur \emph{test} : un hook dans une condition n'est pas du React légal, mais c'est exactement ce que \issue{4} signalait comme perdu, donc il compte), les \code{while}, les corps de \code{for}, les étiquettes, les \code{switch} et les \code{try}. Au niveau des expressions :
+
+\rustsnippet[label={lst:frontend-expr-calls-hook}]{src/lowering/hook_call_detect.rs}{60}{88}{\code{expr_calls_hook}}
+
+\rustsnippet{src/lowering/hook_call_detect.rs}{102}{109}{\code{callee_is_hook}}
+
+Trois propriétés sont à retenir.
+\begin{itemize}
+  \item La marche \emph{ne descend pas} dans les fonctions imbriquées. Un \code{useState} dans un callback est le problème du callback ; le compter ferait passer pour composant un utilitaire capitalisé qui contient un littéral de composant (test \code{rule_four_does_not_widen_past_real_hook_calls}, \src{src/lowering/component_detector.rs}{266}{278}).
+  \item Le prédicat est purement \emph{nominal} : \code{is_hook_name} sur un identifiant nu ou sur la propriété d'un accès membre, sans résolution d'import. Tout \code{obj.useX()} compte, y compris sur un objet qui n'a rien de React. Détecter trop largement ne coûte, au pire, que des faux positifs.
+  \item Seul le \emph{callee} d'un appel est inspecté, pas ses arguments. \code{useRouter().push} est vu (l'objet d'un accès membre est visité), \code{track(useId())} ne l'est pas. Nous y reviendrons au \cref{sec:frontend-limites}.
+\end{itemize}
+
+\begin{decision}[\issue{122} et \adr{3} : un écart documentaire]
+\adr{3} fixe la première définition du composant en trois priorités : \og Priority 0: name starts with \code{use} → custom hook, never a component. Priority 1: at least one return path produces a \code{JSXElement} → component. Priority 2: annotated \code{React.FC} / \code{React.ReactElement} / \code{JSX.Element} → component.\fg{} Le code ajoute la contrainte de majuscule et la règle 4 (commit \code{31f08ef}), que l'ADR ne mentionne pas. La reproduction de \issue{122} mesurait \code{components_analyzed: 0} pour un composant \code{NullComp} qui renvoie \code{null}, contre un composant et quatre diagnostics, dont une \Error{} \regle{stale-closure}, pour le même corps terminé par \code{return <i />}. Au commit étudié, \code{NullComp} (\file{/tmp/ch05/i122/A.tsx}) reçoit les mêmes quatre diagnostics que son jumeau JSX :
+\begin{sortie}
+  NullComp  (2 hooks)  /tmp/ch05/i122/A.tsx
+    warn   missing-cleanup  [hook:1]  (line 5:20)  this effect calls `setInterval` but returns no cleanup. …
+    warn   missing-deps  [hook:1]  var:ms  (line 5:2)  `ms` is used in this effect but not in its deps array, …
+    warn   missing-deps  [hook:1]  var:n  (line 5:2)  `n` is used in this effect but not in its deps array, …
+    error  stale-closure  [hook:1]  var:n  (line 5:20)  the `setInterval` callback registered by this mount-only effect reads `n` and writes it back. …
+\end{sortie}
+(Messages tronqués, lignes \og trace step\fg{} élidées.)
+\end{decision}
+
+\begin{piege}
+Deux leçons générales se lisent dans ces corrections. D'abord, au front-end, un défaut de \emph{précision} apparent (une forme non reconnue) est en réalité un défaut de \emph{soundness} : \issue{122} porte les deux étiquettes. Ensuite, la règle 4 compte les hooks appelés conditionnellement, alors qu'ils sont illégaux : le détecteur n'a pas à juger le code, seulement à le trouver ; l'illégalité est l'affaire de la règle \regle{conditional-hook}.
+\end{piege}
+
+% ---------------------------------------------------------------------------
+\section{La provenance des hooks}
+\label{sec:frontend-provenance}
+
+\subsection{Le problème : un nom de hook ne dit pas d'où il vient}
+
+Détecter les hooks custom \emph{définis} dans un fichier ne suffit pas : il faut aussi savoir, à chaque \emph{appel} de hook, ce qu'on appelle. Le moteur modélise précisément les hooks de React qu'il connaît (\code{useState}, \code{useEffect}, \code{useMemo}…), inline les hooks custom du projet, applique des résumés aux hooks de paquets connus, et traite tout le reste comme inconnu (\adr{5} : un hook non reconnu vaut $\Top$, avec une \Info{}). Se tromper de catégorie a deux faces. Classer React un appel qui ne l'est pas, c'est lui appliquer une sémantique qu'il n'a pas ; classer inconnu un vrai hook de React, c'est perdre tout ce que le moteur sait de lui. Voici le cas qui a fixé la règle.
+
+\begin{exemple}{Un \code{useMemo} local masque celui de React}{frontend-shadow}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch05/shadow/Shadow.tsx}}]
+import { useState, useEffect } from "react";
+
+function useMemo(name: string) {
+  const [v, setV] = useState(0);
+  useEffect(() => { setV(v + 1); });
+  return v;
+}
+
+export function C() {
+  const v = useMemo("k");
+  return <div>{v}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+$ reactant check /tmp/ch05/shadow --no-color --show-clean
+  C  (1 hooks)  /tmp/ch05/shadow/Shadow.tsx
+    warn   infinite-loop  [hook:1]  (line 5:2)  this effect keeps pushing state `v` to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
+\end{sortie}
+Le \code{useMemo} de ce fichier n'est pas celui de React : la définition locale le masque. Il est classé hook custom, inliné dans \code{C}, et la boucle de son effet est trouvée (le témoin pointe la ligne 5, dans le hook). L'avoir classé \code{useMemo} de React aurait fait disparaître l'effet et la boucle. C'est le scénario du test \code{locally_defined_use_hook_shadows_react} (\file{tests/hook_classification.rs}).
+\end{exemple}
+
+\subsection{\code{HookOrigin} : ce que la déclaration d'import prouve}
+
+Le commit \code{27538cd} (\og hook identity by provenance — ADR-023 step 1\fg{}) a remplacé une classification par le nom, avec une devinette \og fail-open\fg{} pour les cas douteux, par une table de provenance \og fail-closed\fg{} :
+
+\rustsnippet[label={lst:frontend-hookorigin}]{src/lowering/import_resolution.rs}{35}{55}{\code{HookOrigin}}
+
+Chaque variante enregistre ce qui a été \emph{prouvé} de l'origine. \code{React} : le spécificateur littéral était \code{"react"}. \code{File} : il a été résolu vers un fichier local. \code{Package} : il n'a pas été résolu (paquet npm ou fichier manquant). Le spécificateur brut est conservé dans les deux dernières variantes, parce que la recherche des résumés de paquets (\code{SummaryRegistry}, \adr{5} et \adr{26} §5) se fait par spécificateur, y compris quand un alias \file{tsconfig} fait pointer un nom de paquet vers un fichier local. La table est construite par :
+
+\rustsnippet[label={lst:frontend-build-hook-origins}]{src/lowering/import_resolution.rs}{74}{130}{\code{build_hook_origins}}
+
+Quatre points décident de tout.
+\begin{enumerate}
+  \item La clé est le nom \emph{local}, mais l'entrée est retenue si le nom local \emph{ou} le nom importé est un nom de hook : \code{import { useData as fetchData }} donne une entrée \code{fetchData}, et le hook garde son nom d'origine \code{useData}.
+  \item La \og React-ité\fg{} se décide sur la chaîne littérale \code{"react"}, \emph{avant} tout appel au résolveur (\src{src/lowering/import_resolution.rs}{88}{91}). Un projet dont le \file{tsconfig} fait pointer \code{react} vers un fichier (cela existe) garde ainsi les hooks de React classés comme tels. Dans l'ordre inverse, ils deviendraient tous des \code{Custom} opaques : ce que le code appelle \og the mass-FN hazard\fg{}.
+  \item La résolution est paresseuse et faite au plus une fois par déclaration.
+  \item Les imports d'espace de noms (\code{import * as R}) sont sautés ; ils passent par \code{react_ns} (liaisons locales du module \code{react} lui-même, \src{src/lowering/mod.rs}{162}{190}).
+\end{enumerate}
+
+\begin{exemple}{Quatre provenances dans un fichier}{frontend-provenances}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ra-ex/e5/Page.tsx} (fichiers \file{hooks/useData.ts}, \file{ui/Widget.tsx}, \file{types.ts} présents)}]
+import { useMemo as useM, useState } from "react";
+import { useData as fetchData } from "./hooks/useData";
+import { useQuery } from "@tanstack/react-query";
+import type { T } from "./types";
+import { Widget as Panel } from "./ui/Widget";
+export * from "./ui/Widget";
+
+export function Page() {
+  const [n, setN] = useState(0);
+  const { d } = fetchData("x");
+  const q = useQuery({ queryKey: ["k"] });
+  const v = useM(() => ({ n }), [n]);
+  return <Panel onChange={setN} />;
+}
+\end{lstlisting}
+Par lecture de \cref{lst:frontend-build-hook-origins}, la table contient quatre entrées : \code{useM} $\mapsto$ \code{React { imported: "useMemo" }} (l'alias ne trompe pas), \code{useState} $\mapsto$ \code{React}, \code{fetchData} $\mapsto$ \code{File} (fichier \file{hooks/useData.ts}, nom importé \code{useData}), \code{useQuery} $\mapsto$ \code{Package { specifier: "@tanstack/react-query", ... }}. \code{Panel} et \code{T} n'y sont pas (ni l'un ni l'autre n'a une forme de hook). Le dossier de notes a vérifié cette table par une sonde. La ligne de commande confirme ce qui en résulte : \code{Page} a quatre hooks, et le composant enfant est bien identifié (nous y reviendrons au \cref{sec:frontend-jsx}) :
+\begin{sortie}
+$ reactant check /tmp/ra-ex/e5 --no-color --show-clean
+  Page  (4 hooks)  /tmp/ra-ex/e5/Page.tsx  ✓
+  Widget  (0 hooks)  /tmp/ra-ex/e5/ui/Widget.tsx
+    error  cross-setter-in-render  var:onChange  (line 3:2)  prop `onChange` (a state setter of parent `Page`) called during render of `Widget`, which triggers a parent re-render on every render
+       (1 trace step(s), rerun with --trace)
+
+⚠  1 error(s) across 4 file(s).
+\end{sortie}
+\end{exemple}
+
+\subsection{\code{ImportCtx} et \code{classify_callee}}
+
+Les tables du front-end sont remises à l'extracteur de hooks sous la forme d'un \code{ImportCtx} :
+
+\rustsnippet{src/lowering/hook_extractor.rs}{531}{543}{\code{ImportCtx}}
+
+\code{origins} vient de \code{build_hook_origins}, \code{react_ns} de \code{build_react_ns}, \code{local_hooks} des noms que \code{detect_custom_hooks} a trouvés dans le fichier (\cref{lst:frontend-lower-program}). L'extracteur, qui appartient au lowering des corps (\cref{chap:lowering-cfg}), classe chaque callee par \code{classify_callee} :
+
+\rustsnippet{src/lowering/hook_extractor.rs}{562}{582}{\code{classify_callee} (début) : un hook local masque tout}
+
+\noindent La suite (\src{src/lowering/hook_extractor.rs}{583}{611}) traduit chaque variante de \code{HookOrigin} en \code{ResolvedHookCall} : \code{React} donne \code{is_react: true} et le spécificateur \code{"react"}, \code{File} donne \code{resolved_file: Some(file)}, \code{Package} garde le spécificateur sans fichier. Viennent ensuite la présomption conventionnelle pour un nom nu non importé (\src{src/lowering/hook_extractor.rs}{612}{620}) et le cas d'un accès membre \code{Expr::FieldAccess} (\src{src/lowering/hook_extractor.rs}{622}{634}).
+
+L'ordre de priorité est celui de la portée lexicale de JavaScript, et la \cref{fig:frontend-classify-callee} le résume : (1) un hook défini dans le fichier masque tout import et tout global de même nom ; (2) sinon, la table \code{HookOrigin} décide par provenance ; (3) sinon, un nom de hook non importé est présumé React (sources de test, globaux) ; (4) pour un appel \code{ns.useX(...)}, c'est React si et seulement si \code{ns} est lié au module \code{react} ou est le global conventionnel \code{React}, et un hook custom de provenance inconnue sinon. Un \code{Custom} est ensuite résolu par le moteur, par inlining (\code{HookRegistry}) ou par résumé (\code{SummaryRegistry}) ; à défaut, il donne l'\Info{} \og hook \dots\ was not found in the registry\fg{}.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[
+  q/.style={bloc,font=\scriptsize,text width=30mm},
+  r/.style={bloc,font=\scriptsize,fill=white,text width=26mm}]
+  \node[q] (form) at (4.8,0) {forme du callee ?};
+  \node[q] (loc) at (2.4,-1.4) {nom $\in$ \texttt{local\_hooks} ?};
+  \node[q] (org) at (2.4,-2.7) {nom $\in$ \texttt{origins} ?};
+  \node[q] (conv) at (2.4,-4.0) {\texttt{is\_hook\_name}(nom) ?};
+  \node[r] (rnone) at (2.4,-5.3) {appel ordinaire};
+  \node[q] (fld) at (7.6,-1.4) {\texttt{is\_hook\_name}(champ) ?};
+  \node[q,text width=34mm] (ns) at (7.6,-2.9) {\texttt{ns} $\in$ \texttt{react\_ns}\\ou \texttt{ns} = \texttt{React} ?};
+  \node[r] (rloc) at (-1.2,-1.4) {\texttt{Custom}, fichier courant};
+  \node[r] (rorg) at (-1.2,-2.7) {\texttt{React} / \texttt{File} / \texttt{Package} selon la variante};
+  \node[r] (rconv) at (-1.2,-4.0) {React (convention)};
+  \node[r,text width=12mm] (rnsr) at (6.4,-4.4) {React};
+  \node[r,text width=24mm] (rnsc) at (9.3,-4.4) {\texttt{Custom}, provenance inconnue};
+  \node[r,text width=14mm] (rfld) at (10.9,-1.4) {appel ordinaire};
+  \draw[fleche] (form) -- node[etiquette,left]{\texttt{Var(nom)}} (loc);
+  \draw[fleche] (form) -- node[etiquette,right]{\texttt{ns.champ}} (fld);
+  \draw[fleche] (loc) -- node[etiquette,above]{oui} (rloc);
+  \draw[fleche] (loc) -- node[etiquette,right]{non} (org);
+  \draw[fleche] (org) -- node[etiquette,above]{oui} (rorg);
+  \draw[fleche] (org) -- node[etiquette,right]{non} (conv);
+  \draw[fleche] (conv) -- node[etiquette,above]{oui} (rconv);
+  \draw[fleche] (conv) -- node[etiquette,right]{non} (rnone);
+  \draw[fleche] (fld) -- node[etiquette,above]{non} (rfld);
+  \draw[fleche] (fld) -- node[etiquette,right]{oui} (ns);
+  \draw[fleche] (ns) -- node[etiquette,left]{oui} (rnsr);
+  \draw[fleche] (ns) -- node[etiquette,right]{non} (rnsc);
+\end{tikzpicture}
+\caption{Arbre de décision de \texttt{classify\_callee} (\texttt{hook\_extractor.rs}, l.~562--637). Toute autre forme de callee est un appel ordinaire.}\label{fig:frontend-classify-callee}
+\end{figure}
+
+\begin{remarque}
+Le \code{Custom} d'un import de fichier porte \code{resolved_file} mais un \code{import_source} vide : \code{import_source} ne garde que les spécificateurs non relatifs, c'est-à-dire les noms de paquets (\src{src/lowering/hook_extractor.rs}{494}{498}). Un hook local reçoit \code{resolved_file} égal au fichier courant, ce qui garde précise la recherche \code{(file, name)} dans le registre.
+\end{remarque}
+
+\begin{piege}
+La présomption (3), \og nom de hook non importé $\Rightarrow$ React\fg{}, est une convention, pas une preuve. Elle est sûre parce qu'elle est la \emph{dernière} : une définition locale ou un import non-React priment toujours. Autre subtilité : le masquage ne vaut qu'au niveau supérieur. Une liaison \code{const useMemo = ...} \emph{à l'intérieur} d'un composant n'entre pas dans \code{local_hooks}, et un appel à ce \code{useMemo}-là serait classé React. Enfin, l'API \code{use(...)} de React~19 n'est pas un nom de hook au sens de \code{is_hook_name} (pas de quatrième caractère) : le front-end ne la classe jamais comme hook, et \code{classify_callee} ne peut donc jamais produire de \code{ResolvedHookCall} dont le nom d'origine est \code{"use"} --- ni par \code{local_hooks} (qui ne contient que des noms passant \code{is_hook_name}), ni par la table \code{HookOrigin} (même garde à l'insertion), ni par la convention (même garde). Le moteur, lui, anticipe pourtant ce cas : \code{reads_unnamed_context} teste \code{name == "use"} sur un \code{HookEntry::Custom} (\srcline{src/engine/render_deps.rs}{662}), une branche qu'aucun appel à \code{use(...)} ne peut atteindre par ce chemin au commit \snapshotCommit{}. Le point d'évaluation des appels ordinaires, lui, compense : \code{eval} sur un \code{Expr::Call} traite tout callee nommé \code{"use"} comme \code{is_hook_name} l'aurait fait (\srcline{src/engine/render_deps.rs}{897}), qu'il s'agisse ou non d'un \code{HookEntry}. Le filet de sécurité existe donc, mais un cran plus bas que ce que le commentaire de \code{reads_unnamed_context} laisse penser.
+\end{piege}
+
+% ---------------------------------------------------------------------------
+\section{Les faits de module}
+\label{sec:frontend-faits-module}
+
+Certaines informations ne concernent aucune fonction en particulier, mais le module entier : les constantes de niveau supérieur, les contextes qu'il crée, les directives qu'il déclare, les fichiers qu'il importe. Le front-end les extrait avec la même prudence : \emph{n'enregistrer que ce qui est syntaxiquement certain}.
+
+\subsection{Les constantes de module}
+
+\begin{exemple}{Une constante de module n'est pas un littéral frais}{frontend-consts}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch05/consts/Consts.tsx}}]
+import { useEffect } from "react";
+
+const OPTIONS = { retries: 3 } as const;
+let mutable = { retries: 3 };
+
+export function Stable() {
+  useEffect(() => { console.log(OPTIONS); }, [OPTIONS]);
+  return <div />;
+}
+
+export function Fresh() {
+  const options = { retries: 3 };
+  useEffect(() => { console.log(options); }, [options]);
+  return <div />;
+}
+
+export function ViaLet() {
+  useEffect(() => { console.log(mutable); }, [mutable]);
+  return <div />;
+}
+\end{lstlisting}
+\begin{sortie}
+$ reactant check /tmp/ch05/consts --no-color --show-clean
+  Fresh  (1 hooks)  /tmp/ch05/consts/Consts.tsx
+    warn   always-unstable-deps  [hook:0]  (line 13:2)  this effect depends on `options`, a new reference every render, so `Object.is` always differs and the effect re-runs on every render regardless of the other deps
+       (1 trace step(s), rerun with --trace)
+  Stable  (1 hooks)  /tmp/ch05/consts/Consts.tsx  ✓
+  ViaLet  (1 hooks)  /tmp/ch05/consts/Consts.tsx  ✓
+
+⚠  1 warning(s) across 1 file(s).
+\end{sortie}
+Le même littéral objet est instable dans le corps de \code{Fresh} (recréé à chaque rendu) et stable au niveau du module (évalué une fois, au chargement). \code{ViaLet} n'est pas signalé non plus, mais pour une autre raison : \code{mutable} n'est pas une constante collectée, sa valeur est inconnue ($\Top$), et une règle \Warning{} qui affirme \og toujours frais\fg{} ne peut pas s'appuyer sur un inconnu.
+\end{exemple}
+
+Ce que le front-end sait d'un initialiseur de constante est décrit par :
+
+\rustsnippet{src/ir/component.rs}{12}{41}{\code{ModuleConstInit}}
+
+\code{collect_module_consts} (\src{src/lowering/mod.rs}{243}{341}) parcourt les instructions de niveau supérieur, ne garde que les déclarations \code{const} (nues ou exportées) à motif identifiant, pèle les enveloppes TypeScript et les parenthèses (\code{peel_ts}, \src{src/lowering/mod.rs}{248}{259}), puis classe l'initialiseur : un littéral primitif (booléen, \code{null}, nombre, chaîne) donne \code{Prim} ; un objet, un tableau, un \code{new}, une expression régulière ou un JSX donne \code{Ref} ; un appel de \code{createContext} prouvé React donne \code{Context}. Tout le reste est ignoré, et c'est voulu : \og the value domain has no sound encoding for "unknown kind, constant across renders" — they stay ⊤\fg{} (\src{src/lowering/mod.rs}{240}{242}, \issue{34}). Les initialiseurs fonctionnels sont exclus aussi, car ils relèvent des détecteurs. Notons que \code{const N = -1} n'est pas collecté (\code{-1} est une \code{UnaryExpression}) et que \code{let} et \code{var} ne le sont jamais (réaffectables). Le moteur amorce son environnement initial avec ces valeurs, \code{Ref} et \code{Context} devenant des références \code{Stable} (\src{src/engine/fixpoint.rs}{171}{188}, \cref{chap:statevalue-stabilite}).
+
+\subsection{Les contextes et leur identité}
+
+La variante \code{Context} existe parce qu'une règle de provider a besoin du \emph{rôle} : \code{<X.Provider>} ne fournit un contexte que si \code{X} en est un, et rien d'autre dans l'IR ne peut le dire. \code{createContext} n'est reconnu que s'il est atteint par une liaison React : un nom importé de \code{"react"} (éventuellement renommé) ou \code{ns.createContext} avec \code{ns} lié au module \code{react} ou égal à \code{React} (\src{src/lowering/mod.rs}{277}{293}). Un \code{createContext} importé d'un autre paquet n'est pas un contexte (test \code{other_calls_are_still_skipped}).
+
+La variante porte un \code{ContextId} (\src{src/ir/component.rs}{43}{57}) : le fichier qui appelle \code{createContext} et le nom qu'il lie. Deux fichiers qui importent le même contexte sous des alias différents désignent ainsi la même cellule (\issue{109}). Pour cela, \code{scan_context_names} projette la table sur les contextes de \emph{chaque} fichier, y compris ceux sans composant (un \file{contexts/ctx.ts} qui n'exporte que le contexte est la forme courante), puis \code{resolve_imported_contexts} (\src{src/resolver/mod.rs}{389}{431}) croise chaque import résolu avec la table du fichier d'origine. La résolution ne va qu'à \emph{un} niveau : un contexte réexporté par un fichier tiers n'est pas suivi (\issue{49}), ce qui peut manquer un appariement consommateur--fournisseur, jamais en créer un faux.
+
+\subsection{\code{ModuleFacts} : directives et arêtes d'import}
+
+\rustsnippet[label={lst:frontend-modulefacts}]{src/ir/module.rs}{21}{36}{\code{ModuleFacts}}
+
+\code{collect_module_facts} (\src{src/lowering/module_facts.rs}{17}{65}) remplit les deux champs. Les \code{directives} viennent de \code{Program::directives}, qu'oxc restreint au \emph{prologue} : un \code{'use client'} placé après une instruction réelle n'est pas une directive. Les \code{imports} sont les fichiers vers lesquels le résolveur a pu mapper un spécificateur, dédoublonnés dans l'ordre de première apparition, pour les \code{import} de valeur, les imports à effet de bord (\code{import "./x"}) et les réexportations (\code{export ... from}, \code{export * from}), parce qu'un barrel réexportateur tire le module exactement comme un import. \code{import type} et \code{export type ... from} ne sont \emph{pas} des arêtes : ils sont effacés avant l'exécution et ne transportent aucun environnement.
+
+La table \code{ModuleTable} (\src{src/ir/module.rs}{44}{52}) associe ces faits à chaque fichier abaissé ; elle est délibérément \emph{non interprétée} (\src{src/ir/module.rs}{11}{16}). Une table vide répond \og inconnu\fg{} partout, et chaque appelant doit lire \og inconnu\fg{} comme absence de preuve, jamais comme preuve du contraire. Le seul mécanisme partagé est un parcours :
+
+\rustsnippet[label={lst:frontend-reachable}]{src/ir/module.rs}{100}{126}{\code{reachable_from}, parcours en largeur arrêté par une frontière}
+
+Le parcours part des points de départ (\code{seeds}), suit les arêtes d'import, et s'arrête \emph{sur} un module qui déclare la directive frontière, en l'excluant. Il termine sur les cycles d'import grâce à \code{seen} et coûte $O(V+E)$. C'est toute la règle des Server Components en une fonction : une directive, écrite une fois en tête d'un module, gouverne tout ce qui est importé en dessous.
+
+\begin{exemple}{Le graphe serveur d'un projet Next.js}{frontend-next}
+La fixture \file{tests/fixtures/next_project} (alias \code{@/*} vers \file{./src/*}) est dessinée en \cref{fig:frontend-next}. \file{src/app/page.tsx} n'a pas de directive et appelle \code{useState} ; \file{src/components/counter.tsx} commence par \code{"use client"} ; \file{src/components/sidebar.tsx} n'a pas de directive et n'est importé que par le layout serveur.
+\begin{sortie}
+$ reactant check tests/fixtures/next_project --no-color --rule server-component-hook
+  HomePage  (2 hooks)  tests/fixtures/next_project/src/app/page.tsx
+    warn   server-component-hook  [hook:0]  (line 7:8)  `useState` is called in a Server Component. this file is an App Router `page` and no `"use client"` directive covers it, so React renders it on the server, where hooks do not exist; add `"use client"` at the top of the file, or move the stateful part into a child component that declares it
+  Sidebar  (2 hooks)  tests/fixtures/next_project/src/components/sidebar.tsx
+    warn   server-component-hook  [hook:0]  (line 8:8)  `usePathname`, `useState`, `useMemo` are called in a Server Component. this module is imported into the App Router's server graph and no `"use client"` directive covers it, so React renders it on the server, where hooks do not exist; add `"use client"` at the top of the file, or move the stateful part into a child component that declares it
+   1 clean component(s) hidden, rerun with --show-clean
+
+⚠  2 warning(s) across 7 file(s).
+\end{sortie}
+Le front-end a fourni le nom \code{HomePage} (par \code{export default function HomePage}), les directives de chaque fichier et les arêtes résolues par alias ; \code{server_modules} (\src{src/project/nextjs.rs}{48}{55}) appelle \code{reachable_from} depuis les entrées serveur de l'App Router (\file{layout}, \file{page}\dots), et la règle \regle{server-component-hook} (\cref{chap:regles-rendu-rsc}) font le reste. \code{Counter}, derrière sa frontière, n'est pas un Server Component : il n'est pas signalé par cette règle (sans le filtre \code{--rule}, il reçoit un \regle{infinite-loop} sans rapport avec le front-end).
+\end{exemple}
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=6mm and 5mm,
+  srv/.style={bloc,font=\scriptsize,fill=ra-amber!15,text width=30mm},
+  cli/.style={bloc,font=\scriptsize,fill=white,dashed,text width=30mm}]
+  \node[srv] (layout) {\texttt{app/layout.tsx}\\(départ)};
+  \node[srv,right=of layout] (page) {\texttt{app/page.tsx}\\(départ)};
+  \node[srv,right=of page] (dash) {\texttt{app/dashboard/}\\\texttt{page.tsx} (départ)};
+  \node[srv,below=of layout] (side) {\texttt{components/}\\\texttt{sidebar.tsx}};
+  \node[srv,below=of side] (nav) {\texttt{hooks/}\\\texttt{use-nav-items.ts}};
+  \node[cli,below=of page] (counter) {\texttt{components/}\\\texttt{counter.tsx}\\\texttt{"use client"}};
+  \node[srv,below=of dash] (stats) {\texttt{lib/stats.ts}};
+  \draw[flechemust] (layout) -- (side);
+  \draw[flechemust] (side) -- (nav);
+  \draw[flechemay] (page) -- node[etiquette,right]{frontière} (counter);
+  \draw[flechemust] (dash) -- (stats);
+\end{tikzpicture}
+\caption{Le graphe d'import de \texttt{tests/fixtures/next\_project}. En orange, l'ensemble \texttt{reachable\_from(départs, Some("use client"))} : les modules serveur. Le parcours s'arrête sur \texttt{counter.tsx}, qui déclare la frontière, et l'exclut.}\label{fig:frontend-next}
+\end{figure}
+
+\begin{decision}[\adr{26} §1--2 : des faits de module dans l'IR]
+Les directives et les arêtes sont des faits de \emph{fichier} et vivent hors de \code{ComponentIR} : \og a directive governs every symbol in the module at once, and an import edge has no component to hang off\fg{}. La table est non interprétée ; les arêtes de type sont exclues ; \code{build_resolved_imports} perd son pré-filtre \og relatifs seulement\fg{} (un alias résolu ne peut qu'ajouter des arêtes). L'alternative structurante refusée était d'\emph{ignorer} les Server Components : \og Server-ness is not a property of a file, it is a property of \emph{how the file is reached}\fg{}, et décider sur des arêtes incomplètes serait un faux négatif. La règle qui en découle est \Warning{}, pas \Error{}, parce que ses faits viennent du front-end syntaxique et non du domaine abstrait.
+\end{decision}
+
+\begin{remarque}
+Contrairement à \code{collect_module_facts}, \code{build_resolved_imports} (\src{src/lowering/import_resolution.rs}{140}{177}) ne filtre pas \code{import type} : un nom de type entre dans les imports résolus. C'est sans effet, un type ne correspondant à aucun composant, contexte ni utilitaire. À l'inverse, \code{import { type T }} (modificateur par spécificateur) garde \code{import_kind == Value} au niveau de la déclaration et \emph{reste} une arête : un fichier qui n'exporte que des types peut ainsi déclencher le blind spot \code{unread-imports}. C'est une sur-approximation, jamais un faux négatif.
+\end{remarque}
+
+\subsection{Les props typées DOM}
+
+\begin{sloppypar}
+Dernier fait extrait par le front-end, local à un composant : la fonction \code{collect_dom_props} (\src{src/lowering/component_detector.rs}{113}{139}) lit l'annotation du \emph{premier} paramètre (littéral de type, ou \code{type} ou \code{interface} du même fichier) et retient les membres dont le type est une interface DOM (\code{HTML...Element}, \code{SVG...Element}, \code{Element}, \code{Node}, \code{EventTarget}, \code{Document} ; \src{src/lowering/component_detector.rs}{196}{208}). Muter ces props est de la manipulation impérative du DOM, et la règle \regle{state-mutation} les exempte. Les unions (\code{HTMLCanvasElement | null}) et les \code{interface ... extends} ne sont pas suivies ; le commentaire l'assume, puisqu'une exemption manquée ne coûte qu'un \Warning{}.
+\end{sloppypar}
+
+\begin{exemple}{L'exemption DOM et la déstructuration}{frontend-dom}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ra-ex/e3b/Dom.tsx}}]
+import { useEffect } from "react";
+type Props = { canvas: HTMLCanvasElement };
+export function ChartA(props: Props) {
+  useEffect(() => { props.canvas.width = 3; }, [props.canvas]);
+  return <div />;
+}
+export function ChartB({ canvas }: Props) {
+  useEffect(() => { canvas.width = 3; }, [canvas]);
+  return <div />;
+}
+\end{lstlisting}
+\begin{sortie}
+  ChartA  (1 hooks)  /tmp/ra-ex/e3b/Dom.tsx  ✓
+  ChartB  (1 hooks)  /tmp/ra-ex/e3b/Dom.tsx
+    warn   state-mutation  var:canvas  (line 8:20)  `canvas` roots in this component's props, so mutating it writes into an object owned by the parent; copy it before changing
+       (1 trace step(s), rerun with --trace)
+\end{sortie}
+\code{collect_dom_props} rend \code{{"canvas"}} dans les deux cas. Mais la règle n'exempte que le motif \code{props.canvas} sur le paramètre du composant (\src{src/rules/impls/state_mutation.rs}{121}{127}) ; un paramètre déstructuré s'appelle \code{__p0}, et \code{canvas} y est lié par le préambule de paramètres. C'est un faux positif \Warning{}, sur la forme la plus courante. Le dossier de notes le signale comme non répertorié.
+\end{exemple}
+
+% ---------------------------------------------------------------------------
+\section{L'identité des callees JSX}
+\label{sec:frontend-jsx}
+
+\subsection{Le problème : qui est \code{<Widget/>} ?}
+
+Quand un composant écrit \code{<Panel onChange={setN}/>}, le moteur doit trouver le corps de \code{Panel} pour l'analyser comme enfant, avec les props que le parent lui passe. Le nom seul ne suffit pas : \code{Panel} peut être un alias d'import, et un projet réel contient souvent vingt composants \code{Form}. Avant \issue{7}, le moteur résolvait un callee JSX par \code{get_by_name}, qui rendait la première clé \code{(file, name)} \emph{dans l'ordre de tri} : un leurre \file{a/Widget.tsx} pouvait prendre la place du \code{./b/Widget} importé, et l'\Error{} qui dépendait du vrai corps disparaissait.
+
+\begin{exemple}{Un alias, un leurre, et une référence ambiguë}{frontend-ident}
+Deux fichiers définissent \code{Widget} : \file{a/Widget.tsx} (inoffensif) et \file{b/Widget.tsx}, qui appelle sa prop \code{onChange} pendant le rendu. \file{App.tsx} importe \code{import { Widget as Panel } from "./b/Widget"} et rend \code{<Panel onChange={setN} />} ; \file{Guess.tsx} rend \code{<Widget onChange={setN} />} sans rien importer.
+\begin{sortie}
+$ reactant check /tmp/ch05/ident --no-color --show-clean --info
+  App  (1 hooks)  /tmp/ch05/ident/App.tsx  ✓
+    verified  …
+  Guess  (1 hooks)  /tmp/ch05/ident/Guess.tsx
+    info   analysis-limit  several analysed files define a component called `Widget` and this reference does not resolve to one of them, so the child is treated as unknown. Import it explicitly from its file (FN possible)
+    suspended  analysis-limit  4 passing check(s) withheld: the analysis was truncated in this component, so they are not guaranteed
+  Widget@/tmp/ch05/ident/b/Widget.tsx  (0 hooks)  /tmp/ch05/ident/b/Widget.tsx
+    error  cross-setter-in-render  var:onChange  (line 2:2)  prop `onChange` (a state setter of parent `App`) called during render of `Widget@/tmp/ch05/ident/b/Widget.tsx`, which triggers a parent re-render on every render
+       (1 trace step(s), rerun with --trace)
+\end{sortie}
+(Les quatre lignes \code{verified} de \code{App} sont élidées.) L'alias \code{Panel} est résolu vers le \code{Widget} de \file{b/}, dont l'\Error{} est attribuée au bon parent. La référence de \code{Guess}, qu'aucun import ne tranche, n'est pas devinée : l'enfant devient inconnu, et une \Info{} le dit. Le nom affiché \code{Widget@<fichier>} n'est qu'un rendu, qui désambiguïse deux composants homonymes (\adr{40} §2).
+\end{exemple}
+
+\subsection{\code{CompOrigin} et \code{JsxOrigins}}
+
+Un callee JSX porte désormais \og ce que son propre fichier a prouvé\fg{} (\adr{40} §3) : un \code{CompOrigin} (\src{src/ir/expr.rs}{160}{172}), c'est-à-dire le fichier qui définit le composant et le nom sous lequel ce fichier le connaît. Les deux moitiés comptent : le fichier sépare les homonymes, le nom résout l'alias (\code{<Panel/>} ici, \code{Widget} là-bas). La table \code{JsxOrigins} (\src{src/lowering/import_resolution.rs}{207}{224}), un \code{Arc<HashMap<Symbol, Arc<CompOrigin>>>} partagé par tous les corps du fichier, est construite une fois par fichier :
+
+\rustsnippet[label={lst:frontend-jsx-origins}]{src/lowering/import_resolution.rs}{237}{262}{\code{build_jsx_origins}}
+
+On y pose d'abord \emph{tous} les noms liés au niveau supérieur (\code{top_level_binding_names}, \src{src/lowering/mod.rs}{63}{126} : fonctions, classes, variables, y compris sous \code{export}), délibérément pas \og tous les composants\fg{} : un nom qui ne se révèle pas composant ne correspond simplement à rien dans le registre. On pose ensuite les imports résolus, avec leur nom d'origine (\code{ResolvedImport}, \src{src/lowering/import_resolution.rs}{18}{33}). Un nom absent de la table est \og non résolu\fg{}, pas absent du programme : imports d'espace de noms, barrels et paquets npm y tombent, et le moteur se rabat alors sur le nom.
+
+La table voyage dans le \code{LowerCtx} (\src{src/lowering/cfg_builder.rs}{45}{74}), qui regroupe la table des lignes, le compteur de sites d'allocation et les origines JSX : un corps imbriqué (un \code{FnLit}) hérite des trois sans passe dédiée. Le tampon est posé au lowering de chaque élément capitalisé :
+
+\rustsnippet{src/lowering/expr_lower.rs}{832}{842}{le callee JSX reçoit son origine}
+
+\noindent et consommé en un seul endroit du moteur :
+
+\rustsnippet[label={lst:frontend-resolve-child}]{src/engine/component_registry.rs}{114}{127}{\code{resolve_child}, trois réponses}
+
+Origine prouvée d'abord ; sinon le nom, s'il n'est défini que dans un fichier ; sinon \code{Ambiguous}, qui rend l'enfant inanalysable et fait porter au parent une \code{analysis-limit}. Jamais de \og premier par ordre de tri\fg{}.
+
+\begin{decision}[\adr{40} §3--5 : l'identité d'un callee se prouve dans son fichier]
+Le callee JSX porte l'origine que son fichier a établie ; la résolution vit en un seul lieu et refuse de deviner (\og The old first-match was not non-deterministic, it was \emph{wrong}\fg{}) ; tout chemin est normalisé une fois, en amont (\code{normalize} dans \code{lower_files_with}), pour que clés de registre et réponses du résolveur s'accordent. Alternative refusée : analyser \emph{tous} les candidats d'un nom ambigu. \og Sound and strictly more precise, and dropped on measurement\fg{} : 1\,347 références ambiguës sur quatorze dépôts du corpus, \code{<Button/>} seul en comptant 1\,453 quand le corpus est analysé d'un bloc, et une analyse complète de chaque candidat à chaque site reproduirait le blocage quadratique de \issue{86}. Le changement d'identité a été vérifié neutre : digest identique sur 35\,541 fichiers.
+\end{decision}
+
+% ---------------------------------------------------------------------------
+\section{Les limites du front-end sont des questions de soundness}
+\label{sec:frontend-limites}
+
+\subsection{Absent n'est pas $\Top$}
+
+Partout ailleurs dans le pipeline, ce que l'analyse ne sait pas est sur-approximé : une valeur opaque vaut $\Top$, un hook inconnu vaut $\Top$ avec une \Info{}. Le front-end est le seul endroit où une décision \emph{binaire et syntaxique} conditionne l'existence même de l'objet analysé. Une fonction que les trois détecteurs refusent n'est pas approximée : elle est \emph{absente}.
+
+\begin{invariant}{Asymétrie du front-end}{frontend-asymetrie}
+Détecter trop largement (une fonction capitalisée qui renvoie du JSX sans jamais être rendue, un \code{obj.useX()} qui n'est pas un hook) coûte au pire des faux positifs, tolérés. Détecter trop étroitement retire du code à l'analyse : c'est un risque de faux négatif, donc un défaut de \emph{soundness} au sens de \cref{def:soundness}, pas de précision.
+\end{invariant}
+
+C'est exactement la requalification faite par \issue{122}. Mesurons ce que la définition actuelle laisse passer.
+
+\begin{exemple}{Huit composants, un seul vu}{frontend-limits}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ra-ex/e6/Limits.tsx}}]
+import React, { useState, memo } from "react";
+import { createPortal } from "react-dom";
+
+export function List({ items }: { items: string[] }) {
+  return items.map((i) => <li key={i}>{i}</li>);
+}
+export function Switchy({ k }: { k: number }) {
+  switch (k) {
+    case 1: return <a />;
+    default: return <b />;
+  }
+}
+export function Portal({ el }: { el: Element }) {
+  return createPortal(<div />, el);
+}
+export function Logger() {
+  console.log(useState(0));
+  return null;
+}
+export const Memo = memo(function Inner() { return <i />; });
+export class Klass extends React.Component { render() { return <p />; } }
+export function Dyn({ c }: { c: boolean }) {
+  const C = c ? List : Switchy;
+  return <C items={[]} k={1} />;
+}
+export function useful() { return <u />; }
+\end{lstlisting}
+\begin{sortie}
+$ reactant check /tmp/ra-ex/e6 --no-color --verbose --show-clean --info
+[verbose] symbol graph: 1 nodes, topo order = [Dyn@/tmp/ra-ex/e6/Limits.tsx]
+…
+  Dyn  (0 hooks)  /tmp/ra-ex/e6/Limits.tsx
+    info   analysis-limit  component `C` was not found in the analysis registry. Pass its file on the command line to analyse it (FN possible)
+
+✓  1 file(s) no issues found.
+\end{sortie}
+Sept définitions sur huit ne sont vues par aucun détecteur : \code{List} (retour par un appel \code{.map}), \code{Switchy} (\code{switch}), \code{Portal} (\code{createPortal(...)}), \code{Logger} (hook en argument d'appel), \code{Memo} (\issue{64}), \code{Klass} (composant de classe), \code{useful} (hors des trois classes). La ligne finale affirme \og no issues found\fg{} alors que six composants React valides n'ont pas été analysés.
+\end{exemple}
+
+Le \cref{tab:frontend-limites} recense les formes non détectées au commit étudié. Les premières sont documentées par des issues ; les autres ont été observées par le dossier de notes et ne correspondent, à notre connaissance, à aucune issue.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{5.3cm} >{\raggedright\arraybackslash}X}
+\toprule
+Forme & Cause dans le code \\
+\midrule
+\code{const C = cond ? A : B; <C/>} (\issue{63}) & le \code{CompApp} \code{C} n'a pas d'origine et ne résout vers rien \\
+\code{memo(...)}, \code{forwardRef(...)} (\issue{64}) & \code{consider_var} n'accepte qu'une flèche ou une fonction nue \\
+fonction imbriquée (\issue{56}) & la marche est au niveau supérieur seulement \\
+utilitaire \code{export default} (\issue{55}) & \code{detect_utilities} passe \code{None} \\
+\code{node_modules} (\issue{51}) & jamais abaissé, par conception \\
+\midrule
+retour dans un \code{switch}, \code{do...while}, \code{for...of} & pas de bras dans \code{stmt_has_jsx_return} \\
+\code{return items.map(...)}, \code{createPortal(...)}, \code{[<a/>, <b/>]} & \code{expr_contains_jsx} ne regarde ni appels ni tableaux \\
+hook seulement en argument (\code{track(useId())}), sous \code{?.}, dans un gabarit, dans un \code{for...of} & \code{expr_calls_hook} n'inspecte que le callee ; pas de bras \code{ChainExpression}, gabarit, \code{ForOf} \\
+composant de classe & \code{detect_fns} ignore \code{ClassDeclaration} \\
+annotation en union (\code{JSX.Element | null}) & seules les \code{TSTypeReference} sont examinées \\
+initialiseur parenthésé \code{(() => <div/>)} & \code{consider_var} ne pèle pas les parenthèses \\
+composant n'appelant que \code{use(...)} de React~19 & \code{is_hook_name("use")} est faux \\
+\bottomrule
+\end{tabularx}
+\caption{Formes non détectées au commit \snapshotCommit. Au-dessus du trait : issues ouvertes ou décisions. En dessous : observées, non répertoriées à notre connaissance.}\label{tab:frontend-limites}
+\end{table}
+
+\subsection{Quand l'utilisateur est-il averti ?}
+
+Une absence n'est signalée que si un composant \emph{détecté} rend le composant manquant : l'\Info{} \code{analysis-limit} \og component \dots\ was not found in the analysis registry … (FN possible)\fg{} apparaît alors, visible avec \code{--info}. Si personne ne le rend, rien ne le signale. Le cas suivant montre les deux faces sur un même défaut.
+
+\begin{exemple}{Un faux négatif de bout en bout}{frontend-switch}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ra-ex/e7/App.tsx}}]
+import { useState } from "react";
+
+function ViaIf({ k, onChange }: { k: number; onChange: (n: number) => void }) {
+  onChange(1);
+  if (k === 1) return <a />;
+  return <b />;
+}
+function ViaSwitch({ k, onChange }: { k: number; onChange: (n: number) => void }) {
+  onChange(1);
+  switch (k) {
+    case 1: return <a />;
+    default: return <b />;
+  }
+}
+export function App() {
+  const [n, setN] = useState(0);
+  return (
+    <div>
+      <ViaIf k={n} onChange={setN} />
+      <ViaSwitch k={n} onChange={setN} />
+    </div>
+  );
+}
+\end{lstlisting}
+\begin{sortie}
+$ reactant check /tmp/ra-ex/e7 --no-color
+  ViaIf  (0 hooks)  /tmp/ra-ex/e7/App.tsx
+    error  cross-setter-in-render  var:onChange  (line 4:2)  prop `onChange` (a state setter of parent `App`) called during render of `ViaIf`, which triggers a parent re-render on every render
+       (1 trace step(s), rerun with --trace)
+   1 clean component(s) hidden, rerun with --show-clean
+
+⚠  1 error(s) across 1 file(s).
+\end{sortie}
+Le même défaut certain (un setter du parent appelé pendant le rendu de l'enfant) est trouvé dans \code{ViaIf} et manqué dans \code{ViaSwitch} ; la seule différence est la forme du contrôle qui mène au \code{return}. Avec \code{--info}, \code{App} porte \og component `ViaSwitch` was not found in the analysis registry. Pass its file on the command line to analyse it (FN possible)\fg{}, un conseil trompeur puisque le fichier a été passé.
+\end{exemple}
+
+Un dernier défaut vient du résolveur par défaut, que toutes les tables du front-end consultent. \code{DefaultImportResolver::resolve} essaie \code{base.with_extension(ext)} pour chaque extension source (\src{src/resolver/mod.rs}{659}{665}), et \code{Path::with_extension} \emph{remplace} la dernière extension : \code{"./Button.styles"} devient \file{Button.ts}, \file{Button.tsx}… Avec \file{Button.tsx} et \file{Button.styles.ts} présents, l'import est résolu vers le mauvais fichier :
+
+\begin{sortie}
+$ reactant check /tmp/ch05/dots/App.tsx --no-color --show-clean --info
+  App  (1 hooks)  /tmp/ch05/dots/App.tsx
+    info   analysis-limit  [hook:0]  (line 4:8)  hook `useTheme` was not found in the registry. Pass its source file or add a HookSummary to analyse it (FN possible)
+    suspended  analysis-limit  1 passing check(s) withheld: the analysis was truncated in this component, so they are not guaranteed
+
+⚠  1 file(s), no findings, but parts of this run were not analyzed, so this is not a clean bill.
+   not analyzed:
+     • 1 imported file(s) resolved outside the analysed set and were never read. Pass them on the command line to analyse them (/tmp/ch05/dots/Button.tsx)
+\end{sortie}
+
+\noindent Le blind spot nomme \file{Button.tsx}, alors que \code{useTheme} vit dans \file{Button.styles.ts}. Quand le répertoire entier est analysé, la boucle de \code{useTheme} est bien trouvée (le moteur retombe sur la résolution par nom du hook) ; mais la même arête fausse peut aussi retirer silencieusement un composant entier du graphe serveur de \regle{server-component-hook}, sans blind spot cette fois, parce que le fichier vers lequel elle pointe à tort est bien dans l'ensemble analysé. Sur un projet App Router où \file{app/page.tsx} importe \code{"./util.data"} (résolu vers un \file{util.tsx} sans rapport, présent à côté, plutôt que vers \file{util.data.ts}), le composant \code{Deep} que \file{util.data.ts} importe à son tour --- il appelle \code{useState} sans \code{"use client"} --- disparaît de la preuve :
+\begin{sortie}
+$ reactant check /tmp/ch05/dots-graph --no-color --rule server-component-hook --show-clean
+  Deep  (1 hooks)  /tmp/ch05/dots-graph/app/deep.tsx  ✓
+
+✓  4 file(s) no issues found.
+\end{sortie}
+\noindent En ne changeant que le nom du fichier importé (\code{"./util-data"} sans point, aucun \file{util.tsx} pour s'y substituer), le même arbre est correctement clos et \code{Deep} reçoit le \Warning{} \regle{server-component-hook} attendu. Ce n'est donc pas seulement un blind spot mal nommé : c'est un faux négatif silencieux, par le même mécanisme.
+
+\subsection{Les frontières tracées}
+
+\begin{decision}[\issue{63} et \issue{51}, wontfix]
+\issue{63} (\og Out of scope — dynamic components\fg{}) : \og \code{const C = cond ? A : B; <C />} → no \code{CompApp} is generated, so it is not analyzed. Reopen with a design for resolving a component reference through a join.\fg{} Au commit étudié, un \code{CompApp} \code{C} est bien généré, sans origine, et ne résout vers rien : l'effet est celui que l'issue décrit, par un autre mécanisme. \issue{51} (\og By design — \code{node_modules} utilities/hooks/components are never lowered\fg{}) : \og the summary registry is the supported extension point for third-party behaviour\fg{}. Les alternatives, un join de références de composants et l'abaissement des sources de dépendances, restent ouvertes \og avec un design\fg{} pour la première et hors périmètre pour la seconde ; dans les deux cas l'enfant non résolu est signalé par une \Info{} \code{analysis-limit}, et le comportement des paquets passe par les résumés.
+\end{decision}
+
+Deux issues ouvertes sont rédigées comme des décisions : \issue{64} (\code{React.memo} et \code{forwardRef}, \og the one most likely to be worth lifting\fg{}) et \issue{55} (imports par défaut résolus par nom local, utilitaires \code{export default} non détectés). Les formes du bas du \cref{tab:frontend-limites}, en revanche, ne relèvent d'aucune décision : ce sont des trous de prédicats structurels, et chacun ne peut, une fois comblé, qu'ajouter des composants, donc des faux positifs possibles et aucun faux négatif (\cref{exo:frontend-switch}).
+
+% ---------------------------------------------------------------------------
+\begin{resume}
+\begin{sloppypar}
+\begin{itemize}
+  \item oxc parse chaque fichier dans sa propre arène ; seul \code{panicked} fait sauter un fichier, une erreur récupérée est signalée et le fichier est abaissé (\code{ParseError::analyzed}). \code{source_type_for} active JSX pour \file{.js}/\file{.jsx} ; \code{preserve_parens} matérialise les parenthèses.
+  \item Le front-end rend, par fichier, des IR possédées (\code{ComponentIR}, \code{HookIR}, \code{FunctionIR}) et des faits de module (\code{ModuleFacts}, contextes, imports résolus) ; aucun domaine ne voit l'AST (\cref{inv:frontend-frontiere}).
+  \item Un marcheur unique, \code{detect_fns}, énumère les fonctions de niveau supérieur ; chaque détecteur n'apporte qu'un prédicat \code{Classify} et un traitement de l'\code{export default}. \code{Candidate::build_cfg} est l'unique point de dispatch corps bloc / corps concis (\issue{5}).
+  \item Hook custom : \code{is_hook_name}. Utilitaire : ni hook ni majuscule, pas de retour JSX. Composant : majuscule et l'une des règles 2 (retour JSX), 3 (annotation), 4 (appel de hook, \issue{122}). Les classes sont disjointes, pas exhaustives (\cref{def:composant-hook-utilitaire}, \cref{prop:frontend-partition}).
+  \item La provenance d'un appel de hook est décidée fail-closed : hook local, puis \code{HookOrigin} (\code{"react"} testé avant le résolveur), puis convention, puis espace de noms (\cref{fig:frontend-classify-callee}).
+  \item Les faits de module n'enregistrent que le certain : le type \code{ModuleConstInit} (\code{Prim}, \code{Ref}, \code{Context(ContextId)}), directives du prologue, arêtes d'import de valeur ; \code{ModuleTable::reachable_from} porte toute la logique des frontières RSC (\adr{26}).
+  \item Un callee JSX porte l'origine que son fichier a prouvée (\code{CompOrigin}) ; \code{resolve_child} répond origine, nom unique ou \code{Ambiguous}, jamais une devinette (\adr{40}).
+  \item Au front-end, absent n'est pas $\Top$ : une forme non détectée est un risque de faux négatif, souvent silencieux (\cref{inv:frontend-asymetrie}, \cref{tab:frontend-limites}).
+\end{itemize}
+Fichiers rencontrés : dans \file{src/lowering/}, \file{mod.rs}, \file{detector.rs}, \file{component_detector.rs}, \file{hook_detector.rs}, \file{utility_detector.rs}, \file{jsx_detect.rs}, \file{hook_call_detect.rs}, \file{module_facts.rs}, \file{import_resolution.rs}, \file{utility_lowerer.rs} ; leurs voisins \file{src/ir/component.rs}, \file{src/ir/module.rs}, \file{src/ir/source_range.rs} et \file{src/resolver/mod.rs}. Le \cref{chap:ir} décrit l'IR que ces fonctions remplissent, et le \cref{chap:lowering-cfg} le lowering des corps que \code{Candidate::build_cfg} déclenche ; l'usage inter-fichiers des faits produits ici est l'objet du \cref{chap:inter-composants}.
+\end{sloppypar}
+\end{resume}
+
+\section*{Exercices}
+\addcontentsline{toc}{section}{Exercices}
+
+\begin{exercice}{Classer à la main}{frontend-classer}
+Pour chacune des huit définitions de l'\cref{ex:frontend-limits}, dire quel détecteur la rejette et à quelle étape (marcheur, nom, règle 2, 3 ou 4).
+\end{exercice}
+\begin{solution}
+\code{List}, \code{Switchy}, \code{Portal} : nom accepté, règles 2 à 4 en échec (appel, \code{switch}, appel), aucun hook direct. \code{Logger} : règle 4 en échec, le hook est un argument d'appel. \code{Memo} : rejeté par \code{consider_var} (l'initialiseur est un appel). \code{Klass} : rejeté par le marcheur (\code{ClassDeclaration}). \code{Dyn} : composant par la règle 2. \code{useful} : pas un hook (quatrième caractère minuscule), pas un composant (minuscule), pas un utilitaire (retour JSX).
+\end{solution}
+
+\begin{exercice}{Combler le trou du \code{switch}}{frontend-switch}
+Proposer la modification minimale de \code{stmt_has_jsx_return} qui fait détecter \code{ViaSwitch} (\cref{ex:frontend-switch}). Montrer qu'elle ne peut introduire que des faux positifs.
+\end{exercice}
+\begin{solution}
+Ajouter un bras \code{Statement::SwitchStatement(sw) => sw.cases.iter().any(|c| body_returns_jsx(&c.consequent))}, sur le modèle de \code{stmt_calls_hook}. La modification n'agrandit que l'ensemble des fonctions classées composants ; par \cref{inv:frontend-asymetrie}, une fonction ajoutée à tort est analysée pour rien (faux positif possible), et aucune fonction auparavant analysée ne disparaît. Elle ne peut donc créer aucun faux négatif.
+\end{solution}
+
+\begin{exercice}{L'ordre \og react\fg{} puis résolveur}{frontend-react-first}
+Expliquer pourquoi \code{build_hook_origins} teste la chaîne \code{"react"} avant d'appeler le résolveur. Décrire une configuration \file{tsconfig.json} qui casserait l'ordre inverse, et l'effet observable.
+\end{exercice}
+\begin{solution}
+Une entrée \code{"paths": { "react": ["./src/shims/react.ts"] }} fait résoudre \code{"react"} vers un fichier local. Avec l'ordre inverse, tous les imports de React deviendraient \code{HookOrigin::File}, donc des hooks \code{Custom} : \code{useState} ne créerait plus de slot, \code{useEffect} plus d'effet, et toutes les règles qui en dépendent se tairaient. C'est le \og mass-FN hazard\fg{} du commentaire.
+\end{solution}
+
+\begin{exercice}{Types et arêtes}{frontend-types}
+Pourquoi \code{import type} est-il exclu de \code{ModuleFacts::imports} mais pas de \code{build_resolved_imports} ? Est-ce un problème de soundness ?
+\end{exercice}
+\begin{solution}
+Une arête de \code{ModuleFacts} a une sémantique d'exécution (elle propage un environnement serveur ou client) : une arête de type ferait entrer à tort un module serveur dans la clôture client. Un import résolu n'est qu'une clé de recherche dans les tables de composants, contextes et utilitaires ; un nom de type n'y rencontre rien. Aucun problème de soundness dans les deux cas.
+\end{solution}
+
+\begin{exercice}{Un pelage central}{frontend-peel}
+\code{const P = (() => <div/>);} n'est pas détecté, alors que \code{collect_module_consts} sait peler les parenthèses. Proposer une correction conforme au principe 3 de \file{CLAUDE.md}, plutôt qu'un cas spécial dans \code{consider_var}.
+\end{exercice}
+\begin{solution}
+Extraire \code{peel_ts} de \code{collect_module_consts} en une fonction du module \code{lowering} (elle ne dépend que d'oxc), et l'appliquer à l'initialiseur dans \code{consider_var} comme dans \code{collect_module_consts}. Un seul pelage partagé : la prochaine enveloppe (\code{satisfies}, \code{as const}) sera traitée partout à la fois.
+\end{solution}
+
+\begin{exercice}{Tracer un alias}{frontend-trace-alias}
+Pour \code{import { Widget as Panel } from "./b/Widget"} (\cref{ex:frontend-ident}), suivre le nom \code{Panel} de \code{build_resolved_imports} jusqu'à \code{resolve_child}, en nommant chaque structure traversée.
+\end{exercice}
+\begin{solution}
+\code{build_resolved_imports} produit \code{Panel} $\mapsto$ \code{ResolvedImport { file: b/Widget.tsx, imported: "Widget" }} ; \code{build_jsx_origins} en fait \code{Panel} $\mapsto$ \code{CompOrigin { file: b/Widget.tsx, name: "Widget" }} dans \code{JsxOrigins} ; \code{LowerCtx} transporte la table jusqu'à \file{expr_lower.rs}, qui pose l'origine sur \code{Expr::CompApp}. Au moteur, \code{resolve_child} trouve la clé \code{(b/Widget.tsx, Widget)} dans le registre et répond \code{Resolved}, sans consulter le nom \code{Panel}.
+\end{solution}

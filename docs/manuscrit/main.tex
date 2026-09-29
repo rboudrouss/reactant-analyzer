@@ -1,0 +1,26 @@
+% ---------------------------------------------------------------------------
+% reactant-analyzer — manuscrit pédagogique
+% Compilation :  cd docs/manuscrit && ./build.sh
+% ---------------------------------------------------------------------------
+\documentclass[11pt,a4paper,openany]{book}
+\input{preamble}
+
+\title{Analyse statique de programmes React par interprétation abstraite\\[1ex]
+  {\large Anatomie complète de \reactant}}
+\author{rboudrouss}
+\date{Instantané du dépôt au commit \snapshotCommit{} (\snapshotDate)}
+
+\begin{document}
+\frontmatter
+\maketitle
+\input{chapters/00-avant-propos}
+\tableofcontents
+\listoffigures
+\lstlistoflistings
+\mainmatter
+\input{chapter-list}
+\backmatter
+\bibliographystyle{alpha}
+\bibliography{refs}
+\printindex
+\end{document}

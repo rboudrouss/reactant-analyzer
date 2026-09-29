@@ -1,0 +1,66 @@
+\chapter*{Avant-propos}
+\addcontentsline{toc}{chapter}{Avant-propos}
+
+Ce manuscrit décrit \reactant{}, un analyseur statique de programmes React
+fondé sur l'interprétation abstraite, tel qu'il existe au commit
+\snapshotCommit{} du dépôt (\snapshotDate). Il a été écrit pour qu'un lecteur
+qui connaît Rust et React côté utilisateur, sans formation préalable en analyse
+statique, en sorte en connaissant très bien la codebase : ses fichiers, ses
+types, ses algorithmes, ses décisions d'architecture et ses limites.
+
+\medskip
+
+\noindent\textbf{Parcours.} L'ordre des chapitres va du concret vers
+l'abstrait. La première partie pose le problème : les bugs React visés, le
+modèle d'exécution de React que l'on abstrait, les rappels d'interprétation
+abstraite nécessaires, puis un tour d'architecture de la codebase. Les parties
+suivantes suivent un fichier source dans l'ordre où l'analyseur le traite : le
+parseur et la détection des composants, la représentation intermédiaire et le
+lowering, les domaines abstraits, le moteur de point fixe et ses relations,
+l'analyse inter-composants, puis les règles qui transforment ces faits en
+diagnostics. La dernière partie décrit l'outil lui-même (ligne de commande,
+distribution, méthode de mesure), l'histoire de ses décisions et ses limites
+connues. Trois annexes servent de référence : les fiches des décisions
+d'architecture, le glossaire et le catalogue des règles. La carte de la
+codebase prévue en quatrième annexe n'a pas été rédigée dans cette version ; le
+tour d'architecture (chapitre~\ref{chap:tour-architecture}) en tient lieu.
+
+Un lecteur pressé peut lire les chapitres 1 à 4 puis piocher ; un lecteur qui
+veut contribuer au moteur lira dans l'ordre jusqu'au chapitre 16 ; un lecteur
+qui veut écrire une règle lira les chapitres 1 à 4, 17 et 22.
+
+\medskip
+
+\noindent\textbf{Conventions.} Les extraits de code Rust sont pris tels quels
+dans le dépôt, avec leurs numéros de ligne réels ; les programmes React
+d'exemple sont donnés en TSX et les sorties de l'analyseur ont toutes été
+observées sur le binaire construit au commit photographié. Les encadrés
+\emph{Rappel React} rappellent un point de la sémantique de React nécessaire à
+la compréhension ; les encadrés \emph{Décision} résument une décision
+d'architecture (ADR) et les alternatives refusées ; les encadrés \emph{Piège}
+signalent une subtilité ou une erreur classique ; les encadrés
+\emph{Exercice} proposent un travail au lecteur, avec solution. Les
+identifiants, noms de fichiers et noms de règles restent en anglais, tels qu'ils
+apparaissent dans le code ; les notions mathématiques sont en français avec une
+notation unifiée (ordre $\lleq$, join $\join$, meet $\meet$, widening $\widen$,
+concrétisation $\gam$).
+
+\medskip
+
+\noindent\textbf{État du texte.} Chaque chapitre a été rédigé à partir de
+dossiers techniques établis sur le code, puis relu par un vérificateur qui a
+recontrôlé chaque extrait et rejoué chaque sortie. Les constats faits en cours
+de rédaction sur le code lui-même (faux négatifs ou faux positifs observés,
+écarts entre une ADR et le code) sont rassemblés au
+chapitre~\ref{chap:limites-perspectives} et présentés comme des observations
+au commit \snapshotCommit{}, non comme des jugements. Une passe finale
+d'harmonisation reste à faire ; les renvois croisés et l'index peuvent encore
+comporter des irrégularités.
+
+\medskip
+
+\noindent\textbf{Sources.} La documentation officielle de React
+\cite{ReactDocs}, la sémantique formelle React-tRace \cite{LeeAhnYi2025} et
+les travaux fondateurs de l'interprétation abstraite
+\cite{CousotCousot77,CousotCousot79,RivalYi2020} sont les références externes
+de ce manuscrit ; tout le reste vient du dépôt \cite{ReactantRepo}.

@@ -1,0 +1,1169 @@
+% ---------------------------------------------------------------------------
+% Chapitre 23 — Projets, configuration, driver et CLI
+% Sources : notes/13-project-cli-driver.md (intégral) ; src/main.rs, src/lib.rs,
+% src/config.rs, src/cli/*.rs, src/driver/*.rs, src/project/*.rs,
+% src/resolver/*.rs, src/registry/*.rs ; ADR-011, 016, 022 §3/§5, 024, 026 ;
+% docs/usage.md ; docs/schemas/reactant-config.schema.json.
+% Sorties observées avec target/debug/reactant (commit e67b10a), NO_COLOR=1,
+% depuis la racine du dépôt (fixtures) ou depuis /tmp/ch23 (arbres construits).
+% La distribution (WASM, npm, action GitHub) est traitée au chapitre 24.
+% ---------------------------------------------------------------------------
+\chapter{Projets, configuration, driver et CLI}
+\label{chap:projet-cli-driver}
+
+\begin{objectifs}
+  \item Savoir invoquer \reactant{} et lire sa sortie : sous-commandes, forme historique, codes de sortie, anatomie d'une ligne de finding.
+  \item Connaître le fichier \file{reactant.config.json}, la précédence \og drapeaux avant configuration\fg{} et la résolution des overrides (\code{off}, allowlist, plafond de sévérité $\mathit{pin} \meet \mathit{polarit\acute{e}}$).
+  \item Suivre \code{run_check}, la fonction unique qui compose tout un \code{check} pour l'hôte natif comme pour l'hôte WASM, et ses points de sortie.
+  \item Comprendre comment un run choisit ses fichiers (\file{.gitignore}, exclusions) et comment il résout les imports d'un projet (Vite, Next.js, \file{tsconfig} \code{extends}/\code{references}/\code{paths}/\code{baseUrl}).
+  \item Maîtriser le contrat central du sous-système : \emph{pas de \og clean bill\fg{} pour du code non lu} (blind spots, \code{--follow-imports}).
+  \item Connaître les deux rendus (humain et JSON v2), leurs deux comptages, et le registre des résumés de hooks de bibliothèques.
+\end{objectifs}
+
+\prerequis{\cref{chap:frontend-detection} (parse oxc, détection des composants et des hooks, faits de module) ; \cref{chap:splice-inlining} (inlining des hooks, résumés de bibliothèques) ; \cref{chap:inter-composants} (racines, analyse d'un programme) ; \cref{chap:api-regles} (registre de règles, clamp, sceau de sévérité, \cref{def:certified} ; témoins, \cref{def:witness}) ; \cref{chap:regles-declaratives} pour les packs ; \cref{chap:regles-rendu-rsc} pour \regle{server-component-hook}. La notion de soundness (\cref{def:soundness}) est supposée acquise.}
+
+Les chapitres précédents ont décrit le cœur de l'analyseur : l'IR, le moteur, les relations, les règles. Ce chapitre décrit sa \emph{coquille} : tout ce qui se passe avant le parsing (quels fichiers lire, avec quelle résolution d'imports, sous quelle configuration) et tout ce qui se passe après les règles (tri, groupage, comptage, rendu, code de retour). Rien de ce code ne manipule un treillis. Il porte pourtant une part de la soundness du système, car un fichier qu'on oublie de lire est un faux négatif aussi sûrement qu'une fonction de transfert trop optimiste. Le fil rouge du chapitre est cette phrase de \file{src/driver/blind_spots.rs} : \og \emph{\og No issues found\fg{} is a claim about the code, and the analyzer may only make it about code it actually read}\fg{}.
+
+On procède du plus visible au plus enfoui : l'invocation telle que l'utilisateur la tape (\cref{sec:projet-cli-driver-invocation}), la configuration (\cref{sec:projet-cli-driver-config}), le driver qui compose le tout (\cref{sec:projet-cli-driver-driver}), puis les étapes du driver dans l'ordre où il les exécute : découverte des fichiers, projets et résolution d'imports, parse, blind spots, Next.js, rendu, et enfin le registre des résumés de bibliothèques.
+
+% ===========================================================================
+\section{L'invocation vue de l'utilisateur}
+\label{sec:projet-cli-driver-invocation}
+
+\subsection{Deux premiers runs}
+
+Le fichier \file{tests/fixtures/clean.tsx} contient quatre composants sans défaut. Le premier est un compteur ordinaire :
+
+\tsxsnippet{tests/fixtures/clean.tsx}{7}{20}{un compteur sans défaut}
+
+Lancé sans sous-commande, l'analyseur répond :
+
+\begin{shell}
+$ reactant tests/fixtures/clean.tsx ; echo "exit=$?"
+\end{shell}
+\begin{sortie}
+   4 clean component(s) hidden, rerun with --show-clean
+
+✓  1 file(s) no issues found.
+exit=0
+\end{sortie}
+
+Trois choses se lisent déjà. La forme \code{reactant <chemin>} est une forme \emph{historique}, équivalente à \code{reactant check <chemin>}. Les composants propres sont masqués par défaut et seulement comptés. Et la ligne finale \og ✓ … no issues found\fg{}, que nous appellerons le \terme{clean bill}, est une affirmation que l'outil ne fait que sous conditions (\cref{sec:projet-cli-driver-blind-spots}).
+
+Le second fixture, \file{tests/fixtures/config_project/App.tsx}, contient deux défauts connus :
+
+\tsxsnippet{tests/fixtures/config_project/App.tsx}{7}{14}{un setter en plein rendu et une dep manquante}
+
+\begin{sortie}
+  App  (2 hooks)  tests/fixtures/config_project/App.tsx
+    warn   missing-deps  [hook:1]  var:n  (line 10:2)  `n` is used in this effect but not in its deps array, and it is recreated on every render
+       (1 trace step(s), rerun with --trace)
+    error  setter-in-render  [hook:0]  (line 9:2)  setter `setN` called directly in the render body, move this call into a useEffect or an event handler
+       (1 trace step(s), rerun with --trace)
+
+⚠  1 error(s), 1 warning(s) across 1 file(s).
+exit=1
+\end{sortie}
+
+\paragraph{Anatomie d'une ligne.} L'en-tête de composant donne le nom affiché, le nombre de hooks \emph{abaissés} (\code{useState}, \code{useEffect} ; les handlers JSX comptent aussi, ce sont des \code{HookEntry::Handler}), et le fichier de définition. Chaque finding porte ensuite, dans cet ordre : une étiquette de sévérité de largeur fixe (\code{error}, \code{warn}, \code{info}) ; le nom de la règle ; le label du hook concerné \code{[hook:N]} ; la variable en cause \code{var:x} s'il y en a une ; la position \code{(line L:C)}, avec une ligne comptée à partir de 1 et une colonne à partir de 0 ; le message ; enfin le nombre de pas de témoin (\cref{def:witness}), visibles sous \code{--trace}. L'ordre des deux findings (\regle{missing-deps} avant \regle{setter-in-render}) n'est pas celui du fichier : c'est le tri total du registre de règles, par nom de règle d'abord (\src{src/rules/registry.rs}{296}{333}).
+
+\paragraph{Masquage.} Trois classes de composants ne s'impriment pas (\src{src/driver/human.rs}{113}{148}). Un composant \emph{trivial} (zéro hook, zéro finding) n'est jamais imprimé, même sous \code{--show-clean}. Un composant \emph{propre} (des hooks, aucun finding) est masqué et compté, sauf sous \code{--show-clean}. Un composant dont \emph{tous} les findings répètent une localisation déjà imprimée est masqué et compté (\cref{sec:projet-cli-driver-rendu}). Sous \code{--show-clean --info}, un composant propre imprime la liste des vérifications applicables qui ont tourné sans rien trouver :
+
+\begin{sortie}
+  Counter  (3 hooks)  tests/fixtures/clean.tsx  ✓
+    verified  always-unstable-deps  no deps array is defeated by an always-fresh reference
+    verified  conditional-hook  all hooks run unconditionally, in a stable order
+    verified  derived-state  no effect merely mirrors other state
+    verified  infinite-loop  no effect diverges into an infinite render loop
+    …
+\end{sortie}
+
+\noindent(extrait ; la liste complète compte dix lignes pour \code{Counter}). Les trois hooks de \code{Counter} sont \code{useState}, \code{useEffect} et le handler \code{onClick}.
+
+\subsection{Sous-commandes et forme historique}
+
+Le binaire tient en cinq lignes : \code{main} appelle \code{cli::run} et sort avec le code rendu (\file{src/main.rs}). La bibliothèque (\file{src/lib.rs}) déclare dix modules publics, \code{config}, \code{domains}, \code{driver}, \code{engine}, \code{ir}, \code{lowering}, \code{project}, \code{registry}, \code{resolver} et \code{rules} ; le module \code{cli} n'en fait \emph{pas} partie. clap et le parsing d'\code{argv} restent du côté binaire (\adr{16} §1), si bien que tout ce qui a un sens pour un autre hôte, le build WASM en particulier, vit dans la bibliothèque.
+
+\rustsnippet[label={lst:cli-struct}]{src/cli/mod.rs}{31}{48}{la structure clap de la ligne de commande}
+
+\code{Cli} juxtapose une sous-commande optionnelle et les arguments de \code{check} aplatis (\code{flatten}). Les sous-commandes sont \code{check}, \code{rules}, \code{explain <rule>}, \code{schemas [--out DIR]} et \code{help} (\src{src/cli/mod.rs}{50}{76}). L'aide \code{help} n'est pas celle de clap (\code{disable_help_subcommand}) : c'est \code{driver::run_help}, une page partagée avec l'hôte WASM ; \code{-h}/\code{--help} restent la référence exhaustive générée par clap. Le dispatch :
+
+\rustsnippet[label={lst:cli-run}]{src/cli/mod.rs}{110}{127}{le dispatch des sous-commandes}
+
+Le cas \code{None} couvre à la fois \code{reactant} nu et \code{reactant src/} : \code{check::run} remplace une liste de chemins vide par \code{"."} (\src{src/cli/check.rs}{99}{102}), si bien que \code{reactant} seul analyse le répertoire courant.
+
+\begin{piege}
+L'attribut \code{args_conflicts_with_subcommands = true} interdit de placer un drapeau \emph{avant} une sous-commande. \file{docs/usage.md} dit que \code{reactant --info check src/} est \og rejected\fg{}. C'est vrai, mais pas par clap : clap lit la forme historique, avec \code{check} et \code{src} comme chemins, et c'est le driver qui refuse le premier argument.
+\begin{sortie}
+$ reactant --info check src
+[error] no command or path named `check`
+
+reactant: static analyzer for React hook bugs, based on abstract interpretation
+…
+exit=2
+\end{sortie}
+Pour la même raison, un répertoire qui s'appelle littéralement \code{rules} ou \code{check} doit s'écrire \code{./rules}. Sinon, la sous-commande l'emporte.
+\end{piege}
+
+\code{rules} liste les noms de diagnostics que le registre peut émettre. Au commit étudié, on en compte 21 pour les natives : dix-neuf règles, dont deux émettent un second nom (\regle{cross-component-infinite-loop}, \regle{cross-setter-in-render}), suivies de ceux des packs chargés (\src{src/driver/mod.rs}{624}{642}). \code{explain <rule>} imprime la documentation d'un nom : résumé, explication, \code{Example:}, \code{Fix:} et \code{Options:} (\src{src/driver/mod.rs}{644}{704}). Un nom inconnu donne une suggestion calculée par sous-chaîne et par segment séparé par \code{-}. Ce n'est pas une distance d'édition :
+
+\begin{sortie}
+$ reactant explain loop
+[error] unknown rule `loop`
+did you mean: cross-component-infinite-loop, infinite-loop?
+exit=2
+\end{sortie}
+
+\code{schemas} émet les JSON Schemas de \file{pack.json} et de \file{reactant.config.json}, dérivés des types Rust par \code{schemars} (\file{src/cli/schemas_cmd.rs}, feature cargo \code{schema-gen}). \file{tests/schemas.rs} vérifie que les fichiers versionnés sous \file{docs/schemas/} sont identiques à cette sortie.
+
+\subsection{Codes de sortie}
+
+Trois constantes suffisent (\src{src/driver/mod.rs}{36}{38}) : \code{EXIT_OK = 0}, \code{EXIT_FINDINGS = 1}, \code{EXIT_USAGE = 2}. Le code 1 dépend du seuil \code{--fail-on} (\code{error}, \code{warning} par défaut, ou \code{never}). Le code 2 couvre toute erreur d'usage ou d'entrée-sortie ; en voici quatre, observées :
+
+\begin{sortie}
+$ reactant chekc                                    # stdout vide, aide sur stderr
+[error] no command or path named `chekc`
+$ reactant check does/not/exist
+[error] no such file or directory: does/not/exist
+$ reactant check tests/fixtures/vite_project --entry Bogus
+[error] --entry: no component named `Bogus`
+[error] name a component defined in the analysed files, `Name@path` to pick one of several with the same name
+$ reactant check --bogus
+error: unexpected argument '--bogus' found
+\end{sortie}
+
+La dernière erreur vient de clap, qui sort lui aussi avec le code 2 (observé ici). Les autres sont produites par le driver ou par le chargement de la configuration. Ce qui \emph{ne} change \emph{jamais} le code de sortie : les diagnostics \Info{}, les blind spots (\cref{sec:projet-cli-driver-blind-spots}) et les findings masqués parce qu'ils vivent hors des chemins nommés (\cref{sec:projet-cli-driver-follow}).
+
+\begin{decision}[ADR-016 — une CLI à sous-commandes, un pipeline unique]
+Avant \adr{16}, la CLI était une commande plate dont \file{src/main.rs} dupliquait le pipeline d'analyse, et cela \emph{sans} résolveur d'imports : le binaire ne voyait pas les hooks définis dans d'autres fichiers, alors que l'API plugin les voyait. L'ADR décide : (1) des sous-commandes, avec \code{check} par défaut et la forme historique conservée ; (2) un pipeline dédupliqué, \code{lower_files} $\to$ \code{LoweredProgram} $\to$ \code{analyze_lowered}, ce qui donne enfin au binaire la résolution cross-file ; (3) des métadonnées de règles indexées par \emph{nom de diagnostic}, parce que onze structures de règles émettaient treize noms ; (4) une sortie JSON par DTO dédiés, le type \code{Diagnostic} restant sans serde ; (5) le contrat 0/1/2 et \code{--fail-on}, un \file{tsconfig} manquant n'étant qu'un avertissement, jamais un code 2 ; (6) les types de projet (\cref{sec:projet-cli-driver-projets}). Alternative refusée pour (3) : étendre le trait \code{Rule}, ce qui aurait cassé les implémentations externes sans couvrir les noms doubles. Les points (3) et (4) ont depuis été absorbés par le \code{RuleRegistry} dynamique et par le driver partagé (\adr{22} §6 et §8).
+\end{decision}
+
+% ===========================================================================
+\section{La configuration}
+\label{sec:projet-cli-driver-config}
+
+\subsection{Un fichier découvert à la racine}
+
+Le fixture \file{tests/fixtures/config_discover} contient le même \code{App.tsx} que ci-dessus et ce fichier de configuration, commentaire compris :
+
+\begin{lstlisting}[language=JSON,caption={\file{tests/fixtures/config_discover/reactant.config.json} (verbatim)}]
+{
+  // Discovered at the project root without --config; proves discovery+merge.
+  "failOn": "never"
+}
+\end{lstlisting}
+
+\code{reactant check tests/fixtures/config_discover} imprime les deux mêmes findings, mais sort avec le code \textbf{0} : la clé \code{failOn} a comblé l'absence du drapeau \code{--fail-on}. Le fichier est du JSONC, c'est-à-dire du JSON avec commentaires et virgules finales, comme les \file{tsconfig.json}. Il passe par le même \code{strip_jsonc} que ces derniers (\cref{sec:projet-cli-driver-tsconfig}).
+
+\rustsnippet[label={lst:reactant-config}]{src/config.rs}{26}{67}{le type de la configuration}
+
+Chaque champ a un rôle précis :
+\begin{itemize}
+  \item \code{schema} (\code{\$schema} en JSON) sert à l'éditeur et n'est pas interprété ;
+  \item \code{packs} donne la liste ordonnée des packs de règles déclaratives (\cref{chap:regles-declaratives}), noms npm ou chemins ; l'ordre des packs est l'ordre de sortie (\adr{22} §8) ;
+  \item \code{rules} associe un nom de diagnostic à un réglage (voir plus bas). C'est une \code{BTreeMap}, pour une itération déterministe ;
+  \item les champs suivants sont les équivalents des drapeaux de \code{check} : \code{entry}, \code{allRoots}, \code{failOn}, \code{project}, \code{format}, \code{info}, \code{showClean}, \code{trace}, \code{excludeDirs}, \code{followImports} (\code{rename_all = "camelCase"}).
+\end{itemize}
+\code{--verbose}, \code{--rule}, \code{--ignore-rule}, \code{--rule-option} et \code{--no-color} n'ont pas d'équivalent de configuration ; les options de règles passent par \code{rules}.
+
+\paragraph{Validation bruyante.} L'en-tête du module pose le principe : \og a present but broken config is always an error, never silently degraded to defaults (silent config loss would silently drop packs and overrides)\fg{} (\src{src/config.rs}{1}{10}). L'attribut \code{deny_unknown_fields} en est la première application :
+
+\begin{sortie}
+$ reactant check tests/fixtures/config_project --config tests/fixtures/config_project/badkey.json
+[error] invalid tests/fixtures/config_project/badkey.json: unknown field `rulez`, expected one of `$schema`, `packs`, `rules`, `entry`, `allRoots`, `failOn`, `project`, `format`, `info`, `showClean`, `trace`, `excludeDirs`, `followImports` at line 2 column 9
+exit=2
+\end{sortie}
+
+La position \og line 2 column 9\fg{} est exacte parce que \code{strip_jsonc} remplace chaque commentaire en conservant ses retours à la ligne.
+
+\paragraph{Trois formes de réglage.} Une entrée de \code{rules} s'écrit \code{"off"}, \code{"<sévérité>"} ou \code{\{ "severity": …, "options": \{…\} \}}. Les trois se normalisent dans un seul type :
+
+\rustsnippet{src/config.rs}{96}{104}{un réglage de règle normalisé}
+
+La désérialisation est écrite à la main (\src{src/config.rs}{124}{177}), avec un \code{Visitor} qui accepte une chaîne ou un objet. Le commentaire donne la raison : \og an untagged enum would report "data did not match any variant", useless for the loud-validation contract — every message must say what was expected and what was found\fg{}. Le résultat, observé :
+
+\begin{sortie}
+[error] invalid tests/fixtures/config_project/badsetting.json: unknown rule setting `warn`, expected "off", "error", "warning" or "info" at line 2 column 35
+\end{sortie}
+
+\subsection{Chargement : configuration, registre, packs}
+
+\code{check::run} commence par déterminer une \emph{racine} : le premier argument qui est un répertoire, sinon \code{"."} (\src{src/cli/check.rs}{104}{112}). Le driver recalcule la même racine pour détecter le projet (\cref{sec:projet-cli-driver-driver}). Puis \code{load_config_and_registry} (\src{src/cli/config_load.rs}{16}{91}) procède en quatre temps :
+\begin{enumerate}
+  \item Un \code{--config <p>} explicite est chargé, et son absence est une erreur d'usage (\og An explicit --config must exist\fg{}). Sinon \code{config::discover(root)} cherche \emph{seulement} \file{<root>/reactant.config.json}, sans remonter vers les ancêtres ni se replier sur le répertoire courant (\src{src/config.rs}{334}{340}). Sinon, la configuration par défaut s'applique.
+  \item Les chemins de packs relatifs se résolvent contre le répertoire du fichier de configuration (\og the tsconfig-\code{extends} contract\fg{}), si bien qu'une configuration veut dire la même chose depuis n'importe quel répertoire courant.
+  \item Le registre part des règles natives, \code{RuleRegistry::natives()}. Les \code{options} non vides de \code{rules} sont transmises au chargeur de packs, indexées par identifiant complet.
+  \item Les packs sont chargés dans l'ordre de la configuration :
+\end{enumerate}
+
+\rustsnippet[label={lst:config-load-packs}]{src/cli/config_load.rs}{55}{91}{chargement des packs, chaque échec est bruyant}
+
+Le commentaire des lignes 55--57 formule une idée qui reviendra souvent : ignorer un pack configuré exécuterait moins de règles que la configuration ne le demande, \og the config-level analogue of a false negative\fg{}. La résolution d'une spécification de pack (\src{src/cli/config_load.rs}{93}{128}) est volontairement simple. Une spécification qui commence par \code{.} ou \code{/}, ou qui finit par \code{.json}, est un chemin. Toute autre est un nom npm, cherché dans \file{<base>/node_modules/<nom>/}, où l'on prend le champ \code{"reactant"} du \file{package.json}, à défaut \file{pack.json}. Il n'y a pas d'algorithme de résolution Node complet. Ce module lit le disque avec \code{std::fs} et non à travers la couture \code{FileSystem} : c'est du code d'hôte natif, et l'hôte WASM résout les packs de son côté (\cref{chap:distribution}).
+
+\begin{sortie}
+[error] pack `@team/react-rules`: not installed: tests/fixtures/config_project/node_modules/@team/react-rules does not exist
+exit=2
+\end{sortie}
+
+\code{rules} et \code{explain} réutilisent la même fonction avec \code{root = "."} (\file{src/cli/rules_cmd.rs}, \file{src/cli/explain.rs}) : leur configuration est celle du répertoire courant, alors que celle de \code{check} est celle du premier répertoire argument.
+
+\subsection{Précédence : les drapeaux comblent, la configuration complète}
+
+Un même réglage peut venir de deux sources, par exemple \code{--fail-on} et \code{"failOn"}. La règle d'\adr{22} §5 est que les drapeaux l'emportent. Pour que la configuration puisse combler un drapeau \emph{absent}, il faut pouvoir distinguer \og drapeau absent\fg{} de \og drapeau à sa valeur par défaut\fg{}. C'est pourquoi les trois options énumérées de \code{CheckArgs} n'ont pas de valeur par défaut clap :
+
+\rustsnippet{src/cli/check.rs}{62}{75}{trois \code{Option} sans défaut clap}
+
+\begin{invariant}{Absent n'est pas défaut}{projet-cli-driver-absent}
+Tant que la fusion avec la configuration n'a pas eu lieu, un drapeau non passé est représenté par \code{None} (options énumérées) ou par une liste vide (\code{entry}, \code{exclude_dir}). Les défauts finaux (\code{Human}, \code{Warning}, \code{Auto}) ne sont appliqués qu'\emph{après} la fusion (\src{src/cli/check.rs}{174}{188}). Un \code{default_value} clap produirait toujours \code{Some} et rendrait la configuration inopérante sur ces trois clés.
+\end{invariant}
+
+La fusion elle-même vit dans la bibliothèque, sur une forme neutre des drapeaux, \code{CheckArgsPartial} (\src{src/config.rs}{231}{248}). Chaque hôte y projette son \code{argv}, fusionne, puis en tire des \code{CheckOptions}. Il y a donc un seul mécanisme de précédence pour deux hôtes.
+
+\rustsnippet[label={lst:merge}]{src/config.rs}{250}{269}{la fusion drapeaux / configuration}
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+Régime & Champs & Règle & Conséquence \\
+\midrule
+liste & \code{entry}, \code{exclude_dirs} & drapeau non vide remplace & pas de concaténation \\
+booléen & \code{all_roots}, \code{info}, \code{show_clean}, & OU logique & la config ne peut pas \\
+ & \code{trace}, \code{follow_imports} & & être éteinte en CLI \\
+option & \code{fail_on}, \code{format}, \code{project} & \code{Option::or}, drapeau d'abord & défaut appliqué après \\
+sans équivalent & \code{verbose}, \code{rule}, \code{ignore_rule}, & drapeau seul & \\
+ & \code{rule_option}, \code{no_color} & & \\
+\bottomrule
+\end{tabular}
+\caption{Les trois régimes de précédence de \code{CheckArgsPartial::merge}.}
+\label{tab:projet-cli-driver-precedence}
+\end{table}
+
+\Cref{tab:projet-cli-driver-precedence} résume les trois régimes. Pour les listes, un test de \file{tests/discovery_exclusions.rs} vérifie que \code{--exclude-dir} remplace \code{excludeDirs} en entier :\\ \code{the_flag_beats_the_config_exclude_dirs}.
+
+\begin{piege}
+Les booléens sont \og turn-on-only\fg{} : aucun \code{--no-info} n'existe, et une configuration qui pose \code{"info": true} ne peut pas être contredite depuis la ligne de commande. Pour un run ponctuel sans \code{--info}, il faut passer une autre configuration avec \code{--config}.
+\end{piege}
+
+\subsection{Overrides de règles : \code{off}, allowlist, options}
+
+Les réglages de \code{rules} et les filtres \code{--rule}/\code{--ignore-rule} se combinent en un seul ensemble d'overrides :
+
+\rustsnippet[label={lst:resolve-overrides}]{src/config.rs}{271}{293}{la résolution des overrides}
+
+Trois phrases résument la fonction. \code{--ignore-rule} refuse toujours. Un \code{--rule X} explicite \emph{ressuscite} un \code{X} que la configuration avait mis à \code{"off"}. Et dès qu'un \code{--rule} est présent, il définit une allowlist. Sur le fixture, avec \file{off.json} = \code{\{"rules": \{"missing-deps": "off"\}\}}, on observe :
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}lllp{25mm}p{27mm}@{}}
+\toprule
+config & \code{--rule} & \code{--ignore-rule} & \regle{missing-deps} & \regle{setter-in-render} \\
+\midrule
+\code{"off"} & --- & --- & masqué & visible (exit 1) \\
+\code{"off"} & \code{missing-deps} & --- & visible (résurrection) & masqué (allowlist) \\
+\code{"off"} & \code{missing-deps} & \code{missing-deps} & masqué & masqué ; \og ✓ no issues found\fg{} \\
+\bottomrule
+\end{tabular}
+\caption{Table de vérité observée des overrides sur \file{tests/fixtures/config_project} ; la colonne \og config\fg{} est la valeur de \code{rules.missing-deps} dans \file{off.json}.}
+\label{tab:projet-cli-driver-overrides}
+\end{table}
+
+La dernière ligne de la \cref{tab:projet-cli-driver-overrides} mérite attention. Le composant \code{App} n'a plus de finding visible : il est compté comme \og clean component\fg{} et le clean bill est imprimé. Cette ligne est une affirmation sur les règles \emph{demandées}, pas sur le code. Le filtrage agit après les règles, par \code{RuleRegistry::visible} dans \code{check_component} (\src{src/rules/registry.rs}{293}{294}). Il n'ôte donc rien au calcul, seulement à l'affichage et au comptage.
+
+\paragraph{Options de règles.} \code{--rule-option <rule>:<key>=<value>} est découpé au premier \code{:} puis au premier \code{=}. La valeur est lue comme du JSON si elle en est (\code{3}, \code{true}), comme une chaîne sinon (\src{src/config.rs}{295}{319}). \code{apply_rule_options} la pose ensuite par-dessus la valeur de configuration de même clé (\src{src/config.rs}{321}{332}). La validation n'est pas faite ici mais dans \code{RuleRegistry::set_overrides} (\src{src/rules/registry.rs}{160}{200}) : nom de diagnostic connu, règle qui accepte des options, clé déclarée, type et bornes. Un seul échec suffit pour sortir avec le code 2 :
+
+\begin{sortie}
+[error] rule `missing-deps` is built-in and declares no options
+[error] option `minDepth` of rule `state-lifted-too-high` must be an integer between 1 and 64
+[error] `--rule-option badformat`: expected `<rule>:<key>=<value>`
+[error] unknown rule `no-such-rule`. Run `reactant rules` for the list of valid names
+\end{sortie}
+
+\noindent Ce sont quatre runs distincts, dans l'ordre :\\ \code{--rule-option missing-deps:foo=1} ;\\ \code{--rule-option state-lifted-too-high:minDepth=abc} ;\\ \code{--rule-option badformat} ;\\ \code{--config} vers \file{badrule.json}, qui nomme \code{no-such-rule}. Un nom inconnu dans \code{rules}, \code{--rule} ou \code{--ignore-rule} est refusé, parce qu'une faute de frappe dans un \code{"off"} ne ferait rien en silence, et une faute dans un \code{--rule} masquerait tout en silence.
+
+\subsection{Sévérité : un plafond, jamais un plancher}
+
+Le champ \code{severity} d'un réglage n'est pas une sévérité imposée mais un \emph{plafond}, que la configuration seule peut poser. \code{Diagnostic::clamp} ne fait que baisser :
+
+\rustsnippet[label={lst:clamp}]{src/rules/api/diagnostic.rs}{104}{114}{le clamp, qui ne fait que baisser}
+
+Observons les deux sens. Avec \file{downgrade.json} (\code{"setter-in-render": "warning"}) et \code{--fail-on error}, les deux lignes deviennent \code{warn}, le résumé est \og ⚠ 2 warning(s) across 1 file(s)\fg{} et le code de sortie vaut 0. Avec \file{upgrade.json} (\code{"missing-deps": "error"}), le JSON garde \code{"severity": "warning"} : la demande de promotion est un no-op structurel (test \code{config_upgrade_is_a_no_op}, \file{tests/config.rs}).
+
+\begin{decision}[ADR-022 §3 et §5 — $\mathit{pin} \meet \mathit{polarit\acute{e}}$, pour les natives comme pour les packs]
+Une sévérité \Error{} est une preuve (\cref{def:certified}) : elle ne se construit que par \code{Diagnostic::error}, derrière le sceau de la couche règles (\cref{chap:api-regles}). La sévérité effective d'un finding est donc le meet du plafond demandé (\emph{pin}) et de la sévérité construite (la \emph{polarité}), pris dans l'ordre $\Info \lleq \Warning \lleq \Error$. Baisser un \Error{} natif est permis : le consommateur en prend le risque. Promouvoir un finding de polarité may en \Error{} ne peut pas arriver, et c'est silencieux et structurel. \code{"off"} désactive. La même règle vaut pour les natives et pour les packs, ce qui évite un second régime (\cref{chap:regles-declaratives}). L'alternative, une sévérité libre dans la configuration, aurait permis à un fichier JSON de fabriquer des \Error{} que le moteur n'a pas prouvés, contre l'invariant des niveaux de diagnostic.
+\end{decision}
+
+\begin{remarque}
+Deux ordres coexistent sur \code{Severity} (\src{src/rules/api/diagnostic.rs}{41}{52}). Le \emph{rang} ($\Error = 2 > \Warning = 1 > \Info = 0$) sert au clamp. L'ordre de l'énumération ($\Error < \Warning < \Info$) sert au tri déterministe de la sortie. Les confondre inverserait l'un des deux.
+\end{remarque}
+
+% ===========================================================================
+\section{Le driver : \code{run_check} comme composition}
+\label{sec:projet-cli-driver-driver}
+
+\subsection{Hôte et driver}
+
+Une fois la configuration fusionnée et les overrides installés dans le registre, \code{check::run} n'a plus qu'un appel à faire :
+
+\rustsnippet{src/cli/check.rs}{192}{202}{l'hôte natif appelle le driver, imprime, sort}
+
+Tout le reste est dans \code{driver::run_check}, dont l'en-tête de module définit la frontière :
+
+\rustsnippet[label={lst:driver-header}]{src/driver/mod.rs}{1}{10}{le contrat du driver}
+
+\begin{definition}{Hôte, driver}{projet-cli-driver-hote}
+Le \terme{driver} est la fonction \code{run_check} et ses renderers : la composition complète d'un \code{check}, du contexte de projet au texte rendu. Il ne lit le monde qu'à travers la couture \code{FileSystem} et rend des flux tamponnés. Un \terme{hôte} est un frontend (le binaire natif, ou le wrapper WASM/JS) : il parse \code{argv}, découvre et fusionne la configuration, résout les overrides sur le registre, décide des couleurs (tty, \code{NO_COLOR}, \code{--no-color}), écrit les flux et termine le processus.
+\end{definition}
+
+\rustsnippet[label={lst:check-options}]{src/driver/mod.rs}{61}{90}{options résolues et sortie tamponnée}
+
+La signature est \code{run_check(fs: Arc<dyn FileSystem>, paths: \&[String], registry: \&RuleRegistry, opts: \&CheckOptions, display: \&dyn Fn(\&Path) -> String) -> CheckOutput} (\src{src/driver/mod.rs}{102}{112}). Le registre arrive prêt, avec les natives, les packs et les overrides installés. Quelques champs appellent un commentaire. \code{color} est déjà résolu par l'hôte ; côté natif, c'est \file{src/cli/color.rs} (couleurs actives si et seulement s'il n'y a pas de \code{--no-color}, si \code{NO_COLOR} est absent ou vide, et si stdout est un terminal). Le driver ne \og renifle\fg{} jamais l'environnement. \code{display} rend un chemin pour l'affichage : la CLI passe un relativiseur au répertoire courant, \code{display_relative} (\src{src/cli/mod.rs}{21}{29}), et WASM passe l'identité. \code{CheckOutput} est tamponné, et l'on sait ce que porte chaque flux : \code{stdout} contient le rapport, humain ou \emph{un seul} document JSON ; \code{stderr} contient les avertissements, les erreurs de parse et le bavardage \code{--verbose}.
+
+Ce découpage a une conséquence testable. Le crate WASM appelle le même \code{run_check} avec un \code{MemFileSystem} (\cref{chap:distribution}), et \file{tests/memfs_parity.rs} exige une sortie octet par octet identique entre \code{OsFileSystem} et \code{MemFileSystem} sur les fixtures \code{vite_project}, \code{next_project} et \code{cross_file_hook}. La couture elle-même est minuscule :
+
+\rustsnippet{src/resolver/filesystem.rs}{12}{19}{la couture en lecture seule}
+
+\code{OsFileSystem} relaie simplement \code{std::fs}. \code{MemFileSystem} est une \code{BTreeMap<PathBuf, String>} dont les clés sont normalisées lexicalement à l'insertion. Un répertoire y \og existe\fg{} si et seulement si une clé lui est strictement préfixée, composante par composante (\src{src/resolver/filesystem.rs}{75}{82}). Découverte, détection de projet, chaînes \file{tsconfig} et résolution d'alias tournent ainsi \emph{dans} le moteur au-dessus de la table, et aucune sémantique de l'analyseur n'est réimplémentée côté hôte (\src{src/resolver/filesystem.rs}{1}{7}).
+
+\subsection{Le flot de \code{run_check}}
+
+La \cref{fig:run-check-flot} montre l'ordre exact des étapes (\src{src/driver/mod.rs}{106}{508}), avec les points de sortie \code{EXIT_USAGE} à droite et, à gauche, les étapes qui alimentent la liste des blind spots.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=3.2mm,
+    etape/.style={bloc,minimum width=62mm,font=\footnotesize},
+    sortie/.style={draw=ra-red,fill=white,rounded corners=2pt,thick,align=left,font=\scriptsize,inner sep=3pt,text width=40mm},
+    aveugle/.style={draw=ra-amber,fill=white,rounded corners=2pt,align=left,font=\scriptsize,inner sep=3pt,text width=24mm},
+    fsort/.style={fleche,draw=ra-red},
+    favg/.style={fleche,dashed,draw=ra-amber}]
+  \node[etape] (s1) {1. commande mal tapée ?};
+  \node[etape,below=of s1] (s2) {2. racine = 1\textsuperscript{er} répertoire, sinon \code{.}};
+  \node[etape,below=of s2] (s3) {3. \code{build_context} (+ avertissement \code{--project})};
+  \node[etape,below=of s3] (s4) {4. découverte (\code{DefaultFileDiscoverer})};
+  \node[etape,below=of s4] (s5) {5. [\code{--follow-imports}] \code{import_closure}};
+  \node[etape,below=of s5] (s6) {6. \code{lower_files_with} : parse + lowering};
+  \node[etape,below=of s6] (s7) {7. imports résolus mais non lus};
+  \node[etape,below=of s7] (s8) {8. stratégie de racines, contrôle \code{--entry}};
+  \node[etape,below=of s8] (s9) {9. aucun composant ? rapport vide, rendu};
+  \node[etape,below=of s9] (s10) {10. \code{analyze_lowered} (+ \code{new_with_common})};
+  \node[etape,below=of s10] (s11) {11. \code{ProgramCache} ; \code{check_component} par composant};
+  \node[etape,below=of s11] (s12) {12. comptage, code de sortie (\code{--fail-on})};
+  \node[etape,below=of s12] (s13) {13. \code{human::render} | \code{json::render}};
+  \node[bloc,below=of s13,font=\footnotesize] (out) {\code{CheckOutput \{ stdout, stderr, exit_code \}}};
+  \foreach \a/\b in {s1/s2,s2/s3,s3/s4,s4/s5,s5/s6,s6/s7,s7/s8,s8/s9,s9/s10,s10/s11,s11/s12,s12/s13,s13/out}
+    \draw[fleche] (\a) -- (\b);
+  % sorties EXIT_USAGE
+  \node[sortie,right=8mm of s1] (e1) {\code{no command or path named} + aide\\exit 2, stdout vide};
+  \node[sortie,right=8mm of s4] (e4) {\code{no such file or directory}\\\code{no .ts/.tsx/.js/.jsx files found}\\exit 2};
+  \node[sortie,right=8mm of s8] (e8) {\code{--entry: no component named}\\exit 2};
+  \draw[fsort] (s1) -- (e1);
+  \draw[fsort] (s4) -- (e4);
+  \draw[fsort] (s8) -- (e8);
+  % blind spots
+  \node[aveugle,left=8mm of s3] (b3) {\code{unresolved-aliases}};
+  \node[aveugle,left=8mm of s6] (b6) {\code{unparsed-files}};
+  \node[aveugle,left=8mm of s7] (b7) {\code{unread-imports}};
+  \draw[favg] (s3) -- (b3);
+  \draw[favg] (s6) -- (b6);
+  \draw[favg] (s7) -- (b7);
+  \node[etiquette,above=1mm of b3] {liste \code{blind}};
+  \node[etiquette,above=1mm of e1] {\code{EXIT_USAGE}};
+\end{tikzpicture}
+\caption{Le flot de \code{run_check}. À droite, en rouge, les trois points de sortie \code{EXIT_USAGE} du driver (les autres codes 2 naissent avant, dans l'hôte : clap, configuration, overrides). À gauche, en pointillés, les trois étapes qui alimentent la liste des blind spots.}
+\label{fig:run-check-flot}
+\end{figure}
+
+\paragraph{1. Commande mal tapée.} C'est la première garde :
+
+\rustsnippet{src/driver/mod.rs}{115}{129}{un premier argument qui ne nomme rien}
+
+Un premier argument sans \code{/}, sans \code{\textbackslash} et sans \code{.}, qui n'existe pas sur le disque, ressemble à une commande. La page d'aide lui répond mieux qu'une erreur d'entrée-sortie (test \code{an_unknown_command_prints_the_help_not_an_io_error}, \file{tests/cli.rs}). Seul le premier argument est examiné, parce que c'est la seule position qu'une commande puisse occuper. Un argument en forme de chemin garde son \og no such file or directory\fg{}.
+
+\paragraph{2--3. Racine et contexte.} La racine de projet est le premier argument qui est un répertoire à travers la couture, sinon \code{.} (\src{src/driver/mod.rs}{131}{139}). C'est la même règle que dans \code{check.rs}, mais évaluée par \code{fs.is_dir}. Puis \code{build_context} calcule le type de projet, la racine de découverte et le résolveur (\cref{sec:projet-cli-driver-projets}). Un \code{alias_warning} est imprimé et devient un blind spot. Sous \code{--verbose}, une ligne résume le contexte.
+
+\paragraph{4--7. Fichiers.} La découverte (\cref{sec:projet-cli-driver-decouverte}), la fermeture optionnelle des imports (\cref{sec:projet-cli-driver-follow}), le lowering et le canal d'erreurs (\cref{sec:projet-cli-driver-parse}), puis le calcul des imports non lus (\cref{sec:projet-cli-driver-blind-spots}).
+
+\paragraph{8. Racines.} La stratégie est \code{Explicit} si \code{--entry} est non vide (noms nettoyés par \code{trim}), sinon \code{AllComponents} sous \code{--all-roots}, sinon \code{Heuristic} (\src{src/driver/mod.rs}{282}{288} ; la notion de racine est au \cref{chap:inter-composants}). Une table \og origine $\to$ (fichier, nombre de hooks)\fg{} est construite \emph{avant} l'analyse, qui consomme les composants. Elle est indexée par l'origine \code{(fichier, nom)} du composant et jamais par son nom affiché, dont l'orthographe dépend des autres fichiers présents dans le run (\issue{7}, \adr{40}). Puis vient le contrôle de \code{--entry} :
+
+\rustsnippet{src/driver/mod.rs}{307}{321}{un \code{--entry} qui ne sélectionne rien est une erreur}
+
+Le commentaire donne le raisonnement : un nom qui ne correspond à rien ne sélectionne aucune racine et réduit silencieusement le run à l'analyse intra-composant. Chaque finding inter-composants serait alors perdu sur une faute de frappe, avec un rapport par ailleurs propre.
+
+\paragraph{9--10. Analyse.} S'il n'y a aucun composant, un rapport vide est rendu tout de suite, avec le code 0. Sinon :
+
+\rustsnippet{src/driver/mod.rs}{366}{374}{le seul branchement de \code{new_with_common} dans un run réel}
+
+Le driver est le \emph{seul} endroit du dépôt où le registre commun de résumés de bibliothèques est installé dans un run réel (\cref{sec:projet-cli-driver-summary}). \code{Config::default()} garde un registre vide pour que les tests unitaires conservent leurs lignes de base. Sous \code{--verbose}, le driver imprime ensuite \code{components_analyzed} et les compteurs \code{cache hits/misses}. Il s'agit du cache inter-composants du moteur (\cref{chap:inter-composants}), qui indexe le résultat d'un enfant par ses props abstraites. Ce n'est pas un cache disque : chaque invocation repart de zéro.
+
+\paragraph{11. Règles.} Les composants sont parcourus dans l'ordre de leur nom affiché. Un \emph{seul} \code{ProgramCache} sert tout le run : les règles qui ont besoin de structures programme, comme le graphe de churn de \regle{infinite-loop} (\cref{chap:churn}), le construisent une fois au lieu d'une fois par composant, ce qui rendait la phase des règles quadratique (\issue{86}, \src{src/driver/mod.rs}{407}{410}). Pour chaque composant, \code{registry.check_component} fait tout le passage des règles : \code{check}, repli sur \code{safe_check}, clamp, filtres \code{off}/allow, tri total (\cref{chap:api-regles}). Le driver ne garde que le filtre d'affichage des \Info{} (\code{--info}) et la mise à l'écart des composants définis hors des chemins nommés (\cref{sec:projet-cli-driver-follow}).
+
+\paragraph{12. Code de sortie.}
+
+\rustsnippet{src/driver/mod.rs}{480}{484}{la politique de sortie}
+
+\begin{invariant}{Ce qui fait le code de sortie}{projet-cli-driver-exit}
+Le code 1 est décidé par les seuls comptes \code{errors} et \code{warnings} des composants \emph{rapportés}, ligne par ligne, après clamp et filtres. Les \Info{} n'y entrent jamais, les blind spots non plus (test \code{a_blind_spot_is_not_a_finding}, \file{tests/blind_spots.rs}), ni les findings retenus hors des chemins nommés. Les comptes sont faits \emph{par ligne composant}, sans groupage par localisation (\cref{sec:projet-cli-driver-rendu}).
+\end{invariant}
+
+\paragraph{Déterminisme.} Deux runs consécutifs doivent être identiques octet par octet (tests \code{consecutive_runs_are_byte_identical} et sa variante \code{--trace}, \file{tests/cli.rs} ; variante avec configuration dans \file{tests/config.rs}). Plusieurs dispositifs y concourent : le tri de \code{discover} (l'ordre de \code{read_dir} ne fait pas partie du contrat), les \code{BTreeMap}/\code{BTreeSet} de la configuration et des imports non lus, le tri des arêtes vers les utilitaires, le tri des composants par nom affiché, le tri total des diagnostics dans \code{check_component} et le groupage par localisation dans l'ordre du rapport. Les notes d'un diagnostic ne sont pas triées : c'est leur production qui doit être déterministe, d'où le test \code{--trace}.
+
+% ===========================================================================
+\section{La découverte des fichiers}
+\label{sec:projet-cli-driver-decouverte}
+
+\subsection{Un exemple : \code{scripts/build} n'est pas du build}
+
+Construisons sous \file{/tmp/ch23/gi} un petit dépôt : un \file{package.json} vide, un \file{.gitignore} de deux lignes (\code{dist} et \code{/src/generated}), le même composant \code{Looper} à boucle infinie dans \file{scripts/build/Tool.tsx} et dans \file{dist/Out.tsx}, un module \file{src/generated/api.ts}, et \file{src/Uses.tsx} qui l'importe par \code{./generated/api}. Depuis \file{/tmp/ch23} :
+
+\begin{sortie}
+$ reactant gi
+  Looper  (2 hooks)  gi/scripts/build/Tool.tsx
+    warn   infinite-loop  [hook:0]  (line 4:2)  this effect keeps pushing state `n` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
+
+⚠  1 warning(s) across 2 file(s).
+   not analyzed:
+     • 1 imported file(s) resolved outside the analysed set and were never read. Pass them on the command line to analyse them (gi/src/generated/api.ts)
+exit=1
+\end{sortie}
+
+\file{scripts/build/} est parcouru, parce que le \file{.gitignore} ne mentionne pas \code{build}. \file{dist/} est sauté, par le motif non ancré \code{dist}. \file{src/generated/} est sauté lui aussi, par le motif ancré \code{/src/generated}. Mais comme \file{Uses.tsx} importe un fichier de ce répertoire, le run le \emph{nomme} dans un blind spot et retient le clean bill (\cref{sec:projet-cli-driver-blind-spots}). \code{Uses}, sans hook ni finding, est trivial et ne s'imprime pas. Avec \code{--exclude-dir vendor}, la liste configurée remplace \emph{toute} la politique par défaut :
+
+\begin{sortie}
+$ reactant gi --exclude-dir vendor
+  Looper@gi/dist/Out.tsx  (2 hooks)  gi/dist/Out.tsx
+    warn   infinite-loop  [hook:0]  (line 4:2)  …
+  Looper@gi/scripts/build/Tool.tsx  (2 hooks)  gi/scripts/build/Tool.tsx
+    warn   infinite-loop  [hook:0]  (line 4:2)  …
+
+⚠  2 warning(s) across 4 file(s).
+\end{sortie}
+
+\noindent(messages élidés). Quatre fichiers sont lus et le blind spot disparaît. Les deux \code{Looper} homonymes sont désambiguïsés sous la forme \code{Name@path}.
+
+\subsection{Quels fichiers, quels répertoires}
+
+Un fichier est \emph{source} s'il a une extension de \code{SOURCE_EXTENSIONS} = \code{["ts", "tsx", "js", "jsx"]} et n'est ni un \code{*.d.ts}, ni un \code{*.test.*}, ni un \code{*.spec.*} (\src{src/resolver/mod.rs}{535}{557}). \file{.mts} et \file{.cts} ne sont donc jamais découverts, bien que \code{source_type_for} sache les parser. Les répertoires obéissent à trois listes (\src{src/resolver/mod.rs}{506}{533}, commentaires élidés) :
+
+\begin{lstlisting}[language=Rust,caption={Les constantes de la découverte (élagué : quatre lignes non contiguës, \srcline{src/resolver/mod.rs}{509}, 515, 526, 533)}]
+pub const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx"];
+pub const ALWAYS_EXCLUDED_DIRS: &[&str] = &["node_modules", ".git"];
+pub const EXCLUDED_DIRS: &[&str] = &["node_modules", "dist", "build", ".next"];
+pub const HOST_PRUNED_DIRS: &[&str] = &["node_modules", ".git", ".next"];
+\end{lstlisting}
+
+\code{HOST_PRUNED_DIRS} sert à l'hôte WASM, qui charge un sur-ensemble de fichiers et laisse le moteur refiltrer (\cref{chap:distribution}). La politique elle-même tient dans une fonction et une récursion :
+
+\rustsnippet[label={lst:skip-dir}]{src/resolver/mod.rs}{559}{575}{la politique de répertoires}
+
+La marche \code{walk} (\src{src/resolver/mod.rs}{577}{599}) empile le \file{.gitignore} du répertoire courant s'il y en a un. Pour chaque enfant, elle descend dans un répertoire que \code{skip_dir} ne saute pas, retient un fichier si \code{is_source_file} l'accepte, puis dépile en remontant.
+
+L'ordre de précédence est le suivant. \code{ALWAYS_EXCLUDED_DIRS} court-circuite tout : \code{--exclude-dir} restreint ce qu'on saute en plus, il ne fait pas entrer la marche dans un arbre de paquets. Vient ensuite la liste configurée, si elle est non vide. Puis les \file{.gitignore} du dépôt, s'il y en a au moins un. Enfin, les noms intégrés. \code{discover} (\src{src/resolver/mod.rs}{601}{623}) renvoie seul un \code{root} qui est un fichier source, amorce la pile des \file{.gitignore} situés \emph{au-dessus} de \code{root}, marche, puis \emph{trie}.
+
+\begin{decision}[\#137 — lire ce que le dépôt déclare généré]
+L'ancienne politique appliquait les quatre noms d'\code{EXCLUDED_DIRS} à toute profondeur. Elle sautait donc \file{scripts/build/}, du code \emph{d'outillage} et non de la sortie de build, ainsi que tout répertoire fonctionnel appelé \code{dist}. Le commentaire de \code{EXCLUDED_DIRS} la qualifie de \og soundness bug\fg{}. Le correctif ne consiste pas à allonger ou raccourcir la liste, ce qui aurait été un patch local, mais à lire la source de vérité du dépôt, le \file{.gitignore}. Les noms intégrés ne restent que comme réponse quand il n'y a rien à lire.
+\end{decision}
+
+\subsection{Un lecteur de \file{.gitignore} pour une seule question}
+
+Le module \file{src/resolver/gitignore.rs} ne répond qu'à une question : \og ce répertoire est-il de la sortie générée ?\fg{}. Il n'est jamais interrogé sur un fichier, ce qui dispense des subtilités propres aux fichiers (un \code{/} final restreint aux répertoires, ré-inclusion d'un fichier sous un répertoire exclu). La pile se construit ainsi :
+
+\rustsnippet{src/resolver/gitignore.rs}{98}{114}{les \file{.gitignore} au-dessus de la racine de marche}
+
+Le \emph{work tree} est le premier ancêtre qui porte un \file{.git} (répertoire, ou fichier dans le cas d'un worktree ou d'un sous-module) ou un \file{package.json} (\src{src/resolver/gitignore.rs}{149}{153}). Sans lui, rien n'est lu au-dessus de la racine : un \file{.gitignore} égaré dans \file{\$HOME} ne doit pas décider de ce que sont les sources d'un projet. La marche empile ensuite un \file{.gitignore} par répertoire rencontré et le dépile en remontant, grâce au booléen rendu par \code{push_for}. Chaque couche rend un verdict à trois valeurs, où la dernière règle qui s'applique gagne :
+
+\rustsnippet{src/resolver/gitignore.rs}{59}{75}{verdict d'un fichier : la dernière règle gagne}
+
+Puis, dans la pile, la couche la plus profonde qui a une opinion gagne (\code{find_map} sur les couches en ordre inverse, \src{src/resolver/gitignore.rs}{138}{146}). C'est ce qui permet à un \code{!generated} placé dans \file{packages/b/.gitignore} de ré-inclure ce que la racine excluait (un test de \file{tests/discovery_exclusions.rs} le vérifie). L'analyse d'une ligne (\src{src/resolver/gitignore.rs}{155}{192}) suit git : blancs finaux coupés sauf s'ils sont échappés, lignes vides et \code{\#…} ignorées, \code{!} pour la négation, \code{/} final retiré, et toute \code{/} restante \emph{ancre} le motif au répertoire du fichier. Le glob (\src{src/resolver/gitignore.rs}{211}{255}) traite \code{**}, qui traverse les \code{/} (et \code{a/**/b} reconnaît \code{a/b}), \code{*} et \code{?}, qui ne les traversent pas, les classes \code{[…]} et l'échappement.
+
+\begin{invariant}{Syntaxe incomprise, répertoire lu}{projet-cli-driver-gitignore}
+Ignorer un répertoire qu'il fallait lire est un faux négatif. Toute syntaxe que le lecteur ne comprend pas, par exemple une classe \code{[} non terminée, \emph{ne reconnaît rien} (\src{src/resolver/gitignore.rs}{235}{237}) : le doute fait lire davantage, jamais moins.
+\end{invariant}
+
+\begin{piege}
+L'invariant ne couvre que la syntaxe. Un répertoire \emph{réellement} listé, comme le \file{src/generated/} de l'exemple, n'est plus parcouru, alors qu'il contient du code que l'application importe. L'ancienne liste de noms l'aurait lu. La parade est le blind spot \code{unread-imports}, qui nomme tout fichier importé mais non lu. Le lecteur n'est pas git non plus : il ignore \file{.git/info/exclude} et les excludes globaux (\file{docs/limitations.md}).
+\end{piege}
+
+% ===========================================================================
+\section{Projets et résolution d'imports}
+\label{sec:projet-cli-driver-projets}
+
+\subsection{Un projet Vite}
+
+Le fixture \file{tests/fixtures/vite_project} reproduit l'échafaudage de Vite. \file{src/App.tsx} importe un hook par alias :
+
+\tsxsnippet{tests/fixtures/vite_project/src/App.tsx}{5}{10}{un import par l'alias \code{@/*}}
+
+\tsxsnippet{tests/fixtures/vite_project/src/hooks/useData.ts}{4}{10}{le hook, qui boucle}
+
+La racine \file{tsconfig.json} ne contient que des \code{references} (JSONC, virgules finales comprises). C'est \file{tsconfig.app.json} qui déclare \code{"baseUrl": "."} et \code{"paths": \{ "@/*": ["./src/*"] \}}.
+
+\begin{sortie}
+$ reactant check tests/fixtures/vite_project --verbose
+[verbose] vite project: discovery root tests/fixtures/vite_project/src, tsconfig aliases loaded
+[verbose] symbol graph: 2 nodes, topo order = [useData@tests/fixtures/vite_project/src/hooks/useData.ts, App@tests/fixtures/vite_project/src/App.tsx]
+[verbose] 1 components analyzed
+[verbose] cache hits: 0, misses: 0
+  [verbose] App: 3 iteration(s), widened: [1]
+  App  (1 hooks)  tests/fixtures/vite_project/src/App.tsx
+    warn   infinite-loop  [hook:1]  (tests/fixtures/vite_project/src/hooks/useData.ts:6:2)  this effect keeps pushing state `value` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
+
+⚠  1 warning(s) across 2 file(s).
+\end{sortie}
+
+Quatre décisions du sous-système se lisent dans cette sortie. \code{vite.config.ts} désigne un projet Vite. La découverte est rétrécie à \file{src/}, si bien que \file{vite.config.ts} n'est pas analysé (\og 2 file(s)\fg{}). L'alias \code{@/hooks/useData} est résolu vers \file{src/hooks/useData.ts} après un saut par \code{references}. Enfin, le hook est inliné dans \code{App}, et la position, qui pointe dans un autre fichier que l'en-tête, s'imprime avec son chemin (\cref{sec:projet-cli-driver-rendu}).
+
+\subsection{Type de projet, racine de configuration, racine de découverte}
+
+\rustsnippet{src/project/mod.rs}{26}{37}{les trois conventions reconnues}
+
+La détection repose sur des fichiers marqueurs : \code{next.config.\{ts,js,mjs,cjs,mts\}} désigne un projet Next.js, \code{vite.config.\{ts,js,mjs,mts\}} un projet Vite (\src{src/project/mod.rs}{39}{67}). Next est testé \emph{avant} Vite, parce qu'une application Next peut porter un \file{vite.config.*} pour son exécuteur de tests (vitest). Le marqueur est cherché en remontant les ancêtres :
+
+\rustsnippet[label={lst:locate}]{src/project/mod.rs}{80}{105}{la remontée vers le marqueur le plus proche}
+
+\begin{definition}{Racine de configuration, racine de découverte}{projet-cli-driver-racines}
+La \terme{racine de configuration} (\code{config_root}) est l'ancêtre le plus proche de la racine de projet, elle-même comprise, qui porte un marqueur ; c'est là que commence la recherche des \file{tsconfig}. La \terme{racine de découverte} (\code{discovery_root}) est le répertoire effectivement parcouru pour trouver les sources : la racine de projet, ou \file{<racine>/src} dans les cas de rétrécissement.
+\end{definition}
+
+\rustsnippet[label={lst:build-context-1}]{src/project/mod.rs}{171}{215}{\code{build_context}, première moitié}
+
+La seconde moitié (\src{src/project/mod.rs}{217}{253}) choisit le résolveur et l'avertissement selon le résultat de \code{locate_tsconfig_paths}. Elle a trois bras, et deux d'entre eux posent un \code{alias_warning} dont le texte nomme \code{vite.config} ou \code{next.config} ; on en verra un en \cref{sec:projet-cli-driver-nextjs}.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[font=\footnotesize,
+    q/.style={draw=ra-blue,fill=ra-bg,rounded corners=2pt,thick,align=center,inner sep=3pt},
+    r/.style={draw=ra-teal,fill=white,rounded corners=2pt,thick,align=center,inner sep=3pt,text width=36mm},
+    w/.style={draw=ra-amber,fill=white,rounded corners=2pt,thick,align=center,inner sep=3pt,text width=36mm},
+    lab/.style={etiquette,font=\scriptsize}]
+  \node[q] (loc) at (0,0) {\code{locate(root)} : marqueur en remontant ?};
+  \node[q] (kind) at (0,-1.3) {\code{kind} = \code{forced} sinon type localisé sinon \code{Plain}};
+  \node[q] (eq) at (0,-2.6) {\code{config_root == root} ?};
+  \node[r] (nar) at (-4.2,-3.9) {rétrécir : \code{Vite} $\to$ \file{src/} si existe ;\\ \code{NextJs} $\to$ \file{src/} si \file{src/app} ou \file{src/pages}};
+  \node[r] (keep) at (4.2,-3.9) {\code{discovery_root = root}\\(pointer dedans est déjà un rétrécissement)};
+  \node[q] (plain) at (0,-5.3) {\code{kind == Plain} ?};
+  \node[r] (dflt) at (-4.6,-6.5) {\code{DefaultImportResolver}\\pas d'avertissement};
+  \node[q] (ts) at (2.2,-6.5) {\code{locate_tsconfig_paths(config_root)}};
+  \node[w] (b1) at (-3.8,-8.1) {\code{Some}, \code{patterns} vide\\\code{TsconfigPathsResolver}\\+ avertissement \og baseUrl sans paths\fg{}};
+  \node[r] (b2) at (0.4,-8.1) {\code{Some}, motifs\\\code{TsconfigPathsResolver}\\pas d'avertissement};
+  \node[w] (b3) at (4.6,-8.1) {\code{None}\\\code{DefaultImportResolver}\\+ avertissement \og no paths\fg{}};
+  \draw[fleche] (loc) -- node[lab,right]{\code{config_root} = ancêtre trouvé, sinon \code{root}} (kind);
+  \draw[fleche] (kind) -- (eq);
+  \draw[fleche] (eq) -| node[lab,above,pos=0.25]{oui} (nar);
+  \draw[fleche] (eq) -| node[lab,above,pos=0.25]{non} (keep);
+  \draw[fleche] (nar) |- (plain);
+  \draw[fleche] (keep) |- (plain);
+  \draw[fleche] (plain) -| node[lab,above,pos=0.25]{oui} (dflt);
+  \draw[fleche] (plain) -| node[lab,above,pos=0.3]{non} (ts);
+  \draw[fleche] (ts) -- (b1);
+  \draw[fleche] (ts) -- (b2);
+  \draw[fleche] (ts) -- (b3);
+\end{tikzpicture}
+\caption{L'arbre de décision de \code{build_context}. En orange, les deux feuilles qui posent un \code{alias_warning}, que le driver transforme en blind spot \code{unresolved-aliases}.}
+\label{fig:build-context}
+\end{figure}
+
+La \cref{fig:build-context} résume la fonction. Deux choix y méritent d'être justifiés. Le premier : \code{--project} nomme un \emph{type}, pas un \emph{lieu}. Un type forcé réutilise la racine localisée s'il y en a une, et se replie sur la racine donnée sinon, ce qui garde \code{--project vite} utilisable sur un arbre sans marqueur. Le driver prévient alors, en appliquant la même remontée pour ne pas prétendre absent un marqueur situé un niveau plus haut (\src{src/driver/mod.rs}{147}{163} ; tests \code{forcing_a_kind_\{from_inside_the_project_does_not,on_an_unmarked_tree_still\}_warn} dans \file{tests/blind_spots.rs}) :
+\begin{sortie}
+[warn] --project vite: no vite.config.* found in …, still trying tsconfig paths
+\end{sortie}
+Le second : le rétrécissement à \file{src/} est une commodité pour \og analyser ce projet\fg{}. Il ne s'applique que si le chemin donné \emph{est} la racine de configuration. Pointer dans un sous-répertoire est déjà un rétrécissement, et ré-élargir analyserait des fichiers que personne n'a demandés. Pour Next.js, le rétrécissement exige \file{src/app} ou \file{src/pages} (\src{src/project/mod.rs}{135}{149}), car Next peuple exactement l'une des deux dispositions.
+
+\begin{decision}[ADR-016 §6 — des alias lus dans \file{tsconfig} seulement]
+Les alias d'un projet Vite peuvent aussi se déclarer dans \code{resolve.alias} de \file{vite.config.*}. Les lire exigerait d'\emph{exécuter} du JavaScript, et l'ADR refuse l'alternative d'une expression régulière \og au mieux\fg{} : \og a best-effort regex would risk \emph{wrong} resolutions, i.e. silent FNs\fg{}. \file{jsconfig.json} et les cartes \code{exports} de \file{package.json} sont hors périmètre. Le manque est dit et non caché : quand un type Vite ou Next ne trouve pas de \code{paths}, un avertissement est imprimé \emph{hors} \code{--info}, parce que c'est un caveat de soundness et pas du bruit. Il nomme le fichier de configuration dont les alias ne sont pas lus (\og Aliases declared only in vite.config are not read\fg{}).
+\end{decision}
+
+\begin{remarque}
+L'avertissement est sound mais grossier. Il est émis même si le projet n'écrit aucun \code{@/…}, ce qui retient à tort le clean bill (\cref{sec:projet-cli-driver-nextjs}). Ce faux positif de caveat ne coûte qu'un \og ✓\fg{} ; il ne peut pas produire de faux négatif.
+\end{remarque}
+
+\subsection{Les \file{tsconfig} : fichier, répertoire, ancêtres}
+\label{sec:projet-cli-driver-tsconfig}
+
+La recherche des \code{paths} emboîte trois niveaux, résumés en \cref{fig:tsconfig-graphe}. Le résultat est un \code{TsconfigPaths} :
+
+\rustsnippet{src/project/tsconfig.rs}{16}{27}{\code{baseUrl} et \code{paths}, en forme absolue}
+
+\begin{invariant}{\og baseUrl seul\fg{} n'est pas \og rien\fg{}}{projet-cli-driver-baseurl}
+\code{Some(TsconfigPaths)} avec \code{patterns} vide signifie qu'une configuration déclare un \code{baseUrl} et aucun \code{paths}. Les spécificateurs nus se résolvent alors contre la base, mais aucun alias n'existe. \code{None} signifie que rien n'a été trouvé. Cette distinction choisit la feuille de la \cref{fig:build-context}.
+\end{invariant}
+
+\paragraph{Niveau fichier : \code{paths_from_config}.} Un fichier qui déclare ses propres \code{paths} non vides gagne. Sans \code{baseUrl}, sa base est son propre répertoire, selon la sémantique de TypeScript 4.1 et suivants. Sinon, on hérite par \code{extends}, chaîne ou tableau :
+
+\rustsnippet[label={lst:paths-from-config}]{src/project/tsconfig.rs}{221}{245}{l'héritage par \code{extends}}
+
+Si le fichier n'a ni \code{paths} ni \code{extends}, il rend son \code{baseUrl} seul avec une liste de motifs vide, ou \code{None} (\src{src/project/tsconfig.rs}{206}{215}).
+
+Un parent qui n'a qu'un \code{baseUrl} ne clôt pas la recherche, puisqu'une entrée suivante du tableau peut encore déclarer les alias. Il est seulement mis de côté. Un \code{baseUrl} déclaré dans le fichier courant l'emporte sur celui qui est hérité. Un ensemble \code{visited} partagé coupe les cycles. \code{resolve_config_ref} (\src{src/project/tsconfig.rs}{137}{154}) ajoute \code{.json} si l'extension manque, fait viser \file{<dir>/tsconfig.json} à une référence de répertoire, et ne suit pas les \code{extends} vers un paquet. Un nom nu sans \code{/} est écarté d'emblée. Un nom scopé comme \code{"@tsconfig/vite-react"} contient un \code{/} : il est tenté comme chemin relatif au fichier déclarant, puis écarté faute de fichier. Un projet Vite dont le \file{tsconfig.json} se réduit à \code{\{ "extends": "@tsconfig/vite-react" \}}, sans \file{node_modules}, donne ainsi l'avertissement \og no tsconfig `paths` found\fg{} et le blind spot correspondant (observé sous \file{/tmp/ch23/ext}).
+Un \file{tsconfig} illisible ou non parsable donne \code{None} en silence à ce niveau. Le silence est rattrapé par l'\code{alias_warning}, jamais par un code 2 (\adr{16} §5).
+
+\paragraph{Niveau répertoire : \code{load_tsconfig_paths}} (\src{src/project/tsconfig.rs}{247}{295}). On part de \file{<root>/tsconfig.json} et de sa chaîne \code{extends}. Si aucun \code{paths} n'y figure, on parcourt \code{references[].path} dans l'ordre : c'est la disposition de Vite, où les \code{paths} sont dans \file{tsconfig.app.json}. Un résultat \og baseUrl seul\fg{} est retenu, mais ne court-circuite \emph{pas} ce saut (test \code{a_bare_base_url_does_not_shortcut_the_references_hop}).
+
+\paragraph{Niveau ancêtres : \code{locate_tsconfig_paths}.}
+
+\rustsnippet{src/project/mod.rs}{121}{133}{le plus proche ancêtre qui déclare de vrais \code{paths}}
+
+Le répertoire du marqueur est l'endroit où la recherche \emph{commence}, pas celui où elle s'arrête (\issue{139}). Un monorepo qui garde \file{vite.config.mts} dans une sous-application et les \code{paths} à la racine perdait sinon tous ses alias. Le commentaire de la fonction cite excalidraw, qui analysait 37 fichiers sans rien rapporter pour exactement cette raison. La même discipline que pour \code{references} s'applique : un ancêtre à \code{baseUrl} seul n'est retenu qu'à défaut de mieux.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[font=\footnotesize,
+    cfg/.style={draw=ra-blue,fill=white,rounded corners=2pt,thick,align=center,inner sep=3pt,font=\scriptsize\ttfamily},
+    niv/.style={draw=ra-gray,dashed,rounded corners=4pt,inner sep=5pt}]
+  \node[cfg] (anc) at (0,0) {../../tsconfig.json\\paths: @/* $\to$ ./src/*};
+  \node[cfg] (root) at (0,-2.2) {tsconfig.json\\(racine de config)};
+  \node[cfg] (base) at (-4.2,-2.2) {base.json\\baseUrl: .};
+  \node[cfg] (base2) at (-4.2,-3.9) {paths.json\\paths: \dots};
+  \node[cfg] (app) at (5.0,-2.2) {tsconfig.app.json\\paths: @/* $\to$ ./src/*};
+  \node[cfg] (node) at (5.0,-3.9) {tsconfig.node.json};
+  \draw[flechemust] (root) -- node[etiquette,above]{extends[0]} (base);
+  \draw[flechemust] (root) to[bend right=15] node[etiquette,below right]{extends[1]} (base2);
+  \draw[flechemay] (root) -- node[etiquette,above,pos=0.4]{references[0]} (app);
+  \draw[flechemay] (root) to[bend right=15] node[etiquette,below left]{references[1]} (node);
+  \draw[fleche,dotted] (root) -- node[etiquette,right]{ancêtre, si rien de mieux} (anc);
+  \begin{scope}[on background layer]
+    \node[niv,fit=(base) (base2),label={[etiquette]below:1. fichier (extends)}] {};
+    \node[niv,fit=(app) (node),label={[etiquette]below:2. répertoire (references)}] {};
+    \node[niv,fit=(anc),label={[etiquette]above:3. ancêtres (\#139)}] {};
+  \end{scope}
+\end{tikzpicture}
+\caption{Les trois niveaux de la recherche des \code{paths}. Traits pleins : la chaîne \code{extends}, suivie en premier, où un parent à \code{baseUrl} seul est mis de côté. Tirets : le saut \code{references}, tenté si la chaîne n'a pas de motifs. Pointillés : la remontée vers les ancêtres de la racine de configuration. Un ensemble \code{visited} partagé coupe les cycles.}
+\label{fig:tsconfig-graphe}
+\end{figure}
+
+Le JSONC est ôté par \code{strip_jsonc} (\src{src/project/tsconfig.rs}{29}{128}), en deux passes attentives aux chaînes. La première supprime \code{// …} et \code{/* … */} en conservant les retours à la ligne, pour que les positions d'erreur restent justes. La seconde supprime toute virgule dont le prochain caractère non blanc est \code{]} ou \code{\}}. La configuration de \reactant{} réutilise cette fonction.
+
+\subsection{Résoudre un spécificateur}
+
+Un résolveur implémente un trait d'une méthode (\src{src/resolver/mod.rs}{42}{47}). Sa documentation, \og Resolve a relative specifier\fg{}, date d'\adr{13} : depuis \adr{16} et \adr{26}, les résolveurs \file{tsconfig} répondent aussi à des spécificateurs non relatifs. \code{DefaultImportResolver} (\src{src/resolver/mod.rs}{650}{677}) ne traite que les spécificateurs relatifs. Il essaie \code{<base>.<ext>} pour chaque extension source, puis \code{<base>/index.<ext>}, et rend un chemin normalisé. \code{TsconfigPathsResolver} ajoute les alias :
+
+\rustsnippet[label={lst:paths-resolve}]{src/project/paths_resolver.rs}{78}{116}{résolution TypeScript : exacts, plus long préfixe, puis \code{baseUrl}}
+
+Les motifs exacts (sans \code{*}) passent d'abord. Viennent ensuite les motifs à joker, triés à la construction par longueur de préfixe décroissante (\og \code{@/generated/*} must beat \code{@/*}\fg{}, \srcline{src/project/paths_resolver.rs}{44}). Un préfixe qui reconnaît le spécificateur le \emph{consomme}. Si aucune cible n'existe, la réponse est \code{None}, sans retomber sur un motif plus court ni sur \code{baseUrl}, comme le fait TypeScript. En dernier recours, le spécificateur est sondé tel quel contre \code{baseUrl}. La sonde (\src{src/project/paths_resolver.rs}{55}{75}) essaie \code{<base>/<cible>}, puis \code{.with_extension(ext)}, puis \code{/index.<ext>}.
+
+\begin{proposition}{La sonde \code{baseUrl} ajoute, elle ne redirige pas}{projet-cli-driver-sonde}
+Soit $s$ un spécificateur non relatif. Si $s$ est reconnu par un motif de \code{paths}, la sonde \code{baseUrl} n'est pas consultée. Sinon, elle ne rend un chemin que si un fichier source existe à \code{<baseUrl>/}$s$, avec une extension ou un \file{index} ajoutés. Elle ne peut donc qu'\emph{ajouter} une arête d'import là où l'on avait \code{None}, jamais changer une résolution existante.
+\end{proposition}
+\noindent\emph{Preuve.} Les deux premières boucles rendent avant la dernière ligne dès qu'un motif reconnaît $s$ (\src{src/project/paths_resolver.rs}{84}{111}). La dernière ligne n'est atteinte qu'en l'absence de reconnaissance, et \code{probe} ne rend \code{Some} qu'après un \code{fs.is_file} vrai. \hfill$\square$
+
+\noindent Un paquet npm (\code{react}, \code{@tanstack/react-query}) retombe ainsi sur \code{None}, sauf si un fichier homonyme existe sous \code{baseUrl}. C'est l'argument de soundness d'\adr{26} §2--3 : admettre les spécificateurs non relatifs dans les arêtes d'import ne peut qu'en ajouter.
+
+\paragraph{Combinateurs.} \code{ChainResolver} (le premier qui répond gagne) et \code{ScopedResolver} (la portée dont la racine est le plus long préfixe du fichier \emph{importateur} gagne, pour les monorepos) existent pour l'API plugin (\src{src/resolver/mod.rs}{96}{160} ; \file{docs/plugins.md}). Le driver ne s'en sert pas : un run n'a qu'un résolveur, celui de \code{build_context}.
+
+\subsection{Pièges de la détection}
+
+\begin{piege}
+La remontée de \code{locate} est \emph{lexicale} (\code{Path::parent}) et non canonique. Depuis un chemin relatif, elle s'arrête donc au répertoire courant. \code{cd tests/fixtures/vite_project/src \&\& reactant . --verbose} n'imprime aucune ligne \og vite project\fg{} : le run est \code{Plain}. Avec le chemin absolu, \code{reactant "\$PWD"}, Vite est détecté. Sur ce fixture, le finding survit dans les deux cas. Le hook y est découvert dans le même run et trouvé par son nom seul, \code{get_by_name} du registre à clé \code{(fichier, nom)} (\src{src/registry/keyed.rs}{61}{67}, \adr{13}), même sans alias résolu.
+\end{piege}
+
+\begin{piege}
+Si \emph{seuls des fichiers} sont passés, la racine de projet est \code{"."} (\src{src/driver/mod.rs}{134}{139}) et la détection n'utilise pas le répertoire du fichier. Depuis la racine du dépôt, observé :
+\begin{sortie}
+$ reactant tests/fixtures/vite_project/src/App.tsx
+   1 clean component(s) hidden, rerun with --show-clean
+
+✓  1 file(s) no issues found.
+exit=0
+\end{sortie}
+Le run est \code{Plain}. L'alias \code{@/hooks/useData} n'est pas résolu, aucune arête n'est créée, donc aucun blind spot \code{unread-imports}, et le hook n'est pas dans le run. Le clean bill est imprimé alors qu'un hook qui boucle n'a pas été lu. Seul \code{--info} révèle \og analysis-limit … hook `useData` was not found in the registry … (FN possible)\fg{}. Le comportement est cohérent avec le contrat affiché (\cref{sec:projet-cli-driver-blind-spots} : un spécificateur non résolu est indistinguable d'un paquet npm), mais c'est un piège d'usage. \code{reactant tests/fixtures/vite_project/src} (le répertoire) détecte Vite et trouve le finding. Ce n'est pas le cas qu'\issue{9} a fermé : sa correction fait remonter \emph{la racine donnée} vers l'ancêtre marqué (\src{src/project/mod.rs}{171}{178}), alors qu'ici aucun argument n'est un répertoire, si bien que la racine vaut \code{"."} avant même que \code{locate} ne s'exécute (\src{src/driver/mod.rs}{131}{139}) : il n'y a pas de chemin à remonter. Au commit \snapshotCommit, ce cas précis, un seul fichier passé en argument, n'a pas d'issue ouverte qui le décrive.
+\end{piege}
+
+\begin{piege}
+Avec plusieurs répertoires en argument, seul le \emph{premier} décide du type de projet, de la configuration et du rétrécissement à \file{src/}. Les autres sont parcourus tels quels avec le même résolveur, ce qui peut résoudre un alias d'un paquet vers un fichier \emph{réel} d'un autre paquet, sans blind spot (\cref{exo:projet-cli-driver-monorepo}). Un répertoire sans source donne un code 2 même si les autres en ont. La liste des fichiers n'est pas dédupliquée entre arguments : \code{reactant dir dir/App.tsx} compte deux fois le même fichier dans \og across N file(s)\fg{}, sans dupliquer les findings.
+\end{piege}
+
+% ===========================================================================
+\section{Parse, lowering et canal d'erreurs}
+\label{sec:projet-cli-driver-parse}
+
+Sous \file{/tmp/ch23/parse}, \file{Recovered.tsx} contient la ligne \code{const z = a ?? b || c;} (une erreur de syntaxe dont oxc se rétablit), suivie d'un composant qui boucle. \file{Broken.tsx} commence par \code{const = ;}, qui fait paniquer le parser.
+
+\begin{sortie}
+$ reactant parse
+[skipped] parse/Broken.tsx: Unexpected token, the file was not analyzed
+[parse error] parse/Recovered.tsx: Logical expressions and coalesce expressions cannot be mixed
+  App  (2 hooks)  parse/Recovered.tsx
+    warn   infinite-loop  [hook:0]  (line 6:2)  this effect keeps pushing state `n` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
+
+⚠  1 warning(s) across 1 file(s).
+   not analyzed:
+     • 1 file(s) could not be parsed and were dropped, so nothing in them was analysed
+exit=1
+\end{sortie}
+
+Le fichier récupéré est \emph{analysé} : son finding existe malgré l'erreur de syntaxe. Le fichier abandonné est signalé deux fois, par une ligne \code{[skipped]} et par un blind spot. Les deux cas n'ont pas la même gravité, et le type d'erreur les distingue :
+
+\rustsnippet{src/resolver/mod.rs}{164}{178}{deux erreurs de parse qui ne se valent pas}
+
+La boucle de \code{lower_files_with} décide entre les deux :
+
+\rustsnippet[label={lst:lower-loop}]{src/resolver/mod.rs}{270}{312}{lecture, parse, et le seul critère d'abandon}
+
+Trois points de ce code comptent. (i) Chaque chemin est normalisé \emph{avant} de servir de clé. La découverte rend les chemins tels que l'utilisateur les a tapés (\file{./b/W.tsx} pour \code{reactant .}), le résolveur les rend normalisés, et une recherche \code{(fichier, nom)} construite depuis un import manquait donc toutes ses cibles, en silence, sur un run lancé avec un chemin préfixé par \code{.}. \code{normalize} (\src{src/resolver/mod.rs}{625}{648}) est une réduction lexicale de \code{.} et \code{..}. \code{canonicalize} n'est pas employé, parce qu'il suivrait les liens symboliques et produirait des chemins UNC sous Windows. (ii) \code{ret.panicked} est le seul signal d'oxc qui dise \og cet AST est inutilisable\fg{}. Sauter un fichier dès qu'une liste de diagnostics est non vide abandonnerait des fichiers entiers, ce qui est un faux négatif interdit, et de plus en plus fréquent à mesure qu'oxc déplace des vérifications sémantiques TypeScript dans le parser (commit \code{7d1957c}). (iii) Le type source dépend de l'extension :
+
+\rustsnippet{src/resolver/mod.rs}{193}{200}{le type source, JSX partout sauf dans \file{.ts}}
+
+\file{.js} et \file{.jsx} acceptent le JSX, parce que l'écosystème React en met dans des \file{.js} (Babel, CRA, Docusaurus). Le commentaire rapporte que trois composants réels d'excalidraw étaient perdus quand un \file{.js} était parsé sans JSX et faisait paniquer le parser. \file{.ts} reste sans JSX, puisque \code{<T>expr} y est une assertion de type.
+
+Après le parse, chaque fichier subit quatre passes de lowering : composants, hooks personnalisés, utilitaires, faits de module (\cref{chap:frontend-detection}). Deux collectes s'y ajoutent, noms de contextes et imports résolus. Après la boucle, deux passes inter-fichiers ont besoin que tous les fichiers aient été vus : \code{resolve_imported_contexts} (un contexte importé d'un autre fichier analysé devient un contexte ici, sur un niveau seulement, \issue{49}) et \code{resolve_imported_utilities} (arêtes vers les utilitaires, triées pour le déterminisme). Le produit est un \code{LoweredProgram} (\src{src/resolver/mod.rs}{202}{233}) : composants, hooks, utilitaires, nombre de fichiers effectivement abaissés, erreurs de parse, \code{FileTable} (\adr{19}), \code{ModuleTable} (directives et arêtes d'import résolues, \adr{26} §1) et arêtes vers les utilitaires (\adr{27} §3). C'est la frontière \og parse+lower / analyse\fg{} qu'\adr{16} §2 a exposée.
+
+Reste le canal de rapport :
+
+\rustsnippet{src/driver/mod.rs}{236}{260}{bruit récupéré contre perte silencieuse}
+
+\begin{invariant}{Un fichier perdu est toujours dit}{projet-cli-driver-skipped}
+Une erreur récupérée (\code{[parse error]}) n'est imprimée qu'en format humain : c'est du bruit, et le fichier a été analysé. Un fichier abandonné (\code{[skipped]}) est imprimé \emph{quel que soit le format}, sur stderr, si bien que stdout reste un seul document JSON. Il alimente de plus le blind spot \code{unparsed-files}. En JSON, \code{parse_errors[].analyzed} porte la même distinction :
+\begin{sortie}
+  "files_analyzed": 1,
+  "parse_errors": [
+    { "file": "parse/Broken.tsx", "message": "Unexpected token", "analyzed": false },
+    { "file": "parse/Recovered.tsx", "message": "Logical expressions and coalesce expressions cannot be mixed", "analyzed": true }
+  ],
+\end{sortie}
+\noindent(JSON reformaté sur moins de lignes ; contenu observé avec \code{--format json}, dont le stderr ne contient que la ligne \code{[skipped]}).
+\end{invariant}
+
+% ===========================================================================
+\section{Blind spots : pas de clean bill pour du code non lu}
+\label{sec:projet-cli-driver-blind-spots}
+
+\subsection{Un run rétréci}
+
+Le fixture \file{tests/fixtures/blind_spots/outside_root} contient \file{app/App.tsx}, qui importe \code{../shared/useThing} (un hook qui boucle), et \file{app/Broken.tsx}, qui a sa propre boucle. Pointons l'analyseur sur \file{app} seulement :
+
+\begin{sortie}
+$ reactant tests/fixtures/blind_spots/outside_root/app
+  Broken  (2 hooks)  tests/fixtures/blind_spots/outside_root/app/Broken.tsx
+    warn   infinite-loop  [hook:0]  (line 7:2)  this effect keeps pushing state `n` to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
+   1 clean component(s) hidden, rerun with --show-clean
+
+⚠  1 warning(s) across 2 file(s).
+   not analyzed:
+     • 1 imported file(s) resolved outside the analysed set and were never read. Pass them on the command line to analyse them (tests/fixtures/blind_spots/outside_root/shared/useThing.ts)
+exit=1
+\end{sortie}
+
+\code{App} est \og propre\fg{} par ignorance : \code{useThing} est opaque, parce que son fichier n'est pas dans le run. Le résolveur savait exactement où était ce code, et le run le dit.
+
+\begin{definition}{Blind spot}{projet-cli-driver-blind-spot}
+Un \terme{blind spot} est une raison pour laquelle le silence d'un run n'est pas une preuve de correction : une source vers laquelle le pipeline a été dirigé et qu'il n'a pas lue. Il en existe trois espèces, de clés stables \code{unresolved-aliases} (les alias du projet n'ont pas pu être chargés), \code{unparsed-files} (des fichiers ont été abandonnés au parse) et \code{unread-imports} (des imports résolus vers de vrais fichiers que la découverte n'a pas atteints).
+\end{definition}
+
+\rustsnippet[label={lst:blind-spots}]{src/driver/blind_spots.rs}{22}{31}{une raison pour laquelle le silence n'est pas une preuve}
+
+L'en-tête du module (\src{src/driver/blind_spots.rs}{1}{13}) fixe l'architecture : les blind spots sont collectés \og once, at the driver level\fg{}, et une liste non vide interdit le clean bill \og in every output format\fg{}. Les entrées sont agrégées par espèce : un run qui abandonne deux cents fichiers le dit en une ligne, et le détail reste où il est déjà (le tableau \code{parse_errors}, les diagnostics \code{--info}). Le calcul des imports non lus est remarquable par ce qu'il \emph{ne} fait \emph{pas} :
+
+\rustsnippet{src/driver/mod.rs}{262}{280}{les arêtes résolues qui sortent de l'ensemble analysé}
+
+Il lit les arêtes déjà résolues par le lowering (la \code{ModuleTable}) au lieu de re-résoudre les imports, et ne peut donc pas contredire ce que le lowering a fait. Le \code{BTreeSet} rend les trois exemples déterministes.
+
+\begin{invariant}{Pas de clean bill pour du code non lu}{projet-cli-driver-clean-bill}
+La ligne \og ✓ … no issues found.\fg{} n'est imprimée que si le run n'a ni \Error{} ni \Warning{} visibles \emph{et} n'a aucun blind spot (\src{src/driver/human.rs}{265}{283}). Sinon, la ligne devient \og ⚠ … no findings, but parts of this run were not analyzed, so this is not a clean bill.\fg{}, suivie de la liste \code{not analyzed:}. La règle vaut dans tous les formats : en JSON, un \code{blind_spots} non vide signifie que \code{summary.errors} et \code{summary.warnings} sont un minorant et non un verdict (\src{src/driver/json.rs}{23}{25}). Un nouveau blind spot s'ajoute en poussant sur la liste, pas en modifiant chaque renderer.
+\end{invariant}
+
+\begin{decision}[Couverture seulement : \code{analysis-limit} n'est pas un blind spot]
+Une \Info{} \regle{analysis-limit} décrit du code que l'analyseur \emph{a} lu et abstrait soundement en $\Top$, par exemple un hook de paquet npm introuvable. Elle se déclenche sur presque tous les runs : le module mesure 370 sites sur une application de 209 fichiers, presque tous des composants et des hooks npm. \og A caveat printed every time is a caveat nobody reads\fg{} (\src{src/driver/blind_spots.rs}{15}{20}). Ce qui retient le clean bill est plus étroit et décisif : une source que le run a été chargé de lire et qu'il n'a pas lue. Le prix de ce choix se voit au piège du fichier seul (\cref{sec:projet-cli-driver-projets}) : un spécificateur que le résolveur n'a pas su résoudre est indistinguable d'un paquet npm, donc ne crée pas d'arête, donc pas de blind spot.
+\end{decision}
+
+\subsection{\code{--follow-imports} : lire ce que les chemins nommés importent}
+\label{sec:projet-cli-driver-follow}
+
+La parade au run rétréci est opt-in :
+
+\begin{sortie}
+$ reactant tests/fixtures/blind_spots/outside_root/app --follow-imports
+  App  (1 hooks)  tests/fixtures/blind_spots/outside_root/app/App.tsx
+    warn   infinite-loop  [hook:1]  (tests/fixtures/blind_spots/outside_root/shared/useThing.ts:6:2)  this effect keeps pushing state `n` to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
+  Broken  (2 hooks)  …
+
+⚠  2 warning(s) across 3 file(s).
+   followed 1 imported file(s) (tests/fixtures/blind_spots/outside_root/shared/useThing.ts)
+\end{sortie}
+
+La fermeture est calculée \emph{avant} le lowering, pour coûter un parse de plus par fichier plutôt qu'une passe de lowering complète par niveau de profondeur (\src{src/driver/mod.rs}{216}{234}) :
+
+\rustsnippet[label={lst:closure}]{src/resolver/closure.rs}{44}{66}{la fermeture transitive des imports}
+
+C'est un parcours en profondeur avec un ensemble \code{seen}, qui termine sur les cycles. Chaque fichier y est parsé une fois pour ses seules arêtes, par \code{collect_module_facts}, la fonction même qui produit le blind spot \code{unread-imports}. La fermeture ne peut donc pas diverger de ce qui est déclaré non lu. \code{followable} exclut tout chemin qui contient \code{node_modules}, même si un alias \file{tsconfig} y pointe : le code des paquets n'est jamais abaissé, et le \code{SummaryRegistry} est le point d'extension prévu pour lui (\issue{51}, fermée \code{wontfix}). Les exclusions de la découverte (\file{.gitignore}, \code{EXCLUDED_DIRS}) ne s'appliquent \emph{pas} : elles décident de ce qu'on parcourt à l'aveugle, alors qu'une arête d'import explicite prouve que le code s'exécute. Les \code{import type} ne sont pas des arêtes. La documentation du drapeau prévient que ce n'est pas une optimisation : \og the closure often approaches the whole project\fg{}.
+
+\begin{definition}{Chemins nommés, fichiers suivis, findings retenus}{projet-cli-driver-nommes}
+Les \terme{chemins nommés} sont les fichiers issus des arguments. Ils fixent la \emph{portée du rapport}. Les \terme{fichiers suivis} sont ceux que la fermeture ajoute, et ils ne servent qu'à rendre l'analyse des fichiers nommés correcte. Un finding d'un composant défini dans un fichier suivi est calculé mais \emph{retenu} : il est compté dans \code{withheld} et non affiché.
+\end{definition}
+
+\rustsnippet{src/driver/mod.rs}{440}{451}{un composant hors des chemins nommés : compté, pas montré}
+
+L'exemple \file{/tmp/ch23/wh} rend ce mécanisme visible. \file{app/App.tsx} rend \code{<Panel />}, défini dans \file{shared/Panel.tsx}, qui boucle.
+
+\begin{sortie}
+$ reactant wh/app
+
+⚠  1 file(s), no findings, but parts of this run were not analyzed, so this is not a clean bill.
+   not analyzed:
+     • 1 imported file(s) resolved outside the analysed set and were never read. Pass them on the command line to analyse them (wh/shared/Panel.tsx)
+exit=0
+$ reactant wh/app --follow-imports
+
+✓  2 file(s) no issues found.
+   followed 1 imported file(s) (wh/shared/Panel.tsx)
+   1 finding(s) in those file(s) are not shown. Name the path(s) to report them (wh/shared/Panel.tsx)
+exit=0
+\end{sortie}
+
+\begin{piege}
+Sous \code{--follow-imports}, le clean bill peut coexister avec un finding réel. Le « ✓ » porte sur les chemins nommés, le finding de \code{Panel} est retenu, et le code de sortie vaut 0. La ligne jaune qui suit est la \og moitié honnête\fg{} de ce choix : le finding existe, le run dit combien il y en a et où. En JSON, \code{followed.withheld} vaut 1 et \code{summary.warnings} vaut 0. Pour le rapporter, il faut nommer \file{wh/shared}.
+\end{piege}
+
+% ===========================================================================
+\section{Next.js et le graphe serveur}
+\label{sec:projet-cli-driver-nextjs}
+
+\begin{react}[Server Components et App Router]
+Sous l'App Router de Next.js, un module est un \emph{Server Component} sauf si une directive \code{"use client"} ouvre une frontière client au-dessus de lui dans le graphe d'imports. Un Server Component est rendu une fois, sur le serveur, et React ne lui fournit aucun hook. Les fichiers réservés \code{page}, \code{layout}, \code{template}, \code{default}, \code{not-found} et \code{loading} sous un répertoire \file{app/} sont des entrées serveur. \code{error} et \code{global-error} doivent être des Client Components. Un module importé des deux côtés est compilé deux fois, et la copie serveur doit s'exécuter elle aussi.
+\end{react}
+
+Le type \code{NextJs} ajoute trois choses aux conventions de Vite : le rétrécissement conditionnel à \file{src/} (\cref{sec:projet-cli-driver-projets}), la sonde \code{baseUrl} (\cref{prop:projet-cli-driver-sonde}) et le calcul du graphe serveur, qui nourrit la règle \regle{server-component-hook} (\cref{chap:regles-rendu-rsc}) :
+
+\rustsnippet[label={lst:nextjs}]{src/project/nextjs.rs}{26}{55}{entrées serveur et graphe serveur}
+
+La liste \code{SERVER_ENTRY_STEMS} (\src{src/project/nextjs.rs}{13}{24}) contient les six noms du rappel ci-dessus. \code{error} et \code{global-error} en sont délibérément absents.
+
+Le calcul exige les deux moitiés de la convention (un nom réservé \emph{et} un ancêtre \file{app}), faute de quoi n'importe quel \file{components/page.tsx} serait une entrée. L'appartenance au graphe est décidée par l'atteignabilité et non par l'absence de directive. \code{reachable_from} est l'unique mécanisme partagé sur la \code{ModuleTable}, une table non interprétée de chaînes et de chemins (\adr{26} §1).
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[font=\scriptsize,
+    mod/.style={draw=ra-gray,fill=white,rounded corners=2pt,align=center,inner sep=3pt,font=\scriptsize\ttfamily},
+    entree/.style={mod,draw=ra-blue,very thick},
+    client/.style={mod,draw=ra-amber,dashed,thick}]
+  \node[entree] (page) at (0,0) {app/page.tsx\\useState};
+  \node[entree] (layout) at (4,0) {app/layout.tsx};
+  \node[entree] (dash) at (8,0) {app/dashboard/page.tsx\\async, sans hook};
+  \node[client] (counter) at (0,-2) {"use client"\\components/counter.tsx};
+  \node[mod] (sidebar) at (4,-2) {components/sidebar.tsx\\usePathname, useNavItems};
+  \node[mod] (nav) at (4,-3.8) {hooks/use-nav-items.ts};
+  \node[mod] (stats) at (8,-2) {lib/stats.ts};
+  \draw[fleche] (page) -- node[etiquette,left]{@/components/counter} (counter);
+  \draw[fleche] (layout) -- node[etiquette,right]{@/components/sidebar} (sidebar);
+  \draw[fleche] (sidebar) -- (nav);
+  \draw[fleche] (dash) -- node[etiquette,right]{@/lib/stats} (stats);
+  \draw[ra-amber,thick,dashed] (-1.9,-1.2) -- (1.9,-1.2) node[etiquette,right,text=ra-amber]{frontière};
+\end{tikzpicture}
+\caption{Le graphe d'imports de \file{tests/fixtures/next_project/src} (chemins relatifs à \file{src/}). En gras, les trois entrées serveur. Le graphe serveur est \{\file{page}, \file{layout}, \file{dashboard/page}, \file{sidebar}, \file{use-nav-items}, \file{stats}\} ; il s'arrête à \file{counter.tsx}, qui porte \code{"use client"}.}
+\label{fig:next-graphe}
+\end{figure}
+
+Le fixture \file{tests/fixtures/next_project} (\cref{fig:next-graphe}) comprend une page serveur qui appelle \code{useState}, un layout qui importe une barre latérale sans directive, un composant client et une page asynchrone sans hook.
+
+\begin{sortie}
+$ reactant tests/fixtures/next_project --verbose --show-clean
+[verbose] next.js project: discovery root tests/fixtures/next_project/src, tsconfig aliases loaded
+…
+[verbose] 3 components analyzed
+[verbose] cache hits: 1, misses: 2
+…
+  Counter  (3 hooks)  tests/fixtures/next_project/src/components/counter.tsx
+    warn   infinite-loop  [hook:1]  (line 7:2)  this effect has no dependency array and may store a fresh reference into state `n`, so it re-runs after every render and can re-trigger itself: possible infinite render loop
+       (1 trace step(s), rerun with --trace)
+  HomePage  (2 hooks)  tests/fixtures/next_project/src/app/page.tsx
+    warn   server-component-hook  [hook:0]  (line 7:8)  `useState` is called in a Server Component. this file is an App Router `page` and no `"use client"` directive covers it, …
+  Sidebar  (2 hooks)  tests/fixtures/next_project/src/components/sidebar.tsx
+    warn   server-component-hook  [hook:0]  (line 8:8)  `usePathname`, `useState`, `useMemo` are called in a Server Component. this module is imported into the App Router's server graph …
+
+⚠  3 warning(s) across 7 file(s).
+\end{sortie}
+
+\noindent(lignes élidées par \code{…}). \file{src/app} existe, donc la découverte se fait dans \file{src/}, et ni \file{next.config.ts} ni \file{tsconfig.json} ne sont analysés. Les \og 3 components analyzed\fg{} sont les trois racines (\code{HomePage}, \code{RootLayout}, \code{DashboardPage}), les enfants étant analysés par descente. \code{RootLayout} et \code{DashboardPage}, sans hook ni finding, ne s'impriment pas même sous \code{--show-clean}. \code{usePathname}, importé de \code{next/navigation}, est un hook \emph{connu} du registre de résumés (\cref{sec:projet-cli-driver-summary}) et ne donne pas d'\Info{} \og unknown hook\fg{}.
+
+\paragraph{Un run rétréci sous-rapporte, et le dit.}
+\begin{sortie}
+$ reactant tests/fixtures/next_project/src/app
+   1 clean component(s) hidden, rerun with --show-clean
+
+⚠  3 file(s), no findings, but parts of this run were not analyzed, so this is not a clean bill.
+   not analyzed:
+     • 3 imported file(s) resolved outside the analysed set and were never read. Pass them on the command line to analyse them (tests/fixtures/next_project/src/components/counter.tsx, tests/fixtures/next_project/src/components/sidebar.tsx, tests/fixtures/next_project/src/lib/stats.ts)
+exit=0
+\end{sortie}
+\regle{server-component-hook} ne se déclenche plus sur \code{HomePage}. \file{counter.tsx}, le seul fichier qui porte \code{"use client"}, n'a pas été abaissé, et la règle est gardée par la présence d'au moins un \code{"use client"} dans le programme (\adr{26} §4). La règle sous-rapporte, conformément à son contrat, et le blind spot retient le clean bill : il n'y a pas de faux négatif silencieux.
+
+\paragraph{Un projet à \code{baseUrl} seul.} Sous \file{/tmp/ch23/nb} : un \file{next.config.js}, un \file{tsconfig.json} réduit à \code{\{ "compilerOptions": \{ "baseUrl": "." \} \}}, puis \file{app/page.tsx} qui importe \code{components/widget}, \file{components/widget.tsx} (\code{"use client"}) qui importe \code{useCounter} depuis \code{lib/counter}, et \file{lib/counter.ts} qui boucle.
+\begin{sortie}
+$ reactant nb --verbose
+[warn] tsconfig declares `baseUrl` but no `paths`, so bare specifiers resolve against it, but `@/...`-style aliases stay unresolved and their targets are NOT analyzed (possible false negatives). Aliases declared only in next.config are not read.
+[verbose] next.js project: discovery root nb, tsconfig aliases unavailable
+…
+  Widget  (1 hooks)  nb/components/widget.tsx
+    warn   infinite-loop  [hook:1]  (nb/lib/counter.ts:4:2)  this effect keeps pushing state `n` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
+
+⚠  1 warning(s) across 4 file(s).
+   not analyzed:
+     • tsconfig declares `baseUrl` but no `paths`, …
+\end{sortie}
+La sonde \code{baseUrl} résout \code{components/widget} et \code{lib/counter}, ce qui donne l'arête \code{<Widget />} et l'inlining de \code{useCounter}. Sans \file{src/app}, la découverte reste à la racine et \file{next.config.js} est analysé (\og 4 file(s)\fg{}). Le blind spot \code{unresolved-aliases} est posé alors que ce projet n'écrit aucun \code{@/…}. C'est le caveat grossier de la \cref{sec:projet-cli-driver-projets}. De plus, \code{--verbose} dit \og aliases unavailable\fg{} alors qu'un résolveur \code{baseUrl} est bien chargé, parce que le libellé ne teste que \code{alias_warning.is_none()} (\src{src/driver/mod.rs}{181}{185}).
+
+\begin{decision}[ADR-026 — analyser les Server Components quand même]
+L'alternative naturelle, \emph{sauter} les modules serveur, est refusée. Le caractère serveur n'est pas une propriété d'un fichier mais de la façon dont il est atteint, à travers des alias que le résolveur a pu manquer. Décider \og serveur, on saute\fg{} sur des arêtes incomplètes perdrait en silence les défauts du module. Les analyser ne coûte rien en soundness : un Server Component n'a pas d'état, et l'interprétation abstraite le sur-approxime comme tout composant aux props $\Top$. Deux autres alternatives sont refusées : fabriquer un \code{Certified} à partir de la convention de chemins (\og it would dress a path convention as a domain proof\fg{}), d'où un \Warning{} ; et supprimer les autres findings d'un module serveur, ce qui transformerait chaque erreur de classification en faux négatif. L'ADR ajoute la détection \code{next.config.*} avant Vite, le rétrécissement conditionnel, la sonde \code{baseUrl} et des résumés \code{next/navigation}. Un point de son §5 est dépassé : \code{usePathname} y est dit \og typé \code{string}\fg{}, alors qu'au commit étudié c'est un résumé \code{Held} (\issue{161}).
+\end{decision}
+
+% ===========================================================================
+\section{Le rendu : humain et JSON}
+\label{sec:projet-cli-driver-rendu}
+
+\subsection{Nommer le bon fichier}
+
+Un hook inliné depuis un autre fichier porte des positions de ce fichier. Imprimer \code{(line 6:2)} sous l'en-tête d'\code{App.tsx} désignerait une ligne dans le mauvais fichier. \adr{24} §1 l'a mesuré : 44~\% des findings de règles personnalisées étaient dans ce cas. Une seule fonction rend toutes les positions, celle de la ligne principale comme celles des pas \code{--trace} :
+
+\rustsnippet{src/driver/human.rs}{23}{35}{\code{(line L:C)} ou \code{(chemin:L:C)}}
+
+\begin{decision}[ADR-011 — positions et notes]
+\adr{11} a introduit \code{SourceRange \{ line, col \}} (ligne comptée à partir de 1), calculé par une table des débuts de ligne construite une fois en $O(n)$ puis interrogée par recherche binaire en $O(\log n)$. Il a aussi introduit des \code{span: Option<SourceRange>} sur les instructions et les \code{HookEntry}, et des \code{Note} portées par \code{Diagnostic} pour exprimer une chaîne causale, affichées \og → …\fg{} par la CLI. Sans cela, un diagnostic ne donnait que \code{[hook:0]}, sans ligne et sans le handler qui avait élargi un état. L'ADR a été dépassée sur deux points : \adr{19} a ajouté un \code{file: FileId} aux positions et typé les notes en \code{Step}, et \adr{24} fait nommer le fichier d'origine sur la ligne principale. Malgré son nom, \code{SourceRange} est une position de \emph{début} (\src{src/ir/source_range.rs}{36}{42}) : aucun renderer n'imprime de fin de plage.
+\end{decision}
+
+\subsection{Localisations et attributions}
+
+Trois composants \code{Alpha}, \code{Beta} et \code{Gamma} appellent \code{useShared(k)}, défini dans \file{hooks/useShared.ts} avec la boucle du \cref{sec:projet-cli-driver-projets} (fixture \file{tests/fixtures/shared_hook_repeat}) :
+
+\begin{sortie}
+$ reactant check tests/fixtures/shared_hook_repeat --trace
+  Alpha  (1 hooks)  tests/fixtures/shared_hook_repeat/App.tsx
+    warn   infinite-loop  [hook:1]  (tests/fixtures/shared_hook_repeat/hooks/useShared.ts:8:2)  this effect keeps pushing state `value` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop  [in 3 components]
+       in: Alpha, Beta, Gamma
+       → state `value` is written here [hook:2] (tests/fixtures/shared_hook_repeat/hooks/useShared.ts:8:2)
+       → the abstract value of state `value` kept growing and was widened at iteration 3
+   2 component(s) hidden. Every finding in them is a source line already reported above
+
+⚠  1 warning(s) across 2 file(s), 3 component attribution(s).
+\end{sortie}
+
+En JSON, le même run a trois lignes de diagnostic, une par composant, toutes avec \code{"file": "…/hooks/useShared.ts"} et \code{"line": 8}, puis \code{"summary": \{ "errors": 0, "warnings": 3, …, "exit_code": 1 \}}.
+
+\begin{definition}{Localisation, attribution}{projet-cli-driver-localisation}
+Une \terme{attribution} est une ligne \og (composant, diagnostic)\fg{} du rapport. Une \terme{localisation} est une classe d'attributions de même clé \code{(rule, (fichier, ligne, colonne), message)}. Une attribution sans position forme sa propre classe. Le composant \emph{canonique} d'une localisation est le premier dans l'ordre du rapport, c'est-à-dire par nom affiché.
+\end{definition}
+
+\rustsnippet{src/driver/locations.rs}{24}{40}{la clé de groupage et l'index}
+
+La construction (\src{src/driver/locations.rs}{42}{89}) fait une passe unique dans l'ordre du rapport. Une clé déjà vue avec une position connue ajoute le composant au groupe existant et marque la ligne comme répétition (\code{None}). Une clé nouvelle ouvre un groupe et compte une \Error{} ou un \Warning{}. Le résumé humain compte des localisations, le JSON et \code{--fail-on} comptent des attributions. La queue \og , N component attribution(s)\fg{} n'apparaît que si les deux nombres diffèrent (\src{src/driver/human.rs}{284}{310}). Le module cite sa mesure : 6\,322 findings pour 1\,170 localisations distinctes sur le corpus du 2 septembre 2026, soit 81~\% de répétition (\src{src/driver/locations.rs}{8}{10}).
+
+\begin{decision}[ADR-024 §2 et \#129 — grouper pour l'affichage, jamais dédupliquer]
+\adr{24} §2 refuse de dédupliquer les findings entre les consommateurs d'un hook. Ils ne sont pas redondants mais \emph{incomparables} : le même corps de hook, analysé sous \code{useStep(1)} et sous \code{useStep(0)}, donne des faits différents. Un hook n'a pas d'analyse propre, et supprimer les findings par consommateur au profit d'un finding de niveau hook serait un générateur de faux négatifs. Le groupage d'affichage, forme faible, était alors différé. \issue{129} l'a adopté, \emph{uniquement} dans le renderer humain : le JSON reste une ligne par composant, et \code{--fail-on} lit les comptes non groupés. Ce que chaque finding \emph{est} ne change pas.
+\end{decision}
+
+\begin{piege}
+\adr{24} §2 nommait deux risques du groupage : un groupe n'a qu'un témoin, et le \code{hook_label} peut différer d'un membre à l'autre. L'implémentation imprime le \code{[hook:N]} et la trace du composant \emph{canonique} seulement. Les autres chaînes de témoins et les autres labels ne sont visibles qu'en JSON. Deux membres d'une localisation ont même règle, même position et même message, mais pas nécessairement même label ni même chemin de témoin.
+\end{piege}
+
+\paragraph{Le canal d'assurance.} Sous \code{--info} seulement, chaque composant imprimé liste ses \code{verified} (\cref{sec:projet-cli-driver-invocation}). Quand une \regle{analysis-limit} a tronqué l'analyse, le registre vide cette liste, et le renderer imprime à la place ce qui a été retenu (\src{src/driver/human.rs}{37}{66}) :
+\begin{sortie}
+$ reactant tests/fixtures/vite_project/src/App.tsx --info
+  App  (1 hooks)  tests/fixtures/vite_project/src/App.tsx
+    info   analysis-limit  [hook:0]  (line 8:8)  hook `useData` was not found in the registry. Pass its source file or add a HookSummary to analyse it (FN possible)
+    suspended  analysis-limit  1 passing check(s) withheld: the analysis was truncated in this component, so they are not guaranteed
+\end{sortie}
+La ligne \code{suspended} n'est \emph{pas} soumise aux filtres de règles : \code{--ignore-rule analysis-limit} masque l'avis, pas l'absence de garantie.
+
+\subsection{Le schéma JSON v2}
+
+\code{--format json} produit un seul document sur stdout (\code{to_string_pretty} suivi d'un retour à la ligne). Sa racine :
+
+\rustsnippet{src/driver/json.rs}{17}{31}{la racine du rapport JSON}
+
+Chaque diagnostic sépare deux fichiers. \code{to_json_diag} (\src{src/driver/json.rs}{229}{254}) calcule \code{file: anchor_file.or_else(|| file.map(display))}, où \code{anchor_file} est le fichier de la position du diagnostic, et \code{component_file: file.map(display)} :
+
+\begin{sortie}
+$ reactant check tests/fixtures/cross_file_hook --format json      # extrait
+      "component": "Page",
+      "file": "tests/fixtures/cross_file_hook/hooks/useData.ts",
+      "component_file": "tests/fixtures/cross_file_hook/page.tsx",
+      "line": 7,
+      "col": 2,
+      "hook_label": 1,
+      …
+        { "message": "state `value` is written here", "kind": "write", "hook_label": 2,
+          "file": "tests/fixtures/cross_file_hook/hooks/useData.ts", "line": 7, "col": 2,
+          "slot": 1, "value_class": "unknown" },
+        { "message": "the abstract value of state `value` kept growing and was widened at iteration 3",
+          "kind": "widen", "hook_label": null, "file": null, "line": null, "col": null,
+          "slot": 1, "iteration": 3 }
+\end{sortie}
+
+\noindent(notes reformatées sur moins de lignes). En v1, \code{file} était le fichier du composant et se trouvait donc apparié à un numéro de ligne d'un autre fichier. La v2 fait de \code{file} le fichier de l'ancre, avec repli sur \code{component_file}, qui garde le sens v1 (\adr{24} §1). Les autres points à connaître :
+\begin{itemize}
+  \item \code{notes[].kind} est \code{Step::kind()} : \code{binding}, \code{resolve}, \code{call}, \code{write}, \code{read}, \code{branch}, \code{handler}, \code{cycle-edge}, \code{widen}, \code{mutate}, \code{capture}, \code{init-once}, \code{forward}, \code{rerender} (\src{src/rules/api/witness.rs}{134}{151}). Les champs propres à un genre sont omis quand ils sont vides. \code{file}, \code{line}, \code{col} et \code{hook_label} sont toujours présents, à \code{null} au besoin ;
+  \item \code{summary.errors}/\code{warnings} comptent des attributions. \code{components_analyzed} est le nombre de composants \emph{rapportés} et non le compteur du moteur. \code{exit_code} reflète le \code{--fail-on} actif ;
+  \item \code{blind_spots} est toujours présent, éventuellement vide ; \code{followed} n'apparaît que sous \code{--follow-imports} ;
+  \item aucun JSON Schema n'est généré pour le rapport : seuls \file{pack.json} et \file{reactant.config.json} en ont un, et les types TypeScript du rapport, côté npm, sont écrits à la main.
+\end{itemize}
+
+\begin{remarque}
+La documentation n'a pas suivi le code sur trois points. La doc du variant \code{OutputFormat::Json}, visible dans \code{reactant --help}, dit \og schema v1\fg{} (\srcline{src/cli/mod.rs}{82}), alors que le code émet \code{version: 2} (\srcline{src/driver/json.rs}{268}). La liste des \code{kind} de \file{docs/usage.md} et du commentaire \src{src/driver/json.rs}{91}{92} omet \code{forward} et \code{rerender}. Enfin, la page \code{reactant help} n'affiche pas \code{--rule-option}, que \code{--help} de clap connaît.
+\end{remarque}
+
+% ===========================================================================
+\section{Le registre des résumés de bibliothèques}
+\label{sec:projet-cli-driver-summary}
+
+\subsection{Connu n'est pas modélisé}
+
+Le fichier \file{/tmp/ch23/sum/Nav.tsx} contient deux composants identiques, à la provenance du hook près :
+
+\begin{lstlisting}[language=TypeScript,caption={Deux \code{useQuery}, deux provenances (\file{/tmp/ch23/sum/Nav.tsx})},label={lst:sum-nav}]
+import { useEffect } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { useQuery as useOther } from "my-query-lib";
+
+export function Known() {
+  const q = useQuery({ queryKey: ["a"] });
+  useEffect(() => {
+    console.log(q);
+  }, [q]);
+  return <div />;
+}
+
+export function Unknown() {
+  const q = useOther({ queryKey: ["a"] });
+  useEffect(() => {
+    console.log(q);
+  }, [q]);
+  return <div />;
+}
+\end{lstlisting}
+
+\begin{sortie}
+$ reactant Nav.tsx --info
+  Unknown  (2 hooks)  Nav.tsx
+    info   analysis-limit  [hook:0]  (line 14:8)  hook `useQuery` was not found in the registry. Pass its source file or add a HookSummary to analyse it (FN possible)
+    suspended  analysis-limit  4 passing check(s) withheld: the analysis was truncated in this component, so they are not guaranteed
+   1 clean component(s) hidden, rerun with --show-clean
+
+✓  1 file(s) no issues found.
+\end{sortie}
+
+Dans les deux cas, la valeur de \code{q} est $\Top$. Mais \code{Known} importe un hook \emph{connu} : il n'émet pas d'\Info{}, et ses assurances ne sont pas suspendues. \code{Unknown} importe un hook \emph{introuvable}, et l'analyseur admet la limite. Le message nomme le nom importé (\code{useQuery}), pas l'alias local. La recherche se fait par provenance, \code{(paquet, nom)} :
+
+\rustsnippet{src/registry/summary.rs}{52}{60}{la clé des résumés}
+
+\rustsnippet{src/registry/summary.rs}{166}{177}{la recherche : paquet exact, puis non scopé}
+
+\subsection{Le trait et le registre commun}
+
+\rustsnippet[label={lst:hook-summary}]{src/registry/summary.rs}{10}{31}{le contrat abstrait d'un hook sans source (début)}
+
+Le trait se termine par deux prédicats, \code{held_across_updates} et \code{navigates}, tous deux \code{false} par défaut (\src{src/registry/summary.rs}{33}{47}).
+
+Un résumé répond à quatre questions. Le moteur les lit dans cet ordre (\src{src/engine/fixpoint.rs}{958}{977}) : \code{navigates} (le résultat est une fonction qui navigue, comme \code{useNavigate()}) ; \code{held_across_updates} (le résultat ne bouge que sur navigation et reste immobile à travers la boucle de re-rendu automatique, \issue{161}) ; \code{members} (contrats par membre nommé ou par position de tuple) ; enfin \code{summarize}, $\Top$ par défaut. La consommation dans \code{expand_custom_hooks}, avec le retaguage du marqueur d'appel qui garde la \code{HookEntry} visible aux règles des hooks, est décrite au \cref{chap:splice-inlining}. Le commentaire de tête de cette branche (\src{src/engine/fixpoint.rs}{944}{948}) dit encore que les hooks connus \og are removed from the hooks vec\fg{}, alors que le code les garde délibérément quelques lignes plus bas.
+
+Le contenu de \code{new_with_common()} (\src{src/registry/summary.rs}{77}{150}), dans l'ordre d'insertion :
+\begin{enumerate}
+  \item des hooks connus, en $\Top$, pour \code{@tanstack/react-query}, \code{react-router-dom}/\code{react-router}, \code{next/navigation}, \code{next/router} et \code{next/compat/router} (\code{useRouter}) ;
+  \item des résumés \code{Held} : \code{useSearchParams}, \code{useParams}, \code{usePathname}, \code{useSelectedLayoutSegment(s)} de \code{next/navigation} ; \code{useParams}, \code{useLocation}, \code{useMatch} de React Router ;
+  \item pour React Router, \code{useSearchParams} en tuple (\code{"0"} $\to$ \code{Held}, \code{"1"} $\to$ \code{Navigator \{ stable: false \}}) et \code{useNavigate} en \code{NavigatorSummary} ;
+  \item des formes par membre : \code{react-hook-form} (\code{useForm}/\code{useFormContext}, treize membres \code{StableRef} et \code{handleSubmit} en \code{Wrapper \{ stable: true \}}) ; \code{useRouter} de Next (\code{push}, \code{replace}, \code{back}, \code{forward} en \code{Navigator \{ stable: true \}} ; \code{refresh}, \code{prefetch} en \code{StableRef}) ; \code{swr} (\code{mutate} stable) ; \code{@mantine/form} (\code{onSubmit} en \code{Wrapper \{ stable: false \}}) ; \code{jotai} (position \code{"1"} de \code{useAtom} stable, \code{useSetAtom} stable, \code{useAtomValue}/\code{useStore} en $\Top$) ;
+  \item \code{use-debounce}, connu et $\Top$.
+\end{enumerate}
+
+\begin{react}[identité des valeurs de bibliothèque]
+Les deps d'un hook sont comparées par \code{Object.is}. Ce qu'une bibliothèque \emph{documente}, c'est qu'un membre garde son identité d'un rendu à l'autre (\code{setValue} de react-hook-form, \code{router.push} de Next, \code{mutate} de SWR, le setter de jotai), et c'est pourquoi les applications l'omettent des deps. Une valeur d'URL (\code{useSearchParams}, \code{useParams}, \code{usePathname}) ne change que sur navigation, que la boucle de re-rendu automatique ne peut pas provoquer, sauf si un corps qu'elle exécute navigue lui-même.
+\end{react}
+
+\begin{decision}[Revendiquer une stabilité est le sens dangereux]
+Trois politiques découlent de la soundness. (1) Enregistrer un hook en $\Top$ n'est pas le modéliser. C'est déclarer qu'il est \emph{connu}, ce qui distingue une imprécision délibérée de l'\Info{} \og hook introuvable\fg{} (\src{src/registry/summary.rs}{69}{76}). (2) \code{useContext} et les hooks React non modélisés (\code{useActionState}, \code{useOptimistic}, \code{useTransition}, \code{useId}, \code{useFormStatus}) sont \emph{volontairement} laissés inconnus : l'\Info{} signale un trou du moteur qu'il faut combler en les modélisant, et un résumé $\Top$ le cacherait (\adr{26} §5). (3) Un contrat par membre ne crédite que les membres listés. Les autres restent $\Top$, si bien qu'un membre ajouté à la bibliothèque après l'écriture de la table n'hérite jamais d'une stabilité que personne n'a écrite. Une revendication de stabilité est ce qui fait \emph{perdre} des findings. Faute de preuve suffisante, \code{useDebouncedCallback} reste donc $\Top$ : le corpus n'offrait qu'un site pour vérifier la stabilité documentée.
+\end{decision}
+
+\begin{piege}
+Un \code{HookSummary} écrit par un plugin et qui renverrait une valeur précise par \code{summarize}, \code{null} par exemple, est projeté par le moteur sur trois classes seulement, \code{StableRef}, \code{UnstableRef} ou $\Top$ (\src{src/engine/fixpoint.rs}{1169}{1181}). De plus, l'argument \code{args} reçoit toujours \code{\&[]}. Enfin, \code{new_with_common()} insère certaines clés deux fois (\code{(next/navigation, usePathname)} en $\Top$ puis en \code{Held}, \code{useRouter} en $\Top$ puis en forme) : le dernier \code{HashMap::insert} gagne, et l'ordre des insertions fait partie du contrat.
+\end{piege}
+
+\paragraph{Le registre à clé composite.} Les registres de composants, de hooks et de fonctions partagent une primitive, \code{KeyedRegistry<V>}, une table \code{(PathBuf, Symbol)} $\to$ \code{V} (\src{src/registry/keyed.rs}{15}{23}). La clé composite évite les collisions entre deux fichiers qui définissent le même nom (\adr{13}). La recherche héritée par nom seul, \code{get_by_name}, prend la première clé dans l'ordre trié. C'est elle qui retrouve \code{useData} dans le run \code{--project plain} du \cref{sec:projet-cli-driver-projets}, où l'alias n'est pas résolu mais où le hook a été découvert. Entre deux homonymes, ce repli choisit la première clé triée, qui n'est pas forcément la bonne (\cref{exo:projet-cli-driver-monorepo}). Ce fichier n'a pas de tests (\issue{17}), et il ne faut pas confondre ce registre avec le \code{RuleRegistry} des règles.
+
+% ===========================================================================
+\begin{resume}
+\begin{itemize}
+  \item La \textbf{CLI} est une coquille mince (\file{src/cli/}) : clap, fusion de la configuration, overrides, écriture des flux. Toute la composition d'un \code{check} vit dans \code{driver::run_check}, partagée octet pour octet avec l'hôte WASM à travers la couture \code{FileSystem}. Les codes de sortie sont 0, 1 (seuil \code{--fail-on}) et 2 (usage ou entrée-sortie).
+  \item La \textbf{configuration} \file{reactant.config.json} est du JSONC, validé bruyamment. Les drapeaux comblent en premier et la configuration complète (\code{CheckArgsPartial::merge} : les listes remplacent, les booléens se combinent par OU, les options par \code{or}). Les overrides combinent \code{"off"}, la résurrection par \code{--rule}, l'allowlist, \code{--ignore-rule} (qui refuse toujours) et un plafond de sévérité qui ne fait que baisser ($\mathit{pin} \meet \mathit{polarit\acute{e}}$).
+  \item La \textbf{découverte} lit le \file{.gitignore} du dépôt pour savoir quels répertoires sont générés (\#137). La syntaxe incomprise fait lire davantage. \code{node_modules} et \code{.git} ne sont jamais parcourus.
+  \item Les \textbf{projets} Vite et Next.js sont détectés par marqueur en remontant les ancêtres. Les alias viennent des seuls \file{tsconfig}, par \code{extends}, puis \code{references}, puis les ancêtres. Le résolveur suit la sémantique de TypeScript (exacts, plus long préfixe, puis \code{baseUrl}, qui ne peut qu'ajouter).
+  \item Un fichier récupéré au parse est \textbf{analysé} ; un fichier perdu est toujours dit.
+  \item \textbf{Pas de clean bill pour du code non lu} : alias non chargés, fichiers perdus et imports résolus hors de l'ensemble analysé retiennent le « ✓ » dans tous les formats. \code{--follow-imports} lit la fermeture, mais le rapport reste limité aux chemins nommés, les findings des fichiers suivis étant comptés et non montrés. Les spécificateurs non résolus et les \regle{analysis-limit} ne sont pas des blind spots.
+  \item Le \textbf{rendu humain} nomme le fichier de chaque position et groupe par localisation. Le \textbf{JSON v2} reste une ligne par composant ; \code{--fail-on} compte des attributions.
+  \item Le \textbf{SummaryRegistry} déclare des hooks de bibliothèques \emph{connus} (\code{Held}, \code{Navigator}, contrats par membre). Il n'est installé que par le driver.
+\end{itemize}
+Types et fichiers rencontrés :
+\begin{itemize}
+  \item \file{src/cli/} : \code{Cli}, \code{CheckArgs} ; \file{src/config.rs} : \code{ReactantConfig}, \code{RuleSetting}, \code{CheckArgsPartial} ;
+  \item \file{src/driver/} : \code{CheckOptions}, \code{CheckOutput}, \code{CheckReport}, \code{BlindSpot}, \code{Followed}, \code{LocationIndex} ;
+  \item \file{src/project/} : \code{ProjectKind}, \code{ProjectContext}, \code{TsconfigPaths}, \code{TsconfigPathsResolver} ;
+  \item \file{src/resolver/} : \code{FileSystem}, \code{GitignoreStack}, \code{ParseError}, \code{LoweredProgram}, \code{import_closure} ;
+  \item \file{src/registry/} : \code{HookSummary}, \code{SummaryRegistry}, \code{KeyedRegistry}.
+\end{itemize}
+Le chapitre suivant (\cref{chap:distribution}) montre l'autre hôte du driver : le cœur WASM, le paquet npm et l'action GitHub.
+\end{resume}
+
+% ===========================================================================
+\section{Exercices}
+\label{sec:projet-cli-driver-exercices}
+
+\begin{exercice}{Fichier ou répertoire}{projet-cli-driver-fichier}
+Depuis la racine du dépôt, prédire les fichiers analysés, les blind spots et le code de sortie de \code{reactant tests/fixtures/vite_project/src/App.tsx}, puis de \code{reactant tests/fixtures/vite_project/src}. Expliquer l'écart.
+\end{exercice}
+\begin{solution}
+Dans le premier cas, seul un fichier est passé : la racine de projet est \code{"."}, qui ne porte pas de marqueur, donc le run est \code{Plain}. L'alias \code{@/hooks/useData} n'est pas résolu et aucune arête n'est créée, donc il n'y a pas de blind spot. Le hook est absent du run. On obtient \og ✓ 1 file(s) no issues found.\fg{} et le code 0, et seul \code{--info} montre l'\regle{analysis-limit}. Dans le second cas, \code{src} est un répertoire : \code{locate} remonte à \file{vite_project}, qui porte \file{vite.config.ts}, puis charge les \code{paths}. Pas de rétrécissement, puisque la racine donnée n'est pas la racine de configuration. Deux fichiers sont lus, un \Warning{} \regle{infinite-loop} est émis, et le code vaut 1. La détection utilise le premier \emph{répertoire}, jamais le répertoire d'un fichier.
+\end{solution}
+
+\begin{exercice}{Faire réapparaître \regle{missing-deps}}{projet-cli-driver-off}
+Avec une configuration \code{"missing-deps": "off"}, donner des drapeaux qui rendent \regle{missing-deps} visible. Donner ensuite une combinaison où il ne peut pas l'être, quoi que dise la configuration.
+\end{exercice}
+\begin{solution}
+\code{--rule missing-deps} le ressuscite (\code{entry.off = setting.off \&\& !rule.contains(name)}), mais pose une allowlist qui masque toutes les autres règles. Tout \code{--ignore-rule missing-deps} le masque de façon définitive, puisque la boucle sur \code{ignore_rule} vient après et force \code{off = true} (\cref{lst:resolve-overrides}). Voir la \cref{tab:projet-cli-driver-overrides}.
+\end{solution}
+
+\begin{exercice}{Un \file{.gitignore} illisible}{projet-cli-driver-gitignore}
+Écrire un \file{.gitignore} dont une ligne contient une classe non terminée (\code{gen[}) et qui devrait, selon l'auteur, exclure \file{gen1/}. Que fait \reactant{} ? Pourquoi est-ce le bon sens d'erreur ?
+\end{exercice}
+\begin{solution}
+\code{class_end} ne trouve pas de \code{]}, et \code{glob_match} rend \code{false} : la règle ne reconnaît rien, et \file{gen1/} est parcouru (sauf si une autre règle l'exclut). L'erreur conduit à lire un répertoire de trop. Au pire, cela produit des faux positifs sur du code généré, jamais un faux négatif sur du code source (\cref{inv:projet-cli-driver-gitignore}).
+\end{solution}
+
+\begin{exercice}{\code{extends} en tableau}{projet-cli-driver-extends}
+Un \file{tsconfig.json} déclare \code{"baseUrl": "./a"} et \code{"extends": ["./p1.json", "./p2.json"]}. \file{p1.json} ne déclare qu'un \code{"baseUrl": "./b"}, \file{p2.json} déclare \code{"baseUrl": "./c"} et des \code{paths}. Quel \code{TsconfigPaths} \code{paths_from_config} rend-il ?
+\end{exercice}
+\begin{solution}
+Sans \code{paths} propres, on parcourt \code{extends}. \file{p1.json} rend \code{(b, [])}, dont la base est écrasée par la base propre \code{a} (\src{src/project/tsconfig.rs}{229}{232}), puis le résultat est mis de côté dans \code{inherited_base}. \file{p2.json} rend \code{(c, motifs)}, dont la base est de même écrasée par \code{a}, et comme les motifs sont non vides, la fonction les rend. Résultat : \code{base_url} = \file{<dir>/a}, motifs de \file{p2.json}. Le \code{baseUrl} déclaré dans le fichier courant l'emporte toujours sur l'hérité (\cref{lst:paths-from-config}).
+\end{solution}
+
+\begin{exercice}{Deux comptages}{projet-cli-driver-comptages}
+Sur \file{tests/fixtures/shared_hook_repeat}, pourquoi le résumé humain dit-il \og 1 warning(s)\fg{} et le JSON \code{"warnings": 3} ? Lequel pilote \code{--fail-on} ? Pourquoi \adr{24} interdit-il de faire le groupage dans les règles ?
+\end{exercice}
+\begin{solution}
+L'humain compte des localisations (\code{LocationIndex}), et les trois attributions partagent la clé \code{(infinite-loop, useShared.ts:8:2, message)}. Le JSON et \code{--fail-on} comptent les attributions ligne par ligne (\cref{inv:projet-cli-driver-exit}). Dédupliquer dans les règles supprimerait des findings par consommateur, qui sont incomparables (\code{useStep(1)} contre \code{useStep(0)}) : ce serait un générateur de faux négatifs.
+\end{solution}
+
+\begin{exercice}{Un résumé maison}{projet-cli-driver-summary}
+Écrire (en Rust) un \code{HookSummary} pour un hook \code{useStableThing} qui renvoie une référence stable, l'enregistrer sans paquet, et expliquer pourquoi un \code{summarize} qui rendrait \code{StateValue::null()} serait lu comme $\Top$ par le moteur.
+\end{exercice}
+\begin{solution}
+\begin{lstlisting}[language=Rust]
+struct StableThing;
+impl HookSummary for StableThing {
+    fn name(&self) -> &str { "useStableThing" }
+    fn summarize(&self, _args: &[StateValue]) -> StateValue {
+        StateValue::reference(Stability::Stable)
+    }
+}
+registry.register(Box::new(StableThing)); // clé (None, "useStableThing")
+\end{lstlisting}
+Le registre doit ensuite être placé dans \code{Config::summary_registry} par l'appelant : le driver n'installe que \code{new_with_common()}. \code{state_value_to_summary_value} ne distingue que la référence stable, la référence instable et le reste. \code{null} tombe dans \og le reste\fg{}, c'est-à-dire $\Top$ (\src{src/engine/fixpoint.rs}{1172}{1181}). C'est sound, puisque $\Top$ sur-approxime \code{null}, mais imprécis.
+\end{solution}
+
+\begin{exercice}{Un monorepo à deux \file{tsconfig}}{projet-cli-driver-monorepo}
+Sous \file{/tmp/ch23/mono2}, \file{apps/web} porte un \file{vite.config.ts} et un \file{tsconfig.json} (\code{@/*} $\to$ \code{./src/*}), et \file{packages/ui} un \file{tsconfig.json} (\code{@/*} $\to$ \code{./lib/*}). Chaque paquet définit un hook \code{useThing} : celui de \file{apps/web/src} ne fait rien, celui de \file{packages/ui/lib} boucle. \code{App} et \code{Button} importent chacun \code{"@/useThing"}. On observe :
+\begin{sortie}
+$ reactant packages/ui           # ⚠  1 warning(s) across 2 file(s).  exit=1 (Button)
+$ reactant apps/web packages     # ✓  4 file(s) no issues found.     exit=0
+$ reactant apps packages         # ✓  5 file(s) no issues found.     exit=0
+\end{sortie}
+\noindent(lignes de résumé seulement). Expliquer les trois résultats. Comment \code{ScopedResolver} réglerait-il le problème, et pourquoi le driver ne peut-il pas l'utiliser seul ?
+\end{exercice}
+\begin{solution}
+\emph{Premier run.} \file{packages/ui} n'a pas de marqueur, donc le run est \code{Plain} et l'alias n'est pas résolu. Le seul \code{useThing} du run est trouvé par son nom seul (\code{get_by_name}), et c'est le bon. \emph{Deuxième run.} Le premier répertoire, \file{apps/web}, fixe un contexte Vite, avec \emph{un} résolveur, celui des \code{paths} de \file{apps/web}. Le \code{"@/useThing"} de \file{Button.tsx} est résolu vers \file{apps/web/src/useThing.ts}, un fichier qui existe, si bien que la résolution est \emph{fausse} et non absente. Le hook qui boucle n'est pas inliné dans \code{Button}, et aucun blind spot n'est posé, puisque le fichier ciblé est lu. \emph{Troisième run.} \file{apps} n'a pas de marqueur, donc le run est \code{Plain}. Les deux alias restent non résolus, et \code{get_by_name} prend la première clé triée, \code{(apps/web/src/useThing.ts, useThing)}, pour les deux composants. Les deux derniers runs impriment un clean bill sur un programme qui boucle : ce sont des faux négatifs silencieux. \code{ScopedResolver} routerait par fichier \emph{importateur}, la portée de plus long préfixe gagnant (\code{scope("packages/ui", …)}, \code{scope("apps/web", …)}), ce qui corrige le deuxième run. Mais \code{build_context} ne construit qu'un \code{ProjectContext}, avec un seul \code{resolver}, et le driver n'offre aucun moyen d'en composer plusieurs. Il faut passer par l'API plugin (\file{docs/plugins.md}). Le troisième run relève en plus du repli par nom (\adr{13}), qui choisit arbitrairement entre homonymes. Au commit \snapshotCommit, aucune issue ouverte ne décrit ce faux négatif silencieux propre au premier répertoire qui fixe l'unique résolveur d'un run multi-répertoires : \issue{48} porte sur les spécificateurs \code{@workspace/*}, non résolus faute d'algorithme de workspace, et \issue{59} (fermée) documente seulement l'absence d'un \code{ImportResolver} par fichier, sans constater le cas où un alias se résout \emph{à tort} vers un fichier réel d'un autre paquet.
+\end{solution}

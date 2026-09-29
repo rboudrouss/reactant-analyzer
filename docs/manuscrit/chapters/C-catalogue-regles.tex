@@ -1,0 +1,257 @@
+% ---------------------------------------------------------------------------
+% Annexe C — Catalogue des règles
+% Sources : notes/10-rules-state.md (§1.4), notes/11-rules-effects-render.md
+% (§4.11), notes/12-declarative-packs.md (§ packs livrés) ; src/rules/docs.rs,
+% src/rules/registry.rs ; les tableaux récapitulatifs des chapitres 18 à 22
+% (tab:regles-etat-recap, tab:regles-effets-carte, tab:infinite-loop-bras,
+% tab:regles-rendu-rsc-apercu, tab:decl-packs), relus et reformatés en fiches ;
+% packs/guardrails.json, packs/community/*.json ; sorties observées avec
+% target/debug/reactant (commit e67b10a) depuis /tmp/manuscrit-check.
+% Cette annexe est un index : elle ne réexplique pas les règles, elle renvoie
+% au chapitre qui le fait.
+% ---------------------------------------------------------------------------
+\chapter{Catalogue des règles}
+\label{chap:catalogue-regles}
+
+\begin{objectifs}
+  \item Disposer d'une fiche de référence compacte pour chacune des dix-neuf règles natives (vingt et un noms de diagnostic) : niveau maximal, primitive must qui ouvre l'\Error, relations et données du moteur lues, fichier, tests, chapitre où elle est expliquée en détail.
+  \item Disposer de la même fiche pour les règles déclaratives des packs livrés (\code{guardrails}, \code{community/*}), et savoir ce que leur statut \og non first-party\fg{} signifie.
+  \item Comprendre la distinction entre \emph{id de règle} (\code{Rule::name()}, namespace des options) et \emph{nom de diagnostic} (\code{Diagnostic::rule}, namespace de \code{--rule}, \code{off}, \code{RuleDoc}), et pourquoi elle empêche un faux négatif silencieux.
+  \item Savoir lire et reproduire les sorties de \code{reactant rules} et \code{reactant explain}, et retrouver dans le code la table qui les alimente.
+\end{objectifs}
+
+\prerequis{\cref{chap:api-regles} (le trait \code{Rule}, le jeton \code{Certified}, \cref{def:certified}, les primitives must, les témoins, \cref{def:witness}) ; \cref{chap:regles-etat}, \cref{chap:infinite-loop}, \cref{chap:regles-effets}, \cref{chap:regles-rendu-rsc} et \cref{chap:regles-declaratives}, dont cette annexe résume et indexe la matière sans la reprendre.}
+
+Cette annexe n'ajoute aucun mécanisme nouveau : c'est un catalogue, à consulter plutôt qu'à lire d'un trait. Chaque ligne d'une fiche est une reformulation compacte d'un fait déjà établi et sourcé dans le chapitre correspondant ; le renvoi \code{chap:\ldots} en tête de chaque tableau dit où trouver le bug React visé, les exemples gradués avec leur sortie observée, les faux positifs assumés et les faux négatifs connus. Toutes les sorties de cette annexe ont été observées au commit \snapshotCommit{} avec le binaire \file{target/debug/reactant}, depuis \file{/tmp/manuscrit-check/}.
+
+% ===========================================================================
+\section{Lire ce catalogue}
+\label{sec:catalogue-regles-lire}
+
+\subsection{Deux espaces de noms}
+
+Une règle a un \emph{id} (\code{Rule::name()}) et émet un ou plusieurs \emph{noms de diagnostic} (\code{Diagnostic::rule}). La plupart du temps les deux coïncident ; deux règles seulement en émettent un second : \regle{infinite-loop} émet aussi \code{cross-component-infinite-loop}, \regle{setter-in-render} émet aussi \code{cross-setter-in-render}. Le module qui compose les frontends (CLI et WASM) l'explique dans son commentaire de tête :
+
+\rustsnippet{src/rules/registry.rs}{11}{17}{la discipline de nommage : deux espaces de noms, une seule raison}
+
+\begin{piege}
+Les options d'une règle (\code{minDepth}, \code{maxDeps}\ldots) s'adressent à l'\emph{id} ; les surcharges de sévérité, \code{off} et les filtres \code{--rule}/\code{--ignore-rule} s'adressent au \emph{nom de diagnostic}. Adresser des options à \code{cross-setter-in-render} lève \code{RegistryError::OptionsOnDiagnosticOnly} : ce nom n'est pas un id de règle, seulement une étiquette de sortie. Couper une règle par son id plutôt que par ses noms de diagnostic ferait taire le nom \emph{et} son cousin \code{cross-*}, alors qu'\code{off} ne doit couper que ce qui est explicitement nommé --- un faux négatif interdit par construction.
+\end{piege}
+
+\subsection{Ce que \code{reactant rules} et \code{reactant explain} affichent}
+
+Les deux sous-commandes lisent la même table statique, \code{RULE_DOCS} (\src{src/rules/docs.rs}{64}{}), triée alphabétiquement par nom de diagnostic ; les règles chargées dynamiquement depuis un pack (\cref{sec:catalogue-regles-packs}) y ajoutent leur propre \code{RuleDoc}, construit depuis leur JSON. Une entrée porte cinq champs : le nom, un résumé d'une ligne (\code{rules}), une explication, un exemple fautif et une piste de correction (les trois derniers, affichés par \code{explain}) :
+
+\rustsnippet{src/rules/docs.rs}{165}{178}{une entrée de \code{RULE_DOCS} : le résumé, l'explication, l'exemple et la correction d'\regle{infinite-loop}}
+
+Le test \code{every_rule_name_has_a_doc} garantit qu'aucune règle native n'est sans \code{RuleDoc} ; il n'assure rien sur leur fraîcheur --- \cref{sec:infinite-loop-anatomie} montre un doc-comment de \file{infinite\_loop.rs} en retard de deux ADR sur le code qu'il décrit, quand ce catalogue-ci décrit la règle au commit \snapshotCommit.
+
+% ===========================================================================
+\section{Les dix-neuf règles natives}
+\label{sec:catalogue-regles-natives}
+
+Dix-neuf fichiers de \file{src/rules/impls/} (tous sauf \file{mod.rs}) implémentent le trait \code{Rule} ; ils émettent vingt et un noms de diagnostic une fois comptés \code{cross-component-infinite-loop} et \code{cross-setter-in-render}. Les quatre tableaux qui suivent reprennent, groupe par groupe, la même grille : niveau maximal, primitive must qui ouvre l'\Error{} (\og\,---\,\fg{} si la règle ne peut jamais en produire), données et relations du moteur lues, fichier avec sa longueur et le nombre de tests qui l'exercent. Le \cref{tab:api-regles-primitives} donne, pour chaque primitive must citée ici, le fait exact qu'elle certifie.
+
+\subsection{Les règles sur l'état (\cref{chap:regles-etat})}
+
+\begin{table}[htbp]\centering\scriptsize
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{2.6cm}p{0.9cm}>{\raggedright\arraybackslash}p{3.4cm}X>{\raggedright\arraybackslash}p{3.5cm}@{}}
+\toprule
+règle & niveaux & preuve de l'\Error & données du moteur lues & fichier (lignes, tests) \\
+\midrule
+\regle{lazy-init} & E,W,I & \code{must_init_calls_setter} & initialiseurs \code{State}/\code{Ref}, \code{setter_var_labels}, registre de fonctions & \file{lazy_init.rs} (644~l., 16 tests) \\
+\regle{unstable-context-value} & W & --- & \code{module_consts}, rendu et tas convergés, \code{is_unstable_reference_only} & \file{unstable_context_value.rs} (72~l., 14 tests) \\
+\regle{redundant-set-state} & W & --- & store d'état, \code{block_states}, \relation{slot_writers} (régions), \code{escaping_slots} & \file{redundant_set_state.rs} (629~l., 8 tests) \\
+\regle{setter-in-render}, \regle{cross-setter-in-render} & E,W & \code{ExitDominance::certify} + phase \code{Sync} + \code{must_write} & \code{collect_setter_calls}, \code{cross_component_setters}, \code{converges_once_written} & \file{setter_in_render.rs} (586~l., 7 tests) \\
+\regle{derived-state} & W & --- (lit \code{must_setter_on_all_paths} sans en tirer d'\Error) & deps, \code{all_setter_labels}, \relation{slot_writers}, \code{slot_setter_escapes} & \file{derived_state.rs} (169~l., 17 tests) \\
+\regle{state-mutation} & E,W & \code{must_same_ref_mutation} & tous les corps, \code{all_setter_labels}, \code{mutation_receiver} & \file{state_mutation.rs} (521~l., 19 tests) \\
+\regle{frozen-initial-state} & E,W,I & \code{classify_motion} $\to$ \code{must_frozen_seed} & \relation{slot_seeds}, tas convergé, \code{MountIndex}, \code{may_written_slots} & \file{frozen_initial_state.rs} (336~l., 39 tests) \\
+\bottomrule
+\end{tabularx}
+\caption{Les sept règles d'état du \cref{chap:regles-etat} (E~=~\Error, W~=~\Warning, I~=~\Info).}
+\label{tab:catalogue-regles-etat}
+\end{table}
+
+\subsection{Le point fixe et le prop drilling (\cref{chap:infinite-loop})}
+
+\begin{table}[htbp]\centering\scriptsize
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{2.6cm}p{0.9cm}>{\raggedright\arraybackslash}p{3.4cm}X>{\raggedright\arraybackslash}p{3.5cm}@{}}
+\toprule
+règle & niveaux & preuve de l'\Error & données du moteur lues & fichier (lignes, tests) \\
+\midrule
+\regle{infinite-loop}, \regle{cross-component-infinite-loop} & E,W,I & \code{must_effect_cycle} (bras~3, cycle tout-\code{Must} mono-composant) ou \code{must_on_all_paths} (bras~4, self-slot) & \code{widen_trace}, \code{effect_setter_writes}, \code{all_setter_labels}, \code{cross_component_setters}, \code{ChurnGraph::cycles}, \relation{slot_writers} & \file{infinite_loop.rs} (1667~l., 19 tests) + \file{tests/effect_cycles.rs} (40) \\
+\regle{state-lifted-too-high} & W & --- (jamais d'\Error : le coût des re-rendus n'est pas certain, leur nombre l'est) & \code{render_deps}, \code{RenderIndex::home_of}, \code{Home::wasted_renders}, \code{Home::siblings}, \code{mount_count} ; options \code{minDepth}, \code{minWastedRenders} & \file{state_lifted_too_high.rs} (146~l., 13 tests) \\
+\bottomrule
+\end{tabularx}
+\caption{Les deux règles du \cref{chap:infinite-loop} : quatre bras pour la première (\cref{tab:infinite-loop-bras}), la dépendance de rendu pour la seconde.}
+\label{tab:catalogue-regles-infinite-loop}
+\end{table}
+
+\begin{piege}
+\regle{infinite-loop} est la seule règle de ce catalogue dont le doc-comment (\src{src/rules/impls/infinite_loop.rs}{26}{37}) contredit le code au commit \snapshotCommit{} sur deux points précis (le filtre sur les deps tout-instables, le traitement du cas \code{cross-component} sans état partagé connu) --- détaillé au \cref{sec:infinite-loop-anatomie}. Une fiche de catalogue ne remplace jamais une lecture du code pour qui modifie la règle.
+\end{piege}
+
+\subsection{Les règles sur les effets et les hooks à deps (\cref{chap:regles-effets})}
+
+\begin{table}[htbp]\centering\scriptsize
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{2.6cm}p{0.9cm}>{\raggedright\arraybackslash}p{3.4cm}X>{\raggedright\arraybackslash}p{3.5cm}@{}}
+\toprule
+règle & niveaux & preuve de l'\Error & données du moteur lues & fichier (lignes, tests) \\
+\midrule
+\regle{widening-info} & I & --- & \code{widen_trace} & \file{widening_info.rs} (41~l.) + \file{tests/widening_e2e.rs} (4, partagés avec \regle{infinite-loop}) \\
+\regle{analysis-limit} & I & --- & \code{stats}, \code{hook_calls[].opaque}, \code{effect_info} & \file{analysis_limit_info.rs} (158~l.) ; tests dispersés dans les suites e2e des limites (pas de fichier dédié) \\
+\regle{conditional-hook} & E (toujours) & \code{hook_is_conditional} $\to$ \code{Certified<ConditionalHookCall>} & \code{hook_calls}, \code{render_cfg} (dominance de tous les blocs de sortie atteignables) & \file{conditional_hook.rs} (581~l., 9 tests) + \file{tests/conditional_hook_e2e.rs} (1) \\
+\regle{always-unstable-deps} & W & --- & \code{hooks} (deps), environnement de sortie, stores et tas convergés & \file{always_unstable_deps.rs} (489~l., 19 tests) \\
+\regle{missing-deps} & W & --- & \code{effect_info} (\code{covering_deps}), environnement de sortie, tas convergé & \file{missing_deps.rs} (701~l., 30 tests) + \file{tests/deps_exactness.rs} (14) \\
+\regle{unnecessary-rerender} & W & --- & \code{hooks} (initialiseur, corps), stores convergés au montage & \file{unnecessary_rerender.rs} (446~l., 7 tests) \\
+\regle{missing-cleanup} & W & --- & \relation{registrations}, corps d'effet (\code{cleanup_verdict}) & \file{missing_cleanup.rs} (113~l., 9 tests) \\
+\regle{stale-closure} & E (sous preuve), sinon W & \code{must_stale_capture} (cinq conjoints) $\to$ \code{Certified<StaleCapture>} & \relation{registrations}, corps de callback, alias de setters & \file{stale_closure.rs} (469~l., 21 tests) \\
+\bottomrule
+\end{tabularx}
+\caption{Les huit règles du \cref{chap:regles-effets} (\cref{tab:regles-effets-carte} dans ce chapitre-là).}
+\label{tab:catalogue-regles-effets}
+\end{table}
+
+\subsection{Le rendu et les Server Components (\cref{chap:regles-rendu-rsc})}
+
+\begin{table}[htbp]\centering\scriptsize
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{2.6cm}p{0.9cm}>{\raggedright\arraybackslash}p{3.4cm}X>{\raggedright\arraybackslash}p{3.5cm}@{}}
+\toprule
+règle & niveaux & preuve de l'\Error & données du moteur lues & fichier (lignes, tests) \\
+\midrule
+\regle{wasted-subtree-render} & W & --- (une absence d'usage certaine, un coût non chiffré) & \code{render_deps} (par composant), \code{RenderIndex}, \relation{slot_writers}, \relation{registrations}, \code{state_store} ; options \code{minWastedRenders}, \code{continuousOnly} & \file{wasted_subtree_render.rs} (333~l., 13 tests) \\
+\regle{server-component-hook} & W & --- (fait de convention, hors du domaine des valeurs) & \code{ModuleTable} (directives, arêtes d'import), \code{HookEntry}, \code{HookProvenance} & \file{server_component_hook.rs} (308~l., 5 tests) + \file{tests/nextjs_project.rs} (13, partagés) \\
+\bottomrule
+\end{tabularx}
+\caption{Les deux règles du \cref{chap:regles-rendu-rsc} (\cref{tab:regles-rendu-rsc-apercu} dans ce chapitre-là).}
+\label{tab:catalogue-regles-rendu-rsc}
+\end{table}
+
+\begin{remarque}
+Sept règles seulement plafonnent au-dessus du \Warning : quatre peuvent atteindre l'\Error{} sans condition supplémentaire au-delà de leur primitive must (\regle{lazy-init} si l'initialiseur écrit, \regle{setter-in-render}, \regle{state-mutation}, \regle{frozen-initial-state}), deux sous condition structurelle stricte (\regle{conditional-hook}, toujours ; \regle{stale-closure}, sous cinq preuves conjointes), et \regle{infinite-loop} sous deux preuves distinctes selon le bras. Les huit autres --- \regle{unstable-context-value}, \regle{redundant-set-state}, \regle{derived-state}, \regle{state-lifted-too-high}, \regle{always-unstable-deps}, \regle{missing-deps}, \regle{unnecessary-rerender}, \regle{missing-cleanup}, \regle{wasted-subtree-render}, \regle{server-component-hook} --- plafonnent au \Warning{} par construction : soit le fait est certain mais son coût ne l'est pas, soit la question posée sort du domaine que le point fixe a prouvé. \regle{widening-info} et \regle{analysis-limit} sont les deux seules règles d'\Info{} pure : elles ne portent aucun verdict sur le code, seulement sur les limites de l'analyse elle-même.
+\end{remarque}
+
+% ===========================================================================
+\section{Les règles des packs livrés}
+\label{sec:catalogue-regles-packs}
+
+Le \cref{chap:regles-declaratives} décrit le langage : une règle déclarative ancre une entité dans une relation du moteur, l'énumère au besoin (\code{forEach}), lui applique une conjonction de gardes typées, et déclare une sévérité clampée par \code{pin} $\meet$ polarité (\adr{22}, \adr{23}). Cette section n'en répète pas la mécanique ; elle catalogue les règles que les packs livrés au commit \snapshotCommit{} en tirent.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}l l c X@{}}
+\toprule
+fichier & pack & règles & thème \\
+\midrule
+\file{packs/guardrails.json} & \code{guardrails} & 5 & deps absentes, deps toutes stables, self-retriggering, budget de taille, hooks bannis (\cref{tab:catalogue-regles-guardrails}) \\
+\file{packs/community/async.json} & \code{community-async} & 5 & continuations asynchrones sans teardown, écriture hors phase React, doubles écritures, sélecteurs de store instables \\
+\file{packs/community/effects.json} & \code{community-effects} & 4 & enregistrements et teardowns non appariés \\
+\file{packs/community/render.json} & \code{community-render} & 3 & props instables, snapshots de store \\
+\file{packs/community/state.json} & \code{community-state} & 3 & collisions d'écriture dans le même tick, effets miroir \\
+\file{packs/community/wave2.json} & \code{community-wave2} & 8 & ressources non libérées, navigation et travail coûteux en rendu, inputs non contrôlés\ldots \\
+\bottomrule
+\end{tabularx}
+\caption{Les six packs livrés (\file{packs/}), vingt-huit règles déclaratives au total en plus des dix-neuf natives.}
+\label{tab:catalogue-regles-packs}
+\end{table}
+
+\subsection{\code{guardrails} : le pack de démonstration}
+
+\code{guardrails} est le seul pack dont les règles sont écrites comme des garde-fous d'équipe directement activables ; c'est celui que le \cref{chap:regles-declaratives} commente ligne à ligne.
+
+\begin{table}[htbp]\centering\scriptsize
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{3.6cm}p{1.3cm}X@{}}
+\toprule
+id (\code{guardrails/\ldots}) & sévérité & ancre et gardes \\
+\midrule
+\code{effect-without-deps-array} & warning & effet dont \code{deps_declared = false} \\
+\code{inert-single-dep} & warning & effet à $\geq 1$ dep, dont chaque dep est prouvée \code{stable} (\code{every}) \\
+\code{self-retriggering-effect} & error & effet dont un setter du corps est dans les deps \emph{et} \code{must_setter_on_all_paths} \\
+\code{oversized-effect} & warning & effet dont le nombre de deps dépasse le paramètre \code{maxDeps} (défaut 5) \\
+\code{banned-hook} & warning & appel de hook dont le nom est dans le paramètre \code{banned} (défaut \code{[]}) \\
+\bottomrule
+\end{tabularx}
+\caption{Les cinq règles de \code{packs/guardrails.json}, lues directement dans le JSON.}
+\label{tab:catalogue-regles-guardrails}
+\end{table}
+
+\code{self-retriggering-effect} est la seule règle déclarative épinglée \code{error} parmi les six packs livrés (test \code{no_community_rule_claims_an_error}, \file{tests/community\_packs.rs}) : elle réutilise directement \code{must_setter_on_all_paths}, la primitive du \cref{tab:api-regles-primitives} que \regle{derived-state} consomme côté natif, ce qui illustre la promesse du langage --- \og aucune sévérité déclarative au-delà de ce qu'une primitive du moteur a déjà prouvée\fg.
+
+\subsection{Les packs \code{community/*} : des preuves de vocabulaire, pas des règles à activer}
+
+Les vingt-trois règles des cinq packs \code{community/*} viennent de la campagne \og liste de souhaits à l'aveugle\fg{} du 2026-09-02 (\issue{128}) : chacune traduit en JSON déclaratif une demande formulée sans connaître le vocabulaire disponible. Leur statut est écrit noir sur blanc en tête du test qui les protège :
+
+\begin{quote}\small
+\og These are NOT first-party rules. Several are proxies with known false positives --- the campaign's point was to measure the vocabulary against demand, and a proxy that had to stand in for a missing fact is evidence, not a recommendation.\fg{} (\src{tests/community_packs.rs}{4}{7})
+\end{quote}
+
+\begin{piege}
+Charger un pack \code{community/*} dans un projet réel sans relire ses règles une à une expose à des faux positifs assumés par construction : la doc de \code{controlled-input-without-a-writer}, par exemple, rapporte que sur un corpus de 34\,730 fichiers tous les résultats étaient des \code{<input type="hidden">}, que la règle ne peut pas exclure faute de lire la \emph{valeur} du prop \code{type} (\issue{67}). Aucune de ces règles n'atteint \code{error} ; c'est la seule garantie que le test leur impose.
+\end{piege}
+
+\subsection{La sortie de \code{reactant rules}}
+
+Chargé avec le pack \code{guardrails} (fichier de configuration minimal, \code{\{ "packs": [\ldots] \}}), \code{reactant rules} affiche les vingt et un noms natifs puis les cinq noms qualifiés \code{guardrails/\ldots}, triés alphabétiquement dans chaque bloc :
+
+\begin{shell}
+$ reactant rules --config reactant.config.json
+\end{shell}
+\begin{sortie}
+  always-unstable-deps                  a dep is a fresh reference every render, so the deps array never matches
+  analysis-limit                        the analyzer deliberately truncated analysis here (potential false negatives)
+  conditional-hook                      hook called inside a conditional branch
+  cross-component-infinite-loop         child effect sets parent state, parent re-renders child, effect refires
+  cross-setter-in-render                parent's setter (received as prop) called during render
+  derived-state                         effect only mirrors another state, so compute it during render
+  frozen-initial-state                  useState seeded from a prop that changes, so the state freezes at the first value
+  infinite-loop                         effect sets state that re-triggers the effect, and the state diverges
+  lazy-init                             useState initializer calls a function on every render
+  missing-cleanup                       effect starts something long-lived and returns no teardown
+  missing-deps                          effect body captures a variable not listed in its deps array
+  redundant-set-state                   setState called with the value the state already holds
+  server-component-hook                 a hook is called in a Next.js Server Component
+  setter-in-render                      setState called during the render body
+  stale-closure                         long-lived callback keeps a state value frozen at registration time
+  state-lifted-too-high                 state is used only deep in one child subtree; the components above re-render to pass it down
+  state-mutation                        state or prop object mutated in place, same reference, no re-render
+  unnecessary-rerender                  mount-only effect immediately overwrites the initial state
+  unstable-context-value                context provider hands consumers a new object every render
+  wasted-subtree-render                 a state written on every keystroke or pointer move re-renders subtrees that do not depend on it
+  widening-info                         state slot required widening to converge (precision lost here)
+  guardrails/effect-without-deps-array  an effect declares no dependency array at all
+  guardrails/inert-single-dep           every dependency of an effect is provably stable, so it can never re-run
+  guardrails/self-retriggering-effect   an effect unconditionally writes a state slot listed in its own dependency array
+  guardrails/oversized-effect           an effect's dependency array exceeds the team's size budget
+  guardrails/banned-hook                a custom hook the team has withdrawn is still being called
+\end{sortie}
+Avec les cinq packs \code{community/*} ajoutés à la configuration, la même commande produit quarante-neuf lignes au lieu de vingt-six --- vingt-trois règles déclaratives de plus (les vingt-huit du \cref{tab:catalogue-regles-packs} moins les cinq déjà chargées de \code{guardrails}), chacune sous son préfixe de pack (\code{community-async/\ldots}, \code{community-wave2/\ldots}\ldots), sans qu'aucun nom natif ne bouge : les deux espaces de noms ne se recouvrent jamais, par construction du préfixe \code{pack/}.
+
+% ===========================================================================
+\begin{resume}
+\begin{itemize}
+  \item Ce catalogue index dix-neuf règles natives (vingt et un noms de diagnostic, deux règles en émettant chacune deux) et vingt-huit règles déclaratives réparties sur six packs livrés (\code{guardrails}, cinq \code{community/*}).
+  \item Deux espaces de noms coexistent et ne se confondent pas : l'\emph{id} de règle (\code{Rule::name()}, namespace des options) et le \emph{nom de diagnostic} (\code{Diagnostic::rule}, namespace de \code{off}/\code{--rule}/\code{RuleDoc}) ; \code{reactant rules} et \code{reactant explain} lisent la table statique \code{RULE_DOCS} plus les \code{RuleDoc} générés par pack.
+  \item Sept règles natives seulement peuvent atteindre l'\Error, chacune derrière une primitive must distincte du \cref{tab:api-regles-primitives} (\cref{chap:api-regles}) ; les douze autres plafonnent au \Warning{} ou à l'\Info{} par construction, pas par prudence éditoriale.
+  \item \code{guardrails} est le seul pack directement activable ; les cinq packs \code{community/*} sont des preuves d'expressivité issues d'une campagne à l'aveugle (\issue{128}), assumées comme porteuses de faux positifs et jamais épinglées \code{error}.
+  \item Pour chaque règle, le tableau de son groupe donne le chemin vers le fichier, le nombre de tests, et le chapitre qui explique le bug React visé, l'algorithme et les cas limites ; cette annexe ne s'y substitue pas.
+\end{itemize}
+\end{resume}
+
+% ===========================================================================
+\section{Exercices}
+\label{sec:catalogue-regles-exercices}
+
+\begin{exercice}{Deux noms, une règle}{catalogue-regles-noms}
+Un projet configure \code{"off": ["infinite-loop"]}. Le composant suivant, où un effet écrit l'état d'un parent reçu en prop, est-il encore signalé ? Justifier en citant le nom de diagnostic concerné et la raison pour laquelle \code{off} ne coupe pas l'exécution de la règle elle-même (\cref{sec:catalogue-regles-lire}).
+\end{exercice}
+
+\begin{solution}
+Oui : \code{off} vise le nom de diagnostic \code{infinite-loop}, pas l'id de règle \code{InfiniteLoop}. Le bras~2 (cross-component) de la même règle émet \code{cross-component-infinite-loop}, un nom distinct que la configuration ne mentionne pas ; le composant reste signalé sous ce nom. Couper l'id aurait éteint les deux noms d'un coup, un faux négatif que la discipline de nommage de \file{registry.rs} interdit précisément d'introduire.
+\end{solution}
+
+\begin{exercice}{Plafond de sévérité}{catalogue-regles-plafond}
+Parmi \regle{state-lifted-too-high}, \regle{conditional-hook} et \code{guardrails/self-retriggering-effect}, laquelle peut produire une \Error{}, et à quelle primitive must le doit-elle ?
+\end{exercice}
+
+\begin{solution}
+\regle{conditional-hook} le peut toujours, via \code{hook_is_conditional} qui frappe un \code{Certified<ConditionalHookCall>} dès qu'un hook ne domine pas toutes les sorties atteignables du rendu (\cref{tab:catalogue-regles-effets}). \code{guardrails/self-retriggering-effect} le peut aussi, mais par une garde déclarative \code{must_setter_on_all_paths}, la même primitive que \regle{derived-state} consomme côté natif sans jamais en tirer d'\Error{} --- deux lectures différentes du même fait. \regle{state-lifted-too-high} ne le peut jamais : le nombre de re-rendus gaspillés est certain, leur coût ne l'est pas, et la règle plafonne au \Warning{} par construction (\cref{tab:catalogue-regles-infinite-loop}).
+\end{solution}

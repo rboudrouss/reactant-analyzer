@@ -1,0 +1,906 @@
+% Chapitre 06 — La représentation intermédiaire
+% Dossier source : notes/03-ir.md (§1–§4.4, §5, §6.1, §6.4, §6.7, §7–§9), code src/ir/*.rs
+% (hors splice.rs et remap.rs, traités au chapitre 8) au commit e67b10a.
+% Sorties d'analyseur observées avec target/debug/reactant (commit e67b10a) sur des
+% fichiers placés sous /tmp/ch06/. Les impressions d'IR viennent de la sonde
+% /tmp/ra-ir-probe (hors dépôt, décrite au dossier 03 §6.0), rejouée sur ces fichiers.
+\chapter{La représentation intermédiaire}
+\label{chap:ir}
+
+\begin{objectifs}
+  \item Comprendre pourquoi \reactant{} n'interprète pas l'AST d'oxc mais une représentation intermédiaire (IR) dédiée, en graphe de flot de contrôle, et quelles alternatives ont été écartées (\adr{3}, \adr{4}).
+  \item Lire sans hésiter les types du squelette : \code{CFG}, \code{BasicBlock}, \code{Terminator}, \code{EdgeKind}, \code{Stmt}, et connaître leurs invariants (\code{validate}, ordre des blocs, blocs orphelins).
+  \item Connaître l'énumération \code{Expr} famille par famille, la notion de \terme{site} d'allocation (\code{ExprId}) et la discipline du parcours canonique \code{for_each_child}.
+  \item Savoir comment un appel de hook devient une ligne \code{HookEntry}, un label positionnel (le \terme{slot}), un marqueur \code{HookMarker}, et comment un tableau de deps est lu (\code{DepsArg}, \code{DepsList}, \code{Arity}).
+  \item Situer les unités (\code{ComponentIR}, \code{HookIR}, \code{FunctionIR}), les faits de module et les identités internées (\code{FileId}, \code{ComponentId}, \adr{40}).
+  \item Savoir d'où vient une position de diagnostic (\code{SourceRange}, \adr{11}, \adr{39}) et utiliser les analyses syntaxiques de l'IR : variables libres, chemins d'accès, couverture par préfixe, certificats de liaison.
+\end{objectifs}
+
+\prerequis{\cref{chap:frontend-detection} (d'où viennent les unités abaissées), \cref{chap:react-modele} (règles des hooks, deps, handlers), \cref{chap:interpretation-abstraite} (treillis, \cref{def:treillis} ; soundness, \cref{def:soundness} ; dominance, \cref{def:dominance}).}
+
+Ce chapitre décrit le \emph{vocabulaire commun} du projet. Le lowering (\cref{chap:lowering-cfg}) l'écrit ; le moteur l'interprète ; les relations et les règles le relisent ; le driver n'en consomme que les positions et les identités. Tout ce qui vit sous \file{src/ir/} est décrit ici, sauf la greffe de CFG (\file{splice.rs}) et le décalage d'identités (\file{remap.rs}), qui ont leur chapitre (\cref{chap:splice-inlining}). Nous partons d'un compteur de dix lignes, et nous le suivons jusqu'à sa forme abaissée.
+
+% ===========================================================================
+\section{Pourquoi une IR, et pourquoi un CFG}
+\label{sec:ir-pourquoi}
+
+\subsection{Un compteur et ses formes équivalentes}
+
+Voici le programme qui nous accompagnera tout au long du chapitre.
+
+\begin{lstlisting}[language=TypeScript,caption={Un compteur avec retour anticipé (\file{/tmp/ch06/counter.tsx})},label={lst:ir-counter}]
+import { useState } from "react";
+
+export function Counter() {
+  const [count, setCount] = useState(0);
+  if (count > 10) {
+    return null;
+  }
+  return <button onClick={() => setCount(count + 1)}>{count}</button>;
+}
+\end{lstlisting}
+
+Pour analyser ce composant, l'interpréteur abstrait doit savoir trois choses : que \code{count} est la valeur d'un emplacement d'état et \code{setCount} son écrivain ; qu'il existe deux chemins vers la sortie, dont l'un s'arrête avant le JSX ; que la flèche passée à \code{onClick} n'est pas exécutée pendant le rendu, mais plus tard, un nombre quelconque de fois.
+
+L'AST d'oxc ne dit rien de tout cela directement. Il dit qu'il y a une \code{VariableDeclaration} dont le motif est un \code{ArrayPattern}, qu'il y a un \code{IfStatement} dont le bloc contient un \code{ReturnStatement}, et qu'il y a un \code{JSXElement} avec un \code{JSXAttribute}. Pire, JavaScript offre des dizaines d'orthographes pour la même chose : \code{if (c) return null;} et \code{return c ? null : <button/>} ; une déstructuration et deux accès indexés ; \code{a && f()} et \code{if (a) f()}. Une fonction de transfert écrite sur l'AST devrait traiter chacune d'elles, et chacune serait une occasion d'oublier un cas --- c'est-à-dire, pour un analyseur qui se veut sound, un faux négatif (FN).
+
+\subsection{La décision : une IR dédiée, en graphe de flot de contrôle}
+
+\begin{decision}[\adr{3} --- une IR dédiée, fondée sur un CFG]
+\textbf{Contexte.} Appliquer les fonctions de transfert sur l'AST oxc oblige à traiter \og des dizaines de formes équivalentes\fg{} (déstructuration, court-circuits, ternaires, retours anticipés).
+
+\textbf{Décision.} Une IR dédiée, inspirée de React-tRace~\cite{LeeAhnYi2025} mais représentée en CFG. Le lowering est la seule couche qui lit l'AST ; \og Abstract domains never see the Oxc AST, only the IR\fg{} (section \emph{Consequences}).
+
+\textbf{Alternatives refusées.} (1) Travailler sur l'AST : refusé pour la raison ci-dessus. (2) Une IR arborescente à la React-tRace : elle exige une transformation CPS pour les retours anticipés et ne représente pas les boucles sans arcs arrière. Le CFG représente nativement \code{return}, boucles et \code{switch}, identifie structurellement les en-têtes de boucle (où placer le \emph{widening}, \cref{def:widening}), et rend la dominance --- nécessaire pour détecter un hook conditionnel --- calculable par un algorithme standard.
+
+\textbf{Écarts avec le code d'aujourd'hui.} L'ADR renvoie à un \file{docs/ir.md} qui n'existe pas ; elle décrit des nœuds \code{UseState}/\code{UseEffect}/\code{HookCall} (aujourd'hui : une table \code{HookEntry} et des marqueurs, \cref{sec:ir-hooks}), un \code{TsAnnotated { expr, ty }} (aujourd'hui sans type) et un désucrage de \code{a && b} en expression \code{If} (aujourd'hui : un diamant de blocs). La décision de fond, elle, tient.
+\end{decision}
+
+\begin{invariant}{L'IR est la frontière de l'AST}{ir-frontiere-ast}
+Aucun type de \file{src/ir/} ne référence oxc. Toutes les structures sont \emph{possédées} (\code{String}, \code{PathBuf}, \code{Arc<...>}), sans durée de vie liée à l'arène du parseur : l'AST d'un fichier est libéré dès la fin de son lowering (un \code{Allocator} par fichier dans \code{lower_files_with}, \src{src/resolver/mod.rs}{247}{349}). Toutes dérivent \code{Debug} et \code{Clone} : le moteur clone et réécrit librement l'IR (greffe, décalage).
+\end{invariant}
+
+\begin{decision}[\adr{4} --- un composant, c'est un rendu \emph{et} une table de hooks]
+\textbf{Décision.} Un composant est représenté par un \code{render_cfg} et une table \code{hooks} dont chaque effet porte son propre CFG. Il n'y a pas de méta-CFG unique \og rendu $\to$ effet $\to$ vérification\fg{}.
+
+\textbf{Alternative refusée.} Le méta-CFG : graphe énorme, séparation rendu/effet rendue implicite, risque de mal modéliser l'ordre d'exécution de React. L'argument décisif : les bugs visés sont des propriétés de l'\emph{état au point fixe}, pas de chemins dans un graphe unifié. La séparation est un invariant sémantique de React (un effet ne s'exécute jamais pendant le rendu) ; l'inscrire dans la structure le préserve sans effort.
+
+\textbf{Écart.} Le squelette de l'ADR (\code{deps: Option<Vec<Expr>>}, pas de handlers, pas de positions) est antérieur au code ; nous décrivons le code.
+\end{decision}
+
+\subsection{Le périmètre : seize fichiers}
+
+\Cref{tab:ir-fichiers} donne la carte de \file{src/ir/} (4\,423 lignes au total). Le module \file{mod.rs} ré-exporte la surface utilisée par le reste du crate (\src{src/ir/mod.rs}{17}{34}) ; certains types importants ne sont \emph{pas} ré-exportés et se nomment par leur chemin complet : \code{ExprId} (\code{crate::ir::types}), \code{MarkerVal} et \code{SummaryValue} (\code{crate::ir::expr}), \code{DepsArg} et \code{HookProvenance} (\code{crate::ir::hooks}), \code{AccessPath} (\code{crate::ir::free_vars}), \code{ClosureBinding} (\code{crate::ir::bindings}).
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}lrp{8.2cm}@{}}
+\toprule
+Fichier & Lignes & Rôle \\
+\midrule
+\file{types.rs} & 25 & alias de base, \code{ExprId}, \code{QualifiedSlot} \\
+\file{cfg.rs} & 228 & \code{CFG}, blocs, terminateurs, arêtes, accessibilité, \code{validate} \\
+\file{stmt.rs} & 54 & instructions \code{Stmt}, \code{MemberKey} \\
+\file{expr.rs} & 548 & expressions, opérateurs, valeurs de hooks, parcours canonique \\
+\file{hooks.rs} & 358 & \code{HookEntry}, \code{DepsArg}, \code{DepsList}, \code{Arity}, \code{HookProvenance} \\
+\file{component.rs} & 83 & \code{ComponentIR}, \code{ModuleConstInit}, \code{ContextId} \\
+\file{hook_ir.rs}, \file{function_ir.rs} & 24, 22 & \code{HookIR}, \code{FunctionIR} \\
+\file{component_id.rs} & 274 & \code{ComponentId}, \code{ComponentTable} (\adr{40}) \\
+\file{module.rs} & 222 & \code{ModuleFacts}, \code{ModuleTable} \\
+\file{source_range.rs} & 102 & \code{FileId}, \code{FileTable}, \code{SourceRange}, \code{SourceMap} \\
+\file{free_vars.rs} & 630 & variables libres, \code{AccessPath}, épinglage, couverture \\
+\file{bindings.rs} & 212 & certificats de liaison, \code{ClosureBinding} \\
+\file{splice.rs}, \file{remap.rs} & 1156, 451 & greffe, α-renommage, décalage (\cref{chap:splice-inlining}) \\
+\file{mod.rs} & 34 & déclarations et ré-exports \\
+\bottomrule
+\end{tabular}
+\caption{Les fichiers de \file{src/ir/} au commit \snapshotCommit{} (\code{wc -l}).}\label{tab:ir-fichiers}
+\end{table}
+
+\subsection{Les alias de base}
+
+Le fichier le plus court fixe le vocabulaire :
+
+\rustsnippet[label={lst:ir-types}]{src/ir/types.rs}{1}{25}{alias de base et clé d'allocation}
+
+\code{Symbol} et \code{Var} sont tous deux des \code{String} ; par convention, \code{Symbol} nomme une entité (composant, champ, tag JSX) et \code{Var} une variable d'un corps, mais aucun typage fort ne les distingue. \code{BlockId} identifie un bloc \emph{dans un} CFG. \code{HookLabel} est le rang d'un hook \emph{dans un} composant (\cref{sec:ir-hooks}) ; comme il n'est pas global, tout fait qui traverse les composants nomme un slot par la paire \code{QualifiedSlot} (\adr{42} §2). \code{ExprId} est la clé d'un site d'allocation, que nous définirons en \cref{sec:ir-sites}.
+
+% ===========================================================================
+\section{Le squelette : blocs, terminateurs, arêtes, instructions}
+\label{sec:ir-cfg}
+
+\subsection{Le CFG du compteur}
+
+Avant les définitions, regardons ce que le lowering produit pour le \cref{lst:ir-counter}. L'impression suivante vient d'une sonde de lecture (un petit programme hors dépôt qui appelle \code{resolver::lower_files} et imprime l'IR) ; la notation est simple : \code{B0:} ouvre un bloc, \code{->} introduit le terminateur, \code{let x = e @fFileId(0):4:9} est une instruction \code{Let} placée en ligne 4, colonne 9 du fichier 0, \texttt{Obj\#0\{...\}} et \texttt{Fn\#1(...)} sont des nœuds allouants avec leur \code{ExprId}.
+
+\begin{sortie}
+ComponentIR Counter file=counter.tsx param=props dom_props={} module_consts=[]
+  render_cfg:
+    entry=B0
+    B0:
+      let count = StateVal(0)   @fFileId(0):4:9
+      let setCount = StateSetter(0)   @fFileId(0):4:16
+      -> branch (count Gt 10) ? B1 : B2  @fFileId(0):5:6
+    B1:
+      -> return null
+    B2:
+      -> jump B3
+    B3:
+      -> return Native<button>(Obj#0{onClick: Fn#1() {
+        entry=B0
+        B0:
+          -> return setCount((count Add 1))
+        edges:
+      }}; [count]) prop_spans=["onClick@fFileId(0):8:17"] @fFileId(0):8:9
+    edges: B0->B1:IfTrue B0->B2:IfFalse B2->B3:Unconditional
+  hook: State #0 init=0 @fFileId(0):4:8
+  hook: Handler #1 event=click @fFileId(0):8:17
+      entry=B0
+      B0:
+        -> return setCount((count Add 1))
+      edges:
+  prov: HookProvenance { label: 0, origin_hook: "useState", react: true, specifier: Some("react"), file: None, inlined: false, span: Some(SourceRange { file: FileId(0), line: 4, col: 8 }) }
+\end{sortie}
+
+\Cref{fig:ir-cfg-counter} dessine le même graphe. Plusieurs traits de l'IR s'y lisent déjà. L'appel \code{useState(0)} a disparu du rendu : il est devenu une ligne \texttt{State \#0} de la table des hooks, et les deux liaisons du tuple lisent \code{StateVal(0)} et \code{StateSetter(0)}. Le \code{if} est un terminateur \code{Branch} à deux arêtes typées. Le bras \og sinon\fg{} implicite est un bloc vide \code{B2} qui saute vers la suite. Enfin, la flèche de \code{onClick} est présente \emph{deux fois} : dans les props de l'élément (c'est une valeur créée à chaque rendu) et comme point d'entrée \texttt{Handler \#1}.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=9mm and 14mm]
+  \node[cfgbloc] (b0) {B0\\let count = StateVal(0)\\let setCount = StateSetter(0)\\branch (count Gt 10)};
+  \node[cfgbloc,below left=of b0] (b1) {B1\\return null};
+  \node[cfgbloc,below right=of b0] (b2) {B2\\jump B3};
+  \node[cfgbloc,below=of b2] (b3) {B3\\return Native<button>(\ldots)};
+  \draw[fleche] (b0) -- node[etiquette,left=2pt] {IfTrue} (b1);
+  \draw[fleche] (b0) -- node[etiquette,right=2pt] {IfFalse} (b2);
+  \draw[fleche] (b2) -- node[etiquette,right=2pt] {Unconditional} (b3);
+  \node[cfgbloc,right=22mm of b0] (h) {Handler \#1 (click)\\B0: return setCount(count Add 1)};
+  \node[cfgbloc,below=6mm of h] (s) {State \#0\\init = 0};
+  \node[etiquette,above=1mm of h] {table \code{hooks}};
+\end{tikzpicture}
+\caption{Le \code{render_cfg} du compteur (\cref{lst:ir-counter}) et sa table de hooks. Le bloc \code{B1} et le bloc \code{B3} sont deux sorties ; le corps du handler est un CFG à part.}\label{fig:ir-cfg-counter}
+\end{figure}
+
+\subsection{Les types}
+
+\rustsnippet[label={lst:ir-cfg-types}]{src/ir/cfg.rs}{5}{65}{blocs, terminateurs, arêtes et graphe}
+
+\begin{definition}{Graphe de flot de contrôle (CFG)}{cfg}
+Un \terme{CFG} de \reactant{} est un triplet $(\mathit{entry}, B, E)$ où $B$ associe à chaque \code{BlockId} un \terme{bloc de base} --- une séquence linéaire d'instructions \code{Stmt} suivie d'un unique \terme{terminateur} --- et où $E$ est une liste d'arêtes $(\mathit{from}, \mathit{to}, \mathit{kind})$. Le terminateur est \code{Jump(t)} (saut), \code{Branch { cond, then_, else_ }} (choix sur une expression), \code{Return(e)} (sortie du corps avec la valeur de \code{e}) ou \code{Unreachable} (le contrôle ne continue pas : \code{throw}, \code{break} orphelin). La nature d'une arête, \code{EdgeKind}, vaut \code{Unconditional}, \code{IfTrue}, \code{IfFalse}, \code{Back} (arc arrière d'une boucle) ou \code{Await} (le successeur s'exécute à un tour ultérieur de la boucle d'événements).
+\end{definition}
+
+Reprenons les champs un par un.
+
+\begin{itemize}
+  \item \code{BasicBlock.id} doit être égal à la clé sous laquelle le bloc est rangé ; \code{stmts} est la séquence d'instructions ; \code{term} le terminateur unique.
+  \item \code{Branch.cond} est une expression quelconque ; pour un court-circuit \code{&&}/\code{||}, c'est une variable temporaire \code{Var("__tN")} (le diamant est expliqué plus bas). \code{Branch.span} situe la condition dans la source.
+  \item \code{Return(e)} ne porte \emph{pas} de position. Le commentaire (\src{src/ir/cfg.rs}{23}{28}) l'assume : l'ajouter touche une quarantaine de sites de construction ; le prix est qu'un hook atteint seulement par un \code{return} produit des findings sans numéro de ligne. C'est l'issue ouverte \issue{140}.
+  \item \code{Unreachable} n'est jamais la chute en fin de corps : depuis \adr{25}, une fonction qui \og tombe\fg{} de sa dernière instruction se termine par \code{Return(Lit(Unit))}, c'est-à-dire \code{return undefined}.
+  \item \code{EdgeKind} : \code{IfTrue}/\code{IfFalse} servent au raffinement par les gardes, \code{Back} au placement du widening (\adr{14}), \code{Await} à la frontière de phase des corps asynchrones (\adr{35}).
+  \item \code{CFG.blocks} est une \code{BTreeMap} : le commentaire (\src{src/ir/cfg.rs}{54}{59}) en donne la raison, la reproductibilité. Tout parcours visite les blocs par \code{BlockId} croissant, donc dans l'ordre du lowering, et une passe qui choisit un bloc \og représentatif\fg{} (le premier site d'appel d'un setter, pour un témoin) choisit le même à chaque exécution. Sous une \code{HashMap}, ce choix suivait la graine de hachage du processus.
+\end{itemize}
+
+\begin{piege}
+\textbf{La navigation lit les arêtes, pas les terminateurs.} \code{successors} et \code{predecessors} parcourent \code{CFG.edges}. Un terminateur \code{Jump(7)} sans arête \code{(b, 7)} correspondante rend le bloc 7 invisible au worklist, bien qu'il soit présent dans \code{blocks}. C'est la troisième clause de \code{validate}, ci-dessous.
+\end{piege}
+
+\begin{piege}
+\textbf{Sur un diamant de court-circuit, \code{EdgeKind} n'est pas une polarité.} Pour \code{a && b}, le lowering produit \code{let __t = a; branch __t ? rhs : join}, puis \code{__t := b} dans \code{rhs}. Mais les \emph{deux} arêtes sortantes reçoivent \code{IfTrue}, et pour \code{||}/\code{??} les deux reçoivent \code{IfFalse} (\src{src/lowering/expr_lower.rs}{763}{780}) : la nature de l'arête encode l'\emph{opérateur} (le sens dans lequel on entre dans l'opérande droit), et c'est ainsi que \code{guards.rs} la relit pour déplier une garde conjonctive (\src{src/engine/guards.rs}{1019}{1028}). Observé sur \code{ok && setX(1)} : \code{edges: ... B4->B8:IfTrue B4->B9:IfTrue}. L'interpréteur, lui, raffine l'environnement d'après \code{then_}/\code{else_} du terminateur (\src{src/engine/cfg_analyzer.rs}{135}{140}), ce qui est correct. Un nouveau consommateur qui lirait \code{IfTrue} comme \og la condition est vraie sur cette arête\fg{} se tromperait sur l'arête qui court-circuite.
+\end{piege}
+
+\subsection{Deux accessibilités et une validation}
+
+Trois méthodes de \code{CFG} méritent d'être connues par cœur.
+
+\rustsnippet{src/ir/cfg.rs}{146}{163}{les blocs atteignables depuis l'entrée}
+
+Le commentaire est la leçon : le lowering d'un \code{if}/\code{else} et la greffe laissent des \terme{blocs orphelins} (une jointure dont tous les prédécesseurs ont retourné, un corps inliné après un \code{throw}). \og Tous les blocs du CFG\fg{} et \og tous les blocs qui peuvent s'exécuter\fg{} ne sont pas le même ensemble ; toute quantification sur les points de programme --- et d'abord sur les sorties --- doit passer par \code{reachable_blocks}.
+
+La seconde accessibilité est \code{post_await_blocks} (\src{src/ir/cfg.rs}{111}{144}) : la fermeture, par les successeurs, des cibles de toutes les arêtes \code{Await} du corps. Elle sur-approxime \og exécuté après une suspension\fg{} : l'en-tête d'une boucle dont le corps attend en fait partie, car la deuxième itération s'exécute bien après la suspension. Un \code{await} dans un callback imbriqué n'affecte que le CFG de ce callback, qui est un graphe distinct.
+
+\rustsnippet[label={lst:ir-validate}]{src/ir/cfg.rs}{181}{227}{la bonne formation structurelle}
+
+\code{validate} annonce trois clauses et en vérifie en fait quatre : l'entrée existe ; chaque arête relie deux blocs existants ; chaque bloc est rangé sous son propre \code{id} ; chaque cible de terminateur existe \emph{et} possède une arête. Elle ne vérifie pas la réciproque (une arête sans terminateur correspondant), ni la densité des identifiants. Son seul appel est un \code{debug_assert!} en fin de greffe (\src{src/ir/splice.rs}{251}{255}) : actif dans les tests et en build debug, absent en release.
+
+\begin{remarque}
+Le dossier source relève un invariant \emph{implicite} : les \code{BlockId} d'un CFG forment l'intervalle $0..n$ sans trou. Le lowering alloue les blocs par un compteur (le bloc 0 est l'entrée) et la greffe place les blocs de l'appelé à la suite du maximum ; elle en dépend pour placer son bloc de jointure (\cref{chap:splice-inlining}). Cet invariant n'est ni documenté ni vérifié par \code{validate}. Au \snapshotCommit{}, il tient sans exception sur les 930 CFG des fixtures et les 5\,512 CFG de cinq corpus externes ; cette mesure, empirique et non refaite pour ce chapitre, est celle du dossier source (§3.3), et ne prouve donc rien au-delà de ces 6\,442 CFG.
+\end{remarque}
+
+\subsection{Les instructions}
+
+\rustsnippet[label={lst:ir-stmt}]{src/ir/stmt.rs}{7}{29}{les quatre formes d'instruction}
+
+Quatre formes seulement, toutes avec une position optionnelle :
+
+\begin{itemize}
+  \item \code{Let { var, rhs }} introduit une liaison locale (\code{const}, \code{let}, un temporaire du lowering, un paramètre greffé).
+  \item \code{Assign { var, rhs }} écrit dans une liaison existante. La distinction avec \code{Let} n'est pas cosmétique : un \code{Assign} sans \code{Let} du même nom dans le corps est \og l'orthographe IR d'une écriture dans une liaison extérieure\fg{} (\src{src/ir/splice.rs}{160}{163}), ce que la greffe doit respecter.
+  \item \code{MemberWrite { obj, key, rhs }} est une écriture \emph{en place} : \code{obj.f = v}, \code{arr[i] = v}, \code{obj.f++}, \code{delete obj.f}. L'identité de l'objet dans le tas ne change pas --- c'est une mutation, pas une re-liaison --- et c'est exactement ce que la règle \regle{state-mutation} doit voir. La clé est un \code{MemberKey} :
+\end{itemize}
+
+\rustsnippet{src/ir/stmt.rs}{47}{54}{la cible d'une écriture membre}
+
+\begin{itemize}
+  \item \code{ExprStmt(e)} évalue une expression pour ses effets (un appel, typiquement).
+\end{itemize}
+
+\begin{exemple}{Une affectation en position d'instruction est émise deux fois}{ir-double-emission}
+Dans l'effet \code{useEffect(() => { document.title = String(total); })}, la sonde imprime :
+\begin{sortie}
+      B0:
+        document.title <- String(total)   @fFileId(0):11:4
+        String(total);   @fFileId(0):11:4
+        -> return undefined
+\end{sortie}
+Le \code{MemberWrite} est suivi d'un \code{ExprStmt} qui ré-évalue le membre droit. La cause est vérifiée dans le lowering : une expression d'affectation pousse son écriture puis \emph{renvoie sa valeur} (\src{src/lowering/expr_lower.rs}{519}{535}), et une instruction-expression enveloppe toujours cette valeur dans un \code{ExprStmt} (\src{src/lowering/cfg_builder.rs}{286}{289}). Même chose pour \code{x = e;}, qui donne \code{Assign} puis \code{ExprStmt(Var(x))}. C'est sans danger pour la soundness : un appel sur-compté n'est pas un appel perdu. Mais un lecteur qui compte les appels d'un corps doit le savoir.
+\end{exemple}
+
+\begin{remarque}
+\code{Stmt::span} (\src{src/ir/stmt.rs}{31}{45}) documente qu'un \code{None} est \og un bug à corriger, pas une forme à contourner\fg{} (\adr{39}). Un résidu subsiste : le \code{let __obj_N = __p0} produit pour un paramètre déstructuré (\code{function C({ x })}) n'a pas de position (\code{@-} dans les impressions de la \cref{sec:ir-analyses}), parce que \code{inject_param_preamble} passe \code{None} au lowering du motif (\src{src/lowering/cfg_builder.rs}{963}{965}). La conséquence est bénigne : ce \code{Let} ne fait que copier une variable.
+\end{remarque}
+
+% ===========================================================================
+\section{Les expressions}
+\label{sec:ir-expr}
+
+\subsection{Littéraux et opérateurs}
+
+\rustsnippet{src/ir/expr.rs}{10}{18}{les littéraux primitifs}
+
+\code{Unit} est \code{undefined}. Un littéral numérique devient \code{Int} s'il est entier et de valeur absolue inférieure à \code{i32::MAX}, \code{Float} sinon (\src{src/lowering/expr_lower.rs}{148}{154}). \code{Prim} ne dérive pas \code{PartialEq} (un \code{f64} interdirait de toute façon \code{Eq}).
+
+Les opérateurs binaires (\src{src/ir/expr.rs}{20}{63}) ont chacun leur variant : \code{Add}, \code{Sub}, \code{Mul}, \code{Div}, \code{Mod}, \code{Pow}, les comparaisons, \code{In}, \code{InstanceOf} et les six opérateurs bit à bit. Le commentaire de \code{BitAnd} énonce la politique, qui vaut pour tout l'IR :
+
+\rustsnippet{src/ir/expr.rs}{44}{56}{un variant par opérateur, plus de \code{Unknown}}
+
+\code{lower_binop} n'a pas de bras \texttt{\_} : un opérateur ajouté au langage serait une erreur de compilation, pas une valeur silencieusement fausse. Deux détails comptent. D'une part \code{Eq}/\code{Neq} couvrent à la fois \code{==} et \code{===} (\src{src/lowering/expr_lower.rs}{1187}{1188}) : l'IR ne distingue pas égalité stricte et non stricte. D'autre part \code{And}/\code{Or} existent dans \code{BinOp}, mais les \code{&&}/\code{||} du source sont désucrés en diamant de blocs (\adr{20}, non-changement n°1), pour ne pas perdre les effets de bord d'un opérande droit court-circuité. Côté unaire (\src{src/ir/expr.rs}{65}{80}), \code{UnaryOp::Unknown} subsiste pour les opérateurs restants ; il s'évalue à $\Top$, \og jamais comme l'identité, qui falsifierait la valeur de l'opérande\fg{}.
+
+\subsection{L'énumération \code{Expr}}
+
+Voici la première moitié de l'énumération : littéraux, nœuds allouants, variables, accès et opérateurs.
+
+\rustsnippet[label={lst:ir-expr-1}]{src/ir/expr.rs}{174}{228}{\code{Expr}, première partie}
+
+Puis les appels, le JSX, l'annotation TypeScript et les valeurs de hooks :
+
+\rustsnippet[label={lst:ir-expr-2}]{src/ir/expr.rs}{230}{300}{\code{Expr}, seconde partie}
+
+Le \cref{tab:ir-expr} regroupe les variants en familles.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}p{2.3cm}p{3.6cm}p{7.2cm}@{}}
+\toprule
+Famille & Variants & Source typique et remarques \\
+\midrule
+littéral & \code{Lit} & \code{1}, \code{"a"}, \code{null} ; l'identifiant \code{undefined} devient \code{Lit(Unit)}. \\
+allouant & \code{ObjectLit}, \code{ArrayLit}, \code{FnLit}, \code{New} & portent un \code{id: ExprId} (\cref{sec:ir-sites}). Un spread d'objet est rangé sous une clé préfixée par \code{"..."} ; \code{ArrayLit.arity} garde la longueur \emph{source} ; \code{FnLit.body_cfg} est un CFG séparé, partagé par \code{Arc}. \\
+variable & \code{Var} & après une greffe, peut porter un suffixe \texttt{\#n} (\cref{chap:splice-inlining}). \\
+accès & \code{FieldAccess}, \code{IndexAccess} & \code{a?.b} s'abaisse comme \code{a.b} (\src{src/lowering/expr_lower.rs}{649}{653}). \\
+opérateur & \code{BinOp}, \code{UnaryOp} & un variant par opérateur. \\
+appel & \code{Call} & callee opaque $\Rightarrow$ $\Top$, sauf inlining ou résumé. \\
+JSX & \code{CompApp}, \code{NativeElem} & composant (props dont \code{children}) / élément natif (enfants à part). \\
+annotation & \code{TSAnnotated} & \code{x as T}, \code{useState<T>()} ; le type est effacé. \\
+hook & \code{StateVal}, \code{StateSetter}, \code{MemoVal}, \code{CallbackVal}, \code{HookMarker}, \code{SummaryVal} & ce que lit une liaison de hook (\cref{sec:ir-hooks}). \\
+\bottomrule
+\end{tabular}
+\caption{Les familles de \code{Expr}.}\label{tab:ir-expr}
+\end{table}
+
+Quelques champs demandent un commentaire.
+
+\begin{itemize}
+  \item \code{ArrayLit.arity} et \code{spread_at} : dès que le lowering aplatit un spread (\code{[...rows]} devient un seul élément \code{rows}) ou omet une élision (\code{[a, , b]}), \code{elems.len()} cesse de dire la longueur du tableau. Le commentaire l'explique : c'est le dernier point où cette information est connue, d'où son enregistrement. Nous retrouverons ces deux champs dans les deps (\cref{sec:ir-deps}).
+  \item \code{New} existe depuis le commit photographié (\issue{158}) : abaissé en \code{Call}, \code{new Map()} était une valeur qui \og tient en place\fg{}, invisible à tout test de fraîcheur. C'est désormais un nœud allouant, comme un littéral d'objet.
+  \item \code{CompApp.origin} est la preuve d'identité du composant nommé (\adr{40} §3, \cref{sec:ir-identites}) ; \code{None} est une ignorance, jamais une négation prouvée. \code{CompApp.props} est un \code{ObjectLit} où les enfants JSX sont rangés sous la clé \code{children}, comme en React ; \code{NativeElem} garde ses enfants à part, parce que le DOM n'a pas de prop \code{children} à passer à du code utilisateur.
+  \item \code{NativeElem.prop_spans} est une liste et non une table, pour une raison de taille : \code{Expr} est le type le plus fréquent de l'IR, et un en-tête de \code{HashMap} lui coûterait deux fois sa charge utile.
+  \item \code{TSAnnotated} ne garde pas le type (\adr{20}, non-changement n°10) : les types TypeScript sont effacés à l'exécution, et raffiner une valeur abstraite par \code{useState<number>} serait unsound (l'état peut contenir \code{undefined} ou une valeur forcée par \code{as any}). Le nœud ne sert qu'à être pelé par \code{peel_ts}.
+\end{itemize}
+
+\begin{react}[pourquoi les handlers ne sont pas exécutés au rendu]
+Une fonction passée à \code{onClick} est créée à chaque rendu mais n'est appelée qu'à l'arrivée d'un événement, un nombre quelconque de fois. L'IR reflète les deux faits : la \code{FnLit} reste dans les props de l'élément (une référence fraîche à chaque rendu, ce qui compte pour la stabilité référentielle) et son corps est réifié en \code{HookEntry::Handler}, un point d'entrée que le moteur exécute \og plus tard, n'importe quand\fg{} dans son point fixe (\cref{chap:point-fixe-composant}).
+\end{react}
+
+\subsection{Les sites d'allocation}
+\label{sec:ir-sites}
+
+Considérons \code{const style = { color: "red" };} dans un rendu. À chaque rendu, React réexécute le corps et crée un \emph{nouvel} objet ; mais c'est toujours le \emph{même} littéral du source. L'interprétation abstraite ne peut pas suivre les objets concrets (il y en a un par rendu, donc potentiellement une infinité) ; elle suit les littéraux qui les créent.
+
+\begin{definition}{Site}{site}
+Un \terme{site} est une occurrence syntaxique, dans le code abaissé, d'une opération qui alloue une référence (littéral d'objet, de tableau, de fonction, \code{new}) ou qui écrit un état. Pour les allocations, le site est matérialisé par le champ \code{id: ExprId} des variants \code{ObjectLit}, \code{ArrayLit}, \code{FnLit}, \code{New} (et \code{SummaryValue::Shape}). Tous les objets concrets créés par un même site sont représentés par une seule entrée du tas abstrait, indexée par cet \code{ExprId} (\adr{10}).
+\end{definition}
+
+Dans le compteur, \texttt{Obj\#0} (l'objet des props du \code{<button>}) et \texttt{Fn\#1} (la flèche du handler) sont deux sites. Le modèle de tas lui-même relève de \cref{chap:transfert-stores} ; retenons ici trois règles de fabrication.
+
+\begin{enumerate}
+  \item Les \code{ExprId} du lowering viennent d'un compteur \emph{par fichier} (\code{ExprIds}, un \code{Rc<Cell<usize>>} partagé par tous les corps abaissés d'un fichier, \src{src/lowering/cfg_builder.rs}{20}{42}). Le \og compteur dans \code{BlockBuilder}\fg{} décrit par \adr{10} §1 est obsolète depuis \issue{134}.
+  \item Un hook custom, abaissé par un autre appel, recommence à 0 : quand on greffe son corps dans un composant, il faut décaler ses identifiants (\code{Offsets::ids}, \cref{chap:splice-inlining}), sans quoi l'objet de l'appelé partagerait l'entrée de tas d'un objet de l'appelant.
+  \item \code{ExprId::fresh} (\cref{lst:ir-types}) puise dans un compteur global au processus commençant à $10^9$, pour ne jamais croiser les identifiants du lowering. Il sert aux valeurs synthétiques de l'analyse inter-composants (l'objet \code{props} d'un enfant, \srcline{src/domains/transfer/state_value.rs}{563}).
+\end{enumerate}
+
+\code{ExprId} dérive \code{Ord} depuis \issue{120} : le premier élément d'un parcours sur un \code{HashSet<ExprId>} dépendait de la graine de hachage.
+
+\begin{piege}
+\textbf{\og Unique par fichier\fg{} n'est pas \og unique dans le programme\fg{}.} Le dossier source a reproduit une collision : quand un parent passe à un enfant d'un \emph{autre} fichier un objet de son tas, les entrées copiées portent les identifiants du fichier parent, alors que l'enfant alloue avec ceux de son propre fichier, et l'insertion dans le tas écrase (\src{src/domains/stores/heap.rs}{41}{43}). Quand les deux numéros coïncident, la closure du parent est remplacée et une écriture d'état disparaît : un faux négatif. La collision elle-même (\code{Heap::insert} qui écrase, \src{src/domains/stores/heap.rs}{41}{43}, et la copie par \code{ExprId} du fichier parent, \srcline{src/domains/transfer/state_value.rs}{563}) est vérifiée dans le code cité ; sa reproduction pas à pas sur un cas concret, faite par le dossier source (§6.8(b)/§8.1), n'a pas été rejouée pour ce chapitre. Ce défaut est détaillé au \cref{chap:inter-composants} et au \cref{chap:limites-perspectives}.
+\end{piege}
+
+\subsection{Deux aides sur les littéraux d'objet}
+
+Un spread d'objet (\code{{ a: 1, ...opts }}) est gardé comme un membre synthétique dont la clé commence par \code{"..."}, préfixe qu'aucune propriété du source ne peut avoir. Une lecture par nom doit en tenir compte :
+
+\rustsnippet{src/ir/expr.rs}{89}{113}{lire un membre par son nom, en respectant les spreads}
+
+Un membre écrit \emph{avant} un spread a pu être écrasé par ce spread : il \og ne répond rien\fg{} (\code{None}), plutôt que de répondre une valeur peut-être fausse. Et \code{rev()} retient la \emph{dernière} écriture d'une clé dupliquée, comme JavaScript. La fonction est partagée par l'interpréteur (\code{obj_members}) et par la poursuite de liaisons du moteur (\code{engine::seeds}), pour que les deux lecteurs ne divergent pas. Dans le même esprit, \code{MUTATING_METHODS} (\src{src/ir/expr.rs}{121}{135}) est la liste \emph{unique} des méthodes qui mutent leur receveur (\code{push}, \code{splice}, \code{sort}, \code{set}\ldots), partagée par \regle{state-mutation}, la garde de pureté et la dépendance de rendu.
+
+\subsection{Le parcours canonique}
+
+Les analyses de l'IR sont des parcours récursifs d'expressions. Chacun traite spécialement quelques variants (une variable, une fonction) et descend structurellement dans les autres. Le risque est connu : un parcours qui écrit \texttt{\_ => \{\}} pour \og tout le reste\fg{} absorbe silencieusement un variant ajouté plus tard comme \og sans enfants\fg{}, et perd tout ce qui est dessous. Pour une analyse sound, c'est un faux négatif en attente. L'IR impose donc un point unique :
+
+\rustsnippet[label={lst:ir-for-each-child}]{src/ir/expr.rs}{463}{511}{l'énumération canonique des enfants directs}
+
+\begin{invariant}{Pas de bras \texttt{\_} dans l'énumération des enfants}{ir-for-each-child}
+\code{Expr::for_each_child} énumère les enfants directs de chaque variant par un \code{match} exhaustif, sans bras \texttt{\_}. Les parcoureurs n'écrivent que les bras qu'ils traitent spécialement et délèguent le reste à \code{for_each_child}. Ajouter un variant à \code{Expr} casse alors la compilation à une vingtaine d'endroits (mesure citée dans le commentaire, \src{src/ir/expr.rs}{385}{402}), tous guidés par le compilateur, et aucun parcoureur ne le traite mal en silence.
+\end{invariant}
+
+Deux conséquences. D'abord, \code{FnLit} est une \emph{feuille} : son corps est un CFG, pas une sous-expression, et franchir la frontière de fonction est une décision de chaque parcoureur. Ensuite, le même principe est appliqué ailleurs : \code{HookEntry::body_cfg} (\cref{sec:ir-hooks}) énumère lui aussi ses variants un par un.
+
+\begin{piege}
+Le commentaire qui décrit \code{for_each_child} (\src{src/ir/expr.rs}{385}{402}) est placé au-dessus de \code{subscription_listener}, et enchaîne sans ligne vide sur la documentation de celle-ci : rustdoc attache donc l'ensemble à \code{subscription_listener}, et \code{for_each_child} n'a pas de documentation propre dans la doc générée. Lisez le source.
+\end{piege}
+
+Le compagnon de \code{for_each_child} au niveau d'un corps entier est \code{CFG::for_each_expr} (\src{src/ir/cfg.rs}{67}{109}) : il applique une fonction à chaque expression \emph{de premier niveau} --- membres droits des instructions, objet, index et valeur d'un \code{MemberWrite}, expressions des terminateurs \code{Return} et \code{Branch} --- en visitant les blocs par identifiant croissant, orphelins compris. La visite des terminateurs n'est pas un détail : un ancien défaut les ignorait, et une variable lue seulement dans une condition n'était pas libre (test \srcline{src/engine/fixpoint.rs}{2734}). La variante \code{for_each_expr_where} filtre les instructions visitées ; elle sert à ignorer un \code{let} d'alias (\cref{sec:ir-analyses}).
+
+Parmi les autres méthodes de \code{Expr} : \code{is_call_free} (\src{src/ir/expr.rs}{516}{528}) est faux dès qu'apparaît un \code{Call}, un \code{New}, un \code{CompApp} ou un \code{NativeElem} (le commentaire omet ce dernier, le code l'inclut) ; \code{peel_ts} retire les annotations ; \code{describe} (\src{src/ir/expr.rs}{432}{461}) fabrique une description courte pour un message, en lisant les racines par \code{source_name} pour ne jamais montrer un suffixe de greffe.
+
+% ===========================================================================
+\section{Les hooks dans l'IR}
+\label{sec:ir-hooks}
+
+\subsection{Labels positionnels et slots}
+
+\begin{react}[l'identité d'un hook est son rang]
+React ne connaît pas le nom des variables d'état : il associe le $i$-ème appel de hook d'un rendu à la $i$-ème cellule de la fibre. C'est la raison d'être de la règle des hooks (pas d'appel conditionnel, pas d'appel dans une boucle) : l'ordre d'appel doit être le même à chaque rendu (\cref{chap:react-modele}).
+\end{react}
+
+L'IR reproduit exactement ce modèle. L'extraction des hooks (\code{extract_hooks}, \cref{chap:lowering-cfg}) parcourt le CFG et numérote les appels dans l'ordre de parcours ; \code{extract_handlers} puis \code{extract_subscriptions} poursuivent la numérotation (\src{src/lowering/mod.rs}{465}{470}), si bien que les handlers ont des labels \emph{après} tous les hooks React. Dans le compteur, \code{useState} a le label 0 et le handler le label 1.
+
+\begin{definition}{Slot, label de hook}{slot}
+Le \terme{label} d'un hook (\code{HookLabel}) est son rang d'extraction dans le corps d'un composant. Un \terme{slot} est l'emplacement d'état créé par un \code{useState} (ou un \code{useReducer}), identifié par le label de ce hook : \code{StateVal(l)} lit sa valeur courante, \code{StateSetter(l)} est son setter. Hors de son composant, un slot se nomme par \code{QualifiedSlot = (ComponentId, HookLabel)}.
+\end{definition}
+
+Le label est local : deux composants ont chacun un slot 0. Quand un hook custom est greffé dans un composant, ses labels sont décalés à la suite de ceux de l'appelant --- c'est la traduction directe de ce que fait React, pour qui les hooks d'un hook custom \emph{sont} ceux de son appelant, dans l'ordre (\cref{chap:splice-inlining}).
+
+\subsection{La table \code{HookEntry}}
+
+\rustsnippet[label={lst:ir-hookentry}]{src/ir/hooks.rs}{247}{313}{une ligne de la table des hooks}
+
+Tous les variants portent \code{label} et \code{span} (le site d'appel ; \code{None} si le hook n'est atteint que par un \code{return}, \issue{140}). Les autres champs :
+
+\begin{itemize}
+  \item \code{State { init }} : l'expression d'initialisation. Ce n'est pas un CFG ; un initialiseur paresseux \code{useState(() => ...)} est une \code{FnLit} dans \code{init}.
+  \item \code{Effect { body_cfg, deps }} : \code{useEffect}, mais aussi \code{useLayoutEffect} et \code{useInsertionEffect}, réunis. Pour les bugs visés (boucles d'état, captures périmées), le moment exact d'exécution ne change pas le point fixe ; la distinction reste lisible dans la provenance.
+  \item \code{Memo}, \code{Callback} : le corps est \emph{sorti} du rendu, qui ne garde que \code{MemoVal(l)}/\code{CallbackVal(l)}. \code{Callback.params} existe parce qu'une fonction mémoïsée prend des arguments, qu'il faut retirer de ses variables libres sous peine de les lire comme des captures d'une liaison homonyme. Le commentaire de \code{Memo.deps} parle encore d'un \code{None} : il est antérieur au passage à \code{DepsArg}.
+  \item \code{Ref { init }} : \code{useRef(init)}.
+  \item \code{Custom} : tout appel de hook que le lowering ne modélise pas --- hook utilisateur, hook de paquet, et même hooks de React non modélisés comme \code{useContext}. \code{import_source} garde le spécificateur npm brut (clé de la table de résumés), \code{resolved_file} le fichier de définition (clé du registre des hooks, avec le nom). Le champ \code{binding} est écrit par le lowering mais n'est lu nulle part en aval au commit étudié (le dossier source l'a vérifié par \code{grep}) : c'est un champ mort, que la greffe ne renomme d'ailleurs pas.
+  \item \code{Handler { event, body_cfg }} : un pseudo-hook, point d'entrée événementiel. Il vient des props JSX (\code{onX={...}}, et \code{ref} sur un élément natif ; toute prop fonctionnelle d'un composant) ou d'un \code{addEventListener} dans un corps d'effet. Il n'a pas de ligne de provenance.
+\end{itemize}
+
+\Cref{tab:ir-classification} résume ce que devient chaque appel, d'après \code{make_hook_entry} et \code{hook_result_expr} (\src{src/lowering/hook_extractor.rs}{642}{788}). Le nom considéré est toujours le nom d'\emph{origine} (\code{import { useEffect as ue }} est un \code{useEffect}), et l'appartenance à React vient de la résolution des imports (\cref{chap:frontend-detection}).
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}p{3.6cm}p{5cm}p{4.3cm}@{}}
+\toprule
+Appel (origine) & Ligne \code{HookEntry} & Ce que lit la liaison \\
+\midrule
+hook non React & \code{Custom} & \code{HookMarker(l, Unknown)} \\
+\code{useState(init)} & \code{State} (\code{init} absent : \code{Lit(Unit)}) & \code{StateVal(l)}, \code{StateSetter(l)} \\
+\code{useReducer(r, init)} & \code{State} (le réducteur est ignoré) & \code{StateVal(l)} \\
+\code{useEffect} et variantes & \code{Effect} & \code{HookMarker(l, Undefined)} \\
+\code{useMemo(fn, deps)} & \code{Memo} & \code{MemoVal(l)} \\
+\code{useCallback(fn, deps)} & \code{Callback} & \code{CallbackVal(l)} \\
+\code{useRef(init)} & \code{Ref} (\code{init} absent : \code{Lit(Null)}) & \code{HookMarker(l, StableRef)} \\
+autre \code{use*} de React & \code{Custom} (\code{import_source: "react"}) & \code{HookMarker(l, Unknown)} \\
+\bottomrule
+\end{tabular}
+\caption{Classification d'un appel de hook au lowering.}\label{tab:ir-classification}
+\end{table}
+
+Le corps d'un effet ou d'un memo est fixé par \code{hook_body_cfg} (\src{src/lowering/hook_extractor.rs}{809}{835}) : une \code{FnLit} donne son propre CFG ; tout autre argument (une variable, un membre, un appel) donne un bloc unique \code{ExprStmt(Call { fn_: arg, args: [] }); return undefined} --- le hook \emph{invoque} son argument, le corps est donc exactement cette invocation. L'ancien repli était un CFG \code{Unreachable}, c'est-à-dire $\Bot$ au lieu de $\Top$ : \code{useEffect(handler)} sortait propre, et même certifié.
+
+La projection \code{body_cfg} applique la discipline de \cref{inv:ir-for-each-child} :
+
+\rustsnippet{src/ir/hooks.rs}{341}{357}{le corps d'une ligne, sans bras par défaut}
+
+\begin{piege}
+\textbf{Un \code{Handler} n'a pas de paramètres.} Quand \code{onClick={onPick}} désigne un \code{useCallback((opts) => opts.id, deps)}, la ligne \code{Handler} reçoit une copie du corps du callback, mais le variant n'a pas de champ \code{params} : dans l'exemple de la \cref{sec:ir-analyses}, la sonde imprime \texttt{Handler \#4 event=click} avec le corps \code{return opts.id}, où \code{opts} était le paramètre du callback. Le moteur exécute ce corps dans l'environnement de sortie du rendu (\src{src/engine/fixpoint.rs}{453}{481}) et calcule ses variables libres sans retrait (\src{src/engine/fixpoint.rs}{1498}{1521}) : le paramètre est lu comme la prop homonyme du composant, au lieu de $\Top$. Même situation pour une flèche inline \code{(n) => setN(n)}. C'est un constat nouveau, propre à la rédaction de ce chapitre, absent du dossier source. Rejoué sur deux variantes d'un composant à deux slots d'état (\file{/tmp/ch06/hparam2.tsx}, où le paramètre \code{n} du handler porte le même nom qu'un slot du composant, et \file{/tmp/ch06/hparam3.tsx}, où il s'appelle \code{e}), \code{reactant check} rapporte le \emph{même} \Warning{} \regle{infinite-loop} dans les deux cas : sur ces deux cas, la confusion de \code{n} avec le slot homonyme ne change aucun diagnostic. Un faux négatif ou un faux positif demeure possible sur un autre programme, mais n'est pas démontré au \snapshotCommit{}.
+\end{piege}
+
+\subsection{Marqueurs : ancrer un hook sans valeur}
+
+Un \code{useEffect} ne produit aucune valeur suivie ; pourtant son site d'appel doit rester dans le CFG. La règle \regle{conditional-hook} demande si ce site domine toutes les sorties (\cref{def:dominance}), et la greffe d'un hook custom a besoin de retrouver le bloc où il était appelé. C'est le rôle de \code{HookMarker(l, v)} : dans le rendu du \cref{lst:ir-counter}, rien ne l'illustre, mais l'exemple de la \cref{sec:ir-analyses} en montre deux (\code{HookMarker(0, Undefined);}). La seconde composante dit ce que la \emph{liaison} lit :
+
+\rustsnippet[label={lst:ir-markerval}]{src/ir/expr.rs}{302}{331}{ce que lit une liaison de marqueur}
+
+\begin{decision}[la valeur d'un marqueur se décide au lowering]
+Le commentaire de tête donne l'argument : c'est au lowering qu'on sait encore si le hook est celui de React. Un hook de React sans résultat suivi renvoie vraiment \code{undefined} ; un hook custom non résolu renvoie quelque chose dont le moteur ne sait rien. Confondre les deux --- comme le faisait un unique \code{undefined} --- rendait le retour d'un hook opaque \emph{prouvablement stable}, et faisait taire toutes les règles gardées par la stabilité : un faux négatif. D'où quatre valeurs : \code{Undefined} seulement pour un \code{Effect}, \code{StableRef} pour un \code{Ref}, \code{Unknown} pour tout le reste, y compris \code{useContext} ou \code{useId} (\src{src/lowering/hook_extractor.rs}{766}{772}) ; \code{Summary} est posé plus tard par le moteur.
+\end{decision}
+
+Le moteur \emph{re-étiquette} (\og retag\fg{}) le marqueur d'un hook de bibliothèque connu : \code{retag_marker} (\src{src/engine/fixpoint.rs}{1247}{1275}) remplace \code{Unknown} par \code{Summary(...)} plutôt que de remplacer le marqueur par un \code{SummaryVal} nu. Le commentaire de \code{Summary} rappelle pourquoi : écraser le marqueur effaçait le label, donc le site d'appel dont toute vérification des règles des hooks a besoin --- un \code{useAtom()} conditionnel était invisible à \regle{conditional-hook}. Les résumés eux-mêmes (\code{SummaryValue}, \src{src/ir/expr.rs}{333}{382} : \code{Top}, \code{StableRef}, \code{UnstableRef}, \code{Wrapper}, \code{Shape}, \code{Held}, \code{Navigator}) vivent dans l'IR pour éviter une dépendance circulaire entre \file{ir} et \file{domains} ; leur sens abstrait est donné au \cref{chap:transfert-stores}.
+
+\subsection{Les tableaux de deps}
+\label{sec:ir-deps}
+
+\begin{react}[comment React compare les deps]
+Pour un effet, un memo ou un callback, React compare \emph{chaque élément} du tableau de deps avec \code{Object.is} entre deux rendus. Sans tableau, l'effet s'exécute après chaque rendu. Un spread \code{[...rows]} fait comparer \code{rows[0]}, \code{rows[1]}, \ldots, jamais \code{rows} lui-même.
+\end{react}
+
+Trois situations sont donc à distinguer, et l'exemple suivant les réunit.
+
+\begin{lstlisting}[language=TypeScript,caption={Quatre formes de deps (\file{/tmp/ch06/exo.tsx})},label={lst:ir-exo-deps}]
+export function Exo({ a, b, deps }: { a: number; b: number[]; deps: any[] }) {
+  useEffect(() => { console.log(a); }, [a, , ...b]);
+  useEffect(() => { console.log(a); }, deps);
+  useEffect(() => { console.log(a); });
+  useEffect(() => { console.log(a); }, [a] as const);
+  return null;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  hook: Effect #0 deps=List[a, b] arity=AtLeast(2) spread_at=[1] @fFileId(0):4:2
+  hook: Effect #1 deps=Opaque @fFileId(0):5:2
+  hook: Effect #2 deps=Absent @fFileId(0):6:2
+  hook: Effect #3 deps=List[a] arity=Exact(1) spread_at=[] @fFileId(0):7:2
+\end{sortie}
+
+\rustsnippet[label={lst:ir-depsarg}]{src/ir/hooks.rs}{88}{107}{les trois états de l'argument deps}
+
+\begin{definition}{Argument deps}{ir-deps-arg}
+L'argument deps d'un hook est lu dans l'un de trois états : \code{Absent} (aucun argument : le hook se réexécute à chaque rendu, rien de ce qu'il capture ne peut être périmé) ; \code{Opaque} (un argument que l'IR ne sait pas lire, par exemple une variable : le hook \emph{est} gardé par une liste, mais le moteur n'en voit pas les éléments) ; \code{List(l)} (un littéral de tableau écrit, avec ce que le lowering a pu en garder).
+\end{definition}
+
+Le commentaire insiste : replier deux de ces états l'un sur l'autre \og a coûté des findings dans les deux sens\fg{}. Lire \code{Opaque} comme \code{Absent} fait sauter le hook par les règles de deps (FN) ; le lire comme une liste vide prétend qu'il ne déclare rien (FP massif). \code{from_expr} (\src{src/ir/hooks.rs}{109}{126}) pèle d'abord les annotations : \code{[a] as const} est un littéral de tableau (effet 3 ci-dessus). Et \code{is_declared} (\src{src/ir/hooks.rs}{145}{150}) répond vrai pour \code{Opaque} : l'appelant a écrit un tableau, dire le contraire afficherait \og cet effet se réexécute après chaque rendu\fg{} sur un hook gardé.
+
+\rustsnippet[label={lst:ir-depslist}]{src/ir/hooks.rs}{160}{178}{un tableau de deps écrit}
+
+\code{elems} contient les éléments visibles : une élision n'en fournit aucun, un spread fournit sa \emph{source} comme un seul élément. \code{arity} dit combien d'entrées le tableau source contient vraiment :
+
+\rustsnippet{src/ir/hooks.rs}{44}{58}{l'arité d'un tableau écrit}
+
+Dans l'effet 0, \code{[a, , ...b]} a trois composantes : \code{a} compte pour un, l'élision pour un (la longueur reste \emph{comptable}), le spread pour \og au moins zéro\fg{}. D'où \code{elems = [a, b]}, \code{AtLeast(2)} et \code{spread_at = [1]}.
+
+\paragraph{\code{Arity} est un petit treillis.} Ordonnons les arités par inclusion de leurs concrétisations : $\gam(\code{Exact}(n)) = {n}$ et $\gam(\code{AtLeast}(n)) = {m \mid m \geq n}$. Alors $\code{Exact}(n) \lleq \code{AtLeast}(m)$ ssi $m \leq n$, et $\code{AtLeast}(n) \lleq \code{AtLeast}(m)$ ssi $m \leq n$ ; \code{AtLeast(0)} est le top (\cref{fig:ir-arity}). La méthode \code{may_be} (\src{src/ir/hooks.rs}{76}{85}) est exactement le test d'appartenance $n \in \gam(a)$, et \code{at_least} le minorant garanti, qui permet encore à une liste ouverte de \emph{réfuter} une affirmation d'arité. Le code ne définit ni join ni meet : l'arité est un fait syntaxique d'un site, jamais fusionné. Si l'on en voulait un, $\code{Exact}(a) \join \code{Exact}(b) = \code{AtLeast}(\min(a,b))$ pour $a \neq b$.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[treillis,x=21mm,y=11mm]
+  \node (a0) at (0,3) {\code{AtLeast(0)} = $\Top$};
+  \node (e0) at (-1,2) {\code{Exact(0)}};
+  \node (a1) at (1,2) {\code{AtLeast(1)}};
+  \node (e1) at (0,1) {\code{Exact(1)}};
+  \node (a2) at (2,1) {\code{AtLeast(2)}};
+  \node (e2) at (1,0) {\code{Exact(2)}};
+  \node (a3) at (3,0) {\ldots};
+  \draw (a0) -- (e0); \draw (a0) -- (a1);
+  \draw (a1) -- (e1); \draw (a1) -- (a2);
+  \draw (a2) -- (e2); \draw (a2) -- (a3);
+\end{tikzpicture}
+\caption{Diagramme de Hasse de \code{Arity} ordonnée par concrétisation. Chaque \code{Exact(n)} est minimal ; la chaîne des \code{AtLeast} descend sans fin.}\label{fig:ir-arity}
+\end{figure}
+
+\paragraph{Lire pour tirer, lire pour taire.} Reste la question qui justifie \code{spread_at} :
+
+\rustsnippet[label={lst:ir-covering}]{src/ir/hooks.rs}{192}{215}{les entrées qui couvrent une lecture}
+
+\begin{invariant}{Lire pour tirer, lire pour taire}{ir-tirer-taire}
+Énumérer \code{elems} pour faire \emph{tirer} une règle est sound quelle que soit la troncature, car chaque élément sur-approxime ce qu'il représente. L'énumérer pour faire \emph{taire} une règle ne l'est pas : React compare \code{rows[0], rows[1], ...} et jamais \code{rows}, si bien que créditer \code{[...rows]} comme déclarant \code{rows} supprimerait une capture périmée que React lui-même rapporte. Une suppression passe donc toujours par \code{covering()}, qui retire les sources de spread et garde les éléments écrits à côté.
+\end{invariant}
+
+C'est ce que fait le moteur : l'épinglage des lectures (\cref{sec:ir-analyses}) est calculé sur \code{deps.covering()} (\srcline{src/engine/fixpoint.rs}{1435}), et \regle{missing-deps} déclare ses chemins à partir de la même couverture (\srcline{src/rules/impls/missing_deps.rs}{62}). Les passes IR vers IR (décalage, renommage, substitution) traversent les deps par \code{map_exprs}, qui réécrit chaque élément en conservant \code{arity} et \code{spread_at} (\src{src/ir/hooks.rs}{224}{245}) : ce que le source contenait ne change pas.
+
+\subsection{La provenance}
+
+\code{HookEntry} dit ce que le moteur \emph{modélise} (\code{useLayoutEffect} devient \code{Effect}). Une seconde table dit ce qui a été \emph{prouvé} de l'identité de chaque appel :
+
+\rustsnippet[label={lst:ir-provenance}]{src/ir/hooks.rs}{10}{42}{une ligne de provenance}
+
+Dans le compteur, la ligne unique dit : label 0, hook d'origine \code{useState}, de React, importé de \code{"react"}, écrit directement dans le composant. Trois remarques. La table survit à l'expansion des hooks custom : chaque ligne d'un hook greffé y est fusionnée, labels décalés et \code{inlined: true}, ce qui distingue un composant qui atteint \code{useLayoutEffect} par un wrapper d'un composant qui l'appelle directement (\adr{23}). La ligne du wrapper lui-même reste, alors que sa ligne \code{HookEntry} a été remplacée par le corps greffé : son label \emph{pend}, d'où le champ \code{span}, qui permet encore de la situer (\adr{27} §7). Enfin, les handlers n'ont pas de ligne de provenance (le compteur a deux hooks et une seule ligne).
+
+% ===========================================================================
+\section{Les unités de l'IR et les faits de module}
+\label{sec:ir-unites}
+
+Le lowering produit trois sortes d'unités, une par classe de fonction détectée (\cref{def:composant-hook-utilitaire}), plus des faits par fichier.
+
+\subsection{Composant, hook custom, utilitaire}
+
+\rustsnippet[label={lst:ir-componentir}]{src/ir/component.rs}{59}{83}{l'IR d'un composant}
+
+Le \cref{chap:frontend-detection} a montré comment ces champs sont remplis ; rappelons leur sens pour l'analyse.
+
+\begin{itemize}
+  \item \code{file} et \code{name} forment la clé \code{(file, name)} des registres (\adr{13}) et l'origine \code{CompOrigin} d'où l'on interne l'identité (\cref{sec:ir-identites}).
+  \item \code{param} est \emph{un seul} nom : celui du premier paramètre s'il est un identifiant, \code{"props"} si le composant n'en a pas (\src{src/lowering/mod.rs}{471}{474}), et un temporaire \code{__p0} s'il est déstructuré ; le rendu commence alors par \code{let __obj_N = __p0} suivi d'un \code{let} par propriété.
+  \item \code{render_cfg} est le corps, hooks remplacés par leurs valeurs ; \code{hooks} et \code{hook_provenance} sont les deux tables de la \cref{sec:ir-hooks}.
+  \item \code{dom_props} : les props typées comme interfaces DOM, que \regle{state-mutation} exempte (muter un \code{HTMLCanvasElement} n'est pas écrire dans des données de React).
+  \item \code{module_consts} : les \code{const} de module dont le \emph{genre} est syntaxiquement certain, partagées (\code{Arc}) par tous les composants du fichier.
+\end{itemize}
+
+Un hook custom et un utilitaire ont chacun leur unité :
+
+\rustsnippet{src/ir/hook_ir.rs}{9}{24}{l'IR d'un hook custom}
+
+\rustsnippet{src/ir/function_ir.rs}{15}{22}{l'IR d'un utilitaire}
+
+Les différences structurelles traduisent la règle des hooks. Un \code{HookIR} a plusieurs paramètres, une table de hooks et une provenance : ses hooks deviendront ceux de l'appelant. Un \code{FunctionIR} n'a ni l'une ni l'autre, parce qu'un utilitaire (une fonction dont le nom ne commence pas par \code{use}) n'appelle pas de hook. Un \code{ComponentIR} n'a qu'un paramètre, les props. Les deux premières unités servent de cibles à la greffe (\cref{chap:splice-inlining}) ; un composant enfant, lui, n'est jamais greffé : il est analysé avec des props abstraites (\adr{12}, \cref{chap:inter-composants}).
+
+\begin{piege}
+Le commentaire de tête de \file{function_ir.rs} cite \code{doOrNot(setX(...))} comme cible d'inlining. Au commit étudié, seules les instructions \code{let x = f(...)} et \code{f(...);} dont le callee est une variable sont inlinées (\src{src/engine/fixpoint.rs}{1698}{1718}) ; un appel en position d'expression ne l'est pas (\issue{52}).
+\end{piege}
+
+\subsection{Constantes de module et contextes}
+
+\begin{exemple}{Une constante de module est stable}{ir-module-const}
+Dans \code{const EMPTY = []; function List() { useEffect(..., [EMPTY]); }}, le tableau est créé une fois, au chargement du module : sa référence est la même à chaque rendu, et le dep ne change jamais. À l'inverse, \code{const X = f();} peut être n'importe quoi.
+\end{exemple}
+
+\rustsnippet[label={lst:ir-moduleconst}]{src/ir/component.rs}{12}{41}{ce que l'on sait d'un initialiseur de \code{const} de module}
+
+Le commentaire de tête pose le critère : seuls les initialiseurs dont le genre JavaScript est certain sont collectés, car le domaine produit exprime \og constant d'un rendu à l'autre\fg{} soit par une primitive exacte, soit par une référence \code{Stable} (\cref{chap:statevalue-stabilite}) ; une valeur opaque n'a pas d'encodage sound et reste absente de la table, donc $\Top$. Le moteur sème ces constantes dans l'environnement d'entrée : \code{Prim(p)} donne la valeur exacte, \code{Ref} et \code{Context(_)} une référence stable (\src{src/engine/fixpoint.rs}{152}{190}).
+
+Le variant \code{Context} porte l'identité de la cellule de contexte :
+
+\rustsnippet{src/ir/component.rs}{43}{57}{l'identité canonique d'un contexte}
+
+\og Aussi profonde que la chaîne de résolution, et pas plus\fg{} : un contexte ré-exporté par un troisième fichier n'est résolu que d'un niveau (\issue{49}), si bien que deux importeurs qui atteignent la même cellule par des profondeurs différentes obtiennent deux identifiants --- un appariement manqué, jamais un appariement faux. La relation qui apparie fournisseurs et consommateurs est au \cref{chap:relations}.
+
+\subsection{Les faits de module}
+
+\rustsnippet{src/ir/module.rs}{21}{36}{ce qu'un fichier déclare de lui-même}
+
+\code{directives} est le prologue du module (\code{"use client"}, \code{"use strict"}), et seulement le prologue ; \code{imports} les fichiers importés que le résolveur a pu associer à un vrai fichier, ré-exports compris (un barrel porte une frontière de directive exactement comme un import). La table \code{ModuleTable} (\src{src/ir/module.rs}{44}{126}) associe à chaque chemin abaissé ses faits ; elle est \og délibérément non interprétée\fg{} (\src{src/ir/module.rs}{11}{16}) : le sens de \code{"use client"} est donné par l'appelant, à travers un mécanisme unique, \code{reachable_from(seeds, boundary)}, la fermeture des imports arrêtée à tout module qui déclare la frontière.
+
+\begin{invariant}{Une table vide ne prouve rien}{ir-module-table-vide}
+\code{ModuleTable} est vide quand l'IR est construite à la main (tests unitaires). Toute requête répond alors \og inconnu\fg{}, et chaque appelant doit le lire comme \emph{absence de preuve}, jamais comme preuve du contraire. \code{any_declares(directive)} est la porte de toute règle dérivée d'une directive : un code qui n'écrit jamais \code{"use client"} n'est pas un code Server Components (\regle{server-component-hook}, \cref{chap:regles-rendu-rsc}).
+\end{invariant}
+
+% ===========================================================================
+\section{Les identités internées}
+\label{sec:ir-identites}
+
+\subsection{Le patron : un identifiant de 4 octets et une table}
+
+Deux entités de l'IR ont besoin d'une identité comparable, bon marché et indépendante de tout le reste : les fichiers et les composants. Le projet utilise pour les deux le même patron, l'\terme{internement} : un \emph{newtype} \code{Copy} de 4 octets, sans constructeur public, fabriqué uniquement par une table qui en garde l'inverse.
+
+\rustsnippet{src/ir/source_range.rs}{3}{16}{l'identité d'un fichier et sa table}
+
+\code{FileTable::intern} (\src{src/ir/source_range.rs}{18}{25}) renvoie l'identifiant existant ou en crée un nouveau ; c'est une recherche linéaire, sans importance à l'échelle d'un projet. \code{SourceMap::empty} utilise la valeur réservée \code{u32::MAX}, qui n'est jamais résolue. L'identité de fichier est née d'une limite d'\adr{11} (une position dans un CFG inliné depuis un autre fichier ne pouvait pas nommer ce fichier) et a été introduite par \adr{19}.
+
+\rustsnippet{src/ir/component_id.rs}{23}{29}{l'identité d'un composant}
+
+\rustsnippet{src/ir/component_id.rs}{55}{75}{la table d'internement des composants}
+
+La table est construite une fois par le registre des composants, qui interne chaque clé \code{(file, name)} \emph{en ordre de clé trié} : l'ordre des identifiants est donc reproductible. Elle voyage sur le résultat d'analyse, pour que règles et renderers résolvent contre la table même qui a indexé l'analyse. \code{ComponentId::SYNTHETIC} (\code{u32::MAX}) est l'identifiant partagé par les IR construites à la main, que \code{register} permet d'enregistrer sans le renuméroter.
+
+\subsection{Le nom affiché n'est pas une identité}
+
+\rustsnippet{src/ir/component_id.rs}{138}{154}{le nom à \emph{montrer}}
+
+\begin{exemple}{Un alias et un leurre homonyme}{ir-identite}
+Trois fichiers sous \file{/tmp/ch06/ident/} :
+\begin{lstlisting}[language=TypeScript]
+// App.tsx
+import { useState } from "react";
+import { Widget as Panel } from "./b/Widget";
+
+export function App() {
+  const [n, setN] = useState(0);
+  return <Panel onChange={setN} value={n} />;
+}
+// a/Widget.tsx
+export function Widget() {
+  return <div>clean</div>;
+}
+// b/Widget.tsx
+export function Widget({ onChange }) {
+  onChange(1);
+  return <div>buggy</div>;
+}
+\end{lstlisting}
+Le rendu de \code{App} contient \texttt{CompApp<Panel>(Obj\#0\{onChange: setN, value: n\}) origin=Some("b/Widget.tsx::Widget")} : le nom écrit (\code{Panel}) n'est pas le nom enregistré (\code{Widget}), et seule l'origine prouvée par l'import permet la résolution. Sans elle, \code{Widget} serait ambigu (deux fichiers le définissent). La commande \code{reactant check . --trace --show-clean} donne :
+\begin{sortie}
+  App  (1 hooks)  App.tsx  ✓
+  Widget@b/Widget.tsx  (0 hooks)  b/Widget.tsx
+    error  cross-setter-in-render  var:onChange  (line 2:2)  prop `onChange` (a state setter of parent `App`) called during render of `Widget@b/Widget.tsx`, which triggers a parent re-render on every render
+       → `onChange` is a state setter, so calling it writes state (line 2:2)
+
+⚠  1 error(s) across 3 file(s).
+\end{sortie}
+Le suffixe \code{@b/Widget.tsx} est frappé au rendu par \code{display_name}, parce que deux fichiers définissent \code{Widget}.
+\end{exemple}
+
+\begin{decision}[\adr{40} --- l'identité est un identifiant interné, le nom affiché est un rendu]
+\textbf{Contexte.} Un composant était nommé de trois façons : la clé \code{(PathBuf, Symbol)} du registre, le nom affiché (\code{Name} ou \code{Name@file}) et le \code{Symbol} nu de \code{CompApp}. Après \adr{38} §5, c'est le nom affiché qui indexait l'analyse (stores partagés, étiquettes \code{Versioned}, setters) ; or il dépend du \emph{contenu} du projet : ajouter un fichier sans rapport qui définit un second \code{Widget} renomme le premier et ré-indexe toutes ces tables. Deux défauts en découlaient, qui finissaient tous deux en \og ✓ no issues found\fg{} : un enfant JSX résolu par le premier nom en ordre de tri (un leurre \file{a/Widget.tsx} déplaçait le vrai \file{./b/Widget}), et des chemins orthographiés différemment par la découverte et par le résolveur.
+
+\textbf{Décision.} (1) \code{ComponentId} interné dans une \code{ComponentTable}, sur le modèle de \code{FileId} ; (2) le nom affiché est frappé au rendu et rien ne le compare ; (3) \code{CompApp} porte \code{origin} (fichier et nom exporté) ; (4) la résolution vit en un seul lieu, \code{resolve_child}, qui refuse de deviner (\code{Ambiguous}, avec un \code{analysis-limit}) ; (5) une seule orthographe de chemin.
+
+\textbf{Alternative refusée.} Analyser tous les candidats d'un nom ambigu : sound et plus précis, mais 1\,347 références ambiguës dans le corpus, et la forme même du blocage quadratique de \issue{86}.
+\end{decision}
+
+Trois tests de \file{component_id.rs} fixent ces propriétés :
+\begin{itemize}
+  \item \code{interning_is_idempotent_and_two_files_are_two_ids} ;
+  \item \code{the_display_suffix_appears_only_on_a_collision} ;
+  \item {\footnotesize\code{interning_a_namesake_changes_an_existing_display_name_but_not_its_id}} (\srcline{src/ir/component_id.rs}{227}), qui est \emph{la} raison pour laquelle aucune table n'est indexée par le nom affiché.
+\end{itemize}
+
+\begin{piege}
+\code{ComponentTable::register} ne refuse qu'un \emph{identifiant} déjà présent, pas une \emph{origine} déjà internée sous un autre identifiant (\src{src/ir/component_id.rs}{94}{101}). Enregistrer sous \code{SYNTHETIC} une origine déjà internée écraserait l'entrée inverse et compterait deux fois le nom, qui prendrait un suffixe \code{@file} sans homonyme réel. Aucun appelant ne le fait au commit étudié : les deux appels hors du module enregistrent un seul composant dans une table vide (\src{src/engine/program_result.rs}{91}{99}, \srcline{src/test_support.rs}{86}).
+\end{piege}
+
+% ===========================================================================
+\section{Les positions}
+\label{sec:ir-positions}
+
+\rustsnippet{src/ir/source_range.rs}{36}{42}{une position source}
+
+Malgré son nom, un \code{SourceRange} est un \emph{point}, pas un intervalle : \code{(file, line, col)}, ligne comptée à partir de 1, colonne à partir de 0. Le lowering le frappe à partir de l'offset de début d'un nœud oxc, par la table des débuts de ligne de la \code{SourceMap} du fichier (\cref{chap:frontend-detection}) :
+
+\rustsnippet{src/ir/source_range.rs}{94}{102}{d'un offset à une position}
+
+La recherche est un \code{partition_point} en $O(\log L)$ (et non un \code{binary_search} comme l'écrit \adr{11}). La colonne est une différence d'\emph{octets} UTF-8, puisque les offsets d'oxc sont des octets : sur une ligne qui contient des caractères non ASCII avant la position, la colonne affichée est en octets, pas en caractères. Vérifié sur \texttt{const s = "café"; const y = 2;} : \texttt{é} occupant deux octets, la sonde situe \code{y} en colonne 27, quand un compte par caractères en donnerait 26.
+\code{SourceRange} n'implémente pas \code{Ord} ; l'ordre dans un fichier passe par \code{pos_key}.
+
+Où l'IR porte-t-elle des positions ? Sur chaque \code{Stmt}, chaque \code{HookEntry}, chaque \code{Branch}, sur \code{CompApp} et \code{NativeElem} (la balise ouvrante) et sur les props événementielles (\code{prop_spans}). Pas sur \code{Return}. Une position n'est jamais une identité : c'est ce qu'un diagnostic affiche et ce qui le regroupe.
+
+\begin{decision}[\adr{11}, \adr{19}, \adr{39} --- trois étapes vers \og tout finding a une position\fg{}]
+\textbf{\adr{11}} introduit \code{SourceRange { line, col }}, une position optionnelle sur chaque \code{Stmt} et chaque \code{HookEntry} (\code{Option} pour les IR construites à la main) et les notes de diagnostic. \textbf{\adr{19}} §1 ajoute le \code{FileId} : les positions d'un corps greffé gardent le fichier où elles ont été abaissées, ce qui permet de nommer le fichier d'origine d'un finding \og avec zéro logique dans la greffe\fg{} (\adr{24}). \textbf{\adr{39}} traite le résidu : 82 findings sur 7\,146 n'avaient aucune position. Règle : \emph{une liaison synthétique est synthétique, sa position ne l'est pas}. Tout temporaire (hoist d'un \code{await}, bras de ternaire, opérande de \code{||}, défaut de déstructuration) prend la position de l'expression qu'il lie ; ce que le source ne peut nommer, la greffe le nomme par le site d'appel ; un corps sans instruction propre hérite de la position par laquelle on y est entré, en repli et jamais en écrasement ; un finding sans position prend la première position de sa chaîne de témoins, une fois pour toutes les règles. Résultat mesuré : zéro finding sans position, ensemble des findings inchangé.
+
+\textbf{Alternative refusée.} Donner une position à \code{Terminator::Return} : \og mieux d'une ligne, au prix d'une centaine de sites de construction\fg{} ; laissé ouvert (\issue{140}).
+\end{decision}
+
+Le compteur illustre le troisième point : le corps concis du handler, \code{() => setCount(count + 1)}, est un \code{Return} seul, sans instruction ni position ; un diagnostic sur ce setter hérite de la position de la prop \code{onClick} (\code{8:17}), par laquelle le parcours est entré.
+
+% ===========================================================================
+\section{Analyses syntaxiques sur l'IR}
+\label{sec:ir-analyses}
+
+Plusieurs règles et plusieurs parties du moteur posent à l'IR des questions purement syntaxiques : quelles variables ce corps capture-t-il ? Quels membres lit-il ? Ce tableau de deps couvre-t-il ces lectures ? Ce nom désigne-t-il à coup sûr cette fonction ? Les réponses vivent dans \file{free_vars.rs} et \file{bindings.rs}. Un exemple d'abord.
+
+\begin{lstlisting}[language=TypeScript,caption={Deps, chemins et alias (\file{/tmp/ch06/deps.tsx})},label={lst:ir-deps}]
+import { useEffect, useMemo, useCallback } from "react";
+
+export function Search({ opts, rows, deps }: { opts: any; rows: any[]; deps: any[] }) {
+  const cfg = opts.config;
+  useEffect(() => {
+    console.log(cfg.theme.color, opts.page[rows.length].id);
+  }, [opts.config.theme]);
+  const total = useMemo(() => rows.length, [...rows]);
+  const onPick = useCallback((opts: any) => opts.id, deps);
+  useEffect(() => {
+    document.title = String(total);
+  });
+  return <div onClick={onPick}>{total}</div>;
+}
+\end{lstlisting}
+
+Le rendu abaissé (extrait de la sonde) montre le préambule de paramètres, les liaisons de hooks et les deux marqueurs d'effet :
+\begin{sortie}
+    B0:
+      let __obj_81 = __p0   @-
+      let opts = __obj_81.opts   @fFileId(0):3:25
+      let rows = __obj_81.rows   @fFileId(0):3:31
+      let deps = __obj_81.deps   @fFileId(0):3:37
+      let cfg = opts.config   @fFileId(0):4:8
+      HookMarker(0, Undefined);   @fFileId(0):5:2
+      let total = MemoVal(1)   @fFileId(0):8:8
+      let onPick = CallbackVal(2)   @fFileId(0):9:8
+      HookMarker(3, Undefined);   @fFileId(0):10:2
+      -> return Native<div>(Obj#6{onClick: onPick}; [total]) prop_spans=["onClick@fFileId(0):13:14"] @fFileId(0):13:9
+  hook: Effect #0 deps=List[opts.config.theme] arity=Exact(1) spread_at=[] @fFileId(0):5:2
+  hook: Memo #1 deps=List[rows] arity=AtLeast(0) spread_at=[0] @fFileId(0):8:8
+  hook: Callback #2 params=["opts"] deps=Opaque @fFileId(0):9:8
+  hook: Effect #3 deps=Absent @fFileId(0):10:2
+  hook: Handler #4 event=click @fFileId(0):13:14
+\end{sortie}
+
+et l'analyseur rapporte :
+\begin{sortie}
+  Search  (5 hooks)  deps.tsx
+    warn   missing-deps  [hook:0]  var:cfg  (line 5:2)  `cfg` is used in this effect but not in its deps array, and its value may change between renders
+    warn   missing-deps  [hook:0]  var:opts  (line 5:2)  `opts.page` is used in this effect but not in its deps array, and its value may change between renders
+    warn   missing-deps  [hook:0]  var:rows  (line 5:2)  `rows` is used in this effect but not in its deps array, and its value may change between renders
+    warn   missing-deps  [hook:1]  var:rows  (line 8:8)  `rows` is used in this memo but not in its deps array, and its value may change between renders
+\end{sortie}
+(les lignes \og 1 trace step(s)\fg{} sont omises). Chacun de ces quatre \Warning{} s'explique par une fonction de cette section.
+
+\subsection{Variables libres}
+
+\begin{definition}{Variable libre d'un corps}{ir-variable-libre}
+Les \terme{variables libres} d'un CFG $C$ sont les variables lues quelque part dans $C$ moins celles qui y sont définies (cible d'un \code{Let} ou d'un \code{Assign}) : $\mathit{libres}(C) = \bigl(\bigcup_{e \in C} \mathit{lues}(e)\bigr) \setminus \mathit{définies}(C)$, avec $\mathit{lues}(\code{FnLit}(ps, C')) = \mathit{libres}(C') \setminus ps$.
+\end{definition}
+
+\rustsnippet{src/ir/free_vars.rs}{91}{107}{les variables libres d'un corps}
+
+Le calcul est \emph{insensible au flot} : toute la liste des lues, moins toute la liste des définies. Il visite les terminateurs (par \code{for_each_expr}) et les orphelins, ce qui sur-approxime les lectures --- le bon côté pour des captures. \code{collect_used_vars} (\src{src/ir/free_vars.rs}{403}{423}) traite deux bras : \code{Var} et \code{FnLit}, dont les paramètres masquent les liaisons extérieures (\code{(open) => !open} ne lit aucun \code{open} extérieur) ; tout le reste est délégué à \code{for_each_child}. Un \code{Assign} à une variable extérieure la rend \og définie\fg{} : on ne \emph{lit} pas \code{x} en l'écrivant. Ces variables libres alimentent les \code{HandlerInfo} du moteur et la capture d'une closure dans le tas (\srcline{src/domains/stores/heap.rs}{57}).
+
+\subsection{Chemins d'accès}
+
+La granularité de la variable ne suffit pas à \regle{missing-deps} : avec \code{[x.b]} en deps, un corps qui lit \code{x.a} a bien une dépendance manquante, un corps qui lit \code{x.b} non.
+
+\rustsnippet[label={lst:ir-accesspath}]{src/ir/free_vars.rs}{6}{23}{un chemin d'accès}
+
+Le calcul des chemins libres, \code{compute_free_paths}, suit la même structure que celui des variables, avec deux raffinements. D'abord, une chaîne de membres est lue \emph{entière} par \code{extract_path} :
+
+\rustsnippet{src/ir/free_vars.rs}{280}{311}{extraire la chaîne maximale enracinée à une variable}
+
+Un index dynamique arrête la chaîne. Ce qui est \emph{au-dessus} reste nommé : l'accès \code{opts.page[rows.length].id} lit le chemin \code{opts.page}, par où la lecture passe. Ce qui est dessous est perdu, et l'expression d'index est lue à part, d'où le chemin \code{rows.length}. Le commentaire de tête (\og collapsed to the bare root\fg{}) est antérieur à ce comportement : depuis \issue{89}, le préfixe au-dessus de l'index est conservé.
+
+Ensuite, les \terme{alias locaux} sont résolus. Un nom lié exactement une fois dans le corps, par un \code{Let}, à une chaîne de membres sans index (\code{const c = x.a}) est un renommage, pas une lecture : son \code{let} est ignoré (par \code{for_each_expr_where}), et les chemins enracinés à \code{c} sont réécrits vers \code{x.a} (\src{src/ir/free_vars.rs}{158}{207}). La réécriture est \emph{intra-corps} : dans l'exemple, \code{cfg} est un alias défini dans le rendu, et le corps de l'effet ne le voit pas ; la lecture \code{cfg.theme.color} reste enracinée à \code{cfg}, alors que \code{opts.config.theme} est déclaré. C'est le premier \Warning{} : un faux positif (FP) toléré, documenté dans les limites connues.
+
+\subsection{Couverture et épinglage}
+
+\rustsnippet[label={lst:ir-coverage}]{src/ir/free_vars.rs}{253}{278}{les chemins déclarés et la couverture par préfixe}
+
+\begin{definition}{Couverture par préfixe}{ir-couverture}
+Un chemin lu $u$ est \terme{couvert} par un ensemble de chemins déclarés $D$ s'il existe $d \in D$ de même racine dont la suite de segments est un préfixe de celle de $u$. \code{[x]} couvre \code{x.a} ; \code{[x.a]} couvre \code{x.a} et \code{x.a.b} ; \code{[x.b]} ne couvre ni \code{x.a} ni \code{x}.
+\end{definition}
+
+Côté usage, un index garde le préfixe au-dessus de lui ; côté déclaration, un dep indexé (\code{[x[i]]}) ne déclare \emph{rien}, car on ne sait pas quel élément il épingle. Les deux choix penchent vers le faux positif. Avec l'\cref{inv:ir-tirer-taire}, cela explique les trois derniers \Warning{} de l'exemple : \code{opts.page} et \code{rows.length} ne sont pas couverts par \code{opts.config.theme} ; et pour le memo, \code{[...rows]} a une couverture vide, donc \code{rows} n'est pas déclaré. Le callback 2 (deps \code{Opaque}) ne produit rien ; ses lectures de \code{opts} sont celles de son propre paramètre, retiré des chemins libres (\src{src/engine/fixpoint.rs}{1476}{1479}). L'effet 3 (deps \code{Absent}) non plus : il ne peut rien capturer de périmé.
+
+Dernier raffinement : l'\terme{épinglage}. Dans \code{useCallback(() => ... searchParams.get("sort") ..., [searchParams.get("sort")])}, le corps lit \code{searchParams}, mais seulement à l'intérieur d'une sous-expression qui apparaît \emph{verbatim} dans les deps. React compare la valeur de cette sous-expression, le hook est recréé dès qu'elle change : la lecture ne peut pas être périmée. \code{free_paths_and_pinned} (\src{src/ir/free_vars.rs}{120}{156}) renvoie les chemins libres et ceux qui sont ainsi épinglés, par égalité de \emph{clés canoniques} (\src{src/ir/free_vars.rs}{374}{401}). \og Verbatim est toute la revendication\fg{} : \code{[JSON.stringify(o)]} n'épingle pas \code{o}, car une sérialisation perd de l'information. \regle{missing-deps} combine les deux faits : une lecture est acceptée si elle est couverte ou épinglée (\srcline{src/rules/impls/missing_deps.rs}{75}).
+
+\subsection{Certificats de liaison}
+
+La dernière question est plus forte : ce nom désigne-t-il \emph{à coup sûr} cette valeur ? Résoudre \code{useStore(sel)} vers le corps de \code{const sel = s => ...} n'est sound que si \code{sel} ne peut pas signifier autre chose au moment de l'appel. \file{bindings.rs} répond à trois forces croissantes, toutes \emph{fail closed} : un nom non prouvé n'est pas \og pas une fonction\fg{}, c'est un nom dont on refuse de fixer le sens, et l'appelant répond $\Top$ (\src{src/ir/bindings.rs}{1}{19}).
+
+\rustsnippet{src/ir/bindings.rs}{128}{149}{l'unique membre droit d'un nom}
+
+Le premier niveau, \code{binding_of} (\src{src/ir/bindings.rs}{105}{126}), part de cette liaison unique et la suit à travers les renommages (\code{{ bump }} range le membre comme \code{Var("bump")}), au plus huit sauts. Si un nom intermédiaire n'a pas de liaison unique, la poursuite s'arrête sur ce nom, \og qu'aucun appelant ne prend pour une valeur\fg{}. \code{closure_binding_of} ajoute les membres d'un \code{ObjectLit} (un hook custom qui renvoie \code{{ clearFieldError }} livre la même closure qu'un \code{const clearFieldError = useCallback(...)}) et répond dans l'une des deux orthographes d'une fonction :
+
+\rustsnippet{src/ir/bindings.rs}{49}{56}{les deux orthographes d'une liaison fonctionnelle}
+
+Le certificat renforcé, enfin, exige en plus qu'aucun corps imbriqué ne re-lie le nom :
+
+\rustsnippet{src/ir/bindings.rs}{151}{179}{le certificat qui autorise à exécuter un corps}
+
+Le paramètre \code{also} est indispensable pour une raison propre à l'IR : l'extraction des hooks a \emph{sorti} les corps d'effet, de memo et de callback du rendu (\cref{sec:ir-hooks}). Un \code{useEffect(() => { sel = other })} serait invisible à une descente du seul rendu, et le certificat certifierait un corps que l'appel ne reçoit pas.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}p{3.8cm}p{5.2cm}p{4cm}@{}}
+\toprule
+Lecture & Force & Consommateur principal \\
+\midrule
+\code{local_bindings} & tous les membres droits de chaque nom, sans unicité & gardes, seeds, churn \\
+\code{binding_of}, \code{closure_binding_of}, \code{fn_binding_in} & liaison unique dans \emph{ce} corps, renommages et membres suivis & \regle{missing-deps}, \regle{stale-closure}, gardes \\
+\code{certified_fn_binding} & idem, et jamais re-liée dans un corps imbriqué ni dans un corps de hook sorti & arguments \code{FnLit} des hooks custom (\srcline{src/engine/fixpoint.rs}{261}) \\
+\bottomrule
+\end{tabular}
+\caption{Les trois lectures de liaison de \file{bindings.rs}.}\label{tab:ir-bindings}
+\end{table}
+
+\begin{piege}
+\code{sole_binding_in} compte les \code{Assign} comme des liaisons : \code{let x = ...; x = ...;} n'a pas de liaison unique, et la réponse est \code{None}. C'est voulu (fail closed), mais un lecteur qui attend \og la valeur de \code{x}\fg{} après une réaffectation n'obtiendra rien.
+\end{piege}
+
+% ===========================================================================
+\section{Où l'IR choisit le côté sûr}
+\label{sec:ir-limites}
+
+Récapitulons. Presque chaque choix de ce chapitre tranche entre précision et soundness (\cref{def:soundness}), et presque toujours du même côté : \cref{tab:ir-cote-sur} les rassemble.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}p{4.2cm}p{5.6cm}p{3.2cm}@{}}
+\toprule
+Lieu & Choix & Erreur résiduelle \\
+\midrule
+\code{DepsList::covering} & un spread ne couvre rien & FP \\
+\code{DepsArg::Opaque} & gardé mais illisible & ni FN ni FP massif \\
+\code{MarkerVal::Unknown} & hook opaque $= \Top$, pas \code{undefined} & FP \\
+\code{ModuleConstInit} & genres certains seulement & FP ($\Top$) \\
+\code{object_member} après spread & ne répond rien & FP \\
+\code{dep_paths} avec index & ne déclare rien & FP \\
+\code{extract_path} (usage) & garde le préfixe au-dessus de l'index & FP limité \\
+alias locaux & intra-corps seulement & FP \\
+\code{certified_fn_binding} & refuse au moindre re-binding & précision perdue, $\Top$ \\
+chute en fin de corps & \code{Return(undefined)} (\adr{25}) & évite un FN \\
+\code{hook_body_cfg} & un argument non littéral est invoqué & évite un FN \\
+\code{CompApp.origin}, \code{resolve_child} & \code{Ambiguous} plutôt que deviner & limite signalée \\
+\code{ModuleTable} vide & \og pas de preuve\fg{} & aucune confusion \\
+\code{TSAnnotated} & le type n'est jamais lu & évite un FN \\
+\bottomrule
+\end{tabular}
+\caption{Précision contre soundness dans l'IR.}\label{tab:ir-cote-sur}
+\end{table}
+
+Il reste des limites connues, qui ne relèvent pas toutes de ce chapitre mais que l'IR rend visibles :
+\begin{itemize}
+  \item \issue{140} : \code{Terminator::Return} sans position ; un hook atteint seulement par un \code{return} donne un finding sans ligne.
+  \item \issue{49} : les ré-exports ne sont résolus qu'à un niveau, ce qui touche \code{ContextId} et \code{CompOrigin}.
+  \item \issue{63} (\emph{wontfix}) : un composant dynamique (\code{const C = cond ? A : B; <C/>}) donne un \code{CompApp} sans origine, que rien ne résout. L'issue et \adr{12} disent qu'aucun \code{CompApp} n'est produit ; le dossier source observe qu'il en est produit un, non résolu.
+  \item \issue{28} : \code{useContext} est un \code{Custom} non modélisé.
+  \item Le champ \code{HookEntry::Custom.binding} est mort ; la ligne de provenance d'un wrapper greffé a un label pendant ; les handlers n'ont ni paramètres ni ligne de provenance.
+\end{itemize}
+
+Les défauts qui naissent de la greffe (collision de sites entre fichiers, un hook custom appelé deux fois n'est greffé qu'une fois, expression de \code{return} perdue pour un appel sans liaison) sont exposés au \cref{chap:splice-inlining}.
+
+\begin{resume}
+L'IR de \reactant{} est un ensemble de types possédés, sans AST, que lisent le moteur, les relations et les règles (\adr{3}). Un corps est un \code{CFG} : une \code{BTreeMap} de \code{BasicBlock} (instructions \code{Let}, \code{Assign}, \code{MemberWrite}, \code{ExprStmt}, puis un \code{Terminator} \code{Jump}, \code{Branch}, \code{Return} ou \code{Unreachable}) et une liste d'arêtes typées (\code{Unconditional}, \code{IfTrue}, \code{IfFalse}, \code{Back}, \code{Await}) qui fait foi pour la navigation. Un composant est un \code{render_cfg} plus une table de hooks dont chaque effet a son CFG (\adr{4}).
+
+\code{Expr} se lit par familles ; les nœuds allouants portent un \code{ExprId}, le \emph{site} qui indexe le tas abstrait (\adr{10}) ; \code{for_each_child} est l'énumération canonique sans bras par défaut. Un appel de hook devient une ligne \code{HookEntry} indexée par son rang (le label, qui nomme le \emph{slot}), une valeur dans le rendu (\code{StateVal}, \code{MemoVal}\ldots{} ou \code{HookMarker} avec un \code{MarkerVal}) et une ligne de provenance. Les deps sont \code{Absent}, \code{Opaque} ou \code{List} ; une liste garde son arité et ses spreads, et seule sa couverture peut faire taire une règle.
+
+Les unités sont \code{ComponentIR}, \code{HookIR}, \code{FunctionIR} ; les faits de module (\code{ModuleConstInit}, \code{ContextId}, \code{ModuleFacts}) ne disent que ce qui est certain, et une absence n'est jamais une preuve. Fichiers et composants ont une identité internée de 4 octets (\code{FileId}, \code{ComponentId}) ; le nom affiché est un rendu (\adr{40}). Les positions sont des points \code{(file, line, col)} ; toute liaison synthétique prend la position de ce qu'elle lie (\adr{39}). Enfin \file{free_vars.rs} et \file{bindings.rs} répondent aux questions syntaxiques : variables et chemins libres, couverture par préfixe, épinglage, certificats de liaison.
+
+\textbf{Fichiers rencontrés} (sous \file{src/ir/}) : \file{types.rs}, \file{cfg.rs}, \file{stmt.rs}, \file{expr.rs}, \file{hooks.rs}, \file{component.rs}, \file{hook_ir.rs}, \file{function_ir.rs}, \file{component_id.rs}, \file{module.rs}, \file{source_range.rs}, \file{free_vars.rs}, \file{bindings.rs}.
+
+\textbf{Suite :} le \cref{chap:lowering-cfg} montre comment le lowering construit ces structures à partir de l'AST, forme syntaxique par forme syntaxique ; le \cref{chap:splice-inlining} montre comment le moteur les réécrit pour greffer hooks custom et utilitaires.
+\end{resume}
+
+\section*{Exercices}
+\addcontentsline{toc}{section}{Exercices}
+
+\begin{exercice}{Prédire \code{DepsArg}}{ir-predire-deps}
+Pour chacun des appels suivants, donner le \code{DepsArg} produit (état, \code{elems}, \code{arity}, \code{spread_at}), puis la couverture \code{covering()} : (a) \code{useEffect(f, [a, , ...b])} ; (b) \code{useEffect(f, deps)} ; (c) \code{useEffect(f)} ; (d) \code{useEffect(f, [a] as const)} ; (e) \code{useMemo(g, [...xs, y])}.
+\end{exercice}
+\begin{solution}
+Les quatre premiers cas sont ceux du \cref{lst:ir-exo-deps}, observés : (a) \code{List}, \code{elems = [a, b]}, \code{AtLeast(2)}, \code{spread_at = [1]}, couverture \code{[a]} ; (b) \code{Opaque}, couverture vide mais \code{is_declared()} vrai ; (c) \code{Absent} ; (d) \code{List}, \code{[a]}, \code{Exact(1)} (l'annotation est pelée). Pour (e), par la même règle de comptage (et la sonde le confirme sur \file{/tmp/ch06/e.tsx}) : \code{elems = [xs, y]}, \code{AtLeast(1)}, \code{spread_at = [0]}, couverture \code{[y]}.
+\end{solution}
+
+\begin{exercice}{Dessiner un CFG}{ir-dessiner-cfg}
+Dessiner le CFG du rendu suivant, en nommant la nature de chaque arête, puis le comparer à la sortie de la sonde donnée en solution.
+\begin{lstlisting}[language=TypeScript]
+export function List({ items, ok }: { items: number[]; ok: boolean }) {
+  const [x, setX] = useState(0);
+  let total = 0;
+  for (let i = 0; i < items.length; i++) {
+    if (items[i] < 0) break;
+    total = total + items[i];
+  }
+  ok && setX(1);
+  return <p>{total}</p>;
+}
+\end{lstlisting}
+\end{exercice}
+\begin{solution}
+La sonde (\file{/tmp/ch06/loop.tsx}) imprime, préambule de paramètres omis :
+\begin{sortie}
+    B0: ... let total = 0; let i = 0;  -> jump B1
+    B1: -> branch (i Lt items.length) ? B2 : B4
+    B2: -> branch (items[i] Lt 0) ? B5 : B6
+    B3: i := (i Add 1); i;  -> jump B1
+    B4: let __t0 = ok;  -> branch __t0 ? B8 : B9
+    B5: -> jump B4
+    B6: -> jump B7
+    B7: total := (total Add items[i]); total;  -> jump B3
+    B8: __t0 := setX(1);  -> jump B9
+    B9: __t0;  -> return Native<p>(...)
+    edges: B0->B1:Unconditional B1->B2:IfTrue B1->B4:IfFalse B2->B5:IfTrue B2->B6:IfFalse
+           B5->B4:Unconditional B6->B7:Unconditional B7->B3:Unconditional B3->B1:Back
+           B4->B8:IfTrue B4->B9:IfTrue B8->B9:Unconditional
+\end{sortie}
+L'incrément \code{B3} ferme la boucle par l'unique arête \code{Back}, vers l'en-tête \code{B1} ; le \code{break} (\code{B5}) saute vers la sortie de boucle \code{B4}. Les deux arêtes du diamant \code{&&} sont étiquetées \code{IfTrue} : voir le piège de la \cref{sec:ir-cfg}. L'ordre des identifiants n'est pas l'ordre d'exécution (\code{B3} est exécuté après \code{B7}).
+\end{solution}
+
+\begin{exercice}{Ajouter un variant à \code{Expr}}{ir-nouveau-variant}
+On ajoute un variant \code{Expr::Await(Box<Expr>)}. (a) Que faut-il écrire dans \code{for_each_child} ? (b) Pourquoi un parcoureur qui écrirait \texttt{\_ => \{\}} au lieu de déléguer serait-il un faux négatif en attente ? (c) Citer deux autres \code{match} de ce chapitre qui profitent de la même discipline.
+\end{exercice}
+\begin{solution}
+(a) Un bras \code{Expr::Await(inner) => f(inner)} : le compilateur l'exige, faute de bras par défaut. (b) Parce que le parcoureur traiterait l'expression attendue comme \og sans enfants\fg{} : un setter appelé dans \code{await setX(...)} deviendrait invisible, par exemple aux variables libres. (c) \code{HookEntry::body_cfg}, \code{HookEntry::label}/\code{span}, et \code{lower_binop} côté lowering.
+\end{solution}
+
+\begin{exercice}{Chemins libres, déclarés, couverts}{ir-chemins}
+Pour \code{useEffect(() => { f(x.a[i].b); }, [x.a.b])}, où \code{x}, \code{i} et \code{f} sont des props, donner les chemins libres du corps, les chemins déclarés, et les lectures non couvertes. Quels deps faut-il écrire pour faire taire \regle{missing-deps} ?
+\end{exercice}
+\begin{solution}
+Chemins libres : \code{f}, \code{x.a} (le préfixe au-dessus de l'index), \code{i}. Chemin déclaré : \code{x.a.b}, qui n'est préfixe d'aucun d'eux. Les trois lectures sont non couvertes ; l'analyseur (\file{/tmp/ch06/paths.tsx}) rapporte trois \Warning{} \regle{missing-deps}, dont \og \code{x.a} is used in this effect but not in its deps array\fg{}. Avec \code{[x.a, i, f]}, il ne rapporte plus rien.
+\end{solution}
+
+\begin{exercice}{Pourquoi ne jamais indexer par le nom affiché}{ir-nom-affiche}
+Un projet contient un seul composant \code{Widget}, dans \file{a/Widget.tsx}. On ajoute \file{b/Widget.tsx}, qui définit un autre \code{Widget} sans rapport. (a) Que devient \code{display_name} du premier ? son \code{ComponentId} ? (b) Qu'arriverait-il à un store partagé indexé par le nom affiché ? (c) Quel test de \file{component_id.rs} fixe ce comportement ?
+\end{exercice}
+\begin{solution}
+(a) Le nom affiché passe de \code{Widget} à \code{Widget@a/Widget.tsx} ; l'identifiant ne change pas. (b) Toutes ses clés changeraient à cause d'une modification lointaine et sans rapport : c'est exactement le défaut qu'\adr{40} corrige. (c) \code{interning_a_namesake_changes_an_existing_display_name_but_not_its_id}.
+\end{solution}
+
+\begin{exercice}{Tirer ou taire}{ir-tirer-taire}
+Expliquer, en un paragraphe, pourquoi \regle{missing-deps} peut énumérer \code{elems} pour \emph{signaler} une lecture, mais doit passer par \code{covering()} pour la \emph{déclarer}. Construire un effet où confondre les deux ferait un faux négatif.
+\end{exercice}
+\begin{solution}
+Signaler est une affirmation \og peut-être\fg{} : chaque élément sur-approxime ce qu'il représente, et une énumération trop large ne crée au pire qu'un faux positif. Déclarer fait taire la règle : il faut que React compare vraiment la valeur lue. Avec \code{useEffect(() => { ref.current = rows; }, [...rows])}, React compare \code{rows[0], rows[1], ...} et jamais l'identité de \code{rows} ; si \code{rows} est remplacé par un nouveau tableau aux mêmes éléments, l'effet ne se réexécute pas et \code{ref.current} garde l'ancien tableau. Créditer \code{rows} comme déclaré tairait ce défaut : un faux négatif. C'est le memo du \cref{lst:ir-deps}, signalé à bon droit.
+\end{solution}

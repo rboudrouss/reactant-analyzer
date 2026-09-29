@@ -1,0 +1,1868 @@
+% ---------------------------------------------------------------------------
+% Chapitre 09 — Les treillis simples : plats, ensembles bornés, intervalles
+% Sources : notes/04-domains-lattices.md (§1–§3.5, §4.2–§4.4, §6.1–§6.3, §6.7,
+% §8), src/domains/mod.rs, src/domains/impls/{mod,bool_val,setter_val,
+% str_const,interval}.rs, src/domains/transfer/state_value.rs (eval_binop,
+% eval_bitwise), src/engine/cfg_analyzer.rs (narrow_env_for_branch),
+% src/engine/fixpoint.rs (seuils, boucle externe), ADR-002, ADR-014, ADR-020,
+% commit 548f922.
+% Sorties observées au commit e67b10a avec target/debug/reactant sur les
+% fichiers /tmp/ch09/*.tsx.
+% ---------------------------------------------------------------------------
+\chapter{Les treillis simples : plats, ensembles bornés, intervalles}
+\label{chap:treillis-simples}
+
+\begin{objectifs}
+  \item Lire le trait \code{AbstractDomain} comme un contrat : ce que chaque méthode doit garantir pour que l'analyse reste sound.
+  \item Connaître les trois familles de treillis \og simples\fg{} du code : les treillis plats (\code{BoolVal}, \code{SetterVal}), l'ensemble borné de chaînes (\code{StrConst}), les intervalles (\code{Interval}).
+  \item Savoir calculer à la main toutes les opérations des intervalles : ordre, join, arithmétique (\texttt{+ - * \% **}), opérateurs bit à bit, widening simple et à seuils, raffinement sur gardes.
+  \item Savoir prouver en quelques lignes la soundness de chacune de ces opérations, et reconnaître les endroits où le code s'en écarte.
+  \item Connaître les limites observées : $\code{NaN}$ et $\pm\infty$, $0 \times \pm\infty$, décalages sur des non-entiers, cycles finis.
+\end{objectifs}
+
+\prerequis{\cref{chap:interpretation-abstraite} (treillis, concrétisation, widening, soundness : \cref{def:treillis}, \cref{def:concretisation}, \cref{def:widening}, \cref{def:soundness}) ; \cref{chap:ir} pour les expressions \code{Expr}, \code{BinOp}, \code{Prim} ; \cref{chap:lowering-cfg} pour la forme des conditions de branche.}
+
+Le \cref{chap:interpretation-abstraite} a présenté les treillis \og en un coup
+d'œil\fg{} et suivi un compteur jusqu'à son point fixe. Ce chapitre ouvre la
+boîte. Il décrit, opération par opération, les quatre domaines de base sur
+lesquels repose toute valeur abstraite de \reactant{}. Ces domaines sont
+petits (moins de 900 lignes à eux quatre), mais chaque ligne compte : une
+borne mal arrondie ou un cas $\Bot$ oublié suffit à produire un faux négatif,
+et un faux négatif est interdit (\cref{def:soundness}).
+
+Le \cref{chap:statevalue-stabilite} assemblera ces domaines en un produit,
+\code{StateValue}, et y ajoutera le treillis de stabilité référentielle. On
+peut déjà situer les pièces (\cref{fig:treillis-simples-produit}) : sur les
+huit composantes de \code{StateValue}, quatre sont les treillis de ce
+chapitre, trois sont de simples booléens \og cette sorte est-elle possible
+?\fg{}, et une est la stabilité.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=2mm]
+  \node[bloc,minimum width=26mm] (num) {\code{num}\\\code{Interval}};
+  \node[bloc,minimum width=26mm,right=of num] (bool) {\code{boolean}\\\code{BoolVal}};
+  \node[bloc,minimum width=26mm,right=of bool] (str) {\code{str}\\\code{StrConst}};
+  \node[bloc,minimum width=26mm,right=of str] (set) {\code{setter}\\\code{SetterVal}};
+  \node[cfgbloc,minimum width=26mm,below=4mm of num] (ref) {\code{reference}\\\code{Stability}};
+  \node[cfgbloc,minimum width=26mm,right=of ref] (null) {\code{null}\\\code{bool}};
+  \node[cfgbloc,minimum width=26mm,right=of null] (undef) {\code{undef}\\\code{bool}};
+  \node[cfgbloc,minimum width=26mm,right=of undef] (other) {\code{other}\\\code{bool}};
+  \node[draw=ra-gray,dashed,rounded corners,fit=(num)(set)(ref)(other),inner sep=4pt,label={[etiquette]above:\code{StateValue} (\src{src/domains/impls/state_value.rs}{26}{44})}] {};
+\end{tikzpicture}
+\caption{Les huit composantes du produit \code{StateValue}. En bleu, les
+treillis étudiés dans ce chapitre ; en gris, ceux du
+\cref{chap:statevalue-stabilite} (la stabilité et les trois bits de sorte).}
+\label{fig:treillis-simples-produit}
+\end{figure}
+
+% ===========================================================================
+\section{Le contrat d'un domaine : le trait \code{AbstractDomain}}
+\label{sec:treillis-simples-contrat}
+
+\subsection{Une question concrète}
+
+Prenons le programme qui servira de fil rouge à tout le chapitre.
+
+\begin{lstlisting}[language=TypeScript,caption={Deux compteurs (\file{/tmp/ch09/counter.tsx}, repris de \file{tests/fixtures/widening.tsx})},label={lst:treillis-simples-counter}]
+import { useState, useEffect } from "react";
+
+export function Unbounded() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    setCount(count + 1);
+  }, [count]);
+  return <div>{count}</div>;
+}
+
+export function Guarded() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    if (count < 10) setCount(count + 1);
+  }, [count]);
+  return <div>{count}</div>;
+}
+\end{lstlisting}
+
+\code{Unbounded} boucle : chaque exécution de l'effet écrit une nouvelle valeur
+dans \code{count}, ce qui provoque un nouveau rendu, donc une nouvelle
+exécution de l'effet. \code{Guarded} s'arrête à 10. Pour les distinguer,
+l'analyseur doit répondre à une question sur des \emph{nombres} : l'ensemble
+des valeurs que \code{count} peut prendre est-il borné ? Il lui faut donc un
+domaine qui représente des ensembles de nombres (les intervalles), qui sache
+calculer \code{count + 1} (l'arithmétique), exploiter \code{count < 10} (le
+raffinement sur garde) et converger malgré une suite de valeurs infinie (le
+widening). L'analyseur répond ainsi :
+
+\begin{sortie}
+$ reactant check /tmp/ch09/counter.tsx --show-clean
+  Guarded  (2 hooks)  /tmp/ch09/counter.tsx  ✓
+  Unbounded  (2 hooks)  /tmp/ch09/counter.tsx
+    warn   infinite-loop  [hook:0]  (line 5:2)  this effect keeps pushing state `count` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
+
+⚠  1 warning(s) across 1 file(s).
+\end{sortie}
+
+Toutes les pièces de cette réponse sont dans ce chapitre, sauf la règle
+elle-même (\cref{chap:infinite-loop}) et la boucle de point fixe
+(\cref{chap:point-fixe-composant}).
+
+\subsection{Le trait, méthode par méthode}
+
+Un domaine abstrait est, dans le code, un type qui implémente
+\code{AbstractDomain} (\file{src/domains/mod.rs}). La tête du trait a été
+présentée au \cref{chap:interpretation-abstraite}
+(\cref{lst:interpretation-abstraite-abstractdomain}) : \code{bottom},
+\code{top}, \code{is_bottom}, \code{join}, \code{meet}, \code{widen}, et
+\code{widen_to} dont l'implémentation par défaut ignore les seuils. L'ordre du
+treillis n'est pas une méthode : c'est le supertrait \code{PartialOrd}
+(\code{a <= b} signifie $a \lleq b$, \code{partial_cmp} rend \code{None} pour
+deux éléments incomparables). La suite du trait est moins connue ; la voici.
+
+\rustsnippet[label={lst:treillis-simples-narrow-defaut}]{src/domains/mod.rs}{40}{85}{ponts vers \code{StateValue} et raffinements par défaut}
+
+Suivent \code{narrow_leq}, \code{narrow_gt}, \code{narrow_geq},
+\code{narrow_eq} et \code{narrow_neq}, de la même forme
+(\src{src/domains/mod.rs}{86}{100}). Trois groupes de méthodes :
+\begin{itemize}
+  \item \textbf{Les ponts} \code{as_state_value} / \code{from_state_value}
+    servent au tas, qui range l'environnement capturé par une fermeture sous
+    forme de \code{StateValue}. Seul \code{StateValue} les redéfinit.
+  \item \textbf{Les raffinements de sorte} (\code{narrow_drop_null},
+    \code{narrow_drop_undef}, \code{narrow_keep_nullish_only},
+    \code{narrow_truthy}, \code{narrow_falsy}) ne concernent que le produit,
+    seul à savoir ce qu'est une sorte ; ils sont étudiés au
+    \cref{chap:statevalue-stabilite}, sauf \code{narrow_truthy} dont l'effet
+    sur les nombres est vu en \cref{sec:treillis-simples-gardes}.
+  \item \textbf{Les raffinements numériques} \code{narrow_lt} \dots{}
+    \code{narrow_neq} restreignent une valeur à celles qui satisfont
+    \code{x < v}, \code{x <= v}, etc., pour un littéral \code{v}.
+    \code{Interval} les redéfinit, et \code{StateValue} les délègue à sa
+    composante \code{num}.
+\end{itemize}
+
+Tous les raffinements valent l'identité par défaut, et le commentaire dit
+pourquoi c'est permis : ne rien raffiner est toujours sound, seulement
+imprécis. Le \cref{tab:treillis-simples-qui-redefinit} récapitule qui redéfinit
+quoi.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{lcccc}
+\hline
+Domaine & \code{widen_to} & ponts & \code{narrow_lt} \dots{} \code{narrow_neq} & raffinements de sorte \\
+\hline
+\code{BoolVal}, \code{SetterVal} (macro) & défaut & défaut & identité & identité \\
+\code{StrConst} & défaut & défaut & identité & identité \\
+\code{Stability} & défaut & défaut & identité & identité \\
+\code{Interval} & redéfini & défaut & redéfinis & identité \\
+\code{StateValue} & redéfini & redéfinis & délégués à \code{num} & redéfinis \\
+\hline
+\end{tabular}
+\caption{Les méthodes à implémentation par défaut de \code{AbstractDomain}, et
+les domaines qui les redéfinissent (relevé des \code{impl AbstractDomain}).}
+\label{tab:treillis-simples-qui-redefinit}
+\end{table}
+
+\subsection{Le contrat}
+
+Le trait ne dit rien des propriétés que ses méthodes doivent avoir ; elles
+sont pourtant le fondement de la soundness. Écrivons-les une fois.
+
+\begin{definition}{Contrat d'un domaine abstrait}{treillis-simples-contrat}
+  Soit $D$ un type qui implémente \code{AbstractDomain}, muni d'une
+  concrétisation $\gam : D \to \powerset(\Val)$ (\cref{def:concretisation}),
+  où $\Val$ est l'ensemble des valeurs JavaScript concernées. Le domaine
+  respecte le contrat si, pour tous $a, b \in D$ :
+  \begin{enumerate}
+    \item \emph{ordre} : $a \lleq b \Rightarrow \gam(a) \subseteq \gam(b)$ ;
+    \item \emph{bottom et top} : $\gam(\Bot) = \emptyset$ et $\gam(\Top) = \Val$ ;
+      \code{is_bottom(a)} n'est vrai que si $\gam(a) = \emptyset$ ;
+    \item \emph{join} : $a \lleq a \join b$ et $b \lleq a \join b$, donc
+      $\gam(a) \cup \gam(b) \subseteq \gam(a \join b)$ ;
+    \item \emph{widening} : \code{widen} et \code{widen_to} (pour tout
+      ensemble fini de seuils) majorent le join et rendent toute suite
+      d'élargissements stationnaire (\cref{def:widening}) ;
+    \item \emph{raffinement} : pour une condition $c$ et son opérateur
+      \code{narrow_c}, $\gam(\code{narrow_c}(a)) \supseteq \gam(a) \cap
+      \{x \mid c(x)\}$ ;
+    \item \emph{meet} : $\gam(a) \cap \gam(b) \subseteq \gam(a \meet b)$.
+  \end{enumerate}
+\end{definition}
+
+Les conditions 3 à 5 portent la soundness : un join ou un raffinement qui
+perdrait une valeur concrète ferait disparaître un comportement réel. Le join
+n'a pas besoin d'être la plus petite borne supérieure pour être sound (il suffit
+qu'il majore), mais il l'est pour les quatre domaines du chapitre, et c'est ce
+qui fait leur précision. La condition 6 est de pure forme aujourd'hui :
+
+\begin{piege}
+  \code{meet} n'est appelé nulle part hors des tests et des délégations
+  internes (\code{StateValue::meet} vers ses composantes). Le raffinement de
+  l'analyse passe exclusivement par les \code{narrow_*}, jamais par
+  \code{meet}. Un contributeur qui voudrait raffiner un état par
+  \og intersection avec la garde\fg{} doit donc écrire un \code{narrow_*}, ou
+  vérifier d'abord que le \code{meet} du domaine concerné respecte la
+  condition 6 (ce n'est pas le cas de \code{Stability},
+  \cref{chap:statevalue-stabilite}).
+\end{piege}
+
+\begin{piege}
+  Dans \code{impl AbstractDomain for Interval}, les raffinements du trait sont
+  écrits \code{Interval::narrow_lt(&self, v)} et non \code{self.narrow_lt(v)}
+  (\src{src/domains/impls/interval.rs}{362}{365}). La méthode du trait prend
+  \code{self} par valeur, la méthode inhérente \code{&self}. Dans le corps du
+  trait, \code{self.narrow_lt(v)} serait résolu dès l'étape \og par valeur\fg{}
+  de la recherche de méthode, donc vers la méthode du trait elle-même :
+  récursion infinie. Le commentaire \og fully-qualified\fg{} du code le
+  signale.
+\end{piege}
+
+\begin{remarque}
+  Le commentaire en tête du trait annonce encore \code{Clone + Copy}, alors
+  que la borne réelle ne contient pas \code{Copy}
+  (\cref{chap:interpretation-abstraite}). Des quatre domaines de ce chapitre,
+  \code{BoolVal} et \code{Interval} sont \code{Copy} ; \code{SetterVal} et
+  \code{StrConst} ne dérivent pas \code{Copy} (le second contient un
+  \code{Arc}), d'où les \code{clone()} de la macro ci-dessous.
+\end{remarque}
+
+% ===========================================================================
+\section{Les treillis plats : \code{BoolVal} et \code{SetterVal}}
+\label{sec:treillis-simples-plats}
+
+\subsection{Deux exemples React}
+
+Un booléen d'état est l'exemple le plus simple de valeur à suivre :
+
+\begin{lstlisting}[language=TypeScript,caption={Un booléen d'état et un setter choisi dynamiquement (exemple d'illustration)},label={lst:treillis-simples-bool}]
+export function Panel({ admin }: { admin: boolean }) {
+  const [open, setOpen] = useState(false);
+  const [a, setA] = useState(0);
+  const [b, setB] = useState(0);
+  const set = admin ? setA : setB;
+  return <button onClick={() => { setOpen(!open); set(1); }}>{open ? "-" : "+"}</button>;
+}
+\end{lstlisting}
+
+Que sait-on de \code{open} ? Au premier rendu, qu'il vaut \code{false} ;
+après un clic, qu'il vaut \code{true} ; en général, qu'il vaut l'un ou
+l'autre. Que sait-on de \code{set} ? Que c'est \emph{un} setter de
+\code{useState}, mais lequel dépend de la prop : \code{setA} ou \code{setB}.
+Dans les deux cas, l'information utile est \og une valeur précise, ou bien on
+ne sait pas laquelle\fg{}. C'est exactement ce que capture un treillis plat.
+
+\begin{definition}{Treillis plat}{treillis-simples-plat}
+  Soit $M$ un ensemble (les éléments \og intermédiaires\fg{}). Le
+  \terme{treillis plat} sur $M$ est $M \cup \{\Bot, \Top\}$ ordonné par
+  $\Bot \lleq m \lleq \Top$ pour tout $m \in M$, deux éléments distincts de
+  $M$ étant incomparables. Son join vaut $a \join a = a$,
+  $\Bot \join x = x \join \Bot = x$, et $\Top$ dans tous les autres cas ; son
+  meet est le dual. Sa hauteur est 2 (plus longue chaîne stricte :
+  $\Bot \sqsubset m \sqsubset \Top$).
+\end{definition}
+
+\Cref{fig:treillis-simples-hasse-plat} dessine le treillis plat générique et
+indique, sur chaque arête, quel bras du code la justifie.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[treillis]
+  \node (bot) at (0,0) {$\Bot$};
+  \node (m1) at (-2.2,1.6) {$m_1$};
+  \node (m2) at (-0.8,1.6) {$m_2$};
+  \node (m3) at (0.6,1.6) {$m_3$};
+  \node (md) at (1.8,1.6) {$\cdots$};
+  \node (top) at (0,3.2) {$\Top$};
+  \foreach \n in {m1,m2,m3} { \draw (bot) -- (\n) -- (top); }
+  \draw[dashed,ra-gray] (bot) -- (md) -- (top);
+  \node[etiquette,align=left,anchor=west] at (2.4,2.6) {$m_i \lleq \Top$ : bras \code{(_, $top)}};
+  \node[etiquette,align=left,anchor=west] at (2.4,0.6) {$\Bot \lleq m_i$ : bras \code{($bottom, _)}};
+  \node[etiquette,align=left,anchor=west] at (2.4,1.6) {$m_i \neq m_j$ : aucun bras, \code{None}};
+  \begin{scope}[xshift=-5.2cm]
+    \node (bb) at (0,0) {\code{Bottom}};
+    \node (bt) at (-1.1,1.6) {\code{True}};
+    \node (bf) at (1.1,1.6) {\code{False}};
+    \node (btop) at (0,3.2) {\code{Top}};
+    \draw (bb) -- (bt) -- (btop) -- (bf) -- (bb);
+    \node[etiquette] at (0,-0.5) {$\gam = \emptyset$};
+    \node[etiquette] at (0,3.7) {$\gam = \{\mathtt{true},\mathtt{false}\}$};
+  \end{scope}
+\end{tikzpicture}
+\caption{À gauche, \code{BoolVal}, dont la concrétisation est une bijection
+avec $\powerset(\{\mathtt{true},\mathtt{false}\})$. À droite, le treillis plat
+engendré par \code{flat_lattice!} pour un ensemble quelconque d'éléments
+intermédiaires, avec le bras de \code{partial_cmp} qui établit chaque
+relation.}
+\label{fig:treillis-simples-hasse-plat}
+\end{figure}
+
+\subsection{Ce que fait le code : la macro \code{flat_lattice!}}
+
+Les deux treillis plats du code ne diffèrent que par la charge utile de leurs
+éléments intermédiaires. Leur ordre et leurs opérations sont donc engendrés
+par une seule macro, introduite lors de la campagne de dette technique
+(décision D5 d'\adr{20}).
+
+\rustsnippet[label={lst:treillis-simples-flat}]{src/domains/impls/mod.rs}{1}{53}{la macro \code{flat_lattice!}}
+
+Lisons-la bras par bras.
+\begin{itemize}
+  \item \textbf{Paramètres} (l.~11). La macro reçoit le type et les noms de
+    ses variantes $\Bot$ et $\Top$ ; toutes les autres variantes sont les
+    éléments intermédiaires. Elle exige \code{PartialEq + Clone} (les gardes
+    \code{a == b} et les \code{clone()}).
+  \item \textbf{\code{partial_cmp}} (l.~13--21). L'égalité d'abord ; puis
+    \og $\Bot$ à gauche ou $\Top$ à droite\fg{} donne \code{Less} ; puis
+    \og $\Top$ à gauche ou $\Bot$ à droite\fg{} donne \code{Greater} ; le reste,
+    deux intermédiaires distincts, est incomparable. L'ordre des bras compte
+    pour le couple $(\Bot, \Top)$, qui satisfait les deux motifs : le premier
+    gagne, et c'est bien \code{Less}.
+  \item \textbf{\code{join}} (l.~34--40). Égaux : on garde. L'un est $\Bot$ :
+    on garde l'autre (le motif \code{($bottom, x) | (x, $bottom)} lie
+    \code{x} des deux côtés). Sinon : $\Top$. Ce \og sinon\fg{} couvre aussi les
+    cas où l'un est $\Top$, ce qui est correct.
+  \item \textbf{\code{meet}} (l.~41--47) est le dual : $\Top$ est neutre, deux
+    éléments différents donnent $\Bot$.
+  \item \textbf{\code{widen}} (l.~48--50) est le join : la hauteur est finie.
+\end{itemize}
+
+\begin{proposition}{\code{flat_lattice!} engendre un treillis}{treillis-simples-flat-treillis}
+  Pour tout type instancié par \code{flat_lattice!}, \code{partial_cmp} est
+  l'ordre du treillis plat de la \cref{def:treillis-simples-plat}, \code{join}
+  en est la plus petite borne supérieure, \code{meet} la plus grande borne
+  inférieure, et \code{widen} est un widening.
+\end{proposition}
+\begin{proof}
+  L'ordre : les trois bras reproduisent exactement les trois clauses de la
+  définition (réflexivité, $\Bot$ minimum, $\Top$ maximum), le dernier bras
+  déclare incomparables deux intermédiaires distincts. Le join : si
+  $a = b$, $a$ est la plus petite borne de $\{a\}$ ; si $a = \Bot$, $b$ majore
+  $a$ et $b$ et tout majorant de $b$ en est un de $\{a,b\}$ ; sinon, soit l'un
+  vaut $\Top$ (seul majorant), soit $a$ et $b$ sont deux intermédiaires
+  distincts, dont le seul majorant commun est $\Top$. Le meet est dual. Le
+  widening : \code{widen = join} majore le join, et toute suite croissante
+  d'un treillis de hauteur 2 est stationnaire après au plus deux pas stricts.
+\end{proof}
+
+La macro est définie \emph{avant} les déclarations \code{pub mod bool_val;} et
+\code{pub mod setter_val;} (\src{src/domains/impls/mod.rs}{55}{60}). C'est la
+portée \emph{textuelle} des \code{macro_rules!} qui la rend visible dans ces
+sous-modules, sans \texttt{\#[macro\_export]} ni \code{use}. Déplacer la
+déclaration des modules au-dessus de la macro casserait la compilation.
+
+\subsection{\code{BoolVal} : un treillis plat exact}
+
+\rustsnippet[label={lst:treillis-simples-boolval}]{src/domains/impls/bool_val.rs}{1}{13}{le treillis des booléens}
+
+La concrétisation est
+$\gam(\code{Bottom}) = \emptyset$, $\gam(\code{True}) = \{\mathtt{true}\}$,
+$\gam(\code{False}) = \{\mathtt{false}\}$,
+$\gam(\code{Top}) = \{\mathtt{true}, \mathtt{false}\}$. C'est une bijection
+avec les parties de $\{\mathtt{true}, \mathtt{false}\}$, compatible avec
+l'ordre : le treillis plat \emph{est} ici le treillis des parties, et join et
+meet sont exacts ($\gam(a \join b) = \gam(a) \cup \gam(b)$). C'est le seul
+domaine du chapitre sans aucune perte.
+
+Où naissent les booléens abstraits ? Un littéral \code{true} ou \code{false}
+donne \code{True} ou \code{False}, comme un littéral numérique donne
+\code{Interval::point} et une chaîne un singleton : trois cas d'un même
+\code{match} (\src{src/domains/transfer/state_value.rs}{112}{117}).
+
+La négation \code{!x} inverse exactement un
+booléen pur (\src{src/domains/transfer/state_value.rs}{947}{965}). En
+revanche, \emph{toute} comparaison (\code{==}, \code{<}, \code{in},
+\code{instanceof}\dots) rend \code{BoolVal::Top}, même \code{1 < 2}
+(\src{src/domains/transfer/state_value.rs}{797}{806}) : le domaine ne
+calcule pas la valeur d'une comparaison ; c'est le raffinement de branche
+(\cref{sec:treillis-simples-gardes}) qui exploite la condition. Rendre un
+booléen pur, et non $\Top$ tout entier, a son importance : les composantes
+\code{num} et \code{str} du résultat restent à $\Bot$, ce qui permet
+d'enchaîner d'autres raffinements sur le résultat.
+
+\begin{piege}
+  \code{!x} sur un $x$ qui vaut $\Bot$ rend \code{boolean(Top)} et non
+  $\Bot$ : le test \og booléen pur\fg{} de la ligne 949 est satisfait par
+  $\Bot$ (toutes ses composantes sont vides), puis le \code{match} tombe dans
+  \code{_ => BoolVal::Top}. Un chemin mort redevient vivant pour la suite
+  de l'évaluation. C'est imprécis, pas unsound : $\Top$ majore tout.
+\end{piege}
+
+\subsection{\code{SetterVal} : un treillis plat à identité}
+
+\rustsnippet[label={lst:treillis-simples-setterval}]{src/domains/impls/setter_val.rs}{3}{37}{le treillis plat des setters}
+
+\begin{itemize}
+  \item \code{One(ComponentId, HookLabel)} désigne \emph{le} setter du slot
+    \code{HookLabel} (\cref{def:slot}) du composant \code{ComponentId} :
+    $\gam(\code{One}(c,l)) = \{\text{la fonction }\code{setState}\text{ du
+    slot } l \text{ de } c\}$. L'identité est un \code{ComponentId} interné
+    (\adr{40}), plus un nom de composant comme dans les premières versions.
+  \item \code{Top} : $\gam$ est l'ensemble de tous les setters de
+    \code{useState}. On sait que la valeur est un setter, pas lequel.
+  \item \code{as_one} (l.~27--32) est l'accesseur qu'utilisent les règles et
+    les relations pour savoir \emph{quel} slot un appel écrit : il ne répond
+    que si l'identité est exacte.
+\end{itemize}
+
+Dans le \cref{lst:treillis-simples-bool}, les deux branches de
+\code{admin ? setA : setB} donnent \code{One(c,1)} et \code{One(c,2)} ; leur
+join est \code{Top}. Ici le treillis plat \emph{perd} de l'information :
+$\gam(\code{Top})$ contient tous les setters, alors que la vérité est
+\og \code{setA} ou \code{setB}\fg{}. La perte est sound (on majore) et c'est le
+prix de la hauteur 2.
+
+\begin{react}[identité des setters]
+  React garantit que la fonction \code{setState} rendue par \code{useState}
+  garde la même identité d'un rendu à l'autre. C'est pourquoi tout
+  \code{SetterVal} non $\Bot$ est projeté sur la stabilité \code{Stable}
+  (commentaire des lignes 13--14 et 35--36) : on peut ignorer quel setter,
+  on sait qu'il ne change pas.
+\end{react}
+
+% ===========================================================================
+\section{Un ensemble borné de chaînes : \code{StrConst}}
+\label{sec:treillis-simples-strconst}
+
+\subsection{Le problème}
+
+Les chaînes d'état sont souvent des \emph{énumérations} déguisées :
+
+\begin{lstlisting}[language=TypeScript,caption={Un mode d'affichage (exemple d'illustration)},label={lst:treillis-simples-mode}]
+export function Gallery() {
+  const [mode, setMode] = useState("grid");
+  return (
+    <div className={"gallery-" + mode}>
+      <button onClick={() => setMode("list")}>list</button>
+      <button onClick={() => setMode("grid")}>grid</button>
+    </div>
+  );
+}
+\end{lstlisting}
+
+Un treillis plat sur les chaînes dirait de \code{mode} : $\Top$, puisque deux
+constantes différentes y sont écrites. On aimerait garder
+$\{\code{"grid"}, \code{"list"}\}$, et pour \code{className},
+$\{\code{"gallery-grid"}, \code{"gallery-list"}\}$. Le treillis des parties de
+l'ensemble des chaînes le permettrait, mais il est de hauteur infinie : une
+chaîne qui grandit (\code{s + "x"}) engendrerait une suite d'ensembles
+strictement croissante. La solution classique borne la taille des ensembles.
+
+\begin{definition}{Ensemble $k$-borné}{treillis-simples-k-ensemble}
+  Soit $S$ un ensemble (ici les chaînes) et $k \ge 1$. Le treillis des
+  \terme{ensembles $k$-bornés} sur $S$ est
+  $\{\Bot\} \cup \{X \subseteq S \mid 1 \le |X| \le k\} \cup \{\Top\}$,
+  ordonné par l'inclusion, $\Bot$ en dessous de tout et $\Top$ au-dessus. La
+  concrétisation est $\gam(\Bot) = \emptyset$, $\gam(X) = X$,
+  $\gam(\Top) = S$. Le join de $X$ et $Y$ est $X \cup Y$ si
+  $|X \cup Y| \le k$, et $\Top$ sinon ; le meet est $X \cap Y$ (et $\Bot$ si
+  l'intersection est vide). La hauteur est $k + 1$.
+\end{definition}
+
+\subsection{Ce que fait le code}
+
+\rustsnippet[label={lst:treillis-simples-strconst}]{src/domains/impls/str_const.rs}{7}{39}{\code{StrConst}, ses constructeurs, $k = 4$}
+
+\begin{itemize}
+  \item \code{STR_WIDEN_THRESHOLD} vaut 4 : c'est le $k$ de la définition.
+    Ce seuil vient du domaine produit d'origine (\adr{8}), qui l'a transmis
+    tel quel à \adr{15}.
+  \item \texttt{Set(Arc<BTreeSet<String>{}>)} : l'ensemble est trié
+    (\code{BTreeSet}), ce qui rend l'égalité et l'affichage déterministes, et
+    partagé (\code{Arc}), ce qui rend le \code{clone} d'une valeur abstraite
+    bon marché : les environnements sont copiés à chaque bloc.
+  \item \code{singleton} fabrique $\{s\}$ ; \code{from_set} est le
+    constructeur \emph{canonique} : vide $\mapsto \Bot$, plus de 4 éléments
+    $\mapsto \Top$, sinon l'ensemble.
+\end{itemize}
+
+\begin{invariant}{Forme canonique de \code{StrConst}}{treillis-simples-strconst}
+  Toute valeur \code{Set(s)} construite par \code{singleton} ou
+  \code{from_set} vérifie $1 \le |s| \le 4$. L'invariant n'est pas imposé par
+  le type : la variante étant publique, \code{StrConst::Set(Arc::new(}$\emptyset$\code{))}
+  reste constructible, et \code{is_bottom} y répondrait \code{false}. Tout
+  code qui fabrique un ensemble doit passer par \code{from_set}.
+\end{invariant}
+
+L'ordre et les opérations :
+
+\rustsnippet[label={lst:treillis-simples-strconst-ord}]{src/domains/impls/str_const.rs}{42}{62}{l'ordre de \code{StrConst} : l'inclusion}
+
+\rustsnippet[label={lst:treillis-simples-strconst-join}]{src/domains/impls/str_const.rs}{75}{102}{join, meet et widen de \code{StrConst}}
+
+L'ordre est l'inclusion, avec les deux sentinelles aux extrémités ; les bras
+$\Bot$ précèdent les bras $\Top$, si bien que $(\Bot, \Top)$ donne
+\code{Less}. Le join calcule l'union puis la fait passer par \code{from_set},
+qui la remplace par $\Top$ si elle a plus de 4 éléments. Le meet calcule
+l'intersection, qui ne peut pas grossir, et que \code{from_set} transforme en
+$\Bot$ si elle est vide.
+
+\Cref{fig:treillis-simples-hasse-strconst} en dessine un fragment.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[treillis,xscale=1.05]
+  \node (bot) at (0,0) {$\Bot$};
+  \node (a) at (-3,1.2) {$\{a\}$};
+  \node (b) at (-1,1.2) {$\{b\}$};
+  \node (c) at (1,1.2) {$\{c\}$};
+  \node (d) at (3,1.2) {$\{d\}$};
+  \node (ab) at (-3,2.4) {$\{a,b\}$};
+  \node (bc) at (-1,2.4) {$\{b,c\}$};
+  \node (cd) at (1,2.4) {$\{c,d\}$};
+  \node (dots2) at (3,2.4) {$\cdots$};
+  \node (abc) at (-2,3.6) {$\{a,b,c\}$};
+  \node (bcd) at (0.5,3.6) {$\{b,c,d\}$};
+  \node (dots3) at (2.6,3.6) {$\cdots$};
+  \node (abcd) at (-0.5,4.8) {$\{a,b,c,d\}$};
+  \node (abce) at (2.2,4.8) {$\{a,b,c,e\}$};
+  \node (dots4) at (3.9,4.8) {$\cdots$};
+  \node (top) at (0.6,6.0) {$\Top$};
+  \foreach \n in {a,b,c,d} { \draw (bot) -- (\n); }
+  \draw (a) -- (ab) (b) -- (ab) (b) -- (bc) (c) -- (bc) (c) -- (cd) (d) -- (cd);
+  \draw (ab) -- (abc) (bc) -- (abc) (bc) -- (bcd) (cd) -- (bcd);
+  \draw (abc) -- (abcd) (bcd) -- (abcd) (abc) -- (abce);
+  \draw (abcd) -- (top) (abce) -- (top);
+  \draw[dashed,ra-gray] (dots4) -- (top);
+  \node[etiquette,anchor=west] at (4.3,6.0) {$\gam = $ toutes les chaînes};
+  \node[etiquette,anchor=west] at (4.3,4.8) {taille 4 ($k$)};
+  \node[etiquette,anchor=west] at (4.3,1.2) {singletons};
+  \node[etiquette,anchor=west] at (4.3,0) {$\gam = \emptyset$};
+  \draw[fleche,ra-amber] (abc.north west) to[bend left=35] node[etiquette,left,pos=0.6] {$\join \{d,e\}$} (top.west);
+\end{tikzpicture}
+\caption{Un fragment de \code{StrConst} (quelques arêtes seulement). Les
+ensembles de taille 1 à 4 sont ordonnés par inclusion ; au-delà, le join
+saute à $\Top$ : $\{a,b,c\} \join \{d,e\} = \Top$ (flèche), car l'union a cinq
+éléments.}
+\label{fig:treillis-simples-hasse-strconst}
+\end{figure}
+
+\begin{proposition}{\code{StrConst} est un treillis de hauteur 5}{treillis-simples-strconst}
+  \code{partial_cmp} est l'ordre des ensembles 4-bornés, \code{join} en est
+  la plus petite borne supérieure, \code{meet} la plus grande borne
+  inférieure. La plus longue chaîne stricte a six éléments
+  ($\Bot \sqsubset \{a\} \sqsubset \{a,b\} \sqsubset \{a,b,c\} \sqsubset
+  \{a,b,c,d\} \sqsubset \Top$), donc \code{widen = join} est un widening.
+\end{proposition}
+\begin{proof}
+  Pour le join de $X$ et $Y$ : tout majorant commun est soit $\Top$, soit un
+  ensemble $Z$ de taille au plus 4 contenant $X$ et $Y$, donc contenant
+  $X \cup Y$. Si $|X \cup Y| \le 4$, $X \cup Y$ est lui-même un élément et
+  c'est le plus petit majorant. Sinon aucun ensemble représentable ne contient
+  $X \cup Y$, et le seul majorant est $\Top$. Pour le meet, tout minorant
+  commun est $\Bot$ ou un ensemble inclus dans $X$ et dans $Y$, donc dans
+  $X \cap Y$, qui a au plus 4 éléments : c'est le plus grand minorant (ou
+  $\Bot$ s'il est vide). La chaîne gagne au plus un élément par pas, et
+  $\Top$ est atteint au cinquième ajout.
+\end{proof}
+
+La soundness du join découle de la proposition : il majore les deux
+opérandes, donc $\gam(X) \cup \gam(Y) \subseteq \gam(X \join Y)$. Mais
+l'égalité ne vaut plus au-delà du seuil :
+$\gam(\{a,b,c\} \join \{d,e\}) = S \supsetneq \{a,b,c,d,e\}$. Le
+\og widening au seuil\fg{} du commentaire du code n'est donc pas un widening
+au sens de la \cref{def:widening} (c'est le join, qui suffit déjà), mais une
+perte de précision inscrite dans le join lui-même.
+
+\begin{piege}
+  \code{StrConst} dérive \code{PartialEq}, et l'égalité d'un
+  \texttt{Arc<BTreeSet<String>{}>} compare le \emph{contenu}, pas les pointeurs
+  (l'\code{impl PartialEq for Arc<T>} délègue à \code{T}). Deux ensembles
+  égaux alloués séparément sont égaux, ce qu'exige le test de convergence du
+  point fixe. Remplacer cette égalité par \code{Arc::ptr_eq}
+  \og pour aller plus vite\fg{} empêcherait l'analyse de converger.
+\end{piege}
+
+\subsection{Où naissent les ensembles de chaînes}
+
+Un littéral chaîne donne un singleton. L'opérateur \code{+} sur deux chaînes
+pures calcule le produit cartésien des concaténations, puis le passe par
+\code{from_set} (\src{src/domains/transfer/state_value.rs}{754}{768}, qui
+est le début de la table des opérateurs du
+\cref{lst:treillis-simples-eval-binop}). Dans le
+\cref{lst:treillis-simples-mode}, \code{"gallery-" + mode} avec
+$\code{mode} = \{\code{"grid"}, \code{"list"}\}$ donne
+$\{\code{"gallery-grid"}, \code{"gallery-list"}\}$. Si l'un des opérandes
+est une chaîne inconnue ($\Top$), le résultat est \og une chaîne\fg{}
+(\code{StateValue::str_top()}), et non $\Top$ tout entier. Enfin
+\code{typeof x} rend un singleton exact (\code{"number"},
+\code{"string"}\dots) dès que $x$ n'a qu'une sorte possible
+(\src{src/domains/transfer/state_value.rs}{969}{977}).
+
+\begin{decision}[ADR-20 --- pas de combinateur \code{BoundedPowerset}]
+  La campagne de dette technique a examiné l'extraction d'un combinateur
+  générique \code{BoundedPowerset<T, N>} dont \code{StrConst} serait une
+  instance (non-changement n\textsuperscript{o}~5 d'\adr{20}). Refusé : seul
+  \code{StrConst} est un pur ensemble borné. \code{Stability}, qui ressemble à
+  un ensemble borné de slots, mêle à ce fragment des éléments
+  (\code{PerRender}, \code{Unknown}) aux joins croisés ; la faire entrer dans
+  le combinateur restructurerait un type critique pour la soundness pour un
+  seul consommateur réel. Abstraction prématurée.
+\end{decision}
+
+% ===========================================================================
+\section{Les intervalles : représentation, ordre, join}
+\label{sec:treillis-simples-intervalles}
+
+\subsection{Le problème}
+
+Revenons à \code{Guarded} (\cref{lst:treillis-simples-counter}). L'ensemble
+exact des valeurs de \code{count} est $\{0, 1, \dots, 10\}$. Pour
+\code{Unbounded}, c'est $\Nat$ tout entier. Un domaine de parties finies ne
+peut représenter le second, et le premier serait déjà coûteux avec une borne
+à $10^6$. Les \emph{intervalles} gardent seulement la plus petite et la plus
+grande valeur : $[0, 10]$ et $[0, +\infty]$. On perd les trous (un intervalle
+est \emph{convexe}), mais on garde exactement ce que la règle
+\regle{infinite-loop} veut savoir : la valeur est-elle bornée ?
+
+\begin{definition}{Intervalle abstrait}{treillis-simples-intervalle}
+  Un intervalle abstrait est un triplet $(\ell, h, \iota)$ où
+  $\ell, h \in \mathbb{R} \cup \{-\infty, +\infty\}$ et $\iota$ est un
+  booléen (\code{is_int}). Sa concrétisation est
+  \[
+    \gam(\ell, h, \iota) \;=\; \{ x \in \mathbb{R} \mid \ell \le x \le h \}
+    \;\cap\; \begin{cases} \Int & \text{si } \iota \\ \mathbb{R} & \text{sinon.}\end{cases}
+  \]
+  Tout triplet avec $\ell > h$ dénote $\emptyset$ : c'est $\Bot$. Le top est
+  $[-\infty, +\infty]$ avec $\iota$ faux. La valeur JavaScript \code{NaN}
+  n'appartient à la concrétisation d'\emph{aucun} intervalle ; les bornes
+  infinies signifient \og pas de borne\fg{}.
+\end{definition}
+
+La dernière phrase est une décision, pas une évidence : elle oblige toute
+opération qui peut produire \code{NaN} à sortir du domaine des intervalles
+(\cref{sec:treillis-simples-arith}).
+
+\subsection{Ce que fait le code}
+
+\rustsnippet[label={lst:treillis-simples-interval}]{src/domains/impls/interval.rs}{5}{27}{la structure \code{Interval}}
+
+\begin{itemize}
+  \item \code{lo}, \code{hi} : les bornes, fermées, en \code{f64}.
+    \code{f64::INFINITY} et \code{f64::NEG_INFINITY} codent l'absence de
+    borne.
+  \item \code{is_int} : \og toute valeur concrète est entière\fg{}. Vrai veut
+    dire \emph{prouvé} entier ; faux veut dire \og peut contenir des
+    non-entiers\fg{}. Le bit n'ajoute aucune valeur à la concrétisation, il
+    en retire (les non-entiers) : c'est une annotation de précision.
+  \item \code{PartialEq} est écrit à la main (l.~23--27) pour
+    \emph{ignorer} \code{is_int} : deux intervalles de mêmes bornes sont
+    égaux. Le point fixe converge ainsi quelle que soit l'évolution du bit.
+\end{itemize}
+
+\begin{invariant}{Sens du bit \code{is_int}}{treillis-simples-is-int}
+  Si \code{is_int} est vrai, toute valeur concrète représentée est un entier.
+  Toute opération qui produit un intervalle ne met \code{is_int} à vrai que si
+  elle peut le prouver. Réciproquement, un \code{is_int} faux n'est jamais
+  faux \og à tort\fg{} : il n'enlève rien.
+\end{invariant}
+
+Les constructeurs élémentaires :
+
+\rustsnippet[label={lst:treillis-simples-interval-ctors}]{src/domains/impls/interval.rs}{29}{67}{constructeurs et tests élémentaires}
+
+\begin{itemize}
+  \item \code{point(v)} est l'abstraction d'une valeur unique. Son bit vaut
+    vrai si $v$ est fini et sans partie fractionnaire : \code{point(3.0)} est
+    entier, \code{point(1.5)} ne l'est pas, \code{point(f64::INFINITY)} non
+    plus.
+  \item \code{bottom()} est le $\Bot$ \emph{canonique} $[+\infty, -\infty]$,
+    avec \code{is_int} vrai par vacuité (l'ensemble vide ne contient aucun
+    non-entier).
+  \item \code{is_bottom} teste $\ell > h$, et non l'égalité au $\Bot$
+    canonique : c'est le seul test fiable (voir le piège plus bas).
+\end{itemize}
+
+\subsection{Ordre, join, meet}
+
+\rustsnippet[label={lst:treillis-simples-interval-ord}]{src/domains/impls/interval.rs}{312}{328}{l'ordre des intervalles : l'inclusion des bornes}
+
+L'ordre est l'inclusion : $[a,b] \lleq [c,d]$ ssi $c \le a$ et $b \le d$. Le
+join est l'enveloppe convexe (\code{hull}, présentée au
+\cref{chap:interpretation-abstraite},
+\cref{lst:interpretation-abstraite-hull}) : les bornes extrêmes, entier si
+les deux opérandes le sont, $\Bot$ neutre. L'implémentation du trait relie les
+deux et définit le meet :
+
+\rustsnippet[label={lst:treillis-simples-interval-impl}]{src/domains/impls/interval.rs}{332}{361}{\code{impl AbstractDomain for Interval} (début)}
+
+Le meet est l'intersection des bornes. Son bit est un \emph{ou} : si l'un des
+opérandes ne contient que des entiers, leur intersection non plus ; il n'y a
+pas de test $\Bot$, car un résultat $\ell > h$ est $\Bot$ par construction.
+
+\begin{proposition}{Treillis des intervalles}{treillis-simples-interval-treillis}
+  Sur les intervalles non vides, \code{hull} est la plus petite borne
+  supérieure et \code{meet} la plus grande borne inférieure pour l'ordre
+  d'inclusion des bornes ; les deux respectent la concrétisation
+  (conditions 3 et 6 de la \cref{def:treillis-simples-contrat}).
+\end{proposition}
+\begin{proof}
+  Un intervalle $[c,d]$ majore $[a_1,b_1]$ et $[a_2,b_2]$ ssi
+  $c \le \min(a_1,a_2)$ et $d \ge \max(b_1,b_2)$ ; le plus petit est
+  $[\min(a_1,a_2), \max(b_1,b_2)]$, c'est \code{hull}. Si $x \in
+  \gam(a_1,b_1,\iota_1)$, alors $\min(a_1,a_2) \le x \le \max(b_1,b_2)$ ; et si
+  $\iota_1 \wedge \iota_2$, $x$ est entier. Le raisonnement est dual pour le
+  meet : $x$ dans les deux concrétisations est entre les deux bornes basses et
+  les deux bornes hautes, et entier dès que l'un des $\iota$ l'impose.
+\end{proof}
+
+\Cref{fig:treillis-simples-hasse-intervalles} montre un fragment de ce
+treillis. Il est de hauteur infinie : la chaîne $[0,0] \sqsubset [0,1]
+\sqsubset [0,2] \sqsubset \cdots$ ne s'arrête jamais, ce qui imposera le
+widening (\cref{sec:treillis-simples-widening}).
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[treillis,xscale=1.2,yscale=1.1]
+  \node (bot) at (0,0) {$\Bot$ \scriptsize($\ell > h$)};
+  \node (p0) at (-2,1.2) {$[0,0]$};
+  \node (p1) at (0,1.2) {$[1,1]$};
+  \node (p2) at (2,1.2) {$[2,2]$};
+  \node (pd) at (3.4,1.2) {$\cdots$};
+  \node (pm) at (-3.4,1.2) {$\cdots$};
+  \node (i01) at (-1,2.4) {$[0,1]$};
+  \node (i12) at (1,2.4) {$[1,2]$};
+  \node (i02) at (0,3.6) {$[0,2]$};
+  \node (i03) at (-1.4,4.8) {$[0,3]$};
+  \node (im12) at (1.4,4.8) {$[-1,2]$};
+  \node (i0inf) at (-2.2,6.0) {$[0,+\infty]$};
+  \node (top) at (0,7.2) {$[-\infty,+\infty] = \Top$};
+  \foreach \n in {p0,p1,p2} { \draw (bot) -- (\n); }
+  \draw[dashed,ra-gray] (bot) -- (pd) (bot) -- (pm);
+  \draw (p0) -- (i01) -- (p1) -- (i12) -- (p2);
+  \draw (i01) -- (i02) -- (i12);
+  \draw (i02) -- (i03) (i02) -- (im12);
+  \draw[dashed,ra-gray] (i03) -- (i0inf) (i0inf) -- (top) (im12) -- (top);
+  \draw[flechemay] (p0.west) to[bend left=40] node[etiquette,left] {chaîne infinie} (i0inf.west);
+\end{tikzpicture}
+\caption{Un fragment du treillis des intervalles. Les points sont les
+atomes ; le join de $[0,0]$ et $[2,2]$ est $[0,2]$, qui contient aussi $1$
+(convexité). Toute chaîne $[0,0] \sqsubset [0,1] \sqsubset \cdots$ monte sans
+fin vers $[0,+\infty]$ : hauteur infinie.}
+\label{fig:treillis-simples-hasse-intervalles}
+\end{figure}
+
+\begin{exemple}{Le join perd les trous}{treillis-simples-hull}
+  Un handler écrit \code{setX(0)}, un autre \code{setX(10)}. Le slot vaut
+  $[0,0] \join [10,10] = [0,10]$, qui contient aussi $1, \dots, 9$. Le join est
+  pourtant la plus petite borne supérieure \emph{dans ce treillis} : aucun
+  intervalle plus petit ne contient $0$ et $10$. La perte vient du choix du
+  domaine (convexe), pas de l'opération.
+\end{exemple}
+
+\begin{piege}
+  $\Bot$ a plusieurs représentations. Le raffinement
+  $[10,20]$ sous \code{x < 5} donne $[10, 4]$ (\cref{sec:treillis-simples-gardes}),
+  un $\Bot$ non canonique. Les combinateurs (\code{hull}, \code{widen},
+  \code{add}\dots) testent \code{is_bottom()} d'abord et le traitent
+  correctement. Mais \code{PartialEq} et \code{PartialOrd} comparent les
+  bornes brutes : \code{[10,4] == Interval::bottom()} est faux, et
+  \code{partial_cmp([10,4], [0,3])} rend \code{None} (aucune des deux
+  inclusions de bornes n'est vraie, \cref{lst:treillis-simples-interval-ord}),
+  alors qu'un $\Bot$ devrait être \code{Less} que tout. Le
+  \cref{chap:interpretation-abstraite} a relevé la conséquence pratique (une
+  worklist qui revisite un bloc mort). Tout code nouveau qui compare des
+  intervalles doit tester \code{is_bottom()} avant l'ordre.
+
+  L'effet sur le point fixe est précis. \code{StateStore::leq}
+  (\src{src/domains/stores/state_store.rs}{70}{77}) délègue à
+  \code{leq_pointwise} (\src{src/domains/stores/mod.rs}{23}{25}), qui compare
+  par \code{partial_cmp} brut ; \code{changed_labels}
+  (\src{src/domains/stores/state_store.rs}{87}{95}) compare de même par
+  \code{!=} brut. Si un slot contient un $\Bot$ non canonique dont la forme
+  diffère d'un tour à l'autre (deux narrowings à des littéraux différents,
+  par exemple), le test de convergence
+  (\code{new_state.leq(&state)}, \src{src/engine/fixpoint.rs}{495}{495})
+  peut rendre \code{false} alors que les deux valeurs dénotent
+  $\emptyset$ : la boucle externe continue un tour de plus qu'il ne
+  faudrait, et \code{changed_labels} peut marquer le slot \og changé\fg{} à
+  tort, avançant son entrée dans \code{widen_trace}. Ce n'est ni un défaut de
+  soundness (un tour de plus ne perd aucune valeur) ni un risque de
+  non-terminaison : le garde-fou des 100 itérations
+  (\src{src/engine/fixpoint.rs}{499}{512}) force de toute façon un
+  \code{widen} final. L'impact observable est une perte de précision
+  possible (un widening avancé d'un tour) sur un slot qui n'était de toute
+  façon plus atteignable.
+\end{piege}
+
+\begin{piege}
+  Parce que \code{is_int} est hors de l'égalité, un tour de point fixe qui
+  n'ajouterait qu'un non-entier \emph{à l'intérieur} des bornes serait jugé
+  convergé, et l'état retenu garderait un \code{is_int} vrai devenu faux.
+  Le dossier de notes a tenté de reproduire ce scénario (un compteur par pas
+  de $0{,}5$) sans y parvenir : le bit y est bien faux à la convergence. Le
+  risque reste théorique, mais c'est la seule brèche de
+  l'\cref{inv:treillis-simples-is-int}. Au commit \snapshotCommit{}, ni une
+  reproduction ni une preuve d'impossibilité n'existent : le scénario exige
+  que les bornes se stabilisent \emph{avant} qu'un opérande non entier
+  n'entre en jeu à bornes inchangées, ce qu'aucun des exemples essayés
+  (croissance directe, modulo) ne produit, faute d'avoir su construire un
+  programme où l'un se produit sans l'autre.
+\end{piege}
+
+% ===========================================================================
+\section{Arithmétique d'intervalles}
+\label{sec:treillis-simples-arith}
+
+\subsection{Addition, soustraction, multiplication, négation}
+
+Chaque écriture d'état d'un compteur passe par une opération arithmétique :
+\code{count + 1}, \code{total - price}, \code{n * 2}. Le domaine doit
+calculer, à partir des intervalles des opérandes, un intervalle qui contient
+tous les résultats possibles.
+
+\rustsnippet[label={lst:treillis-simples-add-mul}]{src/domains/impls/interval.rs}{148}{187}{addition, soustraction, multiplication}
+
+\rustsnippet[label={lst:treillis-simples-neg}]{src/domains/impls/interval.rs}{189}{198}{négation}
+
+Ce sont les formules classiques de l'arithmétique d'intervalles :
+\begin{align*}
+  [a,b] + [c,d] &= [a+c,\; b+d], &
+  [a,b] - [c,d] &= [a-d,\; b-c], \\
+  [a,b] \times [c,d] &= [\min P,\; \max P],\ P = \{ac, ad, bc, bd\}, &
+  -[a,b] &= [-b,\; -a].
+\end{align*}
+Un opérande $\Bot$ rend $\Bot$ : un chemin mort reste mort. Le bit entier est
+un \emph{et} : la somme, la différence ou le produit de deux entiers est
+entier, mais un seul non-entier suffit à perdre la garantie (test
+\code{integrality_lost_through_float_arithmetic},
+\src{src/domains/impls/interval.rs}{608}{613}).
+
+\begin{theoreme}{Soundness de l'arithmétique d'intervalles}{treillis-simples-arith}
+  Pour $x \in \gam(I)$ et $y \in \gam(J)$ finis, $x + y \in \gam(I + J)$,
+  $x - y \in \gam(I - J)$, $-x \in \gam(-I)$, et, si aucun produit de coins
+  n'est indéterminé ($0 \times \pm\infty$), $x y \in \gam(I \times J)$.
+\end{theoreme}
+\begin{proof}
+  Addition : $a \le x \le b$ et $c \le y \le d$ donnent $a + c \le x + y \le
+  b + d$. Soustraction : $-d \le -y \le -c$, puis addition. Négation :
+  multiplier par $-1$ renverse les inégalités. Multiplication : pour $y$
+  fixé, $x \mapsto xy$ est affine, donc ses extremums sur $[a,b]$ sont en
+  $a$ ou $b$ ; puis $y \mapsto ay$ et $y \mapsto by$ sont affines, extremums
+  en $c$ ou $d$ : les extremums de $xy$ sur le pavé sont parmi les quatre
+  coins. Le bit : somme, différence, produit et opposé d'entiers sont
+  entiers.
+\end{proof}
+
+Le calcul se fait en \code{f64}, avec l'arrondi au plus proche. Comme
+JavaScript calcule les valeurs concrètes avec la même arithmétique et que
+l'arrondi est monotone ($u \le v \Rightarrow \mathrm{rd}(u) \le
+\mathrm{rd}(v)$), les bornes calculées encadrent encore les résultats
+concrets. Cet argument n'est écrit nulle part dans le code ; il est
+nécessaire, et il suffit.
+
+La restriction \og aucun produit indéterminé\fg{} du théorème n'est pas une
+précaution de style : le code la viole dans un cas, étudié à la
+\cref{sec:treillis-simples-limites}.
+
+\subsection{\code{NaN}, $\pm\infty$ et la division}
+
+Puisque \code{NaN} n'est dans aucun intervalle, une opération qui peut le
+produire doit rendre autre chose qu'un intervalle. La division en est
+l'exemple type : \code{x / 0} vaut $\pm$\code{Infinity}, et \code{0 / 0} vaut
+\code{NaN}. Le code ne cherche pas à distinguer les cas : \code{BinOp::Div}
+rend toujours $\Top$ au niveau \code{StateValue}
+(\cref{lst:treillis-simples-eval-binop}). \code{docs/limitations.md} le
+documente.
+
+La place de $\pm\infty$ est plus ambiguë. Une borne infinie signifie
+\og non borné\fg{}, mais un littéral \code{1e999} vaut concrètement
+\code{Infinity}, et \code{point(f64::INFINITY)} produit l'intervalle
+$[+\infty, +\infty]$. Le code traite de fait les infinis comme des
+\emph{absences de borne}, pas comme des valeurs : les formules ci-dessus
+donneraient $+\infty - (+\infty) = \code{NaN}$ comme borne si les deux
+opérandes étaient le point $+\infty$. Aucun programme React raisonnable ne
+fait d'arithmétique sur \code{Infinity}, et l'écart n'a pas été observé sur
+un diagnostic ; il est signalé à la \cref{sec:treillis-simples-limites}.
+
+\subsection{Reste et puissance (commit \code{548f922})}
+
+Jusqu'au commit \code{548f922} (issue \issue{73}), \texttt{\%} et \code{**}
+n'avaient pas de variante propre dans l'IR et tombaient dans l'opérateur
+opaque. Ils sont maintenant modélisés :
+
+\rustsnippet[label={lst:treillis-simples-rem-pow}]{src/domains/impls/interval.rs}{200}{253}{reste et puissance}
+
+Les deux fonctions rendent une \code{Option} : \code{None} signifie
+\og le résultat peut être \code{NaN}\fg{}, et l'appelant le transforme en
+$\Top$.
+
+\paragraph{Le reste.} En JavaScript, \texttt{x \% m} a le signe du dividende
+\code{x}, et sa valeur absolue est strictement inférieure à $|m|$ et
+inférieure ou égale à $|x|$. Le code en tire :
+\begin{itemize}
+  \item si le diviseur peut être nul ($c \le 0 \le d$), \code{None} ;
+  \item sinon, $\mu = \max(|c|, |d|)$, la plus grande valeur absolue
+    possible du diviseur, et la borne $\beta = \mu - 1$ sur des entiers
+    (strictement sous $\mu$), $\beta = \mu$ sinon (borne fermée, donc
+    sur-approximation d'une borne ouverte) ;
+  \item la borne basse est $0$ si le dividende est positif, sinon
+    $\max(a, -\beta)$ ; la borne haute est $0$ si le dividende est négatif,
+    sinon $\min(b, \beta)$.
+\end{itemize}
+
+\begin{proposition}{Soundness du reste}{treillis-simples-rem}
+  Si $0 \notin [c,d]$, pour tous $x \in \gam([a,b])$, $m \in \gam([c,d])$
+  finis, $x \mathbin{\%} m \in \gam(\code{rem}([a,b],[c,d]))$.
+\end{proposition}
+\begin{proof}
+  Soit $r = x \mathbin{\%} m$. Si $x \ge 0$, $0 \le r \le x \le b$ et
+  $r < |m| \le \mu$ ; sur des entiers $r \le \mu - 1$. Donc
+  $r \le \min(b, \beta)$ et $r \ge 0 \ge$ la borne basse (qui vaut $0$ ou
+  $\max(a,-\beta) \le 0$). Le cas $x \le 0$ est symétrique. Si $a \ge 0$, tout
+  $x$ est positif et $r \ge 0$ : la borne basse $0$ est correcte ; si
+  $b \le 0$, la borne haute $0$ l'est de même. Le bit : le reste de deux
+  entiers est entier.
+\end{proof}
+
+\begin{exemple}{Un compteur modulo}{treillis-simples-mod}
+  \texttt{setI((i + 1) \% 3)} à partir de \code{i = 0}. Au premier tour,
+  $[0,0] + [1,1] = [1,1]$ et $\code{rem}([1,1],[3,3]) = [0, \min(1, 2)] =
+  [0,1]$ ; le slot vaut $[0,0] \join [0,1] = [0,1]$. Au deuxième,
+  $[1,2] \mathbin{\%} [3,3] = [0,2]$ ; au troisième, $[1,3] \mathbin{\%} [3,3]
+  = [0,2]$ : point fixe, sans widening. Avant le commit \code{548f922}, le
+  résultat était $\Top$.
+\end{exemple}
+
+\paragraph{La puissance.} Sur le quadrant $x \ge 0, y \ge 0$, la fonction
+$x^y$ est croissante en $x$ pour $y$ fixé, et monotone en $y$ pour $x$ fixé
+(croissante si $x > 1$, constante si $x = 1$, décroissante si $x < 1$). Ses
+extremums sur un pavé sont donc aux coins, comme pour le produit. Hors du
+quadrant, un exposant fractionnaire d'une base négative donne \code{NaN}, un
+exposant négatif de zéro donne \code{Infinity} : \code{None}. On note que
+$0^0 = 1$ en JavaScript comme pour \code{f64::powf}.
+
+\begin{decision}[commit 548f922 --- une variante par opérateur]
+  Le commit qui modélise \texttt{\%} et \code{**} applique une règle prise avec
+  \issue{74} et \issue{75} : chaque opérateur du langage a sa variante de
+  \code{BinOp}, jamais un opérateur source porté par \code{Unknown}. Avec
+  \code{Mod}, \code{Pow}, \code{In} et \code{InstanceOf}, \code{BinOp::Unknown}
+  n'a plus de producteur et disparaît ; \code{lower_binop} devient exhaustif,
+  si bien qu'un opérateur nouveau du langage ne peut plus tomber
+  silencieusement dans l'opaque. L'alternative (garder un joker \code{_}
+  vers $\Top$) était sound mais masquait les oublis. Le corpus, à 1494
+  diagnostics avant le commit, n'a pas bougé (\file{docs/corpus-baseline.json}
+  n'est pas modifié par ce commit).
+\end{decision}
+
+\subsection{La table des opérateurs binaires}
+
+Les intervalles ne sont jamais utilisés seuls : l'évaluateur manipule des
+\code{StateValue}, et il décide, opérateur par opérateur, s'il peut se ramener
+aux intervalles.
+
+\rustsnippet[label={lst:treillis-simples-eval-binop}]{src/domains/transfer/state_value.rs}{752}{811}{la table des opérateurs binaires}
+
+Le passage aux intervalles se fait par \code{as_arith}
+(\src{src/domains/transfer/state_value.rs}{708}{732}), qui rend un intervalle
+si les seules sortes possibles de la valeur sont \og nombre\fg{} et
+\og \code{null}\fg{}, puisque \code{ToNumber(null)} vaut $0$ ; le
+\cref{chap:statevalue-stabilite} en détaille la logique. Il rend \code{None}
+dès qu'un \code{undefined}, un booléen, une chaîne, une référence, un setter
+ou la sorte résiduelle \code{other} est possible. La lecture de la table,
+ligne par ligne :
+\begin{itemize}
+  \item \code{+} : numérique si les deux opérandes le sont ; concaténation
+    exacte si les deux sont des chaînes pures ; \og une chaîne\fg{} si ce sont
+    des chaînes mal connues ; $\Top$ sinon. \code{1 + "a"} donne donc
+    $\Top$ et non une chaîne : sûr, imprécis.
+  \item \code{-} et \code{*} : numériques ou $\Top$ ; \code{/} : toujours
+    $\Top$ ; \texttt{\%} et \code{**} : l'intervalle, ou $\Top$ si \code{None}.
+  \item \code{&&} et \code{||} : $\Top$. Leur valeur est rarement utilisée,
+    car le lowering les transforme en diamant de CFG
+    (\cref{chap:lowering-cfg}).
+  \item comparaisons, \code{in}, \code{instanceof} : un booléen inconnu
+    (\cref{sec:treillis-simples-plats}).
+  \item bit à bit : \code{eval_bitwise}, section suivante.
+\end{itemize}
+
+% ===========================================================================
+\section{Les opérateurs bit à bit}
+\label{sec:treillis-simples-bitwise}
+
+Le code React utilise les opérateurs bit à bit pour des drapeaux
+(\code{flags & MASK}), des hachages (\texttt{hash >{}>{}> 0}) ou des index
+(\texttt{i <{}< 1}). Jusqu'à \issue{74}, ils valaient $\Top$ ; ils sont
+maintenant modélisés à partir d'une observation simple.
+
+\begin{remarque}
+  JavaScript convertit les deux opérandes d'un opérateur bit à bit par
+  \code{ToInt32} (\code{ToUint32} pour l'opérande gauche de \texttt{>{}>{}>}) :
+  troncature vers zéro, puis réduction modulo $2^{32}$ dans
+  $[-2^{31}, 2^{31}-1]$. Le résultat est donc \emph{toujours} un entier de
+  cette plage, quels que soient les opérandes (chaînes, objets,
+  \code{undefined}\dots), et un entier de $[0, 2^{32}-1]$ pour \texttt{>{}>{}>}.
+\end{remarque}
+
+\rustsnippet[label={lst:treillis-simples-int32}]{src/domains/transfer/state_value.rs}{813}{844}{plages int32/uint32 et utilitaires}
+
+\rustsnippet[label={lst:treillis-simples-bitwise-a}]{src/domains/transfer/state_value.rs}{846}{886}{\code{eval_bitwise} : plancher, \code{&}, \code{|} et \code{^}}
+
+\rustsnippet[label={lst:treillis-simples-bitwise-b}]{src/domains/transfer/state_value.rs}{887}{939}{\code{eval_bitwise} : décalages, et \code{all_ones_above}}
+
+Le principe : un résultat \emph{plancher} (\code{int32_range} ou
+\code{uint32_range}, l.~925--928), qui ne demande aucune hypothèse sur les
+opérandes, et un résultat \emph{raffiné} quand un opérande est constant ou
+borné. Rendre la plage int32 plutôt que $\Top$ est déjà un gain : les
+composantes chaîne, booléen et référence restent à $\Bot$, et une garde sur
+le résultat reste raffinable. Cas par cas :
+\begin{itemize}
+  \item \code{x & m}, avec $m$ une constante de $[0, 2^{31}-1]$ (à gauche ou
+    à droite) : le résultat n'a que des bits de $m$, donc est dans $[0, m]$.
+  \item \code{x | y}, \code{x ^ y}, les deux opérandes positifs dans int32 :
+    le résultat ne peut pas avoir de bit au-dessus du plus haut bit possible
+    des opérandes, donc il est dans $[0, 2^n - 1]$ où $2^n - 1$ est le plus
+    petit nombre de la forme \og que des 1\fg{} au moins égal au max
+    (\code{all_ones_above}).
+  \item \texttt{x <{}< k}, $k$ constant : multiplication des bornes par $2^k$,
+    gardée seulement si le résultat ne déborde pas d'int32 (au-delà, la
+    réduction modulo $2^{32}$ rend l'opération non monotone).
+  \item \texttt{x >{}> k} : division entière par $2^k$ arrondie vers le bas,
+    monotone.
+  \item \texttt{x >{}>{}> k} : le résultat tient dans les $32 - k$ bits bas, quel
+    que soit $x$.
+  \item Un opérande $\Bot$ rend $\Bot$ (l.~857--859).
+\end{itemize}
+
+La négation bit à bit \code{~x}, qui vaut
+$-(\code{ToInt32}(x) + 1)$, est traitée à part dans les opérateurs unaires,
+avec soin :
+
+\rustsnippet[label={lst:treillis-simples-bitnot}]{src/domains/transfer/state_value.rs}{978}{993}{la négation bit à bit}
+
+La fonction est décroissante, les bornes s'échangent, et les arrondis
+\code{ceil} sur la borne haute et \code{floor} sur la borne basse encadrent
+la troncature de \code{ToInt32} sur des non-entiers : pour $x = 1{,}5$,
+$\code{ToInt32}(x) = 1$ et $\mathord{\sim} x = -2$, dans
+$[-\lceil 1{,}5\rceil - 1, -\lfloor 1{,}5 \rfloor - 1] = [-3, -2]$.
+
+\begin{exemple}{Calculs bit à bit}{treillis-simples-bitwise}
+  $[0,100] \mathbin{\&} 15 = [0,15]$. $[0,5] \mathbin{|} [0,9]$ : le max est
+  $9$, $\lfloor \log_2 9 \rfloor + 1 = 4$ bits, résultat $[0, 15]$.
+  $[3,3] \ll 2 = [12,12]$. $[0,1000] \gg 2 = [0, 250]$.
+  $x \ggg 28 \in [0, 15]$ quel que soit $x$.
+  $\mathord{\sim}[-3,4] = [-5, 2]$.
+\end{exemple}
+
+\subsection{Un faux négatif : les décalages sur des non-entiers}
+
+Les bras \texttt{<{}<} et \texttt{>{}>} supposent implicitement que les bornes de
+l'opérande sont des entiers : ils multiplient ou divisent \code{a.lo} et
+\code{a.hi} tels quels. Or \code{ToInt32} \emph{tronque} d'abord. Pour
+$x = 1{,}5$, JavaScript calcule $1{,}5 \ll 1 = \code{ToInt32}(1{,}5) \ll 1 =
+1 \ll 1 = 2$, alors que le code calcule $[1{,}5 \times 2, 1{,}5 \times 2] =
+[3,3]$, qui ne contient pas $2$. De même pour $x = -1{,}5$ :
+$-1{,}5 \gg 0 = \code{ToInt32}(-1{,}5) = -1$, alors que le code calcule
+$[\lfloor -1{,}5 \rfloor, \lfloor -1{,}5 \rfloor] = [-2, -2]$. Ce sont des
+sous-approximations, la direction interdite.
+
+Le défaut est observable de bout en bout :
+
+\begin{lstlisting}[language=TypeScript,caption={Décalages sur un état non entier (\file{/tmp/ch09/shift2.tsx}, élagué de sa ligne d'import)},label={lst:treillis-simples-shift}]
+export function ShlFloat() {
+  const [x] = useState(1.5);
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    const y = x << 1;
+    setCount(count + 3 - y);
+  }, [count]);
+  return <div>{count}</div>;
+}
+
+export function ShrFloat() {
+  const [x] = useState(-1.5);
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    const y = x >> 0;
+    setCount(count + y + 2);
+  }, [count]);
+  return <div>{count}</div>;
+}
+
+export function ShlInt() {
+  const [x] = useState(1);
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    const y = x << 1;
+    setCount(count + 3 - y);
+  }, [count]);
+  return <div>{count}</div>;
+}
+\end{lstlisting}
+
+Concrètement, les trois composants bouclent : dans \code{ShlFloat},
+\code{y} vaut $2$ et l'effet écrit \code{count + 1} ; dans \code{ShrFloat},
+\code{y} vaut $-1$ et l'effet écrit encore \code{count + 1} ; \code{ShlInt}
+est le témoin entier. L'analyseur :
+
+\begin{sortie}
+$ reactant check /tmp/ch09/shift2.tsx --show-clean
+  ShlFloat  (3 hooks)  /tmp/ch09/shift2.tsx  ✓
+  ShlInt  (3 hooks)  /tmp/ch09/shift2.tsx
+    warn   infinite-loop  [hook:1]  (line 26:2)  this effect keeps pushing state `count` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
+  ShrFloat  (3 hooks)  /tmp/ch09/shift2.tsx  ✓
+
+⚠  1 warning(s) across 1 file(s).
+\end{sortie}
+
+Pour l'analyseur, \code{y} vaut $[3,3]$ dans \code{ShlFloat} et $[-2,-2]$
+dans \code{ShrFloat} : l'effet écrit \code{count + 0}, la valeur ne change
+pas, le point fixe converge sans widening, et les deux boucles infinies sont
+déclarées sans défaut. C'est un faux négatif ; aucune issue ne le suit au
+commit étudié. La correction naturelle, centrale et d'une ligne par bras,
+consiste à tronquer les bornes avant de décaler (\code{trunc} est monotone,
+et coïncide avec \code{ToInt32} sur la plage int32), ou à exiger
+\code{is_int} ; c'est l'\cref{exo:treillis-simples-shift}.
+
+% ===========================================================================
+\section{Widening : du saut à l'infini aux seuils}
+\label{sec:treillis-simples-widening}
+
+\subsection{La chronologie d'un compteur}
+
+Le treillis des intervalles est de hauteur infinie : sans précaution, le
+point fixe de \code{Unbounded} ne termine pas. Suivons la boucle externe du
+moteur (\cref{chap:point-fixe-composant}) sur les deux compteurs du
+\cref{lst:treillis-simples-counter}. Le slot est amorcé à $[0,0]$ par
+\code{useState(0)}. À chaque tour, l'effet lit la valeur courante, écrit
+\code{count + 1}, et l'écriture est ajoutée au slot par join (mise à jour
+faible). Tant que le compteur de tours \code{iteration} reste sous
+\code{widen_threshold} (3 par défaut, \src{src/engine/fixpoint.rs}{51}{59}),
+le nouvel état remplace l'ancien ; à partir de 3, il est \emph{élargi}
+(\src{src/engine/fixpoint.rs}{514}{529}, reproduit au
+\cref{lst:interpretation-abstraite-outer-widen}) :
+
+\begin{center}
+\code{state = state.widen_to(&new_state, &thresholds)}
+\end{center}
+
+\Cref{fig:treillis-simples-chronologie} dessine les deux histoires.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[x=26mm,y=11mm]
+  \foreach \i/\t in {0/{amorçage},1/{tour 1},2/{tour 2},3/{tour 3 (widening)},4/{tour 4}} {
+    \node[etiquette] at (\i,0.9) {\t};
+  }
+  \draw[fleche] (-0.4,0.45) -- (4.5,0.45);
+  % Unbounded
+  \node[etiquette,anchor=east] at (-0.35,-0.3) {\code{Unbounded}};
+  \node[bloc] (u0) at (0,-0.3) {$[0,0]$};
+  \node[bloc] (u1) at (1,-0.3) {$[0,1]$};
+  \node[bloc] (u2) at (2,-0.3) {$[0,2]$};
+  \node[bloc,draw=ra-amber] (u3) at (3,-0.3) {$[0,+\infty]$};
+  \node[bloc] (u4) at (4,-0.3) {$[0,+\infty]$ \checkmark};
+  \draw[fleche] (u0) -- (u1); \draw[fleche] (u1) -- (u2); \draw[fleche] (u2) -- (u3); \draw[fleche] (u3) -- (u4);
+  \node[etiquette] at (3,-1.05) {$[0,2] \widen_{\{0,1\}} [0,3]$};
+  % Guarded
+  \node[etiquette,anchor=east] at (-0.35,-2.3) {\code{Guarded}};
+  \node[bloc] (g0) at (0,-2.3) {$[0,0]$};
+  \node[bloc] (g1) at (1,-2.3) {$[0,1]$};
+  \node[bloc] (g2) at (2,-2.3) {$[0,2]$};
+  \node[bloc,draw=ra-amber] (g3) at (3,-2.3) {$[0,10]$};
+  \node[bloc] (g4) at (4,-2.3) {$[0,10]$ \checkmark};
+  \draw[fleche] (g0) -- (g1); \draw[fleche] (g1) -- (g2); \draw[fleche] (g2) -- (g3); \draw[fleche] (g3) -- (g4);
+  \node[etiquette] at (3,-3.05) {$[0,2] \widen_{\{0,1,10\}} [0,3]$};
+  \node[etiquette,align=center] at (4,-3.85) {lecture $[0,10]$, garde $\Rightarrow [0,9]$,\\écriture $[1,10]$ : stable};
+\end{tikzpicture}
+\caption{Chronologie du slot \code{count} dans la boucle externe. Aux tours
+1 et 2, le nouvel état remplace l'ancien ; au tour 3 (\code{iteration = 3}),
+il est élargi à seuils : la borne haute saute au plus petit seuil
+$\ge 3$, qui est $+\infty$ pour \code{Unbounded} ($T = \{0,1\}$) et $10$ pour
+\code{Guarded} ($T = \{0,1,10\}$). Au tour 4, le nouvel état est inclus dans
+l'ancien : post-point fixe (\checkmark).}
+\label{fig:treillis-simples-chronologie}
+\end{figure}
+
+Détaillons \code{Guarded}. Tour 1 : l'effet lit $[0,0]$, la garde
+\code{count < 10} le laisse intact, l'écriture vaut $[1,1]$, le slot
+$[0,0] \join [1,1] = [0,1]$. Tour 2 : lecture $[0,1]$, écriture $[1,2]$, slot
+$[0,2]$. Tour 3 : l'état candidat est $[0,3]$ ; comme \code{iteration}
+atteint 3, on calcule $[0,2] \widen_T [0,3]$ avec $T = \{0, 1, 10\}$ (les
+littéraux du composant) : la borne haute a grandi, elle prend le plus petit
+seuil $\ge 3$, soit $10$. Tour 4 : la lecture vaut $[0,10]$, la garde la
+raffine en $[0,9]$ (\cref{sec:treillis-simples-gardes}), l'écriture vaut
+$[1,10]$, le candidat $[0,10]$ est inclus dans l'état : c'est fini. Les
+valeurs finales $[0,+\infty]$ et $[0,10]$ sont épinglées par les tests
+\code{unbounded_counter_is_flagged_and_grows_to_infinity} et
+\code{guarded_counter_converges_bounded}
+(\src{tests/widening_e2e.rs}{79}{122}). La sortie \texttt{-{}-info} en
+garde la trace :
+
+\begin{sortie}
+$ reactant check /tmp/ch09/counter.tsx --info --trace
+  Guarded  (2 hooks)  /tmp/ch09/counter.tsx
+    info   widening-info  (line 13:2)  state `count` kept changing during analysis and was approximated to converge, so findings that depend on it may be imprecise
+       → state `count` is written here [hook:1] (line 13:2)
+       → the abstract value of state `count` kept growing and was widened at iteration 3
+  Unbounded  (2 hooks)  /tmp/ch09/counter.tsx
+    warn   infinite-loop  [hook:0]  (line 5:2)  this effect keeps pushing state `count` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       → state `count` is written here [hook:1] (line 5:2)
+       → the abstract value of state `count` kept growing and was widened at iteration 3
+    info   widening-info  (line 5:2)  state `count` kept changing during analysis and was approximated to converge, so findings that depend on it may be imprecise
+       → state `count` is written here [hook:1] (line 5:2)
+       → the abstract value of state `count` kept growing and was widened at iteration 3
+
+⚠  1 warning(s) across 1 file(s).
+\end{sortie}
+
+(Sortie élaguée des lignes \texttt{verified} : \texttt{--info} liste aussi,
+pour chaque composant, les règles qui ne signalent rien.) Les deux slots ont
+été élargis au tour 3 ; seul celui d'\code{Unbounded} est
+non borné, et c'est ce que lit \regle{infinite-loop}.
+
+\subsection{Les deux opérateurs}
+
+Le widening simple (\src{src/domains/impls/interval.rs}{85}{106}) et le
+widening à seuils (\src{src/domains/impls/interval.rs}{108}{146}) ont été
+reproduits au \cref{chap:interpretation-abstraite}
+(\cref{lst:interpretation-abstraite-widen,lst:interpretation-abstraite-widen-to}),
+avec leur formule (\cref{def:widening}). Rappelons celle du second : une
+borne qui n'a pas grandi est conservée ; une borne haute qui a grandi jusqu'à
+$d$ devient $\min\{t \in T \cup \{+\infty\} \mid t \ge d\}$, une borne basse
+qui a baissé jusqu'à $c$ devient $\max\{t \in T \cup \{-\infty\} \mid t \le
+c\}$. Le code calcule ces extremums par \code{filter} puis \code{fold} à
+partir de $\pm\infty$, sans exiger que $T$ soit trié.
+
+\begin{theoreme}{\code{widen_to} est un widening}{treillis-simples-widen-to}
+  Pour tout ensemble fini $T \subseteq \mathbb{R}$ :
+  (i) $I \join J \lleq I \widen_T J$ pour tous $I, J$ ;
+  (ii) pour toute suite $J_1, J_2, \dots$, la suite $I_0$,
+  $I_{n+1} = I_n \widen_T J_{n+1}$ est ultimement stationnaire.
+\end{theoreme}
+\begin{proof}
+  (i) Si $I$ ou $J$ est $\Bot$, le code rend l'autre, qui est le join. Sinon,
+  la borne haute du résultat est $h_I$ si $h_J \le h_I$, et un $t \ge h_J$
+  sinon (seuil ou $+\infty$) : dans les deux cas elle est
+  $\ge \max(h_I, h_J)$. Symétriquement pour la borne basse. Le bit est
+  $\iota_I \wedge \iota_J$, comme le join. (ii) La borne haute de $I_n$ ne
+  décroît jamais : elle est conservée ou remplacée par un $t \ge h_{J} > h_{I_n}$.
+  Après son premier saut, elle appartient à $T \cup \{+\infty\}$, ensemble
+  fini, et chaque saut ultérieur la fait croître strictement dans cet
+  ensemble : au plus $|T| + 1$ sauts. Idem pour la borne basse. Une suite
+  dont les deux bornes cessent de changer est stationnaire.
+\end{proof}
+
+Le test \code{widen_to_is_sound_superset_of_hull}
+(\src{src/domains/impls/interval.rs}{568}{576}) vérifie (i) sur un exemple.
+Le point (ii) explique pourquoi l'ensemble des seuils doit être \emph{fini}
+et \emph{fixé} avant le point fixe : des seuils qui dépendraient des valeurs
+calculées pourraient ne jamais s'épuiser.
+
+\begin{remarque}
+  \code{widen_to} ne s'applique qu'à la composante \code{num} du produit.
+  \code{StateValue::widen_to} le dit en deux lignes : seuils pour
+  \code{num}, widening ordinaire (donc join, pour les composantes de hauteur
+  finie) pour le reste.
+\end{remarque}
+
+\rustsnippet[label={lst:treillis-simples-sv-widen-to}]{src/domains/impls/state_value.rs}{670}{676}{le widening à seuils du produit}
+
+\subsection{D'où viennent les seuils}
+
+\code{collect_thresholds} (\src{src/engine/fixpoint.rs}{1185}{1206},
+reproduit au \cref{lst:interpretation-abstraite-thresholds}) récolte une
+fois par composant les littéraux numériques du rendu, des initialiseurs de
+\code{useState}, des corps d'effets et de handlers. La descente dans les
+expressions est la suivante :
+
+\rustsnippet[label={lst:treillis-simples-collect-lits}]{src/engine/fixpoint.rs}{1212}{1224}{la récolte des littéraux, fermetures comprises}
+
+Le cas \code{FnLit} est notable : la descente structurelle ordinaire ne
+traverse pas les fermetures, mais un seuil écrit dans une fermeture
+(\code{onClick={() => n < 5 && setN(n + 1)}}) doit pouvoir borner une
+croissance gardée. Le résultat est trié et dédupliqué. Pour \code{Unbounded},
+$T = \{0, 1\}$ (l'initialiseur et l'incrément) ; pour \code{Guarded},
+$T = \{0, 1, 10\}$.
+
+\begin{piege}
+  Tout littéral numérique devient un seuil, même sans rapport avec la
+  croissance étudiée. Un \code{padding: 12} dans le rendu d'un compteur non
+  gardé ferait sauter la borne à $12$ au tour 3, puis, au tour suivant, à
+  $+\infty$ (aucun seuil $\ge 13$). La précision peut changer, jamais la
+  soundness (théorème ci-dessus), mais un seuil de plus peut retarder la
+  convergence d'un tour, et changer le numéro d'itération qu'affiche
+  \regle{widening-info}.
+\end{piege}
+
+\subsection{Le même widening dans les boucles locales}
+
+La boucle externe n'est pas le seul endroit où une valeur peut croître sans
+fin : une boucle \code{while} dans un effet en est un autre. \code{analyze_cfg}
+applique le même opérateur, avec les mêmes seuils, sur les arcs arrière du
+CFG (\src{src/engine/cfg_analyzer.rs}{97}{112}), à partir du troisième passage
+par un même en-tête (\cref{chap:cfg-analyzer-dominance}). Sur le composant
+\code{BoundedLocalLoop} de \file{tests/fixtures/widening.tsx}
+(\code{let i = 0; while (i < 5) { i = i + 1; } setTotal(i);}), l'en-tête de
+boucle voit $[0,0]$, $[0,1]$, $[0,2]$, puis $[0,2] \widen_{\{0,1,5\}} [0,3] =
+[0,5]$ ; le corps, raffiné par \code{i < 5}, écrit $[1,5]$, et l'en-tête est
+stable. La sortie de boucle, raffinée par la négation \code{i >= 5}, vaut
+$[5,5]$, et le slot \code{total} converge vers $[0,5]$
+(test \code{bounded_local_loop_is_precise},
+\src{tests/widening_e2e.rs}{125}{137}).
+
+\begin{decision}[ADR-14 --- seuils, signature inchangée, pas de narrowing]
+  \adr{14} ajoute le widening à seuils \og à la ASTRÉE\fg{} sur un ensemble
+  fini récolté une fois par composant, appliqué à la boucle externe et aux
+  arcs arrière. Deux choix de détail sont ceux du code actuel. D'abord, la
+  signature de \code{AbstractDomain::widen} n'est pas modifiée (la faire
+  porter des seuils aurait fait fuir un paramètre inutile dans tous les
+  domaines et les stores) : on ajoute \code{widen_to}, avec une
+  implémentation par défaut qui ignore les seuils. Ensuite, la partie 2 de
+  l'ADR (un opérateur \code{narrow} et une phase descendante bornée) est
+  abandonnée par la révision du 28 juin 2026 : le raffinement sur garde
+  pendant la montée et les seuils récupèrent déjà les bornes littérales, et
+  une phase descendante ne pourrait pas faire redescendre le store d'état,
+  où les écritures s'accumulent par join. L'ADR prévoyait aussi de ne
+  récolter que les littéraux des gardes et des initialiseurs ; le code en
+  récolte davantage, ce qui est sans danger. Les éléments annexes de l'ADR
+  (un type \code{WidenOutcome}) n'ont pas été réalisés : le nom n'apparaît
+  nulle part dans \file{src/}.
+\end{decision}
+
+\begin{piege}
+  Le mot \og narrowing\fg{} a deux sens. En théorie de l'interprétation
+  abstraite, c'est l'opérateur de la phase descendante, que \reactant{}
+  n'implémente pas. Dans le code, les méthodes \code{narrow_*} sont des
+  \emph{raffinements sur garde} : elles restreignent une variable sous une
+  condition de branche, pendant la montée. C'est l'objet de la section
+  suivante. \adr{14} insiste sur la distinction.
+\end{piege}
+
+% ===========================================================================
+\section{Raffinement sur gardes}
+\label{sec:treillis-simples-gardes}
+
+\subsection{Le besoin}
+
+Sans raffinement, la garde de \code{Guarded} ne sert à rien : l'effet lit
+$[0,10]$, écrit $[1,11]$, et le widening fait sauter la borne à $+\infty$.
+Il faut que, \emph{dans la branche} \code{if (count < 10)}, la variable
+\code{count} soit restreinte aux valeurs qui satisfont la condition. C'est
+le rôle des \code{narrow_*}. Leur contrat est la condition 5 de la
+\cref{def:treillis-simples-contrat} : garder au moins toutes les valeurs
+concrètes qui satisfont la condition.
+
+\subsection{Ce que fait le code : les raffinements numériques}
+
+\rustsnippet[label={lst:treillis-simples-narrow}]{src/domains/impls/interval.rs}{255}{309}{les raffinements numériques des intervalles}
+
+Pour une comparaison stricte à un littéral $v$, la borne sûre sur les réels
+est $v$ elle-même, fermée : $x < v \Rightarrow x \le v$ est vrai, et l'on ne
+peut pas représenter une borne ouverte. Sur des entiers, en revanche,
+$x < v \Rightarrow x \le \lceil v \rceil - 1$. Le code applique cette
+seconde forme seulement si \code{is_int} est prouvé. C'est tout l'intérêt
+du bit : sans lui, $[0,10]$ sous \code{count < 10} resterait $[0,10]$,
+l'écriture vaudrait $[1,11]$, et le compteur gardé ne convergerait pas vers
+une borne finie.
+
+\begin{theoreme}{Soundness des raffinements numériques}{treillis-simples-narrow}
+  Pour tout intervalle $I$ et tout littéral $v$ :
+  $\gam(I) \cap \{x \mid x < v\} \subseteq \gam(\code{narrow_lt}(I, v))$,
+  et de même pour \code{narrow_leq}, \code{narrow_gt}, \code{narrow_geq},
+  \code{narrow_eq}, \code{narrow_neq} avec leurs conditions respectives.
+\end{theoreme}
+\begin{proof}
+  \code{narrow_lt} : soit $x \in \gam(I)$ avec $x < v$. Si $I$ n'est pas
+  entier, $x \le v$ et $x \le h$, donc $x \le \min(h, v)$. Si $I$ est
+  entier, $x$ est un entier $< v$, donc $x \le \lceil v \rceil - 1$ (pour
+  $v$ entier, $\lceil v \rceil - 1 = v - 1$ ; pour $v$ non entier, le plus
+  grand entier $< v$ est $\lfloor v \rfloor = \lceil v \rceil - 1$). La
+  borne basse et le bit ne changent pas, et $x$ reste entier. Les cas
+  \code{narrow_leq} ($\lfloor v \rfloor$), \code{narrow_gt}
+  ($\lfloor v \rfloor + 1$), \code{narrow_geq} ($\lceil v \rceil$) sont
+  symétriques. \code{narrow_eq} : si $v \in [\ell, h]$, le seul $x$ possible
+  est $v$, et \code{point(v)} le contient ; sinon aucun $x$ ne convient et
+  $\Bot$ est exact. \code{narrow_neq} : rendre $I$ est toujours sûr ; rendre
+  $\Bot$ quand $I$ est le point $v$ l'est aussi, car aucun $x \neq v$ n'est
+  dans $\gam([v,v])$.
+\end{proof}
+
+\begin{exemple}{Arrondis entiers}{treillis-simples-arrondis}
+  Sur un intervalle entier $[0,9]$ : sous \code{x < 4.5}, borne
+  $\lceil 4{,}5 \rceil - 1 = 4$, résultat $[0,4]$ ; sous \code{x <= 4.5},
+  $\lfloor 4{,}5 \rfloor = 4$ ; sous \code{x > 4.5}, $\lfloor 4{,}5\rfloor +
+  1 = 5$, résultat $[5,9]$. Sur le point non entier $[1{,}7; 1{,}7]$ sous
+  \code{x < 2}, le bit est faux, la borne est $2$, et $1{,}7$ est gardé. Un
+  code qui aurait appliqué $x < 2 \Rightarrow x \le 1$ sans condition aurait
+  rendu $\Bot$ et perdu une valeur réelle ; c'était le cas avant
+  l'introduction du bit \code{is_int}, pour corriger précisément ce faux
+  négatif (tests \code{narrow_lt_float_keeps_boundary_value} et
+  \code{narrow_lt_integer_still_tightens},
+  \src{src/domains/impls/interval.rs}{587}{606}).
+\end{exemple}
+
+\code{narrow_neq} est volontairement faible : un intervalle ne peut pas être
+coupé en son milieu ($[0,5]$ privé de $3$ n'est pas convexe), si bien que
+seul le cas d'un point égal à $v$ est exploité. Il en va de même pour les
+bornes : $[0,5]$ privé de $0$ \emph{pourrait} devenir $[1,5]$ sur des
+entiers, mais le code ne le fait pas (précision non implémentée, sans
+conséquence sur la soundness).
+
+\subsection{Qui appelle les raffinements}
+
+Le moteur choisit l'opérateur à partir de la \emph{forme syntaxique} de la
+condition, dans \code{narrow_env_for_branch}
+(\cref{chap:cfg-analyzer-dominance}). Pour les comparaisons numériques :
+
+\rustsnippet[label={lst:treillis-simples-narrow-env}]{src/engine/cfg_analyzer.rs}{212}{241}{choix du raffinement numérique selon la condition et la branche}
+
+Le paramètre \code{taken} distingue la branche \og alors\fg{} (condition vraie)
+de la branche \og sinon\fg{} (condition fausse, donc négation). La négation
+de \code{x < v} est \code{x >= v}, d'où les paires croisées. Le
+\cref{tab:treillis-simples-motifs} résume tous les motifs reconnus.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{lll}
+\hline
+Condition & branche vraie & branche fausse \\
+\hline
+\code{x < v} / \code{x <= v} & \code{narrow_lt} / \code{narrow_leq} & \code{narrow_geq} / \code{narrow_gt} \\
+\code{x > v} / \code{x >= v} & \code{narrow_gt} / \code{narrow_geq} & \code{narrow_leq} / \code{narrow_lt} \\
+\code{x == v}, \code{x === v} & \code{narrow_eq} & \code{narrow_neq} \\
+\code{x != v}, \code{x !== v} & \code{narrow_neq} & \code{narrow_eq} \\
+\code{x == null} (ou \code{undefined}) & \code{narrow_keep_nullish_only} & \code{narrow_drop_null} (\code{_undef}) \\
+\code{x} & \code{narrow_truthy} & \code{narrow_falsy} \\
+\code{!x} & \code{narrow_falsy} & \code{narrow_truthy} \\
+\hline
+\end{tabular}
+\caption{Motifs reconnus par \code{narrow_env_for_branch}
+(\src{src/engine/cfg_analyzer.rs}{212}{293}) ; \code{x} est une variable,
+\code{v} un littéral numérique. L'IR confond \code{==} et \code{===}.}
+\label{tab:treillis-simples-motifs}
+\end{table}
+
+Tout autre motif laisse l'environnement inchangé, ce qui est sûr : littéral à
+gauche (\code{10 > count}), comparaison entre deux variables
+(\code{count < limit}, le faux positif du \cref{lst:interpretation-abstraite-limit}),
+comparaison à une chaîne (\code{mode === "a"}), \code{typeof x === "string"},
+conditions composées par \code{&&} ou \code{||} (qui sont des diamants de CFG,
+chaque membre étant alors une garde séparée).
+
+\begin{piege}
+  La branche fausse de \code{x < 5} applique \code{narrow_geq(5)}, la
+  négation \emph{numérique}. Or \code{undefined < 5} est faux : la branche
+  \og sinon\fg{} est prise par une valeur qui n'est pas $\ge 5$. C'est
+  pourtant sûr, parce que \code{StateValue} ne délègue la comparaison qu'à
+  sa composante \code{num} et garde toutes les autres telles quelles
+  (\src{src/domains/impls/state_value.rs}{604}{629}, avec le commentaire
+  \og \code{null < 5} est vrai en JS\fg{}). Un contributeur qui ferait
+  \og mourir\fg{} les sortes non numériques dans une branche de comparaison
+  introduirait un faux négatif.
+\end{piege}
+
+\subsection{La véracité, et une garde impossible qui n'élague rien}
+
+\code{if (n)} ne compare à rien ; la branche vraie exclut les valeurs
+\emph{falsy} de JavaScript : \code{null}, \code{undefined}, \code{0},
+\code{""}, \code{false} (et \code{NaN}, qu'aucun intervalle ne contient).
+Côté nombres, \code{narrow_truthy} délègue à \code{narrow_neq(0.0)} :
+
+\rustsnippet[label={lst:treillis-simples-truthy}]{src/domains/impls/state_value.rs}{565}{582}{le raffinement de véracité (branche vraie)}
+
+Sur un point $[0,0]$, le résultat est $\Bot$ ; sur $[0,5]$, rien ne change.
+Les composantes booléenne et chaîne sont traitées de même (\code{False}
+meurt, \code{""} est retiré de l'ensemble). Deux programmes le montrent :
+
+\begin{lstlisting}[language=TypeScript,caption={Garde de véracité (\file{/tmp/ch09/limits.tsx}, extrait)},label={lst:treillis-simples-truthy-ex}]
+export function TruthyFromZero() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    if (n) setN(n + 1);
+  }, [n]);
+  return <div>{n}</div>;
+}
+
+export function TruthyFromOne() {
+  const [n, setN] = useState(1);
+  useEffect(() => {
+    if (n) setN(n + 1);
+  }, [n]);
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+
+Dans \code{TruthyFromZero}, la branche raffine $[0,0]$ en $\Bot$, puis
+\code{n + 1} vaut $\Bot$ (l'addition absorbe $\Bot$), et l'écriture ne change
+rien : pas de boucle, conformément à la réalité (test
+\code{truthy_guarded_increment_from_zero_never_starts}). Dans
+\code{TruthyFromOne}, $[1,1]$ survit, et le compteur croît :
+
+\begin{sortie}
+$ reactant check /tmp/ch09/limits.tsx
+  TruthyFromOne  (2 hooks)  /tmp/ch09/limits.tsx
+    warn   infinite-loop  [hook:0]  (line 29:2)  this effect keeps pushing state `n` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
+  TruthyFromZero  (2 hooks)  /tmp/ch09/limits.tsx
+    warn   redundant-set-state  [hook:0]  (line 21:2)  state `n` is set to a stable value it already holds, so the update is redundant
+       (1 trace step(s), rerun with --trace)
+\end{sortie}
+
+(Sortie élaguée aux deux composants concernés.) Le \Warning{}
+\regle{redundant-set-state} sur \code{TruthyFromZero} est un faux positif :
+l'écriture n'a jamais lieu. La règle réévalue l'argument \code{n + 1} dans
+l'environnement convergé \emph{sans} le raffinement de la branche, obtient
+$[1,1]$, et conclut \og même valeur\fg{} parce que $[1,1]$ et $[0,0]$ sont tous
+deux des valeurs \og stables\fg{} (\cref{chap:regles-etat}).
+
+Enfin, un raffinement qui donne $\Bot$ ne rend pas la branche morte :
+\code{narrow_env_for_branch} remplace la variable testée dans
+l'environnement, mais le bloc reste analysé. Si l'écriture ne dépend pas de
+la variable raffinée, elle a lieu. On le voit avec une première version du
+\cref{lst:treillis-simples-shift} où l'effet s'écrit
+\texttt{const y = x <{}< 1; if (y === 2) setCount(count + 1);} : \code{y} vaut
+$[3,3]$, la garde le raffine en $\Bot$, et pourtant l'écriture
+\code{count + 1} est prise en compte (\regle{infinite-loop} tire, fichier
+\file{/tmp/ch09/shift.tsx}). Ne pas élaguer est sûr ; c'est seulement moins
+précis qu'un élagage de bloc.
+
+% ===========================================================================
+\section{Bilan : la soundness opération par opération}
+\label{sec:treillis-simples-soundness}
+
+Le \cref{tab:treillis-simples-bilan} rassemble les arguments du chapitre.
+Une opération \emph{exacte} ne perd aucune information
+($\gam(a \join b) = \gam(a) \cup \gam(b)$, ou l'analogue) ; une opération
+\emph{sound} sur-approxime ; un \emph{défaut} sous-approxime dans certains
+cas, ce qui peut produire un faux négatif.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{p{4.1cm}p{5.4cm}p{4.2cm}}
+\hline
+Opération & Argument & Statut \\
+\hline
+\code{BoolVal} : join, meet & bijection avec $\powerset(\Bool)$ & exact \\
+\code{SetterVal} : join, meet & \cref{prop:treillis-simples-flat-treillis} & sound \\
+\code{StrConst} : join, meet & \cref{prop:treillis-simples-strconst} & sound (join exact sous le seuil) \\
+concaténation de chaînes & produit cartésien, puis \code{from_set} & exact sous le seuil \\
+\code{hull}, \code{meet} des intervalles & \cref{prop:treillis-simples-interval-treillis} & sound \\
+\code{add}, \code{sub}, \code{neg} & \cref{thm:treillis-simples-arith} & sound (bornes infinies) \\
+\code{mul} & \cref{thm:treillis-simples-arith}, sauf $0 \times \pm\infty$ & \textbf{défaut} \\
+\code{rem}, \code{pow} & \cref{prop:treillis-simples-rem}, coins du quadrant & sound (valeurs finies) \\
+\code{/}, \code{&&}, \code{||} & $\Top$ & sound \\
+comparaisons, \code{in}, \code{instanceof} & \code{BoolVal::Top} & sound \\
+\code{&}, \code{|}, \code{^}, \texttt{>{}>{}>}, \code{~} & plage int32/uint32, bits & sound \\
+\texttt{<{}<}, \texttt{>{}>} & multiplication / division des bornes brutes & \textbf{défaut} (non-entiers) \\
+\code{widen}, \code{widen_to} & \cref{thm:treillis-simples-widen-to} & widening \\
+\code{narrow_lt} \dots{} \code{narrow_neq} & \cref{thm:treillis-simples-narrow} & sound \\
+\hline
+\end{tabular}
+\caption{Statut de soundness des opérations des treillis simples.}
+\label{tab:treillis-simples-bilan}
+\end{table}
+
+Deux défauts sur quatorze lignes : c'est peu, et chacun tient à une
+hypothèse implicite (pas de \code{NaN} dans un repli \code{min}/\code{max},
+des bornes entières dans un décalage). Tous deux se corrigent dans la couche
+intervalle, une fois pour toutes les règles, ce qui est l'esprit du
+projet (principes de \file{CLAUDE.md} : corriger le moteur, pas les règles).
+
+% ===========================================================================
+\section{Limites et défauts observés}
+\label{sec:treillis-simples-limites}
+
+\subsection{$0 \times \pm\infty$ : un $\Bot$ inattendu}
+
+Le repli de \code{mul} (\src{src/domains/impls/interval.rs}{180}{181})
+calcule le minimum et le maximum des quatre produits de coins avec
+\code{f64::min} et \code{f64::max}. Or ces fonctions \emph{ignorent}
+\code{NaN} : \code{f64::min(x, NaN)} vaut \code{x}. Un produit de coins
+$0 \times \pm\infty$, qui vaut \code{NaN}, est donc silencieusement écarté.
+C'est souvent sans conséquence ($[0,5] \times [0,+\infty]$ donne bien
+$[0,+\infty]$, les autres coins suffisent), mais si les \emph{quatre} coins
+sont \code{NaN}, les replis rendent leurs valeurs initiales, $+\infty$ et
+$-\infty$ : l'intervalle $[+\infty, -\infty]$, c'est-à-dire $\Bot$. Cela
+arrive pour $[0,0] \times [-\infty, +\infty]$. Or, pour tout $x$ fini,
+$0 \times x = 0$ : la valeur concrète $0$ est perdue.
+
+\begin{lstlisting}[language=TypeScript,caption={Un produit par zéro d'un état non borné (\file{/tmp/ch09/limits.tsx}, extrait)},label={lst:treillis-simples-zero}]
+export function ZeroTimesUnbounded() {
+  const [n, setN] = useState(0);
+  const [k, setK] = useState(0);
+  const z = n * 0;
+  useEffect(() => {
+    setK(k + 1 + z);
+  }, [k]);
+  return (
+    <div>
+      <button onClick={() => setN(n + 1)}>+</button>
+      <button onClick={() => setN(n - 1)}>-</button>
+      {k}
+    </div>
+  );
+}
+\end{lstlisting}
+
+Les deux handlers élargissent \code{n} dans les deux sens, vers
+$[-\infty, +\infty]$, et \code{z = n * 0} est alors évalué à $\Bot$.
+L'analyseur le laisse voir par un diagnostic contradictoire :
+
+\begin{sortie}
+$ reactant check /tmp/ch09/limits.tsx
+  ZeroTimesUnbounded  (5 hooks)  /tmp/ch09/limits.tsx
+    warn   infinite-loop  [hook:1]  (line 7:2)  this effect keeps pushing state `k` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
+    warn   missing-deps  [hook:2]  var:z  (line 7:2)  `z` is used in this effect but not in its deps array, and its value never changes between renders
+       (1 trace step(s), rerun with --trace)
+\end{sortie}
+
+\og its value never changes\fg{} est la formulation commune aux valeurs de
+stabilité $\Bot$ et \code{Stable} ; la règle, elle, ne se tait que sur
+\code{Stable}. Rejouée avec \code{const z = 0;} au lieu de
+\code{const z = n * 0;}, la même sortie ne porte plus que
+l'\regle{infinite-loop} : c'est bien le $\Bot$ de \code{z} qui produit ce
+\regle{missing-deps}. Ici la conséquence est un faux positif, et la boucle
+sur \code{k} reste détectée. La raison n'est pas que \code{n} resterait
+borné : les deux gestionnaires font grandir son intervalle des deux côtés à
+chaque tour, et il atteint bien $[-\infty,+\infty]$ (c'est ce qui rend
+\code{z} inatteignable). Mais le \code{widen_trace} qui alimente
+\regle{widening-info} n'enregistre que les élargissements de
+\code{state_from_render} et \code{state_from_effects}
+(\src{src/engine/fixpoint.rs}{514}{516}, commentaire
+\og handler widening is not a bug\fg{}) : l'élargissement de \code{n}, dû
+aux gestionnaires de clic, n'y apparaît pas, quand bien même le \code{n}
+final est bien non borné. Mais $\Bot$
+signifie \og inatteignable\fg{} : toute écriture dont la valeur dépendrait
+de \code{z} deviendrait un no-op abstrait, et une boucle réelle pourrait
+disparaître. La correction naturelle (non appliquée au commit étudié) est
+de traiter $0 \times \pm\infty$ comme $0$ (puisque $\pm\infty$ dénote
+l'absence de borne et non une valeur), ou de rendre $\Top$ dès qu'un coin
+est \code{NaN} ; c'est l'\cref{exo:treillis-simples-mul}.
+
+\subsection{\code{Infinity} comme valeur}
+
+La \cref{def:treillis-simples-intervalle} traite $\pm\infty$ comme absence
+de borne. Mais \code{useState(1e999)} amorce le slot à
+\code{point(f64::INFINITY)} $= [+\infty, +\infty]$, une vraie valeur. Suivons
+\texttt{setN(n \% 3)} : le dividende est positif, le bit est faux (un infini
+n'est pas entier), donc la borne est $\mu = 3$ et \code{rem} rend $[0, 3]$
+(\cref{lst:treillis-simples-rem-pow}). En JavaScript,
+\texttt{Infinity \% 3} vaut \code{NaN}, qui n'y est pas. Le dossier de notes a
+confirmé ce calcul par une sonde, sans effet observable sur les diagnostics
+(\code{NaN} est \code{Object.is}-égal à lui-même, la boucle s'arrête
+concrètement). \code{docs/limitations.md} ne mentionne que les \code{NaN}
+de \code{/}, de \texttt{\%} par un diviseur possiblement nul et de \code{**}
+hors du quadrant positif. L'écart est une limite de la représentation : un
+intervalle ne peut pas dire à la fois \og non borné\fg{} et \og contient
+\code{Infinity}\fg{}.
+
+\subsection{Les cycles finis}
+
+Le domaine représente l'ensemble des valeurs \emph{atteignables}, pas les
+\emph{transitions} entre valeurs. Un état qui cycle dans un ensemble fini a
+donc un point fixe abstrait fini, atteint sans widening :
+
+\begin{lstlisting}[language=TypeScript,caption={Deux cycles finis (\file{/tmp/ch09/limits.tsx}, extrait)},label={lst:treillis-simples-cycles}]
+export function ModCycle() {
+  const [i, setI] = useState(0);
+  useEffect(() => {
+    setI((i + 1) % 3);
+  }, [i]);
+  return <div>{i}</div>;
+}
+
+export function StrToggle() {
+  const [mode, setMode] = useState("a");
+  useEffect(() => {
+    setMode(mode === "a" ? "b" : "a");
+  }, [mode]);
+  return <div>{mode}</div>;
+}
+\end{lstlisting}
+
+\code{i} converge vers $[0,2]$ (\cref{ex:treillis-simples-mod}) et
+\code{mode} vers $\{\code{"a"}, \code{"b"}\}$. Or les deux composants
+bouclent concrètement : chaque écriture change la valeur (au sens
+d'\code{Object.is}), donc la dep change, donc l'effet se réexécute.
+L'analyseur les déclare sans défaut :
+
+\begin{sortie}
+$ reactant check /tmp/ch09/limits.tsx --show-clean
+  ModCycle  (2 hooks)  /tmp/ch09/limits.tsx  ✓
+  StrToggle  (2 hooks)  /tmp/ch09/limits.tsx  ✓
+  …
+\end{sortie}
+
+(Sortie élaguée aux deux composants concernés.) Le bras \og point fixe\fg{}
+de \regle{infinite-loop} exige que le slot ait été élargi et soit non borné,
+ce qui n'est pas le cas d'un cycle fini ; le bras \og churn\fg{} ne
+concerne que les références (\cref{chap:infinite-loop,chap:churn}). Aucun
+treillis de ce chapitre ne peut porter l'information manquante, qui est une
+propriété de transition (\og l'écriture diffère toujours de la valeur
+lue\fg{}) ; c'est une limite de conception. Au commit \snapshotCommit{},
+elle n'est documentée ni dans \file{docs/limitations.md}, ni par une issue
+ouverte (aucune ne correspond à une recherche sur \og cycle\fg{}).
+
+\subsection{Imprécisions assumées}
+
+Pour mémoire, les imprécisions sûres rencontrées dans le chapitre :
+comparaisons jamais évaluées (\code{1 < 2} vaut \code{BoolVal::Top}) ;
+\code{narrow_neq} et \code{narrow_truthy} incapables de couper un intervalle
+($[0,5]$ reste $[0,5]$ sous \code{if (n)}) ; raffinement limité aux motifs
+\og variable contre littéral\fg{} ; garde impossible qui n'élague pas le
+bloc ; \code{1 + "a"} évalué à $\Top$ au lieu d'une chaîne ;
+\code{!}$\Bot$ évalué à un booléen inconnu ; seuils récoltés sans
+discernement. Chacune peut produire un faux positif, aucune un faux négatif.
+
+% ===========================================================================
+\begin{resume}
+\begin{itemize}
+  \item Un domaine est un type qui implémente \code{AbstractDomain}
+    (\file{src/domains/mod.rs}) ; l'ordre est \code{PartialOrd}. Le contrat
+    implicite (\cref{def:treillis-simples-contrat}) exige que join, widening
+    et raffinements majorent ; \code{meet} n'est pas utilisé par l'analyse.
+  \item \code{flat_lattice!} (\file{src/domains/impls/mod.rs}) engendre les
+    treillis plats \code{BoolVal} (exact) et \code{SetterVal} (identité
+    exacte ou $\Top$). \code{StrConst} (\file{str_const.rs}) est un ensemble
+    d'au plus 4 chaînes, $\Top$ au-delà ; hauteur finie, \code{widen = join}.
+  \item \code{Interval} (\file{interval.rs}) : bornes \code{f64}, bit
+    \code{is_int} hors égalité, $\Bot$ multiple (tester \code{is_bottom}),
+    \code{NaN} jamais représenté. Join = enveloppe convexe.
+  \item Arithmétique : formules classiques, sound grâce à la monotonie de
+    l'arrondi ; \code{/} donne $\Top$ ; \texttt{\%} et \code{**} (commit
+    \code{548f922}) rendent \code{None} quand \code{NaN} est possible ;
+    opérateurs bit à bit bornés par int32/uint32 (\code{eval_bitwise}).
+  \item Widening à seuils (\adr{14}) : chaque borne saute au seuil le plus
+    serré parmi les littéraux du composant ; terminaison en au plus
+    $|T| + 1$ sauts par borne. Chronologie du compteur : $[0,0]$, $[0,1]$,
+    $[0,2]$, puis saut à $10$ ou à $+\infty$ au tour 3.
+  \item Raffinement sur garde : \code{narrow_*}, choisis par
+    \code{narrow_env_for_branch} selon la forme \og variable contre
+    littéral\fg{} ; le resserrement entier n'a lieu que si \code{is_int} est
+    prouvé. Pas de phase descendante.
+  \item Défauts : $0 \times \pm\infty$ donne $\Bot$ ; \texttt{<{}<} et \texttt{>{}>}
+    sur des non-entiers sous-approximent (faux négatif observé) ;
+    \code{Infinity} comme valeur ; cycles finis invisibles.
+\end{itemize}
+Le \cref{chap:statevalue-stabilite} assemble ces treillis en un produit sur
+les sortes JavaScript et y ajoute le treillis de stabilité référentielle ;
+le \cref{chap:transfert-stores} décrit l'évaluateur qui les fait vivre.
+\end{resume}
+
+\section*{Exercices}
+\addcontentsline{toc}{section}{Exercices}
+
+\begin{exercice}{Meet des treillis plats}{treillis-simples-flat-meet}
+  (a) Montrer que le \code{meet} de \code{flat_lattice!} est la plus grande
+  borne inférieure. (b) Calculer \code{True} $\meet$ \code{False} et
+  vérifier la condition 6 du contrat pour \code{BoolVal}. (c) Pourquoi le
+  bras \code{(a, b) if a == b} doit-il précéder les autres dans
+  \code{join} ?
+\end{exercice}
+\begin{solution}
+  (a) Égaux : $a$ est le plus grand minorant de $\{a\}$. L'un est $\Top$ :
+  l'autre est minorant et tout minorant commun le minore. Sinon, deux
+  intermédiaires distincts (ou un intermédiaire et $\Bot$) n'ont que $\Bot$
+  comme minorant commun. (b) $\Bot$ ; $\gam(\code{True}) \cap
+  \gam(\code{False}) = \emptyset = \gam(\Bot)$ : exact. (c) Sans lui,
+  $\Top \join \Top$ ou $m \join m$ tomberait dans le dernier bras et rendrait
+  $\Top$ : correct pour $\Top$, mais $m \join m = \Top$ serait une perte
+  de précision gratuite (un booléen toujours \code{True} deviendrait
+  inconnu au premier join).
+\end{solution}
+
+\begin{exercice}{Chaînes}{treillis-simples-str}
+  Calculer (a) $\{\code{"a"},\code{"b"}\} \join \{\code{"c"}\} \join
+  \{\code{"d"}\} \join \{\code{"e"}\}$ en associant à gauche ;
+  (b) $\{\code{"a"},\code{"b"}\} \meet \{\code{"c"}\}$ ; (c) la valeur de
+  \code{"x-" + s} pour $s = \{\code{"a"},\code{"b"}\}$, puis pour
+  $s = \{\code{"a"},\code{"b"},\code{"c"}\}$ et le préfixe
+  $\{\code{"x"},\code{"y"}\}$.
+\end{exercice}
+\begin{solution}
+  (a) $\{a,b,c\}$, puis $\{a,b,c,d\}$ (quatre éléments, encore
+  représentable), puis $\Top$ (cinq). (b) Intersection vide :
+  \code{from_set} rend $\Bot$. (c) $\{\code{"x-a"}, \code{"x-b"}\}$ ; le
+  produit $\{x,y\} \times \{a,b,c\}$ a six éléments, \code{str_set} le
+  remplace par \og une chaîne\fg{} ($\Top$ de \code{StrConst}).
+\end{solution}
+
+\begin{exercice}{Widening à seuils}{treillis-simples-widen}
+  Avec $T = \{10, 20, 100\}$, calculer $[0,5] \widen_T [0,12]$, puis
+  $[0,20] \widen_T [0,25]$, puis $[0,100] \widen_T [0,101]$, puis
+  $[0,5] \widen_T [-3,5]$. Combien de sauts la borne haute peut-elle faire au
+  plus ?
+\end{exercice}
+\begin{solution}
+  $[0,20]$ (plus petit seuil $\ge 12$) ; $[0,100]$ ; $[0,+\infty]$ (aucun
+  seuil $\ge 101$) ; $[-\infty, 5]$ (aucun seuil $\le -3$). La borne haute
+  prend ses valeurs dans $\{10, 20, 100, +\infty\}$ après le premier saut :
+  au plus $|T| + 1 = 4$ sauts.
+\end{solution}
+
+\begin{exercice}{Reste et puissance}{treillis-simples-rem-pow}
+  Calculer avec le code : $[-7,8] \mathbin{\%} [3,3]$ ;
+  $[0,9] \mathbin{\%} [-4,-2]$ ; $[1,2] \mathbin{\%} [5,5]$ ;
+  $[0,9] \mathbin{\%} [0,3]$ ; $[0,2] \mathbin{**} [0,3]$ ;
+  $[-1,2] \mathbin{**} [2,2]$. Commenter la précision du troisième.
+\end{exercice}
+\begin{solution}
+  $[-2,2]$ ($\mu = 3$, $\beta = 2$) ; $[0,3]$ ($\mu = 4$, et en effet
+  $7 \mathbin{\%} -4 = 3$) ; $[0,2]$ ; \code{None}, donc $\Top$ (diviseur
+  possiblement nul) ; coins $0^0 = 1$, $0^3 = 0$, $2^0 = 1$, $2^3 = 8$,
+  donc $[0,8]$ ; \code{None} (base possiblement négative), donc $\Top$. Le
+  troisième est sound mais imprécis : le résultat exact est $[1,2]$, mais le
+  code ne sait pas que $x \mathbin{\%} 5 = x$ quand $0 \le x < 5$ et met la
+  borne basse à $0$.
+\end{solution}
+
+\begin{exercice}{Raffinements entiers}{treillis-simples-narrow}
+  Sur $I = [0,9]$ entier, calculer les raffinements sous \code{x >= 2.5},
+  \code{x > 7}, \code{x == 12}, et sous \code{x !== 9} pour $I = [9,9]$.
+  Refaire le premier avec \code{is_int} faux. Prouver que
+  \code{narrow_gt} est sound avec \code{is_int}.
+\end{exercice}
+\begin{solution}
+  $[3,9]$ ($\lceil 2{,}5 \rceil$) ; $[8,9]$ ($\lfloor 7 \rfloor + 1$) ;
+  $\Bot$ ($12 \notin [0,9]$) ; $\Bot$ (point égal à $9$). Sans bit :
+  $[2{,}5; 9]$. Preuve : un entier $x > v$ vérifie
+  $x \ge \lfloor v \rfloor + 1$, car $\lfloor v \rfloor + 1$ est le plus petit
+  entier strictement supérieur à $v$ ; la nouvelle borne basse
+  $\max(\ell, \lfloor v \rfloor + 1)$ est donc $\le x$.
+\end{solution}
+
+\begin{exercice}{Bit à bit}{treillis-simples-bit}
+  Calculer avec \code{eval_bitwise} : $[0,300] \mathbin{\&} 255$ ;
+  $[0,5] \mathbin{\hat{}} [0,2]$ ; $[-4,4] \mathbin{|} [0,1]$ ;
+  $[100, 2^{30}] \ll 2$ ; $x \ggg 0$ pour $x$ quelconque.
+\end{exercice}
+\begin{solution}
+  $[0,255]$. $\max = 5$, $\lfloor\log_2 5\rfloor + 1 = 3$ bits : $[0,7]$.
+  Opérande gauche possiblement négatif : pas de raffinement, plage int32.
+  $2^{30} \times 4 = 2^{32}$ déborde d'int32 : plage int32. $x \ggg 0 \in
+  [0, 2^{32} - 1]$ (la plage uint32 est le raffinement même, $k = 0$).
+\end{solution}
+
+\begin{exercice}{Corriger la multiplication}{treillis-simples-mul}
+  Proposer une correction de \code{Interval::mul} pour $0 \times \pm\infty$
+  et prouver sa soundness sous l'hypothèse \og $\pm\infty$ est une absence de
+  borne\fg{}.
+\end{exercice}
+\begin{solution}
+  Calculer chaque produit de coins avec la convention $0 \times \pm\infty =
+  0$ (par exemple \code{if p.is_nan() { 0.0 } else { p }}). Preuve : soit
+  $x \in [a,b]$, $y \in [c,d]$ finis. Remplaçons une borne infinie par une
+  borne finie $M$ assez grande pour contenir $x$ et $y$ : sur le pavé fini,
+  le \cref{thm:treillis-simples-arith} s'applique, et les coins valant
+  $0 \times M = 0$ sont exactement ceux que la convention remplace ; les coins
+  $u \times M$ avec $u \neq 0$ ne sont pas plus serrés que $u \times \infty$.
+  L'intervalle corrigé contient donc $xy$. Pour $[0,0] \times
+  [-\infty,+\infty]$ il rend $[0,0]$, exact. L'alternative plus simple,
+  rendre $\Top$ si un coin est \code{NaN}, est sound mais perd
+  $[0,5] \times [0,+\infty] = [0,+\infty]$.
+\end{solution}
+
+\begin{exercice}{Corriger les décalages}{treillis-simples-shift}
+  Corriger les bras \code{Shl} et \code{Shr} d'\code{eval_bitwise} pour les
+  opérandes non entiers, et vérifier sur \code{ShlFloat} et \code{ShrFloat}
+  (\cref{lst:treillis-simples-shift}).
+\end{exercice}
+\begin{solution}
+  Sur la plage int32, $\code{ToInt32}(x) = \mathrm{trunc}(x)$, fonction
+  croissante : l'image de $[\ell, h]$ est $[\mathrm{trunc}(\ell),
+  \mathrm{trunc}(h)]$. Il suffit donc de remplacer \code{a.lo} et
+  \code{a.hi} par \code{a.lo.trunc()} et \code{a.hi.trunc()} avant de
+  multiplier ou de diviser, le reste de la preuve étant celle du cas entier
+  (multiplication par $2^k$ sans débordement, division entière par $2^k$
+  arrondie vers le bas, toutes deux croissantes). \code{ShlFloat} :
+  $\mathrm{trunc}(1{,}5) = 1$, $y = [2,2]$, l'effet écrit \code{count + 1} :
+  la boucle est vue. \code{ShrFloat} : $\mathrm{trunc}(-1{,}5) = -1$,
+  $y = [-1,-1]$, idem. La correction est centrale : toutes les règles qui
+  lisent une valeur issue d'un décalage en profitent.
+\end{solution}

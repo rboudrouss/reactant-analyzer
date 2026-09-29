@@ -1,0 +1,1760 @@
+% ---------------------------------------------------------------------------
+% Chapitre 03 — Rappels d'interprétation abstraite
+% Sources : notes/04-domains-lattices.md (§3.1, §3.3, §3.5, §4.3, §6.1, §10),
+% notes/06-engine-fixpoint.md (§4.3, §4.4, §4.9, §4.12, §6.3, §6.4, §6.16),
+% notes/09-rules-api.md (§3.3, §4.4), ADR-005, ADR-014, ADR-020, ADR-021, ADR-025.
+% Sorties observées au commit e67b10a avec `cargo run -q -- check` sur les
+% fichiers /tmp/ch03/*.tsx. Les valeurs abstraites intermédiaires viennent
+% d'une sonde hors dépôt (/tmp/ch03/probe) : `probe` réplique la boucle externe
+% de analyze_component_impl et appelle analyze_component ; `wl` réplique
+% analyze_cfg en imprimant chaque visite de bloc ; `ops` évalue les
+% opérations de domaine des exercices.
+% ---------------------------------------------------------------------------
+\chapter{Rappels d'interprétation abstraite}
+\label{chap:interpretation-abstraite}
+
+\begin{objectifs}
+  \item Comprendre pourquoi un analyseur statique \emph{approxime}, et dans quel sens il a le droit de se tromper.
+  \item Maîtriser le vocabulaire des treillis (ordre, join, meet, top, bottom, hauteur) et la concrétisation.
+  \item Savoir calculer un point fixe par itération de Kleene et par worklist, et savoir pourquoi le widening est nécessaire.
+  \item Distinguer un fait must d'un fait may, et relier cette polarité aux niveaux \Error{}, \Warning{}, \Info{}.
+  \item Connaître la dominance, l'inlining, les mises à jour fortes et faibles, et situer \reactant{} parmi ces choix.
+\end{objectifs}
+
+\prerequis{\cref{chap:introduction} et \cref{chap:react-modele} (le cycle rendu → commit → effets, le batching des setters). Aucune connaissance préalable d'analyse statique n'est supposée ; la lecture de Rust est supposée.}
+
+\section{Pourquoi approximer}
+\label{sec:interpretation-abstraite-approximer}
+
+\subsection{Une question que l'analyseur doit trancher}
+
+Partons de deux composants presque identiques. Ils sont au cœur de ce
+chapitre ; nous les suivrons jusqu'au bout.
+
+\begin{lstlisting}[language=TypeScript,caption={Deux compteurs pilotés par un effet (\file{/tmp/ch03/counter.tsx}, repris de \file{tests/fixtures/widening.tsx})},label={lst:interpretation-abstraite-counter}]
+import { useState, useEffect } from "react";
+
+export function Runaway() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    setCount(count + 1);
+  }, [count]);
+  return <div>{count}</div>;
+}
+
+export function Guarded() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    if (count < 10) setCount(count + 1);
+  }, [count]);
+  return <div>{count}</div>;
+}
+\end{lstlisting}
+
+À l'exécution (\cref{chap:react-modele}), \code{Runaway} ne s'arrête jamais :
+chaque exécution de l'effet écrit \code{count + 1}, la dep \code{count} change,
+l'effet repart. \code{Guarded} s'arrête après dix tours, quand la garde
+\code{count < 10} devient fausse. La question que l'analyseur doit trancher
+est donc : \emph{l'état \code{count} peut-il grandir sans borne ?}
+
+Regardons ce que React fait vraiment, en notant l'ensemble des valeurs que
+\code{count} prend au fil d'une exécution. Pour \code{Runaway}, c'est
+$\{0,1,2,3,\dots\} = \Nat$ ; pour \code{Guarded}, c'est $\{0,1,\dots,10\}$. Ces
+ensembles sont la réponse exacte. Si l'analyseur savait les calculer, il
+n'aurait plus qu'à demander \og est-il fini ?\fg{}.
+
+\begin{definition}{Sémantique concrète, sémantique collectrice}{semantique-concrete}
+  La \terme{sémantique concrète} d'un programme décrit ses exécutions : suites
+  d'états, un état donnant la valeur de chaque variable et de chaque slot
+  d'état. Sa \terme{sémantique collectrice} en garde l'essentiel pour un
+  analyste : pour chaque point du programme, l'\emph{ensemble} des états
+  qu'une exécution quelconque peut y atteindre. On la note $\mathcal{C}$ ; un
+  élément de $\mathcal{C}$ est une partie de l'ensemble des états.
+\end{definition}
+
+Pour \reactant{}, la sémantique concrète de référence est celle de React
+décrite au \cref{chap:react-modele} (React-tRace étendue, \adr{1}) ; un
+\og point\fg{} est un bloc du rendu, d'un effet ou d'un handler, et un état
+comprend l'environnement local et la valeur de chaque slot.
+
+\subsection{Pourquoi on ne peut pas calculer la réponse exacte}
+
+Deux obstacles s'y opposent.
+
+\begin{itemize}
+  \item \textbf{La taille.} L'ensemble des valeurs de \code{count} dans
+    \code{Runaway} est infini. On ne peut pas l'énumérer, et un ensemble quelconque
+    d'entiers n'a pas de représentation finie.
+  \item \textbf{L'indécidabilité.} Même en se limitant à des questions à
+    réponse oui/non, la réponse exacte est hors d'atteinte. Le théorème de Rice
+    affirme que toute propriété non triviale du comportement d'un programme
+    (et \og ce composant boucle\fg{} en est une) est indécidable : aucun
+    algorithme ne la tranche correctement sur tous les programmes. Un
+    composant React contient un langage Turing-complet (JavaScript) ; on ne
+    peut donc pas espérer un analyseur exact.
+\end{itemize}
+
+Il reste à renoncer à l'exactitude, mais \emph{dans un sens choisi}.
+L'\terme{interprétation abstraite}~\cite{CousotCousot77,CousotCousot79} est la
+théorie qui organise ce renoncement : on remplace les ensembles d'états par des
+\emph{descriptions} finies, calculables, qui contiennent au moins tous les états
+possibles. On calcule ces descriptions en \og exécutant\fg{} le programme sur
+elles, et l'on raisonne sur le résultat. Le manuel de Rival et
+Yi~\cite{RivalYi2020} en donne un exposé complet ; ce chapitre n'en retient que
+ce dont \reactant{} se sert, et montre à chaque fois où le code l'implémente.
+
+\subsection{Sur-approximer, et ce que cela coûte}
+
+Choisir le \og sens\fg{} de l'erreur, c'est choisir entre deux familles
+d'analyses (\cref{fig:interpretation-abstraite-approx}).
+
+\begin{itemize}
+  \item Une \terme{sur-approximation} calcule un ensemble $A$ qui
+    \emph{contient} tous les comportements possibles $\mathcal{C}$ :
+    $\mathcal{C} \subseteq A$. Si $A$ ne rencontre pas la zone des
+    comportements fautifs, le programme est correct : le silence de l'analyse
+    est une preuve. En revanche $A$ peut rencontrer la zone fautive alors que
+    $\mathcal{C}$ ne la rencontre pas : l'analyse signale un défaut qui n'existe
+    pas, c'est un \emph{faux positif}.
+  \item Une \terme{sous-approximation} calcule un ensemble contenu dans
+    $\mathcal{C}$ (c'est ce que fait un test : il exécute quelques
+    comportements). Tout défaut qu'elle trouve est réel, mais son silence ne
+    prouve rien : elle peut manquer un défaut, c'est un \emph{faux négatif}.
+\end{itemize}
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[font=\small]
+  % zone fautive
+  \fill[ra-red!12] (3.1,-1.6) rectangle (6.2,1.6);
+  \node[text=ra-red,font=\small\bfseries] at (5.35,1.25) {défaut};
+  % sur-approximation A
+  \draw[ra-amber,thick,dashed,fill=ra-amber!8] (1.2,0) ellipse (2.45 and 1.35);
+  \node[text=ra-amber,anchor=south east] at (0.2,1.25) {$A$ (abstrait)};
+  % sémantique collectrice C
+  \draw[ra-blue,thick,fill=ra-blue!15] (0.9,-0.05) ellipse (1.5 and 0.8);
+  \node[text=ra-blue] at (0.5,0) {$\mathcal{C}$ (concret)};
+  % intersection A et défaut
+  \node[etiquette,align=center] at (4.55,-0.25) {$A$ touche le défaut,\\$\mathcal{C}$ non :\\faux positif};
+  \draw[fleche] (3.9,-0.9) -- (3.4,-0.55);
+\end{tikzpicture}
+\caption{Sur-approximation. Le concret $\mathcal{C}$ (ensemble des états
+réellement atteignables) est inclus dans l'abstrait $A$. Tant que $A$ évite la
+zone de défaut, le programme est prouvé correct ; si seul $A$ la touche,
+l'analyse émet un faux positif. Jamais un défaut de $\mathcal{C}$ ne peut
+échapper à $A$.}
+\label{fig:interpretation-abstraite-approx}
+\end{figure}
+
+\reactant{} a fait le premier choix et l'a érigé en invariant (\file{CLAUDE.md}) :
+\og faux positifs tolérés, faux négatifs INTERDITS\fg{}. Nous formaliserons cette
+promesse à la \cref{sec:interpretation-abstraite-soundness}, une fois les outils
+en place. Retenons dès maintenant qu'elle a une conséquence inattendue : quand
+l'outil veut affirmer un défaut \emph{certain} (niveau \Error), il lui faut un
+autre type de raisonnement, celui des faits \emph{must}
+(\cref{sec:interpretation-abstraite-must-may}), car une sur-approximation ne
+prouve jamais qu'un comportement a lieu.
+
+\begin{remarque}
+  Le mot \og approximation\fg{} ne veut pas dire \og à peu près\fg{}. Une
+  sur-approximation est une \emph{borne} : elle est fausse au sens où elle
+  contient des états impossibles, mais vraie au sens où elle contient tous les
+  états possibles. Toute la suite du chapitre consiste à rendre cette borne
+  calculable (treillis, points fixes, widening) sans jamais la rendre fausse
+  dans l'autre sens.
+\end{remarque}
+
+\section{Ordres, treillis, top et bottom}
+\label{sec:interpretation-abstraite-treillis}
+
+\subsection{Un premier exemple : que sait-on d'un booléen ?}
+
+Soit un composant qui lit une prop booléenne \code{open}. Sans rien savoir de
+l'appelant, l'analyseur doit décrire les valeurs possibles de \code{open}. Il
+y a quatre descriptions utiles :
+\begin{itemize}
+  \item \og \code{open} ne peut valoir que \code{true}\fg{} ;
+  \item \og \code{open} ne peut valoir que \code{false}\fg{} ;
+  \item \og \code{open} peut valoir l'un ou l'autre\fg{} : on ne sait rien, c'est
+    l'information minimale, notée $\Top$ (\emph{top}) ;
+  \item \og aucune valeur n'est possible\fg{} : le point est inatteignable,
+    notée $\Bot$ (\emph{bottom}).
+\end{itemize}
+Ces descriptions sont ordonnées par la \emph{quantité de valeurs qu'elles
+admettent} : $\Bot$ en admet le moins, $\Top$ le plus ; \code{true} et
+\code{false} ne sont pas comparables. \Cref{fig:interpretation-abstraite-hasse-bool}
+dessine cet ordre : un trait montant de $a$ vers $b$ signifie \og $a$ est plus
+précis que $b$\fg{}. C'est un \terme{diagramme de Hasse}.
+
+Si un chemin du rendu donne \code{open = true} et un autre \code{open = false},
+ce que l'on sait après la jonction des deux chemins est la plus petite
+description qui admette les deux : $\Top$. Cette opération de \og réunion
+d'informations\fg{} s'appelle le \emph{join}.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[treillis,node distance=9mm and 9mm]
+  \node[label={[etiquette]right:$\gam = \emptyset$}] (bot) {$\Bot$};
+  \node[above left=of bot,label={[etiquette]left:$\{\mathtt{true}\}$}] (t) {\code{True}};
+  \node[above right=of bot,label={[etiquette]right:$\{\mathtt{false}\}$}] (f) {\code{False}};
+  \node[above right=of t,label={[etiquette]right:$\{\mathtt{true},\mathtt{false}\}$}] (top) {$\Top$};
+  \draw (bot) -- (t) -- (top) -- (f) -- (bot);
+  \begin{scope}[xshift=7.2cm]
+    \node (sbot) {$\Bot$};
+    \node[above=13mm of sbot] (s2) {\code{One(c,1)}};
+    \node[left=4mm of s2] (s1) {\code{One(c,0)}};
+    \node[right=4mm of s2] (s3) {\code{One(d,0)}};
+    \node[right=2mm of s3] (sdots) {$\cdots$};
+    \node[above=13mm of s2] (stop) {$\Top$};
+    \foreach \n in {s1,s2,s3} { \draw (sbot) -- (\n) -- (stop); }
+  \end{scope}
+\end{tikzpicture}
+\caption{Deux treillis plats. À gauche, \code{BoolVal}
+(\file{src/domains/impls/bool_val.rs}) avec la concrétisation de chaque élément
+(\cref{sec:interpretation-abstraite-concretisation}) ; à droite, \code{SetterVal}
+(\file{src/domains/impls/setter_val.rs}), dont les éléments intermédiaires
+nomment un setter précis (composant, label de hook). Deux éléments
+intermédiaires distincts sont incomparables ; leur join est $\Top$.}
+\label{fig:interpretation-abstraite-hasse-bool}
+\end{figure}
+
+\subsection{Définitions}
+
+\begin{definition}{Ordre partiel, treillis, join, meet}{treillis}
+  Un \terme{ordre partiel} sur un ensemble $L$ est une relation $\lleq$
+  réflexive, antisymétrique et transitive ; deux éléments peuvent être
+  incomparables. Pour $a, b \in L$ :
+  \begin{itemize}
+    \item le \terme{join} $a \join b$ est la plus petite borne supérieure de
+      $a$ et $b$ : $a \lleq a \join b$, $b \lleq a \join b$, et tout $c$ qui
+      majore $a$ et $b$ vérifie $a \join b \lleq c$ ;
+    \item le \terme{meet} $a \meet b$ est, dualement, la plus grande borne
+      inférieure.
+  \end{itemize}
+  $(L, \lleq)$ est un \terme{treillis} si toute paire admet un join et un meet ;
+  il est \emph{complet} si toute partie (même infinie) admet une borne
+  supérieure (notée $\bigsqcup$) et une borne inférieure. Le plus petit élément, s'il
+  existe, est le \terme{bottom} $\Bot$ ; le plus grand est le \terme{top} $\Top$.
+  Une \terme{chaîne ascendante} est une suite $x_0 \lleq x_1 \lleq \cdots$ ; la
+  \terme{hauteur} de $L$ est la longueur maximale d'une chaîne strictement
+  croissante (elle peut être infinie).
+\end{definition}
+
+En analyse, on lit l'ordre comme un ordre d'\emph{information} : $a \lleq b$
+signifie \og $a$ est plus précis que $b$\fg{}, ou \og $b$ admet au moins tous
+les comportements de $a$\fg{}. $\Bot$ décrit un point inatteignable, $\Top$ un
+point dont on ne sait rien (on dira aussi \og inconnu\fg{}). Le join est
+l'opération des \emph{jonctions} du programme (après un \code{if}, en tête de
+boucle, entre deux tours de React) : il fusionne ce que disent plusieurs
+chemins. Le meet raffinerait une information par une autre ; nous verrons que
+\reactant{} ne s'en sert presque pas.
+
+\begin{exemple}{Le treillis plat des booléens}{treillis-plat}
+  Dans \code{BoolVal}, $\code{True} \join \code{False} = \Top$,
+  $\code{True} \meet \code{False} = \Bot$, $\Top \join \code{True} = \Top$ et
+  $\Bot \lleq x \lleq \Top$ pour tout $x$. La hauteur est 2 (plus longue chaîne
+  stricte : $\Bot \sqsubset \code{True} \sqsubset \Top$). Les valeurs ont été
+  vérifiées sur le code (sonde \code{ops}, \code{True vs False = None},
+  \code{True join False = Top}).
+\end{exemple}
+
+\subsection{Ce que fait le code : le trait \code{AbstractDomain}}
+
+Dans \reactant{}, un domaine abstrait est un type Rust qui implémente le trait
+\code{AbstractDomain}. Sa tête traduit exactement la
+définition~\ref{def:treillis} :
+
+\rustsnippet[label={lst:interpretation-abstraite-abstractdomain}]{src/domains/mod.rs}{16}{38}{le trait des domaines abstraits}
+
+\begin{itemize}
+  \item \textbf{L'ordre est \code{PartialOrd}.} Le supertrait
+    \code{PartialOrd} porte l'ordre du treillis : \code{a <= b} signifie
+    $a \lleq b$, et \code{partial_cmp} rend \code{None} pour deux éléments
+    incomparables. Ce n'est pas un ordre total (\code{Ord} serait faux).
+  \item \textbf{\code{bottom}, \code{top}, \code{join}, \code{meet}} sont les
+    quatre ingrédients de la définition. \code{is_bottom} teste
+    l'inatteignabilité (un domaine peut avoir plusieurs représentations de
+    $\Bot$, c'est le cas des intervalles).
+  \item \textbf{\code{widen} et \code{widen_to}} sont les opérateurs de
+    widening de la \cref{sec:interpretation-abstraite-widening}. Par défaut
+    \code{widen_to} ignore ses seuils et délègue à \code{widen}.
+  \item \textbf{\code{PartialEq}} sert au test de convergence des points
+    fixes.
+\end{itemize}
+
+\begin{piege}
+  Le commentaire en tête du trait annonce \code{Clone + Copy}, mais la borne
+  réelle est \code{Clone + PartialEq + PartialOrd + Debug} : pas de
+  \code{Copy}. Le commentaire date d'avant le domaine produit (\adr{15}) et la
+  stabilité versionnée (\adr{17}), dont les valeurs contiennent des ensembles.
+  Se fier à la ligne \code{pub trait}, pas au commentaire.
+\end{piege}
+
+Le domaine le plus simple du code est le treillis plat des booléens :
+
+\rustsnippet[label={lst:interpretation-abstraite-boolval}]{src/domains/impls/bool_val.rs}{1}{13}{\code{BoolVal}, un treillis plat}
+
+La macro \code{flat_lattice!} engendre l'ordre et les opérations de tout
+treillis plat (un $\Bot$, un $\Top$, des éléments intermédiaires deux à deux
+incomparables). Son \code{partial_cmp} et son \code{join} sont la
+définition~\ref{def:treillis} écrite en \code{match} :
+
+\rustsnippet[label={lst:interpretation-abstraite-flat}]{src/domains/impls/mod.rs}{10}{40}{la macro \code{flat_lattice!} (ordre et join)}
+
+L'ordre des bras compte : l'égalité est testée d'abord, puis
+\og $\Bot$ à gauche ou $\Top$ à droite\fg{} (donc \code{Less}) ; le cas
+$(\Bot, \Top)$ tombe ainsi sur \code{Less}. Deux éléments intermédiaires
+différents n'ont aucun bras : \code{None}. Le join suit le même schéma : égaux,
+on garde ; l'un est $\Bot$, on garde l'autre ; sinon $\Top$. Le \code{meet}
+(\src{src/domains/impls/mod.rs}{41}{47}) est le dual, et \code{widen} est le join
+(\src{src/domains/impls/mod.rs}{48}{50}) : un treillis de hauteur finie n'a pas
+besoin de mieux (\cref{sec:interpretation-abstraite-widening}).
+
+Les stores comparent leurs valeurs slot par slot avec un seul utilitaire, qui
+dit bien que l'ordre est partiel :
+
+\rustsnippet[label={lst:interpretation-abstraite-leq-pointwise}]{src/domains/stores/mod.rs}{19}{25}{$a \lleq b$ dans un ordre partiel}
+
+\begin{piege}
+  Écrire \code{!(a > b)} pour tester $a \lleq b$ est faux dans un ordre
+  partiel : deux éléments incomparables ne sont ni \code{>} ni \code{<=}.
+  \code{leq_pointwise} ne retient que \code{Less} ou \code{Equal}, et un
+  couple incomparable n'est donc \emph{pas} considéré comme convergé.
+\end{piege}
+
+\subsection{Autres treillis du projet, en un coup d'œil}
+
+Le \cref{chap:treillis-simples} détaillera les domaines de base ; il suffit ici
+d'en connaître la forme.
+\begin{itemize}
+  \item \code{SetterVal} : treillis plat dont les éléments intermédiaires sont
+    les setters \code{One(ComponentId, HookLabel)}
+    (\cref{fig:interpretation-abstraite-hasse-bool}, à droite).
+  \item \code{StrConst} : ensembles d'au plus quatre chaînes constantes, ordonnés
+    par inclusion, avec $\Top$ au-delà ; hauteur finie.
+  \item \code{Interval} : intervalles de nombres, ordonnés par inclusion ;
+    hauteur \emph{infinie} (\cref{sec:interpretation-abstraite-compteur}).
+  \item \code{Stability} : la stabilité référentielle versionnée d'\adr{17}
+    (\cref{chap:statevalue-stabilite}).
+  \item \code{StateValue} : le produit des précédents, une composante par sorte
+    de valeur JavaScript (\adr{15}). Un produit de treillis est un treillis,
+    ordonné composante par composante.
+\end{itemize}
+
+\section{Concrétisation et correction}
+\label{sec:interpretation-abstraite-concretisation}
+
+\subsection{Ce que \og veut dire\fg{} une valeur abstraite}
+
+Dans \code{Guarded}, l'analyseur finit par attribuer à \code{count}
+l'intervalle $[0,10]$. Pour que cette phrase soit une affirmation vérifiable,
+il faut dire \emph{quels nombres} elle autorise : les entiers de $0$ à $10$. La
+fonction qui associe à chaque valeur abstraite l'ensemble des valeurs concrètes
+qu'elle décrit est la concrétisation.
+
+\begin{definition}{Concrétisation, abstraction, correction}{concretisation}
+  Soit $(L, \lleq)$ un domaine abstrait et $\mathcal{D}$ l'ensemble des
+  valeurs (ou des états) concrets. La \terme{concrétisation}
+  $\gam : L \to \powerset(\mathcal{D})$ associe à chaque valeur abstraite
+  l'ensemble des valeurs concrètes qu'elle représente. Elle est
+  \emph{monotone} : $a \lleq b \Rightarrow \gam(a) \subseteq \gam(b)$. On
+  demande $\gam(\Bot) = \emptyset$ et, souvent, $\gam(\Top) = \mathcal{D}$.
+
+  Une \terme{abstraction} $\abs : \powerset(\mathcal{D}) \to L$ associe à un
+  ensemble concret la meilleure description disponible. Quand
+  $\abs(X) \lleq a \iff X \subseteq \gam(a)$, le couple $(\abs, \gam)$ est une
+  \terme{correspondance de Galois}.
+
+  Une opération abstraite $f^\sharp : L \to L$ est \terme{correcte} vis-à-vis
+  d'une opération concrète $f$ si, pour tout $a$,
+  $f(\gam(a)) \subseteq \gam(f^\sharp(a))$ : ce que $f$ peut produire à partir
+  de valeurs décrites par $a$ est décrit par $f^\sharp(a)$. Pour le join :
+  $\gam(a) \cup \gam(b) \subseteq \gam(a \join b)$.
+\end{definition}
+
+La condition de correction est la seule qui compte pour la soundness : une
+opération abstraite peut être imprécise (rendre plus que nécessaire), jamais
+rendre moins. Une abstraction $\abs$ n'est qu'une commodité de présentation :
+\reactant{} ne définit aucune fonction $\abs$ générale. Il abstrait les
+littéraux au cas par cas (\code{Interval::point(0.0)} pour \code{0}) et calcule
+tout le reste par des opérations abstraites ; $\gam$ n'apparaît, lui, que dans
+les commentaires du code, sous forme de phrases.
+
+\begin{exemple}{Deux concrétisations}{gamma}
+  \begin{itemize}
+    \item \code{BoolVal} : $\gam(\Bot) = \emptyset$,
+      $\gam(\code{True}) = \{\mathtt{true}\}$,
+      $\gam(\code{False}) = \{\mathtt{false}\}$,
+      $\gam(\Top) = \{\mathtt{true}, \mathtt{false}\}$. Ici $\gam$ est une
+      bijection avec les parties de $\{\mathtt{true},\mathtt{false}\}$ ; le
+      join est \emph{exact} : $\gam(a \join b) = \gam(a) \cup \gam(b)$.
+    \item \code{Interval} : $\gam([a,b]) = \{x \mid a \le x \le b\}$, restreint
+      aux entiers si l'intervalle est marqué entier. Le join
+      $[0,0] \join [10,10] = [0,10]$ est correct
+      ($\{0\} \cup \{10\} \subseteq \gam([0,10])$) mais \emph{pas} exact :
+      $\gam([0,10])$ contient aussi $1, \dots, 9$. C'est la perte de précision
+      inhérente à un domaine convexe.
+  \end{itemize}
+\end{exemple}
+
+\subsection{Ce que fait le code : l'intervalle}
+
+La structure \code{Interval} documente sa propre concrétisation :
+
+\rustsnippet[label={lst:interpretation-abstraite-interval}]{src/domains/impls/interval.rs}{5}{27}{les intervalles et leur concrétisation}
+
+\begin{itemize}
+  \item \code{lo}, \code{hi} : bornes fermées, en \code{f64} ; $\pm\infty$
+    représente l'absence de borne. Un intervalle avec \code{lo > hi} est
+    $\Bot$ (vide).
+  \item \code{is_int} : \og toute valeur concrète est entière\fg{}. C'est une
+    annotation de \emph{précision} : elle autorise le raffinement
+    $x < 5 \Rightarrow x \le 4$, que nous retrouverons avec le widening. Elle
+    est volontairement exclue de l'égalité (et de l'ordre) : le point fixe
+    converge quelles que soient les valeurs de ce bit.
+\end{itemize}
+
+Le join des intervalles est l'enveloppe convexe (\emph{hull}) :
+
+\rustsnippet[label={lst:interpretation-abstraite-hull}]{src/domains/impls/interval.rs}{69}{83}{le join des intervalles}
+
+Sa correction se lit ligne à ligne : si $x \in \gam(a)$, alors
+$\min(a.lo, b.lo) \le a.lo \le x \le a.hi \le \max(a.hi, b.hi)$ ; et si les deux
+opérandes ne contiennent que des entiers, leur réunion aussi. Les deux premiers
+tests traitent $\Bot$ comme élément neutre, ce que demande
+$\gam(\Bot) = \emptyset$.
+
+\begin{piege}
+  $\Bot$ a plusieurs représentations. Le $\Bot$ canonique est
+  $[+\infty, -\infty]$, mais un raffinement peut produire, par exemple,
+  $[5, 0]$ (c'est ce que la sonde \code{wl} observe dans la boucle de la
+  \cref{sec:interpretation-abstraite-point-fixe}). Les combinateurs testent
+  \code{is_bottom()} d'abord et restent corrects ; en revanche
+  \code{PartialEq} et \code{PartialOrd} comparent les bornes brutes, et
+  $[5,0] \neq [5,1]$ pour eux alors que les deux sont vides. Conséquence
+  pratique : une worklist peut revisiter un bloc inatteignable pour rien.
+  C'est une imprécision de performance, pas une faute de soundness.
+\end{piege}
+
+\subsection{\og Absent\fg{} vaut $\Top$ ou $\Bot$ selon le contexte}
+
+Deux conteneurs de \reactant{} donnent une valeur par défaut aux clefs
+absentes, et ils ne donnent pas la même.
+
+\rustsnippet[label={lst:interpretation-abstraite-lookup}]{src/domains/stores/abstract_env.rs}{78}{81}{une variable inconnue vaut $\Top$}
+
+\rustsnippet[label={lst:interpretation-abstraite-store-get}]{src/domains/stores/state_store.rs}{24}{27}{un slot jamais écrit vaut $\Bot$}
+
+Les deux choix sont corrects, parce que les deux questions diffèrent. Une
+variable que l'environnement ne connaît pas (un import non résolu, un global
+du navigateur) peut valoir n'importe quoi : répondre autre chose que $\Top$
+inventerait une information. Un slot d'état, au contraire, ne reçoit de valeur
+que par ses écritures ; le store accumule ces écritures par join à partir de
+$\Bot$, et le moteur l'amorce dès le départ avec la valeur initiale de chaque
+\code{useState} (\cref{chap:point-fixe-composant}). \og Pas d'écriture
+vue\fg{} y signifie \og pas de valeur ajoutée\fg{}, donc $\Bot$.
+
+\begin{piege}
+  Confondre les deux conventions est une source classique de faux négatif :
+  lire un slot absent comme $\Bot$ \emph{dans une règle} reviendrait à dire
+  \og cet état ne prend aucune valeur\fg{}, donc \og il ne change pas\fg{}. Les
+  règles lisent l'état convergé, où tout slot a été amorcé ; hors de ce cadre,
+  une absence est une absence d'information, et l'information minimale est
+  $\Top$.
+\end{piege}
+
+\section{Exemple filé : le compteur en intervalles}
+\label{sec:interpretation-abstraite-compteur}
+
+\subsection{Le treillis des intervalles}
+
+Pour répondre à la question de la
+\cref{sec:interpretation-abstraite-approximer}, un domaine qui décrit des
+ensembles de nombres par leurs bornes suffit : le treillis des intervalles
+(\cref{fig:interpretation-abstraite-hasse-intervalles}). Son ordre est
+l'inclusion, $[a,b] \lleq [c,d] \iff c \le a \wedge b \le d$
+(\src{src/domains/impls/interval.rs}{312}{328}) ; son join est l'enveloppe
+convexe, son meet l'intersection. Deux intervalles qui se chevauchent sans
+s'inclure, comme $[1,3]$ et $[2,9]$, sont incomparables (\code{partial_cmp}
+rend \code{None}, vérifié avec la sonde \code{ops}).
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[treillis,x=13mm,y=11mm]
+  \node (bot) at (1,0) {$\Bot$};
+  \node (p0) at (0,1) {$[0,0]$};
+  \node (p1) at (1,1) {$[1,1]$};
+  \node (p2) at (2,1) {$[2,2]$};
+  \node (pd) at (3,1) {$\cdots$};
+  \node (a01) at (0.5,2) {$[0,1]$};
+  \node (a12) at (1.5,2) {$[1,2]$};
+  \node (a02) at (1,3) {$[0,2]$};
+  \node (dots) at (1,4) {$\vdots$};
+  \node (a0i) at (1,5) {$[0,+\infty]$};
+  \node (ami) at (-0.6,5) {$[-\infty,0]$};
+  \node (top) at (0.2,6) {$\Top = [-\infty,+\infty]$};
+  \draw (bot) -- (p0); \draw (bot) -- (p1); \draw (bot) -- (p2);
+  \draw (p0) -- (a01); \draw (p1) -- (a01); \draw (p1) -- (a12); \draw (p2) -- (a12);
+  \draw (a01) -- (a02); \draw (a12) -- (a02);
+  \draw (a02) -- (dots); \draw (dots) -- (a0i);
+  \draw (a0i) -- (top); \draw (ami) -- (top);
+  \draw[dotted] (p0) -- (ami);
+  \draw[ra-blue,very thick,->] (2.3,1.2) -- node[right,etiquette,align=left]{chaîne ascendante\\infinie $[0,0] \lleq [0,1] \lleq [0,2] \lleq \cdots$} (2.3,4.8);
+\end{tikzpicture}
+\caption{Le treillis des intervalles, tronqué. Un intervalle est au-dessus de
+ceux qu'il contient. La chaîne $[0,0] \lleq [0,1] \lleq [0,2] \lleq \cdots$ ne
+s'arrête jamais : la hauteur est infinie, ce qui obligera au widening
+(\cref{sec:interpretation-abstraite-widening}).}
+\label{fig:interpretation-abstraite-hasse-intervalles}
+\end{figure}
+
+Les opérations arithmétiques se relèvent borne à borne. Pour l'addition,
+$[a,b] + [c,d] = [a+c, b+d]$ : si $x \in [a,b]$ et $y \in [c,d]$, alors
+$a + c \le x + y \le b + d$. Le code est la formule
+(\src{src/domains/impls/interval.rs}{148}{157}), précédée du cas $\Bot$ : une
+somme dont un opérande est inatteignable est inatteignable.
+
+\subsection{Un tour abstrait de \code{Runaway}}
+
+Exécutons \og à la main\fg{} un tour de React sur des intervalles, comme le
+fait le moteur (\cref{chap:point-fixe-composant} donnera le détail).
+\begin{enumerate}
+  \item \textbf{Amorçage.} \code{useState(0)} : le slot 0 (\code{count}) vaut
+    $[0,0]$.
+  \item \textbf{Rendu.} La variable \code{count} lit le slot : $[0,0]$. Le
+    rendu n'écrit aucun état.
+  \item \textbf{Effet.} Le corps évalue \code{count + 1}, soit
+    $[0,0] + [1,1] = [1,1]$, et appelle le setter.
+  \item \textbf{Écriture.} Le setter \emph{ne remplace pas} la valeur du slot :
+    il la joint, $[0,0] \join [1,1] = [0,1]$. Nous justifierons ce choix à la
+    \cref{sec:interpretation-abstraite-mises-a-jour} ; retenons que le slot
+    décrit toutes les valeurs que \code{count} a pu prendre jusqu'ici.
+\end{enumerate}
+Au tour suivant, le rendu lit $[0,1]$, l'effet écrit $[1,2]$, le slot devient
+$[0,2]$, et ainsi de suite. Au tour $k$ (en partant de 0), le slot vaut
+$[0, k+1]$ : c'est exactement l'ensemble des valeurs que React donne à
+\code{count} au cours des $k+1$ premières exécutions de l'effet. Chaque tour
+abstrait est correct (il contient ce que React peut faire), mais la suite ne
+se stabilise jamais.
+
+Pour \code{Guarded}, un ingrédient s'ajoute : la garde. Sur la branche
+\og vraie\fg{} de \code{count < 10}, l'analyseur sait que \code{count} est
+strictement inférieur à 10 ; sur un intervalle d'entiers, il le
+\emph{raffine} en $[0,k] \meet [-\infty, 9]$ (le code calcule ce meet
+directement, par \code{Interval::narrow_lt}). C'est le \terme{raffinement de
+garde} (\code{narrow_env_for_branch}, \cref{chap:cfg-analyzer-dominance}). Tant
+que $k < 10$, le raffinement ne change rien. Au tour où le slot vaut
+$[0,10]$, la branche vraie ne voit plus que $[0,9]$, l'effet écrit $[1,10]$, et
+$[0,10] \join [1,10] = [0,10]$ : le tour n'ajoute plus rien.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}rllll@{}}
+  \toprule
+  tour & \multicolumn{2}{l}{\code{Runaway}} & \multicolumn{2}{l}{\code{Guarded}} \\
+  \cmidrule(lr){2-3}\cmidrule(lr){4-5}
+       & slot lu & slot après le tour & slot lu & slot après le tour \\
+  \midrule
+  0 & $[0,0]$ & $[0,1]$ & $[0,0]$ & $[0,1]$ \\
+  1 & $[0,1]$ & $[0,2]$ & $[0,1]$ & $[0,2]$ \\
+  2 & $[0,2]$ & $[0,3]$ & $[0,2]$ & $[0,3]$ \\
+  $\vdots$ & & & & \\
+  9 & $[0,9]$ & $[0,10]$ & $[0,9]$ & $[0,10]$ \\
+  10 & $[0,10]$ & $[0,11]$ & $[0,10]$ & $[0,10]$ \quad(stable) \\
+  $\vdots$ & & & & \\
+  29 & $[0,29]$ & $[0,30]$ & & \\
+  \bottomrule
+\end{tabular}
+\caption{Les tours abstraits des deux compteurs \emph{sans widening}. Valeurs
+observées avec la sonde \code{probe}, qui réplique la boucle externe du moteur
+(\src{src/engine/fixpoint.rs}{355}{530}) en désactivant le widening
+(\code{WT=1000}) : \code{Guarded} s'arrête au tour 10, \code{Runaway} croît
+encore au tour 29, dernier tour exécuté par la sonde.}
+\label{tab:interpretation-abstraite-tours}
+\end{table}
+
+\Cref{tab:interpretation-abstraite-tours} pose les deux questions des sections
+suivantes. D'abord : quand la suite \emph{se stabilise}, comme pour
+\code{Guarded}, pourquoi l'intervalle obtenu est-il une réponse correcte ? C'est
+la théorie du point fixe (\cref{sec:interpretation-abstraite-point-fixe}).
+Ensuite : quand elle \emph{ne se stabilise pas}, comme pour \code{Runaway}, comment
+s'arrêter en temps fini sans perdre la correction ? C'est le widening
+(\cref{sec:interpretation-abstraite-widening}).
+
+\section{Transfert, équations de flot, point fixe}
+\label{sec:interpretation-abstraite-point-fixe}
+
+\subsection{Une boucle locale}
+
+Le compteur de la section précédente itère sur les \emph{tours de React}.
+Une boucle écrite dans le code pose le même problème à plus petite échelle,
+à l'intérieur d'un seul corps de fonction. Le programme suivant est repris de
+la fixture \file{tests/fixtures/widening.tsx} :
+
+\begin{lstlisting}[language=TypeScript,caption={Une boucle bornée dans un effet (\file{/tmp/ch03/loop.tsx}, identique à \code{BoundedLocalLoop} de \file{tests/fixtures/widening.tsx})},label={lst:interpretation-abstraite-loop}]
+import { useState, useEffect } from "react";
+
+export function BoundedLocalLoop() {
+  const [total, setTotal] = useState(0);
+  useEffect(() => {
+    let i = 0;
+    while (i < 5) {
+      i = i + 1;
+    }
+    setTotal(i);
+  }, []);
+  return <div>{total}</div>;
+}
+\end{lstlisting}
+
+Concrètement, \code{i} vaut $0, 1, \dots, 5$ en tête de boucle et $5$ à la
+sortie ; l'effet écrit $5$. L'analyseur doit retrouver au moins cela, sans
+exécuter la boucle un nombre de fois qu'il ne connaît pas à l'avance. Le
+\cref{chap:lowering-cfg} explique comment le corps de l'effet devient un
+graphe de flot de contrôle (CFG, \cref{def:cfg}) ;
+\cref{fig:interpretation-abstraite-cfg-loop} en donne la forme.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=7mm and 16mm]
+  \node[cfgbloc] (b0) {$B_0$ (entrée)\\let i = 0};
+  \node[cfgbloc,below=of b0] (b1) {$B_1$ (en-tête)\\branch i < 5};
+  \node[cfgbloc,below left=of b1] (b2) {$B_2$ (corps)\\i = i + 1};
+  \node[cfgbloc,below right=of b1] (b3) {$B_3$ (sortie)\\setTotal(i)\\return};
+  \draw[fleche] (b0) -- (b1);
+  \draw[fleche] (b1) -- node[etiquette,left]{vrai} (b2);
+  \draw[fleche] (b1) -- node[etiquette,right]{faux} (b3);
+  \draw[flechemay] (b2.west) to[out=150,in=180] node[etiquette,left]{\code{Back}} (b1.west);
+\end{tikzpicture}
+\caption{CFG schématique du corps de l'effet de
+\cref{lst:interpretation-abstraite-loop}. L'arc en pointillés est l'arc arrière
+de la boucle ; le lowering le marque \code{EdgeKind::Back}
+(\cref{chap:lowering-cfg}). La numérotation des blocs est celle de l'exposé,
+pas nécessairement celle du lowering.}
+\label{fig:interpretation-abstraite-cfg-loop}
+\end{figure}
+
+\subsection{Fonctions de transfert}
+
+À chaque bloc, l'analyseur associe une \terme{fonction de transfert}
+abstraite : elle prend la valeur abstraite à l'entrée du bloc (ici, un
+environnement qui donne un intervalle à \code{i}) et rend celle de la
+sortie. Pour $B_2$, \code{i = i + 1} devient
+$f_2^\sharp(\rho) = \rho[\code{i} \mapsto \rho(\code{i}) + [1,1]]$, avec
+l'addition d'intervalles de la \cref{sec:interpretation-abstraite-compteur}.
+Pour une arête issue d'une garde, la fonction de transfert est le
+raffinement : sur l'arête \og vrai\fg{} de $B_1$, $\rho(\code{i})$ devient
+$\rho(\code{i}) \meet [-\infty, 4]$ (\code{i} est entier), sur l'arête
+\og faux\fg{}, $\rho(\code{i}) \meet [5, +\infty]$.
+
+\begin{definition}{Fonction monotone, fonction correcte}{transfert}
+  Une fonction $f^\sharp : L \to L$ est \terme{monotone} si
+  $a \lleq b \Rightarrow f^\sharp(a) \lleq f^\sharp(b)$ : plus d'information en
+  entrée ne donne pas moins d'information en sortie. Elle est
+  \emph{correcte} vis-à-vis de l'instruction concrète $f$ au sens de la
+  \cref{def:concretisation} : $f(\gam(a)) \subseteq \gam(f^\sharp(a))$.
+\end{definition}
+
+L'addition d'intervalles est monotone et correcte (la preuve tient en une
+ligne, donnée plus haut). Le raffinement de garde est correct parce qu'il ne
+retire que des valeurs pour lesquelles la garde est fausse. La monotonie
+est la propriété confortable des manuels ; la correction est la seule dont
+dépend la soundness, et c'est elle que les commentaires du code revendiquent
+(\og \emph{Sound: result ⊒ self.hull(other)}\fg{} sur
+\code{widen_to}, \src{src/domains/impls/interval.rs}{108}{113}).
+
+\subsection{Équations de flot}
+
+Posons une inconnue $X_i$ par bloc, la valeur abstraite à son entrée. Le CFG
+donne directement un système d'équations :
+\[
+\begin{aligned}
+  X_0 &= \rho_0 \quad \text{(l'environnement d'entrée de l'effet)}\\
+  X_1 &= f_0^\sharp(X_0) \;\join\; f_2^\sharp(X_2)\\
+  X_2 &= \mathit{vrai}^\sharp_{\code{i<5}}\big(X_1\big)\\
+  X_3 &= \mathit{faux}^\sharp_{\code{i<5}}\big(X_1\big)
+\end{aligned}
+\]
+L'en-tête $B_1$ a deux prédécesseurs : l'entrée et l'arc arrière. Son
+équation les \emph{joint}. Regroupons les inconnues en un vecteur
+$X = (X_0, \dots, X_3)$ et les membres droits en une fonction $F^\sharp$ ; le
+système s'écrit $X = F^\sharp(X)$. Une solution est un \emph{point fixe} de
+$F^\sharp$.
+
+\begin{definition}{Point fixe, post-point fixe, itération de Kleene}{point-fixe}
+  Soit $F : L \to L$ sur un treillis $L$. Un \terme{point fixe} est un $x$ tel
+  que $F(x) = x$ ; le \terme{plus petit point fixe} se note $\lfp F$. Un
+  \terme{post-point fixe} est un $x$ tel que $F(x) \lleq x$ : appliquer $F$
+  n'ajoute plus rien. L'\terme{itération de Kleene} est la suite
+  \[ x_0 = \Bot, \qquad x_{n+1} = F(x_n) \;(\text{ou, en accumulant, } x_n \join F(x_n)). \]
+\end{definition}
+
+\begin{theoreme}{Tarski, Kleene}{kleene}
+  Si $L$ est un treillis complet et $F$ monotone, alors $F$ a un plus petit
+  point fixe, et c'est le plus petit post-point fixe :
+  $\lfp F$ est la borne inférieure de $\{ x \mid F(x) \lleq x \}$ (Tarski). Si de plus $F$
+  préserve les bornes supérieures des chaînes, la suite de Kleene est
+  croissante et $\lfp F = \bigsqcup_{n} x_n$ ; si $L$ est de hauteur finie,
+  elle atteint $\lfp F$ en un nombre fini de pas.
+\end{theoreme}
+
+La conséquence qui compte pour un analyseur est la suivante.
+
+\begin{theoreme}{Un post-point fixe abstrait est sound}{post-point-fixe}
+  Soit $F$ la fonction concrète de la sémantique collectrice (sur les parties
+  d'états) et $F^\sharp$ une fonction abstraite correcte :
+  $F(\gam(a)) \subseteq \gam(F^\sharp(a))$ pour tout $a$. Si $a$ est un
+  post-point fixe de $F^\sharp$, alors $\lfp F \subseteq \gam(a)$.
+\end{theoreme}
+
+\noindent\emph{Preuve.} Par correction puis monotonie de $\gam$,
+$F(\gam(a)) \subseteq \gam(F^\sharp(a)) \subseteq \gam(a)$ : $\gam(a)$ est un
+post-point fixe de $F$, donc il contient le plus petit (Tarski). \qed
+
+Ce théorème est précieux parce qu'il ne demande \emph{ni} que $F^\sharp$ soit
+monotone, \emph{ni} que $a$ soit le plus petit point fixe abstrait. Il suffit
+de s'arrêter sur un $a$ tel que $F^\sharp(a) \lleq a$ : on peut y arriver par
+n'importe quel chemin, y compris en sautant des étapes (c'est ce que fera le
+widening). Tout le moteur de \reactant{} repose sur ce seul test ;
+\cref{alg:interpretation-abstraite-kleene} en donne la forme la plus simple.
+
+\begin{algorithm}[htbp]
+\KwIn{$F^\sharp : L \to L$}
+\KwOut{un post-point fixe $x$ de $F^\sharp$}
+$x \gets \Bot$\;
+\Repeat{$y \lleq x$}{
+  $y \gets F^\sharp(x)$\;
+  \lIf{$y \lleq x$}{\Return{$x$}}
+  $x \gets x \join y$\;
+}
+\caption{Itération de Kleene (forme accumulante)}
+\label{alg:interpretation-abstraite-kleene}
+\end{algorithm}
+
+\subsection{La worklist : n'itérer que ce qui change}
+
+Itérer $F^\sharp$ en bloc recalcule tous les blocs à chaque pas, même ceux
+dont l'entrée n'a pas bougé. Une \terme{worklist} ne recalcule qu'un bloc dont
+l'entrée a changé, et ne propage qu'aux successeurs concernés
+(\cref{alg:interpretation-abstraite-worklist}). C'est une stratégie
+d'itération chaotique : elle calcule le même résultat que Kleene quand $F^\sharp$
+est monotone et le domaine de hauteur finie, avec beaucoup moins de travail.
+
+\begin{algorithm}[htbp]
+\KwIn{un CFG, un environnement d'entrée $\rho_0$, un seuil $k$}
+\KwOut{l'environnement de sortie de chaque bloc atteint}
+$\mathit{In}[\mathit{entry}] \gets \rho_0$ ; $W \gets [\mathit{entry}]$\;
+\While{$W$ non vide}{
+  $b \gets$ tête de $W$ (FIFO)\;
+  $\mathit{Out}[b] \gets f_b^\sharp(\mathit{In}[b])$\;
+  \ForEach{successeur $s$ de $b$, avec l'environnement raffiné $\rho_s$}{
+    \uIf{$\mathit{In}[s]$ absent}{$\nu \gets \rho_s$\;}
+    \uElseIf{$b \to s$ est un arc arrière et c'est son $k$-ième passage ou plus}{$\nu \gets \mathit{In}[s] \widen \rho_s$\;}
+    \Else{$\nu \gets \mathit{In}[s] \join \rho_s$\;}
+    \lIf{$\nu \neq \mathit{In}[s]$}{$\mathit{In}[s] \gets \nu$ ; enfiler $s$ s'il n'est pas déjà dans $W$}
+  }
+}
+\caption{Worklist d'un CFG, telle que l'implémente \code{analyze_cfg}}
+\label{alg:interpretation-abstraite-worklist}
+\end{algorithm}
+
+\subsection{Ce que fait le code : \code{analyze_cfg}}
+
+\code{analyze_cfg} (\file{src/engine/cfg_analyzer.rs}) est la
+\cref{alg:interpretation-abstraite-worklist} en Rust. Le
+\cref{chap:cfg-analyzer-dominance} la détaille ; en voici les trois temps.
+D'abord l'initialisation :
+
+\rustsnippet[label={lst:interpretation-abstraite-acfg-init}]{src/engine/cfg_analyzer.rs}{47}{58}{\code{analyze_cfg} : initialisation}
+
+\begin{itemize}
+  \item \code{entry_envs} est la table $\mathit{In}$, \code{exit_envs} la table
+    $\mathit{Out}$. Seul le bloc d'entrée reçoit un environnement : un bloc que
+    rien n'atteint n'est jamais visité et n'a pas d'entrée dans
+    \code{exit_envs}, ce qui revient à lui donner $\Bot$.
+  \item \code{state_out} est \emph{une seule} copie du store d'état pour toute
+    la passe. Nous y reviendrons à la
+    \cref{sec:interpretation-abstraite-reactant} : l'état n'est pas suivi bloc
+    par bloc.
+  \item \code{in_worklist} évite d'enfiler deux fois le même bloc ;
+    \code{back_edge_counts} compte les passages par arc arrière, bloc cible par
+    bloc cible (ce compteur déclenchera le widening).
+\end{itemize}
+
+Ensuite l'application de la fonction de transfert d'un bloc :
+
+\rustsnippet[label={lst:interpretation-abstraite-acfg-body}]{src/engine/cfg_analyzer.rs}{60}{89}{\code{analyze_cfg} : transfert d'un bloc}
+
+Les instructions du bloc sont exécutées une à une par le \code{Transfer}
+(\cref{chap:transfert-stores}) ; si le bloc se termine par \code{return e}, les
+effets de bord de \code{e} sont aussi exécutés (un effet
+\code{() => setN(1)} a son appel dans le \code{return}). Enfin, la
+propagation :
+
+\rustsnippet[label={lst:interpretation-abstraite-acfg-succ}]{src/engine/cfg_analyzer.rs}{91}{121}{\code{analyze_cfg} : propagation aux successeurs}
+
+\code{outgoing} (\src{src/engine/cfg_analyzer.rs}{126}{150}) rend chaque
+successeur avec l'environnement raffiné par la garde du \code{Branch}. La
+nouvelle entrée est l'environnement propagé s'il n'y en avait pas, son join
+avec l'ancienne sinon, et son widening à seuils sur un arc arrière dès le
+\code{widen_threshold}-ième passage (3 par défaut,
+\src{src/engine/fixpoint.rs}{51}{60}). Le successeur n'est ré-enfilé que si son
+entrée a changé.
+
+\begin{exemple}{La worklist sur la boucle locale}{worklist-boucle}
+  Déroulons \code{analyze_cfg} sur \cref{fig:interpretation-abstraite-cfg-loop},
+  en ne montrant que la composante numérique de \code{i}. Les seuils du
+  composant sont les littéraux numériques du programme, $T = \{0, 1, 5\}$
+  (\cref{sec:interpretation-abstraite-widening}). Le déroulé est fait à la
+  main d'après le code ; son résultat final est épinglé par le test
+  \code{bounded_local_loop_is_precise} (\src{tests/widening_e2e.rs}{124}{137}).
+
+  \smallskip
+  \begin{tabular}{@{}rlll@{}}
+    \toprule
+    pas & bloc & entrée → sortie & effet sur les successeurs \\
+    \midrule
+    1 & $B_0$ & $\rho_0$ → $[0,0]$ & $\mathit{In}[B_1] := [0,0]$ \\
+    2 & $B_1$ & $[0,0]$ & $\mathit{In}[B_2] := [0,0]$, $\mathit{In}[B_3] := [5,0]$ ($\Bot$) \\
+    3 & $B_2$ & $[0,0]$ → $[1,1]$ & arrière n\textsuperscript{o}1 : $[0,0] \join [1,1] = [0,1]$ \\
+    4 & $B_3$ & $\Bot$ & \code{setTotal} n'ajoute rien \\
+    5 & $B_1$ & $[0,1]$ & $\mathit{In}[B_2] := [0,1]$, $\mathit{In}[B_3] := [5,1]$ ($\Bot$) \\
+    6 & $B_2$ & $[0,1]$ → $[1,2]$ & arrière n\textsuperscript{o}2 : $[0,1] \join [1,2] = [0,2]$ \\
+    7 & $B_3$ & $\Bot$ & rien \\
+    8 & $B_1$ & $[0,2]$ & $\mathit{In}[B_2] := [0,2]$, $\mathit{In}[B_3] := [5,2]$ ($\Bot$) \\
+    9 & $B_2$ & $[0,2]$ → $[1,3]$ & arrière n\textsuperscript{o}3 : $[0,2] \widen_T [1,3] = [0,5]$ \\
+    10 & $B_3$ & $\Bot$ & rien \\
+    11 & $B_1$ & $[0,5]$ & $\mathit{In}[B_2] := [0,4]$, $\mathit{In}[B_3] := [5,5]$ \\
+    12 & $B_2$ & $[0,4]$ → $[1,5]$ & arrière n\textsuperscript{o}4 : $[0,5] \widen_T [1,5] = [0,5]$, inchangé \\
+    13 & $B_3$ & $[5,5]$ & \code{setTotal} écrit $[5,5]$ ; le slot devient $[0,0] \join [5,5] = [0,5]$ \\
+    \bottomrule
+  \end{tabular}
+  \smallskip
+
+  La worklist est vide après le pas 13. Au pas 11, l'arête \og vrai\fg{}
+  raffine $[0,5]$ en $[0,4]$ (\code{i} est entier, \code{i < 5} donne
+  \code{i <= 4}) et l'arête \og faux\fg{} en $[5,5]$. Le slot \code{total} vaut
+  $[0,5]$ : la valeur initiale $0$ et la valeur écrite $5$, réunies par join.
+  C'est exactement la valeur qu'assère le test.
+\end{exemple}
+
+Les pas 4, 7 et 10 visitent $B_3$ pour rien : son entrée est vide à chaque
+fois, mais elle passe de $[5,0]$ à $[5,1]$ puis $[5,2]$, et ces trois
+représentations de $\Bot$ sont différentes pour \code{PartialEq}
+(\cref{sec:interpretation-abstraite-concretisation}, piège sur les $\Bot$
+multiples). C'est un coût, pas une faute.
+
+\subsection{Le point fixe des tours de React}
+
+Le même schéma existe à l'échelle du composant. La boucle externe de
+\code{analyze_component_impl} (\cref{chap:point-fixe-composant}, et
+\cref{chap:react-modele} pour sa lecture comme sémantique de React) exécute un
+tour complet (rendu, mémos, effets, handlers) à partir du store courant, et
+compare :
+
+\rustsnippet[label={lst:interpretation-abstraite-convergence}]{src/engine/fixpoint.rs}{485}{497}{le test de post-point fixe de la boucle externe}
+
+\code{new_state} est $F^\sharp(\code{state})$ : ce qu'un tour de React
+abstrait produit à partir de \code{state}. Le test
+\code{new_state.leq(&state)} est littéralement \og $F^\sharp(x) \lleq x$\fg{},
+le test de post-point fixe du \cref{thm:post-point-fixe}. Tant qu'il échoue,
+\code{state} est remplacé par \code{new_state} (les deux premières fois) puis
+par un widening (\cref{sec:interpretation-abstraite-widening}).
+
+\begin{piege}
+  Le théorème ne garantit rien pour ce que le test \emph{ne regarde pas}. Le
+  test de la boucle externe porte sur le store d'état et lui seul ; le tas et
+  les mémos sont recalculés à chaque tour mais n'entrent pas dans la
+  comparaison (\cref{chap:point-fixe-composant}). De même, au-delà de
+  100 tours, le moteur fait un widening sans seuils puis sort \emph{sans}
+  refaire le test (\src{src/engine/fixpoint.rs}{499}{512}) : l'état retenu
+  n'est alors pas vérifié comme post-point fixe. L'argument de terminaison
+  (\cref{sec:interpretation-abstraite-widening}) dit que ce garde-fou ne
+  devrait jamais servir. Au commit \snapshotCommit{}, aucun test du dépôt ne
+  le déclenche : c'est un filet de sécurité non exercé, pas un chemin validé.
+\end{piege}
+
+\section{Hauteur infinie et widening}
+\label{sec:interpretation-abstraite-widening}
+
+\subsection{Le problème}
+
+Le \cref{thm:kleene} promet un nombre fini de pas si le treillis est de
+hauteur finie. Les intervalles ne le sont pas
+(\cref{fig:interpretation-abstraite-hasse-intervalles}), et
+\cref{tab:interpretation-abstraite-tours} montre la conséquence : sur
+\code{Runaway}, la suite $[0,1], [0,2], [0,3], \dots$ est une chaîne
+strictement croissante qui ne s'arrête jamais. Le plus petit point fixe
+abstrait existe, c'est $[0,+\infty]$, mais Kleene ne l'atteint qu'à la
+limite. Il faut \emph{extrapoler} : deviner une borne qui majore toute la
+suite, et vérifier ensuite que c'est un post-point fixe.
+
+\begin{definition}{Widening, widening à seuils}{widening}
+  Un \terme{widening} sur $L$ est un opérateur binaire $\widen$ tel que :
+  \begin{enumerate}
+    \item il majore le join : $a \join b \lleq a \widen b$ pour tous $a, b$ ;
+    \item pour toute suite $y_0, y_1, \dots$, la suite
+      $x_0 = y_0$, $x_{n+1} = x_n \widen y_{n+1}$ est ultimement stationnaire.
+  \end{enumerate}
+  Remplacer le join de Kleene par $\widen$ donne une suite qui se stabilise en
+  un nombre fini de pas sur un post-point fixe, donc sur une réponse sound
+  (\cref{thm:post-point-fixe}).
+
+  Le widening des intervalles saute à l'infini dès qu'une borne grandit :
+  \[ [a,b] \widen [c,d] = \big[\; c < a \;?\; -\infty : a,\;\; d > b \;?\; +\infty : b \;\big]. \]
+  Le \terme{widening à seuils} $\widen_T$, pour un ensemble fini $T$ de
+  nombres, saute au seuil le plus proche qui englobe la nouvelle borne, et à
+  l'infini seulement s'il n'y en a pas :
+  \[ [a,b] \widen_T [c,d] = [\ell, h] \quad\text{avec}\quad
+     \begin{aligned}
+       \ell &= \max\{t \in T \cup \{-\infty\} \mid t \le c\} \text{ si } c < a, \text{ sinon } a,\\
+       h &= \min\{t \in T \cup \{+\infty\} \mid t \ge d\} \text{ si } d > b, \text{ sinon } b.
+     \end{aligned} \]
+\end{definition}
+
+La première propriété garantit la correction : on ne perd jamais une valeur
+que le join aurait gardée. La seconde garantit la terminaison : pour
+$\widen$, chaque borne ne peut sauter qu'une fois (vers l'infini) ; pour
+$\widen_T$, chaque borne ne peut prendre que des valeurs de $T \cup
+\{\pm\infty\}$ après son premier saut, et ne fait que croître, donc au plus
+$|T| + 1$ sauts par borne.
+
+\begin{exemple}{Widening à la main}{widening-main}
+  Avec $T = \{0, 1, 10\}$ :
+  $[0,2] \widen [0,3] = [0, +\infty]$ (la borne haute grandit) ;
+  $[0,2] \widen_T [0,3] = [0, 10]$ (le plus petit seuil $\ge 3$ est $10$) ;
+  $[0,10] \widen_T [0,10] = [0,10]$ (rien ne grandit) ;
+  $[0,10] \widen_T [0,11] = [0, +\infty]$ (aucun seuil $\ge 11$).
+  Avec $T = \{0, 1\}$, $[0,2] \widen_T [0,3] = [0,+\infty]$.
+\end{exemple}
+
+\subsection{Ce que fait le code : \code{widen} et \code{widen_to}}
+
+Le widening simple des intervalles est la formule ci-dessus, précédée des cas
+$\Bot$ :
+
+\rustsnippet[label={lst:interpretation-abstraite-widen}]{src/domains/impls/interval.rs}{84}{106}{le widening des intervalles}
+
+Le widening à seuils (\adr{14}) remplace $\pm\infty$ par le seuil le plus
+serré :
+
+\rustsnippet[label={lst:interpretation-abstraite-widen-to}]{src/domains/impls/interval.rs}{108}{146}{le widening à seuils}
+
+\begin{itemize}
+  \item Une borne qui n'a pas grandi est conservée telle quelle
+    (\code{self.lo}, \code{self.hi}).
+  \item Une borne haute qui grandit prend le plus petit seuil
+    $\ge$ \code{other.hi} : \code{filter} garde les candidats, \code{fold}
+    avec \code{f64::min} à partir de $+\infty$ prend le minimum, et rend
+    $+\infty$ si aucun seuil ne convient. La borne basse est symétrique. Les
+    seuils n'ont pas besoin d'être triés.
+  \item \code{is_int} reste vrai si les deux opérandes sont entiers ; une borne
+    infinie ne rend pas l'intervalle non entier.
+\end{itemize}
+
+Aux autres composantes du produit \code{StateValue}, qui sont de hauteur
+finie (treillis plats, ensembles bornés de chaînes, \code{Stability}), le
+widening par défaut délègue au join
+(\cref{lst:interpretation-abstraite-abstractdomain}, et
+\src{src/domains/impls/mod.rs}{48}{50} pour les treillis plats).
+
+\subsection{D'où viennent les seuils}
+
+Les seuils sont récoltés une fois par composant, avant le point fixe
+(\srcline{src/engine/fixpoint.rs}{280}) :
+
+\rustsnippet[label={lst:interpretation-abstraite-thresholds}]{src/engine/fixpoint.rs}{1185}{1206}{la récolte des seuils}
+
+Tous les littéraux numériques du rendu, des corps d'effets et de handlers, et
+des initialiseurs de \code{useState} sont pris. L'ADR ne prévoyait que les
+littéraux des gardes et des initialiseurs ; en prendre plus est sans danger :
+l'ensemble reste fini (terminaison) et un seuil de plus n'est qu'une borne
+candidate de plus (précision, jamais soundness). Pour \code{Guarded},
+$T = \{0, 1, 10\}$ ; pour \code{Runaway}, $T = \{0, 1\}$.
+
+\subsection{Retour aux compteurs}
+
+Où le widening intervient-il ? Aux deux endroits où une suite peut croître
+sans fin : les arcs arrière d'un CFG (\cref{lst:interpretation-abstraite-acfg-succ})
+et la boucle des tours de React :
+
+\rustsnippet[label={lst:interpretation-abstraite-outer-widen}]{src/engine/fixpoint.rs}{514}{529}{le widening de la boucle externe}
+
+Le compteur \code{iteration} n'augmente que lorsqu'un tour a changé l'état. Les
+deux premiers changements sont pris tels quels ; à partir du troisième
+(\code{widen_threshold = 3}), l'état est élargi. Rejouons
+\cref{tab:interpretation-abstraite-tours} avec le widening :
+
+\begin{itemize}
+  \item \code{Runaway}. Tours 0 et 1 : le slot passe à $[0,1]$ puis $[0,2]$.
+    Tour 2 : le tour produit $[0,3]$, \code{iteration} vaut 3, donc
+    $\code{state} = [0,2] \widen_{\{0,1\}} [0,3] = [0,+\infty]$. Tour 3 :
+    l'effet écrit $[1,+\infty]$, le join donne $[0,+\infty]$, le test de
+    post-point fixe réussit. Le slot convergé vaut $[0,+\infty]$, ce
+    qu'épingle \code{unbounded_counter_is_flagged_and_grows_to_infinity}
+    (\src{tests/widening_e2e.rs}{79}{92}).
+  \item \code{Guarded}. Même début ; au tour 2,
+    $[0,2] \widen_{\{0,1,10\}} [0,3] = [0,10]$. Tour 3 : la garde raffine
+    $[0,10]$ en $[0,9]$, l'effet écrit $[1,10]$, le join rend $[0,10]$ : post-point
+    fixe. Le test \code{guarded_counter_converges_bounded}
+    (\src{tests/widening_e2e.rs}{94}{122}) épingle $[0,10]$.
+\end{itemize}
+
+La sortie de l'analyseur porte la trace de ces deux calculs. Avec
+\texttt{-{}-info -{}-trace} (sortie élaguée des lignes \code{verified}) :
+
+\begin{sortie}
+$ reactant check /tmp/ch03/counter.tsx --info --trace
+  Guarded  (2 hooks)  /tmp/ch03/counter.tsx
+    info   widening-info  (line 13:2)  state `count` kept changing during analysis and was approximated to converge, so findings that depend on it may be imprecise
+       → state `count` is written here [hook:1] (line 13:2)
+       → the abstract value of state `count` kept growing and was widened at iteration 3
+  Runaway  (2 hooks)  /tmp/ch03/counter.tsx
+    warn   infinite-loop  [hook:0]  (line 5:2)  this effect keeps pushing state `count` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       → state `count` is written here [hook:1] (line 5:2)
+       → the abstract value of state `count` kept growing and was widened at iteration 3
+    info   widening-info  (line 5:2)  state `count` kept changing during analysis and was approximated to converge, so findings that depend on it may be imprecise
+       → state `count` is written here [hook:1] (line 5:2)
+       → the abstract value of state `count` kept growing and was widened at iteration 3
+
+⚠  1 warning(s) across 1 file(s).
+\end{sortie}
+
+Les deux composants ont subi un widening au tour où \code{iteration} a atteint 3
+(l'Info \regle{widening-info} le dit, car un widening est une perte de
+précision possible). Seul \code{Runaway} déclenche \regle{infinite-loop} :
+son slot est non borné, celui de \code{Guarded} ne l'est pas. Le
+\cref{chap:infinite-loop} détaille comment la règle lit cette différence ; le
+niveau \Warning{} (et non \Error) s'expliquera à la
+\cref{sec:interpretation-abstraite-must-may}.
+
+\subsection{Le narrowing, et pourquoi \reactant{} s'en passe}
+
+La théorie classique complète le widening par une phase descendante, le
+\emph{narrowing} : une fois un post-point fixe $x$ atteint, on réapplique
+$F^\sharp$ quelques fois, $x \meet F^\sharp(x)$, pour redescendre vers le plus
+petit point fixe et récupérer la précision perdue par le saut à l'infini.
+
+\begin{decision}[ADR-14 --- seuils oui, narrowing non]
+  \adr{14} prévoyait les deux : widening à seuils (partie 1) et narrowing
+  (partie 2). La partie 1 est implémentée, sur la boucle externe et sur les
+  arcs arrière d'\code{analyze_cfg}. La partie 2 a été abandonnée
+  (révision du 28 juin 2026) sur un constat empirique : le compteur gardé
+  est déjà précis ($[0,10]$) grâce au raffinement de garde pendant la montée,
+  et la boucle locale l'est devenue dès que le widening à seuils a été porté
+  sur l'arc arrière interne ($[0,5]$). Les deux techniques ne récupèrent que
+  des bornes \emph{littérales}, que les seuils capturent déjà en montant.
+  Surtout, une phase descendante ne pourrait pas faire redescendre le store
+  d'état, puisque les écritures s'y accumulent par join
+  (\cref{sec:interpretation-abstraite-mises-a-jour}). Alternative écartée : un
+  opérateur \code{narrow} dans \code{AbstractDomain} et une boucle
+  descendante bornée ; il reste une infrastructure différée, à reconsidérer
+  seulement si des bornes symboliques deviennent nécessaires.
+\end{decision}
+
+Ce que ni les seuils ni le narrowing ne savent faire, c'est une borne
+symbolique. Remplaçons le littéral par une prop :
+
+\begin{lstlisting}[language=TypeScript,caption={Une garde à borne symbolique (\file{/tmp/ch03/limit.tsx}, élagué de sa ligne d'import)},label={lst:interpretation-abstraite-limit}]
+export function Limited({ limit }: { limit: number }) {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    if (count < limit) setCount(count + 1);
+  }, [count, limit]);
+  return <div>{count}</div>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+$ reactant check /tmp/ch03/limit.tsx
+  Limited  (2 hooks)  /tmp/ch03/limit.tsx
+    warn   infinite-loop  [hook:0]  (line 5:2)  this effect keeps pushing state `count` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+\end{sortie}
+
+Pour une valeur finie de \code{limit}, ce composant s'arrête. Mais la garde
+\code{count < limit} compare deux variables : le raffinement de garde ne
+reconnaît que \og variable comparée à un littéral\fg{}
+(\cref{chap:cfg-analyzer-dominance}), aucun seuil ne vaut \code{limit}, et le
+widening saute à $+\infty$. Le \Warning{} est un faux positif, toléré par
+l'invariant. Le corriger demanderait un domaine \emph{relationnel} (qui
+retient $\code{count} \le \code{limit}$), ce que \reactant{} n'a pas
+(\cref{sec:interpretation-abstraite-reactant}).
+
+\begin{piege}
+  Le widening n'est pas monotone et dépend de l'ordre des calculs :
+  $[0,1] \lleq [0,2]$, et pourtant $[0,1] \widen [0,2] = [0,+\infty]$ alors
+  que $[0,2] \widen [0,2] = [0,2]$ ; un argument gauche plus précis donne un
+  résultat moins précis. Élargir au tour 2 ou au tour 3 ne donne donc pas
+  forcément le même résultat. C'est
+  sans conséquence sur la soundness, qui ne repose que sur le test de
+  post-point fixe final (\cref{thm:post-point-fixe}). Mais un changement
+  anodin (un seuil de plus, un \code{widen_threshold} différent, un ordre de
+  visite des blocs différent) peut changer la précision, donc faire
+  apparaître ou disparaître un faux positif.
+\end{piege}
+
+\section{Must, may, et la polarité d'un fait}
+\label{sec:interpretation-abstraite-must-may}
+
+\subsection{Deux setters dans le rendu}
+
+Appeler un setter pendant le rendu est un défaut (\cref{chap:react-modele}).
+Comparons deux façons de le faire :
+
+\begin{lstlisting}[language=TypeScript,caption={Un setter dans le rendu, inconditionnel puis conditionnel (\file{/tmp/ch03/setter.tsx}, élagué de sa ligne d'import)},label={lst:interpretation-abstraite-setter}]
+export function Unconditional() {
+  const [n, setN] = useState(0);
+  setN(n + 1);
+  return <p>{n}</p>;
+}
+
+export function Conditional({ flag }: { flag: boolean }) {
+  const [n, setN] = useState(0);
+  if (flag) setN(1);
+  return <p>{n}</p>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+$ reactant check /tmp/ch03/setter.tsx
+  Conditional  (1 hooks)  /tmp/ch03/setter.tsx
+    warn   setter-in-render  [hook:0]  (line 11:12)  setter `setN` called directly in the render body, move this call into a useEffect or an event handler
+       (1 trace step(s), rerun with --trace)
+  Unconditional  (1 hooks)  /tmp/ch03/setter.tsx
+    error  setter-in-render  [hook:0]  (line 5:2)  setter `setN` called directly in the render body, move this call into a useEffect or an event handler
+       (1 trace step(s), rerun with --trace)
+
+⚠  1 error(s), 1 warning(s) across 1 file(s).
+\end{sortie}
+
+Même règle, deux niveaux. Dans \code{Unconditional}, \emph{tout} rendu
+appelle \code{setN} : le défaut a lieu dès que le composant s'affiche. Dans
+\code{Conditional}, il n'a lieu que si \code{flag} est vrai, ce que
+l'analyseur ne sait pas (\code{flag} est une prop, donc $\Top$). Le premier
+fait est vrai sur \emph{tous} les chemins, le second sur \emph{certains}.
+
+\subsection{Pourquoi une sur-approximation ne suffit pas}
+
+Tout ce qui précède calcule des sur-approximations : l'ensemble abstrait
+contient tous les comportements possibles, et peut-être d'autres. Une
+sur-approximation prouve des \emph{absences} (\og \code{count} ne dépasse
+jamais 10\fg{}), jamais des \emph{présences}. Si l'abstrait dit
+\og \code{setN} est peut-être appelé\fg{}, c'est peut-être à cause d'un chemin
+impossible. Pour affirmer qu'un défaut \emph{a lieu}, il faut l'autre sens :
+un fait vrai de toutes les exécutions, donc une sous-approximation de ce qui
+arrive à coup sûr.
+
+\begin{definition}{Fait must, fait may, polarité}{must-may}
+  Un fait est \terme{must} s'il est établi pour \emph{toutes} les exécutions
+  concrètes que l'abstraction décrit (sur tous les chemins, à tous les tours).
+  Il est \terme{may} s'il vaut pour \emph{au moins une} exécution que
+  l'abstraction admet, qui peut être une exécution impossible introduite par
+  l'approximation. $\Top$ (l'inconnu) n'est ni l'un ni l'autre ; lu comme
+  réponse à la question \og le défaut a-t-il lieu ?\fg{}, il ne peut compter
+  que comme may. La \terme{polarité} d'un fait, d'une relation ou d'une
+  colonne de relation (\cref{def:relation}) dit lequel des deux elle porte :
+  exacte, must, may ou $\Top$.
+\end{definition}
+
+Les deux polarités se calculent avec les mêmes outils, en sens inverse. Une
+analyse may joint aux jonctions (union des possibilités) et part de $\Bot$ :
+plus petit point fixe. Une analyse must intersecte aux jonctions (ce qui est
+vrai de \emph{chaque} prédécesseur) et part de \og tout est vrai\fg{} : plus
+grand point fixe. Nous en verrons un exemple avec la dominance
+(\cref{sec:interpretation-abstraite-dominance}).
+
+\subsection{Ce que fait le code : des verdicts typés par leur polarité}
+
+La couche règles (\cref{chap:api-regles}) inscrit la polarité dans les types
+(\adr{21}). Une primitive must rend un \code{MustResult} :
+
+\rustsnippet[label={lst:interpretation-abstraite-mustresult}]{src/rules/api/query.rs}{111}{135}{les verdicts polarisés}
+
+\begin{itemize}
+  \item \code{All} : établi sur tous les chemins. C'est le seul cas qui
+    transporte un \code{Certified} (\cref{def:certified}), le jeton sans lequel
+    aucune règle ne peut émettre une \Error.
+  \item \code{Some} : établi sur certains chemins seulement, un fait may, sans
+    jeton.
+  \item \code{None} : aucune évidence.
+  \item \code{May<T>} enveloppe un fait may ; aucune fonction ne le
+    transforme en \code{Certified}.
+\end{itemize}
+
+Le contrat de toutes les primitives tient en trois clauses
+(\src{src/rules/api/query.rs}{417}{421}) : chaque primitive rend un verdict
+typé par sa polarité ; $\Top$ se replie en may à l'intérieur ; seules les
+primitives must frappent un \code{Certified}. La deuxième clause est celle
+qui protège la soundness des \Error : un inconnu ne devient jamais une
+certitude.
+
+Voici comment \regle{setter-in-render} fabrique la différence observée plus
+haut :
+
+\rustsnippet[label={lst:interpretation-abstraite-sir-proof}]{src/rules/impls/setter_in_render.rs}{147}{162}{\regle{setter-in-render} : l'\Error{} demande deux musts}
+
+La preuve a deux conjoints must : l'appel a lieu pendant le rendu, et il
+écrit à coup sûr (\code{certain_write}) ; puis son bloc domine toutes les
+sorties du rendu (\code{exit_dom.certify}, \cref{sec:interpretation-abstraite-dominance}).
+Si l'un manque, \code{proof} vaut \code{None} et le diagnostic reste un
+\Warning. Dans \code{Conditional}, le bloc \code{then} ne domine pas le
+\code{return} : pas de jeton, \Warning.
+
+\begin{piege}
+  Un fait must sur \emph{une partie} de la conclusion ne suffit pas. La
+  doctrine du projet (\file{CLAUDE.md}) exige, pour une \Error, la preuve
+  \og de \emph{toute} la conclusion, pas d'un seul conjoint\fg{}.
+  \regle{infinite-loop} en donne un exemple : pour \code{Runaway}, la
+  croissance du slot jusqu'à $+\infty$ est le résultat d'un widening,
+  c'est-à-dire d'une extrapolation sur-approximante ; elle ne prouve pas que
+  l'effet re-tourne indéfiniment. La règle n'émet donc qu'un \Warning{} ;
+  seule la preuve d'un cycle d'effets (\cref{chap:infinite-loop}) atteint
+  l'\Error. L'écart entre divergence de valeur et divergence de référence est
+  suivi par l'\issue{144}.
+\end{piege}
+
+\section{Soundness}
+\label{sec:interpretation-abstraite-soundness}
+
+Nous pouvons maintenant donner à la promesse de l'introduction
+(\cref{def:introduction-soundness}) sa forme exacte.
+
+\begin{definition}{Soundness}{soundness}
+  Une analyse est \terme{sound} lorsque ce qu'elle calcule
+  \emph{sur-approxime} la sémantique concrète : pour tout programme,
+  $\lfp F \subseteq \gam(a)$ où $a$ est le résultat abstrait. Pour un outil
+  de diagnostic, cela se traduit ainsi : si le programme peut exhiber un
+  défaut qu'une règle vise, l'analyse le signale (à un niveau ou à un autre),
+  ou signale explicitement qu'elle n'a pas pu regarder. Un défaut réel non
+  signalé, un \terme{faux négatif} (FN), est interdit ; un signalement sans
+  défaut réel, un \terme{faux positif} (FP), est toléré.
+\end{definition}
+
+Chaque niveau de diagnostic en tire une contrainte différente.
+
+\begin{itemize}
+  \item \textbf{Le silence.} Une règle muette affirme l'absence du défaut. Cette
+    affirmation est une propriété de sur-approximation : elle n'est vraie que
+    si tous les calculs amont ont été corrects (\cref{def:concretisation}) et
+    ont atteint un post-point fixe (\cref{thm:post-point-fixe}). Sous
+    \texttt{-{}-info}, les lignes \code{verified} rendent ce silence visible.
+  \item \textbf{\Error.} Un défaut certain dès que le code s'exécute. C'est une
+    affirmation must, qui ne peut pas venir d'une sur-approximation : elle
+    demande un \code{Certified} (\cref{sec:interpretation-abstraite-must-may}).
+  \item \textbf{\Warning.} Un défaut possible (fait may), ou un fait certain
+    au coût incertain. Tout ce que la sur-approximation ne permet pas
+    d'exclure et que rien ne permet de certifier tombe ici.
+  \item \textbf{\Info.} Une limite de l'analyse, ou un motif qui a l'air
+    voulu. Quand l'analyse n'a pas pu lire du code (un inlining tronqué, par
+    exemple), elle le dit par une \Info{} et suspend ses assurances
+    \code{verified} (\cref{chap:regles-effets}) : un silence qui ne vaut plus
+    preuve est retiré plutôt que maintenu.
+\end{itemize}
+
+\begin{exemple}{Un faux positif toléré}{fp-dead}
+  \begin{lstlisting}[language=TypeScript]
+export function Dead() {
+  const [n, setN] = useState(0);
+  const k = 3;
+  useEffect(() => {
+    if (k > 10) setN(n + 1);
+  }, [n]);
+  return <div>{n}</div>;
+}
+  \end{lstlisting}
+  \begin{sortie}
+$ reactant check /tmp/ch03/dead.tsx
+  Dead  (2 hooks)  /tmp/ch03/dead.tsx
+    warn   infinite-loop  [hook:0]  (line 6:2)  this effect keeps pushing state `n` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+  \end{sortie}
+  La branche est morte : \code{k} vaut 3. Le raffinement de \code{k > 10}
+  donne bien $\Bot$ à \code{k} sur la branche vraie, mais un raffinement vers
+  $\Bot$ ne rend pas le bloc inatteignable : le bloc est exécuté, seule la
+  variable gardée y vaut $\Bot$, et \code{setN(n + 1)} écrit une vraie valeur
+  (\cref{chap:cfg-analyzer-dominance}). Le \Warning{} est un FP : imprécis,
+  sound.
+\end{exemple}
+
+\begin{remarque}
+  La soundness de \reactant{} n'est pas un théorème prouvé une fois pour
+  toutes ; c'est un invariant tenu opération par opération : join et widening
+  majorent le join ($\widen_T$ \og $\sqsupseteq$ hull\fg{}), une variable
+  inconnue vaut $\Top$, une écriture de slot est jointe et jamais remplacée, un
+  appel opaque rend $\Top$, un must ne compte pas un chemin d'exception comme
+  couvert. Le \cref{chap:point-fixe-composant} en dresse l'inventaire. Là où
+  la soundness dépend d'une hypothèse du modèle, une règle dédiée surveille
+  l'hypothèse (soundness en couches, \cref{def:soundness-couches}). Les
+  décisions de ne \emph{pas} changer certains comportements pour des raisons
+  de soundness sont consignées dans \adr{20}.
+\end{remarque}
+
+\begin{piege}
+  \og Tolérer les FP\fg{} ne veut pas dire \og les ignorer\fg{}. Un FP au
+  niveau \Error{} est une faute : l'\Error{} promet un défaut certain, et le
+  contrat de la \cref{sec:interpretation-abstraite-must-may} existe pour
+  l'empêcher. Les FP tolérés sont des \Warning{} (ou des \Info) produits par
+  l'imprécision de la sur-approximation.
+\end{piege}
+
+\section{CFG, dominance, \og sur tous les chemins\fg{}}
+\label{sec:interpretation-abstraite-dominance}
+
+\subsection{Un hook après un \code{return} anticipé}
+
+\begin{lstlisting}[language=TypeScript,caption={Un hook sauté par un \code{return} anticipé (\file{/tmp/ch03/hook.tsx}, élagué de sa ligne d'import)},label={lst:interpretation-abstraite-hook}]
+export function Profile({ user }: { user: string | null }) {
+  if (user === null) {
+    return <p>anonymous</p>;
+  }
+  const [name, setName] = useState(user);
+  useEffect(() => {
+    document.title = name;
+  }, [name]);
+  return <p>{name}</p>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+$ reactant check /tmp/ch03/hook.tsx --trace
+  Profile  (2 hooks)  /tmp/ch03/hook.tsx
+    error  conditional-hook  [hook:0]  (line 7:8)  this hook is called conditionally (not on every render path)
+       → guarded by a condition evaluated here, so some render paths skip the hook (line 4:6)
+    error  conditional-hook  [hook:1]  (line 8:2)  this hook is called conditionally (not on every render path)
+       → guarded by a condition evaluated here, so some render paths skip the hook (line 4:6)
+
+⚠  2 error(s) across 1 file(s).
+\end{sortie}
+
+Les règles des hooks exigent qu'un hook soit appelé à chaque rendu. Sur le CFG
+du rendu (\cref{fig:interpretation-abstraite-cfg-hook}), cela veut dire :
+\emph{tout} chemin de l'entrée à une sortie passe par le bloc du hook. Ce
+\og tout\fg{} est une quantification sur une infinité potentielle de chemins ;
+la dominance la ramène à un calcul fini.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=7mm and 12mm]
+  \node[cfgbloc] (b0) {$B_0$ (entrée)\\branch user === null};
+  \node[cfgbloc,below left=of b0] (b1) {$B_1$\\return <p>anonymous</p>};
+  \node[cfgbloc,below right=of b0] (b2) {$B_2$\\useState(user)\\useEffect(…)\\return <p>{name}</p>};
+  \draw[fleche] (b0) -- node[etiquette,left]{vrai} (b1);
+  \draw[fleche] (b0) -- node[etiquette,right]{faux} (b2);
+\end{tikzpicture}
+\caption{CFG schématique du rendu de \code{Profile}. $\mathrm{Dom}(B_1) = \{B_0,
+B_1\}$ et $\mathrm{Dom}(B_2) = \{B_0, B_2\}$ : $B_2$, qui porte les hooks, ne
+domine pas la sortie $B_1$.}
+\label{fig:interpretation-abstraite-cfg-hook}
+\end{figure}
+
+\begin{definition}{Dominance, post-dominance}{dominance}
+  Dans un CFG d'entrée $e$, un bloc $a$ \terme{domine} un bloc $b$ si tout
+  chemin de $e$ à $b$ passe par $a$. On note $\mathrm{Dom}(b)$ l'ensemble des
+  dominateurs de $b$ ; c'est la plus grande solution du système
+  \[ \mathrm{Dom}(e) = \{e\}, \qquad
+     \mathrm{Dom}(b) = \{b\} \cup \bigcap_{p \in \pred(b)} \mathrm{Dom}(p). \]
+  Un ensemble de blocs $S$ est \terme{sur tous les chemins} (il post-domine
+  l'entrée) si tout chemin de $e$ à une sortie rencontre $S$. Un bloc
+  s'exécute à chaque passage dans le CFG exactement quand il domine toutes
+  les sorties atteignables.
+\end{definition}
+
+Le système de la dominance est une analyse must : l'opérateur de jonction est
+l'intersection, et l'on part de \og tous les blocs dominent tout\fg{} pour
+descendre. C'est donc le \emph{plus grand} point fixe qu'on cherche, par une
+itération duale de Kleene (\cref{def:point-fixe}) : le treillis est celui des
+parties de blocs ordonné par $\supseteq$, fini, et l'itération termine.
+
+\subsection{Ce que fait le code}
+
+\code{compute_dominators} est cet algorithme itératif classique, parcouru en
+ordre postfixe inverse (RPO) :
+
+\rustsnippet[label={lst:interpretation-abstraite-dominators}]{src/engine/dominance.rs}{22}{57}{le plus grand point fixe de la dominance}
+
+Chaque bloc autre que l'entrée part de \code{all_blocks} (lignes 16 à 20,
+hors extrait) et descend par intersection. Un bloc inatteignable n'est pas
+dans le RPO et garde \og tous les blocs\fg{} : il est dominé par tout, ce qui
+est neutre pour un fait must (il ne s'exécute jamais). Pour éviter de refaire
+ce calcul à chaque question, \code{DominatorTree}
+(\src{src/engine/dominance.rs}{94}{111}) le mémorise.
+
+La couche règles consomme la dominance sous une forme typée, qui choisit les
+sorties une fois pour toutes :
+
+\rustsnippet[label={lst:interpretation-abstraite-exitdom}]{src/rules/api/query.rs}{672}{706}{\code{ExitDominance} : négation may et certification must}
+
+\begin{itemize}
+  \item \code{certify} rend \code{All} (avec un \code{Certified}) si le bloc
+    domine \emph{toutes} les sorties : c'est l'arme de \regle{setter-in-render}
+    (\cref{lst:interpretation-abstraite-sir-proof}).
+  \item \code{may_be_skipped} en est la négation : il existe une sortie que le
+    bloc ne domine pas. Pour \code{Profile}, $B_2$ ne domine pas $B_1$ ; le hook
+    est sauté sur au moins un chemin. Le défaut visé est structurel (la règle
+    des hooks porte sur la forme du code, pas sur les valeurs) : l'existence
+    de ce chemin dans le CFG suffit à l'établir, et
+    \regle{conditional-hook} l'émet en \Error{} (\cref{def:hook-conditionnel}).
+  \item Un CFG sans sortie atteignable ne prouve rien dans aucun sens :
+    \code{certify} rend \code{None}, et \code{may_be_skipped} rend faux.
+\end{itemize}
+
+\begin{piege}
+  Les sorties comptées sont les \code{return} \emph{atteignables}
+  (\src{src/rules/api/query.rs}{652}{671}). Le lowering scelle la fin d'un
+  corps par un \code{return undefined} (\adr{25}) ; quand les deux branches
+  d'un \code{if}/\code{else} ont déjà retourné, cette queue est orpheline. La
+  compter ferait croire que tout hook antérieur est sauté, au niveau
+  \Error{} : un FP interdit par la \cref{sec:interpretation-abstraite-soundness}.
+\end{piege}
+
+\code{on_all_paths} (\src{src/engine/dominance.rs}{69}{92}) répond à la
+question voisine \og ces blocs sont-ils sur tous les chemins ?\fg{} par un
+parcours qui évite l'ensemble : atteindre une feuille (un \code{return}, mais
+aussi un \code{throw}) sans le rencontrer, c'est exhiber un chemin qui
+s'échappe. Sa polarité est must : un chemin d'exception compte comme un
+chemin qui évite l'ensemble. Une troisième implémentation du même
+quantificateur existe, l'analyse must avant de \code{must_setter_on_all_paths}
+(\src{src/rules/api/query.rs}{576}{621}), qui calcule elle aussi un plus grand
+point fixe booléen ; le \cref{chap:api-regles} la présente.
+
+\section{Intra- et inter-procédural, inlining}
+\label{sec:interpretation-abstraite-inlining}
+
+Tout ce qui précède opère sur un CFG. Or un composant appelle des fonctions :
+des hooks personnalisés, des utilitaires, des composants enfants. Une analyse
+\terme{intra-procédurale} traite chaque fonction isolément et remplace un
+appel par ce qu'elle sait sans le lire, c'est-à-dire $\Top$ : sound, mais
+aveugle. Une analyse \terme{inter-procédurale} suit les appels. Deux familles
+de techniques existent : calculer un \emph{résumé} de chaque fonction,
+réutilisé à chaque appel ; ou \terme{inliner}, c'est-à-dire greffer le corps
+de la fonction appelée au site d'appel et analyser le tout comme un seul CFG.
+L'inlining est la plus précise (chaque appel est analysé dans son contexte)
+et la plus coûteuse (le CFG grossit, la récursion doit être coupée).
+
+\begin{lstlisting}[language=TypeScript,caption={Un hook personnalisé qui boucle (\file{/tmp/ch03/custom.tsx}, élagué de sa ligne d'import)},label={lst:interpretation-abstraite-custom}]
+function useTicker(start: number) {
+  const [t, setT] = useState(start);
+  useEffect(() => {
+    setT(t + 1);
+  }, [t]);
+  return t;
+}
+
+export function Clock() {
+  const t = useTicker(0);
+  return <p>{t}</p>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+$ reactant check /tmp/ch03/custom.tsx
+  Clock  (1 hooks)  /tmp/ch03/custom.tsx
+    warn   infinite-loop  [hook:1]  (line 5:2)  this effect keeps pushing state `t` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
+\end{sortie}
+
+\code{Clock} ne contient qu'un hook, l'appel à \code{useTicker}. Le
+diagnostic désigne pourtant \code{[hook:1]}, à la ligne 5 de
+\code{useTicker} : le moteur a greffé le corps du hook dans le rendu de
+\code{Clock}, décalé ses labels de hooks, et analysé le compteur comme s'il
+était écrit dans le composant. \reactant{} fait ce choix partout où il
+dispose du source.
+
+\begin{itemize}
+  \item \textbf{Hooks personnalisés} : greffés entiers au site d'appel, labels
+    décalés, paramètres substitués (\code{expand_custom_hooks},
+    \src{src/engine/fixpoint.rs}{884}{1142}). Un hook qui s'appelle lui-même,
+    ou un second appel du même hook dans le même composant, reste opaque
+    ($\Top$). Le commentaire du code l'avoue (\og \emph{second call stays opaque
+    FN, not FP}\fg{}) ; la sortie le compense : appeler \code{useTicker} deux
+    fois (\file{/tmp/ch03/twice.tsx}) produit une \Info{}
+    \regle{analysis-limit} sur le second appel (\og \emph{hook `useTicker` was
+    not found in the registry}\fg{}, message trompeur puisque le hook y est) et
+    la ligne \code{suspended analysis-limit 9 passing check(s) withheld}.
+  \item \textbf{Hooks de bibliothèque sans source} : un registre de résumés
+    (\code{SummaryRegistry}) donne leur valeur abstraite ; c'est la technique
+    par résumé, réservée à ce cas.
+  \item \textbf{Utilitaires} : greffés en position d'instruction, au plus une
+    fois par nom et par CFG, dans un budget de \code{max_inline_depth} = 8
+    greffes par CFG (\src{src/engine/fixpoint.rs}{1611}{1634}) ; un budget
+    épuisé laisse les appels restants opaques et suspend les assurances du
+    composant (\cref{sec:interpretation-abstraite-soundness}, rubrique \Info).
+  \item \textbf{Composants enfants} : analysés de haut en bas avec les props
+    que le parent leur passe, et leurs écritures dans l'état du parent
+    remontent par un store partagé (\adr{12}).
+\end{itemize}
+
+Les mécanismes de greffe (\emph{splice}, renommage, identités) sont l'objet du
+\cref{chap:splice-inlining}, l'analyse entre composants et entre fichiers
+celui du \cref{chap:inter-composants}. Retenons ici leur statut théorique :
+l'inlining ne change rien au cadre de ce chapitre, il agrandit le CFG sur
+lequel on calcule le point fixe ; et chaque endroit où il renonce (récursion,
+budget, callee inconnu) retombe sur $\Top$, donc reste sound.
+
+\section{Mises à jour fortes et faibles}
+\label{sec:interpretation-abstraite-mises-a-jour}
+
+\begin{lstlisting}[language=TypeScript,caption={Deux écritures successives (\file{/tmp/ch03/weak.tsx}, élagué de sa ligne d'import)},label={lst:interpretation-abstraite-weak}]
+export function Twice() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    let x = 1;
+    x = 5;
+    setN(x);
+    setN(7);
+  }, []);
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+
+Après \code{x = 5}, l'ancienne valeur de \code{x} est perdue : il est exact
+de \emph{remplacer} $[1,1]$ par $[5,5]$. C'est une \terme{mise à jour forte}.
+Elle n'est correcte que si l'écriture désigne un unique lieu de stockage
+concret, qu'elle a certainement lieu, et que l'abstraction ne décrit pas
+plusieurs instants à la fois. Quand l'une de ces conditions manque, il faut
+une \terme{mise à jour faible} : joindre la nouvelle valeur à l'ancienne,
+$v \gets v \join v'$, ce qui dit \og ce lieu vaut l'ancienne valeur ou la
+nouvelle\fg{}.
+
+\reactant{} emploie les deux, selon ce que le lieu abstrait représente.
+\begin{itemize}
+  \item \textbf{Variables locales : forte.} L'environnement est calculé bloc
+    par bloc ; une affectation remplace la liaison
+    (\code{AbstractEnv::extend} est un \code{insert},
+    \src{src/domains/stores/abstract_env.rs}{100}{103}). Les chemins sont
+    réunis par join aux jonctions du CFG.
+  \item \textbf{Slots d'état : faible.} Un slot abstrait décrit \emph{toutes}
+    les valeurs que l'état prend au fil de \emph{tous} les tours de React,
+    pas sa valeur à un instant. Écrire ne peut donc qu'ajouter :
+\end{itemize}
+
+\rustsnippet[label={lst:interpretation-abstraite-update}]{src/domains/stores/state_store.rs}{29}{33}{l'écriture d'un slot est un join}
+
+\begin{itemize}
+  \item \textbf{Champs du tas : faible.} Un objet abstrait est identifié par son
+    site d'allocation (\cref{def:site}) et représente tous les objets créés à ce
+    site ; une écriture \code{obj.f = v} peut n'avoir lieu que sur un chemin, et
+    \code{obj} peut désigner plusieurs sites. Le code joint donc, et le dit :
+    \og \emph{join, never replace}\fg{}
+    (\src{src/domains/interp/interpreter.rs}{150}{154}).
+\end{itemize}
+
+Sur \code{Twice}, le slot \code{n} reçoit $[0,0]$ (amorçage), puis
+$[5,5]$, puis $[7,7]$ : il vaut $[0,0] \join [5,5] \join [7,7] = [0,7]$
+(calcul fait d'après \cref{lst:interpretation-abstraite-update}). En React,
+les deux appels sont regroupés (batching) et le rendu suivant voit 7 ;
+l'abstrait contient $0$ et $7$, et aussi $1, \dots, 6$ : une perte de
+précision, pas d'information fausse. C'est aussi pourquoi le narrowing ne
+pourrait pas faire redescendre un slot
+(\cref{sec:interpretation-abstraite-widening}) : aucune écriture n'est jamais
+retirée.
+
+\begin{sortie}
+$ reactant check /tmp/ch03/weak.tsx
+  Twice  (2 hooks)  /tmp/ch03/weak.tsx
+    warn   unnecessary-rerender  [hook:0]  (line 5:2)  mount-only effect sets state `n` to a constant different from its initial value, which costs one extra rerender on mount; consider initialising directly with the target value
+       (1 trace step(s), rerun with --trace)
+\end{sortie}
+
+La règle qui répond ici ne lit pas le slot joint ; elle parcourt les appels de
+setter de l'effet de montage et évalue leurs arguments un par un
+(\src{src/rules/impls/unnecessary_rerender.rs}{110}{144}, et
+\cref{chap:regles-etat}). La
+mise à jour faible est la bonne abstraction du store, pas la seule source
+d'information des règles : quand une question porte sur \emph{une} écriture,
+le moteur la conserve à part, site par site (\cref{def:slot-writer}).
+
+\begin{piege}
+  Rendre fortes les écritures d'état \og parce que le dernier \code{setN}
+  gagne\fg{} serait un faux négatif en puissance : le slot ne décrirait plus
+  les valeurs vues par les rendus intermédiaires, ni celles écrites par un
+  autre effet ou un handler au même tour. La règle \og dernier set gagne\fg{}
+  vaut pour un tour concret donné ; le slot abstrait les résume tous.
+\end{piege}
+
+\section{Ce que \reactant{} fait, et ne fait pas}
+\label{sec:interpretation-abstraite-reactant}
+
+Un analyseur par interprétation abstraite se caractérise par une poignée de
+choix : ce qu'il distingue (flot, chemins, contextes), ce que ses domaines
+savent exprimer, et comment il force la terminaison.
+\Cref{tab:interpretation-abstraite-choix} résume ceux de \reactant{} ;
+chacun a été rencontré dans ce chapitre.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+  \toprule
+  Dimension & Choix de \reactant{} \\
+  \midrule
+  Sensibilité au flot (variables) & Oui : un environnement par entrée et sortie de bloc (\code{entry_envs}, \code{exit_envs}), mises à jour fortes. \\
+  Sensibilité au flot (état) & Non : un seul store par passe (\code{state_out}), partagé par tous les blocs, et un seul store pour tous les tours ; mises à jour faibles. \\
+  Sensibilité aux chemins & Non, sauf le raffinement de garde : les chemins sont joints aux jonctions ; une garde \og variable comparée à un littéral\fg{} raffine chaque branche, sans jamais rendre une branche morte. \\
+  Forme de l'IR & Pas de SSA : les variables sont des noms, une affectation rebinde le nom dans l'environnement (\cref{chap:ir}). \\
+  Domaines numériques & Non relationnels : un intervalle par variable ou par slot ; aucune relation entre deux variables (d'où le FP de \code{Limited}). \\
+  Inter-procédural & Inlining des hooks, des utilitaires et des enfants, coupé à la récursion et par un budget ; résumés pour les hooks de bibliothèque ; $\Top$ ailleurs. \\
+  Terminaison & Widening à seuils après 3 changements, sur les arcs arrière et entre tours ; widening sans seuils et arrêt au-delà de 100 tours. Pas de narrowing (\adr{14}). \\
+  Polarité & Sur-approximation (may) pour le silence et les \Warning ; faits must certifiés (dominance, analyses must avant) pour les \Error. \\
+  \bottomrule
+\end{tabularx}
+\caption{Les choix d'interprétation abstraite de \reactant{}.}
+\label{tab:interpretation-abstraite-choix}
+\end{table}
+
+Deux de ces choix méritent une phrase de justification. L'état est
+insensible au flot parce que la question que posent les règles porte sur
+l'ensemble des valeurs qu'un slot prend au cours de la vie du composant, pas
+sur sa valeur en un point du rendu : React ne change un slot qu'entre deux
+rendus, et le résumé de tous les tours est précisément ce qu'il faut. Les
+domaines sont non relationnels parce que les bornes que \adr{14} a
+rencontrées sont des littéraux, que les seuils capturent déjà ; un domaine
+relationnel (octogones, polyèdres) ne se justifierait que pour des bornes
+symboliques comme celle de \code{Limited}, cas que l'ADR laisse ouvert.
+
+Les chapitres suivants reprennent chaque ligne du tableau à la
+\emph{taille réelle} du code : les domaines de base
+(\cref{chap:treillis-simples}), le produit \code{StateValue} et la stabilité
+(\cref{chap:statevalue-stabilite}), le transfert et les stores
+(\cref{chap:transfert-stores}), la worklist et la dominance
+(\cref{chap:cfg-analyzer-dominance}), la boucle externe
+(\cref{chap:point-fixe-composant}).
+
+\begin{resume}
+\begin{itemize}
+  \item Aucun analyseur ne peut calculer exactement les comportements d'un
+    composant (taille, indécidabilité). \reactant{} \emph{sur-approxime} :
+    l'abstrait contient tout le concret. Son silence est une preuve ; ses
+    erreurs sont des faux positifs, jamais des faux négatifs
+    (\cref{def:soundness}).
+  \item Un domaine abstrait est un treillis (\cref{def:treillis}) : ordre
+    partiel (\code{PartialOrd}), join, meet, $\Bot$, $\Top$. Sa
+    concrétisation $\gam$ dit ce que signifie chaque valeur ; une opération
+    est correcte si elle ne perd aucune valeur concrète
+    (\cref{def:concretisation}). Trait \code{AbstractDomain}
+    (\file{src/domains/mod.rs}), \code{BoolVal}, \code{flat_lattice!},
+    \code{Interval}.
+  \item Le résultat d'une analyse est un post-point fixe d'équations de flot
+    (\cref{def:point-fixe}) ; tout post-point fixe d'une fonction abstraite
+    correcte est sound (\cref{thm:post-point-fixe}). \code{analyze_cfg} est
+    une worklist FIFO sur un CFG ; la boucle externe de
+    \code{analyze_component_impl} teste \code{new_state.leq(&state)}.
+  \item Les intervalles sont de hauteur infinie : le widening à seuils
+    (\cref{def:widening}, \code{Interval::widen_to}, seuils récoltés par
+    \code{collect_thresholds}) force la terminaison après
+    \code{widen_threshold = 3} changements. Pas de narrowing (\adr{14}) : le
+    raffinement de garde et les seuils récupèrent les bornes littérales, pas
+    les bornes symboliques.
+  \item Une \Error{} demande un fait \emph{must} (\cref{def:must-may}) ;
+    \code{MustResult::All} est le seul porteur de \code{Certified} ; $\Top$ se
+    replie en may. La dominance (\cref{def:dominance},
+    \file{src/engine/dominance.rs}, \code{ExitDominance}) est l'analyse must
+    de référence, un plus grand point fixe.
+  \item L'environnement est sensible au flot et mis à jour fortement ; l'état
+    et le tas sont insensibles au flot et mis à jour faiblement ; l'inlining
+    rend l'analyse inter-procédurale, et chaque renoncement retombe sur
+    $\Top$.
+\end{itemize}
+Le \cref{chap:tour-architecture} situe ces mécanismes dans l'architecture du
+code ; la partie III (\cref{chap:treillis-simples} à
+\cref{chap:transfert-stores}) reprend les domaines un par un, la partie IV
+(\cref{chap:cfg-analyzer-dominance} et suivants) le moteur.
+\end{resume}
+
+\section*{Exercices}
+\addcontentsline{toc}{section}{Exercices}
+
+\begin{exercice}{Le treillis plat}{flat}
+  (a) Avec \cref{lst:interpretation-abstraite-flat}, que rend
+  \code{partial_cmp} sur $(\Bot, \Top)$, sur $(\Top, \Bot)$, sur
+  $(\code{True}, \code{False})$ ? (b) Calculer
+  $\code{One(c,0)} \join \code{One(c,1)}$ et $\code{One(c,0)} \meet \Top$ dans
+  \code{SetterVal}. (c) Pourquoi le widening d'un treillis plat peut-il être
+  le join ?
+\end{exercice}
+\begin{solution}
+  (a) $(\Bot,\Top)$ : les éléments diffèrent, le deuxième bras
+  s'applique (\og $\Bot$ à gauche\fg{}), \code{Some(Less)} ;
+  $(\Top,\Bot)$ : ni égalité, ni deuxième bras, le troisième donne
+  \code{Some(Greater)} ; $(\code{True},\code{False})$ : aucun bras,
+  \code{None}. (b) Deux éléments intermédiaires distincts : $\Top$. Le meet
+  avec $\Top$ rend l'autre opérande, \code{One(c,0)}. (c) La hauteur est 2 :
+  toute chaîne strictement croissante a au plus trois éléments, donc la suite
+  des joins est stationnaire ; le join vérifie les deux conditions de la
+  \cref{def:widening}.
+\end{solution}
+
+\begin{exercice}{Calculs d'intervalles}{intervalles}
+  Calculer $[1,3] \join [2,9]$, $[1,3] \meet [2,9]$, $[0,4] \join \Bot$,
+  $[1,3] + [2,9]$, et dire si $[1,3] \lleq [2,9]$. Le join
+  $[1,3] \join [7,9]$ est-il exact au sens de l'\cref{ex:gamma} ?
+\end{exercice}
+\begin{solution}
+  $[1,9]$ ; $[2,3]$ ; $[0,4]$ ($\Bot$ est neutre) ; $[3,12]$ ; non, les deux
+  intervalles sont incomparables (\code{partial_cmp} rend \code{None}).
+  $[1,3] \join [7,9] = [1,9]$ n'est pas exact : $\gam([1,9])$ contient $5$, qui
+  n'est dans aucun des deux opérandes.
+\end{solution}
+
+\begin{exercice}{Widening à seuils}{widening}
+  Avec $T = \{10, 20, 100\}$, calculer successivement
+  $[0,5] \widen_T [0,12]$, puis le résultat $\widen_T [0,25]$, puis le
+  résultat $\widen_T [0,101]$. Calculer aussi $[0,5] \widen_T [-3,5]$.
+  Combien de sauts la borne haute peut-elle faire au plus ?
+\end{exercice}
+\begin{solution}
+  $[0,20]$ (plus petit seuil $\ge 12$) ; $[0,100]$ ; $[0,+\infty]$ (aucun seuil
+  $\ge 101$). Pour la borne basse, aucun seuil n'est $\le -3$ :
+  $[-\infty, 5]$. Après son premier saut, la borne haute ne prend que des
+  valeurs de $T \cup \{+\infty\}$ et ne fait que croître : au plus
+  $|T| + 1 = 4$ sauts. C'est l'argument de terminaison de \adr{14}.
+\end{solution}
+
+\begin{exercice}{Une worklist à la main}{worklist}
+  On analyse le corps \texttt{let i = 10; while (i > 0) \{ i = i - 1; \}},
+  de CFG identique à \cref{fig:interpretation-abstraite-cfg-loop}, avec
+  $T = \{0, 1, 10\}$ et un widening au troisième passage par l'arc arrière,
+  comme \code{analyze_cfg}. Donner l'entrée finale de l'en-tête et la valeur
+  de \code{i} à la sortie. Refaire le calcul avec le widening sans seuils.
+\end{exercice}
+\begin{solution}
+  En-tête : $[10,10]$, puis $[9,10]$ et $[8,10]$ (joins, passages 1 et 2).
+  Passage 3 : le corps rend $[7,9]$ et
+  $[8,10] \widen_T [7,9] = [1,10]$ (plus grand seuil $\le 7$). Passage 4 :
+  la branche vraie raffine $[1,10]$ par \code{i > 0} (entier) en $[1,10]$, le
+  corps rend $[0,9]$, et $[1,10] \widen_T [0,9] = [0,10]$. L'en-tête vaut
+  $[0,10]$ ; la branche vraie y donne encore $[1,10]$ (inchangé, la worklist se
+  vide) et la branche fausse $[0,10] \meet [-\infty,0] = [0,0]$ : \code{i}
+  vaut $[0,0]$ à la sortie, la réponse exacte. Sans seuils, le passage 3 donne
+  $[-\infty,10]$, qui est déjà un post-point fixe, et la sortie vaut
+  $[-\infty, 0]$ : correct, mais la borne basse est perdue.
+\end{solution}
+
+\begin{exercice}{Dominance et niveau}{dominance}
+  Pour \code{Conditional} (\cref{lst:interpretation-abstraite-setter}),
+  dessiner le CFG du rendu, calculer $\mathrm{Dom}$ de chaque bloc, et en
+  déduire ce que rendent \code{certify} et \code{may_be_skipped} pour le bloc
+  de \code{setN(1)}. Retrouver le niveau observé.
+\end{exercice}
+\begin{solution}
+  \code{lower_if} (\src{src/lowering/cfg_builder.rs}{544}{585}) scelle
+  toujours un bloc \code{then} et un bloc \code{else}, même sans
+  \code{else} source : quatre blocs, pas trois. L'entrée $E$ porte le
+  \code{useState} et le test de \code{flag} ; $S$ est le \code{then}
+  (\code{setN(1)}, puis saut) ; $X$ est l'\code{else} vide (rien à lowerer,
+  saut immédiat) ; $R$ est le bloc de jonction, qui porte le \code{return} et
+  n'est atteint que depuis $S$ et $X$ (jamais directement depuis $E$).
+  $\mathrm{Dom}(E) = \{E\}$, $\mathrm{Dom}(S) = \{E, S\}$,
+  $\mathrm{Dom}(X) = \{E, X\}$,
+  $\mathrm{Dom}(R) = \{R\} \cup (\{E,S\} \cap \{E,X\}) = \{E, R\}$ : le bloc
+  vide $X$ ne change rien au résultat, puisqu'il hérite tel quel du
+  dominateur de $E$. $S$ ne domine pas la seule sortie $R$ : \code{certify}
+  rend \code{None} (pas de \code{Certified}), \code{may_be_skipped} rend
+  vrai. Sans preuve, la règle \regle{setter-in-render} s'arrête au
+  \Warning{} observé.
+\end{solution}
+
+\begin{exercice}{Forte ou faible ?}{maj}
+  Un objet est alloué par un littéral \texttt{const o = \{ v: 0 \}} dans le
+  rendu, puis un handler fait \code{o.v = 1}. La variable \code{o} ne désigne
+  qu'un site d'allocation. Pourquoi l'écriture sur le tas doit-elle
+  néanmoins rester faible ?
+\end{exercice}
+\begin{solution}
+  Le site d'allocation résume \emph{tous} les objets créés à cet endroit, un
+  par rendu : un seul objet concret reçoit l'écriture, les autres gardent
+  $0$. Et le handler peut ne jamais s'exécuter, ou s'exécuter sur un seul
+  chemin. Remplacer $0$ par $1$ affirmerait que tous ces objets valent $1$ :
+  une sous-approximation, donc un FN possible.
+\end{solution}

@@ -1,0 +1,809 @@
+% Chapitre 04 — Tour d'architecture : lire la codebase
+% Dossiers sources : §1 de notes/01 à notes/15, notes/13 §4.10 (run_check),
+% notes/15 §5.7 (principes), CLAUDE.md, Cargo.toml, src/lib.rs, src/main.rs.
+% Sorties observées avec target/debug/reactant (commit e67b10a) sur des
+% fichiers placés sous /tmp/tour/.
+\chapter{Tour d'architecture : lire la codebase}
+\label{chap:tour-architecture}
+
+\begin{objectifs}
+  \item Savoir situer chacun des 142 fichiers de \file{src/} (et le crate \code{reactant-wasm}) : son module, son rôle en une phrase, le chapitre qui le traite.
+  \item Suivre une invocation \code{reactant check counter.tsx} de \code{main} jusqu'au code de sortie, en nommant à chaque étape la fonction appelée et le type qui passe à l'étape suivante.
+  \item Connaître les cinq couches du projet et les frontières qui les séparent : plus d'AST après le lowering, des règles qui ne parcourent pas l'IR, un driver partagé par tous les hôtes.
+  \item Reconnaître les conventions transversales qui reviennent partout : fail-closed, must et may comme types, identités internées, positions \code{SourceRange}.
+  \item Lire les trois principes de \file{CLAUDE.md} dans le code, et savoir où chercher (tests, fixtures, \code{--trace}, \code{--verbose}, \code{explain}) quand on veut comprendre un comportement.
+\end{objectifs}
+
+\prerequis{\cref{chap:introduction} (ce que fait l'outil, sa sortie) ; \cref{chap:react-modele} (rendu, commit, effets) pour les exemples ; \cref{chap:interpretation-abstraite} pour le vocabulaire must / may et la soundness (\cref{def:must-may,def:soundness}). Aucun chapitre technique n'est requis : celui-ci est la carte qui les précède tous.}
+
+Un lecteur qui ouvre le dépôt pour la première fois trouve environ soixante mille lignes de Rust réparties en 142 fichiers. Aucune n'est inutile, mais toutes ne se lisent pas au même moment. Ce chapitre ne détaille aucun algorithme : il donne la carte. Il répond à trois questions dans l'ordre où un nouveau contributeur se les pose. Où est quoi ? Par où passe une exécution ? Quelles règles du jeu tiennent l'ensemble ?
+
+Le fil conducteur est le plus petit programme qui fasse réagir l'analyseur : un compteur dont l'effet incrémente l'état qu'il observe.
+
+\begin{lstlisting}[language=TypeScript,caption={Le programme témoin du chapitre (\file{/tmp/tour/counter.tsx})},label={lst:tour-counter}]
+import { useState, useEffect } from "react";
+
+export function Counter() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    setCount(count + 1);
+  }, [count]);
+  return <p>{count}</p>;
+}
+\end{lstlisting}
+
+L'analyseur, lancé sur ce fichier, répond (sortie observée, \code{--no-color}) :
+
+\begin{sortie}
+  Counter  (2 hooks)  counter.tsx
+    warn   infinite-loop  [hook:0]  (line 5:2)  this effect keeps pushing state `count` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
+
+⚠  1 warning(s) across 1 file(s).
+\end{sortie}
+
+et sort avec le code 1. Entre la ligne de commande et cette ligne \code{warn}, le fichier a été découvert, parsé, abaissé en IR, interprété jusqu'à un point fixe ; des relations ont été dérivées ; dix-neuf règles ont été consultées ; le résultat a été trié, compté et rendu. La \cref{sec:tour-architecture-flot} suit ce trajet pas à pas. Avant cela, il faut savoir où se trouvent les pièces.
+
+% ============================================================================
+\section{La carte : crates, modules et fichiers}
+\label{sec:tour-architecture-carte}
+
+\subsection{Un workspace, deux crates, un paquet npm}
+
+Le dépôt est un workspace Cargo à deux membres. Le manifeste racine déclare aussi deux \emph{features} et sépare explicitement la bibliothèque du binaire :
+
+\rustsnippet[language={}]{Cargo.toml}{13}{33}{workspace, features, binaire et bibliothèque}
+
+Trois choses sont à retenir.
+\begin{itemize}
+  \item \textbf{La bibliothèque \code{reactant}} (\file{src/lib.rs}) contient tout l'analyseur. Le binaire \code{reactant} (\file{src/main.rs}) n'existe qu'avec la feature \code{cli}, qui tire \code{clap}.
+  \item \textbf{Le crate \code{reactant-wasm}} (\file{crates/reactant-wasm/}) dépend de la bibliothèque avec \code{default-features = false} : ni \code{clap} ni \code{schemars}. Il expose, via \code{wasm-bindgen}, cinq fonctions (\code{hostConstants}, \code{helpPage}, \code{packSpecs}, \code{validatePack}, \code{run}) ; \code{run} appelle le même \code{driver::run_check} que la CLI native (\srcline{crates/reactant-wasm/src/lib.rs}{249}).
+  \item \textbf{Le paquet npm \code{reactant-analyzer}} (\file{npm/}) emballe ce module WASM : un exécutable \file{npm/bin/reactant.js}, une API JavaScript (\file{npm/lib/}), des tests de fumée (\file{npm/test/}). Il est traité au \cref{chap:distribution}.
+\end{itemize}
+
+Les dépendances de la bibliothèque sont volontairement minces : les quatre crates \code{oxc_parser}, \code{oxc_ast}, \code{oxc_span}, \code{oxc_allocator} en version 0.138.0 (\src{Cargo.toml}{36}{39}), \code{serde}, \code{serde_json}, \code{serde_path_to_error}, plus \code{clap} et \code{schemars} optionnels. Le commentaire des lignes 18--19 en donne la raison : le build WASM doit se contenter d'\og oxc + serde\fg{}.
+
+\subsection{La racine : \file{lib.rs} et \file{main.rs}}
+
+Le binaire tient en cinq lignes :
+
+\rustfile{src/main.rs}{le binaire entier}
+
+et la bibliothèque en treize :
+
+\rustfile{src/lib.rs}{la surface de la bibliothèque}
+
+Le module \code{cli} n'est \emph{pas} dans la bibliothèque : il est déclaré par \file{main.rs}, côté binaire, et c'est lui qui dépend de \code{clap} (\adr{16}). Tout le reste --- y compris le \code{driver}, qui compose une exécution complète --- est dans la bibliothèque, donc réutilisable par le crate WASM et par les tests. \file{test_support.rs} n'est compilé qu'en test.
+
+\subsection{Les dix modules de la bibliothèque}
+
+Les dix modules publics se rangent en cinq couches (\cref{sec:tour-architecture-couches}). En une phrase chacun :
+
+\begin{description}
+  \item[\file{src/lowering/}] le front-end : lit l'AST d'oxc, détecte composants, hooks custom et utilitaires, et produit l'IR. C'est, avec \file{src/resolver/}, le seul module qui importe oxc.
+  \item[\file{src/ir/}] la représentation intermédiaire : CFG, instructions, expressions, table des hooks, identités (\code{FileId}, \code{ComponentId}), et la primitive de splice.
+  \item[\file{src/domains/}] les domaines abstraits (treillis, produit \code{StateValue}), l'interpréteur des expressions et des instructions, les stores.
+  \item[\file{src/engine/}] le moteur : worklist sur un CFG, point fixe d'un composant, analyse de programme, relations dérivées à la convergence.
+  \item[\file{src/registry/}] le registre générique indexé par \code{(fichier, nom)} et les résumés de hooks de bibliothèques (\code{SummaryRegistry}).
+  \item[\file{src/rules/}] la couche règles : API typée, dix-neuf règles natives, registre, documentation, packs déclaratifs.
+  \item[\file{src/resolver/}] découverte des fichiers, résolution des imports, parse et lowering de tous les fichiers, point d'entrée de l'analyse.
+  \item[\file{src/project/}] conventions de projet (Vite, Next.js, tsconfig) qui paramètrent la découverte et la résolution.
+  \item[\file{src/driver/}] la composition complète de \code{check} et les rendus humain et JSON, partagés par tous les hôtes.
+  \item[\file{src/config.rs}] le fichier \file{reactant.config.json} : types, lecture, précédence avec les options de ligne de commande.
+\end{description}
+
+\subsection{Fichier par fichier}
+
+La \cref{tab:tour-architecture-fichiers} donne, pour chaque fichier, sa taille (lignes brutes, tests unitaires compris), son rôle en une phrase et le chapitre qui le traite. Elle tient lieu de carte de la codebase pour cette version du manuscrit ; les types et fonctions publics de chaque fichier sont détaillés dans le chapitre qui le traite. Deux conseils de lecture.
+\begin{itemize}
+  \item Les tailles sont trompeuses : \file{fixpoint.rs} (2\,815 lignes) contient environ mille lignes de tests, et \file{transfer/state_value.rs} (2\,749 lignes) n'a que 1\,041 lignes de production, le reste étant des tests.
+  \item Beaucoup de fichiers commencent par un commentaire \code{//!} qui résume leur rôle et cite l'ADR fondateur : c'est la première chose à lire en ouvrant un fichier.
+\end{itemize}
+
+{\small
+\begin{longtable}{@{}p{4.6cm}r p{8.3cm}c@{}}
+\caption{Les fichiers de \file{src/} (chemins relatifs à \file{src/}) et du crate WASM, au commit \snapshotCommit. La dernière colonne renvoie au chapitre qui traite le fichier.}\label{tab:tour-architecture-fichiers}\\
+\toprule
+Fichier & Lignes & Rôle & Ch. \\
+\midrule
+\endfirsthead
+\toprule
+Fichier & Lignes & Rôle & Ch. \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+\multicolumn{4}{@{}l}{\textbf{Racine}}\\
+\file{main.rs} & 5 & le binaire : \code{std::process::exit(cli::run())} & \ref{chap:projet-cli-driver} \\
+\file{lib.rs} & 13 & déclaration des dix modules publics & \ref{chap:projet-cli-driver} \\
+\file{config.rs} & 455 & \file{reactant.config.json} : types, JSONC, précédence, surcharges de sévérité & \ref{chap:projet-cli-driver} \\
+\file{test_support.rs} & 142 & constructeurs de fixtures partagés par les tests unitaires & \ref{chap:tests-corpus} \\
+\midrule
+\multicolumn{4}{@{}l}{\textbf{\file{lowering/} --- le front-end}}\\
+\file{mod.rs} & 565 & façade : \code{Candidate}, \code{is_hook_name}, constantes de module, lowerers des composants et des hooks & \ref{chap:frontend-detection} \\
+\file{detector.rs} & 169 & marcheur commun des fonctions de niveau supérieur & \ref{chap:frontend-detection} \\
+\file{component_detector.rs} & 352 & classification \og composant\fg{}, props typées DOM & \ref{chap:frontend-detection} \\
+\file{hook_detector.rs} & 162 & classification \og hook custom\fg{} & \ref{chap:frontend-detection} \\
+\file{utility_detector.rs} & 114 & classification \og utilitaire\fg{} & \ref{chap:frontend-detection} \\
+\file{hook_call_detect.rs} & 109 & \og ce corps appelle-t-il un hook ?\fg{} (\issue{122}) & \ref{chap:frontend-detection} \\
+\file{jsx_detect.rs} & 63 & \og un chemin de retour produit-il du JSX ?\fg{} & \ref{chap:frontend-detection} \\
+\file{import_resolution.rs} & 262 & provenance des imports : \code{HookOrigin}, \code{ResolvedImport}, \code{JsxOrigins} & \ref{chap:frontend-detection} \\
+\file{module_facts.rs} & 163 & directives et arêtes d'import d'un fichier (\code{ModuleFacts}) & \ref{chap:frontend-detection} \\
+\file{utility_lowerer.rs} & 62 & lowering des utilitaires en \code{FunctionIR} & \ref{chap:frontend-detection} \\
+\file{cfg_builder.rs} & 1\,381 & construction des blocs, lowering des instructions et des motifs de liaison & \ref{chap:lowering-cfg} \\
+\file{expr_lower.rs} & 1\,667 & lowering des expressions, fente des blocs sur \code{?:}, \code{&&}, \code{||}, \code{??}, \code{await} & \ref{chap:lowering-cfg} \\
+\file{hook_extractor.rs} & 1\,623 & passe IR vers IR : appels de hooks, handlers, subscriptions deviennent des \code{HookEntry} & \ref{chap:lowering-cfg} \\
+\midrule
+\multicolumn{4}{@{}l}{\textbf{\file{ir/} --- la représentation intermédiaire}}\\
+\file{mod.rs} & 34 & ré-exports de la surface publique de l'IR & \ref{chap:ir} \\
+\file{types.rs} & 25 & alias de base (\code{Symbol}, \code{HookLabel}, \code{BlockId}, \code{Var}, \code{QualifiedSlot}) et \code{ExprId} & \ref{chap:ir} \\
+\file{source_range.rs} & 102 & \code{FileId}, \code{FileTable}, \code{SourceRange}, \code{SourceMap} & \ref{chap:ir} \\
+\file{cfg.rs} & 228 & le CFG : \code{BasicBlock}, \code{Terminator}, \code{EdgeKind}, \code{Edge} & \ref{chap:ir} \\
+\file{stmt.rs} & 54 & les instructions \code{Stmt} & \ref{chap:ir} \\
+\file{expr.rs} & 548 & les expressions \code{Expr}, opérateurs, valeurs marquées des hooks & \ref{chap:ir} \\
+\file{hooks.rs} & 358 & la table des hooks : \code{HookEntry}, deps, provenance & \ref{chap:ir} \\
+\file{component.rs} & 83 & \code{ComponentIR}, \code{ModuleConstInit}, \code{ContextId} & \ref{chap:ir} \\
+\file{hook_ir.rs} & 24 & \code{HookIR}, l'IR d'un hook custom & \ref{chap:ir} \\
+\file{function_ir.rs} & 22 & \code{FunctionIR}, l'IR d'un utilitaire & \ref{chap:ir} \\
+\file{component_id.rs} & 274 & identité internée \code{ComponentId}, \code{ComponentTable} (\adr{40}) & \ref{chap:ir} \\
+\file{module.rs} & 222 & \code{ModuleFacts}, \code{ModuleTable} & \ref{chap:ir} \\
+\file{bindings.rs} & 212 & certificats de liaison syntaxique (\og ce nom est-il lié à coup sûr ?\fg{}) & \ref{chap:ir} \\
+\file{free_vars.rs} & 630 & variables libres, chemins d'accès \code{AccessPath}, couverture par les deps & \ref{chap:ir} \\
+\file{remap.rs} & 451 & décalage des labels de hooks et des sites d'allocation & \ref{chap:splice-inlining} \\
+\file{splice.rs} & 1\,156 & la primitive de greffe d'un CFG dans un autre, \(\alpha\)-renommage & \ref{chap:splice-inlining} \\
+\midrule
+\multicolumn{4}{@{}l}{\textbf{\file{domains/} --- valeurs abstraites, interpréteur, stores}}\\
+\file{mod.rs} & 162 & les traits \code{AbstractDomain} et \code{Transfer} & \ref{chap:treillis-simples} \\
+\file{context.rs} & 171 & contextes de transfert : \code{AnalysisCtx}, \code{InterCtx}, \code{AnalyzeChildFn} & \ref{chap:statevalue-stabilite} \\
+\file{impls/mod.rs} & 65 & macro \code{flat_lattice!}, ré-exports des domaines & \ref{chap:treillis-simples} \\
+\file{impls/bool_val.rs} & 13 & treillis plat des booléens & \ref{chap:treillis-simples} \\
+\file{impls/setter_val.rs} & 72 & treillis plat des setters, avec identité & \ref{chap:treillis-simples} \\
+\file{impls/str_const.rs} & 153 & ensembles bornés de constantes de chaînes & \ref{chap:treillis-simples} \\
+\file{impls/interval.rs} & 614 & intervalles de flottants avec bit d'intégralité & \ref{chap:treillis-simples} \\
+\file{impls/stability.rs} & 367 & stabilité référentielle versionnée (\adr{17}) & \ref{chap:statevalue-stabilite} \\
+\file{impls/state_value.rs} & 1\,262 & le produit \code{StateValue} des sortes de valeurs JS (\adr{15}) & \ref{chap:statevalue-stabilite} \\
+\file{transfer/mod.rs} & 3 & ré-export de \code{StateValueTransfer} & \ref{chap:transfert-stores} \\
+\file{transfer/state_value.rs} & 2\,749 & sémantique des expressions, mémos, inlining d'un enfant (\code{eval_comp_app}) & \ref{chap:transfert-stores} \\
+\file{interp/mod.rs} & 9 & ré-exports de l'interpréteur & \ref{chap:transfert-stores} \\
+\file{interp/interpreter.rs} & 583 & sémantique des instructions : liaisons, appels de setter, callbacks & \ref{chap:transfert-stores} \\
+\file{interp/callbacks.rs} & 131 & classification d'un callee (\code{TriggerClass}, \adr{9}) & \ref{chap:transfert-stores} \\
+\file{interp/cfg.rs} & 26 & ordre topologique d'un corps de fonction & \ref{chap:transfert-stores} \\
+\file{stores/mod.rs} & 35 & déclarations, ordre ponctuel partagé par les stores & \ref{chap:transfert-stores} \\
+\file{stores/abstract_env.rs} & 366 & l'environnement local \code{AbstractEnv} & \ref{chap:transfert-stores} \\
+\file{stores/state_store.rs} & 173 & les valeurs écrites des slots \code{useState} & \ref{chap:transfert-stores} \\
+\file{stores/memo_store.rs} & 70 & les valeurs des \code{useMemo} et \code{useCallback} & \ref{chap:transfert-stores} \\
+\file{stores/shared_state_store.rs} & 204 & les écritures inter-composants & \ref{chap:transfert-stores} \\
+\file{stores/heap.rs} & 165 & le tas abstrait, indexé par site d'allocation & \ref{chap:transfert-stores} \\
+\midrule
+\multicolumn{4}{@{}l}{\textbf{\file{engine/} --- le moteur}}\\
+\file{mod.rs} & 49 & déclaration des sous-modules, surface publique & \ref{chap:point-fixe-composant} \\
+\file{cfg_analyzer.rs} & 1\,019 & worklist sur un CFG, widening sur arcs arrière, raffinement sur les gardes & \ref{chap:cfg-analyzer-dominance} \\
+\file{dominance.rs} & 304 & dominateurs, \og sur tous les chemins\fg{} & \ref{chap:cfg-analyzer-dominance} \\
+\file{eval.rs} & 105 & évaluer une expression contre les stores convergés & \ref{chap:cfg-analyzer-dominance} \\
+\file{fixpoint.rs} & 2\,815 & point fixe d'un composant, analyse de programme, expansion des hooks et utilitaires & \ref{chap:point-fixe-composant} \\
+\file{hook_registry.rs} & 101 & registre \code{(fichier, nom)} des \code{HookIR} & \ref{chap:splice-inlining} \\
+\file{function_registry.rs} & 125 & registre des \code{FunctionIR}, résolution fail-closed & \ref{chap:splice-inlining} \\
+\file{triggers.rs} & 110 & relation \relation{effect_triggers} : quel slot fait bouger quelle dep & \ref{chap:relations} \\
+\file{setters.rs} & 2\,490 & marche des setters, relations \relation{slot_writers}, \relation{slot_reads}, \relation{body_calls} & \ref{chap:relations} \\
+\file{written.rs} & 415 & ce qu'une écriture stocke (fraîcheur, valeur) & \ref{chap:relations} \\
+\file{guards.rs} & 1\,058 & preuve \og une écriture éteint ses propres gardes\fg{} & \ref{chap:relations} \\
+\file{seeds.rs} & 552 & relation \relation{slot_seeds} (\code{useState} amorcé par une prop) & \ref{chap:relations} \\
+\file{registrations.rs} & 683 & relation \relation{registrations} (callbacks confiés à un registrar) & \ref{chap:relations} \\
+\file{program_relations.rs} & 42 & \code{ProgramRelations} : relations de programme, paresseuses & \ref{chap:relations} \\
+\file{churn.rs} & 927 & le graphe de churn du programme et ses cycles & \ref{chap:churn} \\
+\file{render_deps.rs} & 1\,276 & dépendance de rendu (\adr{41}) & \ref{chap:inter-composants} \\
+\file{symbol_graph.rs} & 416 & graphe de symboles et ordre topologique (lu par \code{--verbose} seulement) & \ref{chap:inter-composants} \\
+\file{root_detector.rs} & 329 & choix des racines (\code{RootStrategy}) & \ref{chap:inter-composants} \\
+\file{component_cache.rs} & 327 & cache des analyses d'enfants, indexé par props abstraites & \ref{chap:inter-composants} \\
+\file{component_registry.rs} & 256 & registre des composants, résolution d'un callee JSX & \ref{chap:inter-composants} \\
+\file{analysis_result.rs} & 289 & \code{AnalysisResult}, le résultat par composant & \ref{chap:inter-composants} \\
+\file{program_result.rs} & 225 & \code{ProgramAnalysisResult}, le résultat par programme & \ref{chap:inter-composants} \\
+\midrule
+\multicolumn{4}{@{}l}{\textbf{\file{registry/}}}\\
+\file{mod.rs} & 5 & ré-exports & \ref{chap:projet-cli-driver} \\
+\file{keyed.rs} & 113 & registre générique indexé par \code{(fichier, nom)} & \ref{chap:projet-cli-driver} \\
+\file{summary.rs} & 573 & résumés abstraits des hooks de bibliothèques (sans leur source) & \ref{chap:splice-inlining} \\
+\midrule
+\multicolumn{4}{@{}l}{\textbf{\file{rules/} --- la couche règles}}\\
+\file{mod.rs} & 131 & trait \code{Rule}, \code{SafeCheck}, \code{all_rules} & \ref{chap:api-regles} \\
+\file{registry.rs} & 808 & registre dynamique (natives puis packs), passe \code{check_component} & \ref{chap:api-regles} \\
+\file{docs.rs} & 426 & documentation statique de chaque nom de diagnostic & \ref{chap:api-regles} \\
+\file{api/mod.rs} & 13 & déclaration de la surface typée & \ref{chap:api-regles} \\
+\file{api/query.rs} & 1\,259 & requêtes typées : \code{Certified}, \code{MustResult}, \code{May}, \code{RuleCtx} & \ref{chap:api-regles} \\
+\file{api/witness.rs} & 560 & vocabulaire fermé des témoins (\code{Step}, \code{Note}) & \ref{chap:api-regles} \\
+\file{api/diagnostic.rs} & 218 & \code{Diagnostic} scellé, \code{Severity} & \ref{chap:api-regles} \\
+\file{api/cache.rs} & 77 & \code{ProgramCache} : structures de programme paresseuses & \ref{chap:api-regles} \\
+\file{helpers/mod.rs} & 267 & nommage des valeurs et des slots, scans, porte de stabilité des deps & \ref{chap:api-regles} \\
+\file{helpers/jsx.rs} & 365 & relations d'éléments JSX, verdict d'identité d'un site & \ref{chap:api-regles} \\
+\file{helpers/context_flow.rs} & 234 & relation \relation{context_consumers} (\adr{32}) & \ref{chap:api-regles} \\
+\file{helpers/providers.rs} & 107 & providers de contexte prouvés & \ref{chap:api-regles} \\
+\file{helpers/purity.rs} & 155 & qu'est-ce qu'une mutation en place & \ref{chap:api-regles} \\
+\file{helpers/mount.rs} & 566 & durée de montage : où un composant est rendu & \ref{chap:api-regles} \\
+\file{helpers/cycles.rs} & 248 & nommage et projection du graphe de churn & \ref{chap:churn} \\
+\file{helpers/render_tree.rs} & 777 & vue de programme de la dépendance de rendu (\code{RenderIndex}) & \ref{chap:regles-rendu-rsc} \\
+\file{impls/mod.rs} & 44 & un module par règle, rien d'autre & \ref{chap:api-regles} \\
+\file{impls/lazy_init.rs} & 644 & \regle{lazy-init} : initialiseur recalculé à chaque rendu & \ref{chap:regles-etat} \\
+\file{impls/unstable_context_value.rs} & 72 & \regle{unstable-context-value} : valeur de provider fraîche & \ref{chap:regles-etat} \\
+\file{impls/redundant_set_state.rs} & 629 & \regle{redundant-set-state} : écrire la valeur déjà présente & \ref{chap:regles-etat} \\
+\file{impls/setter_in_render.rs} & 586 & \regle{setter-in-render} : setter appelé pendant le rendu & \ref{chap:regles-etat} \\
+\file{impls/derived_state.rs} & 169 & \regle{derived-state} : effet qui recopie un autre état & \ref{chap:regles-etat} \\
+\file{impls/state_mutation.rs} & 521 & \regle{state-mutation} : objet d'état ou de props muté en place & \ref{chap:regles-etat} \\
+\file{impls/frozen_initial_state.rs} & 336 & \regle{frozen-initial-state} : état figé sur la première prop & \ref{chap:regles-etat} \\
+\file{impls/infinite_loop.rs} & 1\,667 & \regle{infinite-loop} : boucle de rendu infinie & \ref{chap:infinite-loop} \\
+\file{impls/state_lifted_too_high.rs} & 146 & \regle{state-lifted-too-high} : état placé trop haut & \ref{chap:infinite-loop} \\
+\file{impls/widening_info.rs} & 41 & \regle{widening-info} : slot élargi pour converger (Info) & \ref{chap:regles-effets} \\
+\file{impls/analysis_limit_info.rs} & 158 & \regle{analysis-limit} : analyse tronquée (Info) & \ref{chap:regles-effets} \\
+\file{impls/conditional_hook.rs} & 581 & \regle{conditional-hook} : hook appelé sous condition & \ref{chap:regles-effets} \\
+\file{impls/always_unstable_deps.rs} & 489 & \regle{always-unstable-deps} : dep toujours fraîche & \ref{chap:regles-effets} \\
+\file{impls/missing_deps.rs} & 701 & \regle{missing-deps} : variable capturée absente des deps & \ref{chap:regles-effets} \\
+\file{impls/unnecessary_rerender.rs} & 446 & \regle{unnecessary-rerender} : effet de montage qui écrase l'état initial & \ref{chap:regles-effets} \\
+\file{impls/missing_cleanup.rs} & 113 & \regle{missing-cleanup} : effet sans teardown & \ref{chap:regles-effets} \\
+\file{impls/stale_closure.rs} & 469 & \regle{stale-closure} : callback durable figé sur un état & \ref{chap:regles-effets} \\
+\file{impls/wasted_subtree_render.rs} & 333 & \regle{wasted-subtree-render} : sous-arbres re-rendus pour rien & \ref{chap:regles-rendu-rsc} \\
+\file{impls/server_component_hook.rs} & 308 & \regle{server-component-hook} : hook dans un Server Component & \ref{chap:regles-rendu-rsc} \\
+\file{declarative/mod.rs} & 87 & \code{load_pack}, seule surface publique des packs & \ref{chap:regles-declaratives} \\
+\file{declarative/schema.rs} & 958 & modèle serde de \file{pack.json} & \ref{chap:regles-declaratives} \\
+\file{declarative/validate.rs} & 2\,544 & validation sémantique d'un pack (typage des entités) & \ref{chap:regles-declaratives} \\
+\file{declarative/entity.rs} & 1\,261 & adaptateur entre entités du schéma et relations du moteur & \ref{chap:regles-declaratives} \\
+\file{declarative/exec.rs} & 918 & l'exécuteur \code{TierARule} & \ref{chap:regles-declaratives} \\
+\midrule
+\multicolumn{4}{@{}l}{\textbf{\file{resolver/}, \file{project/} --- fichiers et projets}}\\
+\file{resolver/mod.rs} & 1\,164 & découverte, résolution d'imports, parse et lowering de chaque fichier, \code{analyze_lowered} & \ref{chap:projet-cli-driver} \\
+\file{resolver/filesystem.rs} & 166 & la couture \code{FileSystem} (\code{OsFileSystem}, \code{MemFileSystem}) & \ref{chap:projet-cli-driver} \\
+\file{resolver/gitignore.rs} & 383 & \file{.gitignore}, pour la seule question \og répertoire généré ?\fg{} & \ref{chap:projet-cli-driver} \\
+\file{resolver/closure.rs} & 217 & fermeture transitive des imports (\code{--follow-imports}) & \ref{chap:projet-cli-driver} \\
+\file{project/mod.rs} & 464 & détection du type de projet, contexte d'analyse & \ref{chap:projet-cli-driver} \\
+\file{project/tsconfig.rs} & 563 & lecture JSONC des tsconfig, \code{paths} et \code{baseUrl} & \ref{chap:projet-cli-driver} \\
+\file{project/paths_resolver.rs} & 254 & résolveur d'imports fondé sur les alias tsconfig & \ref{chap:projet-cli-driver} \\
+\file{project/nextjs.rs} & 151 & conventions de l'App Router : graphe serveur & \ref{chap:regles-rendu-rsc} \\
+\midrule
+\multicolumn{4}{@{}l}{\textbf{\file{driver/}, \file{cli/} --- la coquille}}\\
+\file{driver/mod.rs} & 704 & \code{run_check} et les sous-commandes d'aide, \code{rules}, \code{explain} & \ref{chap:projet-cli-driver} \\
+\file{driver/report.rs} & 68 & \code{CheckReport}, ce que lisent les deux rendus & \ref{chap:projet-cli-driver} \\
+\file{driver/human.rs} & 362 & rendu humain & \ref{chap:projet-cli-driver} \\
+\file{driver/json.rs} & 307 & rendu JSON (schéma version 2) & \ref{chap:projet-cli-driver} \\
+\file{driver/locations.rs} & 103 & groupage des findings par position source (\issue{129}) & \ref{chap:projet-cli-driver} \\
+\file{driver/blind_spots.rs} & 73 & ce que l'exécution sait ne pas avoir lu & \ref{chap:projet-cli-driver} \\
+\file{driver/palette.rs} & 49 & séquences de couleur ANSI & \ref{chap:projet-cli-driver} \\
+\file{cli/mod.rs} & 127 & parsing \code{clap}, dispatch des sous-commandes & \ref{chap:projet-cli-driver} \\
+\file{cli/check.rs} & 202 & \code{check} : fusion options et config, appel du driver & \ref{chap:projet-cli-driver} \\
+\file{cli/config_load.rs} & 128 & chargement de la config et du registre (natives, puis packs) & \ref{chap:projet-cli-driver} \\
+\file{cli/rules_cmd.rs} & 19 & sous-commande \code{rules} & \ref{chap:projet-cli-driver} \\
+\file{cli/explain.rs} & 17 & sous-commande \code{explain} & \ref{chap:projet-cli-driver} \\
+\file{cli/schemas_cmd.rs} & 63 & sous-commande \code{schemas} (schémas JSON) & \ref{chap:projet-cli-driver} \\
+\file{cli/color.rs} & 14 & activation des couleurs (option, \code{NO_COLOR}, tty) & \ref{chap:projet-cli-driver} \\
+\midrule
+\multicolumn{4}{@{}l}{\textbf{Crate \code{reactant-wasm}}}\\
+\file{crates/reactant-wasm/src/lib.rs} & 323 & point d'entrée WASM : cinq fonctions \code{wasm-bindgen}, dont \code{run} & \ref{chap:distribution} \\
+\end{longtable}
+}
+
+% ============================================================================
+\section{Le flot d'une invocation, de bout en bout}
+\label{sec:tour-architecture-flot}
+
+Reprenons \code{reactant check counter.tsx} et suivons l'exécution. La \cref{fig:tour-architecture-pipeline} en donne la vue d'ensemble : les modules traversés et, sur les flèches, le type qui passe d'une étape à la suivante. Les sous-sections qui suivent la parcourent dans l'ordre.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[
+    etape/.style={bloc,text width=40mm,minimum height=11mm,font=\scriptsize},
+    typeg/.style={font=\scriptsize\ttfamily,text=ra-gray,align=right,text width=25mm},
+    typed/.style={font=\scriptsize\ttfamily,text=ra-gray,align=left,text width=25mm}]
+  % colonne gauche : de l'argv à l'IR
+  \node[etape] (cli) {\file{src/main.rs}, \file{src/cli/}\\\code{cli::run} → \code{check::run}};
+  \node[etape,below=9mm of cli] (drv) {\file{src/driver/mod.rs}\\\code{run_check} : contexte, découverte};
+  \node[etape,below=9mm of drv] (lf) {\file{src/resolver/mod.rs}\\\code{lower_files_with}, fichier par fichier};
+  \node[etape,below=9mm of lf] (parse) {oxc : \code{Parser::parse}\\(une arène par fichier)};
+  \node[etape,below=9mm of parse] (low) {\file{src/lowering/}\\détecteurs, \code{build_cfg}, \code{extract_hooks}};
+  % colonne droite : de l'IR à la sortie
+  \node[etape,right=18mm of low] (reg) {\file{src/resolver/mod.rs}\\\code{analyze_lowered} : registres};
+  \node[etape,above=9mm of reg] (eng) {\file{src/engine/fixpoint.rs}, \file{src/domains/}\\\code{analyze_program}};
+  \node[etape,above=9mm of eng] (rel) {\file{src/engine/}\\relations de convergence, \code{ProgramRelations}};
+  \node[etape,above=9mm of rel] (rules) {\file{src/rules/registry.rs}\\\code{check_component}};
+  \node[etape,above=9mm of rules] (rend) {\file{src/driver/}\\comptage, rendu \code{human} ou \code{json}};
+  \node[etiquette,above=5mm of cli] (argv) {argv};
+  \node[etiquette,above=5mm of rend] (out) {stdout, stderr, code de sortie};
+  \draw[fleche] (argv) -- (cli);
+  \draw[fleche] (cli) -- node[typeg,left]{CheckOptions, \&RuleRegistry} (drv);
+  \draw[fleche] (drv) -- node[typeg,left]{Vec<PathBuf>} (lf);
+  \draw[fleche] (lf) -- node[typeg,left]{source : \&str} (parse);
+  \draw[fleche] (parse) -- node[typeg,left]{ParserReturn, Program<'a>} (low);
+  \draw[fleche] (low) -- (reg);
+  \node[font=\scriptsize\ttfamily,text=ra-gray,align=center,below=3mm] at ($(low.south)!0.5!(reg.south)$) {ComponentIR, HookIR, FunctionIR → LoweredProgram};
+  \draw[fleche] (reg) -- node[typed,right]{ComponentRegistry} (eng);
+  \draw[fleche] (eng) -- node[typed,right]{AnalysisResult (un par composant)} (rel);
+  \draw[fleche] (rel) -- node[typed,right]{ProgramAnalysisResult, ProgramCache} (rules);
+  \draw[fleche] (rules) -- node[typed,right]{ComponentFindings (Diagnostic)} (rend);
+  \draw[fleche] (rend) -- node[typed,right]{CheckOutput} (out);
+  % frontière de l'AST
+  \coordinate (m) at ($(low.east)!0.5!(reg.west)$);
+  \draw[dashed,draw=ra-amber,thick] ($(m)+(0,-8mm)$) -- (m |- cli.north);
+  \node[font=\scriptsize\itshape,text=ra-amber,rotate=90,anchor=south] at ($(m |- lf.center)+(-1mm,0)$) {fin de l'AST};
+\end{tikzpicture}
+\caption{Le pipeline de \code{reactant check}, module par module. À gauche, de la ligne de commande à l'IR ; à droite, de l'IR à la sortie. Sur chaque flèche, le type principal transmis. L'AST d'oxc n'existe qu'entre le parse et le lowering, et seulement le temps d'un fichier : aucune flèche ne franchit la ligne pointillée avec un AST.}
+\label{fig:tour-architecture-pipeline}
+\end{figure}
+
+\subsection{De \code{main} au driver}
+
+\code{main} appelle \code{cli::run} (\srcline{src/cli/mod.rs}{111}), qui parse les arguments avec \code{clap} et dispatche. \code{reactant counter.tsx} sans sous-commande est un \code{check}, comme \code{reactant check counter.tsx}. \code{check::run} (\srcline{src/cli/check.rs}{99}) charge la configuration et le registre des règles (\code{load_config_and_registry}, \srcline{src/cli/config_load.rs}{16}), fusionne options et configuration (les options gagnent, \adr{22}), puis passe la main :
+
+\rustsnippet{src/cli/check.rs}{192}{202}{le binaire appelle le driver, puis écrit les flux}
+
+Le driver ne touche jamais les flux du processus. Il reçoit un système de fichiers derrière une couture (\code{Arc<dyn FileSystem>}), les chemins positionnels, le registre prêt à l'emploi, les options résolues et une fonction d'affichage des chemins ; il rend trois valeurs tamponnées :
+
+\rustsnippet{src/driver/mod.rs}{85}{90}{la sortie tamponnée du driver}
+
+\rustsnippet{src/driver/mod.rs}{102}{112}{la signature de \code{run_check}}
+
+C'est cette signature qui permet au crate WASM d'appeler la même fonction avec un \code{MemFileSystem} et une fonction d'affichage identité. Les deux hôtes ne diffèrent que par ce qu'ils passent et par ce qu'ils font des trois champs rendus.
+
+\subsection{Contexte, découverte, lowering}
+
+\code{run_check} commence par des vérifications d'usage (premier argument qui ressemble à une commande mal tapée), construit le contexte de projet (Vite, Next.js ou simple parcours, alias tsconfig), puis découvre les fichiers : un répertoire est parcouru récursivement à la recherche de \code{.ts}, \code{.tsx}, \code{.js}, \code{.jsx} ; un fichier nommé est pris tel quel. Pour \file{counter.tsx}, la liste contient un seul chemin. Le \cref{chap:projet-cli-driver} détaille ces étapes ; ici, seule compte la suivante :
+
+\rustsnippet{src/driver/mod.rs}{236}{237}{un seul appel pour tout le front-end}
+
+\code{lower_files_with} (\src{src/resolver/mod.rs}{247}{349}) boucle sur les fichiers. Pour chacun, elle lit la source à travers la couture, crée une arène, parse, puis appelle trois lowerers et deux collecteurs de faits de module. Le cœur du parse est court :
+
+\rustsnippet[label={lst:tour-parse}]{src/resolver/mod.rs}{289}{312}{parse d'un fichier et décision de le garder}
+
+\paragraph{Premier type : \code{ParserReturn}.} Le parseur d'oxc~\cite{oxc} rend un \code{ParserReturn} dont le projet lit trois champs : \code{program} (l'AST, alloué dans l'arène \code{alloc}), \code{diagnostics} (les erreurs de syntaxe) et \code{panicked} (vrai quand l'AST est inutilisable). La décision codée ici est une décision de soundness : un fichier dont le parseur a \emph{récupéré} une erreur est quand même abaissé, et seul un \code{panicked} fait sauter le fichier --- lequel est alors signalé sur stderr (\code{[skipped]}) et interdit le \og tout va bien\fg{} final. Sur un fichier contenant \code{const x = ;} passé à côté de \file{counter.tsx}, on observe :
+
+\begin{sortie}
+[skipped] broken.tsx: Unexpected token, the file was not analyzed
+  Counter  (2 hooks)  counter.tsx
+    warn   infinite-loop  [hook:0]  (line 5:2)  this effect keeps pushing state `count` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
+
+⚠  1 warning(s) across 1 file(s).
+   not analyzed:
+     • 1 file(s) could not be parsed and were dropped, so nothing in them was analysed
+\end{sortie}
+
+\paragraph{Deuxième type : \code{Candidate}.} Chaque lowerer commence par demander aux détecteurs quelles fonctions de niveau supérieur l'intéressent. La réponse est une liste de \code{Candidate}, une vue \emph{empruntée} dans l'AST :
+
+\rustsnippet{src/lowering/mod.rs}{128}{144}{le candidat produit par les détecteurs}
+
+Pour \file{counter.tsx}, le détecteur de composants rend un candidat \code{Counter} : un nom en majuscule, un corps qui retourne du JSX (\cref{chap:frontend-detection}). Le champ \code{expression} distingue \code{x => expr} de \code{x => \{ expr; \}}, qu'oxc représente de la même façon ; l'oublier a coûté un faux négatif (\issue{5}), d'où le commentaire.
+
+\paragraph{Troisième type : \code{ComponentIR}.} Le candidat est ensuite abaissé. La chaîne, pour un composant, tient en quatre appels :
+
+\rustsnippet{src/lowering/mod.rs}{463}{470}{du candidat au CFG et à la table des hooks}
+
+\code{build_cfg} produit le CFG du corps de rendu (\cref{chap:lowering-cfg}) ; \code{extract_hooks} y reconnaît les appels de hooks, les remplace par des valeurs marquées et fabrique la table des \code{HookEntry} ; \code{extract_handlers} et \code{extract_subscriptions} y ajoutent les handlers JSX et les \code{addEventListener} des effets. Les labels sont attribués dans cet ordre : pour \code{Counter}, le \code{useState} reçoit le label 0 et le \code{useEffect} le label 1 --- ce sont les \code{[hook:0]} et \code{[hook:1]} de la sortie. Le résultat est un \code{ComponentIR} :
+
+\rustsnippet[label={lst:tour-component-ir}]{src/ir/component.rs}{59}{83}{l'IR d'un composant}
+
+Ce type ne contient plus aucune référence vers l'AST : \code{PathBuf}, \code{String}, \code{Arc}, un \code{CFG} possédé. Dès la fin de l'itération, l'arène du fichier est libérée. Les hooks custom deviennent de la même façon des \code{HookIR}, les utilitaires des \code{FunctionIR}. Le tout est rangé dans un \code{LoweredProgram} (\src{src/resolver/mod.rs}{208}{233}) qui porte aussi la table des fichiers (\code{FileTable}), la table des faits de module (\code{ModuleTable}), les erreurs de parse et les arêtes d'import des utilitaires.
+
+\subsection{L'analyse : registres, point fixe, relations}
+
+Revenu dans le driver, après quelques contrôles (imports non lus, stratégie de racines, validité de \code{--entry}), l'analyse proprement dite est lancée :
+
+\rustsnippet{src/driver/mod.rs}{370}{374}{la configuration réelle du moteur et l'appel de l'analyse}
+
+\code{analyze_lowered} range les trois sortes d'IR dans leurs registres, puis délègue au moteur :
+
+\rustsnippet{src/resolver/mod.rs}{439}{452}{des IR aux registres, puis au moteur}
+
+\paragraph{Le point fixe.} \code{analyze_program} (\srcline{src/engine/fixpoint.rs}{704}) choisit les racines, puis analyse chacune par \code{analyze_component_impl} (\srcline{src/engine/fixpoint.rs}{130}). Un enfant rencontré dans le JSX d'un parent est analysé à la demande, avec les props abstraites du parent ; les composants qu'aucune racine n'atteint sont analysés ensuite, isolément (\cref{chap:inter-composants}). Pour un composant, \code{analyze_component_impl} greffe d'abord les utilitaires puis les hooks custom dans le CFG (\cref{chap:splice-inlining}), puis itère : passe de rendu, recalcul des mémos, passes des effets et des handlers, join des états écrits, test de convergence. Le test est lisible tel quel :
+
+\rustsnippet{src/engine/fixpoint.rs}{484}{497}{le test de convergence de la boucle externe}
+
+Pour \code{Counter}, chaque tour écrit \code{count + 1} dans le slot 0 ; l'intervalle du slot grandit, le moteur applique un widening, et la boucle converge au troisième tour. \code{--verbose} le montre :
+
+\begin{sortie}
+[verbose] symbol graph: 1 nodes, topo order = [Counter@counter.tsx]
+[verbose] 1 components analyzed
+[verbose] cache hits: 0, misses: 0
+  [verbose] Counter: 3 iteration(s), widened: [0]
+\end{sortie}
+
+\paragraph{Quatrième type : \code{AnalysisResult}.} À la convergence, \code{analyze_component_impl} calcule dans une \og dernière tranche\fg{} les relations propres au composant (\src{src/engine/fixpoint.rs}{596}{667}), puis range tout dans un \code{AnalysisResult}. Ses champs, élagués de leurs commentaires, se regroupent ainsi :
+
+\begin{lstlisting}[language=Rust,caption={Les champs d'\code{AnalysisResult}, élagués et regroupés (\src{src/engine/analysis_result.rs}{171}{272})},label={lst:tour-analysis-result}]
+pub struct AnalysisResult<D: AbstractDomain> {
+    // identité et contexte du composant
+    pub component: ComponentId, pub file: PathBuf, pub param: Var,
+    pub dom_props: Arc<HashSet<Var>>, pub module_consts: Arc<HashMap<Var, ModuleConstInit>>,
+    // stores convergés et environnements par bloc
+    pub state_store: StateStore<D>, pub memo_store: MemoStore<D>, pub heap: Heap,
+    pub block_states: HashMap<BlockId, AbstractEnv<D>>,
+    pub effect_block_states: …, pub handler_block_states: …,
+    // l'IR après expansion, et ce qu'on en a extrait
+    pub render_cfg: CFG, pub hooks: Vec<HookEntry>, pub hook_provenance: Vec<HookProvenance>,
+    pub hook_calls: Vec<HookCallInfo>, pub effect_info: …, pub handler_info: …,
+    pub inline_origins: Vec<InlineOrigin>, pub custom_arg_returns: …,
+    // histoire du point fixe
+    pub widen_trace: HashMap<HookLabel, WidenEvent>, pub effect_setter_writes: StateStore<D>,
+    pub iterations: usize,
+    // relations calculées à la convergence
+    pub slot_writers: Vec<SlotWriter>, pub slot_seeds: Vec<SlotSeed>,
+    pub registrations: Vec<Registration>, pub effect_triggers: Vec<EffectTrigger>,
+}
+\end{lstlisting}
+
+Tous les résultats sont réunis dans un \code{ProgramAnalysisResult} (\src{src/engine/program_result.rs}{28}{69}) : la table \code{components} indexée par \code{ComponentId}, le store partagé inter-composants, le graphe d'appels, les statistiques, et les tables d'identité (\code{component_table}, \code{file_table}, \code{module_table}).
+
+\paragraph{Cinquième type : \code{ProgramRelations}.} Certaines relations ne sont pas celles d'un composant mais du programme : le graphe de churn relie les écritures d'un composant aux effets d'un autre. Elles vivent dans une structure paresseuse, construite une fois par programme :
+
+\rustsnippet{src/engine/program_relations.rs}{19}{42}{les relations de programme, construites à la première demande}
+
+\subsection{Les règles, le tri, la sortie}
+
+Le driver construit \emph{un} cache pour toute l'exécution --- un \code{ProgramCache}, qui contient un \code{ProgramRelations} et trois autres structures de programme encore construites côté règles (\src{src/rules/api/cache.rs}{26}{41}) --- puis, pour chaque composant dans l'ordre lexicographique des noms affichés, appelle le registre :
+
+\rustsnippet{src/driver/mod.rs}{407}{410}{un seul cache pour tout le programme}
+
+\rustsnippet{src/rules/registry.rs}{254}{274}{la passe des règles sur un composant (début)}
+
+Chaque règle reçoit un \code{RuleCtx} (le cache, l'identifiant du composant, ses options), rend un \code{Vec<Diagnostic>} et, si elle n'a rien trouvé, peut publier une assurance positive (\code{SafeCheck}, affichée \og verified\fg{} sous \code{--info}). La suite de \code{check_component} (\src{src/rules/registry.rs}{276}{341}) retire les assurances si un \regle{analysis-limit} a été émis, applique les filtres \code{off}/\code{--rule}, puis trie selon un ordre total pour que deux exécutions produisent des octets identiques.
+
+\paragraph{Sixième type : \code{Diagnostic}.} C'est l'unité de sortie de la couche règles :
+
+\rustsnippet[label={lst:tour-diagnostic}]{src/rules/api/diagnostic.rs}{55}{73}{le diagnostic et son champ de sévérité scellé}
+
+Le champ \code{severity} est privé : on ne le fixe qu'à la construction, par trois constructeurs, dont un seul produit un \Error{} (\cref{sec:tour-architecture-conventions}). Pour \code{Counter}, \regle{infinite-loop} rend un diagnostic \Warning{} ancré au \code{useEffect} (ligne 5, colonne 2), dont \code{hook_label} vaut 0 (le slot \code{count}) et dont les deux notes forment la chaîne de témoins que \code{--trace} déroule :
+
+\begin{sortie}
+  Counter  (2 hooks)  counter.tsx
+    warn   infinite-loop  [hook:0]  (line 5:2)  this effect keeps pushing state `count` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       → state `count` is written here [hook:1] (line 5:2)
+       → the abstract value of state `count` kept growing and was widened at iteration 3
+\end{sortie}
+
+\paragraph{Comptage et code de sortie.} Le driver filtre les \Info{} (sauf \code{--info}), compte \Error{} et \Warning{}, et fixe le code de sortie :
+
+\rustsnippet{src/driver/mod.rs}{480}{484}{la politique de code de sortie}
+
+Par défaut \code{--fail-on warning} : le \Warning{} de \code{Counter} donne le code 1 (\code{EXIT_FINDINGS}). Enfin un \code{CheckReport} est construit et rendu par \code{human::render} ou \code{json::render} (\src{src/driver/mod.rs}{510}{522}). La même exécution avec \code{--format json} produit un document unique sur stdout ; en voici le début, observé :
+
+\begin{sortie}
+{
+  "version": 2,
+  "files_analyzed": 1,
+  "parse_errors": [],
+  "diagnostics": [
+    {
+      "rule": "infinite-loop",
+      "severity": "warning",
+      "component": "Counter",
+      "file": "counter.tsx",
+      "component_file": "counter.tsx",
+      "line": 5,
+      "col": 2,
+      "hook_label": 0,
+      "var": null,
+      "message": "this effect keeps pushing state `count` (its deps …",
+\end{sortie}
+
+(message tronqué ici ; les \code{notes} suivent, puis \code{blind_spots} et \code{summary}).
+
+\begin{remarque}
+La chaîne complète des types rencontrés est donc : \code{ParserReturn} (oxc, emprunté dans l'arène) → \code{Candidate} (vue empruntée de l'AST) → \code{ComponentIR} (possédé, plus d'AST) → \code{LoweredProgram} → \code{AnalysisResult} par composant, réunis en \code{ProgramAnalysisResult} → \code{ProgramRelations} (dans \code{ProgramCache}) → \code{Diagnostic} (dans \code{ComponentFindings}) → \code{CheckReport} → \code{CheckOutput}. Retenir cette liste suffit pour savoir, devant n'importe quelle fonction du dépôt, à quel étage on se trouve.
+\end{remarque}
+
+% ============================================================================
+\section{Cinq couches et leurs frontières}
+\label{sec:tour-architecture-couches}
+
+\begin{definition}{Couche}{tour-architecture-couche}
+Une \terme{couche} de \reactant{} est un groupe de modules qui ne consomme de la couche précédente qu'un type de sortie fixé, et n'en connaît rien d'autre. Le projet en a cinq : le \emph{front-end} (\file{src/lowering/}, avec le parse de \file{src/resolver/}), l'\emph{IR} (\file{src/ir/}), le \emph{moteur} (\file{src/engine/}, \file{src/domains/}, \file{src/registry/}), les \emph{règles} (\file{src/rules/}) et la \emph{coquille} (\file{src/driver/}, \file{src/cli/}, \file{src/project/}, découverte de \file{src/resolver/}, \file{src/config.rs}).
+\end{definition}
+
+La \cref{fig:tour-architecture-couches} empile ces couches et nomme, entre chacune, la frontière et le mécanisme qui la tient. Chaque frontière est une décision documentée ; chacune a une raison de soundness autant que de propreté.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[
+    couche/.style={bloc,text width=58mm,minimum height=11mm},
+    front/.style={font=\scriptsize,text width=70mm,align=left}]
+  \node[couche] (c5) {\textbf{Coquille}\\\file{driver/}, \file{cli/}, \file{project/}, \file{config.rs}};
+  \node[couche,below=9mm of c5] (c4) {\textbf{Règles}\\\file{rules/}};
+  \node[couche,below=9mm of c4] (c3) {\textbf{Moteur}\\\file{engine/}, \file{domains/}, \file{registry/}};
+  \node[couche,below=9mm of c3] (c2) {\textbf{IR}\\\file{ir/}};
+  \node[couche,below=9mm of c2] (c1) {\textbf{Front-end}\\\file{lowering/} (+ parse dans \file{resolver/})};
+  \draw[fleche] (c1) -- (c2);
+  \draw[fleche] (c2) -- (c3);
+  \draw[fleche] (c3) -- (c4);
+  \draw[fleche] (c4) -- (c5);
+  \coordinate (f1) at ($(c1.east)!0.5!(c2.east)+(6mm,0)$);
+  \coordinate (f2) at ($(c2.east)!0.5!(c3.east)+(6mm,0)$);
+  \coordinate (f3) at ($(c3.east)!0.5!(c4.east)+(6mm,0)$);
+  \coordinate (f4) at ($(c4.east)!0.5!(c5.east)+(6mm,0)$);
+  \node[front,anchor=west] at (f1) {\textbf{AST → IR.} oxc n'est importé que dans \file{lowering/} et \file{resolver/} ; l'IR est possédée, l'arène meurt avec le fichier (\adr{3}).};
+  \node[front,anchor=west] at (f2) {\textbf{IR → moteur.} Les domaines ne voient que l'IR ; le moteur est générique en \code{T: Transfer} ; un pointeur de fonction casse le cycle transfert/point fixe.};
+  \node[front,anchor=west] at (f3) {\textbf{Moteur → règles.} Les règles lisent des relations et appellent des primitives must ; elles ne parcourent pas l'IR (\adr{42}, test \file{layer_boundary.rs}).};
+  \node[front,anchor=west] at (f4) {\textbf{Règles → coquille.} \code{ComponentFindings} ; le driver ne fait que trier, compter, rendre ; l'hôte possède les flux (\adr{22}).};
+\end{tikzpicture}
+\caption{Les cinq couches de \reactant{} (de bas en haut, dans l'ordre du flot) et, à droite, la frontière entre deux couches consécutives avec ce qui la fait respecter.}
+\label{fig:tour-architecture-couches}
+\end{figure}
+
+\subsection{Front-end → IR : plus d'AST après le lowering}
+
+\begin{invariant}{Aucun domaine ne voit l'AST}{tour-architecture-ast}
+Aucun type sorti du front-end ne porte de durée de vie liée à l'arène d'oxc. Hors de \file{src/lowering/} et de \file{src/resolver/}, aucun fichier n'importe un crate \code{oxc_*}.
+\end{invariant}
+
+La seconde moitié se vérifie mécaniquement : un \code{grep -rl 'oxc_' src} au commit \snapshotCommit{} ne renvoie que les treize fichiers de \file{src/lowering/} et deux fichiers de \file{src/resolver/} (\file{mod.rs}, qui parse, et \file{closure.rs}, qui re-parse les fichiers suivis par \code{--follow-imports} pour n'en lire que les imports). La première moitié se lit sur les types : \code{Candidate<'a>} emprunte l'AST, \code{ComponentIR} (\cref{lst:tour-component-ir}) ne l'emprunte plus.
+
+\begin{decision}[ADR-3]
+\adr{3} choisit une IR dédiée, un CFG de blocs de base sur un langage d'expressions réduit, plutôt que d'interpréter l'AST d'oxc. Sa conséquence la plus citée est une phrase : \og Abstract domains never see the Oxc AST, only the IR.\fg{} Alternative écartée : interpréter directement l'AST, ce qui obligerait chaque domaine à connaître toutes les formes de sucre syntaxique de JS et TS (déstructurations, court-circuits, \code{switch}, \code{try}, \code{await}\ldots). Le lowering les normalise une fois ; le moteur n'en voit que quatre formes d'instructions. Effet secondaire utile : l'arène d'un fichier est libérée dès la fin de son lowering, et la mémoire de pointe côté AST est celle d'un seul fichier.
+\end{decision}
+
+\subsection{IR → moteur : un interpréteur générique, un cycle cassé}
+
+Le moteur n'est pas écrit pour un domaine particulier : \code{analyze_cfg} est générique en \code{T: Transfer} et \code{analyze_component_impl} en \code{T: Transfer<Domain = StateValue>}. Le seul \code{Transfer} concret du dépôt est \code{StateValueTransfer} (\cref{chap:transfert-stores}). Une difficulté de dépendance apparaît pourtant : quand l'évaluation d'une expression rencontre \code{<Child a=\{x\} />}, le transfert (\file{src/domains/transfer/}) doit relancer l'analyse d'un composant, qui vit dans le moteur (\file{src/engine/fixpoint.rs}) --- lequel dépend lui-même du transfert. Le cycle est cassé par un pointeur de fonction que le moteur fournit au transfert :
+
+\rustsnippet{src/domains/context.rs}{17}{25}{le pointeur de fonction qui casse le cycle transfert / point fixe}
+
+\code{analyze_program} y range \code{analyze_component_inter} (\src{src/engine/fixpoint.rs}{729}{741}). \file{src/domains/} ne nomme \file{src/engine/} qu'à deux endroits : \file{context.rs} importe le type de ce contexte, et \file{transfer/state_value.rs} importe \code{ChildLookup} et \code{CallSite} pour résoudre l'identité d'un enfant JSX et enregistrer l'appel (\cref{chap:inter-composants}) --- toujours dans le sens IR/moteur vers transfert, jamais l'inverse.
+
+\subsection{Moteur → règles : les règles lisent, elles ne parcourent pas}
+
+\begin{exemple}{Un même fait, deux calculs}{tour-architecture-deux-calculs}
+Considérons le fait \og cet effet écrit le slot \code{count}\fg{}. Il faut suivre l'appel \code{setCount} à travers les alias (\code{const s = setCount}), les callbacks (\code{.then(() => setCount(\ldots))}), les hooks custom inlinés. Si deux règles écrivent chacune leur propre parcours du CFG pour le retrouver, elles finissent par ne pas voir les mêmes appels ; l'une manque un \code{.then} que l'autre voit. C'est exactement ce qui s'est produit (\issue{26}).
+\end{exemple}
+
+\begin{invariant}{Frontière walk-free}{tour-architecture-walk-free}
+Une règle lit des lignes de relations et appelle des primitives must ; elle ne parcourt ni CFG ni expression. Tout parcours vit dans le moteur et produit une relation nommée dont les colonnes déclarent leur polarité.
+\end{invariant}
+
+Cet invariant n'est pas un vœu : il est tenu par un test à cliquet. Le test lit le texte de chaque fichier de \file{src/rules/}, hors modules de test, et y cherche des marqueurs de parcours syntaxique ; seuls les fichiers d'une liste figée ont le droit d'en contenir, et la liste ne peut que rétrécir :
+
+\rustsnippet{tests/layer_boundary.rs}{19}{41}{la liste d'autorisation et les marqueurs du cliquet}
+
+\begin{decision}[ADR-42]
+\adr{42} pose la frontière en une phrase : \og a fact computed in two places is two facts that drift, and \#26 is the drift\fg{}. Les relations (écrivains de slots, seeds, enregistrements, déclencheurs d'effets, churn) sont des \emph{produits du moteur}, calculées une fois à la convergence ; la couche règles les lit. \adr{6} avait déjà fait des règles des \og post-passes pures\fg{} sur le point fixe ; \adr{42} ajoute qu'elles ne refont pas de parcours. Alternative refusée : laisser chaque règle marcher la syntaxe à sa guise, ce qui fait diverger les faits d'une règle à l'autre et, en pratique, a produit des faux négatifs.
+\end{decision}
+
+\begin{piege}
+La liste de l'ADR et celle du test ne coïncident pas au commit étudié. \adr{42} §1 cite \file{impls/conditional_hook.rs} parmi les fichiers autorisés et ne cite pas \file{helpers/mod.rs} ; le test (\src{tests/layer_boundary.rs}{20}{31}) autorise \file{helpers/mod.rs} et ne contient plus \file{impls/conditional_hook.rs}. C'est le test qui fait foi --- c'est lui qui échoue. De même, \adr{42} §5 annonce que \code{ProgramRelations} \og remplace\fg{} \code{ProgramCache} ; en réalité \code{ProgramCache} existe toujours et \emph{contient} un \code{ProgramRelations}, en attendant que ses trois autres structures descendent dans le moteur. Quand un ADR et le code divergent, lire le code, puis chercher dans l'historique quel amendement manque.
+\end{piege}
+
+\subsection{Règles → coquille : un driver pour tous les hôtes}
+
+La dernière frontière sépare ce qui est \emph{calculé} de ce qui est \emph{montré}. Le driver ne crée aucun diagnostic et ne peut élever aucune sévérité ; il filtre les \Info{}, compte, choisit le code de sortie et rend. Surtout, tout ce qui dépend du système d'exploitation reste hors de lui : parsing d'argv, détection du terminal et de \code{NO_COLOR}, écriture des flux, sortie du processus. Le commentaire d'en-tête de \file{src/driver/mod.rs} le dit : une seule fonction, \og used verbatim by the native CLI and the WASM entry point, so their behavior cannot fork\fg{} (\adr{22} §6). Le test \file{tests/memfs_parity.rs} vérifie que la sortie est identique octet pour octet entre \code{OsFileSystem} et \code{MemFileSystem} sur plusieurs projets de test.
+
+\begin{remarque}
+Les dépendances entre modules suivent les couches, avec deux nuances qu'il vaut mieux connaître. \file{src/engine/render_deps.rs} et \file{src/rules/helpers/render_tree.rs} importent deux prédicats de nom de \file{src/lowering/} (\code{is_hook_name}, \code{is_event_prop}) : ce sont des fonctions sur des chaînes, pas un accès à l'AST. Et aucun module du moteur, des domaines, de l'IR ou du front-end n'importe \code{crate::rules} : la couche règles est une feuille, qu'on peut retirer sans toucher au reste.
+\end{remarque}
+
+% ============================================================================
+\section{Les conventions transversales}
+\label{sec:tour-architecture-conventions}
+
+Quatre conventions reviennent dans presque tous les fichiers. Les connaître évite de les redécouvrir une par une.
+
+\subsection{Fail-closed : l'absence n'est pas une preuve}
+
+\begin{exemple}{Un nom importé}{tour-architecture-fail-closed}
+Dans \code{import \{ useData \} from "./hooks"}, le moteur veut savoir si \code{useData} est un hook custom défini dans le projet, pour en greffer le corps. Si la résolution échoue (fichier absent, alias tsconfig non chargé), deux lectures sont possibles : \og ce n'est pas un hook du projet, on l'ignore\fg{}, ou \og on ne sait pas ce que c'est\fg{}. La première rend l'appel invisible, et tout ce qu'il fait avec lui ; c'est un faux négatif. La seconde le traite comme inconnu ($\Top$), ce qui est sûr, et le dit. C'est ce que fait l'analyseur sur un composant \code{Panel} qui appelle \code{useData()} importé d'un \file{./hooks} absent (sortie observée avec \code{--info}) :
+\begin{sortie}
+  Panel  (2 hooks)  panel.tsx
+    info   analysis-limit  [hook:0]  (line 5:8)  hook `useData` was not found in the registry. Pass its source file or add a HookSummary to analyse it (FN possible)
+    suspended  analysis-limit  4 passing check(s) withheld: the analysis was truncated in this component, so they are not guaranteed
+\end{sortie}
+Les assurances \og verified\fg{} du composant sont retirées : l'absence de finding n'y vaut plus preuve d'absence de défaut.
+\end{exemple}
+
+\begin{definition}{Fail-closed}{tour-architecture-fail-closed}
+Une question est tranchée \terme{fail-closed} quand l'absence de preuve est lue comme \og non prouvé\fg{} --- donc comme $\Top$ ou comme l'hypothèse qui préserve les diagnostics --- et jamais comme une preuve du contraire.
+\end{definition}
+
+Le dépôt applique la règle partout où une table peut être incomplète. \code{FunctionRegistry::resolve} ne devine jamais un utilitaire par son seul nom à travers les fichiers :
+
+\rustsnippet{src/engine/function_registry.rs}{51}{63}{résolution fail-closed d'un utilitaire}
+
+Les commentaires de types répètent la même discipline : la variante \code{ModuleConstInit::Context} est \og Two-valued on purpose --- absence means `not proven', never `not a context'\fg{} (\src{src/ir/component.rs}{30}{33}) ; le champ \code{module_table} de \code{ProgramAnalysisResult} doit être lu comme \og absent = \emph{unproven}\fg{} ; le champ \code{phase1_reached} existe précisément pour qu'un composant sans appelant connu ne soit pas pris pour une racine prouvée (\src{src/engine/program_result.rs}{52}{68}). Du côté du driver, le même réflexe produit les \emph{blind spots} : un fichier abandonné, un alias non résolu ou un import non lu interdisent le \og no issues found\fg{} final.
+
+\subsection{Must et may comme types}
+
+Le niveau \Error{} promet un défaut certain ; il ne doit donc être construit que sur un fait must (\cref{def:must-may}). Plutôt que de le confier à la vigilance de chaque auteur de règle, le projet l'inscrit dans les types :
+
+\rustsnippet{src/rules/api/query.rs}{115}{129}{un résultat must porte un jeton de preuve ; un fait may n'en porte pas}
+
+Le jeton \code{Certified<E>} n'a qu'un constructeur, privé au module \file{query.rs} ; seules les primitives must de ce module peuvent en frapper un. Et \code{Diagnostic::error} en exige un :
+
+\rustsnippet{src/rules/api/diagnostic.rs}{157}{167}{le seul constructeur d'un Error}
+
+Un \code{May<T>} ou un \code{MustResult::Some} n'a pas de \code{Certified} à passer : produire un \Error{} sur un fait may est une \emph{erreur de compilation}. Le \code{Diagnostic} lui-même vit dans un module feuille pour que ses champs privés restent hors de portée des règles (\cref{lst:tour-diagnostic}). Le \cref{chap:api-regles} détaille cette surface typée (\adr{21}).
+
+\subsection{Identités internées : \code{FileId}, \code{ComponentId}}
+
+\begin{exemple}{Deux \code{Widget}}{tour-architecture-identite}
+Un projet contient \file{a/Widget.tsx} et, plus tard, \file{b/Widget.tsx}. Le rapport doit distinguer les deux : il affiche \code{Widget@a/Widget.tsx}. Si l'analyse utilisait cette chaîne d'affichage comme clé, l'ajout du second fichier renommerait le premier composant dans toutes les tables --- résultats, store partagé, labels de stabilité --- et une recherche écrite avec l'ancienne orthographe manquerait.
+\end{exemple}
+
+La règle du projet est de séparer l'identité de l'affichage. Une identité est un petit entier \code{Copy}, interné une fois dans une table ; le nom affiché est calculé au rendu seulement :
+
+\rustsnippet{src/ir/source_range.rs}{3}{9}{l'identité d'un fichier}
+
+\rustsnippet{src/ir/component_id.rs}{23}{29}{l'identité d'un composant}
+
+Le \code{ComponentTable} est construit par \code{ComponentRegistry::from_components}, le \code{FileTable} pendant le lowering ; tous deux voyagent jusqu'au driver dans le \code{ProgramAnalysisResult}. L'historique de cette règle (\adr{19} pour les fichiers, \adr{40} pour les composants) est raconté au \cref{chap:histoire-doctrine}.
+
+\subsection{Positions : \code{SourceRange}}
+
+Toute position que l'utilisateur voit (\code{(line 5:2)}) vient d'un \code{SourceRange} :
+
+\rustsnippet{src/ir/source_range.rs}{36}{42}{une position source}
+
+La position est calculée pendant le lowering, à partir de l'offset de début de chaque nœud d'oxc et d'une table des débuts de ligne construite une fois par fichier (\code{SourceMap}). Parce qu'elle porte un \code{FileId}, une position à l'intérieur d'un hook custom inliné depuis un autre fichier nomme le bon fichier. La ligne est comptée à partir de 1, la colonne à partir de 0 : le \code{useEffect} de \cref{lst:tour-counter}, en retrait de deux espaces, est en \code{5:2}.
+
+\subsection{Les alias de base}
+
+Enfin, quelques noms de types ne sont que des alias, qu'il faut connaître pour lire les signatures :
+
+\rustsnippet{src/ir/types.rs}{1}{9}{les alias de base de l'IR}
+
+Un \code{HookLabel} est l'indice d'un hook dans sa table, propre à un composant ; un slot se désigne donc hors de son composant par un \code{QualifiedSlot}. \code{ExprId} (\src{src/ir/types.rs}{11}{15}) identifie un \emph{site} d'allocation (\cref{def:site}) ; il dérive \code{Ord} pour que les parcours d'ensembles de sites aient un ordre stable --- le déterminisme de la sortie est une convention à part entière (\issue{120}).
+
+% ============================================================================
+\section{Les trois principes de \file{CLAUDE.md}, dans le code}
+\label{sec:tour-architecture-principes}
+
+Le fichier \file{CLAUDE.md}, à la racine du dépôt, énonce trois principes de conception \og non négociables\fg{} et deux invariants. Ajouté après les dix-neuf premiers ADR, il codifie des pratiques déjà à l'œuvre (\cref{chap:histoire-doctrine}). Voici comment chacun se lit dans le code qu'on vient de parcourir.
+
+\paragraph{1. Pas de workarounds.} \og Corriger la cause racine, jamais le symptôme.\fg{} Exemple : un diagnostic dont la règle a mis une position dans un témoin mais pas sur le diagnostic lui-même s'affichait sans position. Plutôt que de corriger les règles une à une, le registre complète la position pour toutes, une fois :
+
+\rustsnippet{src/rules/registry.rs}{356}{369}{la position manquante est complétée au niveau central}
+
+\paragraph{2. La règle du paragraphe unique.} \og Si une décision demande plus d'un paragraphe pour être justifiée, c'est une mauvaise idée.\fg{} Les ADR récents portent leur justification en une phrase explicite ; \adr{42} §1 écrit littéralement \og One sentence justifies it\fg{}, puis la phrase citée plus haut. Même la décision de garder un fichier dont le parseur a récupéré une erreur (\cref{lst:tour-parse}) tient en une phrase dans son commentaire : sauter le fichier serait un faux négatif interdit.
+
+\paragraph{3. Modulaire et général d'abord.} \og Un problème qui touche plusieurs règles se corrige une fois, au niveau central.\fg{} Trois exemples dans ce chapitre : \code{ProgramRelations} (\og adding a program-level relation means one more field here --- never a rebuild in a rule\fg{}) ; les blind spots, \og collected here, once, at the driver level\fg{} (\file{src/driver/blind_spots.rs}) ; et la primitive de splice, \og one CFG-splice primitive, shared by utility inlining and custom-hook expansion\fg{} (\file{src/ir/splice.rs}), qui a remplacé deux copies divergentes dont l'une perdait des blocs --- un faux négatif.
+
+\paragraph{Les invariants.} Le premier est la soundness : \og Faux positifs tolérés, faux négatifs INTERDITS\fg{} (\cref{def:soundness}). Le second fixe le sens des niveaux ; le code en porte la définition, mot pour mot, sur l'énumération \code{Severity} :
+
+\rustsnippet{src/rules/api/diagnostic.rs}{24}{39}{les trois niveaux de diagnostic, définis dans le code}
+
+C'est pourquoi \code{Counter} reçoit un \Warning{} et non un \Error{} : le message le dit, \og its deps do not provably gate it\fg{}. Une partie de la conclusion n'est pas prouvée must, et un \Error{} exige la preuve de \emph{toute} la conclusion (\cref{chap:infinite-loop}).
+
+\begin{decision}[ADR-20]
+\file{CLAUDE.md} renvoie aussi à \adr{20}, qui clôt une campagne de dette technique en listant les simplifications \emph{refusées} parce qu'elles auraient coûté de la soundness, et au tracker GitHub, où les limites tranchées \og on ne corrige pas\fg{} sont des issues fermées \code{wontfix}. Règle pratique pour un contributeur : avant de proposer un nettoyage ou un correctif, lire ces deux sources ; beaucoup de \og duplications\fg{} apparentes sont des variations voulues.
+\end{decision}
+
+% ============================================================================
+\section{Comment naviguer}
+\label{sec:tour-architecture-naviguer}
+
+\subsection{Les tests comme documentation exécutable}
+
+Le dépôt compte 632 tests unitaires (blocs \code{\#[cfg(test)]} sous \file{src/}) et 69 fichiers de tests d'intégration sous \file{tests/}, plus 43 fixtures sous \file{tests/fixtures/} (fichiers TSX et petits projets complets). Chaque suite d'intégration porte un nom qui dit ce qu'elle fixe : \file{effect_cycles.rs}, \file{stale_closure.rs}, \file{cross_file_context.rs}, \file{memfs_parity.rs}\ldots{} Pour comprendre un comportement, le plus rapide est souvent de trouver le test qui le fixe et de le lancer seul :
+
+\begin{shell}
+cargo test --test effect_cycles            # une suite d'intégration
+cargo test --lib engine::dominance         # les tests unitaires d'un module
+\end{shell}
+
+Les tests d'intégration \og bibliothèque\fg{} rejouent le pipeline sans le driver. Le harnais de \file{tests/corpus_fp_fixes.rs} en est la version la plus lisible : parse, lowering, internement des identités, analyse intra-composant, puis toutes les règles.
+
+\rustsnippet{tests/corpus_fp_fixes.rs}{14}{69}{le pipeline en miniature, dans un test}
+
+On y retrouve les étapes de la \cref{sec:tour-architecture-flot}, à une différence près : \code{analyze_component_as} analyse chaque composant isolément, sans parents ni enfants, alors que la CLI passe par \code{analyze_program}. Les tests inter-composants appellent \code{analyze_program} ; \file{tests/memfs_parity.rs} et les tests du binaire (\code{env!("CARGO_BIN_EXE_reactant")}) passent par le driver. \file{src/test_support.rs} fournit aux tests unitaires des constructeurs de CFG à un bloc et de résultats d'analyse. Le \cref{chap:tests-corpus} décrit ces six altitudes de test et le corpus de mesure.
+
+\subsection{Les options qui montrent l'intérieur}
+
+La CLI offre quatre fenêtres sur le fonctionnement interne, toutes utilisées dans ce chapitre.
+\begin{description}
+  \item[\code{--trace}] déroule la chaîne de témoins de chaque diagnostic (les lignes \code{→}), au lieu du seul décompte \og 2 trace step(s)\fg{}.
+  \item[\code{--verbose}] écrit sur stderr le graphe de symboles, le nombre de composants analysés, les hits et misses du cache inter-composants et, par composant, le nombre d'itérations du point fixe et les labels élargis.
+  \item[\code{--info}] montre les diagnostics \Info{} et, par composant affiché, les assurances \og verified\fg{} des règles applicables qui n'ont rien trouvé. Avec \code{--show-clean}, les composants sans finding sont aussi listés.
+  \item[\code{--format json}] donne le rapport complet sous forme d'un seul document, avec les notes typées (\code{kind}, \code{slot}, \code{iteration}\ldots).
+\end{description}
+
+Sur \code{Counter}, \code{--info} ajoute ceci (observé, avec \code{--verbose}) :
+
+\begin{sortie}
+    info   widening-info  (line 5:2)  state `count` kept changing during analysis and was approximated to converge, so findings that depend on it may be imprecise
+       (2 trace step(s), rerun with --trace)
+    verified  always-unstable-deps  no deps array is defeated by an always-fresh reference
+    verified  conditional-hook  all hooks run unconditionally, in a stable order
+    verified  derived-state  no effect merely mirrors other state
+    verified  lazy-init  no useState/useRef initializer re-runs work on every render
+    verified  missing-cleanup  every effect that starts something long-lived also tears it down
+    verified  missing-deps  every effect declares the variables it reads
+    verified  redundant-set-state  no setState writes the value the state already holds
+    verified  setter-in-render  no setter is called during render
+    verified  state-mutation  no state or prop object is mutated in place
+\end{sortie}
+
+Deux sous-commandes documentent les règles sans lire le code : \code{reactant rules} liste les 21 noms de diagnostic (les dix-neuf règles natives en émettent deux de plus, \regle{cross-component-infinite-loop} et \regle{cross-setter-in-render}) ; \code{reactant explain <règle>} affiche la documentation complète d'un nom, tirée de \file{src/rules/docs.rs}. Extrait observé :
+
+\begin{sortie}
+infinite-loop
+  effect sets state that re-triggers the effect, and the state diverges
+
+The render → effect → setState → render cycle never stabilizes: the abstract value of the state slot required widening and the effect's write stays unbounded, the structural signature of an infinite render loop. […]
+
+Example:
+  useEffect(() => { setCount(count + 1); }, [count]);
+\end{sortie}
+
+\begin{piege}
+Il n'existe \emph{aucune} option pour afficher l'IR ou les valeurs abstraites convergées : \code{--verbose} ne donne que des statistiques, et les types de l'IR ne dérivent que \code{Debug}, sans pretty-printer. Pour voir l'IR d'un composant, il faut écrire un petit programme qui appelle \code{reactant::lowering::lower_program} et imprime le résultat --- c'est ce qu'ont fait les dossiers de préparation de ce manuscrit. Autre écart à connaître : l'aide de \code{--format} annonce \og schema v1, see docs/usage.md\fg{}, alors que le document émis porte \code{"version": 2} et que \file{src/driver/json.rs} se décrit comme \og schema v2\fg{}. C'est la sortie qui fait foi.
+\end{piege}
+
+\subsection{Les documents du dépôt}
+
+Hors du code, cinq sources servent en permanence : \file{docs/adr/} (les 42 ADR, résumées en annexe \cref{chap:fiches-adr}), \file{docs/relations.md} (le catalogue des relations et de leurs polarités, \cref{chap:relations}), \file{docs/limitations.md} (les limites connues, \cref{chap:limites-perspectives}), \file{docs/usage.md} (la CLI et le format JSON) et le tracker GitHub, dont les labels \code{soundness-bug}, \code{precision-fn}, \code{precision-fp} classent le backlog.
+
+% ============================================================================
+\section{Feuille de route des chapitres suivants}
+\label{sec:tour-architecture-feuille-de-route}
+
+La \cref{tab:tour-architecture-fichiers} dit où chaque fichier est traité. Le tableau inverse, plus court, dit ce que chaque chapitre ajoute au flot qu'on vient de suivre.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Chapitre & Étape du flot et fichiers principaux \\
+\midrule
+\ref{chap:frontend-detection} & quelles fonctions sont des composants, hooks, utilitaires : \file{lowering/mod.rs}, les détecteurs, \file{import_resolution.rs} \\
+\ref{chap:ir} & les types de l'IR : \file{ir/cfg.rs}, \file{expr.rs}, \file{hooks.rs}, \file{component.rs}, \file{component_id.rs} \\
+\ref{chap:lowering-cfg} & de l'AST au CFG : \file{cfg_builder.rs}, \file{expr_lower.rs}, \file{hook_extractor.rs} \\
+\ref{chap:splice-inlining} & greffer hooks custom et utilitaires : \file{ir/splice.rs}, \file{remap.rs}, expansions de \file{fixpoint.rs} \\
+\ref{chap:treillis-simples}--\ref{chap:statevalue-stabilite} & les valeurs abstraites : \file{domains/impls/} \\
+\ref{chap:transfert-stores} & l'interpréteur et les stores : \file{domains/transfer/}, \file{interp/}, \file{stores/} \\
+\ref{chap:cfg-analyzer-dominance} & un CFG jusqu'au point fixe local : \file{cfg_analyzer.rs}, \file{dominance.rs}, \file{eval.rs} \\
+\ref{chap:point-fixe-composant} & la boucle externe d'un composant : \code{analyze_component_impl} \\
+\ref{chap:relations}--\ref{chap:churn} & la dernière tranche et le churn : \file{setters.rs}, \file{written.rs}, \file{guards.rs}, \file{churn.rs} \\
+\ref{chap:inter-composants} & parents, enfants, fichiers : \code{analyze_program}, registres, \file{render_deps.rs} \\
+\ref{chap:api-regles} & la surface typée des règles : \file{rules/api/}, \file{registry.rs} \\
+\ref{chap:regles-etat}--\ref{chap:regles-rendu-rsc} & les dix-neuf règles natives : \file{rules/impls/} \\
+\ref{chap:regles-declaratives} & les packs JSON : \file{rules/declarative/} \\
+\ref{chap:projet-cli-driver}--\ref{chap:distribution} & la coquille et les hôtes : \file{driver/}, \file{cli/}, \file{project/}, \file{resolver/}, \code{reactant-wasm}, \file{npm/} \\
+\ref{chap:tests-corpus}--\ref{chap:limites-perspectives} & la méthode : tests, corpus, histoire, limites \\
+\bottomrule
+\end{tabularx}
+\caption{Ce que chaque chapitre ajoute au flot de la \cref{sec:tour-architecture-flot}.}
+\label{tab:tour-architecture-feuille}
+\end{table}
+
+Trois parcours de lecture sont possibles. Le parcours \emph{linéaire} suit l'ordre des chapitres, c'est-à-dire le flot lui-même. Le parcours \emph{règles d'abord} lit les \cref{chap:api-regles,chap:regles-etat,chap:infinite-loop} en revenant aux chapitres du moteur quand une relation est citée : il convient à qui veut écrire une règle. Le parcours \emph{outil} lit les \cref{chap:projet-cli-driver,chap:distribution,chap:tests-corpus} : il convient à qui intègre l'analyseur dans une chaîne de CI.
+
+\begin{resume}
+\begin{itemize}
+  \item Deux crates (\code{reactant}, \code{reactant-wasm}) et un paquet npm. La bibliothèque contient tout, y compris le driver ; le binaire n'ajoute que \code{clap} et l'écriture des flux.
+  \item Le flot d'une invocation : \code{main} → \code{cli::run} → \code{check::run} → \code{run_check} → \code{lower_files_with} (parse oxc, lowering) → \code{analyze_lowered} → \code{analyze_program} (point fixe, relations) → \code{ProgramCache} → \code{check_component} → rendu → \code{CheckOutput}.
+  \item Les types qui passent d'une couche à l'autre : \code{ParserReturn}, \code{Candidate}, \code{ComponentIR}, \code{LoweredProgram}, \code{AnalysisResult}, \code{ProgramAnalysisResult}, \code{ProgramRelations}, \code{Diagnostic}, \code{CheckReport}, \code{CheckOutput}.
+  \item Cinq couches, quatre frontières : plus d'AST après le lowering (\adr{3}) ; un moteur générique en \code{Transfer}, cycle cassé par \code{AnalyzeChildFn} ; des règles qui lisent des relations sans parcourir l'IR (\adr{42}, \file{tests/layer_boundary.rs}) ; un driver partagé par tous les hôtes (\adr{22}).
+  \item Quatre conventions : fail-closed, must et may comme types (\code{Certified}, \code{Diagnostic::error}), identités internées (\code{FileId}, \code{ComponentId}), positions \code{SourceRange}.
+  \item Les principes de \file{CLAUDE.md} se lisent dans le code : correction au niveau central (\code{located}, blind spots, splice unique), justification en une phrase, soundness, niveaux définis sur \code{Severity}.
+  \item Pour naviguer : le test qui fixe un comportement, \code{--trace}, \code{--verbose}, \code{--info}, \code{--format json}, \code{rules}, \code{explain}. Pas de dump d'IR.
+\end{itemize}
+Le chapitre suivant ouvre la première couche : comment le front-end décide, dans un fichier, quelles fonctions sont des composants, des hooks et des utilitaires.
+\end{resume}
+
+% ============================================================================
+\section{Exercices}
+\label{sec:tour-architecture-exercices}
+
+\begin{exercice}{Situer un fichier}{tour-architecture-situer}
+Pour chacun des fichiers suivants, dire à quelle couche il appartient et quel type il consomme ou produit à la frontière : \file{src/lowering/hook_extractor.rs}, \file{src/engine/triggers.rs}, \file{src/rules/api/diagnostic.rs}, \file{src/driver/json.rs}.
+\end{exercice}
+\begin{solution}
+\file{hook_extractor.rs} : front-end ; il réécrit le CFG et produit les \code{HookEntry} d'un \code{ComponentIR}. \file{triggers.rs} : moteur ; il produit la relation \relation{effect_triggers}, rangée dans \code{AnalysisResult}. \file{diagnostic.rs} : règles ; il définit \code{Diagnostic}, la sortie de la couche. \file{json.rs} : coquille ; il consomme un \code{CheckReport} et produit le texte de stdout.
+\end{solution}
+
+\begin{exercice}{Où ajouter un calcul ?}{tour-architecture-ou}
+Une nouvelle règle a besoin de savoir, pour chaque effet, quels \code{setTimeout} il programme. Un contributeur propose de parcourir le CFG de l'effet dans \code{check}. Que répond le cliquet de \file{tests/layer_boundary.rs} ? Où faut-il faire ce calcul ?
+\end{exercice}
+\begin{solution}
+Parcourir les blocs d'un CFG dans un fichier de \file{src/rules/} introduit un marqueur (\code{.blocks.values()}, \code{Stmt::}\ldots) : si le fichier n'est pas dans la liste, le test échoue, et la liste ne peut pas grandir. Le calcul doit être une relation du moteur, calculée à la convergence et lue par la règle. En l'occurrence, la relation \relation{registrations} (\file{src/engine/registrations.rs}) décrit déjà les callbacks qu'un effet confie à un registrar ; la bonne solution est de la lire, ou d'y ajouter une colonne.
+\end{solution}
+
+\begin{exercice}{Un fichier illisible}{tour-architecture-illisible}
+On lance \code{reactant check a.tsx b.tsx}, où \file{b.tsx} contient une erreur de syntaxe dont oxc se remet, et \code{a.tsx} une erreur qui le fait paniquer. Lequel des deux est analysé ? Que voit l'utilisateur, et pourquoi ce choix est-il imposé par la soundness ?
+\end{exercice}
+\begin{solution}
+D'après \cref{lst:tour-parse}, \file{b.tsx} est abaissé et analysé malgré son erreur (le message \code{[parse error]} n'apparaît qu'en format humain) ; \file{a.tsx} est sauté, signalé par \code{[skipped]} sur stderr dans tous les formats, et un blind spot \og could not be parsed and were dropped\fg{} interdit le \og no issues found\fg{}. Sauter \file{b.tsx} parce qu'il contient une erreur rendrait invisibles tous ses défauts : un faux négatif. Pour \file{a.tsx}, l'analyse est impossible ; la soundness impose alors de le dire, pas de se taire.
+\end{solution}
+
+\begin{exercice}{Suivre un label}{tour-architecture-label}
+Dans la sortie JSON de \code{Counter}, le diagnostic porte \code{"hook_label": 0} et sa première note \code{"hook_label": 1}. D'où viennent ces nombres, et pourquoi ne suffisent-ils pas, seuls, à désigner un slot dans le graphe de churn du programme ?
+\end{exercice}
+\begin{solution}
+Ce sont des \code{HookLabel}, attribués par \code{extract_hooks} dans l'ordre des appels de hooks du corps de rendu : 0 pour le \code{useState} (le slot \code{count}), 1 pour le \code{useEffect}. Un \code{HookLabel} est propre à un composant ; deux composants ont chacun un label 0. Toute relation de programme désigne donc un slot par un \code{QualifiedSlot = (ComponentId, HookLabel)} (\src{src/ir/types.rs}{6}{9}).
+\end{solution}

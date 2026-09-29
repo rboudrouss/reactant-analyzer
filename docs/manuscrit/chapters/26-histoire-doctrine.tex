@@ -1,0 +1,900 @@
+% ---------------------------------------------------------------------------
+% Chapitre 26 — Histoire et doctrine du projet
+% Source : notes/15-adr-history-principles.md (§1–§4, §5.1, §5.3–§5.8, §6–§8,
+% §10) ; CLAUDE.md ; docs/adr/README.md ; docs/adr/ADR-020 ; git log au commit
+% e67b10a (322 commits). Les fiches ADR détaillées sont en annexe A
+% (chap:fiches-adr, labels adr:NN).
+% Sorties observées avec target/debug/reactant (commit e67b10a), NO_COLOR=1,
+% depuis /tmp/ch26 (fichiers temporaires reproduits dans le texte).
+% ---------------------------------------------------------------------------
+\chapter{Histoire et doctrine du projet}
+\label{chap:histoire-doctrine}
+
+\begin{objectifs}
+  \item Connaître la chronologie du projet, du prototype jeté du 31 mai 2026 au commit \code{e67b10a} du 27 septembre 2026, et savoir situer chaque ADR dans une phase.
+  \item Comprendre les quatre lieux où le projet range une décision (ADR, journal de précision, issue fermée \code{wontfix}, test-cliquet) et savoir choisir le bon.
+  \item Connaître les principes de \file{CLAUDE.md} et leur histoire : écrits \emph{après} dix-neuf ADR, puis imposés à tous les suivants.
+  \item Savoir expliquer les onze non-changements d'ADR-020 et, plus généralement, pourquoi une simplification apparente peut être un faux négatif déguisé.
+  \item Suivre les grandes bascules de conception : la polarité devenue un type, les relations devenues des produits du moteur, l'identité séparée de son rendu.
+  \item Savoir lire l'argument de soundness d'un changement : dans quelle direction il déplace les findings, et quelle preuve cette direction exige.
+\end{objectifs}
+
+\prerequis{ce chapitre est une synthèse : il suppose lus les chapitres techniques, en particulier \cref{chap:interpretation-abstraite} (soundness, must/may), \cref{chap:statevalue-stabilite} (\code{StateValue}, \code{Stability}), \cref{chap:relations} et \cref{chap:churn} (relations, graphe de churn), \cref{chap:api-regles} (\code{Certified}, témoins) et \cref{chap:tests-corpus} (corpus et mesure). Chaque ADR cité a sa fiche en \cref{chap:fiches-adr}.}
+
+Les chapitres précédents décrivent le code tel qu'il est au commit \code{e67b10a}. Ils répondent à la question \og comment ça marche ?\fg{}. Ce chapitre répond à une autre question : \og pourquoi est-ce fait ainsi, et pas autrement ?\fg{}. Presque chaque type central du dépôt porte dans son commentaire le numéro de l'ADR qui le justifie : \code{StateValue} renvoie à ADR-015, \code{Certified} à ADR-021, \code{EdgeKind::Await} à ADR-035, \code{ProgramRelations} à ADR-042. Lire ces types sans leur histoire, c'est lire la réponse sans la question.
+
+Il y a une raison plus pratique. Un contributeur qui découvre le dépôt voit des duplications, des marches séparées, des niveaux de sévérité qui semblent trop prudents. Il est tenté de \og nettoyer\fg{}. Or beaucoup de ces formes ont déjà été examinées, mesurées, et conservées parce que leur simplification introduisait un faux négatif (FN). Le projet a donc appris à \emph{écrire ses refus}. Connaître ces refus est la condition pour modifier le code dans l'esprit du projet.
+
+Le plan suit l'ordre chronologique, qui se trouve être aussi l'ordre logique : le problème de départ (\cref{sec:histoire-doctrine-depart}), les premières semaines (\cref{sec:histoire-doctrine-premieres}), le tournant du corpus (\cref{sec:histoire-doctrine-corpus}), la codification des principes (\cref{sec:histoire-doctrine-codification}), la polarité devenue un type (\cref{sec:histoire-doctrine-polarite}), les relations (\cref{sec:histoire-doctrine-relations}), l'identité et l'attribution (\cref{sec:histoire-doctrine-identite}), les cascades de rendu (\cref{sec:histoire-doctrine-cascades}), la méthode (\cref{sec:histoire-doctrine-methode}) et enfin les fils rouges (\cref{sec:histoire-doctrine-fils}).
+
+% ===========================================================================
+\section{Un sous-système qui n'est pas du code}
+\label{sec:histoire-doctrine-appareil}
+
+\subsection{Quatre lieux pour une décision}
+
+Prenons un problème concret. Sur le corpus, la règle \regle{infinite-loop} signale un composant qui ne boucle pas. Un contributeur trouve la cause, corrige le moteur, relance le corpus : un finding de moins, aucun de plus. Où écrire ce qui s'est passé ? Et si, au contraire, il décide de ne \emph{pas} corriger, parce que la correction coûterait un FN ailleurs, où écrire ce refus pour que le suivant ne recommence pas ?
+
+Le projet répond par quatre lieux distincts, chacun avec son critère d'entrée.
+
+\begin{definition}{ADR, entrée de journal, wontfix, cliquet}{histoire-doctrine-lieux}
+Une décision du projet est rangée dans exactement l'un de quatre lieux :
+\begin{enumerate}
+  \item un \terme{ADR} (\emph{Architecture Decision Record}, \file{docs/adr/ADR-NNN-*.md}) si elle contraint le reste du système : \og un domaine, une relation, un invariant, une alternative refusée\fg{} (\file{docs/adr/README.md}, l.~3--4) ;
+  \item une entrée du \terme{journal de précision} (\file{docs/precision-log.md}) si c'est une correction de précision mesurée : une règle sur-signalait une forme, le moteur a été corrigé là où l'information se perdait, le corpus l'a mesuré ;
+  \item une \terme{issue fermée wontfix} sur le tracker si c'est une limite tranchée \og on ne corrige pas\fg{} ;
+  \item un \terme{test-cliquet} si la décision doit être rendue exécutoire : un test dont une liste ne peut que rétrécir.
+\end{enumerate}
+\end{definition}
+
+Le journal de précision énonce lui-même la frontière avec les ADR, en gras : \og \textbf{This is not architecture}, so it does not live in \code{adr/}\fg{} (\file{docs/precision-log.md}, l.~6). Une correction de précision enregistre une \emph{mesure} : la forme, l'argument qui la tranche, le delta sur le corpus. Une décision enregistre une \emph{contrainte} que les changements futurs doivent respecter.
+
+\begin{exemple}{Ranger quatre situations}{histoire-doctrine-ranger}
+\begin{itemize}
+  \item Le domaine des valeurs devient un produit sur les sortes JS (ADR-015) : tout transfert, toute règle qui compare des valeurs en dépend. C'est un ADR.
+  \item La règle \regle{infinite-loop} cesse de signaler une garde dont la borne était mal lue, et le corpus perd vingt findings : c'est une entrée du journal de précision.
+  \item Un composant dynamique \code{const C = cond ? A : B} n'est pas résolu, et le projet décide de ne pas le faire sans un design pour résoudre une référence de composant à travers un join : c'est l'issue \issue{63}, fermée \code{wontfix}.
+  \item Les règles ne doivent plus parcourir de CFG : la liste des fichiers qui le font encore est figée dans \file{tests/layer_boundary.rs} et ne peut que rétrécir. C'est un cliquet.
+\end{itemize}
+\end{exemple}
+
+\subsection{Un corpus de décisions}
+
+Au commit \code{e67b10a}, ce sous-système compte quarante-deux ADR (6\,457 lignes au total, hors index), le fichier \file{CLAUDE.md} (40 lignes), le journal de précision (1\,509 lignes), six issues fermées \code{wontfix} et deux cliquets principaux (\file{tests/layer_boundary.rs} et \file{tests/catalogue.rs}). Il n'a pas de type Rust propre, mais il est cité par le code dans les deux sens : les types portent le numéro de leur ADR, et les sections \og Consequences\fg{} des ADR nomment les fichiers touchés. C'est cette double citation qui permet de reconstituer l'histoire depuis le code, et c'est elle que ce chapitre exploite.
+
+\begin{remarque}
+Les ADR sont écrits en anglais depuis le 6 juin 2026 : les ADR 001 à 013 étaient d'abord rédigés en français et ont été traduits par le commit \code{4647b85}. \file{CLAUDE.md}, lui, est resté en français. Les citations de ce chapitre sont données dans leur langue d'origine.
+\end{remarque}
+
+% ===========================================================================
+\section{Le problème de départ}
+\label{sec:histoire-doctrine-depart}
+
+\subsection{Un prototype, puis une réécriture}
+
+Le premier commit, \code{5b44b77 first commit}, date du 8 mai 2026. Il pose un analyseur organisé autour d'un \emph{walker} sur l'AST : \file{src/engine/walker.rs} (800 lignes), \file{src/core/aval.rs}, des règles comme \file{rules/dead_state.rs}. Le 29 mai, le commit \code{002579b} écrit les six premiers ADR, un PRD et un \file{docs/ir.md} ; le 31 mai, \code{f0319bc feat: remove old logic} jette le prototype. Le projet commence donc par une \emph{décision de réécriture} motivée par la conception, pas par un bug.
+
+Pourquoi jeter un analyseur qui fonctionnait ? Parce qu'une fonction de transfert écrite directement sur l'AST d'oxc doit traiter des dizaines de formes équivalentes. Considérons ce composant :
+
+\begin{lstlisting}[language=TypeScript,caption={Trois formes syntaxiques pour un même flot de contrôle}]
+function Badge({ user }) {
+  const [open, setOpen] = useState(false);
+  if (!user) return null;               // retour précoce
+  const label = user.name ?? "anon";    // court-circuit
+  open && setOpen(false);               // effet de bord conditionnel
+  return <span>{label}</span>;
+}
+\end{lstlisting}
+
+Un retour précoce, un \code{??} et un \code{\&\&} à effet de bord sont trois syntaxes pour une seule chose : un branchement. Un walker sur l'AST doit apprendre les trois ; un CFG n'en connaît qu'une.
+
+\begin{decision}[ADR-003 — une IR dédiée à base de CFG]
+\textbf{Décision.} Abaisser l'AST vers une IR propre, représentée comme un CFG de blocs de base terminés par un \code{Terminator} (\cref{def:cfg}). \textbf{Pourquoi.} \og A tree-shaped IR (React-tRace style) requires a CPS-transform pass for early returns and cannot represent loops (\code{while}/\code{for}) without back-edges.\fg{} Le CFG représente nativement les retours précoces et les boucles, place le widening aux en-têtes de boucle et rend la dominance (nécessaire à \regle{conditional-hook}) standard. \textbf{Refusé.} Une IR arborescente à la React-tRace. Voir \adr{3}.
+\end{decision}
+
+\subsection{Deux CFG par composant, et une sémantique de référence}
+
+La deuxième décision fondatrice découpe le composant selon les phases de React.
+
+\begin{react}[phases]
+Le corps d'un composant s'exécute pendant le rendu ; les fonctions passées à \code{useEffect} s'exécutent après le commit. Un \code{setState} appelé dans un effet programme un nouveau rendu, qui recalcule le corps, puis relance les effets dont un dep a changé au sens d'\code{Object.is}.
+\end{react}
+
+\begin{decision}[ADR-004 — \code{render_cfg} et CFG d'effets séparés]
+\textbf{Décision.} Chaque composant porte un CFG de rendu et, par hook, le CFG de son corps. \textbf{Pourquoi.} La séparation rendu/effet est un invariant de React ; autant la rendre structurelle plutôt que de la laisser implicite. \textbf{Refusé.} Un méta-CFG unique \og render + effects in a single graph with render→effect→check back-edges\fg{}, plus expressif mais qui \og makes the render-time / effect-time semantic separation implicit\fg{} et \og risks incorrect modeling of React's execution order\fg{}. Voir \adr{4}.
+\end{decision}
+
+La troisième décision fixe la sémantique concrète dont l'analyse est l'abstraction.
+
+\begin{decision}[ADR-001 — React-tRace comme sémantique concrète]
+\textbf{Décision.} La sémantique opérationnelle React-tRace \cite{LeeAhnYi2025} sert de sémantique concrète de référence ; les fonctions de transfert en dérivent. \textbf{Pourquoi.} C'est \og the only publicly available React formalization with a conformance proof\fg{}. \textbf{Limite reconnue.} Elle ne couvre que \code{useState} et \code{useEffect} sans tableau de deps ; les extensions devaient être spécifiées dans \file{docs/semantics.md}. Voir \adr{1}.
+\end{decision}
+
+\begin{piege}
+ADR-001 annonce trois conséquences : un \file{docs/semantics.md} qui spécifie les extensions, des fonctions de transfert qui citent la règle React-tRace correspondante, et des tests de régression contre l'interpréteur OCaml. Aucune des trois n'existe au commit \code{e67b10a} : \file{docs/semantics.md} n'a jamais été créé. La sémantique concrète du projet est donc celle que les \cref{chap:react-modele,chap:transfert-stores} reconstituent à partir du code, pas un document. Un lecteur qui cherche \og la spécification\fg{} ne la trouvera pas ; c'est l'écart le plus ancien entre ADR et code (\cref{sec:histoire-doctrine-ecarts}).
+\end{piege}
+
+\subsection{La frise}
+
+La \cref{fig:histoire-frise} résume les cinq mois du projet. Le volume de commits (322 au total) se répartit ainsi : mai 5, juin 79, juillet 85, août 40, septembre 113. Quatre pauses nettes découpent le travail en campagnes. Le \cref{tab:histoire-phases} nomme les onze phases que la frise numérote.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[x=0.095cm,y=1cm]
+  % histogramme des commits par mois (hauteur = commits x 0.018)
+  \foreach \a/\b/\n in {0/31/5,31/61/79,61/92/85,92/123/40,123/153/113}{
+    \fill[ra-bg,draw=ra-gray] (\a+1,0) rectangle (\b-1,{\n*0.018});
+    \node[font=\scriptsize,above] at ({(\a+\b)/2},{\n*0.018}) {\n};
+  }
+  \node[etiquette,anchor=west] at (0,2.35) {commits par mois (322 au total)};
+  % axe des mois
+  \draw[thick,ra-gray] (0,0) -- (153,0);
+  \foreach \x/\m in {0/mai,31/juin,61/juillet,92/août,123/septembre}{
+    \draw[ra-gray] (\x,0) -- (\x,-0.12);
+    \node[font=\scriptsize,anchor=north west] at (\x,-0.05) {\m};
+  }
+  % bande des phases
+  \fill[ra-gray!15] (0,-1.05) rectangle (153,-0.8);
+  \foreach \a/\b in {42/58,58.6/74,89/117,130/146}{
+    \fill[ra-gray!45] (\a,-1.05) rectangle (\b,-0.8);
+  }
+  \foreach \a/\b in {7/30,31/31.9,32/36,58/58.9,74/79,81/83,84/89,117/122,123/124.4,124.6/130,146/149}{
+    \fill[ra-blue] (\a,-1.05) rectangle (\b,-0.8);
+  }
+  % numéros de phase (trois rangées)
+  \foreach \x/\r/\p in {18.5/1/0,31.4/1/1,34/2/2,58.4/1/3,76.5/1/4,82/1/5,86.5/2/6,119.5/1/7,123.7/2/8,127.3/3/9,147.5/1/10}{
+    \draw[ra-gray,thin] (\x,-1.05) -- (\x,{-1.05-0.28*\r+0.05});
+    \node[font=\scriptsize\bfseries,text=ra-blue] at (\x,{-1.05-0.28*\r-0.08}) {\p};
+  }
+  % releases et CLAUDE.md
+  \foreach \x in {117,118,127,130}{
+    \fill[ra-amber] (\x,-0.8) -- ++(-1,0.22) -- ++(2,0) -- cycle;
+  }
+  \node[font=\scriptsize,text=ra-amber,anchor=east] at (115,-0.68) {v0.1…v0.6};
+  \draw[ra-red,thick] (81,-0.8) -- (81,-0.55);
+  \node[font=\scriptsize,text=ra-red,anchor=east] at (80,-0.62) {\file{CLAUDE.md}};
+  % légende
+  \fill[ra-blue] (0,-2.3) rectangle (4,-2.15); \node[font=\scriptsize,anchor=west] at (5,-2.23) {phase active};
+  \fill[ra-gray!45] (35,-2.3) rectangle (39,-2.15); \node[font=\scriptsize,anchor=west] at (40,-2.23) {pause};
+  \fill[ra-amber] (72,-2.15) -- ++(-1,0) -- ++(1,-0.18) -- ++(1,0.18) -- cycle; \node[font=\scriptsize,anchor=west] at (75,-2.23) {release (tag)};
+\end{tikzpicture}
+\caption{Chronologie du projet, du 8 mai au 27 septembre 2026 : histogramme des commits par mois (\code{git log} au commit \code{e67b10a}), phases numérotées comme au \cref{tab:histoire-phases}, pauses, releases \code{v0.1.0} à \code{v0.6.0}, et arrivée de \file{CLAUDE.md} le 21 juillet.}
+\label{fig:histoire-frise}
+\end{figure}
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}rlX@{}}
+\toprule
+\# & Dates (2026) & Phase et ADR \\
+\midrule
+0 & 05-08 → 05-31 & prototype sur l'AST, six premiers ADR (001–006), puis \code{f0319bc} jette le prototype \\
+1 & 06-01 & le pipeline en un jour : onze commits dans l'ordre du pipeline, de \code{55d76f6} (types IR) à \code{3df3cca} (CLI) \\
+2 & 06-02 → 06-06 & domaines et moteur : ADR-007 à 013, sévérité à trois paliers, inter-composants, cross-file \\
+3 & 06-28 & précision numérique : ADR-014 (widening à seuils ; narrowing écrit puis abandonné) \\
+4 & 07-14 → 07-19 & le corpus entre en scène : ADR-015 à 019 \\
+5 & 07-21 → 07-23 & \file{CLAUDE.md}, campagne de dette technique close par ADR-020 \\
+6 & 07-24 → 07-29 & surface typée et packs : ADR-021 à 025 \\
+7 & 08-26 → 08-31 & distribution (Action, npm, v0.1 à v0.3), ADR-026, le TODO devient le tracker \\
+8 & 09-01 → 09-02 & la vague des relations : treize ADR en deux jours (027–039), catalogue Tier-A 5/21 → 21/22 \\
+9 & 09-02 → 09-08 & campagne de précision, ADR de précision rétrogradés en journal, ADR-040 (identité), v0.4 à v0.6 \\
+10 & 09-24 → 09-27 & doctrine de sévérité (\issue{142}), ADR-041 (cascades de rendu), ADR-042 (relations du moteur), PR \issue{163} \\
+\bottomrule
+\end{tabularx}
+\caption{Les onze phases du projet (dates des commits, \code{git log --date=short}).}
+\label{tab:histoire-phases}
+\end{table}
+
+% ===========================================================================
+\section{Les premières semaines : un pipeline en un jour}
+\label{sec:histoire-doctrine-premieres}
+
+\subsection{L'ordre des commits est l'ordre du manuscrit}
+
+Le 1\textsuperscript{er} juin 2026, onze commits reconstruisent tout le pipeline, dans l'ordre même où les données le traversent : types IR et CFG (\code{55d76f6}), détection des composants (\code{cbab629}), constructeur de CFG (\code{898621b}), lowering des expressions (\code{62f3f7c}), extraction des hooks (\code{667cbb8}), domaines (\code{ebed38a}), stores et trait \code{Transfer} (\code{daa8d67}), moteur (\code{dd02a31}), règles (\code{a1b8db1}), registre de hooks (\code{3af23bc}), CLI et tests de bout en bout (\code{3df3cca}). À la fin de la journée, \file{src/} compte 6\,723 lignes en 41 fichiers. Ce n'est pas un hasard si les parties~II à~V de ce manuscrit suivent le même ordre : la réécriture a été conçue comme une chaîne, et elle a été écrite comme on la lit.
+
+La semaine suivante (phase~2) ajoute les couches qui font de ce pipeline un analyseur : les requêtes inter-domaines (\adr{7}), un premier domaine de valeurs (\adr{8}), la traversée des callbacks (\adr{9}), le tas par site d'allocation (\adr{10}), les positions source (\adr{11}), l'analyse inter-composants par inlining descendant (\adr{12}) et l'analyse cross-file (\adr{13}). Le 6 juin, \file{src/} a triplé (21\,986 lignes, 74 fichiers).
+
+\subsection{Un choix pragmatique qui a survécu : \texorpdfstring{\code{Unknown → skip}}{Unknown -> skip}}
+
+Parmi ces premiers ADR, un choix mérite l'attention, parce qu'il contredit l'invariant que le projet adoptera un mois plus tard. Considérons :
+
+\begin{lstlisting}[language=TypeScript,caption={Un callback passé à une fonction inconnue}]
+useEffect(() => {
+  myUtil(() => setCount(count + 1));   // myUtil : helper utilisateur non résolu
+}, [count]);
+\end{lstlisting}
+
+L'analyse ne sait pas si \code{myUtil} appelle son argument. Descendre dans la closure serait le choix sound : on ne peut pas prouver qu'elle ne s'exécute pas. ADR-009 a fait l'autre choix, et l'a écrit :
+
+\begin{quote}\small
+\og \textbf{Choice of \code{Unknown → skip} default}: for a linter, false positives are more costly than false negatives. Descending an unknown callee would be the \emph{sound} choice (over-approx: we can't prove \code{cb} doesn't run as a consequence), but it would produce an FP on every custom subscription wrapper [\dots] We accept the FN\fg{} (\file{docs/adr/ADR-009-callback-traversal.md}, l.~74--78).
+\end{quote}
+
+Ce choix vit encore dans l'interpréteur du point fixe, sous la forme d'une variante d'énumération :
+
+\rustsnippet{src/domains/interp/callbacks.rs}{6}{23}{les quatre classes de déclencheurs d'ADR-009}
+
+La variante \code{Unknown} documente elle-même sa raison : \og Conservatively NOT descended (FP-averse)\fg{}. Le mot \og conservatively\fg{} est ici trompeur : du point de vue de la soundness, ne pas descendre est la direction \emph{non} conservatrice.
+
+\begin{piege}
+\code{TriggerClass::Unknown} est la plus grande exception de principe encore présente dans le code. Elle date de juin, \file{CLAUDE.md} de juillet. Depuis, la marche des relations a pris l'autre choix : ADR-034 §5 écrit \og The walk descends any function argument of an unknown call, at ⊤, because an unknown callee may invoke it\fg{}. Le moteur contient donc deux interpréteurs de force différente ; l'issue \issue{12} le dit sans détour (\og two CFG interpreters of different strength, and nothing says which ran\fg{}) et \issue{19} suit le FN résiduel. Il ne faut ni le cacher ni le \og corriger\fg{} localement dans une règle : la direction qu'indique la doctrine est d'aligner le point fixe sur la marche des relations, dans le moteur. Au commit \code{e67b10a}, aucune ADR ne tranche encore cette correction : \issue{12} reste \code{OPEN}.
+\end{piege}
+
+% ===========================================================================
+\section{Le tournant du corpus}
+\label{sec:histoire-doctrine-corpus}
+
+Du 12 juin au 14 juillet, le dépôt ne reçoit presque aucun commit (deux pauses, interrompues par ADR-014 le 28 juin). Quand le travail reprend, il change de méthode. ADR-016 (15 juillet) déclare comme premier objectif \og \textbf{Corpus benchmarking.} Measuring the real FP/FN rate on public React repos\fg{} (\src{docs/adr/ADR-016-cli-projects-json.md}{20}{21}), et le commit \code{b0c5d9f} ajoute le script qui génère le répertoire \file{test-repo/}. À partir de là, presque chaque décision cite un chiffre. Trois ADR de cette semaine montrent comment la mesure change la forme du code.
+
+\subsection{ADR-015 : un FN documenté devient une détection}
+
+\begin{exemple}{Un compteur nullable}{histoire-doctrine-null}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch26/ex1.tsx}}]
+import { useState, useEffect } from "react";
+
+export function NullCounter() {
+  const [n, setN] = useState(null);
+  useEffect(() => {
+    setN(n + 1);
+  }, [n]);
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+Au premier tour, \code{n} vaut \code{null} ; \code{null + 1} vaut \code{1} en JavaScript, puis \code{2}, \code{3}\dots{} L'effet dépend de \code{n} et l'écrit à chaque fois : boucle infinie.
+\end{exemple}
+
+Sous ADR-008, le domaine des valeurs était une énumération plate : \code{Bottom}, \code{Null}, \code{Number(Interval)}, \dots, \code{Top}. Le join de \code{Null} et de \code{Number([1,1])} donnait \code{Top}, et \code{Top} ne croît pas : pas de widening, pas de signal. ADR-008 documentait ce FN, et trois rustines s'étaient empilées pour le contourner (un \code{TypedStateStore}, une fonction \code{infer_state_type}, et la lecture de l'annotation \code{useState<T>}).
+
+ADR-015 remplace l'énumération par un produit sur les sortes JS disjointes (\cref{def:statevalue}) :
+
+\rustsnippet{src/domains/impls/state_value.rs}{16}{24}{la justification du produit, en tête du type}
+
+Le join de \code{null} et d'un nombre garde maintenant les deux sortes, la composante numérique croît jusqu'au widening, et la boucle est trouvée :
+
+\begin{sortie}
+  NullCounter  (2 hooks)  ex1.tsx
+    warn   infinite-loop  [hook:0]  (line 5:2)  this effect keeps pushing state `n` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       → state `n` is written here [hook:1] (line 5:2)
+       → the abstract value of state `n` kept growing and was widened at iteration 3
+
+⚠  1 warning(s) across 1 file(s).
+\end{sortie}
+
+Le commit \code{c32e1b0} touche 40 fichiers (+1\,674 / $-$1\,198) et \emph{supprime} les trois rustines. C'est le premier exemple, dans l'histoire du projet, de ce que \file{CLAUDE.md} appellera plus tard \og corriger la cause racine, jamais le symptôme\fg{} : la cause était l'abstraction, pas l'absence d'indice de type.
+
+\begin{remarque}
+Le niveau est \Warning, pas \Error, alors que la boucle est certaine. Le bras \og divergence de valeur\fg{} d'\regle{infinite-loop} n'a pas de must-primitive qui prouve qu'une valeur diffère à chaque tour ; l'issue \issue{144} est ouverte pour cela. La sévérité suit la preuve disponible, pas l'intuition (\cref{sec:histoire-doctrine-polarite}).
+\end{remarque}
+
+\subsection{ADR-017 : un couple FP/FN}
+
+Le premier banc sur le corpus \og memos\fg{} produit cinq faux positifs de \regle{always-unstable-deps}, baptisés F1 à F5. Leur forme commune est celle de \code{Provider} ci-dessous ; et sous ces FP se cachait un FN, celui d'\code{ObjChurn}.
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch26/ex2.tsx}}]
+import { useState, useEffect } from "react";
+
+export function ObjChurn() {
+  const [obj, setObj] = useState({ a: 1 });
+  useEffect(() => {
+    setObj({ ...obj, b: 2 });
+  }, [obj]);
+  return <div>{obj.a}</div>;
+}
+
+export function Provider() {
+  const [ctx, setCtx] = useState({ locale: "en" });
+  useEffect(() => {
+    console.log(ctx);
+  }, [ctx]);
+  return <button onClick={() => setCtx({ locale: "fr" })}>x</button>;
+}
+\end{lstlisting}
+
+Sous ADR-002, le treillis de stabilité avait quatre points, $\Bot \lleq \{\code{Stable}, \code{Unstable}\} \lleq \Top$. Un objet d'état est une référence recréée par le setter : \code{Unstable}. Le dep \code{ctx} de \code{Provider} était donc \og instable\fg{}, d'où le FP ; et l'effet d'\code{ObjChurn}, qui dépend du même genre de valeur, ne pouvait pas être distingué d'un effet sain.
+
+ADR-017 scinde \code{Unstable} en deux bornes (\cref{def:stabilite}) : \code{PerRender}, borne \emph{must} (\og une référence fraîche à chaque rendu, garanti\fg{}), et \code{Versioned(S)}, borne \emph{may} (\og ne change qu'aux setters des slots de $S$\fg{}). Lire un état donne \code{Versioned(\{slot\})} : le setter est stable et l'état ne change qu'au setter.
+
+\begin{sortie}
+  ObjChurn  (2 hooks)  ex2.tsx
+    error  infinite-loop  [hook:0]  (line 5:2)  this effect recreates object state `obj` it depends on. Every run stores a fresh reference (`Object.is` always fails) and re-triggers itself: infinite render loop
+       → a fresh value is written to state `obj` here [hook:1] (line 6:4)
+  Provider  (3 hooks)  ex2.tsx  ✓
+
+⚠  1 error(s) across 1 file(s).
+\end{sortie}
+
+Les deux lignes sont les deux moitiés d'une même décision. \code{Provider} se tait parce que \code{ctx} est \code{Versioned}, pas \code{PerRender}. \code{ObjChurn} devient une \Error{} parce que trois faits must se conjuguent : le dep \emph{est} le slot, l'écriture a lieu sur tous les chemins de l'effet, et la valeur écrite est \code{PerRender}. ADR-017 §4 nomme ce couplage : \og This coupling is a load-bearing soundness dependency\fg{}. Retirer le FP sans le bras churn aurait rendu le FN définitif.
+
+\begin{decision}[ADR-017 — stabilité versionnée]
+\textbf{Décision.} Remplacer \code{Unstable} par \code{PerRender} (must) et \code{Versioned(S)}/\code{VersionedTop} (may) ; convertir la lecture d'un état en \code{Versioned}. \textbf{Coût assumé.} \code{Stability} possède désormais un ensemble et perd \code{Copy} : \og the compile errors force an exhaustive audit of every consumer --- desirable for a semantics change\fg{}. \textbf{Refusé.} Un compteur d'événements pour faire diverger le store : un hack non standard, alors que la certitude vient de la structure des deps. Voir \adr{17}.
+\end{decision}
+
+\subsection{ADR-018 et ADR-019 : le graphe de churn et les témoins}
+
+La même semaine, ADR-018 construit le graphe de churn (\cref{def:churn-graph}) : les cycles de deux effets ou plus, qui n'étaient que des \Info, deviennent des \Error{} quand toutes leurs arêtes sont must. ADR-019 remplace les notes de diagnostic en texte libre par des chaînes de témoins typées (\cref{def:witness}), avec un vocabulaire fermé de variantes \code{Step} et l'interdiction explicite d'une variante \code{Text(String)} : \og a free-text escape hatch would erode the vocabulary back to prose\fg{}. ADR-019 ajoute aussi le \code{FileId} aux positions, parce qu'après l'inlining cross-file une note pouvait pointer dans le mauvais fichier ; le bug \og disappears rather than being patched\fg{} (\srcline{docs/adr/ADR-019-witness-chain.md}{50}).
+
+\begin{sortie}
+    error  infinite-loop  [hook:2]  (line 6:2)  these effects form a state-update cycle (`a` → `b` → `a`) where each step stores a fresh reference that re-runs the next effect: infinite render loop
+       → a fresh value is written to state `b` here [hook:2] (line 6:20)
+       → cycle continues: this effect freshly stores state `a` [hook:3] (line 7:20)
+\end{sortie}
+\noindent(Extrait de la sortie sur \file{/tmp/ch26/ex3.tsx}, deux effets qui s'écrivent l'un l'autre un objet frais ; la même exécution émet une seconde \Error{} pour l'autre effet et deux \Warning{} \regle{derived-state}. Le mécanisme est au \cref{chap:churn}.)
+
+\begin{remarque}
+Le vocabulaire \code{Step} comptait neuf variantes dans ADR-019 ; il en compte quatorze au commit \code{e67b10a} (\code{Mutate}, \code{Capture}, \code{InitOnce}, \code{Forward}, \code{Rerender} se sont ajoutées). Il a crû par la voie sanctionnée, l'extension de l'énumération, sans jamais gagner de variante texte libre. Une décision qui interdit une échappatoire n'interdit pas la croissance.
+\end{remarque}
+
+% ===========================================================================
+\section{La codification : \texorpdfstring{\file{CLAUDE.md}}{CLAUDE.md} et ADR-020}
+\label{sec:histoire-doctrine-codification}
+
+\subsection{Des principes écrits après coup}
+
+Le 21 juillet 2026, le commit \code{6805689} ajoute \file{CLAUDE.md} à la racine. Dix-neuf ADR existent déjà. Le fichier ne crée donc pas une doctrine : il nomme celle qui était déjà à l'œuvre (ADR-013 §7 disait dès le 5 juin \og FPs possible, FNs forbidden\fg{}), puis l'impose à tout ce qui suit. En voici le cœur, tel qu'il est au commit \code{e67b10a} :
+
+\lstinputlisting[language={},firstline=5,lastline=28,firstnumber=5,basicstyle=\ttfamily\scriptsize,caption={\file{CLAUDE.md}, l.~5--28 --- les trois principes et les deux invariants}]{\repoRoot/CLAUDE.md}
+
+Chaque principe répond à une tentation précise.
+\begin{itemize}
+  \item \textbf{Pas de workarounds.} La tentation est de corriger une règle pour un défaut du moteur (\og si la valeur est ⊤, ne rien dire\fg{}). Le principe renvoie la correction à la couche où l'information se perd.
+  \item \textbf{Paragraphe unique.} La tentation est une décision qui empile les cas particuliers. Le principe fait de la longueur de la justification un signal d'alarme.
+  \item \textbf{Général d'abord.} La tentation est la copie par règle. Le principe exige qu'un problème qui touche plusieurs règles soit corrigé une fois, au niveau central.
+\end{itemize}
+
+\begin{definition}{Les deux invariants du projet}{histoire-doctrine-invariants}
+\begin{enumerate}
+  \item \textbf{Soundness} (\cref{def:soundness}) : l'analyse sur-approxime les comportements ; un FP est toléré, un FN interdit.
+  \item \textbf{Niveaux de diagnostic} : une \Error{} est un défaut certain dès que le code s'exécute, prouvé pour \emph{toute} la conclusion ; un \Warning{} est un défaut possible, ou un fait certain au coût incertain ; une \Info{} est une limite de l'analyse ou un motif qui a l'air voulu, affichée derrière \code{--info}.
+\end{enumerate}
+\end{definition}
+
+\subsection{L'histoire du fichier lui-même}
+
+\file{CLAUDE.md} a été modifié quatre fois, et chaque modification enregistre une leçon.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}llX@{}}
+\toprule
+Commit & Date & Changement \\
+\midrule
+\code{6805689} & 07-21 & création : trois principes, soundness, niveaux \og Error (certain), Warning (incertain), Info (limitations)\fg{} \\
+\code{d0fbdb1} & 07-22 & pointeur vers \file{docs/tech-debt.md} (le registre de la campagne de dette) \\
+\code{f72d113} & 07-23 & le registre devient ADR-020 : \og ne pas re-tenter les fixes qui y sont refusés\fg{} \\
+\code{835e0e4} & 08-27 & le backlog devient le tracker GitHub ; convention des issues fermées \code{wontfix} \\
+\code{67b9824} & 09-24 & niveaux réécrits : preuve de \emph{toute} la conclusion ; \og fait certain au coût incertain\fg{} \\
+\bottomrule
+\end{tabularx}
+\caption{Historique de \file{CLAUDE.md} (\code{git log -- CLAUDE.md}).}
+\label{tab:histoire-claude}
+\end{table}
+
+La dernière réécriture mérite un mot. Elle suit \issue{142}, corrigée par \code{307f6c7} (\og the Error tier needs a proof of the whole claim\fg{}) : la règle \regle{stale-closure} émettait une \Error{} dont la preuve ne couvrait qu'un des deux conjoints de sa conclusion. Et elle prépare ADR-041, dont les deux règles restent au \Warning{} parce que \og the extra renders are certain, their cost is not\fg{} (\srcline{docs/adr/ADR-041-render-dependence.md}{90}). La définition des niveaux n'a pas été inventée d'un coup ; elle a été resserrée deux fois par des cas réels.
+
+\subsection{La campagne de dette et ses onze refus}
+
+Entre le 21 et le 23 juillet, une campagne de nettoyage parcourt un registre de dette technique (\file{docs/tech-debt.md} : 18 workarounds, 36 constats d'architecture, un inventaire de code répété). Beaucoup de changements sont appliqués --- le splice unifié, la macro \code{flat_lattice!}, le \code{KindMask}\dots{} Mais la leçon durable est ailleurs, et ADR-020 la formule ainsi :
+
+\begin{quote}\small
+\og the recurring and more important finding was that many high-effort items rested on an \textbf{optimistic false premise}: what looked like accidental duplication was in fact deliberate, load-bearing variation\fg{} (\src{docs/adr/ADR-020-tech-debt-cleanup-decisions.md}{13}{16}).
+\end{quote}
+
+\begin{definition}{Non-changement}{histoire-doctrine-non-changement}
+Un \terme{non-changement} est une simplification apparente (déduplication, unification, suppression d'une passe) examinée puis refusée parce qu'elle coûterait de la soundness, de la précision mesurée ou de la simplicité. Il est écrit avec son argument, pour que la même simplification ne soit pas re-tentée. La charge de la preuve est inversée : \og If any non-change above is revisited, the burden is to show the replacement is \emph{exactly} soundness-equivalent, not merely cleaner\fg{} (\src{docs/adr/ADR-020-tech-debt-cleanup-decisions.md}{155}{156}).
+\end{definition}
+
+Le premier des onze montre la forme de l'argument.
+
+\begin{exemple}{Le diamant \code{\&\&} est une duplication porteuse}{histoire-doctrine-diamant}
+ADR-003 prévoyait d'abaisser \code{a \&\& b} en un nœud d'expression \code{If(a, b, false)}. Le lowering a choisi un diamant de blocs : on évalue \code{a} dans un temporaire, on branche, et \code{b} n'est évalué que dans le bloc de droite (\cref{chap:lowering-cfg}). Pourquoi ne pas revenir au nœud plat, plus simple ? Parce que
+\begin{lstlisting}[language=TypeScript]
+open && setOpen(false);
+\end{lstlisting}
+n'exécute \code{setOpen(false)} que si \code{open} est vrai. Un nœud plat oblige l'évaluateur soit à rejouer cette exécution conditionnelle, soit à perdre l'appel --- un FN sur toute règle qui compte les écritures (\srcline{docs/adr/ADR-020-tech-debt-cleanup-decisions.md}{60}). Le coût accepté est la perte du raffinement relationnel à travers \code{\&\&}, reconstruit par une fonction dédiée.
+\end{exemple}
+
+Le \cref{tab:histoire-adr020} donne les onze refus, chacun en une phrase ; les arguments complets sont dans \adr{20}.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}rlX@{}}
+\toprule
+\# & On garde\dots & \dots parce que la simplification serait \\
+\midrule
+1 & le diamant \code{\&\&}/\code{||} & un FN : l'effet de bord conditionnel du court-circuit se perd \\
+2 & deux bras churn séparés & un FN sur \code{useEffect(() => setObj(\{...obj\}), [obj])} : les bras couvrent des partitions disjointes \\
+3 & \code{may_written_slots} syntaxique & un FN : un bit \og observé par le point fixe\fg{} sous-compte les écritures d'un chemin élagué \\
+4 & la projection \code{to_stability} & une perte : projection légitime, documentée, testée, dont des appelants ont besoin \\
+5 & pas de \code{BoundedPowerset<T,N>} & une abstraction prématurée : un seul vrai consommateur, \code{Stability} est plus riche \\
+6 & une résolution de composant par règle & un FN ou un FP : les résolutions divergent délibérément (rendu seul, par effet, contre un parent) \\
+7 & le chemin \og position de retour\fg{} d'\code{exec_body_impl} & un FN : il faut la \emph{valeur} de l'expression \\
+8 & la graine de tas d'\code{eval_in} par site d'appel & une régression : tas vide et tas convergé ne sont pas interchangeables \\
+9 & la passe \code{resolve_setter_aliases} & un FN sur les alias écrits par l'utilisateur, \code{const s1 = setX} \\
+10 & \code{TSType} hors du domaine & un FN : les types sont effacés et non imposés, \code{useState<number>()} peut valoir \code{undefined} \\
+11 & les noms temporaires par offset & du churn sans bénéfice : le préfixe \code{__arr_} est porteur \\
+\bottomrule
+\end{tabularx}
+\caption{Les onze non-changements d'ADR-020, d'après \file{docs/adr/ADR-020-tech-debt-}\allowbreak\file{cleanup-decisions.md}, l.~60--143.}
+\label{tab:histoire-adr020}
+\end{table}
+
+\begin{decision}[ADR-020 — cartographier avant de \og corriger\fg{}]
+\textbf{Décision.} Clore le registre de dette par un ADR qui enregistre ce qui a été délibérément \emph{laissé}, et supprimer le registre. \textbf{Règle transverse.} \og \textbf{map before ``fixing''; never introduce a false negative to remove a duplication}\fg{} (l.~151--152). \textbf{Conséquence.} \file{CLAUDE.md} renvoie à ADR-020 avec la consigne de ne pas re-tenter ses fixes refusés. Voir \adr{20}.
+\end{decision}
+
+\begin{piege}
+Le principe 3 (\og modulaire et général d'abord\fg{}) semble contredire ADR-020 : deux bras churn, une résolution par règle, n'est-ce pas de la duplication ? Non. Le principe condamne la copie d'un \emph{même} traitement dans chaque règle ; ADR-020 défend des traitements \emph{différents} qui se ressemblent. La généralité n'est pas l'unification aveugle : on unifie ce qui calcule le même fait, pas ce qui a la même forme.
+\end{piege}
+
+% ===========================================================================
+\section{La polarité devient un type}
+\label{sec:histoire-doctrine-polarite}
+
+\subsection{Un FN corrigé deux fois}
+
+Jusqu'au 24 juillet, chaque règle choisissait elle-même son niveau. Rien n'empêchait une règle d'émettre une \Error{} sur un fait may, ni de se taire sur un fait mal quantifié. Le programme suivant montre le second défaut.
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch26/ex8.tsx}}]
+import { useState, useEffect } from "react";
+
+export function C({ data }: { data: unknown }) {
+  const label = "fixed";
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(n + 1);
+  }, [label, data]);
+  return <div>{n}</div>;
+}
+
+export function D() {
+  const label = "fixed";
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(n + 1);
+  }, [label]);
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+
+\begin{react}[sémantique OU des deps]
+React relance un effet si \emph{un} de ses deps a changé au sens d'\code{Object.is}. Un tableau de deps ne bloque définitivement l'effet que si \emph{tous} ses deps restent identiques.
+\end{react}
+
+La garde d'\regle{infinite-loop} doit sauter un effet que ses deps bloquent. Sa première version testait \og la valeur est-elle instable ?\fg{} ; or \code{is_stable()} et \code{is_unstable()} ne sont pas complémentaires, $\Top$ et \code{Versioned} tombent entre les deux, et un effet dont un dep était $\Top$ était sauté. La première correction (\code{a9b91f7}) introduisit \code{all_deps_may_change}, mais avec le mauvais quantificateur : elle sautait l'effet dès qu'\emph{un} dep était prouvé stable. Dans \code{C}, \code{label} est stable et \code{data} (une prop de racine) est $\Top$ : l'effet était sauté, FN. Le durcissement du lendemain (\code{eb5cb93}) pose le bon quantificateur :
+
+\rustsnippet{src/rules/helpers/mod.rs}{211}{235}{la garde quantifiée ∀-stable}
+
+\begin{sortie}
+  C  (2 hooks)  ex8.tsx
+    warn   infinite-loop  [hook:0]  (line 6:2)  this effect keeps pushing state `n` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       → state `n` is written here [hook:1] (line 6:2)
+       → the abstract value of state `n` kept growing and was widened at iteration 3
+    warn   missing-deps  [hook:1]  var:n  (line 6:2)  `n` is used in this effect but not in its deps array, and it is recreated on every render
+       → `n` is read here [hook:1] (line 6:2)
+  D  (2 hooks)  ex8.tsx
+    warn   missing-deps  [hook:1]  var:n  (line 15:2)  `n` is used in this effect but not in its deps array, and it is recreated on every render
+       → `n` is read here [hook:1] (line 15:2)
+\end{sortie}
+
+\code{C} est examiné et signalé. \code{D}, dont tous les deps sont prouvés stables, ne peut tourner qu'une fois après le montage : la garde tue légitimement l'\regle{infinite-loop}, et il ne reste que le \regle{missing-deps}, correct.
+
+Cet épisode donne sa forme opérationnelle à l'invariant de soundness.
+
+\begin{invariant}{La direction d'un changement}{histoire-doctrine-direction}
+Tout changement déclare la direction dans laquelle il déplace les findings. Un ajout (une ligne de relation de plus, une arête de plus, un $\Top$ conservé) va du côté toléré et n'exige qu'un argument de précision. Une suppression (un kill, une garde, un narrowing, une déduplication) peut créer un FN : elle n'est admise que sur une preuve must. Sauter un effet est une suppression ; elle exige \og $\forall$ dep, stable prouvé\fg{}.
+\end{invariant}
+
+On retrouve cette phrase, sous des formes variées, dans presque tous les ADR à partir de 025 : \og Row multiplication cannot lose a match\fg{} (ADR-028), \og Every part of this change moves suppression in one direction: less of it\fg{} (ADR-033), \og The unsound direction is the safe one\fg{} (ADR-036), \og The two behavioural changes go in opposite, argued directions\fg{} (ADR-042).
+
+\subsection{Le sceau : \texorpdfstring{\code{Certified}}{Certified}}
+
+ADR-021 fait de la polarité un type (\cref{def:certified}). Une \Error{} ne peut se construire qu'à partir d'un jeton \code{Certified}, et un \code{Certified} ne peut être frappé que dans le module des requêtes :
+
+\rustsnippet{src/rules/api/query.rs}{74}{93}{le jeton de preuve et son constructeur privé}
+
+La première version n'était pas scellée, et l'ADR le raconte dans un encadré \og Hardening round\fg{} : \og Rust privacy is downward\fg{}, si bien que les constructeurs \og privés\fg{} de \file{rules/mod.rs} restaient appelables depuis chaque sous-module de règle, et un champ \code{pub severity} permettait de forger une \Error{} (\src{docs/adr/ADR-021-typed-query-surface.md}{28}{36}). \code{Diagnostic} a été déplacé dans le module feuille \file{src/rules/api/diagnostic.rs}, et les trois sondes de contrefaçon sont devenues des erreurs de compilation. Le même encadré note que deux primitives étaient des \og token vending machines\fg{} : elles frappaient un \code{Certified} pour quiconque passait \code{true}.
+
+\begin{decision}[ADR-021 — sévérité certifiée par le moteur]
+\textbf{Décision.} must/may/$\Top$ deviennent des types ; \code{Diagnostic::error} est le seul constructeur d'\Error{} et exige un \code{Certified} ; les quatorze règles migrent en une fois. \textbf{Refusé.} Une fenêtre de transition où l'ancienne API resterait disponible : elle laisserait ouvert le vecteur de FN. Voir \adr{21}.
+\end{decision}
+
+\begin{piege}
+Un \code{Certified} prouve \emph{un} fait. Si la conclusion d'un diagnostic est une conjonction, la preuve d'un conjoint ne suffit pas. C'est exactement \issue{142} (\regle{stale-closure}, corrigée) et \issue{143} (l'exécuteur des packs Tier-A, ouverte, \code{soundness-bug}) : une primitive \code{must_*} certifie un conjoint pendant qu'une garde may voisine reste non prouvée. Le type garantit qu'aucune \Error{} ne naît d'un fait may isolé ; il ne garantit pas que le fait certifié soit \emph{toute} la conclusion. D'où la réécriture de \file{CLAUDE.md} du 24 septembre.
+\end{piege}
+
+\subsection{Les packs, et la même idée appliquée aux règles des utilisateurs}
+
+ADR-022 (26 juillet) ouvre l'analyseur aux règles d'équipe : des packs JSON déclaratifs (\cref{chap:regles-declaratives}), un fichier de configuration et une distribution WASM. La sévérité effective d'un finding de pack est \code{pin ⊓ polarity} : le niveau demandé par l'auteur, borné par la polarité du verdict qui a produit ce finding. Le refus notable est celui d'un rejet statique des packs dont le pin dépasse la polarité : il aurait interdit la stratification finding par finding. Le lendemain, ADR-023 remplace le Starlark prévu par ADR-022 §7 : Starlark avait été choisi pour une propriété --- l'absence d'itération non bornée, qui force toute décision must/may à passer par une primitive vérifiée --- et cette propriété n'est pas propre au langage ; ADR-023 la garde et adopte une compilation JS/TS vers le JSON Tier-A. Il refuse d'abord le quantificateur $\forall$ --- refus levé plus tard, quand l'IR a su dire qu'un littéral de tableau est exact.
+
+\begin{remarque}
+Le catalogue de référence Tier-A mesure l'expressivité des packs : combien de règles d'un catalogue de 21, puis 22, le vocabulaire sait écrire. La courbe va de 3/21 à 5/21 fin août, puis de 5/21 à 8/22 (\code{aa0dbf3}, 1\textsuperscript{er} septembre) et, commit par commit, jusqu'à 21/22 (\code{0c45de8}, 2 septembre). La 22\textsuperscript{e} règle est exclue par décision (\issue{101}, fermée \code{wontfix}). Le cliquet est la constante \code{EXPRESSIBLE_NOW} de \file{tests/catalogue.rs}.
+\end{remarque}
+
+% ===========================================================================
+\section{Les relations : un fait, un endroit}
+\label{sec:histoire-doctrine-relations}
+
+\subsection{Le symptôme : deux marches qui divergent}
+
+\begin{exemple}{Une continuation \code{.then} dans un effet sans deps}{histoire-doctrine-then}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch26/ex7.tsx}}]
+import { useState, useEffect } from "react";
+
+function load() { return fetch("/api"); }
+
+export function Poller() {
+  const [data, setData] = useState({ v: 0 });
+  useEffect(() => {
+    load().then(() => setData({ v: 1 }));
+  });
+  return <div>{data.v}</div>;
+}
+\end{lstlisting}
+L'effet n'a pas de tableau de deps : il tourne après chaque rendu. Sa continuation stocke un objet frais, qui provoque un rendu, qui relance l'effet.
+\end{exemple}
+
+ADR-018 avait listé ce cas dans ses limitations : \og Auto-run nested callbacks (\code{.then(() => set(fresh))}) in \textbf{no-deps} effects: no self-edge\fg{}. En septembre, la relation d'écriture \relation{slot_writers} savait déjà que l'écriture existe et qu'elle est différée. Mais le graphe de churn était construit par sa propre marche, dans \file{rules/helpers/}, qui ne voyait pas les écritures imbriquées. Deux calculs du même fait avaient divergé : c'est l'issue \issue{26}. Au commit \code{e67b10a} :
+
+\begin{sortie}
+  Poller  (2 hooks)  ex7.tsx
+    warn   infinite-loop  [hook:1]  (line 7:2)  this effect has no dependency array and may store a fresh reference into state `data`, so it re-runs after every render and can re-trigger itself: possible infinite render loop
+       → a fresh value is written to state `data` here [hook:1] (line 8:4)
+\end{sortie}
+
+La ligne d'écriture est \code{Deferred} ; ADR-042 §4 en fait une auto-arête may, donc un \Warning{} (\cref{chap:churn}).
+
+\subsection{La vague de septembre}
+
+Du 1\textsuperscript{er} au 2 septembre, treize ADR (027 à 039) promeuvent une à une dans le moteur les marches que les règles avaient accumulées depuis juin (\cref{def:relation}). La \cref{fig:histoire-migration} en donne la carte.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[
+  gauche/.style={bloc,fill=white,draw=ra-amber,text width=4.3cm,font=\scriptsize},
+  droite/.style={bloc,text width=5.0cm,font=\scriptsize},
+  date/.style={font=\scriptsize\bfseries,text=ra-gray,anchor=east}]
+  \node[font=\small\bfseries] at (0,0.8) {couche règles (\file{src/rules/})};
+  \node[font=\small\bfseries] at (7.2,0.8) {moteur (\file{src/engine/})};
+  \node[gauche] (g1) at (0,0) {marche des appels de setter};
+  \node[droite] (d1) at (7.2,0) {\relation{slot_writers} (\file{setters.rs}) --- ADR-027, 028, 038};
+  \node[gauche] (g2) at (0,-0.9) {pli des initialiseurs d'état};
+  \node[droite] (d2) at (7.2,-0.9) {\relation{slot_seeds} (\file{seeds.rs}) --- ADR-031, 033};
+  \node[gauche] (g3) at (0,-1.8) {reconnaissance des abonnements};
+  \node[droite] (d3) at (7.2,-1.8) {\relation{registrations} (\file{registrations.rs}) --- ADR-034};
+  \node[gauche] (g4) at (0,-2.7) {appels et lectures dans les corps};
+  \node[droite] (d4) at (7.2,-2.7) {\relation{body_calls}, \relation{slot_reads} (\file{setters.rs}) --- ADR-036, 037};
+  \node[gauche] (g5) at (0,-3.6) {graphe de churn (\file{rules/helpers/})};
+  \node[droite] (d5) at (7.2,-3.6) {\relation{effect_triggers}, graphe de churn (\file{triggers.rs}, \file{churn.rs}) --- ADR-042};
+  \node[droite,draw=ra-teal] (d6) at (7.2,-4.6) {\relation{render_deps} (\file{render_deps.rs}) --- ADR-041, né dans le moteur};
+  \node[gauche,draw=ra-gray] (g7) at (0,-5.6) {restent côté règles : \code{MountIndex}, \code{ContextConsumers}, \code{RenderIndex} (\file{rules/api/cache.rs}) et les dix fichiers du cliquet};
+  \foreach \i in {1,...,5}{ \draw[fleche,draw=ra-blue] (g\i) -- (d\i); }
+  \node[date] at (-2.35,0) {09-01}; \node[date] at (-2.35,-0.9) {09-01};
+  \node[date] at (-2.35,-1.8) {09-02}; \node[date] at (-2.35,-2.7) {09-02};
+  \node[date] at (-2.35,-3.6) {09-27}; \node[date] at (4.5,-4.6) {09-24};
+\end{tikzpicture}
+\caption{La migration des faits de la couche règles vers le moteur (dates des commits d'ADR). Chaque flèche remplace une marche propre à une ou plusieurs règles par une relation calculée une fois, à la fin de la convergence, avec des colonnes polarisées (\file{docs/relations.md}).}
+\label{fig:histoire-migration}
+\end{figure}
+
+Trois décisions de cette vague illustrent chacune un aspect de la doctrine.
+
+\paragraph{Le contrat, pas le nom (ADR-034).} La colonne \code{phase} d'une ligne d'écriture est un verdict may où $\Top$ satisfait toute requête. La rétrécir de \code{Unknown} à \code{Handler} est la seule direction qui puisse \emph{perdre} un finding. ADR-034 ne l'admet que là où le moment d'exécution est un contrat :
+
+\rustsnippet{src/engine/registrations.rs}{40}{57}{les trois moments d'exécution d'un callback enregistré}
+
+\code{addEventListener} a un contrat (le DOM ne rappelle jamais le listener pendant l'enregistrement) ; \code{subscribe} n'en a pas (un \code{BehaviorSubject} RxJS émet sur-le-champ). Le refus de classer \code{subscribe} en \code{Handler} est donc une application directe de l'\cref{inv:histoire-doctrine-direction}.
+
+\paragraph{Une écriture est une écriture où qu'elle soit écrite (ADR-038).} Avant \code{7607ac9}, la marche d'écriture ne visitait que certaines positions syntaxiques. Un setter appelé en argument n'avait \og no row in the writer relation at all\fg{} (\adr{38}, l.~25 du fichier) :
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch26/ex5.tsx}, composant \code{Wrapped} (extrait)}]
+function wrap(x) { return x; }
+
+export function Wrapped() {
+  const [n, setN] = useState(0);
+  wrap(setN(1));
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+  Wrapped  (1 hooks)  ex5.tsx
+    error  setter-in-render  [hook:0]  (line 13:2)  setter `setN` called directly in the render body, move this call into a useEffect or an event handler
+       → `setN` is a state setter, so calling it writes state (line 13:2)
+\end{sortie}
+La correction n'est pas une règle de plus : c'est la suppression d'une porte de traversée dans la marche. Sur le corpus, elle ajoute 27 findings et en retire 9 (des doublons de composants) --- une correction de soundness peut réduire le nombre de findings.
+
+\paragraph{Un champ qui manque se remplit une fois (ADR-039).} Quand une liaison synthétique n'avait pas de position, chaque règle qui s'en apercevait bricolait un repli. ADR-039 remplit la position \og once, for every rule, rather than in each rule that happens to notice\fg{}. C'est le principe 3 appliqué à une métadonnée.
+
+\subsection{ADR-042 : la frontière et son cliquet}
+
+ADR-042 (26 septembre) tire la conclusion de la vague et la justifie en une phrase :
+
+\begin{quote}\small
+\og A rule reads relation rows and calls must-primitives. It walks no CFG and no expression. [\dots] One sentence justifies it: a fact computed in two places is two facts that drift, and \#26 is the drift.\fg{} (\src{docs/adr/ADR-042-relations-are-engine-products.md}{64}{67})
+\end{quote}
+
+La frontière n'est pas laissée à la bonne volonté. Elle est tenue par un test :
+
+\rustsnippet{tests/layer_boundary.rs}{19}{41}{la liste qui ne peut que rétrécir, et les marqueurs de syntaxe}
+
+\begin{definition}{Cliquet}{histoire-doctrine-cliquet}
+Un \terme{cliquet} (\emph{ratchet}) est un test qui fige une liste d'exceptions à une décision et échoue dans les deux sens : si un fichier hors de la liste enfreint la décision (la liste ne peut pas grossir), et si un fichier de la liste ne l'enfreint plus (la liste doit rétrécir). \file{tests/layer_boundary.rs} en porte les deux tests, \code{no_rule_file_outside_the_list_walks_syntax} et \code{the_list_only_shrinks}.
+\end{definition}
+
+Chaque entrée de la liste est, selon l'ADR, \og a promotion still to do, not an exception\fg{}. Le cliquet transforme une décision d'architecture en contrainte que la CI fait respecter.
+
+\begin{piege}
+Le cliquet est textuel : il cherche les chaînes \code{cfg.blocks}, \code{Stmt::}, \code{Terminator::}\dots{} dans la partie non-test de chaque fichier. Un marqueur dans un commentaire compte, et un parcours écrit autrement passe. C'est un cliquet de discipline, pas une preuve. Par ailleurs, la liste écrite dans ADR-042 §1 nomme \file{impls/conditional_hook.rs} et pas \file{helpers/mod.rs}, alors que le test fait l'inverse : quand l'ADR et le cliquet divergent, c'est le cliquet qui dit l'état du code.
+\end{piege}
+
+\begin{decision}[ADR-042 — les relations sont des produits du moteur]
+\textbf{Décision.} Le graphe de churn quitte \file{rules/helpers/} ; la ligne d'écriture gagne les colonnes \code{owner}, \code{block}, \code{written} ; une relation \relation{effect_triggers} naît ; \code{ProgramRelations} remplace \code{ProgramCache} côté moteur ; la frontière est tenue par un cliquet. \textbf{Refusés.} Unifier \relation{effect_triggers} et \relation{render_deps} (identité n'est pas dépendance : le must-rerun a besoin de l'identité) ; et, dans l'amendement du 27 septembre sur les sites de convergence, un plus grand point fixe sur les sites, qui \og would read mutual revival as convergence\fg{}. Voir \adr{42}.
+\end{decision}
+
+% ===========================================================================
+\section{Identité et attribution}
+\label{sec:histoire-doctrine-identite}
+
+Quatre ADR, étalés sur deux mois, corrigent le même défaut sous quatre formes : une chaîne d'affichage servait de clé.
+
+\begin{exemple}{Deux composants du même nom}{histoire-doctrine-widget}
+Le répertoire \file{/tmp/ch26/ex10/} contient deux fichiers \file{a/Widget.tsx} et \file{b/Widget.tsx}, qui définissent chacun un \code{Widget}. Celui de \file{b/} appelle dans un effet la prop \code{onChange} avec un objet frais ; \file{App.tsx} importe \code{Widget} depuis \file{./b/Widget} et lui passe \code{setQ}.
+\begin{sortie}
+  Widget@ex10/b/Widget.tsx  (1 hooks)  ex10/b/Widget.tsx
+    warn   cross-component-infinite-loop  [hook:0]  (line 4:2)  this effect calls `onChange`, a state setter of parent `App` (its deps do not provably gate it, so the effect can re-run every render). Parent re-renders → child re-renders → effect fires again: infinite loop
+   1 clean component(s) hidden, rerun with --show-clean
+
+⚠  1 warning(s) across 3 file(s).
+\end{sortie}
+Le nom \code{Widget@ex10/b/Widget.tsx} n'apparaît que parce qu'un second fichier définit \code{Widget} : c'est un \emph{rendu}, pas une identité. La résolution suit l'import d'\file{App.tsx} vers \file{b/}.
+\end{exemple}
+
+Avant ADR-040, l'identité d'un composant était son nom d'affichage (choix d'ADR-038 §5), et la résolution d'un callee JSX prenait le premier candidat trié --- ici \file{a/Widget.tsx}, qui n'est pas celui que le programme rend. ADR-040 le dit sans euphémisme : \og The old first-match was not non-deterministic, it was \textbf{wrong}\fg{} (\src{docs/adr/ADR-040-component-identity-is-an-interned-id.md}{100}{101}). Une référence qui ne se résout à aucun fichier unique devient \code{Ambiguous}, et le parent porte une \Info{} \regle{analysis-limit} plutôt qu'un inlining deviné. L'identité, elle, devient un entier interné :
+
+\rustsnippet{src/ir/component_id.rs}{23}{29}{l'identité d'un composant}
+
+Le même motif s'était présenté trois fois auparavant.
+\begin{itemize}
+  \item \textbf{ADR-019} : \code{SourceRange} n'avait pas de fichier ; après l'inlining cross-file, une note pouvait pointer dans le mauvais fichier. On ajoute un \code{FileId}.
+  \item \textbf{ADR-024} : un finding né dans un hook inliné est attribué au fichier d'\emph{origine}, et les findings de consommateurs différents ne sont pas fusionnés, parce que leurs faits dépendent des arguments de chacun ; le regroupement (\og \code{[in 2 components]}\fg{}) n'est qu'un affichage (\issue{129}).
+  \item \textbf{ADR-030} : le nom d'un slot écrit par un composant étranger se résout dans le composant \emph{propriétaire}, jamais dans celui qui lit.
+\end{itemize}
+
+\begin{piege}
+Une chaîne d'affichage ne doit jamais servir de clé : elle dépend du contenu du programme (\code{Widget} devient \code{Widget@…} dès qu'un autre fichier le définit). Le coût de la correction est à la mesure de la faute : le commit \code{806d114} touche 107 fichiers (+2\,959 / $-$1\,454). Le digest du corpus reste identique, et la résolution passe de 1\,317 à 1\,348 composants (29 perdus, 60 gagnés) : ce qui disparaît était inliné à tort.
+\end{piege}
+
+% ===========================================================================
+\section{Les cascades de rendu : une seconde analyse plutôt qu'un champ}
+\label{sec:histoire-doctrine-cascades}
+
+La dernière grande décision avant le snapshot concerne les rendus inutiles : un état tenu trop haut, qui re-rend un sous-arbre qui ne le lit pas. Pour les détecter, il faut savoir de quoi dépend la sortie de chaque composant. L'idée la plus directe serait d'ajouter à \code{StateValue} un champ \og dépend de\fg{}. ADR-041 la refuse :
+
+\begin{quote}\small
+\og It is \textbf{not} a field of \code{StateValue}. As a field it would change every existing value comparison [\dots] Dependence is also a different fact from value.\fg{} (\src{docs/adr/ADR-041-render-dependence.md}{44}{47})
+\end{quote}
+
+\begin{decision}[ADR-041 — la dépendance de rendu]
+\textbf{Décision.} Une analyse en avant séparée, sur un composant déjà convergé, composée le long de l'arbre d'éléments d'origine prouvée (\cref{def:render-dep}) ; deux règles, \regle{state-lifted-too-high} et \regle{wasted-subtree-render} ; des options typées sur les règles natives (amende ADR-022 §4). \textbf{Niveau.} \Warning{} au plus : \og the extra renders are certain, their cost is not\fg{}. \textbf{Refusé.} La dépendance comme champ du domaine des valeurs. Voir \adr{41} et \cref{chap:regles-rendu-rsc}.
+\end{decision}
+
+La décision tient en une phrase, comme l'exige le principe 2 : dépendance et valeur sont deux faits, donc deux analyses. Sa mesure aussi : la baseline du corpus passe de 1\,346 à 1\,500 localisations avec l'arrivée des deux règles.
+
+% ===========================================================================
+\section{La méthode}
+\label{sec:histoire-doctrine-methode}
+
+\subsection{Le cycle d'une décision}
+
+Les messages de commit, les sections \og Consequences\fg{} des ADR et le journal de précision laissent voir un processus stable, résumé par la \cref{fig:histoire-cycle}.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=4mm,
+  etape/.style={bloc,text width=10.5cm,align=left,font=\scriptsize}]
+  \node[etape] (e0) {\textbf{Problème observé} : corpus, issue, revue, campagne};
+  \node[etape,below=of e0] (e1) {\textbf{1. Reproduire} sur une fixture minimale (\file{tests/*.rs} ou \file{/tmp})};
+  \node[etape,below=of e1] (e2) {\textbf{2. Localiser} la perte d'information : lowering ? domaine ? relation ? règle ? (principe 1)};
+  \node[etape,below=of e2] (e3) {\textbf{3. Ranger} : contrainte → ADR ; mesure → journal de précision ; refus → issue \code{wontfix}};
+  \node[etape,below=of e3] (e4) {\textbf{4. Argumenter} la direction : ajout (toléré) ou suppression (preuve must)};
+  \node[etape,below=of e4] (e5) {\textbf{5. Test near-miss} qui échoue quand la correction seule est retirée};
+  \node[etape,below=of e5] (e6) {\textbf{6. Mesurer} : \code{before / after / removed / added} (\file{scripts/corpus-diff.py}), chaque delta relu à la source};
+  \node[etape,below=of e6] (e7) {\textbf{7. Fixer} la baseline : commit \code{chore(corpus): baseline N → M}};
+  \foreach \a/\b in {e0/e1,e1/e2,e2/e3,e3/e4,e4/e5,e5/e6,e6/e7}{ \draw[fleche] (\a) -- (\b); }
+  \draw[flechemay] (e6.east) -- ++(0.6,0) |- node[etiquette,pos=0.25,right]{delta inexpliqué} (e2.east);
+\end{tikzpicture}
+\caption{Le cycle d'une décision, reconstitué à partir de l'historique (notes du dossier 15, §4.1). Un delta de corpus qu'on ne sait pas attribuer renvoie à la localisation.}
+\label{fig:histoire-cycle}
+\end{figure}
+
+\begin{exemple}{Un raccourci mesuré puis refusé (ADR-025)}{histoire-doctrine-guard-throw}
+Jusqu'au 29 juillet, un corps qui \og tombe\fg{} à la fin était scellé \code{Unreachable}, comme un \code{throw}. Le splice concluait que le contrôle ne revenait jamais, et 198 composants du corpus étaient coupés de leur propre \code{Return} (le commentaire de \src{src/lowering/cfg_builder.rs}{222}{230} le raconte). ADR-025 scelle la chute en \code{Return(undefined)}. Un raccourci plus large était tentant : relier \emph{tout} \code{Unreachable} au bloc de jonction. Il a été mesuré, puis refusé, sur ce genre de code :
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch26/ex4.tsx} (extrait)}]
+function useCart() {
+  const ctx = useContext(CartContext);
+  if (ctx === undefined) throw new Error("useCart outside provider");
+  const [items] = useState(ctx.items);
+  return items;
+}
+\end{lstlisting}
+Relier le \code{throw} à la jonction invente un chemin vers la sortie qui contourne \code{useState} : \regle{conditional-hook} en \Error{} sur du code conforme. Au commit \code{e67b10a}, \code{Cart} est propre (\code{✓  1 file(s) no issues found.}) ; avec \code{--info}, seule apparaît l'\Info{} \og hook \code{useContext} was not found in the registry\fg{}, qui relève de la limite \issue{28}. Mesure de l'ADR : composants sectionnés 208 → 3 ; 12 findings révélés, aucun perdu.
+\end{exemple}
+
+\subsection{La mesure comme juge, et la mesure corrigée}
+
+Depuis ADR-016, chaque décision est confrontée au corpus, y compris les refus (ADR-025, ADR-040 \og dropped on measurement\fg{}). La métrique, la procédure et l'erreur de comptage du 3 septembre qui l'a fait naître sont au \cref{chap:tests-corpus}. Deux traits concernent l'histoire.
+\begin{itemize}
+  \item \textbf{La mesure peut être fausse, et elle se corrige là où elle est écrite.} ADR-031 porte une mention \og CORRECTED\fg{} : sa comparaison reposait sur un run par côté alors que l'analyse n'était pas encore déterministe (\issue{120}). Le journal de précision porte une \og Table correction\fg{} où un signe s'était inversé.
+  \item \textbf{Une correction de précision peut révéler un défaut de soundness.} La migration d'ADR-031 a fait apparaître le non-déterminisme (\issue{120}) et une suppression fondée sur une coïncidence, que corrige ADR-033.
+\end{itemize}
+
+\subsection{Les ADR rétrogradés et les numéros réutilisés}
+
+Le 2 septembre, en pleine campagne de précision, sept ADR (040 à 046) sont écrits pour des corrections de précision. Le lendemain, le commit \code{87f87b5} (\og ADRs are for decisions, precision fixes get a log\fg{}) les supprime et verse leur contenu dans \file{docs/precision-log.md}. C'est la naissance de la frontière de la \cref{def:histoire-doctrine-lieux}.
+
+\begin{piege}
+Les numéros 040, 041 et 042 ont ensuite été \emph{réattribués} : identité des composants (5 septembre), dépendance de rendu (24 septembre), relations du moteur (26 septembre). Un vieux message de commit qui cite \og ADR-042\fg{} du début septembre peut désigner une correction de précision disparue. Deux autres pièges de lecture de \code{git log} : les ADR 001--013 ont été traduits et plusieurs portent des lignes \code{Updated} successives, si bien que leur champ \code{Date} n'est pas la date du texte actuel ; et certaines issues restent \code{OPEN} alors qu'un commit les nomme comme corrigées (elles restent ouvertes sur un résidu). Ne pas conclure de l'état d'une issue sans lire son dernier commentaire.
+\end{piege}
+
+\subsection{Les refus citables}
+
+Depuis le 27 août (\code{835e0e4}), le backlog vit sur le tracker GitHub et les limites tranchées \og on ne corrige pas\fg{} deviennent des issues fermées \code{wontfix}, créées puis fermées aussitôt pour que le raisonnement soit citable. Le \cref{tab:histoire-wontfix} les liste.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}rX@{}}
+\toprule
+Issue & Titre (tracker) et raison résumée \\
+\midrule
+\issue{40} & \og FP by decision --- whole-object read via guard/nullish is flagged\fg{} : distinguer usage de valeur et test d'existence demanderait de suivre le type de consommation \\
+\issue{42} & \og FP by decision --- \code{stale-closure} emitter-name heuristic\fg{} : un appel \code{on}/\code{addListener} est traité comme un enregistrement durable, plafond \Warning{} \\
+\issue{51} & \og By design --- \code{node_modules} [\dots] are never lowered\fg{} : périmètre ; les résumés de hooks sont le point d'extension \\
+\issue{63} & \og Out of scope --- dynamic components\fg{} : pas de design pour résoudre une référence de composant à travers un join \\
+\issue{65} & \og Out of scope --- anonymous default exports get a generic name\fg{} : reste cosmétique \\
+\issue{101} & \og Catalogue --- \code{nullable-return-unguarded} is excluded by design\fg{} : ancre syntaxique et refus de \code{TSType} (ADR-020 n\textsuperscript{o}~10) \\
+\bottomrule
+\end{tabularx}
+\caption{Les six issues fermées \code{wontfix} (\code{gh issue list --state closed --label wontfix}).}
+\label{tab:histoire-wontfix}
+\end{table}
+
+\subsection{Le graphe des ADR}
+
+Un ADR n'est presque jamais effacé ; il est remplacé en tout ou partie, amendé, ou ses conditions sont levées. La \cref{fig:histoire-graphe-adr} dessine ces relations. Un seul ADR a été entièrement remplacé (008 par 015) ; les autres remplacements portent sur une section.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[
+  a/.style={noeud,rectangle,rounded corners=2pt,minimum width=9mm,font=\scriptsize},
+  sup/.style={fleche,draw=ra-red,very thick},
+  amd/.style={flechemay},
+  ref/.style={flechemust},
+  lab/.style={etiquette,fill=white,inner sep=1pt}]
+  \node[a] (002) at (0,0) {002};    \node[a] (017) at (3,0) {017};
+  \node[a] (008) at (0,-1) {008};   \node[a] (015) at (3,-1) {015};
+  \node[a] (011) at (0,-2) {011};   \node[a] (019) at (3,-2) {019};
+  \node[a] (006) at (0,-3) {006};   \node[a] (021) at (3,-3) {021};
+  \node[a] (018) at (6,0) {018};    \node[a] (029) at (6,-1) {029};
+  \node[a] (042) at (10,-1.5) {042};
+  \node[a] (022) at (3,-4) {022};   \node[a] (023) at (6,-4) {023};
+  \node[a] (041) at (10,-4) {041};
+  \node[a] (027) at (0,-5.2) {027}; \node[a] (034) at (3,-5.2) {034};
+  \node[a] (035) at (3,-6.2) {035}; \node[a] (036) at (6,-6.2) {036};
+  \node[a] (031) at (0,-7.2) {031}; \node[a] (033) at (3,-7.2) {033};
+  \node[a] (038) at (6,-7.2) {038}; \node[a] (040) at (10,-7.2) {040};
+  \draw[ref] (002) -- node[lab,above]{raffine} (017);
+  \draw[sup] (008) -- node[lab,above]{remplace} (015);
+  \draw[sup] (011) -- node[lab,above]{§Note} (019);
+  \draw[sup] (006) -- node[lab,above]{§4} (021);
+  \draw[amd] (018) -- node[lab,sloped,above]{§4, §6} (042);
+  \draw[amd] (029) -- node[lab,above]{§1} (042);
+  \draw[amd] (021) -- node[lab,sloped,below]{§4 → §5} (042);
+  \draw[sup] (022) -- node[lab,above]{§7} (023);
+  \draw[amd] (022) to[bend right=18] node[lab,below]{§4} (041);
+  \draw[ref] (027) -- node[lab,above]{§2 levé} (034);
+  \draw[ref] (027) |- node[lab,pos=0.75,above]{§2 levé} (035);
+  \draw[amd] (035) -- node[lab,above]{§1 (036 §6)} (036);
+  \draw[amd] (031) -- node[lab,above]{§2} (033);
+  \draw[sup] (038) -- node[lab,above]{§5} (040);
+  % légende
+  \draw[sup] (7.6,-5.3) -- ++(0.8,0); \node[font=\scriptsize,anchor=west] at (8.5,-5.3) {remplace (supersedes)};
+  \draw[amd] (7.6,-5.75) -- ++(0.8,0); \node[font=\scriptsize,anchor=west] at (8.5,-5.75) {amende};
+  \draw[ref] (7.6,-6.2) -- ++(0.8,0); \node[font=\scriptsize,anchor=west] at (8.5,-6.2) {raffine, lève une condition};
+\end{tikzpicture}
+\caption{Remplacements et amendements entre ADR (notes du dossier 15, §5.3 ; en-têtes \code{Supersedes}/\code{Amends} des ADR). Une flèche va de l'ADR ancien vers celui qui le modifie ; l'étiquette nomme la section touchée.}
+\label{fig:histoire-graphe-adr}
+\end{figure}
+
+\subsection{Quand l'ADR et le code divergent}
+\label{sec:histoire-doctrine-ecarts}
+
+La double citation ADR ↔ code s'est désynchronisée par endroits. Le lecteur doit connaître ces écarts, constatés au commit \code{e67b10a}, pour ne pas prendre un ADR pour une description du code (\cref{tab:histoire-ecarts} ; ils sont repris, avec leur piste de correction, au \cref{chap:limites-perspectives}).
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}lXX@{}}
+\toprule
+ADR & Annonce & État au commit \code{e67b10a} \\
+\midrule
+001 & \file{docs/semantics.md}, citations React-tRace, tests contre l'interpréteur OCaml & aucun des trois \\
+003 & \file{docs/ir.md} ; \code{a \&\& b} → nœud \code{If} & \file{ir.md} supprimé ; diamant de blocs (ADR-020 n\textsuperscript{o}~1) \\
+005 & \file{src/registry/user_config.rs}, \file{reactant.toml} & absents \\
+016 & schéma JSON v1 & sortie en \code{"version": 2} (ADR-024 §1) \\
+019 & neuf variantes de \code{Step} & quatorze (croissance par la voie sanctionnée) \\
+039 & span sur \code{Return} : \og a hundred construction sites\fg{} & le commentaire de \srcline{src/ir/cfg.rs}{25} dit \og a 40-site IR change\fg{} \\
+042 §1 & liste du cliquet avec \file{impls/conditional_hook.rs} & le test liste \file{helpers/mod.rs} à la place \\
+042 & \og \file{rules/api/cache.rs} is gone\fg{} & présent : \code{ProgramCache} enveloppe \code{ProgramRelations} et trois structures \\
+\bottomrule
+\end{tabularx}
+\caption{Écarts entre ADR et code (notes du dossier 15, §8.3, revérifiés par \code{grep} pour 042).}
+\label{tab:histoire-ecarts}
+\end{table}
+
+% ===========================================================================
+\section{Les fils rouges}
+\label{sec:histoire-doctrine-fils}
+
+Relue d'un bout à l'autre, l'histoire du projet se ramène à huit fils, qui reviennent d'ADR en ADR.
+
+\begin{enumerate}
+  \item \textbf{Soundness : la direction d'abord.} FP tolérés, FN interdits, sous la forme opérationnelle de l'\cref{inv:histoire-doctrine-direction}. Les exceptions historiques (\code{TriggerClass::Unknown}) sont antérieures à la formulation et sont suivies par des issues.
+  \item \textbf{Les niveaux comme typage.} De la convention (trois paliers, 4 juin) à la typestate (\code{Certified}, ADR-021), à l'exécuteur de packs (\code{pin ⊓ polarity}, ADR-022), puis au plafond structurel : une sorte qu'aucune \code{must_*} ne lie ne peut pas atteindre l'\Error{}. Point ouvert : la conjonction (\issue{143}).
+  \item \textbf{Produits du moteur plutôt que marches de règles.} ADR-006 sépare moteur et règles ; de juin à août les règles réaccumulent des marches ; de 027 à 042 elles sont promues une à une (\cref{fig:histoire-migration}).
+  \item \textbf{Généralité, pas unification aveugle.} \og one central relation, never a second bespoke one\fg{} (ADR-027 §4), \og one column, not two\fg{} (ADR-028), une table unique des registrars (ADR-034) --- et, en contrepoids, les duplications porteuses d'ADR-020.
+  \item \textbf{Le paragraphe unique.} Les ADR postérieurs à juillet portent des justifications explicitement \og en une phrase\fg{} (ADR-022 §1, ADR-030 §2, ADR-042 §1). Les ADR longs (021, 022, 023, 042, près de 280 lignes chacun) ne contredisent pas la règle en esprit : chaque décision y a sa phrase, la longueur vient du nombre de décisions.
+  \item \textbf{La mesure plutôt que l'argument}, et la mesure corrigée quand elle est fausse.
+  \item \textbf{Identité n'est pas rendu.} \code{FileId}, \code{ComponentId}, l'identité d'un finding par sa position d'ancre, le nom d'un slot résolu chez son propriétaire.
+  \item \textbf{Déterminisme.} \code{BTreeMap} pour les blocs de CFG, tri avant récursion dans la chasse aux liaisons (ADR-033), digest de la baseline : un résultat qui change d'un run à l'autre ne peut pas juger une décision.
+\end{enumerate}
+
+\begin{remarque}
+Ces fils sont aussi une grille de revue. Devant un changement proposé, on peut poser huit questions : dans quelle direction déplace-t-il les findings ? son niveau est-il porté par une preuve ? calcule-t-il un fait déjà calculé ailleurs ? unifie-t-il deux traitements différents ? se justifie-t-il en une phrase ? a-t-il été mesuré ? utilise-t-il un affichage comme clé ? est-il déterministe ?
+\end{remarque}
+
+% ===========================================================================
+\begin{resume}
+\begin{itemize}
+  \item Le projet range chaque décision dans un lieu : ADR (contrainte), journal de précision (mesure), issue fermée \code{wontfix} (refus citable), cliquet (décision exécutoire). La frontière ADR/journal date du 3 septembre (\code{87f87b5}).
+  \item Onze phases en cinq mois (\cref{fig:histoire-frise}) : prototype jeté, pipeline en un jour, domaines, corpus, codification, surface typée, distribution, relations, précision et identité, doctrine de sévérité et cascades.
+  \item \file{CLAUDE.md} a été écrit après dix-neuf ADR : il nomme une doctrine existante (pas de workaround, paragraphe unique, général d'abord ; soundness ; niveaux) et l'impose ensuite. Sa définition des niveaux a été resserrée par \issue{142}.
+  \item ADR-020 enseigne à cartographier avant de corriger : onze simplifications apparentes sont refusées parce qu'elles coûtent un FN.
+  \item L'invariant opérationnel : tout changement déclare sa direction ; une suppression exige une preuve must. \code{Certified} et \code{Diagnostic::error} en font un type ; le quantificateur $\forall$-stable en est un exemple.
+  \item \og A fact computed in two places is two facts that drift\fg{} : les marches des règles sont promues en relations du moteur, et \file{tests/layer_boundary.rs} empêche le retour en arrière.
+  \item Une chaîne d'affichage n'est jamais une clé (\code{FileId}, \code{ComponentId}, attribution d'origine).
+  \item Types et fichiers rencontrés : \code{TriggerClass}, \code{StateValue}, \code{Stability}, \code{Certified}, \code{Timing}, \code{ComponentId} ; \file{CLAUDE.md}, \file{docs/adr/}, \file{docs/precision-log.md}, \file{tests/layer_boundary.rs}, \file{tests/catalogue.rs}.
+  \item Le chapitre suivant (\cref{chap:limites-perspectives}) rassemble ce qui reste ouvert : les limites assumées, les défauts observés au commit \code{e67b10a} et les pistes de correction à la racine.
+\end{itemize}
+\end{resume}
+
+% ===========================================================================
+\section{Exercices}
+\label{sec:histoire-doctrine-exercices}
+
+\begin{exercice}{Onze phrases}{histoire-doctrine-onze}
+Pour trois des non-changements d'ADR-020 au choix (\cref{tab:histoire-adr020}), écrire un programme React de quelques lignes qui deviendrait un FN si l'on appliquait la simplification refusée.
+\end{exercice}
+\begin{solution}
+Pour le n\textsuperscript{o}~2 : \code{useEffect(() => setObj(\{...obj\}), [obj])}, le cas même que cite l'ADR, disparaîtrait avec le bras self-churn. Pour le n\textsuperscript{o}~9 : \code{const s1 = setX; s1(1);} dans le corps de rendu est la forme que la passe d'alias doit servir. Pour le n\textsuperscript{o}~10 : \code{const [v, setV] = useState<number[]>(); useEffect(() => setV([...(v ?? [])]), [v]);} --- l'annotation laisserait croire à une valeur typée, alors que la valeur initiale est \code{undefined} puis une référence fraîche à chaque tour.
+
+Passés à l'analyseur au commit \code{e67b10a} (fichier \file{/tmp/ch26/exo1.tsx}), le premier et le troisième programme donnent chacun une \Error{} \regle{infinite-loop} (\og this effect recreates object state \dots\fg{}). Le deuxième, en revanche, est \emph{silencieux} : l'alias \code{s1} d'un setter appelé dans le rendu n'est pas signalé par \regle{setter-in-render}. C'est un FN observé, qui montre qu'un non-changement protège un mécanisme sans garantir que chaque règle s'en serve ; il est repris au \cref{chap:limites-perspectives}.
+\end{solution}
+
+\begin{exercice}{Le mauvais quantificateur}{histoire-doctrine-quantificateur}
+Reprendre \file{/tmp/ch26/ex8.tsx}. Remplacer mentalement \code{all_deps_provably_stable} par \og il existe un dep prouvé stable\fg{}. Quel composant devient silencieux ? Pourquoi est-ce un FN, et quelle ligne de la \cref{def:histoire-doctrine-lieux} faudrait-il pour enregistrer ce retour en arrière s'il était voulu ?
+\end{exercice}
+\begin{solution}
+\code{C} devient silencieux : \code{label} est stable, donc la garde \og existentielle\fg{} saute l'effet, alors que \code{data} peut changer et relancer l'effet (sémantique OU). C'est un FN car la boucle reste possible. Un tel changement est une suppression sans preuve must : il contredit l'\cref{inv:histoire-doctrine-direction} et ne pourrait être enregistré nulle part ; il ne peut être que refusé.
+\end{solution}
+
+\begin{exercice}{Ranger une décision}{histoire-doctrine-ranger-exo}
+Pour chacune des situations suivantes, dire où elle doit être enregistrée : (a) \regle{missing-deps} cesse de signaler une forme de lecture mal attribuée, le corpus perd douze findings ; (b) on décide que les composants de classe ne seront pas analysés ; (c) on introduit une nouvelle relation \relation{slot_resets} lue par deux règles ; (d) on veut empêcher toute nouvelle règle d'appeler directement l'évaluateur.
+\end{exercice}
+\begin{solution}
+(a) Journal de précision. (b) Issue fermée \code{wontfix} (avec le raisonnement), et une ligne dans \file{docs/limitations.md}. (c) ADR : une relation est une contrainte que le reste du système doit respecter, et \file{docs/relations.md} doit la nommer (test \code{every_relation_is_in_the_catalogue}). (d) Un cliquet, sur le modèle de \file{tests/layer_boundary.rs}, accompagné d'un ADR qui énonce la frontière.
+\end{solution}
+
+\begin{exercice}{Le raccourci d'ADR-025}{histoire-doctrine-adr025}
+Dessiner le CFG de \code{useCart} inliné dans \code{Cart} (\cref{ex:histoire-doctrine-guard-throw}), d'abord tel que le produit le code, puis avec le raccourci refusé (tout \code{Unreachable} relié au bloc de jonction). Montrer quel hook cesse de dominer toutes les sorties atteignables.
+\end{exercice}
+
+\begin{exercice}{Deux ADR contradictoires}{histoire-doctrine-deux-adr}
+Rédiger, au format du projet (Contexte, Décision, Alternatives refusées, Conséquences), un ADR qui refuse de faire descendre le point fixe dans les callees inconnus, puis l'ADR inverse. Lequel respecte \file{CLAUDE.md} ? Quel serait le coût mesurable du second, et comment le mesurer ?
+\end{exercice}
+
+\begin{exercice}{Numéros réutilisés}{histoire-doctrine-numeros}
+Expliquer comment les numéros d'ADR 040 à 042 ont pu désigner deux documents différents à trois semaines d'écart, et proposer une règle simple qui l'aurait évité.
+\end{exercice}
+\begin{solution}
+Les ADR de précision 040--046 ont été supprimés le 3 septembre (\code{87f87b5}) sans laisser de trace dans \file{docs/adr/} ; les numéros ainsi libérés ont été repris par les ADR suivants, 040 dès le 5 septembre. Une règle possible : un numéro d'ADR n'est jamais réutilisé ; un ADR retiré laisse un fichier-stub \og Withdrawn, see \file{precision-log.md}\fg{}.
+\end{solution}

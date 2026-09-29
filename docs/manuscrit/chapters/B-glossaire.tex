@@ -1,0 +1,432 @@
+% ---------------------------------------------------------------------------
+% Annexe B — Glossaire
+% Sources : section 9 (« Glossaire ») de notes/01-lowering-detection.md à
+% notes/16-react-semantics.md (fusionnées, dédupliquées) ; le « Lexique
+% imposé » et la table « Définitions partagées » de PLAN.md. Les termes déjà
+% formalisés dans un chapitre existant (un label def:...) sont renvoyés par
+% \cref plutôt que redéfinis ; cette annexe résume, elle ne remplace jamais la
+% définition d'origine.
+% ---------------------------------------------------------------------------
+\chapter{Glossaire}
+\label{chap:glossaire}
+
+\begin{objectifs}
+  \item Disposer d'un point d'entrée alphabétique unique pour tout terme, type ou identifiant rencontré dans le manuscrit ou dans le code de \reactant{}.
+  \item Distinguer, pour chaque terme, un rappel d'une phrase de la définition formelle qui vit dans un chapitre (renvoi \code{def:…}) de la simple mention d'un type ou d'une ligne de code sans théorie associée.
+  \item Repérer les quelques mots qui portent deux sens différents selon le chapitre (\code{site}, \code{région}, \code{ancre}) et savoir lequel est en jeu.
+\end{objectifs}
+
+\prerequis{aucun : cette annexe se consulte à tout moment, dans n'importe quel ordre, comme un dictionnaire. Elle suppose seulement le vocabulaire de base de \cref{chap:interpretation-abstraite} (treillis, must/may, soundness) pour les entrées mathématiques.}
+
+Cette annexe fusionne les glossaires des seize dossiers de notes qui ont
+servi à écrire les chapitres techniques, harmonisés avec le \og Lexique
+imposé\fg{} de \file{PLAN.md}. Elle ne réexplique rien : quand un terme a déjà
+une définition formelle numérotée ailleurs dans le manuscrit
+(\cref{def:treillis}, \cref{def:slot}\ldots), l'entrée ici tient en une phrase
+et renvoie au chapitre. Pour tout le reste — un type Rust, une fonction, un
+champ de structure — l'entrée dit ce que fait la chose, en une à trois
+phrases, avec l'endroit du dépôt où la vérifier (\code{\textbackslash src} ou
+\code{\textbackslash srcline}) au commit \code{\snapshotCommit}. Les entrées
+sont classées alphabétiquement sans distinguer majuscule et minuscule ; un
+identifiant du code (\code{StateValue}, \code{ExprId}) est classé à sa
+première lettre, comme un mot ordinaire.
+
+\begin{piege}
+Trois mots changent de sens selon le chapitre où on les lit. \code{site}
+désigne un site d'allocation (\cref{chap:ir}, \code{ExprId}, une clé du tas
+abstrait) \emph{ou} un site d'écriture de la preuve de convergence
+(\cref{chap:churn}, une ligne non-handler d'un corps de rendu ou d'effet) ---
+et \emph{aussi} un \code{ElementSite} de rendu (\cref{chap:inter-composants}).
+\code{région} désigne le corps lexical d'une écriture (\code{WriterRegion},
+\cref{chap:relations}) \emph{ou} la plage de blocs d'une greffe
+(\code{InlineRegion}, \cref{chap:splice-inlining}) : la première est un des
+cinq valeurs \code{Render}/\code{Effect}/\code{Memo}/\code{Callback}/\code{Handler}
+qu'une écriture habite, la seconde une plage \code{start..end} de
+\code{BlockId} que la greffe enregistre pour décider si une écriture est
+directe ou passée par un wrapper. Enfin
+\code{ancre} nomme la position qui fait l'identité d'un diagnostic
+(\cref{chap:api-regles}) \emph{et}, dans le vocabulaire des packs
+déclaratifs, la relation sur laquelle une règle Tier-A itère
+(\cref{chap:regles-declaratives}). Le contexte tranche à chaque fois ; ce
+glossaire signale les deux sens plutôt que d'en choisir un.
+\end{piege}
+
+\section*{Glossaire}
+\addcontentsline{toc}{section}{Glossaire}
+
+\begin{description}
+
+\item[\code{AccessPath} (chemin d'accès)] Racine plus chaîne de champs d'une lecture, utilisée pour épingler une lecture aux deps déclarées d'un hook. \srcline{src/ir/free_vars.rs}{19} — \cref{chap:ir}.
+
+\item[ADR] \emph{Architecture Decision Record} : décision que le reste du système doit respecter (un domaine, une relation, un invariant, une alternative refusée) ; les 42 fiches sont à \cref{chap:fiches-adr}, l'histoire du projet à \cref{chap:histoire-doctrine}. \file{docs/adr/README.md}.
+
+\item[alias de setter] Constante liée une seule fois à un setter (\code{const s = setX}), résolue par fermeture sur le CFG plutôt que par égalité syntaxique. \srcline{src/engine/setters.rs}{581} — \cref{chap:relations}.
+
+\item[alias (tsconfig)] Motif du champ \code{paths} d'un \file{tsconfig.json} (\code{@/*}) ; \og exact\fg{} sans \code{*}, \og wildcard\fg{} avec. \srcline{src/project/paths_resolver.rs}{22} — \cref{chap:projet-cli-driver}.
+
+\item[ambigu / \code{Ambiguous}] Réponse de la résolution d'un nom JSX quand plusieurs fichiers définissent ce nom sans qu'aucune preuve d'import ne tranche ; le composant se lit alors \(\Top\). \srcline{src/engine/component_registry.rs}{114} — \cref{chap:inter-composants}.
+
+\item[\code{analysis-limit}] \Info{} émise quand l'analyse a coupé volontairement (composant introuvable, budget d'inlining épuisé, récursion) ; jamais un défaut, toujours un faux négatif possible signalé. \file{src/rules/impls/analysis_limit_info.rs} — \cref{chap:tests-corpus}.
+
+\item[ancre (\emph{anchor})] Voir l'encadré ci-dessus : position qui fait l'identité d'un diagnostic (\cref{chap:api-regles}) ou relation sur laquelle itère une règle Tier-A (\cref{chap:regles-declaratives}). ADR-024, ADR-022 §2.
+
+\item[arête \code{Await}] Arête de CFG inconditionnelle dont le successeur s'exécute après une suspension (\code{await}) ; les blocs qu'elle atteint sont \og post-await\fg{}, où une marche \code{Sync} devient \code{Deferred}. \srcline{src/ir/cfg.rs}{39} — \cref{chap:lowering-cfg}.
+
+\item[arête \code{Back} (arc arrière)] Arête qui referme une boucle dans un CFG ; seul endroit où le point fixe applique le widening. \srcline{src/ir/cfg.rs}{38} — \cref{chap:cfg-analyzer-dominance}.
+
+\item[arité (\code{Arity})] Longueur connue de la source d'un tableau de deps : \code{Exact(n)} (exactement \(n\)) ou \code{AtLeast(n)} (au moins \(n\), en présence d'un spread). \srcline{src/ir/hooks.rs}{52} — \cref{chap:ir}.
+
+\item[assurance (\code{verified:}) / \code{SafeCheck}] Ligne affichée sous \code{--info} quand une règle applicable n'a rien trouvé ; retirée (\og suspended\fg{}) pour un composant tronqué par un \code{analysis-limit}. \srcline{src/rules/mod.rs}{61} — \cref{chap:api-regles}.
+
+\item[bail-out] Abandon par React d'un rendu déjà planifié quand \code{Object.is(ancienne, nouvelle)} est vrai pour l'état concerné ; la borne de stabilité \code{Stable}/\code{Versioned} sert précisément à prédire ce cas. \cref{chap:react-modele}, \cref{chap:statevalue-stabilite}.
+
+\item[baseline (corpus)] Nombre de localisations distinctes commité dans \file{docs/corpus-baseline.json}, produit par un script et jamais tapé à la main. \cref{chap:tests-corpus}.
+
+\item[\code{baseUrl}-only] Résolveur \code{TsconfigPaths} sans motif (\code{patterns} vide) : résout les spécificateurs nus relativement à \code{baseUrl}, sans alias. \srcline{src/project/tsconfig.rs}{22} — \cref{chap:projet-cli-driver}.
+
+\item[blind spot (angle mort)] Section \og not analyzed\fg{} du rapport (\code{unresolved-aliases}, \code{unparsed-files}, \code{unread-imports}) : ce que le run sait ne pas avoir lu, jamais un finding. \srcline{src/driver/blind_spots.rs}{22} — \cref{chap:projet-cli-driver}.
+
+\item[bloc de base (\code{BasicBlock})] Suite linéaire d'instructions (\code{Stmt}) terminée par un \code{Terminator} ; unité du CFG. \srcline{src/ir/cfg.rs}{6} — \cref{chap:ir} (\cref{def:cfg}).
+
+\item[bloc de jonction (\emph{join block})] Bloc où convergent les branches d'un \code{if}, d'un ternaire ou d'un \code{\&\&}/\code{||} ; porte les instructions qui suivent la structure de contrôle. \cref{chap:lowering-cfg}.
+
+\item[bloc orphelin] Bloc présent dans le CFG mais non atteignable depuis l'entrée (par exemple la jonction de deux \code{return}) ; \code{CFG::reachable_blocks} l'exclut des passes d'analyse. \srcline{src/ir/cfg.rs}{146} — \cref{chap:ir}.
+
+\item[boucle automatique] Suite rendu \(\to\) effets \(\to\) \code{setState} \(\to\) rendu qui s'entretient sans événement externe ; seul objet de la preuve de convergence du churn. \srcline{src/engine/churn.rs}{26} — \cref{chap:churn}.
+
+\item[budget d'inlining] Nombre maximal de greffes d'utilitaires par CFG (\code{max_inline_depth}, 8 par défaut) ; au-delà, les appels restants sont opaques. \srcline{src/engine/fixpoint.rs}{1617} — \cref{chap:splice-inlining}.
+
+\item[canal (\emph{channel})] Sortie de la marche des écrivains : \code{setters} (toujours produite), \code{calls} (\code{collect_calls}), \code{reads} (\code{read_vars} non vide). \cref{chap:relations}.
+
+\item[candidat (\code{Candidate})] Fonction de premier niveau retenue par un détecteur (nom, paramètres, corps, drapeau \code{expression}), avant classification en composant, hook ou utilitaire. \srcline{src/lowering/mod.rs}{133} — \cref{chap:frontend-detection}.
+
+\item[canonisation (stabilité)] Réduction \(\text{Versioned}(\emptyset) \equiv \text{Stable}\), et passage à \code{VersionedTop} au-delà de 4 slots suivis. \srcline{src/domains/impls/stability.rs}{55} — \cref{chap:statevalue-stabilite}.
+
+\item[catalogue Tier A] Les 22 classes de règles de référence utilisées pour mesurer l'expressivité des packs déclaratifs ; 21 sont exprimables, 1 exclue par construction. \file{tests/catalogue.rs} — \cref{chap:regles-declaratives}, \cref{chap:catalogue-regles}.
+
+\item[certificat de liaison] Preuve syntaxique qu'un nom désigne, dans tout le corps analysé, une unique valeur ou fermeture (jamais re-lié plus bas) ; condition pour qu'un \code{Updater} soit lu \code{Functional} plutôt que \(\Top\). \srcline{src/engine/setters.rs}{442} — \cref{chap:relations}.
+
+\item[\code{Certified}] Jeton de preuve \emph{must}, frappé seulement dans \file{src/rules/api/query.rs}, seul passage vers \Error{}. Voir \cref{def:certified}. \srcline{src/rules/api/query.rs}{80}.
+
+\item[CFG (graphe de flot de contrôle)] Graphe de blocs de base et d'arêtes typées produit par le lowering. Voir \cref{def:cfg}. \srcline{src/ir/cfg.rs}{60}.
+
+\item[churn] Réécriture d'une référence fraîche dans un slot dont dépend l'effet qui l'écrit, relançant la boucle automatique par échec d'\code{Object.is}. \cref{chap:churn}, ADR-017.
+
+\item[cible d'affectation] Côté gauche d'une affectation ou d'un motif de déstructuration abaissé par le lowering : identifiant, membre, ou temporaire de motif. \srcline{src/lowering/cfg_builder.rs}{950} — \cref{chap:lowering-cfg}.
+
+\item[clamp / pin / \emph{ceiling}] Abaissement de sévérité par la configuration ou un pack, jamais de relèvement : la sévérité effective est \(\text{pin} \sqcap \text{polarité}\). \srcline{src/rules/api/diagnostic.rs}{104} — \cref{chap:api-regles}.
+
+\item[classe de déclenchement (\code{TriggerClass})] Ce qui déclenche un callback exécuté \og dans le cycle\fg{} : \code{Setter}, \code{InCycle}, \code{Subscription}, \code{Unknown}. \srcline{src/domains/interp/callbacks.rs}{6} — \cref{chap:transfert-stores}.
+
+\item[clean bill] Ligne \code{✓ … no issues found.} du rapport humain, émise seulement en l'absence de tout finding \emph{et} de tout blind spot. \srcline{src/driver/human.rs}{266} — \cref{chap:projet-cli-driver}.
+
+\item[cliquet (\emph{ratchet})] Liste d'exceptions (fichiers de règles qui touchent encore la syntaxe, scénarios de campagne) qui ne peut que rétrécir d'un commit à l'autre. Voir \cref{def:histoire-doctrine-cliquet}. \file{tests/layer_boundary.rs}.
+
+\item[\code{ClosureBinding}] Les deux orthographes possibles d'une liaison fonctionnelle : littéral \code{FnLit} ou \code{CallbackVal(label)} référant à un \code{useCallback}. \srcline{src/ir/bindings.rs}{53} — \cref{chap:ir}.
+
+\item[\code{ComponentId}] Identité internée d'un composant sur 4 octets ; \code{SYNTHETIC} (\code{u32::MAX}) en réserve l'analyse hors registre. \srcline{src/ir/component_id.rs}{28} — \cref{chap:ir}.
+
+\item[composant] Fonction de premier niveau capitalisée satisfaisant l'un des critères 2 à 4 du détecteur (retour JSX, annotation de type, appel direct de hook). Voir \cref{def:composant-hook-utilitaire}. \srcline{src/lowering/component_detector.rs}{47}.
+
+\item[config root / \emph{discovery root}] Ancêtre le plus proche portant un marqueur d'outil de build (racine de configuration, point de départ de la recherche de \file{tsconfig}) et répertoire effectivement parcouru (parfois \code{<root>/src}). \srcline{src/project/mod.rs}{181} — \cref{chap:projet-cli-driver}.
+
+\item[constante de module (\code{ModuleConstInit})] \code{const} de niveau supérieur à initialiseur de nature certaine (primitive, référence, contexte) ; sert notamment à prouver un \code{<X.Provider>}. \srcline{src/ir/component.rs}{12} — \cref{chap:ir}.
+
+\item[container (\code{state-mutation})] Portée dans laquelle une mutation d'objet est signalée : 0 pour le rendu, \(1{+}i\) pour le hook \(i\). \srcline{src/rules/impls/state_mutation.rs}{46} — \cref{chap:regles-etat}.
+
+\item[contested (slot)] Slot écrit dans plusieurs régions lexicales, ou dont le setter s'échappe ; \regle{redundant-set-state} se tait sur un slot contesté. \srcline{src/rules/impls/redundant_set_state.rs}{57} — \cref{chap:regles-etat}.
+
+\item[convergence kill] Suppression d'une arête du graphe de churn dont l'écriture est prouvée tirer au plus une fois dans la boucle automatique ; calculée par plus petit point fixe (ADR-042 §6). \srcline{src/engine/churn.rs}{26} — \cref{chap:churn}.
+
+\item[corpus (épinglé)] Ensemble de dépôts \code{test-repo/} clonés sur des SHA fixes, référence de mesure des campagnes de précision. \file{scripts/setup-test-repo.sh} — \cref{chap:tests-corpus}.
+
+\item[couche (Tour d'architecture)] Bloc de code délimité qui ne connaît que les couches en-dessous de lui (front-end, IR, domaines, moteur, règles, driver). Voir \cref{def:tour-architecture-couche}. \cref{chap:tour-architecture}.
+
+\item[couture (\emph{seam}) FS] Trait \code{FileSystem} par lequel passe toute lecture du moteur, point d'entrée d'un système de fichiers en mémoire pour les tests et le WASM. \srcline{src/resolver/filesystem.rs}{1} — \cref{chap:projet-cli-driver}.
+
+\item[couverture (\emph{covering})] Éléments d'une liste de deps qui peuvent \emph{taire} un finding (à l'exclusion des sources de spread) ; à distinguer des éléments qui peuvent \emph{tirer} une règle. Voir \cref{def:ir-couverture}. \srcline{src/ir/hooks.rs}{203}.
+
+\item[deps] Argument optionnel d'un hook React qui borne quand il se ré-exécute (\code{useEffect}, \code{useMemo}, \code{useCallback}) ; modélisé par \code{DepsArg} (\code{Absent}/\code{Opaque}/\code{List}). \srcline{src/ir/hooks.rs}{103} — \cref{chap:ir}.
+
+\item[diamant] Motif de CFG d'un \code{?:}, \code{\&\&}, \code{||} ou \code{??} : un \code{Branch}, deux blocs qui affectent un temporaire, un bloc de jonction qui le lit. \cref{chap:lowering-cfg}.
+
+\item[directive / prologue] Chaîne littérale en tête d'un module (\code{"use client"}), lue depuis le prologue du programme oxc. \srcline{src/ir/module.rs}{22} — \cref{chap:ir}.
+
+\item[dispatch opaque] Chaîne de \code{Branch(true)} par laquelle le lowering encode le choix d'une \code{case} de \code{switch}. \srcline{src/lowering/cfg_builder.rs}{786} — \cref{chap:lowering-cfg}.
+
+\item[dominance] Un bloc \(a\) domine un bloc \(b\) si tout chemin de l'entrée à \(b\) passe par \(a\). Voir \cref{def:dominance}. \srcline{src/engine/dominance.rs}{6}.
+
+\item[drift (corpus)] État d'un dépôt du corpus qui n'est plus au SHA épinglé : signal d'alerte de la méthode de mesure. \srcline{scripts/setup-test-repo.sh}{80} — \cref{chap:tests-corpus}.
+
+\item[driver] Composition de \code{check} partagée entre le binaire natif et le c\oe{}ur WASM, indépendante d'\code{argv} et des flux d'entrée-sortie. Voir \cref{def:projet-cli-driver-hote}. \srcline{src/driver/mod.rs}{1}.
+
+\item[écrivain (\emph{writer})] Voir \code{SlotWriter} / \cref{def:slot-writer}.
+
+\item[élargissement voir \emph{widening}] Voir \cref{def:widening}.
+
+\item[\code{ElementSite}] Élément de composant construit par le rendu, avec ses deps par prop, sa garde, sa liste, son éventuel \code{Provider} et son parent ; unité de base de \code{render_deps}. \srcline{src/engine/render_deps.rs}{252} — \cref{chap:inter-composants}.
+
+\item[emplacement (\emph{slot} de \code{StateValue})] Une composante du produit \code{StateValue} (nombre, booléen, chaîne, référence, null, undefined, setter, \code{other}) ; à ne pas confondre avec un slot d'état (\cref{def:slot}). \srcline{src/domains/impls/state_value.rs}{26} — \cref{chap:statevalue-stabilite}.
+
+\item[entité / arête / garde (vocabulaire Tier A)] Position dans une relation résolue par le moteur (\code{Anchor}, ligne) ; navigation typée vers une entité voisine (\code{EdgeName}) ; prédicat sur un verdict ou un champ d'entité (\code{Guard}). \srcline{src/rules/declarative/schema.rs}{108} — \cref{chap:regles-declaratives}.
+
+\item[env de sortie (\code{exit\_env})] Jointure des environnements de sortie des blocs \code{Return} d'un rendu ; sert d'environnement d'entrée aux effets et aux handlers. \srcline{src/engine/fixpoint.rs}{1226} — \cref{chap:point-fixe-composant}.
+
+\item[\code{ExitDominance}] Relation \og ce bloc domine toutes les sorties \code{Return} atteignables\fg{} d'un CFG, construite une fois et servant de preuve must à plusieurs règles. \srcline{src/rules/api/query.rs}{647} — \cref{chap:api-regles}.
+
+\item[\code{ExprId} (site d'allocation)] Identité stable d'un nœud allouant (\code{ObjectLit}, \code{ArrayLit}, \code{FnLit}, \code{New}) entre les itérations du point fixe ; clé du tas abstrait. Voir \cref{def:site}. \srcline{src/ir/types.rs}{11}.
+
+\item[fail-closed] Principe : n'enregistrer comme preuve que ce qui est syntaxiquement établi ; l'absence de preuve se lit \(\Top\) (inconnu), jamais comme un fait négatif. \cref{chap:frontend-detection}, \cref{chap:tour-architecture} (\cref{def:tour-architecture-fail-closed}).
+
+\item[faux positif / faux négatif (FP / FN)] Un finding sans défaut réel (toléré) contre un défaut réel non signalé (interdit par l'invariant de soundness). Voir \cref{def:introduction-soundness}.
+
+\item[feeder / nourricier] Slot d'un autre composant dont une prop de graine (\code{seed}) dépend ; \code{MovingFeeder} porte cette relation. \srcline{src/rules/api/query.rs}{779} — \cref{chap:regles-etat}.
+
+\item[fixpoint / point fixe] Le plus petit état stable pour une fonction de transfert monotone ; le point fixe d'un composant est ce que calcule la boucle de \file{fixpoint.rs} (avec widening, donc un post-point fixe). Voir \cref{def:point-fixe}. \cref{chap:point-fixe-composant}.
+
+\item[flèche concise] Fonction fléchée à corps expression (\code{x => expr}) ; le lowering l'abaisse en \code{Return(expr)} et porte le drapeau \code{expression} sur le \code{Candidate}. \srcline{src/lowering/mod.rs}{137} — \cref{chap:frontend-detection}.
+
+\item[foreign (slot)] Slot qualifié qu'un site d'un autre composant écrit (via une prop \code{ComponentSetter}) ; jamais tué par la preuve de convergence du churn. \srcline{src/engine/churn.rs}{342} — \cref{chap:churn}.
+
+\item[freshness (fraîcheur)] Ordre \(\text{Not} < \text{Maybe} < \text{Fresh}\) : l'écriture d'un slot stocke-t-elle une référence neuve à chaque appel. \srcline{src/engine/written.rs}{37} — \cref{chap:relations}.
+
+\item[frontière (\emph{boundary})] Directive de module qui arrête et exclut un parcours \code{reachable\_from} (typiquement \code{"use client"}). \srcline{src/ir/module.rs}{91} — \cref{chap:ir}.
+
+\item[garde (\emph{guard})] Condition de branche qui domine une écriture ou un élément monté ; en Tier A, aussi un filtre de règle sur un verdict. \srcline{src/engine/guards.rs}{655} — \cref{chap:relations}, \cref{chap:churn}.
+
+\item[graphe d'appels] Arêtes \(\text{parent} \to \code{CallSite}\{\text{callee}, \text{props}, \text{location}\}\) enregistrées à chaque évaluation d'un \code{<Child/>}. \srcline{src/engine/program_result.rs}{196} — \cref{chap:transfert-stores}, \cref{chap:inter-composants}.
+
+\item[graphe de churn] Graphe programme-entier \(x \to y\) : un changement de \(x\) relance un effet qui écrit une référence fraîche dans \(y\). Voir \cref{def:churn-graph}. \srcline{src/engine/churn.rs}{94}.
+
+\item[\code{guard\_block}] Bloc dont les gardes dominantes s'appliquent : celui qui a planifié une écriture différée. \srcline{src/engine/setters.rs}{777} — \cref{chap:relations}.
+
+\item[handler] Corps qu'un tiers (React, un enfant) peut invoquer de 0 à \(N\) fois : prop JSX \code{onX} ou callback \code{addEventListener} de premier niveau d'un effet. Voir \cref{def:lowering-handler}. \srcline{src/ir/hooks.rs}{306}.
+
+\item[hauteur (d'un treillis)] Longueur maximale d'une chaîne strictement croissante ; finie pour \code{StrConst} (5) ou \code{Stability} (au plus 8), infinie pour les intervalles. \cref{chap:treillis-simples}.
+
+\item[havoc] Jointure de \(\Top\) dans les slots dont un setter s'échappe vers un enfant inanalysable. Voir \cref{def:inter-composants-havoc}. \srcline{src/domains/transfer/state_value.rs}{265}.
+
+\item[HOF synchrone] Méthode dont le callback s'exécute dans la phase appelante (\code{.map}, \code{.forEach}\ldots), listée dans la table \code{SYNC\_HOF\_METHODS} du moteur. \cref{chap:relations}, \cref{chap:regles-declaratives}.
+
+\item[home / hop (arbre de rendu)] Racine du plus petit sous-arbre contenant tous les usages d'un slot, et une étape parent \(\to\) enfant de transmission d'une valeur par props ou contexte. \srcline{src/rules/helpers/render_tree.rs}{36} — \cref{chap:inter-composants}, \cref{chap:regles-rendu-rsc}.
+
+\item[hook custom] Fonction de premier niveau dont le nom satisfait \code{is\_hook\_name}. Voir \cref{def:composant-hook-utilitaire}. \srcline{src/lowering/hook_detector.rs}{46}.
+
+\item[\code{HookEntry}] Ligne de la table des hooks d'un corps : \code{State}, \code{Effect}, \code{Memo}, \code{Callback}, \code{Ref}, \code{Custom}, \code{Handler}. \srcline{src/ir/hooks.rs}{247} — \cref{chap:ir}.
+
+\item[\code{HookLabel} (label)] Rang \code{usize} d'un hook dans l'ordre de déclaration d'un composant ; indice de slot local au composant. Voir \cref{def:slot}. \srcline{src/ir/types.rs}{2}.
+
+\item[\code{HookMarker} / \code{MarkerVal}] Expression qui ancre, dans le CFG, le site d'appel d'un hook sans valeur suivie ; \code{MarkerVal} dit ce que lit sa liaison (\code{Undefined}, \code{StableRef}, \code{Unknown}, \code{Summary}). \srcline{src/ir/expr.rs}{287} — \cref{chap:ir}.
+
+\item[\code{HookOrigin} / \code{HookProvenance}] Ce que la déclaration d'import prouve d'une liaison de hook (\code{React}, \code{File}, \code{Package}) ; ligne \og label \(\to\) (hook d'origine, spécificateur, fichier, inliné ?)\fg{}. \srcline{src/lowering/import_resolution.rs}{41} — \cref{chap:frontend-detection}.
+
+\item[hôte (\emph{host})] Frontend qui parse \code{argv}, découvre la configuration, décide des couleurs et écrit les flux (CLI native ou emballage WASM/JS) ; jamais frontière de confiance. Voir \cref{def:projet-cli-driver-hote}, \cref{def:hote-transport}.
+
+\item[hull] Le plus petit intervalle contenant deux intervalles : leur \emph{join}.
+\srcline{src/domains/impls/interval.rs}{69} — \cref{chap:treillis-simples}.
+
+\item[IIFE] Fonction immédiatement appelée sur place ; marchée au site d'appel comme un helper de la marche des écrivains. \srcline{src/engine/setters.rs}{1920} — \cref{chap:relations}.
+
+\item[in-cycle] Callback qui s'exécute en conséquence directe du rendu ou de l'effet courant (HOF synchrone, promesse, minuteur) ; s'oppose aux handlers. ADR-009 — \cref{chap:transfert-stores}.
+
+\item[\code{InlineRegion} / région d'inlining] Plage de \code{BlockId} d'une greffe (avec le fichier d'origine), qui décide si une écriture est \code{Direct} ou \code{Via} un wrapper. ADR-027 §4 — \cref{chap:splice-inlining}, \cref{chap:relations}.
+
+\item[inlining (top-down)] Analyse d'un composant enfant au site \code{<Child/>} avec les props abstraites évaluées par le parent. \srcline{src/domains/transfer/state_value.rs}{470} — \cref{chap:inter-composants}.
+
+\item[\code{InterCtx}] Contexte d'analyse inter-composants partagé : registre, cache, store partagé, graphe d'appels, statistiques, pile d'appel. \srcline{src/domains/context.rs}{59} — \cref{chap:transfert-stores}.
+
+\item[IR] Représentation intermédiaire possédée, sans AST, seule lue par les domaines, les relations et les règles. Voir \cref{def:cfg} et \cref{chap:ir}.
+
+\item[k-ensemble (ensemble \(k\)-borné)] Ensemble d'au plus 4 constantes littérales ; au-delà, l'emplacement devient \(\Top\) (widening par seuil de cardinal). Voir \cref{def:treillis-simples-k-ensemble}.
+
+\item[kill / \emph{kill set} (ensemble tueur)] Écriture du site plus les écritures synchrones de slots locaux sur sa chaîne de gardes, dont la mort est requise pour prouver la convergence. Voir \cref{def:kill} (règles), \cref{def:churn-kill-set} (moteur).
+
+\item[\code{KindMask}] Masque des sortes JS peuplées d'un \code{StateValue}, énumération protégée par déstructuration exhaustive. \srcline{src/domains/impls/state_value.rs}{46} — \cref{chap:statevalue-stabilite}.
+
+\item[label (voir \code{HookLabel})] Voir \cref{def:slot}.
+
+\item[landing] Handler (hôte, ou prop \code{onX} opaque) où une capacité d'écriture transmise à un enfant finit par être appelée depuis un événement. \srcline{src/rules/helpers/render_tree.rs}{80} — \cref{chap:inter-composants}.
+
+\item[liaison périmée (\emph{stale binding})] Variable laissée, dans l'IR, à sa valeur antérieure alors que le programme concret l'a réécrite entre-temps ; une sous-approximation assumée du lowering, jamais du domaine. \srcline{src/lowering/expr_lower.rs}{1027} — \cref{chap:lowering-cfg}.
+
+\item[localisation distincte] Tuple \((\text{fichier}, \text{ligne}, \text{colonne}, \text{message})\), unité de compte de la méthode de mesure sur corpus. Voir \cref{def:tests-corpus-localisation}.
+
+\item[lowering (abaissement)] Traduction, en une passe, de l'AST oxc vers l'IR (CFG et table des hooks), indépendante des domaines abstraits. \cref{chap:lowering-cfg}, ADR-003.
+
+\item[marcheur (\emph{walker})] Parcours linéaire commun aux trois détecteurs de \cref{chap:frontend-detection} sur \code{Program::body}. \srcline{src/lowering/detector.rs}{37}.
+
+\item[may / must] Fait vrai sur au moins une exécution (sur-approximation, sert à se taire soundement) contre fait vrai sur toutes les exécutions (sous-approximation, seul à ouvrir l'\Error{}). Voir \cref{def:must-may}.
+
+\item[mint (frapper)] Construire un \code{Certified} ; fonction privée \code{Certified::mint}, jamais exposée hors de \file{query.rs}. \srcline{src/rules/api/query.rs}{88} — \cref{chap:api-regles}.
+
+\item[\code{module\_written} / \code{mutated}] Noms de module écrits par un composant programme-entier, et racines mutées d'un corps ; ces noms ne \og tiennent\fg{} pas à travers la boucle automatique. \srcline{src/engine/churn.rs}{202} — \cref{chap:churn}.
+
+\item[\code{Motion}] Verdict de mouvement d'une prop de graine : \code{Still}, \code{Proven(Certified)}, \code{Unproven}. \srcline{src/rules/api/query.rs}{792} — \cref{chap:regles-etat}.
+
+\item[motion-wins] Règle de \code{to\_stability} : dès qu'un emplacement du produit \code{StateValue} est en mouvement, la stabilité globale devient \code{PerRender}. \srcline{src/domains/impls/state_value.rs}{308} — \cref{chap:statevalue-stabilite}.
+
+\item[mount-only] Effet dont les deps ont une arité exacte de 0 (\code{[]}) : une seule exécution certaine, au montage. \srcline{src/rules/impls/infinite_loop.rs}{96} — \cref{chap:infinite-loop}, \cref{chap:churn}.
+
+\item[\code{MustResult}] Verdict \code{All(Certified)} / \code{Some(T)} / \code{None} d'une primitive must. \srcline{src/rules/api/query.rs}{117} — \cref{chap:api-regles}.
+
+\item[narrowing (raffinement de garde)] Raffinement de l'environnement abstrait sur une branche selon sa condition ; à ne pas confondre avec l'opérateur descendant classique de l'interprétation abstraite (non implémenté ici). Voir \cref{def:cfg-analyzer-dominance-raffinement}.
+
+\item[navigates] Fait qu'une navigation visible quelque part dans le programme fait bouger toute valeur tenue (\code{held}) par cette navigation. \srcline{src/engine/churn.rs}{206} — \cref{chap:churn}.
+
+\item[nom de diagnostic (vs id de règle)] Clé de \code{Diagnostic::rule}, espace de noms de \code{off}, du plafond de sévérité et de \code{--rule} ; distincte de l'id \code{Rule::name()}, espace de noms des options. \srcline{src/rules/registry.rs}{11} — \cref{chap:api-regles}, \cref{chap:catalogue-regles}.
+
+\item[Object.is] Égalité de référence utilisée par React pour comparer deux valeurs de deps, et pour décider un bail-out de \code{setState}. \cref{chap:react-modele}.
+
+\item[opaque (\(\Top\))] Valeur abstraite \og n'importe quoi\fg{}, repli des expressions ou des hooks que l'analyse ne peut ni évaluer ni résumer. \srcline{src/lowering/expr_lower.rs}{24} — \cref{chap:treillis-simples}.
+
+\item[opaque (hook)] Hook qui n'a pu être ni inliné ni résumé par un contrat de bibliothèque ; sa valeur de retour est \(\Top\). \srcline{src/engine/analysis_result.rs}{73} — \cref{chap:splice-inlining}.
+
+\item[pack] Fichier JSON \code{\{schemaVersion, name, rules\}}, espace de noms de règles déclaratives Tier A. Voir \cref{def:regles-declaratives-pack}.
+
+\item[passe / itération] Une exécution d'\code{analyze\_cfg} sur un CFG (rendu, effet, ou handler) ; un tour de la boucle de point fixe d'un composant. Voir \cref{def:cfg-analyzer-dominance-passe}, \cref{def:point-fixe-composant-etat}.
+
+\item[\code{PerRender}] Référence garantie fraîche à chaque rendu (borne \emph{must}) ; pour une valeur non-référence, \og peut changer à chaque rendu\fg{}. Voir \cref{def:stabilite}.
+
+\item[phase 1 / phase 2] Analyse top-down des composants racines sous \code{InterCtx} (phase 1) puis balayage intra des composants non atteints, \code{inter = None} (phase 2). \srcline{src/engine/fixpoint.rs}{723} — \cref{chap:inter-composants}.
+
+\item[phase (\code{WriterPhase})] Moment où une écriture s'exécute (may) : \code{Sync}, \code{Deferred}, \code{Handler}, \code{Cleanup}, \code{Unknown}. Fait partie de la ligne \code{SlotWriter} (\cref{def:slot-writer}). \srcline{src/engine/setters.rs}{687}.
+
+\item[point d'entrée] CFG analysé séparément avec son propre déclencheur : rendu, effet, handler. ADR-009 §3 — \cref{chap:point-fixe-composant}.
+
+\item[polarité] Annotation must/may/exact d'une primitive ou d'une colonne de relation ; seul noyau de confiance résiduel du moteur des règles. ADR-021 « Residual trust » — \cref{chap:api-regles}.
+
+\item[post-await] Voir arête \code{Await}.
+
+\item[post-point fixe] État \(S\) tel que \(F(S) \sqsubseteq S\) ; ce que calcule la boucle du point fixe avec widening (pas nécessairement le plus petit point fixe). \srcline{src/engine/fixpoint.rs}{495} — \cref{chap:point-fixe-composant}.
+
+\item[primitive (\emph{query primitive})] Fonction de \file{query.rs} qui rend un verdict polarisé (may, must, ou un jeton \code{Certified}) à partir des relations du moteur. \srcline{src/rules/api/query.rs}{417} — \cref{chap:api-regles}.
+
+\item[profondeur d'inlining] Nombre de corps imbriqués en cours d'expansion pendant l'interprétation, plafonné (\code{MAX\_INLINE\_DEPTH = 3}). \srcline{src/domains/interp/interpreter.rs}{21} — \cref{chap:transfert-stores}.
+
+\item[\code{ProgramCache} / \code{ProgramRelations}] Structures programme-entier paresseuses (\code{OnceLock}), partagées par tous les contextes de règles d'un run (index de rendu, index de montage, churn\ldots). \srcline{src/rules/api/cache.rs}{26} — \cref{chap:api-regles}.
+
+\item[projection mémo] Valeur d'un \code{useMemo} : une référence dont la stabilité est le join des stabilités de ses deps. \srcline{src/domains/transfer/state_value.rs}{56} — \cref{chap:transfert-stores}.
+
+\item[provenance (\emph{via})] Chaîne de wrappers épissés qui mène à une écriture, ou \code{Direct} si l'appelant écrit lui-même le slot. Fait partie de la ligne \code{SlotWriter} (\cref{def:slot-writer}). \srcline{src/engine/setters.rs}{789}.
+
+\item[QualifiedSlot (slot qualifié)] Paire \((\code{ComponentId}, \code{HookLabel})\) : nom d'un slot en dehors de son composant. Voir \cref{def:slot}. \srcline{src/ir/types.rs}{9}.
+
+\item[\code{QueryContext} / \code{NullCtx} / \code{FixpointCtx}] Canal de requête inter-domaines (une seule requête : \code{callback\_body}) ; \code{FixpointCtx} le sert depuis la table des corps de \code{useCallback}, \code{NullCtx} répond toujours \code{None}. \srcline{src/domains/context.rs}{30} — \cref{chap:transfert-stores}.
+
+\item[racine (\emph{root})] Composant analysé en tête de phase 1, sans parent connu : son paramètre props se lit \(\Top\). Voir \cref{def:inter-composants-racine}. \srcline{src/engine/root_detector.rs}{25}.
+
+\item[ratchet (voir cliquet)] Voir \cref{def:histoire-doctrine-cliquet}.
+
+\item[région (\code{WriterRegion})] Corps lexical d'une écriture : \code{Render}, \code{Effect(l)}, \code{Memo(l)}, \code{Callback(l)}, \code{Handler(l)} ; fait exact, partie de \cref{def:slot-writer}. \srcline{src/engine/setters.rs}{641}.
+
+\item[registration / registrar] Appel d'un corps d'effet qui confie un callback à quelque chose qui lui survit (\code{setInterval}, \code{addEventListener}) ; le \emph{registrar} est la ligne de table qui le reconnaît. \srcline{src/engine/registrations.rs}{63} — \cref{chap:relations}.
+
+\item[relation (du moteur)] Fait nommé, calculé une fois par le moteur, à colonnes de polarité déclarée (\code{slot\_writers}, graphe de churn\ldots). Voir \cref{def:relation}. \file{docs/relations.md}.
+
+\item[remap] Décalage des labels et des \code{ExprId} d'une copie de CFG greffée par un splice, pour éviter toute collision avec l'appelant. \srcline{src/ir/remap.rs}{1} — \cref{chap:splice-inlining}.
+
+\item[render dep (dépendance de rendu)] Ensemble \emph{may} des entrées de rendu (slot, setter, prop, contexte, module) dont une valeur calculée par un composant peut dépendre. Voir \cref{def:render-dep}. \srcline{src/engine/render_deps.rs}{1}.
+
+\item[\code{RenderIndex} / \code{MountIndex}] Vue programme des résumés \code{render\_deps} de tous les composants (plus les comptes de montage), et index composant \(\to\) sites JSX de montage. \srcline{src/rules/helpers/render_tree.rs}{28} — \cref{chap:regles-rendu-rsc}.
+
+\item[résumé (\code{SummaryValue} / \code{HookSummary})] Contrat abstrait, grossier mais sound, d'un hook de bibliothèque sans code source disponible (TanStack, React Router\ldots). \srcline{src/registry/summary.rs}{10} — \cref{chap:splice-inlining}.
+
+\item[reviver] Écriture, sur un autre site, qui peut ranimer la garde d'un site déjà tué ; un site prouvé tirer au plus une fois n'est reviver de personne (plus petit point fixe). Voir \cref{def:churn-kill-set}, \issue{160}.
+
+\item[\code{RuleCtx}] Objet unique auquel une règle se lie pour un composant : programme, composant, résultat convergé, configuration, cache. \srcline{src/rules/api/query.rs}{318} — \cref{chap:api-regles}.
+
+\item[salt (sel)] Suffixe \code{\#n} d'\(\alpha\)-renommage des liaisons locales d'un CFG greffé par splice, pour garantir l'hygiène du renommage. \srcline{src/ir/splice.rs}{300} — \cref{chap:splice-inlining}.
+
+\item[\code{same\_tick}] Fait \emph{may} : une autre écriture synchrone du même slot, dans la même région, est atteignable dans le même tick. \srcline{src/engine/setters.rs}{753} — \cref{chap:relations}.
+
+\item[sceller (\emph{seal})] Fermer un bloc de base courant avec son terminateur et l'insérer dans la table des blocs du CFG. Voir \cref{def:lowering-sceller}. \srcline{src/lowering/cfg_builder.rs}{173}.
+
+\item[seed (graine)] Chemin de prop lu par l'initialiseur d'un \code{useState}, relation \code{slot\_seeds}. \srcline{src/engine/seeds.rs}{49} — \cref{chap:relations}, ADR-031.
+
+\item[setter] Fonction d'écriture d'un slot (\code{Expr::StateSetter(l)} en IR), ou valeur abstraite \code{SetterVal} portant l'identité \((\text{composant}, \text{label})\) de son propriétaire. \srcline{src/domains/impls/setter_val.rs}{15} — \cref{chap:transfert-stores}.
+
+\item[setter qui s'échappe (\emph{escaping})] Alias d'un setter utilisé autrement qu'un appel direct ou un alias pur ; déclenche un \code{havoc} sur le slot correspondant s'il fuit vers un enfant inanalysable. \srcline{src/engine/setters.rs}{2261} — \cref{chap:transfert-stores}, \cref{chap:relations}.
+
+\item[shape (\emph{member contract})] Contrat par membre nommé d'un objet retourné par un hook de bibliothèque, ou par position d'un tuple. \srcline{src/ir/expr.rs}{353} — \cref{chap:splice-inlining}.
+
+\item[site] Deux sens distincts : site d'\emph{allocation} (\code{ExprId}, clé du tas abstrait, \cref{def:site}) et site d'\emph{écriture} (ligne non-handler d'un corps de rendu ou d'effet, unité de la preuve de convergence du churn, \cref{def:churn-site}). Voir l'encadré en tête de cette annexe.
+
+\item[site convergent] Site d'écriture prouvé tirer au plus une fois ; exclu des revivers d'un autre site. \srcline{src/engine/churn.rs}{446} — \cref{chap:churn}.
+
+\item[slot] Emplacement d'état d'un \code{useState}/\code{useReducer}, indexé par son \code{HookLabel}, local au composant. Voir \cref{def:slot}. \srcline{src/ir/types.rs}{6}.
+
+\item[\code{SlotWriter} (writer, ligne d'écriture)] Ligne de la relation \og écrivains d'un slot\fg{} : un site d'appel de setter, avec sa région, sa phase, sa fraîcheur et sa provenance. Voir \cref{def:slot-writer}. \srcline{src/engine/setters.rs}{738}.
+
+\item[soundness] Propriété de l'interprétation abstraite : l'ensemble des comportements calculés sur-approxime les comportements réels ; faux positifs tolérés, faux négatifs interdits. Voir \cref{def:soundness}.
+
+\item[source (entrée de rendu)] Ce dont une valeur calculée au rendu peut dépendre : \code{Slot}, \code{Setter}, \code{Prop}, \code{AllProps}, \code{Ref}, \code{Hook}, \code{Context}, \code{Module}. \srcline{src/engine/render_deps.rs}{53} — \cref{chap:inter-composants}.
+
+\item[splice (greffe)] Insertion du CFG d'un callee (hook custom ou utilitaire) dans l'appelant, au site d'appel, avec \(\alpha\)-renommage hygiénique et décalage des identités. Voir \cref{def:splice-renommage}. \srcline{src/ir/splice.rs}{64}.
+
+\item[\code{StateValue}] Valeur abstraite produit ponctuel de huit emplacements, une par sorte JS observable (nombre, booléen, chaîne, référence, null, undefined, setter, \code{other}). Voir \cref{def:statevalue}. \srcline{src/domains/impls/state_value.rs}{26}.
+
+\item[\code{stays\_mounted}] Fait qu'un parent monte un enfant une fois et le garde monté (gardes et \code{key} invariants) : le \code{[]} de cet enfant ne tire qu'une fois dans la boucle automatique. \srcline{src/engine/churn.rs}{368} — \cref{chap:churn}.
+
+\item[store] Table label \(\to\) valeur abstraite, sujette au point fixe, mise à jour par \emph{weak update} (\og join\fg{} plutôt que remplacement). Voir \cref{def:store}. \srcline{src/domains/stores/state_store.rs}{1}.
+
+\item[teardown / \emph{handle} / \emph{disposer}] Appel qui défait une registration, tel \code{clearInterval} ou \code{removeEventListener}. \emph{handle} est la valeur renvoyée par la registration, jamais descendue par la marche des écrivains. \srcline{src/engine/registrations.rs}{271} — \cref{chap:relations}.
+
+\item[temporaire (lowering)] Variable synthétique introduite par le lowering (\code{\_\_tN}, \code{\_\_arr\_N}, \code{\_\_obj\_N}, \code{\_\_dstr\_N}, \code{\_\_pN}, \code{\_\_term\_N}) pour porter une sous-expression sans nom source. \cref{chap:lowering-cfg}.
+
+\item[terminateur (\code{Terminator})] Fin d'un bloc de base : \code{Jump}, \code{Branch}, \code{Return}, \code{Unreachable}. \srcline{src/ir/cfg.rs}{12} — \cref{chap:ir}.
+
+\item[Tier A / B / C] Trois familles de règles : A, déclarative JSON ; B, frontend programmable (abandonné, ADR-023) ; C, Rust de première main, seule à créer des primitives et l'autorité \Error{}. ADR-021 \emph{Future direction} — \cref{chap:regles-declaratives}.
+
+\item[treillis] Ensemble ordonné muni d'un plus petit élément \(\Bot\), d'un plus grand \(\Top\), et des opérations \code{join} (\(\join\)) et \code{meet} (\(\meet\)). Voir \cref{def:treillis}.
+
+\item[trigger (déclencheur)] Ligne \(( \text{effet}, \text{dep}, \text{slot}, \text{exact})\) de la relation \code{effect\_triggers} : tel changement de slot fait bouger telle dep, avec ou sans garantie de relance (\code{exact}). \srcline{src/engine/triggers.rs}{33} — \cref{chap:relations}.
+
+\item[unbounded (\code{is\_unbounded})] Prédicat \og peut croître sans borne\fg{} : intervalle numérique infini, référence \code{PerRender}, ou emplacement \code{other} peuplé. \srcline{src/domains/impls/state_value.rs}{378} — \cref{chap:statevalue-stabilite}.
+
+\item[utilitaire] Fonction de premier niveau non-hook, non-capitalisée, sans retour JSX et non exportée par défaut. Voir \cref{def:composant-hook-utilitaire}. \srcline{src/lowering/utility_detector.rs}{17}.
+
+\item[Versioned(S)] Borne \emph{may} : la référence ne change qu'aux écritures des slots de l'ensemble \(S\). Voir \cref{def:stabilite}.
+
+\item[vue événement / vue inter-rendus] Le store d'un slot tient le \emph{join} de toutes les valeurs écrites (vue événement) ; une lecture de l'état convertit la référence en \code{Versioned} du slot lu (vue inter-rendus). \srcline{src/domains/transfer/state_value.rs}{122} — \cref{chap:transfert-stores}, ADR-017.
+
+\item[\code{WalkClass}] Classe de phase d'un site dans la marche des écrivains : \code{Sync}, \code{Deferred}, \code{Handler}, \code{Cleanup}, \code{Unknown} (\(\Top\)). \srcline{src/engine/setters.rs}{1332} — \cref{chap:relations}.
+
+\item[weak update (mise à jour faible)] Écriture d'un slot par \emph{join} (\(\text{state}[l] \mathrel{:=} \text{state}[l] \join v\)) plutôt que par remplacement, seule façon de garder la monotonie du point fixe. \srcline{src/domains/stores/state_store.rs}{29} — \cref{chap:point-fixe-composant}.
+
+\item[widening] Opérateur d'accélération de la convergence : une borne qui grandit à chaque itération saute à \(\pm\infty\) (ou au seuil englobant le plus proche, \emph{widening à seuils}). Voir \cref{def:widening}.
+
+\item[\code{widen\_trace}] Trace des slots élargis pendant le point fixe : itération du premier élargissement, et effets \og écrivains\fg{} incriminés — signal de divergence potentielle pour \regle{infinite-loop}. \srcline{src/engine/analysis_result.rs}{18} — \cref{chap:point-fixe-composant}, \cref{chap:infinite-loop}.
+
+\item[witness (chaîne de témoins)] Suite typée de \code{Note} (chacune un \code{Step}) qui explique, étape par étape, comment un diagnostic a été établi. Voir \cref{def:witness}. \srcline{src/rules/api/witness.rs}{86}.
+
+\item[wontfix] Issue fermée qui enregistre un refus citable de corriger une limite : à lire avant de re-proposer le même correctif. Voir \cref{def:histoire-doctrine-lieux}. \file{CLAUDE.md}.
+
+\item[worklist] File des blocs dont l'environnement d'entrée a changé, dédupliquée, amorcée au bloc d'entrée du CFG ; moteur de \code{analyze\_cfg}. \srcline{src/engine/cfg_analyzer.rs}{53} — \cref{chap:cfg-analyzer-dominance}.
+
+\item[wrapper (prouvé)] Membre de bibliothèque qui renvoie un handler autour de son argument (\code{form.handleSubmit(cb)}), prouvé par un résumé plus un contrôle d'échappement. \srcline{src/engine/setters.rs}{1476} — \cref{chap:relations}, \cref{chap:projet-cli-driver}.
+
+\end{description}
+
+\begin{resume}
+\begin{itemize}
+  \item Cette annexe rassemble en une seule liste alphabétique tout le vocabulaire technique du manuscrit : termes mathématiques du \cref{chap:interpretation-abstraite}, types et fonctions du code, vocabulaire des relations et des packs déclaratifs.
+  \item Un terme déjà formalisé ailleurs (\cref{def:treillis}, \cref{def:slot}, \cref{def:slot-writer}, \cref{def:churn-graph}, \cref{def:certified}, \cref{def:witness}\ldots) n'est pas redéfini ici : l'entrée renvoie au chapitre qui porte la définition et sa justification.
+  \item Trois mots changent de sens selon le chapitre --- \code{site}, \code{région}, \code{ancre} --- et ce glossaire signale systématiquement les deux lectures plutôt que d'en imposer une.
+  \item Les entrées propres au code (un type, un champ, une fonction) portent une localisation vérifiée au commit \snapshotCommit{} : elles se lisent comme un index de fichiers autant que comme un dictionnaire de concepts.
+\end{itemize}
+\end{resume}
+
+\section{Exercices}
+\label{sec:glossaire-exercices}
+
+\begin{exercice}{Deux sens d'un même mot}{glossaire-site}
+En une phrase chacun, distinguez le \code{site} du \cref{chap:ir} (\cref{def:site}) du \code{site} du \cref{chap:churn} (\cref{def:churn-site}). Un site d'écriture porte-t-il toujours un \code{ExprId} de site d'allocation ? Justifiez à l'aide de la ligne \code{SlotWriter} (\cref{def:slot-writer}).
+\end{exercice}
+
+\begin{exercice}{Suivre un terme jusqu'à sa définition}{glossaire-chaine}
+Partez de l'entrée \og \code{PerRender}\fg{} de ce glossaire. Sans consulter le \cref{chap:statevalue-stabilite}, énoncez ce que doit être \code{Versioned(S)} par opposition, en vous appuyant seulement sur le vocabulaire \emph{must}/\emph{may} de \cref{def:must-may}. Vérifiez ensuite votre réponse à la définition renvoyée.
+\end{exercice}
+
+\begin{exercice}{Un mot manquant}{glossaire-manquant}
+Choisissez un identifiant Rust public d'un fichier de \file{src/rules/impls/} qui n'apparaît pas dans ce glossaire. Écrivez, au même format qu'une entrée ci-dessus (terme, une à trois phrases, \code{\textbackslash srcline}, chapitre), la fiche qui devrait l'accompagner.
+\end{exercice}

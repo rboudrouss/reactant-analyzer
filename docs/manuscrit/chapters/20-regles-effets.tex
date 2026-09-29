@@ -1,0 +1,1422 @@
+% ---------------------------------------------------------------------------
+% Chapitre 20 — Les règles sur les effets
+% Sources : notes/11-rules-effects-render.md ; src/rules/impls/{widening_info,
+% analysis_limit_info,conditional_hook,always_unstable_deps,missing_deps,
+% unnecessary_rerender,missing_cleanup,stale_closure}.rs ; ADR-017, 021, 034, 038.
+% Sorties observées avec target/debug/reactant (commit e67b10a), fichiers /tmp/ch20/.
+% ---------------------------------------------------------------------------
+\chapter{Les règles sur les effets}
+\label{chap:regles-effets}
+
+\begin{objectifs}
+  \item Connaître les huit règles natives qui portent sur les effets et les hooks à deps : \regle{widening-info}, \regle{analysis-limit}, \regle{conditional-hook}, \regle{always-unstable-deps}, \regle{missing-deps}, \regle{unnecessary-rerender}, \regle{missing-cleanup} et \regle{stale-closure}.
+  \item Savoir, pour chacune, quel défaut React elle vise, quelles données du moteur elle lit, à quel niveau elle peut conclure et quelle preuve ce niveau exige.
+  \item Comprendre les mécanismes transverses que ces règles partagent, dont : la polarité d'une liste de deps (lire pour tirer, lire pour se taire), la relation d'enregistrement \relation{registrations} (\adr{34}) et le jeton \code{Certified} qui seul ouvre la porte de l'\Error{} (\adr{21}).
+  \item Lire une sortie de \reactant{} sur ces règles, y compris les lignes \code{verified} et \code{suspended}, et reconnaître les faux positifs assumés (\issue{40}, \issue{42}) et les faux négatifs connus au commit \snapshotCommit.
+\end{objectifs}
+
+\prerequis{\cref{chap:api-regles} (trait \code{Rule}, sceau de sévérité, \code{Certified}, témoins) ; \cref{chap:relations} (relations du moteur, dont \relation{registrations}) ; \cref{chap:statevalue-stabilite} (treillis \code{Stability}, \code{Versioned}, \code{PerRender}) ; \cref{chap:ir} (\code{DepsArg}, \code{AccessPath}, couverture par préfixe) ; \cref{chap:cfg-analyzer-dominance} (dominance). Le \cref{chap:regles-etat} applique la même grille aux règles sur l'état.}
+
+\section{Vue d'ensemble : sept familles, une grille}
+\label{sec:regles-effets-grille}
+
+Un effet React est un morceau de code que React exécute \emph{après} le commit, et que le composant garde sous contrôle au moyen d'un tableau de dépendances. Les \code{useEffect}, \code{useMemo} et \code{useCallback} ont en commun ce tableau : c'est lui qui décide, rendu après rendu, si le corps doit être ré-exécuté ou si la valeur mémorisée peut être réutilisée. Presque tous les défauts de ce chapitre naissent d'un désaccord entre ce que le corps \emph{lit} et ce que le tableau \emph{déclare}, ou entre ce que l'effet \emph{démarre} et ce qu'il \emph{défait}.
+
+Ce chapitre étudie huit règles natives, regroupées en sept familles et présentées de la plus simple à la plus riche. Toutes sont des post-passes pures (\adr{6}) : elles ne modifient rien, elles lisent l'\code{AnalysisResult} convergé d'un composant (\cref{chap:point-fixe-composant}) et produisent des \code{Diagnostic}. Les règles \regle{wasted-subtree-render} et \regle{server-component-hook}, qui figurent dans le même dossier de notes, relèvent de la dépendance de rendu et des projets Next.js ; elles sont traitées au \cref{chap:regles-rendu-rsc}.
+
+\subsection{La carte des règles}
+
+Le \cref{tab:regles-effets-carte} donne, pour chaque règle, le niveau le plus élevé qu'elle puisse atteindre, ce qu'elle lit et, le cas échéant, le jeton de preuve qui l'autorise à produire une \Error. Le niveau maximal n'est pas une convention : il découle de la construction, puisque \code{Diagnostic::error} exige un \code{Certified<E>} que seul le module \file{src/rules/api/query.rs} peut frapper (\cref{def:certified}). Deux règles seulement détiennent un tel jeton.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}p{3.2cm}p{1.9cm}p{4.6cm}p{3.6cm}@{}}
+\toprule
+Règle & Niveau max & Données du moteur lues & Jeton d'\Error \\
+\midrule
+\regle{widening-info} & \Info & \code{widen_trace} & --- \\
+\regle{analysis-limit} & \Info & \code{stats}, \code{hook_calls[].opaque}, \code{effect_info} & --- \\
+\regle{conditional-hook} & \Error{} (toujours) & \code{hook_calls}, \code{render_cfg} & \code{Certified<}\newline\code{ConditionalHookCall>} \\
+\regle{always-unstable-deps} & \Warning & \code{hooks} (deps), env de sortie, stores et tas convergés & --- \\
+\regle{missing-deps} & \Warning & \code{effect_info}, env de sortie, tas convergé & --- \\
+\regle{unnecessary-rerender} & \Warning & \code{hooks} (init, corps), stores convergés & --- \\
+\regle{missing-cleanup} & \Warning & \relation{registrations}, corps d'effets & --- \\
+\regle{stale-closure} & \Error{} (sous preuve) & \relation{registrations}, corps, alias de setters & \code{Certified<}\newline\code{StaleCapture>} \\
+\bottomrule
+\end{tabular}
+\caption{Les huit règles du chapitre. Fichiers : \file{src/rules/impls/widening_info.rs} (41 lignes), \file{analysis_limit_info.rs} (158), \file{conditional_hook.rs} (581), \file{always_unstable_deps.rs} (489), \file{missing_deps.rs} (701), \file{unnecessary_rerender.rs} (446), \file{missing_cleanup.rs} (113), \file{stale_closure.rs} (469).}
+\label{tab:regles-effets-carte}
+\end{table}
+
+Aucune de ces règles n'a d'état : ce sont des structures unitaires (\code{pub struct MissingDeps;}) qui implémentent le trait \code{Rule} du \cref{chap:api-regles}. Aucune ne déclare d'option. Six d'entre elles fournissent un \code{safe_check}, l'assurance positive « \code{verified} … » affichée sous \code{--info} quand la règle s'appliquait et n'a rien trouvé ; les deux règles \Info{} n'en ont pas, puisqu'une limite n'a pas d'« état sûr » à publier.
+
+\subsection{La grille de lecture}
+
+Chaque règle est présentée avec la même grille, celle du \cref{chap:regles-etat} :
+\begin{enumerate}
+  \item le \emph{défaut React visé}, dans un encadré de rappel ;
+  \item un \emph{programme court} qui déclenche la règle, et sa sortie réellement observée ;
+  \item les \emph{conditions exactes}, lues dans le code (extraits verbatim) ;
+  \item le \emph{niveau} et la \emph{preuve} qu'il exige ;
+  \item les \emph{silences}, que les commentaires du code appellent des \emph{kills} ;
+  \item les \emph{faux positifs assumés} et les \emph{faux négatifs connus}, présentés comme des constats au commit \snapshotCommit.
+\end{enumerate}
+
+\begin{definition}{Kill}{kill}
+Un \terme{kill} est une condition qui supprime un finding candidat. Dans une analyse sound, un kill n'est admissible que s'il est une \emph{preuve} que le défaut ne peut pas se produire (« la capture ne peut pas être périmée », « le slot n'est jamais écrit ») ; un kill heuristique est un faux négatif potentiel, donc interdit (\cref{def:soundness}).
+\end{definition}
+
+Les sorties de ce chapitre ont été obtenues avec le binaire construit au commit \snapshotCommit, sur des fichiers placés sous \file{/tmp/ch20/}, par des commandes de la forme :
+\begin{shell}
+NO_COLOR=1 reactant check /tmp/ch20/timer.tsx --trace [--info] [--show-clean] [--rule R]
+\end{shell}
+Deux conventions aident à les lire. Les numéros \code{[hook:N]} sont les \code{HookLabel} attribués par le lowering dans l'ordre des appels (0 est le premier hook, les handlers JSX \code{onX} comptent aussi). Le registre trie les diagnostics d'un composant d'abord par nom de règle, puis par sévérité et par position (\src{src/rules/registry.rs}{307}{334}) : une sortie est donc groupée par règle en ordre alphabétique, non par ligne.
+
+\subsection{Ce que React fait d'un tableau de deps}
+
+\begin{react}[tableau de dépendances]
+\code{useEffect(f, deps)} exécute \code{f} après le commit du premier rendu, puis après chaque rendu où \emph{au moins une} entrée de \code{deps} diffère de l'entrée de même rang au rendu précédent, selon \code{Object.is}. Sans deuxième argument, l'effet tourne après chaque rendu ; avec \code{[]}, il ne tourne qu'au montage (et son cleanup au démontage). \code{useMemo} et \code{useCallback} utilisent la même comparaison pour décider de recalculer leur valeur. Trois conséquences structurent ce chapitre :
+\begin{itemize}
+  \item une valeur lue par le corps mais absente des deps n'est pas comparée : le corps peut continuer à voir la copie d'un ancien rendu (\regle{missing-deps}, \regle{stale-closure}) ;
+  \item une entrée qui est une référence neuve à chaque rendu fait échouer \code{Object.is} à chaque rendu, et donc tout le tableau (\regle{always-unstable-deps}) ;
+  \item un effet qui démarre quelque chose de durable est ré-exécuté à chaque changement de deps (et deux fois au premier montage sous StrictMode) ; sans cleanup, chaque exécution s'ajoute aux précédentes (\regle{missing-cleanup}).
+\end{itemize}
+\end{react}
+
+\subsection{Trois états d'un argument de deps, deux manières de le lire}
+
+Le \cref{chap:ir} a présenté la façon dont l'IR garde l'argument de deps d'un hook. Elle distingue trois faits, que le code refuse de confondre :
+
+\rustsnippet{src/ir/hooks.rs}{102}{107}{les trois états de l'argument de deps}
+
+\code{Absent} signifie qu'aucun argument n'a été écrit : le hook tourne à chaque rendu et rien de ce qu'il capture ne peut se périmer. \code{Opaque} signifie qu'un argument a été écrit mais que l'IR ne peut pas le lire (\code{useMemo(fn, deps)}, où \code{deps} est une variable) : le hook \emph{est} gardé par une liste, dont aucun élément n'est visible. \code{List} porte un tableau littéral sous la forme d'une \code{DepsList} : les éléments visibles \code{elems}, l'arité \code{Exact(n)} ou \code{AtLeast(n)}, et les positions \code{spread_at} des éléments venus d'un spread. Lire \code{Opaque} comme \code{Absent} sauterait le hook ; le lire comme \code{[]} affirmerait qu'il ne déclare rien. Les deux lectures sont fausses, en sens opposés.
+
+Un spread pose un problème plus fin. Dans \code{useEffect(f, [...rows])}, React compare \code{rows[0]}, \code{rows[1]}, …, jamais \code{rows} lui-même. Le lowering garde pourtant \code{rows} dans \code{elems}, parce que c'est ce qu'il peut voir. Selon qu'une règle lit la liste pour \emph{tirer} ou pour \emph{se taire}, cet élément n'a pas la même valeur de vérité.
+
+\begin{definition}{Polarité d'une lecture de deps}{polarite-deps}
+Une règle lit une liste de deps \terme{pour tirer} quand la présence d'un élément peut la faire émettre un diagnostic (\og cet élément est instable\fg{}) ; elle la lit \terme{pour se taire} quand la présence d'un élément peut supprimer un diagnostic (\og cette lecture est déclarée\fg{}). Lire \code{elems} pour tirer est toujours sound, car chaque élément sur-approxime ce qu'il représente ; lire \code{elems} pour se taire ne l'est pas, car la source d'un spread ne couvre pas sa propre identité.
+\end{definition}
+
+Le code centralise cette distinction dans une seule méthode, \code{DepsList::covering}. Son commentaire (\src{src/ir/hooks.rs}{192}{202}) est l'énoncé même de la définition : lire \code{elems} pour faire \emph{tirer} une règle est sound quelle que soit la troncature de la liste, parce que chaque élément sur-approxime ce qu'il représente ; le lire pour la faire \emph{taire} ne l'est pas, parce que React compare \code{rows[0]}, \code{rows[1]}, etc., et jamais \code{rows}. Les éléments écrits à côté du spread couvrent toujours leurs propres lectures, d'où un filtre plutôt qu'un refus de toute la liste :
+
+\rustsnippet{src/ir/hooks.rs}{203}{215}{la liste qui couvre une lecture (le commentaire de tête, l.~192--202, est résumé dans le texte)}
+% NOTE-ASSEMBLAGE : le commentaire l. 198 contient « … » ; tout listing contenant
+% ce caractère échoue avec le literate actuel ({…}{{\dots}}1 sous babel-french :
+% « Undefined control sequence » dans \@xspace@exceptions@tlp). Plages choisies
+% pour l'éviter ; à corriger dans listings-setup.tex (hors des droits du chapitre).
+
+\begin{invariant}{Polarité des deps}{polarite-deps}
+Une règle qui \emph{tire} sur un élément lit \code{declared_deps()} ou \code{as_slice()} (tous les éléments visibles) ; une règle qui \emph{se tait} parce qu'une lecture est déclarée lit \code{covering_deps()} (tous les éléments sauf les sources de spread). Dans ce chapitre, \regle{always-unstable-deps} est du premier type, \regle{missing-deps} et \regle{stale-closure} du second.
+\end{invariant}
+
+Les deux accesseurs vivent sur \code{EffectInfo}, la vue « deps » qu'une passe de collecte du moteur construit à la convergence pour chaque \code{useEffect}, \code{useMemo} et \code{useCallback} (\src{src/engine/analysis_result.rs}{95}{120}). Outre \code{deps}, elle porte \code{free_paths}, les chemins d'accès lus par le corps et non définis localement, et \code{deps_pinned}, les lectures qui n'apparaissent que dans une sous-expression nommée mot pour mot par les deps ; \regle{missing-deps} en fera l'usage à la \cref{sec:regles-effets-missing-deps}.
+
+\subsection{L'environnement de sortie du rendu}
+
+Plusieurs règles évaluent une expression « telle que le rendu la voit à la fin ». Le moteur leur fournit pour cela l'\terme{environnement de sortie}, le join ($\join$) des environnements abstraits de tous les blocs \code{Return} du CFG de rendu :
+
+\rustsnippet{src/engine/analysis_result.rs}{279}{288}{l'environnement de sortie du rendu}
+
+Le commentaire de la méthode (\src{src/engine/analysis_result.rs}{275}{278}) explique pourquoi la réduction ne part pas de \code{bottom} : \code{bottom.join(env)} envoie toute clé absente de \code{bottom} sur top. La même propriété vaut entre deux environnements de sortie : une variable liée dans l'un et absente de l'autre vaut top dans leur join. La \cref{sec:regles-effets-missing-deps} montrera la conséquence concrète de ce détail sur un composant à retour anticipé.
+
+
+\section{Les règles Info : annoncer ce que l'on n'a pas vu}
+\label{sec:regles-effets-info}
+
+Les deux premières règles ne signalent aucun défaut du programme : elles signalent un défaut de \emph{l'analyse}. Elles sont le moyen par lequel \reactant{} tient la promesse de soundness du \cref{chap:interpretation-abstraite} sans mentir sur sa portée. Un analyseur sound peut perdre de la précision (widening), ou renoncer à regarder une partie du programme (un hook dont il n'a pas le source) ; dans le second cas, un silence ne vaut plus preuve d'absence. Les règles \Info{} le disent, et le registre en tire une conséquence mécanique.
+
+\subsection{Un composant sur lequel l'analyse abdique}
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch20/limits.tsx} : un hook de bibliothèque, des deps illisibles, un compteur qui boucle},label={lst:regles-effets-limits}]
+import { useState, useEffect, useMemo } from "react";
+import { useVendorThing } from "vendor-lib";
+
+export function Counter({ deps }: { deps: any[] }) {
+  const [n, setN] = useState(0);
+  const thing = useVendorThing();
+  const v = useMemo(() => ({ thing }), deps);
+  useEffect(() => {
+    setN(n + 1);
+  }, [n]);
+  return <div>{n}{String(v)}</div>;
+}
+\end{lstlisting}
+
+Trois choses échappent ici à l'analyse : le corps de \code{useVendorThing} (le paquet \code{vendor-lib} n'est pas analysé), les éléments du tableau \code{deps} (une variable, pas un littéral), et la valeur exacte de \code{n}, qui croît sans borne. La sortie, obtenue avec \code{--info --trace} :
+
+\begin{sortie}
+  Counter  (4 hooks)  limits.tsx
+    info   analysis-limit  [hook:1]  (line 6:8)  hook `useVendorThing` was not found in the registry. Pass its source file or add a HookSummary to analyse it (FN possible)
+    info   analysis-limit  [hook:2]  (line 7:8)  the deps argument here is not a written array, so its entries cannot be enumerated, and deps checks run with nothing declared (FP possible, and FN on whatever the list does gate)
+    warn   infinite-loop  [hook:0]  (line 8:2)  this effect keeps pushing state `n` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       → state `n` is written here [hook:3] (line 8:2)
+       → the abstract value of state `n` kept growing and was widened at iteration 3
+    warn   missing-deps  [hook:2]  var:thing  (line 7:8)  `thing` is used in this memo but not in its deps array, and its value may change between renders
+       → `thing` is read here [hook:2] (line 7:8)
+    info   widening-info  (line 8:2)  state `n` kept changing during analysis and was approximated to converge, so findings that depend on it may be imprecise
+       → state `n` is written here [hook:3] (line 8:2)
+       → the abstract value of state `n` kept growing and was widened at iteration 3
+    suspended  analysis-limit  8 passing check(s) withheld: the analysis was truncated in this component, so they are not guaranteed
+\end{sortie}
+
+On y lit, dans l'ordre alphabétique des règles, deux \Info{} \regle{analysis-limit}, le \Warning{} \regle{infinite-loop} (étudié au \cref{chap:infinite-loop}), un \Warning{} \regle{missing-deps} sur \code{thing} qui n'existe que \emph{parce que} les deps sont illisibles, l'\Info{} \regle{widening-info}, et une dernière ligne \code{suspended} que nous expliquerons à la \cref{sec:regles-effets-suspension}. Sans \code{--info}, le driver retire les \Info{} de la sortie (\srcline{src/driver/mod.rs}{438}) ; la suspension, elle, a lieu avant ce filtre.
+
+\subsection{widening-info : la trace du widening}
+
+Le \cref{chap:point-fixe-composant} a décrit la boucle externe du point fixe : au-delà de \code{widen_threshold} tours (3 par défaut, \srcline{src/engine/fixpoint.rs}{54}), le store d'état n'est plus remplacé par sa nouvelle valeur : on lui applique le \emph{widening} ($\widen$), avec les seuils du composant (\adr{14}). C'est à cet endroit que le moteur note, pour chaque slot qui change encore, le premier tour de widening et les effets qui l'écrivaient :
+
+\rustsnippet{src/engine/fixpoint.rs}{514}{529}{l'enregistrement d'un widening dans \code{widen_trace}}
+
+Trois détails comptent pour la règle. D'abord, \code{or_insert_with} garde le \emph{premier} tour de widening, le plus instructif pour un témoin. Ensuite, seul \code{new_state_incycle} est comparé, c'est-à-dire l'état produit par le rendu et les effets : un widening causé par les seuls handlers n'est pas tracé (le commentaire l'annonce : \og handler widening is not a bug\fg{}). Enfin, au-delà de cent tours, le widening est forcé sur tous les labels, tous inscrits dans la trace (\src{src/engine/fixpoint.rs}{499}{512}). Le type enregistré est minimal :
+
+\rustsnippet{src/engine/analysis_result.rs}{20}{28}{un événement de widening}
+
+La règle elle-même est la plus courte du catalogue (41 lignes) : elle trie les labels de \code{widen_trace} et émet une \Info{} par slot, dont les notes sont produites par le producteur de témoins partagé \code{slot_history} (\srcline{src/rules/api/witness.rs}{529}), un \code{Step::Write} par effet écrivain puis un \code{Step::Widen}.
+
+\rustsnippet{src/rules/impls/widening_info.rs}{15}{40}{le corps de \code{check}, tout ce que fait la règle}
+
+Le diagnostic ne porte aucune position : \code{Diagnostic::info} n'en reçoit pas. C'est le registre qui lui en donne une, par la fonction \code{located}, appliquée à tout diagnostic sans position (\adr{19}, \issue{131}) :
+
+\rustsnippet{src/rules/registry.rs}{364}{369}{un diagnostic sans position prend celle de sa première note}
+
+D'où le \code{(line 8:2)} de la sortie : c'est la position de l'effet écrivain, portée par la note \code{Step::Write}.
+
+\begin{remarque}
+\regle{widening-info} n'a pas de \code{NAME} associé : son nom est le littéral \code{"widening-info"} (\src{src/rules/impls/widening_info.rs}{11}{13}). Sa documentation (\file{src/rules/docs.rs}) parle d'un intervalle qui \og saute à $+\infty$\fg{} ; avec les seuils d'\adr{14}, le saut peut s'arrêter à une constante du programme. Le message du diagnostic, lui, reste vrai dans les deux cas.
+\end{remarque}
+
+\subsection{analysis-limit : sept renoncements}
+
+\regle{analysis-limit} rassemble tous les endroits où le moteur a choisi de renoncer à une partie du programme pour rester sound. Chacun est une source de FN possibles, et chacun a son message. Le \cref{tab:regles-effets-limites} les énumère.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}p{3.2cm}p{5cm}p{5.6cm}@{}}
+\toprule
+Cas & Source dans le moteur & Début du message \\
+\midrule
+récursion coupée & \code{stats.recursive_component_refs} & \og recursive component reference \ldots{} is not followed\fg{} \\
+composant inconnu & \code{stats.unknown_component_refs} & \og component \ldots{} was not found in the analysis registry\fg{} \\
+composant ambigu & \code{stats.ambiguous_component_refs} & \og several analysed files define a component called \ldots\fg{} \\
+profondeur de callbacks & \code{stats.callback_depth_capped} & \og callback inlining reached the depth cap (3)\fg{} \\
+budget d'inlining & \code{stats.inline_budget_exhausted} & \og utility inlining ran out of splice budget\fg{} \\
+hook inconnu & \code{hook_calls[].opaque} & \og hook \ldots{} was not found in the registry\fg{} \\
+deps illisibles & \code{EffectInfo::deps_are_opaque()} & \og the deps argument here is not a written array\fg{} \\
+\bottomrule
+\end{tabular}
+\caption{Les sept cas d'\regle{analysis-limit} (\file{src/rules/impls/analysis_limit_info.rs}). La profondeur 3 est \code{MAX_INLINE_DEPTH} (\srcline{src/domains/interp/interpreter.rs}{21}).}
+\label{tab:regles-effets-limites}
+\end{table}
+
+Les cinq premiers cas lisent les statistiques du programme, \code{AnalysisStats}, présentées au \cref{chap:inter-composants} ; ils sont émis sans position, sans label et sans note, si bien que \code{located} n'a rien à leur donner et qu'ils s'affichent sans ligne. Les deux derniers sont propres au composant et méritent qu'on les lise.
+
+\rustsnippet{src/rules/impls/analysis_limit_info.rs}{99}{108}{le hook opaque : la condition}
+
+Le message nomme le hook par sa \code{HookEntry::Custom}, ou à défaut \code{<hook:N>} (l.~109--115), et porte son label et sa position. La condition est \code{call.opaque} et non \og c'est un hook personnalisé\fg{} : un hook de bibliothèque que le \code{SummaryRegistry} résume (\cref{chap:splice-inlining}) est un hook personnalisé dont l'abstraction est \emph{connue} ; il garde sa ligne dans \code{hook_calls} (pour que \regle{conditional-hook} voie l'appel) mais n'est pas une limite. Le cas des deps illisibles, ajouté plus tard, commente lui-même son rôle dans le système :
+
+\rustsnippet{src/rules/impls/analysis_limit_info.rs}{131}{154}{les deps illisibles}
+
+Le message est remarquable par sa double annonce : \og FP possible, and FN on whatever the list does gate\fg{}. Les règles qui lisent les deps pour se taire (\regle{missing-deps}, \regle{stale-closure}) vérifient un tel hook \og rien couvert\fg{}, ce qui ne peut que produire trop de findings (le \code{thing} de la sortie ci-dessus) ; celles qui lisent les deps pour tirer (\regle{always-unstable-deps}) n'ont aucun élément à examiner, et c'est là que se logent les FN possibles.
+
+\begin{piege}
+Le commentaire de tête d'\file{analysis_limit_info.rs} annonce \og Six cases\fg{} (\src{src/rules/impls/analysis_limit_info.rs}{6}{22}) et la documentation générée (\code{reactant explain analysis-limit}) n'en cite que quatre (\src{src/rules/docs.rs}{79}{91}) ; le code en émet sept. Pour savoir ce qu'une règle fait, on lit \code{check}, pas son commentaire.
+\end{piege}
+
+\subsection{La suspension des assurances}
+\label{sec:regles-effets-suspension}
+
+Sous \code{--info}, une règle qui s'appliquait à un composant et n'y a rien trouvé publie une \terme{assurance} (\code{SafeCheck}, \src{src/rules/mod.rs}{61}{73}) : une ligne \code{verified} au présent, \og every effect declares the variables it reads\fg{}. Une assurance est un énoncé universel. Or un composant dont l'analyse a été tronquée ne peut pas en publier honnêtement : le hook opaque peut cacher l'appel conditionnel, la dep manquante, l'effet qui diverge. Le registre applique donc la règle suivante, sur la liste des diagnostics \emph{non filtrée} :
+
+\rustsnippet{src/rules/registry.rs}{287}{291}{un seul \regle{analysis-limit} retire toutes les assurances du composant}
+
+Le commentaire qui précède ce code (\src{src/rules/registry.rs}{276}{286}) donne les deux raisons de sa forme. La lecture se fait sur la liste non filtrée : \code{--ignore-rule analysis-limit} masque l'avis, il ne rétablit pas la garantie (test \src{tests/cli.rs}{330}{340}). Et le compte survit à l'effacement : retirer les assurances en silence rendait un composant tronqué indiscernable d'un composant qui n'avait simplement rien à vérifier. C'est la ligne \code{suspended ... 8 passing check(s) withheld} de la sortie.
+
+\begin{exemple}{Des deps illisibles suffisent}{regles-effets-opaque}
+\begin{lstlisting}[language=TypeScript]
+export function Grid({ items, deps }: { items: number[]; deps: any[] }) {
+  const total = useMemo(() => items.length, deps);
+  return <i>{total}</i>;
+}
+\end{lstlisting}
+\begin{sortie}
+  Grid  (1 hooks)  opaque.tsx
+    info   analysis-limit  [hook:0]  (line 3:8)  the deps argument here is not a written array, so its entries cannot be enumerated, and deps checks run with nothing declared (FP possible, and FN on whatever the list does gate)
+    warn   missing-deps  [hook:0]  var:items  (line 3:8)  `items` is used in this memo but not in its deps array, and its value may change between renders
+       → `items` is read here [hook:0] (line 3:8)
+    suspended  analysis-limit  1 passing check(s) withheld: the analysis was truncated in this component, so they are not guaranteed
+\end{sortie}
+Le \Warning{} sur \code{items} est peut-être un FP (\code{deps} contient peut-être \code{items}) ; l'assurance qu'aurait publiée une autre règle applicable est retenue.
+\end{exemple}
+
+\begin{decision}[niveau \Info{} et suspension par composant]
+\Info{} est, dans la doctrine du projet (\file{CLAUDE.md}), le niveau des \og limites de l'analyse\fg{}, affichées derrière \code{--info}. Une limite n'est ni un défaut certain ni un défaut possible du programme : l'afficher en \Warning{} aurait noyé les vrais findings dans les 28\,230 \og hook not found\fg{} mesurés sur le corpus (\file{docs/campaign/AUDIT.md}, mesure au commit \code{0c45de8}), pour l'essentiel dus au périmètre \code{node_modules} (wontfix \issue{51}). La suspension se fait par composant et non par couple (limite, règle) : un enfant non analysé coûte au parent toutes ses assurances, y compris sur son propre corps. C'est grossier mais sûr ; l'affinement est suivi par \issue{31}. Les deux règles \Info{} n'ont pas de \code{safe_check} : une limite n'a pas d'\og état sûr\fg{} à publier (\src{src/rules/mod.rs}{88}{97}).
+\end{decision}
+
+
+\section{conditional-hook : la règle des hooks par dominance}
+\label{sec:regles-effets-conditional-hook}
+
+\regle{conditional-hook} est la seule règle du catalogue dont l'\Error{} ne dépend d'aucune valeur abstraite : elle ne lit que la \emph{forme} du CFG de rendu. C'est aussi la plus ancienne (\file{src/rules/impls/conditional_hook.rs}, 581 lignes dont 535 de tests), et la meilleure introduction aux preuves must par dominance.
+
+\begin{react}[règles des hooks]
+React ne connaît pas les hooks par leur nom mais par leur \emph{rang} : le premier \code{useState} d'un composant lit le premier slot de sa fibre, le deuxième hook le deuxième, et ainsi de suite (\cref{sec:react-modele-regles-hooks}). Si un rendu saute un hook, tous les hooks suivants lisent le slot de leur voisin ; React le détecte quand le nombre de hooks change (\og Rendered fewer hooks than expected\fg{}) mais pas quand deux hooks de même forme échangent leurs slots. D'où la règle d'\code{eslint-plugin-react-hooks} : un hook s'appelle au niveau supérieur du composant, jamais sous une condition, dans une boucle, après un retour anticipé ou dans un callback.
+\end{react}
+
+\subsection{Le problème : un retour anticipé}
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch20/profile.tsx} : un effet placé après un retour anticipé},label={lst:regles-effets-profile}]
+import { useState, useEffect } from "react";
+
+export function Profile({ user }: { user: { name: string } | null }) {
+  const [open, setOpen] = useState(false);
+  if (!user) {
+    return <p>anonymous</p>;
+  }
+  useEffect(() => {
+    document.title = user.name;
+  }, [user.name]);
+  return <button onClick={() => setOpen(!open)}>{user.name}</button>;
+}
+\end{lstlisting}
+
+Aucun hook n'est ici écrit dans un \code{if} ; c'est le \code{return} de la ligne 6 qui rend le \code{useEffect} conditionnel. Un linter qui chercherait les hooks \og à l'intérieur d'une accolade de \code{if}\fg{} le manquerait. \reactant{} le trouve :
+
+\begin{sortie}
+  Profile  (3 hooks)  profile.tsx
+    error  conditional-hook  [hook:1]  (line 8:2)  this hook is called conditionally (not on every render path)
+       → guarded by a condition evaluated here, so some render paths skip the hook (line 5:6)
+\end{sortie}
+
+Le compteur \og (3 hooks)\fg{} inclut le handler \code{onClick}, qui reçoit le label 2 : le lowering range les props JSX \code{onX} parmi les \code{HookEntry} (variante \code{Handler}), sans en faire des hooks au sens de React. La note pointe la condition \code{!user} (ligne 5, colonne 6).
+
+\subsection{La formulation par dominance}
+
+La question \og ce hook est-il appelé à chaque rendu ?\fg{} se traduit exactement en une question de dominance (\cref{def:dominance}) : un rendu est un chemin de l'entrée du CFG à l'un de ses blocs \code{Return} ; le hook s'exécute sur tous les rendus si et seulement si son bloc se trouve sur tous ces chemins, c'est-à-dire s'il \emph{domine} chacune des sorties.
+
+\begin{definition}{Hook conditionnel}{hook-conditionnel}
+Soit $G$ le CFG de rendu d'un composant, $X$ l'ensemble de ses blocs \code{Return} \emph{atteignables} depuis l'entrée, et $b$ le bloc qui porte l'appel d'un hook. Le hook est \terme{conditionnel} si $X \neq \emptyset$ et s'il existe $x \in X$ tel que $b$ ne domine pas $x$. Il est \emph{inconditionnel} si $b$ domine tout $x \in X$.
+\end{definition}
+
+La \cref{fig:regles-effets-dominance} montre les deux situations typiques. À gauche, le composant \code{Profile} : le bloc d'entrée domine les deux sorties, donc \code{useState} est inconditionnel ; le bloc du \code{useEffect} ne domine pas la sortie \code{return <p>}, donc le hook est conditionnel. À droite, un losange (\code{if}/\code{else} qui se referme) suivi d'un \code{useState} : le bloc de jonction domine l'unique sortie, et le hook est inconditionnel alors même qu'il suit une condition. Le composant \code{Badge} de \file{/tmp/ch20/diamond.tsx}, de cette forme, reçoit l'assurance \og verified conditional-hook all hooks run unconditionally, in a stable order\fg{}.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=9mm and 6mm,
+    sortie/.style={cfgbloc,draw=ra-blue,very thick},
+    hookok/.style={font=\scriptsize\itshape,text=ra-teal},
+    hookko/.style={font=\scriptsize\itshape,text=ra-red}]
+  % --- Profile
+  \node[cfgbloc] (p0) {B0 (entrée)\\ \code{[open,setOpen] = useState(false)}\\ \code{Branch(!user)}};
+  \node[sortie,below left=of p0,xshift=12mm] (p1) {B1\\ \code{Return(<p>)}};
+  \node[sortie,below right=of p0,xshift=-12mm] (p2) {B2\\ \code{HookMarker(1)}~~{\rmfamily(useEffect)}\\ \code{Return(<button>)}};
+  \draw[fleche] (p0) -- node[etiquette,left] {vrai} (p1);
+  \draw[fleche] (p0) -- node[etiquette,right] {faux} (p2);
+  \node[hookok,above=1mm of p0] {B0 domine B1 et B2 : \code{useState} inconditionnel};
+  \node[hookko,below=2mm of p2,align=center] {B2 ne domine pas B1 :\\ \code{useEffect} conditionnel (\Error)};
+  \node[etiquette,below=2mm of p1,align=center] {$\dom(\text{B1})=\{\text{B0},\text{B1}\}$\\ $\dom(\text{B2})=\{\text{B0},\text{B2}\}$};
+  % --- Losange
+  \begin{scope}[xshift=88mm]
+  \node[cfgbloc] (d0) {B0 (entrée)\\ \code{Branch(big)}};
+  \node[cfgbloc,below left=of d0,xshift=8mm] (d1) {B1\\ \code{size = 2}};
+  \node[cfgbloc,below right=of d0,xshift=-8mm] (d2) {B2\\ \code{size = 3}};
+  \node[sortie,below=24mm of d0] (d3) {B3\\ \code{useState(size)}\\ \code{Return(<b>)}};
+  \draw[fleche] (d0) -- (d1); \draw[fleche] (d0) -- (d2);
+  \draw[fleche] (d1) -- (d3); \draw[fleche] (d2) -- (d3);
+  \node[hookok,below=2mm of d3,align=center] {B3 domine l'unique sortie (lui-même) :\\ \code{useState} inconditionnel};
+  \end{scope}
+\end{tikzpicture}
+\caption{Dominance et hooks conditionnels. À gauche, \code{Profile} (\cref{lst:regles-effets-profile}) ; à droite, un losange qui se referme avant le hook. Les sorties (blocs \code{Return} atteignables) sont en trait épais. La numérotation des blocs est illustrative : aucune sortie de la CLI n'expose les identifiants réels.}
+\label{fig:regles-effets-dominance}
+\end{figure}
+
+\subsection{Ce que fait le code}
+
+La règle délègue tout à une primitive de la surface typée (\cref{chap:api-regles}). Son \code{check} tient en quelques lignes :
+
+\rustsnippet{src/rules/impls/conditional_hook.rs}{32}{45}{la règle : une \Error{} par jeton}
+
+Le seul constructeur d'\Error{}, \code{Diagnostic::error}, exige un \code{Certified<E>} (\cref{def:certified}) ; ici \code{E = ConditionalHookCall}, un label et une position (\src{src/rules/api/query.rs}{435}{441}). Ce jeton, seul le module \file{src/rules/api/query.rs} peut le frapper, et il ne le fait que dans \code{hook_is_conditional} :
+
+\rustsnippet{src/rules/api/query.rs}{475}{511}{la primitive \code{hook_is_conditional}}
+
+Trois étapes. (1) \code{ExitDominance::of} construit une fois la relation de dominance et l'ensemble des sorties. (2) Les \code{HookCallInfo} de kind \code{Handler} sont écartés : un handler JSX n'est pas un hook. (3) Pour chaque hook dont le bloc \og peut être sauté\fg{}, on cherche la condition à blâmer (\code{guard_site}), on en fait une note \code{Step::Branch}, et on frappe le jeton. \code{ExitDominance} porte la définition des sorties :
+
+\rustsnippet{src/rules/api/query.rs}{652}{683}{les sorties atteignables et le test \code{may_be_skipped}}
+
+\begin{piege}
+Pourquoi \og atteignables\fg{} ? Le lowering scelle toute fin de fonction par un \code{Return(undefined)} (\adr{25}, \cref{chap:lowering-cfg}). Dans un \code{if}/\code{else} dont les deux branches retournent, ce bloc de fin n'a aucun prédécesseur : ce n'est pas une sortie d'un rendu réel. Le commentaire d'\code{ExitDominance::of} (\src{src/rules/api/query.rs}{654}{658}) motive le filtre par le risque inverse : compter ce bloc rendrait tous les hooks placés avant le \code{if} non dominants pour cette sortie orpheline, donc conditionnels, au niveau \Error. Avec l'algorithme actuel, ce risque ne se matérialiserait pas : un bloc inatteignable n'est pas visité par l'ordre post-ordre inverse et garde pour dominateurs \emph{tous} les blocs (\src{src/engine/dominance.rs}{16}{22}), si bien que tout bloc le \og domine\fg{}. Le filtre n'en est pas moins juste : il rend la définition des sorties indépendante de cette convention de calcul. Le composant \code{Both} de \file{/tmp/ch20/diamond.tsx} (un \code{useState} puis un \code{if}/\code{else} qui retourne des deux côtés) est déclaré \og verified\fg{}. Symétriquement, un CFG sans sortie atteignable ne prouve rien : \code{may_be_skipped} y répond \code{false}.
+\end{piege}
+
+\paragraph{Où est le hook ?} Le bloc d'un hook, \code{HookCallInfo::block_id}, est calculé à la convergence par \code{collect_hook_calls} : c'est le premier bloc, dans l'ordre des identifiants (les blocs vivent dans un \code{BTreeMap}), qui contient une expression porteuse du label (\code{StateVal}, \code{MemoVal}, \code{CallbackVal}, \code{HookMarker}\ldots) ; un label absent du CFG retombe sur le bloc d'entrée (\src{src/engine/fixpoint.rs}{1324}{1354}). Les hooks \og sans valeur\fg{} comme \code{useEffect} ou \code{useRef} n'auraient aucune expression de ce type ; le lowering les ancre par un \code{Expr::HookMarker}, et c'est ce marqueur qui place le \code{useEffect} de \code{Profile} dans B2. Avant l'introduction du marqueur, ces hooks tombaient sur le bloc d'entrée, qui domine tout : un FN historique, corrigé au commit \code{4f61e6d} et épinglé par \file{tests/conditional_hook_e2e.rs}.
+
+\paragraph{Quelle condition blâmer ?} Le témoin choisit, parmi les dominateurs du bloc du hook terminés par un \code{Branch}, ceux dont au moins un successeur n'atteint \emph{pas} le bloc, et retient le plus profond (celui qui a le plus de dominateurs) :
+
+\rustsnippet{src/rules/api/query.rs}{1092}{1105}{le choix de la garde (début de \code{guard_site})}
+
+Le filtre \og un successeur qui n'atteint pas le hook\fg{} évite de blâmer un losange qui se referme \emph{avant} le hook : ses deux branches atteignent le hook, il n'y est pour rien (test \code{rejoining_diamond_between_guard_and_hook_is_not_blamed}, \src{src/rules/impls/conditional_hook.rs}{207}{336}). La position vient du \code{Branch} lui-même ou, à défaut, de la dernière instruction du bloc garde ; si aucune n'est connue, la note est imprimée sans ligne.
+
+\paragraph{Coût.} \code{DominatorTree::new} appelle \code{compute_dominators}, l'algorithme itératif par ensembles en ordre post-ordre inverse (\cref{chap:cfg-analyzer-dominance}) ; chaque requête \code{dominates} n'est ensuite qu'un test d'appartenance à un ensemble de dominateurs (\src{src/engine/dominance.rs}{107}{110}). \code{guard_site}, lui, recalcule les dominateurs et lance un parcours \code{reaches} par successeur candidat : c'est une double construction de la même relation, négligeable sur des CFG de rendu de quelques dizaines de blocs, mais à connaître.
+
+\subsection{Niveau et preuve}
+
+La règle émet toujours une \Error, et c'est la seule du chapitre à le faire sans condition. La preuve est structurelle : il existe un chemin du CFG de rendu, de l'entrée à une sortie atteignable, qui ne passe pas par le hook. Le jeton garantit que la règle ne peut pas conclure sur une quantification plus faible : \code{hook_is_conditional} empaquette le \og pour toute sortie\fg{} pour qu'aucune règle ne puisse le sous-quantifier (\adr{21} §3).
+
+\begin{remarque}
+La preuve porte sur les chemins du CFG, pas sur leur faisabilité : un \code{if (true) return;} placé avant un hook donnerait le même verdict qu'un \code{if (!user)}. C'est la lecture de la règle des hooks elle-même, qui est syntaxique ; \code{eslint-plugin-react-hooks} ne raisonne pas autrement.
+\end{remarque}
+
+\subsection{Cas limites observés}
+
+\begin{exemple}{Boucle, exception, branches qui retournent}{regles-effets-ch-cas}
+Le fichier \file{/tmp/ch20/diamond.tsx} regroupe quatre composants. \code{Badge} (losange puis \code{useState}) et \code{Both} (\code{useState} puis \code{if}/\code{else} qui retournent) sont \og verified\fg{}. \code{Thrower} commence par \code{if (!on) throw new Error("off");} puis appelle \code{useState} : il est \og verified\fg{} lui aussi, parce qu'un bloc qui lève n'est pas une sortie \code{Return} ; un rendu qui lève n'a pas de suite, et ne peut donc pas décaler les hooks d'un rendu ultérieur. C'est exact pour \code{hook_is_conditional}, dont la définition ne porte que sur les \code{Return} atteignables ; que ce choix s'aligne sur la lecture qu'\code{eslint-plugin-react-hooks} fait d'un chemin qui lève reste, au commit \snapshotCommit, une affirmation non vérifiée côté eslint. \code{Loop} appelle \code{useEffect} dans un \code{for (const x of xs)} :
+\begin{sortie}
+  Loop  (1 hooks)  diamond.tsx
+    error  conditional-hook  [hook:0]  (line 30:4)  this hook is called conditionally (not on every render path)
+       → guarded by a condition evaluated here, so some render paths skip the hook
+\end{sortie}
+Le \code{Branch} de la boucle n'a pas de position : la note sort sans ligne.
+\end{exemple}
+
+\begin{piege}
+\textbf{Un hook que l'IR ne voit pas n'est pas vérifié.} Le fichier \file{/tmp/ch20/s4.tsx} compare quatre écritures du même défaut :
+\begin{lstlisting}[language=TypeScript]
+export function A({ on }: { on: boolean }) {
+  let v = 0;
+  if (on) { const w = useMemo(() => 1, []); v = w; }
+  return <i>{v}</i>;
+}
+export function B({ on }: { on: boolean }) {
+  let v = 0;
+  if (on) { v = useMemo(() => 1, []); }
+  useEffect(() => {}, []);
+  return <i>{v}</i>;
+}
+export function C({ on }: { on: boolean }) {
+  if (on) { useEffect(() => {}, []); }
+  return <i />;
+}
+export function D({ on }: { on: boolean }) {
+  const v = on && useMemo(() => 1, []);
+  useEffect(() => {}, []);
+  return <i>{String(v)}</i>;
+}
+\end{lstlisting}
+\code{A} et \code{C} reçoivent l'\Error{} attendue. \code{B} et \code{D} affichent \og (1 hooks)\fg{} et l'assurance \og verified conditional-hook\fg{} : le \code{useMemo} placé en membre droit d'une \emph{affectation} ou d'un \code{&&} ne produit aucun \code{HookEntry}. C'est un FN sur une règle de niveau \Error, constaté au commit \snapshotCommit{} ; sa cause est dans l'extraction des hooks (\cref{chap:lowering-cfg}), pas dans la règle, qui ne peut juger que ce que l'IR lui donne. Le dossier de notes signale la même absence pour un hook dans une branche de ternaire, et ne trouve pas d'issue qui la suive.
+\end{piege}
+
+\paragraph{L'assurance.} Le \code{safe_check} déclare la règle applicable dès que \code{hook_calls} n'est pas vide (\src{src/rules/impls/conditional_hook.rs}{19}{30}). Comme \code{hook_calls} contient aussi les handlers, un composant sans aucun hook mais avec un \code{onClick} reçoit \og verified conditional-hook all hooks run unconditionally, in a stable order\fg{} (composant \code{OnlyHandler}, \file{/tmp/ch20/onlyhandler.tsx}) : une assurance vide de contenu, vraie mais sans objet.
+
+\begin{decision}[ADR-021 : la dominance comme primitive]
+Avant \adr{21}, \file{conditional_hook.rs} gardait sa propre énumération des sorties et son propre \code{DominatorTree}, qui pouvaient diverger d'\code{ExitDominance} sur l'atteignabilité (le commentaire de \src{src/rules/api/query.rs}{477}{479} en garde la trace). La décision : un seul propriétaire de \og ce que sont les sorties\fg{}, une primitive qui rend des \code{Certified<ConditionalHookCall>}, et une règle qui ne fait plus que les convertir en diagnostics. L'alternative, laisser chaque règle calculer sa dominance, rendait possible une règle qui teste \og domine \emph{une} sortie\fg{} au lieu de \og domine \emph{toutes} les sorties\fg{}, c'est-à-dire une \Error{} sur une quantification fausse.
+\end{decision}
+
+
+\section{always-unstable-deps : quand Object.is échoue à chaque rendu}
+\label{sec:regles-effets-always-unstable}
+
+Avec \regle{always-unstable-deps}, on quitte la forme du CFG pour les valeurs : la règle interroge le domaine de stabilité du \cref{chap:statevalue-stabilite}. C'est aussi la première règle à lire une liste de deps, et elle le fait dans la polarité \og tirer\fg{} (\cref{def:polarite-deps}).
+
+\begin{react}[\code{Object.is} et références fraîches]
+React compare chaque entrée de deps à l'entrée de même rang du rendu précédent par \code{Object.is}, et relance le hook dès qu'\emph{une} entrée diffère : c'est un \og ou\fg{} logique sur les entrées. Les primitifs (nombres, booléens, chaînes) sont comparés par valeur ; un littéral objet, tableau ou fonction évalué pendant le rendu est une référence neuve à chaque rendu, et fait donc échouer la comparaison à chaque rendu, quels que soient ses voisins. \code{useMemo}, \code{useCallback} et \code{useRef} existent pour rendre une identité stable ; le setter d'un \code{useState} et l'objet d'un \code{useRef} sont stables par contrat, et un état objet garde son identité tant que son setter n'écrit pas.
+\end{react}
+
+\subsection{Le problème : un objet frais à côté d'un memo}
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch20/feed.tsx} : la même dep, fraîche puis mémoïsée},label={lst:regles-effets-feed}]
+import { useState, useEffect, useMemo } from "react";
+
+export function Feed({ userId }: { userId: string }) {
+  const [count, setCount] = useState(0);
+  const opts = { userId, limit: 20 };
+  useEffect(() => {
+    fetchPosts(opts);
+  }, [opts, count]);
+  const stable = useMemo(() => ({ userId }), [userId]);
+  useEffect(() => {
+    fetchPosts(stable);
+  }, [stable, count]);
+  return <button onClick={() => setCount(count + 1)}>{count}</button>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  Feed  (5 hooks)  feed.tsx
+    warn   always-unstable-deps  [hook:1]  (line 6:2)  this effect depends on `opts`, a new reference every render, so `Object.is` always differs and the effect re-runs on every render regardless of the other deps
+       → the value flows through `opts`, bound here (line 5:8)
+\end{sortie}
+
+Le premier effet dépend de \code{opts}, un littéral objet évalué à chaque rendu : il tourne donc à chaque rendu, et la présence de \code{count} à côté n'y change rien. Le second dépend de \code{stable}, la valeur d'un \code{useMemo} : le memo absorbe la fraîcheur de l'allocation, et l'effet est muet. \code{count} est un nombre, comparé par valeur. La note, produite par le producteur de témoins \code{chase_value} (\srcline{src/rules/api/witness.rs}{463}), remonte d'une liaison vers l'origine de la référence.
+
+\subsection{La borne must \code{PerRender}}
+
+Le treillis \code{Stability} (\adr{17}, \cref{def:stabilite}) distingue deux sortes de bornes sur la \emph{trace de changement} d'une valeur, c'est-à-dire l'ensemble des rendus où \code{Object.is} avec le rendu précédent échoue :
+
+\rustsnippet{src/domains/impls/stability.rs}{35}{52}{le treillis de stabilité référentielle}
+
+\code{Versioned(S)} est une borne \emph{may} : la valeur ne change \emph{qu'aux} écritures des slots de $S$, peut-être moins. Elle sert à se taire. \code{PerRender} est une borne \emph{must} : la référence change à \emph{chaque} rendu. Elle sert à tirer. La règle ne tire que sur ce dernier fait, et seulement pour une valeur qui n'est \emph{que} une référence :
+
+\rustsnippet{src/domains/impls/state_value.rs}{281}{287}{le prédicat de la règle}
+
+La seconde conjonction (\code{populated_kinds().only(KindMask::REF)}) exclut les valeurs mixtes du produit \code{StateValue} (\cref{def:statevalue}) : une dep qui vaut \og un objet ou \code{null}\fg{} n'est pas une référence neuve à coup sûr.
+
+\subsection{Ce que fait le code}
+
+\rustsnippet{src/rules/impls/always_unstable_deps.rs}{71}{109}{la boucle de la règle}
+
+On y lit quatre décisions.
+\begin{enumerate}
+  \item \emph{Pas de liste, pas de finding.} \code{deps.list()} ne rend rien pour \code{Absent} (le hook tourne déjà à chaque rendu) ni pour \code{Opaque} (aucun élément à examiner). Ce second cas est l'un des FN annoncés par \regle{analysis-limit}.
+  \item \emph{Pas de finding sur \code{[]}.} Un effet de montage n'a aucune entrée à comparer.
+  \item \emph{Tous les éléments visibles.} \code{DepsList::as_slice} rend \code{elems}, y compris la source d'un spread : la règle \emph{tire} sur un élément, c'est la polarité où lire \code{elems} est sound (\cref{inv:polarite-deps}).
+  \item \emph{Un tas convergé.} La dep est évaluée par \code{eval_in_stores} (l.~160 du même fichier) dans l'environnement de sortie, avec les stores convergés et une copie du tas convergé, faite une fois par composant (\code{result.heap.clone()}, l.~69). Un tas vide répondrait top à toute lecture de membre (\code{form.onSubmit}), que la règle lit comme un silence : c'était le FN de \issue{135} (test \code{a_member_dep_holding_a_fresh_function_fires}, \srcline{tests/always_unstable_deps.rs}{330}).
+\end{enumerate}
+
+Le message nomme les deps par leur expression, jamais par leur position (\code{fmt_deps}, \src{src/rules/impls/always_unstable_deps.rs}{167}{181}) : une position dans \code{elems} cesse d'être une position dans le tableau source dès que le lowering retire une élision ou aplatit un spread (\issue{118}).
+
+\subsection{Ce que la règle tait, et pourquoi}
+
+\paragraph{Les primitifs.} Un compteur convergé vers $[0, 10]$, ou porté par le widening à $[0, +\infty)$, n'est jamais signalé : sa valeur varie, mais \code{Object.is} compare des nombres par valeur. Le commentaire de tête de la règle l'explique : traiter un large intervalle comme instable confondrait la variance du point fixe avec la nouveauté référentielle, et ferait tirer la règle sur la dep canonique \code{[count]} (\src{src/rules/impls/always_unstable_deps.rs}{20}{25} ; test \code{wide_numeric_state_dep_not_flagged}).
+
+\paragraph{L'état objet.} C'est le cas qui a motivé \adr{17}.
+
+\begin{exemple}{Un état objet n'est pas une référence fraîche}{regles-effets-objstate}
+\begin{lstlisting}[language=TypeScript]
+export function Locale() {
+  const [ctx, setCtx] = useState({ locale: "en" });
+  useEffect(() => {
+    applyLocale(ctx);
+  }, [ctx]);
+  return <button onClick={() => setCtx({ locale: "fr" })}>{ctx.locale}</button>;
+}
+\end{lstlisting}
+Le store d'état contient le join des valeurs \emph{écrites} : deux littéraux objets, donc des références \code{PerRender} au moment de leur allocation. Mais un rendu \emph{lit} le slot, et React garantit que son identité ne change qu'aux écritures du setter. La conversion côté lecture d'\adr{17} (\cref{chap:transfert-stores}) transforme donc la lecture de \code{ctx} en \code{Versioned({(Locale, 0)})}. \code{is_unstable_reference_only} rend \code{false}, et \code{reactant check /tmp/ch20/objstate.tsx --info} publie \og verified always-unstable-deps no deps array is defeated by an always-fresh reference\fg{}. L'effet ne tourne en effet qu'aux clics.
+\end{exemple}
+
+\paragraph{top.} Une dep dont la valeur est inconnue (une prop, par défaut) ne tire pas : top n'est pas une borne must. C'est une perte de précision assumée ; elle ne coûte rien en soundness parce que la règle est un conseil (\Warning) et que la seule conséquence grave d'une dep toujours neuve, la boucle de rendu, est l'affaire d'\regle{infinite-loop}.
+
+\begin{decision}[ADR-017 : \code{Versioned} se tait, et ce silence est couplé]
+Le banc du corpus du 15 juillet 2026 (\og F5\fg{}) laissait cinq \Warning{} \regle{always-unstable-deps}, tous de la forme de l'\cref{ex:regles-effets-objstate} : un provider de contexte à état objet. La cause était une confusion entre fraîcheur \emph{à l'allocation} (un fait sur une écriture) et fraîcheur \emph{par rendu} (un fait inter-rendus sur un slot). \adr{17} les sépare, introduit \code{Versioned(S)} et fait tirer la règle sur \code{PerRender} seulement (\adr{17} §4). Deux alternatives ont été refusées : rendre les lectures d'état \og à peu près stables\fg{} sans nouvelle valeur du treillis (cela créait un FN, le composant \code{ObjChurn} qui réécrit son état avec un objet neuf à chaque effet), et compter les événements d'écriture dans le store. Le point subtil est l'argument de soundness n\textsuperscript{o}\,2 de l'ADR : la garde \og une dep \code{Versioned} borne l'effet\fg{}, utilisée par \regle{infinite-loop}, n'est sound \emph{que} couplée au bras \emph{churn} de cette règle, qui couvre exactement le cas \code{setX({...x})} (\cref{chap:churn}, \cref{chap:infinite-loop}). Retirer l'un sans l'autre rouvre le FN.
+\end{decision}
+
+\subsection{Niveau : un fait certain au coût incertain}
+
+La règle plafonne à \Warning{}, par construction : elle n'appelle que \code{Diagnostic::warn}. Le fait qu'elle affirme est pourtant certain (la référence est neuve à chaque rendu, c'est une borne must) ; ce qui ne l'est pas, c'est le coût. Un \code{useMemo} recalculé à chaque rendu gaspille du travail, un effet relancé à chaque rendu peut n'être qu'un \code{console.log}. La doctrine du projet range précisément ce cas en \Warning{} : \og fait certain au coût incertain\fg{}. L'escalade vers l'\Error{}, quand l'effet réécrit ce qui alimente sa propre dep, appartient au bras churn d'\regle{infinite-loop} (\adr{17} §3).
+
+\begin{piege}
+\textbf{Tirer sur la source d'un spread peut être un FP.} \og Lire \code{elems} pour tirer est sound\fg{} signifie \og ne produit pas de FN\fg{}, pas \og ne produit pas de FP\fg{} :
+\begin{lstlisting}[language=TypeScript]
+export function Rows({ a, b }: { a: number; b: number }) {
+  const rows = [a, b];
+  useEffect(() => { console.log(rows); }, [...rows]);
+  return <i />;
+}
+\end{lstlisting}
+\begin{sortie}
+  Rows  (1 hooks)  spread2.tsx
+    warn   always-unstable-deps  [hook:0]  (line 4:2)  this effect depends on `rows`, a new reference every render, so `Object.is` always differs and the effect re-runs on every render regardless of the other deps
+       → the value flows through `rows`, bound here (line 3:8)
+    warn   missing-deps  [hook:0]  var:rows  (line 4:2)  `rows` is used in this effect but not in its deps array, and it is recreated on every render
+       → `rows` is read here [hook:0] (line 4:2)
+\end{sortie}
+React compare ici \code{a} et \code{b}, deux nombres ; l'effet ne tourne pas à chaque rendu, et le \Warning{} \regle{always-unstable-deps} est un FP (observé au commit \snapshotCommit{} sur \file{/tmp/ch20/spread2.tsx}). Il est toléré : un \Warning{}, sur un motif rare, dans la direction permise. Le \regle{missing-deps}, lui, est juste : le corps lit \code{rows} entier, que \code{[...rows]} ne couvre pas (\cref{sec:regles-effets-missing-deps}).
+\end{piege}
+
+\paragraph{L'assurance.} Elle est publiée quand un \code{EffectInfo} au moins a des deps visibles non vides (\code{!declared_deps().is_empty()}, \src{src/rules/impls/always_unstable_deps.rs}{44}{59}) : \og no deps array is defeated by an always-fresh reference\fg{}.
+
+
+\section{missing-deps : ce que la closure lit et que les deps taisent}
+\label{sec:regles-effets-missing-deps}
+
+\regle{missing-deps} est la règle la plus bavarde du catalogue (4\,128 findings sur le corpus au commit \code{451ed75}, \file{docs/campaign/AUDIT.md}) et celle dont les silences sont les plus travaillés. Elle est l'analogue d'\code{exhaustive-deps} d'\code{eslint-plugin-react-hooks}, avec une différence de fond : là où eslint exige toute valeur réactive, \regle{missing-deps} pardonne ce qu'elle peut \emph{prouver} stable.
+
+\begin{react}[closures et deps]
+Une fonction créée pendant un rendu capture les \code{const} de ce rendu. Le corps d'un \code{useEffect(f, deps)} est une telle fonction : quand les deps ne changent pas, React garde l'effet du rendu précédent, qui continue de voir les valeurs de \emph{ce} rendu. Une valeur lue par le corps et absente des deps n'est pas comparée ; si elle change, le corps travaille sur une copie périmée. Il en va de même pour la fonction mémorisée par \code{useCallback} et la valeur calculée par \code{useMemo}.
+\end{react}
+
+\subsection{Le problème : trois lectures, trois verdicts}
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch20/search.tsx} : une prop oubliée, un ref atteint par un objet frais, un objet non déclaré},label={lst:regles-effets-search}]
+import { useState, useEffect, useRef, useCallback } from "react";
+
+export function Search({ url, settings }: { url: string; settings: any }) {
+  const [n, setN] = useState(0);
+  const r = useRef(0);
+  const bag = { r };
+  useEffect(() => {
+    fetch(url + n);
+  }, [n]);
+  const log = useCallback(() => {
+    console.log(bag.r.current);
+    setN(0);
+  }, []);
+  useEffect(() => {
+    render(settings.halftone, settings.material);
+  }, []);
+  return <button onClick={log}>{n}</button>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  Search  (6 hooks)  search.tsx
+    warn   missing-deps  [hook:2]  var:url  (line 7:2)  `url` is used in this effect but not in its deps array, and its value may change between renders
+       → `url` is read here [hook:2] (line 7:2)
+    warn   missing-deps  [hook:4]  var:settings  (line 14:2)  `settings` is used in this effect but not in its deps array, and its value may change between renders
+       → `settings` is read here [hook:4] (line 14:2)
+\end{sortie}
+
+Le premier effet lit \code{fetch}, \code{url} et \code{n} ; \code{n} est déclaré, \code{fetch} est une globale, \code{url} est une prop (top, donc \og may change\fg{}) : un finding. Le callback lit \code{bag.r.current} et \code{setN} ; \code{bag} est un objet neuf à chaque rendu, et pourtant la règle se tait. Le dernier effet lit deux membres de \code{settings} et la liste ne nomme rien sous \code{settings} : un seul finding, sur la racine. Ces trois verdicts mobilisent les trois notions de cette section : les chemins d'accès, la couverture par préfixe, et les kills de stabilité.
+
+\subsection{Chemins d'accès et couverture par préfixe}
+
+La granularité de la règle n'est pas la variable mais le \emph{chemin d'accès} (\cref{chap:ir}) :
+
+\rustsnippet{src/ir/free_vars.rs}{6}{23}{un chemin d'accès : une racine et une suite de champs}
+
+Côté lecture, un index dynamique coupe le chemin au-dessus de l'index : \code{x.a[i].b} devient \code{x.a}, \og touche tout \code{x.a}\fg{}. Côté deps, il ne déclare rien. La couverture est un test de préfixe :
+
+\rustsnippet{src/ir/free_vars.rs}{253}{278}{les chemins déclarés et la couverture}
+
+\begin{exemple}{Préfixes et index}{regles-effets-paths}
+Le fichier \file{/tmp/ch20/paths.tsx} lit \code{x.a} sous quatre listes. \code{P1} : \code{[x.b]} ne couvre pas \code{x.a} ; \code{P2} : \code{[x]} couvre \code{x.a} ; \code{P3} : \code{[x.a.b]} est plus long que \code{x.a} et ne le couvre pas ; \code{P4} lit \code{x.a[i].b} sous \code{[x.a, i]}, coupé en \code{x.a} (et \code{i}), couvert.
+\begin{sortie}
+  P1  (1 hooks)  paths.tsx
+    warn   missing-deps  [hook:0]  var:x  (line 4:2)  `x.a` is used in this effect but not in its deps array, and its value may change between renders
+       → `x.a` is read here [hook:0] (line 4:2)
+  P2  (1 hooks)  paths.tsx  ✓
+  P3  (1 hooks)  paths.tsx
+    warn   missing-deps  [hook:0]  var:x  (line 12:2)  `x.a` is used in this effect but not in its deps array, and its value may change between renders
+       → `x.a` is read here [hook:0] (line 12:2)
+  P4  (1 hooks)  paths.tsx  ✓
+\end{sortie}
+Les tests unitaires \code{sibling_field_mismatch_warns} et \code{whole_var_dep_covers_field_use} (\srcline{src/rules/impls/missing_deps.rs}{403}, l.~437) épinglent les deux premiers cas.
+\end{exemple}
+
+Les chemins lus viennent de l'\code{EffectInfo} du hook, construit par le moteur à la convergence (\code{collect_effect_info}, \src{src/engine/fixpoint.rs}{1425}{1495}) :
+
+\rustsnippet{src/engine/analysis_result.rs}{95}{120}{la vue \og deps\fg{} d'un effet, d'un memo ou d'un callback}
+
+Deux champs demandent une explication. \code{free_paths} est calculé par \code{compute_free_paths}, qui retire les racines définies dans le corps et résout ses renommages : \code{const c = cond} n'est pas une lecture de \code{cond}, mais \code{const c = pick(cond)} en est une. \code{deps_pinned} contient les lectures qui n'apparaissent \emph{que} dans une sous-expression écrite mot pour mot dans les deps : \code{searchParams.get("sort")} lu dans le corps et déclaré tel quel dans la liste. Une telle lecture est comparée par le tableau lui-même, elle ne peut pas être périmée. Le mot pour mot est toute la condition : \code{[JSON.stringify(o)]} ne \emph{pin} pas \code{o}, parce qu'une sérialisation perd de l'information (\src{src/ir/free_vars.rs}{120}{137}).
+
+\begin{sortie}
+  Lossy  (1 hooks)  pin.tsx
+    warn   missing-deps  [hook:0]  var:o  (line 9:2)  `o` is used in this effect but not in its deps array, and its value may change between renders
+       → `o` is read here [hook:0] (line 9:2)
+  Sorted  (1 hooks)  pin.tsx  ✓
+\end{sortie}
+
+\subsection{L'algorithme}
+
+Voici la boucle principale de \code{check}, élaguée de ses commentaires (les commentaires originaux contiennent le caractère « … », que la chaîne de compilation du manuscrit ne sait pas encore rendre dans un listing) :
+
+\begin{lstlisting}[language=Rust,caption={La boucle de \regle{missing-deps}, élaguée des commentaires (\src{src/rules/impls/missing_deps.rs}{49}{98})},label={lst:regles-effets-md-loop}]
+        for (label, info) in &result.effect_info {
+            if !info.has_deps_array() {
+                continue;
+            }
+
+            let declared: Vec<AccessPath> = dep_paths(&info.covering_deps());
+
+            let declared_roots: HashSet<&Var> = declared.iter().map(|d| &d.root).collect();
+            let mut reported: BTreeSet<AccessPath> = BTreeSet::new();
+
+            for path in &info.free_paths {
+                if path_covered(path, &declared) || info.deps_pinned.contains(path) {
+                    continue;
+                }
+                if !env_exit.contains(&path.root) {
+                    continue;
+                }
+                if !env_exit.lookup(&path.root).is_stable()
+                    && !member_is_stable(path, &env_exit, result)
+                    && !closure_is_behaviorally_stable(path, result, &env_exit, &mut HashSet::new())
+                {
+                    reported.insert(if declared_roots.contains(&path.root) {
+                        path.clone()
+                    } else {
+                        AccessPath::root(path.root.clone())
+                    });
+                }
+            }
+\end{lstlisting}
+
+Sa structure est celle de l'\cref{alg:regles-effets-md}. Chaque ligne qui fait \code{continue} est un kill (\cref{def:kill}), et chacun doit être une preuve que la capture ne peut pas être périmée.
+
+\begin{algorithm}[htbp]
+\KwIn{$R$ : l'\code{AnalysisResult} convergé d'un composant ; $E$ : son environnement de sortie}
+\ForEach{hook $h$ de $R$ muni d'un argument de deps (\code{List} ou \code{Opaque})}{
+  $D \leftarrow$ \code{dep_paths}(\code{covering}($h$.deps)) \tcp*{\code{Opaque} : $D = \emptyset$}
+  $\mathit{rapport} \leftarrow \emptyset$\;
+  \ForEach{chemin $p \in h$.\code{free_paths}}{
+    \lIf{$p$ couvert par $D$ \textbf{ou} $p \in h$.\code{deps_pinned}}{continuer}
+    \lIf{$\mathrm{racine}(p) \notin \dom(E)$}{continuer (globale)}
+    \lIf{$E(\mathrm{racine}(p))$ stable}{continuer (kill 1)}
+    \lIf{un préfixe non vide de $p$ s'évalue stable}{continuer (kill 2)}
+    \lIf{$p$ nomme une closure dont les captures sont stables}{continuer (kill 3)}
+    ajouter à $\mathit{rapport}$ : $p$ si $D$ nomme sa racine, sinon $\mathrm{racine}(p)$\;
+  }
+  émettre un \Warning{} par élément de $\mathit{rapport}$ (ensemble ordonné)\;
+}
+\caption{\regle{missing-deps} (lecture de \src{src/rules/impls/missing_deps.rs}{49}{128})}
+\label{alg:regles-effets-md}
+\end{algorithm}
+
+\paragraph{Polarité.} La liste déclarée est \code{covering_deps()}, pas \code{declared_deps()} : elle décide de ce qu'on \emph{ne} rapporte \emph{pas} (\cref{inv:polarite-deps}). Le composant \code{Spread} de \file{/tmp/ch20/beh.tsx} lit \code{rows} sous \code{[...rows]} ; \code{covering} retire la source du spread, et la règle tire, comme React le ferait :
+\begin{sortie}
+  Spread  (1 hooks)  beh.tsx
+    warn   missing-deps  [hook:0]  var:rows  (line 10:2)  `rows` is used in this effect but not in its deps array, and its value may change between renders
+       → `rows` is read here [hook:0] (line 10:2)
+\end{sortie}
+
+\paragraph{Deps illisibles.} Un argument \code{Opaque} passe le premier test (\code{has_deps_array()} vaut \code{true} pour tout argument écrit) et \code{covering_deps()} est vide : le hook est vérifié \og rien couvert\fg{}. C'est le \code{items} de l'\cref{ex:regles-effets-opaque}, un FP possible, jamais un FN. Le lire comme \code{Absent} aurait sauté un hook qui peut se périmer.
+
+\paragraph{Globales.} Une racine absente de l'environnement de sortie (\code{fetch}, \code{console}, \code{document}) n'est pas une valeur du composant : elle n'est pas rapportée.
+
+\paragraph{Granularité du rapport.} Si la liste nomme au moins un chemin sous la racine de $p$, c'est $p$ lui-même qui est rapporté (le correctif est par membre) ; sinon c'est la racine (le correctif est de déclarer l'objet). D'où \code{x.a} pour \code{P1} et \code{settings}, une seule fois, pour \code{Search}.
+
+\subsection{Les trois kills de stabilité}
+
+\paragraph{Kill 1 : la racine est stable.} \code{env_exit.lookup(root).is_stable()} : un setter, un ref, un littéral, une constante de module. Une valeur qui ne change jamais ne peut pas être périmée. Attention : \code{Versioned} \emph{n'est pas} \code{Stable}. Un état reste une dep requise, comme dans eslint (\adr{17} §4).
+
+\paragraph{Kill 2 : un préfixe est stable.} C'est le cas de \code{bag.r.current}.
+
+\rustsnippet{src/rules/impls/missing_deps.rs}{139}{157}{un préfixe stable suffit}
+
+Le raisonnement du commentaire mérite d'être déplié, et la \cref{fig:regles-effets-prefixes} le fait sur l'exemple. Une lecture n'est périmée que si \emph{chaque} poignée qu'elle traverse peut changer entre rendus. \code{bag} est un objet neuf à chaque rendu (\code{PerRender}) ; mais la copie de \code{bag} que tient une closure périmée contient le \emph{même} ref \code{r}, puisque \code{bag.r} est stable, et \code{.current} lit la valeur courante de ce ref. S'arrêter au chemin entier ne suffit pas : une queue \code{.current} répond top, la cellule d'un ref n'étant pas modélisée dans le tas. S'arrêter à la racine, c'est ce que le kill 1 faisait déjà. Le kill parcourt donc tous les préfixes non vides.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=5mm and 14mm,
+    seg/.style={cfgbloc,minimum width=26mm,align=center},
+    ok/.style={seg,draw=ra-teal,very thick},
+    ko/.style={seg,draw=ra-red,thick}]
+  \node[ko] (b0) {\code{bag}\\ {\rmfamily\scriptsize préfixe 0 : \code{PerRender}}};
+  \node[ok,right=of b0] (b1) {\code{bag.r}\\ {\rmfamily\scriptsize préfixe 1 : ref, \code{Stable}}};
+  \node[seg,right=of b1] (b2) {\code{bag.r.current}\\ {\rmfamily\scriptsize préfixe 2 : top}};
+  \draw[fleche] (b0) -- node[etiquette,above] {\code{.r}} (b1);
+  \draw[fleche] (b1) -- node[etiquette,above] {\code{.current}} (b2);
+  \node[etiquette,below=3mm of b1,align=center,text=ra-teal] {kill 2 : \code{member_is_stable} vrai en $n = 1$\\ la copie périmée de \code{bag} atteint le même ref};
+  \node[ko,below=16mm of b0] (s0) {\code{settings}\\ {\rmfamily\scriptsize préfixe 0 : prop, top}};
+  \node[ko,right=of s0] (s1) {\code{settings.halftone}\\ {\rmfamily\scriptsize préfixe 1 : top}};
+  \draw[fleche] (s0) -- node[etiquette,above] {\code{.halftone}} (s1);
+  \node[etiquette,right=6mm of s1,align=left,text=ra-red] {aucun préfixe stable :\\ finding, sur la racine \code{settings}\\ (la liste ne nomme rien dessous)};
+\end{tikzpicture}
+\caption{Les préfixes de deux chemins lus par \code{Search} (\cref{lst:regles-effets-search}), annotés de la stabilité de leur valeur dans l'environnement de sortie. Un cadre vert est un préfixe stable, qui suffit à éteindre le finding ; un cadre rouge, un préfixe qui peut changer. Le préfixe 0 (la racine) relève du kill 1 ; le kill 2 examine les préfixes $n = 1, \ldots, |p|$.}
+\label{fig:regles-effets-prefixes}
+\end{figure}
+
+L'évaluation passe par \code{result.evaluator()}, l'évaluateur post-convergence du \cref{chap:cfg-analyzer-dominance}, avec le tas convergé : c'est le même correctif (\issue{135}) que pour \regle{always-unstable-deps}. Le commentaire cite l'ordre de grandeur qui l'a motivé : 2\,010 rangées du corpus où le conteneur était frais et le membre ne l'était pas (\issue{88}, \issue{133}).
+
+\paragraph{Kill 3 : la closure se comporte de façon stable.} C'est le plus subtil, et il sépare nettement cette règle de la précédente.
+
+\rustsnippet{src/rules/impls/missing_deps.rs}{159}{181}{identité contre comportement}
+
+Une closure créée au rendu est \code{PerRender} : son \emph{identité} change à chaque rendu. Mais si toutes ses captures sont stables, sa copie périmée se \emph{comporte} exactement comme la copie courante, et l'omettre des deps est inoffensif. La fonction descend récursivement dans les captures qui ne sont pas stables \emph{parce qu'}elles sont elles-mêmes des closures ; un cycle entre closures n'apporte aucune preuve d'instabilité nouvelle et répond \code{true}. Les captures viennent de \code{closure_captures} (\src{src/rules/impls/missing_deps.rs}{204}{224}), qui connaît les deux orthographes d'une closure dans l'IR : un \code{FnLit} lié dans le rendu (captures = \emph{racines} libres, par \code{compute_free_vars}, pour ne jamais en oublier) et un \code{useCallback} extrait dans la table des hooks (captures = ses \code{free_paths}). Le chemin peut atteindre la closure à travers un conteneur (\code{api.bump}, pour un hook personnalisé qui renvoie \code{{ bump }}), par \code{closure_binding_of}, qui échoue fermé dès qu'une liaison est multiple ou conditionnelle (\src{src/ir/bindings.rs}{58}{94}).
+
+\begin{exemple}{Identité contre comportement}{regles-effets-beh}
+\begin{lstlisting}[language=TypeScript]
+export function Beh() {
+  const [x, setX] = useState(0);
+  const reset = () => setX(0);
+  useEffect(() => { reset(); }, []);
+  useEffect(() => { reset(); }, [reset]);
+  return <i>{x}</i>;
+}
+\end{lstlisting}
+\begin{sortie}
+  Beh  (3 hooks)  beh.tsx
+    warn   always-unstable-deps  [hook:2]  (line 6:2)  this effect depends on `reset`, a new reference every render, so `Object.is` always differs and the effect re-runs on every render regardless of the other deps
+       → the value flows through `reset`, bound here (line 4:8)
+\end{sortie}
+Premier effet : \code{reset} n'est pas déclaré, mais sa seule capture, \code{setX}, est stable ; la copie périmée de \code{reset} fait la même chose que la courante, et \regle{missing-deps} se tait (kill 3). Second effet : la même closure, lue cette fois en \emph{identité} par \regle{always-unstable-deps}, défait le tableau. Les deux règles ont raison, chacune pour sa question : l'une demande \og la copie tenue peut-elle se comporter autrement ?\fg{}, l'autre \og \code{Object.is} peut-il réussir ?\fg{}. Le commentaire de \code{closure_is_behaviorally_stable} l'écrit : les règles d'identité (\regle{always-unstable-deps}, le bras churn d'\regle{infinite-loop}) doivent continuer de lire \code{PerRender}.
+\end{exemple}
+
+\subsection{Niveau, message et assurance}
+
+La règle n'émet que des \Warning{}. Une omission peut être voulue (un effet qu'on veut vraiment ne lancer qu'au montage, \issue{32}), et une valeur qui \og peut changer\fg{} ne change peut-être jamais. Le message est construit par \src{src/rules/impls/missing_deps.rs}{100}{127} : le chemin, le mot \code{effect}, \code{memo} ou \code{callback}, et une description de la valeur de la racine, \code{describe_value} :
+
+\rustsnippet{src/rules/helpers/mod.rs}{42}{52}{des stabilités aux mots}
+
+Le diagnostic porte le label du hook, la racine comme \code{var}, la position du hook et une note \code{Step::Read}. L'assurance est publiée dès qu'un \code{EffectInfo} a un argument de deps : \og every effect declares the variables it reads\fg{} (\src{src/rules/impls/missing_deps.rs}{30}{41}).
+
+\begin{piege}
+\textbf{\og it is recreated on every render\fg{} pour un nombre.} Dans le \code{Timer} de la \cref{sec:regles-effets-stale-closure}, \regle{missing-deps} dit de \code{n}, un compteur : \og it is recreated on every render\fg{}. Ce n'est pas une référence ; mais \code{n} a subi le widening vers $[0, +\infty)$, et \code{to_stability} projette un intervalle non ponctuel sur \code{PerRender}, au sens \og peut changer à chaque rendu\fg{} (\adr{17} §4, qui assume ce nom étrange pour un nombre). La \emph{décision} de tirer est juste ; seul le \emph{texte} est imprécis. \code{describe_value} n'ayant qu'un appelant natif, la règle, un correctif qui distinguerait références et primitifs y resterait local.
+\end{piege}
+
+\subsection{Faux positifs assumés}
+
+\begin{decision}[wontfix \#40 : un test d'existence lit l'objet entier]
+\begin{lstlisting}[language=TypeScript]
+export function Locale({ cfg }: { cfg: { locale: string } | null }) {
+  useEffect(() => {
+    if (!cfg) return;
+    applyLocale(cfg.locale);
+  }, [cfg?.locale]);
+  return <div />;
+}
+\end{lstlisting}
+\begin{sortie}
+  Locale  (1 hooks)  wontfix.tsx
+    warn   missing-deps  [hook:0]  var:cfg  (line 6:2)  `cfg` is used in this effect but not in its deps array, and its value may change between renders
+       → `cfg` is read here [hook:0] (line 6:2)
+\end{sortie}
+Le test \code{!cfg} lit la référence entière, que \code{[cfg?.locale]} ne couvre pas. Distinguer \og usage de la valeur\fg{} de \og test d'existence\fg{} demanderait de suivre \emph{comment} une référence est consommée ; le \Warning{} est sound et aligné sur eslint. L'issue \issue{40} est fermée \code{wontfix} : trois findings de ce type sur le corpus, réouverture seulement avec un design de suivi du type de consommation.
+\end{decision}
+
+\begin{piege}
+\textbf{Un retour anticipé rend top ce qui suit.} L'environnement de sortie est le join des environnements des blocs \code{Return} (\cref{sec:regles-effets-grille}) ; une variable liée après un retour anticipé est absente de l'environnement du premier \code{Return}, et le join la rend top.
+\begin{lstlisting}[language=TypeScript]
+export function E({ on }: { on: boolean }) {
+  if (!on) return <b />;
+  const k = 5;
+  useEffect(() => { console.log(k); }, []);
+  return <i />;
+}
+export function F({ on }: { on: boolean }) {
+  const k = 5;
+  useEffect(() => { console.log(k); }, []);
+  return <i />;
+}
+\end{lstlisting}
+\code{reactant check /tmp/ch20/ee.tsx --rule missing-deps} donne, pour \code{E}, \og \code{`k` is used in this effect but not in its deps array, and its value may change between renders}\fg{}, et laisse \code{F} muet. C'est un FP sound (dans la direction \og tirer\fg{}), qui frappe tout composant à retour anticipé ; \code{E} reçoit d'ailleurs aussi l'\Error{} \regle{conditional-hook}, légitime.
+\end{piege}
+
+\subsection{Faux négatifs observés}
+
+La règle hérite des limites du moteur : elle ne voit une valeur changer que si le store d'état a vu l'écriture.
+
+\begin{exemple}{Une écriture que le store ne voit pas}{regles-effets-em3}
+\begin{lstlisting}[language=TypeScript]
+export function C1({ bus2 }: { bus2: any }) {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    window.addEventListener("x", () => setN(5));
+  }, []);
+  useEffect(() => { console.log(n); }, []);
+  return <div>{n}</div>;
+}
+export function C2({ bus2 }: { bus2: any }) {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    bus2.foo(() => setN(5));
+  }, [bus2]);
+  useEffect(() => { console.log(n); }, []);
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+  C1  (4 hooks)  em3.tsx
+    warn   missing-deps  [hook:2]  var:n  (line 7:2)  `n` is used in this effect but not in its deps array, and it is recreated on every render
+       → `n` is read here [hook:2] (line 7:2)
+  C2  (3 hooks)  em3.tsx  ✓
+  C3  (3 hooks)  em3.tsx  ✓
+\end{sortie}
+Dans \code{C1}, le listener \code{addEventListener} est une registration de timing \code{Handler} : l'écriture \code{setN(5)} atteint le store, \code{n} vaut $\{0, 5\}$ et la règle tire. Dans \code{C2} (callback remis à une méthode inconnue) et \code{C3} (le même avec \code{bus2.subscribe}, registrar de timing \code{Unknown}), \code{n} reste la constante 0 dans le store convergé, donc \code{Stable} : la règle est muette alors que \code{n} change vraiment. Le fichier \file{/tmp/ch20/asy.tsx} montre le même silence pour une écriture placée dans une IIFE asynchrone, \code{(async () => { const v = await load(); setN(v); })()}, avec, sous \code{--info}, une assurance \og verified missing-deps\fg{} \emph{fausse}.
+\end{exemple}
+
+Ce n'est pas un défaut de la règle, qui lit correctement ce que le moteur lui donne ; c'est la famille FN des \og callees inconnus\fg{} (\issue{19}, \file{docs/limitations.md}) et le \og gap 4\fg{} de \file{docs/campaign/triage-effects.md} pour l'IIFE. \adr{34} §5 et la marche des écrivains (\cref{chap:relations}) traitent un argument fonction d'un appel inconnu comme un écrivain de phase top ; que cette information n'atteigne pas la valeur du slot lue par la règle est un constat au commit \snapshotCommit, dont la cause précise relève du moteur (\cref{chap:point-fixe-composant}).
+
+
+\section{unnecessary-rerender : l'effet de montage qui écrase l'initialisation}
+\label{sec:regles-effets-unnecessary-rerender}
+
+\regle{unnecessary-rerender} est une règle de conseil, courte et locale. Elle introduit pourtant une idée qui reviendra : une même expression ne s'évalue pas de la même façon selon le \emph{moment} du cycle React qu'on interroge.
+
+\begin{react}[effet de montage et rendu supplémentaire]
+\code{const [x, setX] = useState(A); useEffect(() => { setX(B); }, []);} : au montage, React rend avec \code{A}, commite, exécute l'effet, qui écrit \code{B}, puis rend une seconde fois. Si \code{A} et \code{B} sont deux constantes, le premier rendu est perdu et l'utilisateur peut voir \code{A} un instant. Initialiser directement à \code{B} supprime ce rendu. Une exception : en rendu serveur, le premier rendu client doit reproduire le rendu serveur (hydratation) ; l'idiome \og drapeau de montage\fg{} (\code{useState(false)} passé à \code{true} dans un effet \code{[]}) veut précisément ce second rendu.
+\end{react}
+
+\subsection{Le problème et sa sortie}
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch20/width.tsx}, composant \code{Theme} : deux écritures de montage},label={lst:regles-effets-theme}]
+export function Theme() {
+  const [mode, setMode] = useState("light");
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    setMode("dark");
+    setMounted(true);
+  }, []);
+  return <div className={mode}>{mounted ? "client" : "server"}</div>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  Theme  (3 hooks)  width.tsx
+    warn   unnecessary-rerender  [hook:1]  (line 14:2)  mount-only effect flips state `mounted` from `false` to `true`. The SSR mount-flag idiom costs one extra rerender on every mount; prefer `useSyncExternalStore` for client detection
+       → state `mounted` is written here [hook:2] (line 14:2)
+    warn   unnecessary-rerender  [hook:0]  (line 14:2)  mount-only effect sets state `mode` to a constant different from its initial value, which costs one extra rerender on mount; consider initialising directly with the target value
+       → state `mode` is written here [hook:2] (line 14:2)
+\end{sortie}
+
+Deux \Warning{}, deux conseils. Le label du diagnostic est celui du \emph{slot} (0 pour \code{mode}, 1 pour \code{mounted}), celui de la note est celui de l'effet (2). Les deux findings ont la même position et le même nom de règle ; le tri du registre les départage par message, ce qui explique que \code{mounted} passe avant \code{mode}.
+
+\subsection{Deux évaluations, deux moments}
+
+La règle compare la valeur initiale d'un slot et la valeur qu'y écrit un effet de montage. La valeur initiale est évaluée \emph{au montage}, c'est-à-dire sans rien de ce que le point fixe a accumulé :
+
+\rustsnippet{src/rules/impls/unnecessary_rerender.rs}{62}{82}{la valeur initiale, évaluée avec des stores et un tas vides}
+
+Évaluer l'initialiseur dans les stores convergés serait une erreur de moment : ce qui compte est ce que voit le \emph{premier} rendu. L'argument du setter, lui, est évalué par \code{result.eval_in(&empty_env, a)} (\src{src/rules/impls/unnecessary_rerender.rs}{133}{139}) : un environnement \emph{vide}, mais les stores et le tas \emph{convergés} (\code{ConvergedEval}). La boucle de recherche est un balayage plat :
+
+\rustsnippet{src/rules/impls/unnecessary_rerender.rs}{110}{146}{le balayage des écritures de montage}
+
+Quatre conditions doivent tenir pour chaque instruction : c'est un appel direct \code{setter(...)} en position d'instruction, le setter (alias compris) désigne un slot, sa valeur initiale est \code{Stable}, l'argument est \code{Stable} et différent de la valeur initiale. L'égalité est l'égalité structurelle de \code{StateValue} ; une écriture égale à l'initialisation est l'affaire de \regle{redundant-set-state} (\cref{chap:regles-etat}).
+
+\begin{exemple}{Ce que \og constante\fg{} veut dire}{regles-effets-ur}
+\begin{lstlisting}[language=TypeScript]
+const MOD = "dark";
+export function A() {
+  const [m, setM] = useState("light");
+  const local = "dark";
+  useEffect(() => { setM(local); }, []);
+  return <i>{m}</i>;
+}
+export function B() {
+  const [m, setM] = useState("light");
+  useEffect(() => { setM(MOD); }, []);
+  return <i>{m}</i>;
+}
+export function C() {
+  const [m, setM] = useState("light");
+  useEffect(() => { if (Math.random() > 2) setM("dark"); }, []);
+  return <i>{m}</i>;
+}
+export function D() {
+  const [m, setM] = useState(0);
+  useEffect(() => { setM(1 + 1); }, []);
+  return <i>{m}</i>;
+}
+\end{lstlisting}
+\begin{sortie}
+  A  (2 hooks)  ur.tsx  ✓
+  B  (2 hooks)  ur.tsx  ✓
+  C  (2 hooks)  ur.tsx
+    warn   unnecessary-rerender  [hook:0]  (line 16:2)  mount-only effect sets state `m` to a constant different from its initial value, which costs one extra rerender on mount; consider initialising directly with the target value
+       → state `m` is written here [hook:1] (line 16:2)
+  D  (2 hooks)  ur.tsx
+    warn   unnecessary-rerender  [hook:0]  (line 21:2)  mount-only effect sets state `m` to a constant different from its initial value, which costs one extra rerender on mount; consider initialising directly with the target value
+       → state `m` is written here [hook:1] (line 21:2)
+\end{sortie}
+\code{A} et \code{B} sont muets : \code{local} et \code{MOD} ne sont pas dans l'environnement vide, valent top, et la règle se tait. \code{D} tire : \code{1 + 1} est un littéral calculé, la constante 2. \code{C} tire alors que l'écriture n'a lieu que sur un chemin (qui, ici, n'est jamais pris) : le balayage est plat, sans regard pour le chemin. Le commentaire du code le justifie (\og any const setter call anywhere in a mount-only effect forces the extra render\fg{}), ce qui n'est vrai que pour une écriture inconditionnelle. Sur \code{C}, le rendu supplémentaire n'est que possible.
+\end{exemple}
+
+Ce sont des pertes de précision, pas de soundness : la règle est un conseil. Elle ne compte pas non plus un setter appelé dans un \code{return}, dans un ternaire ou dans un callback imbriqué de l'effet, faute de \code{Stmt::ExprStmt(Expr::Call { ... })}.
+
+\subsection{L'idiome SSR}
+
+\rustsnippet{src/rules/impls/unnecessary_rerender.rs}{148}{156}{le drapeau de montage}
+
+L'idiome reçoit un autre conseil : \og initialiser à la valeur cible\fg{} casserait l'hydratation. Le \Warning{} est conservé, parce que l'idiome a un remplaçant moderne (\code{useSyncExternalStore}). Le conseil s'applique à \emph{toute} bascule \code{false} vers \code{true} de montage, y compris une animation d'entrée qui n'a rien à voir avec la détection du client (\code{isVisible} dans un \code{ScrollEntrance.tsx} du corpus, noté par \file{docs/campaign/triage-2026-09-03-untriaged-clusters.md}) : le message y est inexact, pas le fait (un rendu en plus).
+
+\subsection{Niveau, alias et assurance}
+
+\Warning{} toujours. Sur une écriture inconditionnelle, le fait est certain (un rendu en plus au montage) et son coût incertain ; sur une écriture conditionnelle (\code{C}), le fait lui-même n'est que possible. Les deux lectures mènent au même niveau.
+
+\begin{decision}[ADR-020 §6 : une résolution des setters par corps d'effet]
+Un utilitaire inliné dans l'effet lie son paramètre setter par un alias (\code{let setter = setX}) ; la règle suit ces alias avec \code{resolve_setter_aliases(body_cfg, &setter_to_label)}, \emph{par corps d'effet} (\srcline{src/rules/impls/unnecessary_rerender.rs}{108}). \adr{20} a examiné, et refusé, une résolution unique calculée pour tout le composant et partagée par toutes les règles : un alias défini dans l'effet A fuirait dans l'effet B, et attribuerait une écriture au mauvais slot. Les résolutions divergent entre règles \emph{à dessein} ; une résolution globale serait soit insound, soit vide. \regle{stale-closure} applique la même discipline.
+\end{decision}
+
+Enfin, \src{src/rules/impls/unnecessary_rerender.rs}{36}{53} : l'assurance exige un \code{useState} et un effet dont les deps ont l'arité exacte 0, et s'énonce \og no mount effect overwrites its initial state\fg{}.
+
+
+\section{missing-cleanup : un enregistrement que rien ne défait}
+\label{sec:regles-effets-missing-cleanup}
+
+Avec \regle{missing-cleanup}, on entre dans la seconde famille de défauts annoncée en tête de chapitre : non plus ce que l'effet \emph{lit}, mais ce qu'il \emph{démarre} et ne défait pas. La règle est courte (113 lignes) parce que tout le travail de reconnaissance est fait en amont, par le moteur, dans la relation \relation{registrations} (\adr{34}, \cref{sec:relations-registrations}).
+
+\begin{react}[cleanup d'un effet]
+Une fonction renvoyée par le corps d'un effet est son \emph{cleanup}. React l'appelle avant chaque ré-exécution de l'effet (quand ses deps changent) et au démontage ; en StrictMode et en développement, il monte, démonte et remonte chaque composant au premier montage, donc exécute l'effet deux fois (\cref{sec:react-modele-strictmode}). Un effet qui enregistre un listener, un timer répétitif ou un abonnement sans le défaire en accumule un de plus à chaque exécution ; les anciens continuent de tirer contre un état que le composant n'a plus.
+\end{react}
+
+\subsection{Le problème et sa sortie}
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch20/width.tsx}, composant \code{Width} : un listener jamais retiré},label={lst:regles-effets-width}]
+export function Width() {
+  const [w, setW] = useState(0);
+  useEffect(() => {
+    window.addEventListener("resize", () => setW(window.innerWidth));
+  }, []);
+  return <div>{w}</div>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  Width  (3 hooks)  width.tsx
+    warn   missing-cleanup  [hook:1]  (line 6:4)  this effect calls `window.addEventListener` but returns no cleanup. The registration is repeated every time the effect re-runs (and on every mount, twice under StrictMode) and nothing ever undoes it; return a function that tears it down
+    verified  stale-closure  no long-lived callback captures a stale state value
+\end{sortie}
+
+La position est celle de la registration, non de l'effet. L'assurance de \regle{stale-closure} (le callback ne lit aucun état, seulement \code{setW} et \code{window}) montre au passage que les deux règles lisent la même relation.
+
+\subsection{La relation d'enregistrement}
+
+Une \terme{registration} est un appel, dans le corps d'un effet, qui remet un callback à quelque chose qui survit à l'appel : un timer, la cible d'un événement, un émetteur, une promesse. Le moteur les reconnaît par une table unique de \emph{registrars} (\cref{sec:relations-registrars}), dont chaque ligne porte deux colonnes qui intéressent ce chapitre :
+
+\rustsnippet{src/engine/registrations.rs}{31}{57}{comment et quand un callback enregistré tire}
+
+\code{Firing} dit combien de fois le callback tire : sans borne (\code{Repeating}) ou une fois (\code{Once}). \code{Timing} dit quand il peut tirer par rapport à l'appel qui l'enregistre, et c'est une question de \emph{contrat} : un timer ou une continuation de promesse tire sur un tour ultérieur de la boucle d'événements (\code{Deferred}) ; le DOM n'a pas de dispatch synchrone depuis \code{addEventListener} (\code{Handler}) ; un émetteur reconnu à son seul nom peut appeler le callback sur-le-champ, comme un \code{BehaviorSubject} de RxJS (\code{Unknown}). La \cref{fig:regles-effets-registrars} range les lignes de la table \code{REGISTRARS} (\src{src/engine/registrations.rs}{93}{211}) selon ces deux colonnes.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[
+    cell/.style={draw=ra-gray,minimum width=40mm,minimum height=20mm,align=center,font=\scriptsize,text width=37mm},
+    head/.style={font=\small\bfseries,align=center}]
+  \node[head] at (0,1.5) {\code{Deferred}};
+  \node[head] at (4.2,1.5) {\code{Handler}};
+  \node[head] at (8.4,1.5) {\code{Unknown}};
+  \node[head,anchor=east] at (-2.3,0) {\code{Repeating}};
+  \node[head,anchor=east] at (-2.3,-2.2) {\code{Once}};
+  \node[cell,fill=ra-red!12,very thick,draw=ra-red] (rd) at (0,0) {\code{setInterval}\\[2pt] teardown \code{clearInterval}\\ (par le handle)};
+  \node[cell,fill=ra-red!12,very thick,draw=ra-red] (rh) at (4.2,0) {\code{addEventListener}\\[2pt] teardown \code{removeEventListener}\\ (par le listener)};
+  \node[cell,fill=ra-amber!12] (ru) at (8.4,0) {\code{recv.subscribe}, \code{recv.on},\\ \code{recv.addListener}\\[2pt] (méthodes seulement)};
+  \node[cell] (od) at (0,-2.2) {\code{setTimeout}, \code{setImmediate},\\ \code{requestAnimationFrame},\\ \code{requestIdleCallback},\\ \code{queueMicrotask},\\ \code{.then}, \code{.catch}, \code{.finally}};
+  \node[cell,text=ra-gray] (oh) at (4.2,-2.2) {(aucune ligne)};
+  \node[cell,text=ra-gray] (ou) at (8.4,-2.2) {(aucune ligne)};
+  \draw[ra-blue,very thick,dashed,rounded corners] (-2.2,1.05) rectangle (10.6,-1.05);
+  \node[etiquette,text=ra-blue,anchor=west] at (-2.2,-3.7) {tirets bleus : périmètre de \regle{missing-cleanup} (\code{Repeating})};
+  \node[etiquette,text=ra-red,anchor=west] at (-2.2,-4.1) {cadres rouges : seules lignes où \regle{stale-closure} peut atteindre l'\Error{} (\code{Repeating} et timing prouvé)};
+\end{tikzpicture}
+\caption{La table \code{REGISTRARS} en matrice \code{Firing} $\times$ \code{Timing}. Les lignes \og méthodes seulement\fg{} (\code{method_only}) ne valent que sous la forme \code{recv.nom(...)} ; \code{then}, \code{catch}, \code{finally} aussi. \code{queueMicrotask} et les continuations de promesse n'ont pas de teardown.}
+\label{fig:regles-effets-registrars}
+\end{figure}
+
+La relation est calculée une fois par composant, à la convergence (\code{collect_registrations}, \src{src/engine/registrations.rs}{322}{346}, appelée en \srcline{src/engine/fixpoint.rs}{646}), par un balayage de profondeur 2 : une registration placée dans un helper local appelé par l'effet, ou dans un callback de premier niveau, compte encore ; rien de plus profond. Chaque ligne est une \code{Registration} ; ses derniers champs portent ce que les deux règles liront :
+
+\rustsnippet{src/engine/registrations.rs}{257}{269}{la fin de la ligne \code{Registration}}
+
+Les premiers champs (\src{src/engine/registrations.rs}{238}{256}) sont l'effet porteur (\code{effect}), le nom affiché (\code{display}, par exemple \code{window.addEventListener}), la ligne de table (\code{registrar}), \code{firing}, \code{timing}, le callback tel qu'écrit (\code{callback}) et la liaison qui reçoit la valeur de retour (\code{handle}, le \code{id} de \code{const id = setInterval(...)}). \code{block_id} obéit à un invariant que \regle{stale-closure} exploitera : il n'est renseigné que pour une registration placée au niveau supérieur du corps de l'effet (ou dans un helper appelé en ligne depuis ce niveau) ; dans un callback imbriqué il vaut \code{None}, et une telle registration n'est jamais prouvée atteinte (\src{src/engine/registrations.rs}{584}{588}).
+
+\begin{decision}[ADR-034 : une table, une relation]
+Avant \adr{34}, trois lecteurs posaient la même question aux mêmes sites sans partager la réponse : \regle{stale-closure} et \regle{missing-cleanup} partageaient un balayage dans \code{rules::helpers::registrations}, avec sa propre table ; la marche des écrivains gardait deux listes \code{DEFERRING_*}, libres de diverger ; et la \og phase\fg{} promise par \adr{27} §2 pour un callback enregistré n'existait pas, si bien qu'un callback remis à \code{addEventListener} tombait à top. La décision : une seule table dans \code{engine::registrations}, une colonne par lecteur, et une relation du moteur que les règles lisent au lieu de rebalayer les corps (\adr{42}). Le point de soundness est la colonne \code{timing} : réduire une ligne de \code{Unknown} à \code{Handler} est la seule direction qui peut faire \emph{perdre} un finding, et elle n'est permise que là où le timing est un contrat, pas une devinette sur un nom (\adr{34} §2).
+\end{decision}
+
+\subsection{Le cleanup, fait trois-valué}
+
+\rustsnippet{src/rules/api/query.rs}{1147}{1178}{le verdict de cleanup (le type \code{CleanupVerdict}, l.~1135--1145, a trois variantes : \code{Present}, \code{Absent}, \code{Unknown})}
+
+Chaque bloc \code{Return} du corps de l'effet est classé. Un littéral fonction, ou une variable liée à exactement un littéral fonction (la barre de certitude de \code{fn_lit_binding}), est un cleanup (\code{Present}) ; un \code{return;} nu, ou la fin de corps que le lowering scelle en \code{Return(undefined)}, n'en est pas un (\code{Absent}) ; tout le reste (un appel, une variable importée ou re-liée) est \code{Unknown}. Et un seul \code{Present} suffit.
+
+\begin{invariant}{Seule l'absence est une affirmation}{cleanup-absent}
+\code{CleanupVerdict::Unknown} se replie du côté may : il signifie \og il y a peut-être un cleanup\fg{} et ne peut jamais être lu comme une absence. \code{Absent}, et lui seul, est une affirmation sur laquelle une règle peut agir.
+\end{invariant}
+
+\subsection{La règle}
+
+\rustsnippet{src/rules/impls/missing_cleanup.rs}{56}{84}{un effet sans cleanup qui enregistre quelque chose de répétitif}
+
+Le commentaire de tête (\src{src/rules/impls/missing_cleanup.rs}{15}{30}) donne les deux décisions qui bornent le bruit. \emph{Registrars répétitifs seulement} : un \code{setTimeout} ou un \code{.then} sans cleanup tire au pire une fois, en retard, contre un composant démonté ; c'est un vrai problème, mais un autre (un drapeau d'annulation, pas un teardown), et le signaler sur chaque chaîne de promesses enterrerait le signal. \emph{Absence prouvable seulement} : un effet qui renvoie \emph{quelque chose} a un auteur qui a écrit un teardown, ou quelque chose d'inclassable ; dans les deux cas le conseil serait faux. Le message nomme chaque registrar, dans l'ordre des positions (\src{src/rules/impls/missing_cleanup.rs}{86}{101}) ; il est émis en \Warning{}, jamais en \Error{} : la registration et le teardown peuvent exister tous deux et vivre dans un helper que la règle ne voit pas.
+
+\begin{exemple}{Un émetteur, trois noms}{regles-effets-mc}
+\begin{lstlisting}[language=TypeScript]
+export function M({ a, b }: { a: any; b: any }) {
+  useEffect(() => {
+    a.on("x", () => {});
+    b.subscribe(() => {});
+    a.on("y", () => {});
+  }, [a, b]);
+  return <i />;
+}
+\end{lstlisting}
+\begin{sortie}
+  M  (1 hooks)  mc.tsx
+    warn   missing-cleanup  [hook:0]  (line 4:4)  this effect calls `a.on`, `b.subscribe`, `a.on` but returns no cleanup. The registration is repeated every time the effect re-runs (and on every mount, twice under StrictMode) and nothing ever undoes it; return a function that tears it down
+\end{sortie}
+Les trois lignes sont \code{Repeating}, donc toutes nommées. \code{a.on} apparaît deux fois : \code{names.dedup()} ne retire que les doublons \emph{consécutifs}, et le tri par position intercale \code{b.subscribe}. Défaut cosmétique du message.
+\end{exemple}
+
+\subsection{Ce que la règle ne voit pas}
+
+\begin{piege}
+\textbf{Un cleanup sur un chemin suffit.} Le composant \code{Cond} de \file{/tmp/ch20/sc2.tsx} enregistre un \code{setInterval} sous \code{if (live)} et ne renvoie son cleanup que dans cette branche ; \regle{missing-cleanup} publie \og verified\fg{} (sortie de la \cref{sec:regles-effets-stale-closure}). Ici c'est juste : le chemin sans cleanup n'enregistre rien. Mais le verdict n'est pas sensible au chemin (\og one cleanup on one path is a cleanup\fg{}, \src{src/rules/api/query.rs}{1157}{1159}) : \code{if (tz === "UTC") return () => clearInterval(id);} tait aussi la règle quand l'autre chemin fuit (scénario S-EFF-1 de la campagne à l'aveugle, \file{docs/campaign/triage-effects.md}, gap 3). Ce FN est hors du contrat de la règle, qui est \og ne renvoie aucun cleanup\fg{}.
+\end{piege}
+
+\begin{decision}[\code{cleanup_verdict} plutôt que \code{pairing}]
+Chaque \code{Registration} porte pourtant un fait plus fin, \code{pairing} (\code{Paired}, \code{Unpaired}, \code{Unknown} : le cleanup défait-il \emph{cette} registration, avec le même listener ou le même handle ? \adr{34} §3, amendé par \issue{124}). La règle native ne le lit pas, et le dossier de notes établit que c'est voulu au sens du contrat, sans phrase d'ADR qui le tranche. Trois arguments : la question \og le cleanup ne défait pas cette registration\fg{} est celle d'une autre règle, déclarative, qui s'appuie sur l'ancre \relation{registrations} (\cref{chap:regles-declaratives}) ; \code{Unpaired} couvre aussi \og un cleanup lisible sans le bon teardown\fg{}, et lire \code{pairing} ferait tirer la règle sur des effets qui renvoient un cleanup, ce que sa documentation exclut ; enfin \adr{34} réserve \code{Paired} à la suppression et replie \code{Unknown} du côté may, sans promettre de preuve d'absence.
+\end{decision}
+
+Deux autres limites sont observées : la table n'a pas d'entrée pour les observateurs (\code{ResizeObserver.observe}, \code{MutationObserver.observe} ; scénario S-ASYNC-8), et l'assurance est publiée pour tout composant qui a un \code{useEffect}, même sans aucune registration (\src{src/rules/impls/missing_cleanup.rs}{42}{50}) : \og every effect that starts something long-lived also tears it down\fg{} est alors vrai sans objet.
+
+
+\section{stale-closure : prouver toute la conclusion}
+\label{sec:regles-effets-stale-closure}
+
+\regle{stale-closure} est l'aboutissement du chapitre. Elle réunit tout ce qui précède : la polarité des deps, la stabilité versionnée d'\adr{17}, la relation d'enregistrement d'\adr{34}, la dominance, et la discipline du jeton \code{Certified}. C'est aussi la règle dont l'histoire illustre le mieux ce que veut dire, dans ce projet, \og prouver \emph{toute} la conclusion\fg{}.
+
+\begin{react}[closure périmée d'un callback durable]
+Un callback remis dans un effet à \code{setInterval}, \code{addEventListener}, \code{subscribe} ou \code{.then} survit au rendu qui l'a créé. Il lit les valeurs capturées à ce rendu, et continue de les lire tant que l'effet n'est pas relancé. Trois correctifs canoniques : déclarer la valeur dans les deps (l'effet se relance et réenregistre un callback frais), passer par l'updater fonctionnel (\code{setN(v => v + 1)} reçoit la valeur courante au moment où React applique la mise à jour), ou lire un miroir tenu dans un ref (\code{r.current = n} au rendu, \code{r.current} dans le callback).
+\end{react}
+
+\subsection{Le problème : le compteur figé}
+
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch20/timer.tsx} : la forme canonique et deux variantes},label={lst:regles-effets-timer}]
+import { useState, useEffect } from "react";
+
+export function Timer() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setN(n + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
+  return <div>{n}</div>;
+}
+
+export function Delayed() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const id = setTimeout(() => setN(n + 1), 500);
+    return () => clearTimeout(id);
+  }, []);
+  return <div>{n}</div>;
+}
+
+export function Fixed() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setN((v) => v + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+
+La \cref{fig:regles-effets-timer} déroule \code{Timer} dans le temps. Le callback enregistré au montage a capturé \code{n = 0}. Chaque tick calcule \code{setN(0 + 1)} : le premier fait passer l'état à 1 et provoque un rendu ; l'effet, de deps \code{[]}, n'est pas relancé, et le callback garde sa capture. Les ticks suivants écrivent encore 1, une valeur \code{Object.is}-égale à l'état courant ; l'état n'avance plus jamais.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[x=13mm,y=10mm,
+    ev/.style={bloc,minimum height=9mm,font=\scriptsize,text width=19mm},
+    tk/.style={cfgbloc,font=\scriptsize,text width=19mm,align=center}]
+  \draw[fleche,draw=ra-gray!60] (-0.6,0) -- (10.6,0) node[right,etiquette] {React};
+  \draw[fleche,draw=ra-gray!60] (-0.6,-2.6) -- (10.6,-2.6) node[right,etiquette] {timer};
+  \node[ev] (r1) at (0.4,0) {rendu 1\\ $n = 0$};
+  \node[ev] (c1) at (2.4,0) {commit, effet\\ \code{setInterval(cb)}};
+  \node[tk,draw=ra-red,thick] (cap) at (2.4,-1.3) {\code{cb} capture $n = 0$};
+  \node[tk] (t1) at (4.6,-2.6) {tick 1\\ \code{setN(0 + 1)}};
+  \node[ev] (r2) at (5.9,0) {rendu 2\\ $n = 1$};
+  \node[etiquette,align=center] at (5.9,1.05) {deps \code{[]} : effet non relancé};
+  \node[tk] (t2) at (7.6,-2.6) {tick 2\\ \code{setN(0 + 1)}};
+  \node[tk] (t3) at (9.8,-2.6) {tick 3\\ \code{setN(0 + 1)}};
+  \node[etiquette,align=center] at (8.7,0) {$1 = 1$ : pas de\\ nouvel état};
+  \draw[fleche] (r1) -- (c1);
+  \draw[fleche] (c1) -- (cap);
+  \draw[flechemay] (cap) -- (t1);
+  \draw[fleche] (t1) -- (r2);
+  \draw[flechemay] (cap.east) to[bend left=8] (t2);
+  \draw[flechemay] (cap.east) to[bend left=14] (t3);
+\end{tikzpicture}
+\caption{La capture figée de \code{Timer} (\cref{lst:regles-effets-timer}). Le callback \code{cb} est créé une fois, au rendu 1 ; toutes ses exécutions (flèches pointillées) lisent la même copie $n = 0$. L'état passe à 1 au premier tick, puis n'avance plus.}
+\label{fig:regles-effets-timer}
+\end{figure}
+
+La sortie, restreinte à deux règles avec \code{--rule stale-closure --rule missing-deps --show-clean} :
+
+\begin{sortie}
+  Delayed  (2 hooks)  timer.tsx
+    warn   missing-deps  [hook:1]  var:n  (line 14:2)  `n` is used in this effect but not in its deps array, and it is recreated on every render
+       → `n` is read here [hook:1] (line 14:2)
+    warn   stale-closure  [hook:1]  var:n  (line 15:10)  `n` is captured by the `setTimeout` callback registered in this mount-only effect, so the callback outlives the render and keeps reading the mount-time value after `n` changes
+       → `setTimeout` has side effects (subscriptions/requests/timers re-fire on every call) [hook:1] (line 15:10)
+       → `n` is captured at registration time, so the callback keeps this value, not the latest one [hook:0] (line 15:10)
+       → state `n` is written here [hook:0]
+  Fixed  (2 hooks)  timer.tsx  ✓
+  Timer  (2 hooks)  timer.tsx
+    warn   missing-deps  [hook:1]  var:n  (line 5:2)  `n` is used in this effect but not in its deps array, and it is recreated on every render
+       → `n` is read here [hook:1] (line 5:2)
+    error  stale-closure  [hook:1]  var:n  (line 6:10)  the `setInterval` callback registered by this mount-only effect reads `n` and writes it back. `n` was captured once at mount, so every firing recomputes from the same frozen value and the state can never advance past its first update
+       → `setInterval` has side effects (subscriptions/requests/timers re-fire on every call) [hook:1] (line 6:10)
+       → `n` is captured at registration time, so the callback keeps this value, not the latest one [hook:0] (line 6:10)
+       → state `n` is written here [hook:0]
+\end{sortie}
+
+Trois composants, trois niveaux. \code{Timer} reçoit l'\Error{} ; \code{Delayed}, dont le callback ne tire qu'une fois, un \Warning{} ; \code{Fixed}, qui passe par l'updater fonctionnel, rien. \regle{missing-deps} signale les deux premiers aussi, mais elle ne dit que \og \code{n} n'est pas déclaré\fg{} ; \regle{stale-closure} dit ce qui \emph{s'ensuit}. La note \code{Write} n'a pas de position : l'écriture est le \code{Return} du corps concis \code{() => setN(n + 1)}, qui ne porte pas de position d'instruction.
+
+\subsection{Prouver la conséquence}
+
+Le commentaire de tête de la règle (\src{src/rules/impls/stale_closure.rs}{26}{64}) la sépare nettement de \regle{missing-deps} : celle-ci a la parité eslint, \emph{toute} capture non couverte ; \regle{stale-closure} prouve la \emph{conséquence}. Trois faits s'enchaînent. Le domaine de versions dit que le slot ne change qu'aux écritures de son setter ; les deps disent que l'effet n'est jamais relancé à ces écritures ; la registration dit que la copie périmée continue de s'exécuter. Et quand le callback \emph{écrit} le slot qu'il lit, le gel est auto-infligé et certain.
+
+\subsection{Le chemin d'un finding}
+
+\code{check} (\src{src/rules/impls/stale_closure.rs}{215}{468}) se lit en cinq étapes.
+
+\paragraph{1. Préparation, par composant.} Les alias d'état du rendu (\code{resolve_setter_aliases} sur \code{state_val_labels}), ceux des memos, la table setter vers slot (\code{all_setter_labels}), l'ensemble des slots \emph{peut-être écrits} (\code{may_written_slots}), les fonctions liées du rendu et la table des corps de \code{useCallback} (l.~220--239). \code{may_written_slots} (\src{src/engine/setters.rs}{2194}{2207}) rend les slots dont le setter, ou un alias, est référencé quelque part dans le composant : appelé, passé en prop, capturé.
+
+\paragraph{2. Par effet.} Un effet sans argument de deps est sauté : il se relance à chaque rendu, chaque registration reçoit une capture fraîche (la fuite de l'ancienne est un problème de cleanup, pas de péremption). Un argument illisible \emph{n'est pas} ce cas : il est vérifié \og rien couvert\fg{}. La liste déclarée est la vue \code{covering} (\cref{inv:polarite-deps}), et \code{mount_only} vaut \code{arity == Exact(0)} (l.~253--266). Les registrations sont celles de la relation du moteur, filtrées sur l'effet : pas de second balayage (l.~272--280). Enfin les alias sont \emph{réensemencés par corps d'effet} (l.~284), pour qu'un \code{const cur = n} de l'effet A ne fuie pas dans l'effet B (\adr{20} §6).
+
+\paragraph{3. Résoudre le callback.} La registration porte le callback \emph{tel qu'écrit} ; il faut en trouver le corps.
+
+\rustsnippet{src/rules/impls/stale_closure.rs}{76}{114}{du callback écrit à un corps}
+
+Un littéral fonction se résout à lui-même. Une variable se résout par \code{fn_lit_binding}, d'abord dans le corps de l'effet, puis dans le rendu, puis dans la table des \code{useCallback} ; tout autre cas (un import, une liaison conditionnelle \code{let cb = a ? f : g}) rend \code{None}, et la registration est \emph{sautée}. Une exception, décisive : une variable callback \emph{elle-même déclarée dans les deps} rend \code{None} exprès (\og identity-covered\fg{}). L'effet se relance dès que l'identité de la fonction change, et une closure du rendu change d'identité chaque fois que ses captures changent : la réinscription porte une capture fraîche.
+
+\paragraph{4. Chaque capture.} Les captures sont les chemins libres du corps du callback, moins ses paramètres, triés (l.~300--304). Pour chacune qui n'est pas couverte :
+\begin{itemize}
+  \item sa racine est résolue en slots par \code{resolve_root_slots} (\src{src/rules/impls/stale_closure.rs}{126}{172}), d'abord \emph{syntaxiquement} par les alias d'état (c'est ce qui fait marcher les slots primitifs : un compteur a une composante référence \code{Bottom}, la conversion \code{Versioned} ne s'y applique pas), puis par la valeur évaluée : \code{Versioned(labels)} donne les slots locaux et un drapeau \code{foreign} pour ceux d'un autre composant, \code{VersionedTop} donne \code{foreign} ;
+  \item une racine qui ne se résout en aucun slot (un ref, une valeur \code{Stable}, un setter) est ignorée ;
+  \item les slots locaux jamais écrits sont retirés ; s'il ne reste rien et rien d'étranger, la capture est ignorée (kill \og jamais écrit\fg{}) ;
+  \item on cherche, pour le témoin, si le callback écrit lui-même un slot capturé : c'est \code{self_write}, calculé par \code{collect_setter_calls_with_extra} à profondeur 2 ;
+  \item on demande la preuve d'\Error{} à \code{must_stale_capture}.
+\end{itemize}
+
+\rustsnippet{src/rules/impls/stale_closure.rs}{343}{354}{la sévérité vient du jeton, et de lui seul}
+
+\paragraph{5. Dédoublonner et émettre.} Les candidats sont rangés par chemin dans un \code{BTreeMap} ; pour un même chemin on garde la meilleure sévérité, puis la registration la plus tôt dans le source (l.~356--386). Chaque finding reçoit l'un de trois gabarits de message (\Error{} ; \Warning{} d'un effet de montage ; \Warning{} d'un effet à deps non vides), la position de la registration et un témoin : \code{Step::Call} (le registrar), \code{Step::Resolve} si le callback est une variable nommée, \code{Step::Capture}, et \code{Step::Write} si une auto-écriture a été trouvée (l.~390--463).
+
+\subsection{La preuve d'Error : cinq faits must}
+
+\rustsnippet[label={lst:regles-effets-must-stale}]{src/rules/api/query.rs}{942}{989}{la primitive \code{must_stale_capture}}
+
+La primitive re-dérive tout depuis la registration brute et les corps, plutôt que de faire confiance à des faits calculés par la règle : une preuve d'un conjoint ne peut ainsi pas tenir lieu de la conclusion. Elle frappe un \code{Certified<StaleCapture>} si et seulement si cinq faits tiennent, tous must :
+\begin{enumerate}
+  \item l'effet est de montage : deps \code{[]} exactement, il ne réenregistre jamais ;
+  \item le registrar est \code{Repeating} : le callback tire sans borne ;
+  \item son \code{timing} n'est pas \code{Unknown} : il tire \emph{après} l'appel qui l'enregistre, donc seuls \code{setInterval} et \code{addEventListener} qualifient (\cref{fig:regles-effets-registrars}) ;
+  \item la registration est au niveau supérieur du corps (\code{block_id} renseigné) et sur tous ses chemins (\code{on_all_paths}) ;
+  \item le callback appelle un setter d'un slot capturé, par une instruction de niveau supérieur ou le \code{Return} d'un corps concis, sur tous ses chemins.
+\end{enumerate}
+
+\code{on_all_paths} (\src{src/engine/dominance.rs}{69}{92}) est un parcours depuis l'entrée qui évite l'ensemble de blocs donné ; atteindre un bloc sans successeur en dehors de l'ensemble réfute la propriété. La \cref{fig:regles-effets-conjonction} dessine la conjonction, avec pour chaque feuille (flèche pointillée) le test d'intégration qui la réfute seule et vérifie que le finding retombe en \Warning.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[
+    racine/.style={bloc,draw=ra-red,very thick,text width=24mm},
+    feuille/.style={bloc,text width=46mm,align=left},
+    test/.style={cfgbloc,text width=50mm,align=left}]
+  \node[racine] (root) at (0,0) {\Error{} \regle{stale-closure}\\ $=$ \code{Certified<}\\\code{StaleCapture>}\\[2pt] {\scriptsize conjonction ($\wedge$)}};
+  \foreach \i/\txt/\tst in {
+      1/{deps \code{[]} exactement (\code{Arity::Exact(0)})}/{\code{non_empty_deps_uncovered_capture_warns}\\ \code{[mode]}, l.~239},
+      2/{\code{firing == Repeating}}/{\code{then_capture_warns_not_error}\\ \code{fetch(url).then(...)}, l.~179},
+      3/{\code{timing != Unknown}}/{\code{name_matched_registrar_warns_not_error}\\ \code{registry.on("init", ...)}, l.~260},
+      4/{registration au niveau supérieur, sur tous les chemins du corps de l'effet}/{\code{conditional_registration_warns}\\ \code{if (props.enabled) setInterval}, l.~218},
+      5/{écriture d'un setter capturé, au niveau supérieur, sur tous les chemins du callback}/{\code{conditional_self_write_warns_not_error}\\ \code{if (props.live) setN(n + 1)}, l.~282}} {
+    \node[feuille] (f\i) at (5.0,{2.8-1.4*\i+1.4}) {\scriptsize\txt};
+    \node[test] (t\i) at (11.4,{2.8-1.4*\i+1.4}) {\scriptsize\tst};
+    \draw[flechemust] (root.east) -- (f\i.west);
+    \draw[flechemay] (t\i.west) -- (f\i.east);
+  }
+\end{tikzpicture}
+\caption{La conjonction de \code{must_stale_capture} (\cref{lst:regles-effets-must-stale}). À droite, pour chaque feuille, le test de \file{tests/stale_closure.rs} qui la rend fausse (toutes les autres restant vraies) et exige un \Warning{} au lieu de l'\Error. La feuille 2 est aussi réfutée par \code{set_timeout_self_write_warns} (l.~200).}
+\label{fig:regles-effets-conjonction}
+\end{figure}
+
+\begin{decision}[\#142 : une preuve de \emph{toute} la conclusion]
+Jusqu'à \issue{142}, l'\Error{} de \regle{stale-closure} était frappée d'un jeton \code{Certified<OnAllPaths>} prouvant seulement que la registration était atteinte. Les deux autres conjoints étaient des faits may : le registrar pouvait n'être reconnu qu'à son nom (\code{on}, \code{subscribe}, \code{addListener}, tous \code{Repeating} dans la table), et l'auto-écriture pouvait être \emph{n'importe quelle} écriture, conditionnelle ou imbriquée. Deux programmes l'ont montré : \code{const registry = { on(name, fn) { fn(); } };} dont la méthode \code{on} appelle le callback une fois, synchronement, et jamais plus ; et un intervalle dont l'écriture est sous \code{if (Math.random() > 2)}. Les deux recevaient l'\Error. La cause racine : le typestate garantissait qu'une \Error{} tient \emph{une} preuve, pas que la preuve couvre l'affirmation. Le correctif suit le patron déjà appliqué par \code{must_frozen_seed} et \code{must_effect_cycle} : une primitive must \emph{par affirmation d'\Error}, qui ne frappe que si tous les conjoints sont prouvés. L'alternative, garder une preuve partielle et documenter la limite, contredisait l'invariant du projet : une \Error{} est la preuve de toute la conclusion, pas d'un seul conjoint.
+\end{decision}
+
+\begin{decision}[wontfix \#42 : l'heuristique de nom d'émetteur]
+Une méthode maison nommée \code{on}, \code{addListener} ou \code{subscribe} sur un objet qui n'est pas un émetteur peut donner un \Warning{} \regle{stale-closure} (et \regle{missing-cleanup}). L'issue \issue{42} est fermée \code{wontfix} au motif d'un coût borné : plafond \Warning{} par construction. Ce motif était faux avant \issue{142} ; il est vrai depuis, parce que ces lignes sont \code{Timing::Unknown} et que \code{must_stale_capture} les refuse. La décision couvre aussi l'ancre déclarative \relation{registrations} (\adr{34} §6, \issue{116}).
+\begin{lstlisting}[language=TypeScript]
+const bus = { on(name: string, fn: () => void) { fn(); } };
+export function Emitter() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    bus.on("init", () => setN(n + 1));
+  }, []);
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+  Emitter  (2 hooks)  wontfix.tsx
+    warn   missing-cleanup  [hook:1]  (line 16:4)  this effect calls `bus.on` but returns no cleanup. The registration is repeated every time the effect re-runs (and on every mount, twice under StrictMode) and nothing ever undoes it; return a function that tears it down
+    warn   stale-closure  [hook:1]  var:n  (line 16:4)  `n` is captured by the `bus.on` callback registered in this mount-only effect, so the callback outlives the render and keeps reading the mount-time value after `n` changes
+       → `bus.on` has side effects (subscriptions/requests/timers re-fire on every call) [hook:1] (line 16:4)
+       → `n` is captured at registration time, so the callback keeps this value, not the latest one [hook:0] (line 16:4)
+       → state `n` is written here [hook:0]
+\end{sortie}
+La forme de \code{Emitter} est exactement celle de \code{Timer}, et c'est justement le cas où l'\Error{} serait fausse : ici \code{bus.on} appelle \code{fn} une fois, sur-le-champ.
+\end{decision}
+
+\begin{remarque}
+Le témoin et la preuve n'ont pas la même exigence. \code{self_write}, qui nourrit la note \code{Step::Write}, accepte une écriture conditionnelle ou à profondeur 2 ; \code{must_stale_capture} n'accepte qu'une écriture de niveau supérieur sur tous les chemins. Un \Warning{} peut donc montrer \og state \code{n} is written here\fg{} sans être une \Error{} : c'est le composant \code{Live} de \file{/tmp/ch20/variants.tsx}, dont l'écriture est sous \code{if (live)}. On retrouve la leçon d'\adr{38} : une écriture est une écriture où qu'elle soit écrite (pour un lecteur may), et une certitude seulement quelquefois (pour un lecteur must).
+\end{remarque}
+
+\subsection{Les silences, et ce qui les justifie}
+
+Chacun des kills listés par le commentaire de tête (\src{src/rules/impls/stale_closure.rs}{53}{64}) est une preuve que la capture ne peut pas se périmer.
+
+\begin{exemple}{Quatre composants, quatre verdicts}{regles-effets-sc2}
+\begin{lstlisting}[language=TypeScript]
+export function Scroll() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const h = () => setN(n + 1);
+    window.addEventListener("scroll", h);
+    return () => window.removeEventListener("scroll", h);
+  }, []);
+  return <i>{n}</i>;
+}
+export function Mirror() {
+  const [n, setN] = useState(0);
+  const r = useRef(n);
+  r.current = n;
+  useEffect(() => {
+    const id = setInterval(() => console.log(r.current), 1000);
+    return () => clearInterval(id);
+  }, []);
+  return <button onClick={() => setN(n + 1)}>{n}</button>;
+}
+export function Never() {
+  const [n] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => console.log(n), 1000);
+    return () => clearInterval(id);
+  }, []);
+  return <i>{n}</i>;
+}
+export function Cond({ live }: { live: boolean }) {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    if (live) { const id = setInterval(() => setN(n + 1), 1000); return () => clearInterval(id); }
+  }, []);
+  return <i>{n}</i>;
+}
+\end{lstlisting}
+Avec \code{--rule stale-closure --rule missing-cleanup --info --show-clean --trace} (sortie abrégée aux lignes de ces deux règles) :
+\begin{sortie}
+  Cond  (2 hooks)  sc2.tsx
+    warn   stale-closure  [hook:1]  var:n  (line 32:22)  `n` is captured by the `setInterval` callback registered in this mount-only effect, so the callback outlives the render and keeps reading the mount-time value after `n` changes
+       → `setInterval` has side effects (subscriptions/requests/timers re-fire on every call) [hook:1] (line 32:22)
+       → `n` is captured at registration time, so the callback keeps this value, not the latest one [hook:0] (line 32:22)
+       → state `n` is written here [hook:0]
+    verified  missing-cleanup  every effect that starts something long-lived also tears it down
+  Mirror  (4 hooks)  sc2.tsx  ✓
+    verified  missing-cleanup  every effect that starts something long-lived also tears it down
+    verified  stale-closure  no long-lived callback captures a stale state value
+  Never  (2 hooks)  sc2.tsx  ✓
+    verified  missing-cleanup  every effect that starts something long-lived also tears it down
+    verified  stale-closure  no long-lived callback captures a stale state value
+  Scroll  (2 hooks)  sc2.tsx
+    error  stale-closure  [hook:1]  var:n  (line 6:4)  the `window.addEventListener` callback registered by this mount-only effect reads `n` and writes it back. `n` was captured once at mount, so every firing recomputes from the same frozen value and the state can never advance past its first update
+       → `window.addEventListener` has side effects (subscriptions/requests/timers re-fire on every call) [hook:1] (line 6:4)
+       → `h` is a function defined in this file
+       → `n` is captured at registration time, so the callback keeps this value, not the latest one [hook:0] (line 6:4)
+       → state `n` is written here [hook:0]
+    verified  missing-cleanup  every effect that starts something long-lived also tears it down
+\end{sortie}
+\code{Scroll} : le listener est une variable, résolue dans le corps de l'effet (d'où la note \og \code{h} is a function defined in this file\fg{}, un \code{Step::Resolve}) ; \code{addEventListener} a le timing \code{Handler} ; les cinq faits tiennent, \Error. \code{Mirror} : le callback lit \code{r}, un ref \code{Stable}, qui ne se résout en aucun slot ; silence, c'est le correctif du miroir. \code{Never} : \code{n} est un état, mais son setter n'est jamais référencé ; le slot ne peut pas changer, silence (kill \og jamais écrit\fg{}). \code{Cond} : la registration est dans la branche \code{then}, \code{on_all_paths} échoue sur la feuille 4, \Warning.
+\end{exemple}
+
+Trois autres silences complètent la liste. L'\emph{updater fonctionnel} (\code{Fixed}) : le callback ne lit plus \code{n}, seulement le paramètre \code{v}. L'\emph{effet sans tableau de deps} : le composant \code{NoDeps} de \file{/tmp/ch20/variants.tsx}, un \code{setInterval(() => setN(n + 1))} dans un \code{useEffect} sans deuxième argument, est muet ; chaque rendu réenregistre une capture fraîche. La \emph{couverture par identité} mérite un exemple, car elle met en jeu trois règles à la fois.
+
+\begin{exemple}{\code{tick} dans les deps, puis hors des deps}{regles-effets-tick}
+\begin{lstlisting}[language=TypeScript]
+export function Tick() {
+  const [n, setN] = useState(0);
+  const tick = () => setN(n + 1);
+  useEffect(() => {
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [tick]);
+  return <i>{n}</i>;
+}
+\end{lstlisting}
+Avec \code{[tick]}, \regle{stale-closure} publie \og verified\fg{} : \code{resolve_callback} voit que la variable callback est une dep, et rend \code{None}. Parmi les règles de ce chapitre, le seul finding de ce composant est un \Warning{} \regle{always-unstable-deps} sur \code{tick}, une closure neuve à chaque rendu (sortie de \code{Tick} dans \file{/tmp/ch20/beh.tsx}) : l'effet se réenregistre à chaque rendu, ce qui est précisément ce qui rend la capture fraîche. \regle{infinite-loop} (\cref{chap:infinite-loop}) tire aussi : une dep qui échoue à chaque rendu équivaut, pour cette règle, à une absence de garde, et \code{n} diverge pendant l'analyse comme dans le \code{Counter} du \cref{sec:regles-effets-info}. Avec \code{[]} à la place (\file{/tmp/ch20/tick2.tsx}) :
+\begin{sortie}
+  Tick  (2 hooks)  tick2.tsx
+    warn   missing-deps  [hook:1]  var:tick  (line 5:2)  `tick` is used in this effect but not in its deps array, and it is recreated on every render
+       → `tick` is read here [hook:1] (line 5:2)
+    error  stale-closure  [hook:1]  var:n  (line 6:10)  the `setInterval` callback registered by this mount-only effect reads `n` and writes it back. `n` was captured once at mount, so every firing recomputes from the same frozen value and the state can never advance past its first update
+       → `setInterval` has side effects (subscriptions/requests/timers re-fire on every call) [hook:1] (line 6:10)
+       → `tick` is a function defined in this file
+       → `n` is captured at registration time, so the callback keeps this value, not the latest one [hook:0] (line 6:10)
+       → state `n` is written here [hook:0]
+\end{sortie}
+\code{tick} est résolu dans le rendu par \code{fn_lit_binding} ; son corps concis écrit \code{n} sur tous ses chemins ; \Error. \regle{always-unstable-deps} se tait (deps vides) ; \regle{missing-deps} dit ici \og recreated on every render\fg{} à juste titre, \code{tick} étant une fonction.
+\end{exemple}
+
+\subsection{Niveaux, limites et assurance}
+
+Tout ce qui survit aux kills tire au moins un \Warning{} : un registrar à tir unique (fenêtre de péremption bornée), un registrar reconnu au nom, des deps non vides (le gel dure jusqu'au changement d'une dep sans rapport, composant \code{Mode} de \file{/tmp/ch20/variants.tsx}), une registration ou une auto-écriture conditionnelle ou imbriquée, un slot étranger ou inconnu. Un slot étranger (\code{foreign}) plafonne à \Warning{} et ne bénéficie pas du kill \og jamais écrit\fg{} : rien de local ne permet de prouver quoi que ce soit contre lui (\src{src/rules/impls/stale_closure.rs}{116}{124}).
+
+\begin{piege}
+\textbf{Un callback non résolu est sauté.} Un callback importé, lié conditionnellement ou caché derrière un wrapper non inliné fait rendre \code{None} à \code{resolve_callback}, et la registration est ignorée : c'est un FN documenté (\issue{24}), le prix de la barre de certitude de \code{fn_lit_binding}. Le kill \og jamais écrit\fg{} est, lui, syntaxique : le domaine n'a pas de bit \og jamais écrit\fg{} (\issue{41}), si bien que \regle{missing-deps}, qui n'a pas ce kill, exige encore la dep d'un état jamais écrit.
+\end{piege}
+
+L'assurance est publiée quand un effet à deps déclarées porte au moins une ligne de \relation{registrations} (\src{src/rules/impls/stale_closure.rs}{198}{213}) : \og no long-lived callback captures a stale state value\fg{}. Le corpus ne contient aucun \regle{stale-closure} (\file{docs/campaign/AUDIT.md}) ; l'audit juge ce zéro sain, les bases maintenues passant par l'updater fonctionnel.
+
+
+\section{Synthèse : ce que les règles d'effets se partagent}
+\label{sec:regles-effets-synthese}
+
+Les huit règles de ce chapitre sont indépendantes : aucune n'appelle une autre, chacune lit l'\code{AnalysisResult} convergé à sa façon. Elles partagent pourtant cinq mécanismes, qui sont la vraie matière du chapitre ; le \cref{tab:regles-effets-synthese} les récapitule règle par règle, avec les constats faits pendant la rédaction.
+
+\paragraph{1. Une liste de deps se lit dans une polarité.} Lue pour tirer, elle rend tous ses éléments visibles (\regle{always-unstable-deps}) ; lue pour se taire, elle rend seulement ceux qui couvrent vraiment une lecture (\regle{missing-deps}, \regle{stale-closure}). \code{DepsList::covering} est le seul endroit du code où la différence est faite, et un argument \code{Opaque} n'est ni \code{Absent} ni \code{[]} (\cref{inv:polarite-deps}).
+
+\paragraph{2. Une valeur s'évalue à un moment.} L'environnement de sortie du rendu, joint sur tous les \code{Return}, sert aux règles qui demandent \og ce que le rendu voit\fg{} ; les stores et le tas convergés servent à évaluer une dep ou un membre ; des stores vides servent à évaluer ce que voit le \emph{premier} rendu (\regle{unnecessary-rerender}). Se tromper de moment est une erreur de sémantique, pas de précision : un tas vide rendait \regle{always-unstable-deps} et \regle{missing-deps} muettes sur les membres (\issue{135}).
+
+\paragraph{3. Un fait du moteur n'est calculé qu'une fois.} \relation{registrations} (\adr{34}) est lue par \regle{missing-cleanup} et \regle{stale-closure}, qui balayaient autrefois les mêmes corps chacune de son côté ; \code{EffectInfo} est lu par quatre règles ; \code{widen_trace} par \regle{widening-info} et \regle{infinite-loop}. C'est la frontière d'\adr{42} : les règles ne parcourent pas l'IR pour y retrouver un fait que le moteur sait produire.
+
+\paragraph{4. Une \Error{} est la preuve de toute la conclusion.} Deux règles seulement peuvent en produire, et chacune reçoit son jeton d'une primitive unique de \file{src/rules/api/query.rs} qui quantifie à sa place : \og pour toute sortie\fg{} (\code{hook_is_conditional}), \og les cinq faits\fg{} (\code{must_stale_capture}). L'histoire de \issue{142} montre que le typestate seul ne suffit pas : il garantit qu'une \Error{} tient \emph{une} preuve ; c'est la discipline \og une primitive par affirmation\fg{} qui garantit que la preuve couvre l'affirmation.
+
+\paragraph{5. Un silence n'est une preuve que si l'analyse a regardé.} Chaque kill est une preuve d'impossibilité (\cref{def:kill}), et là où l'analyse renonce, \regle{analysis-limit} le dit et retire les assurances du composant. Les FN constatés de ce chapitre sont presque tous en amont des règles : hooks non extraits, écritures que le store ne voit pas.
+
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}p{2.9cm}p{1.6cm}p{4.4cm}p{5.4cm}@{}}
+\toprule
+Règle & Deps lues & Kills (preuves de silence) & Constats au commit \snapshotCommit{} \\
+\midrule
+\regle{widening-info} & --- & --- & handlers non tracés \\
+\regle{analysis-limit} & --- & --- & doc : 6 puis 4 cas annoncés, 7 émis \\
+\regle{conditional-hook} & --- & bloc qui domine toutes les sorties atteignables & FN : hook en membre droit d'affectation ou de \code{&&} ; assurance vide pour un composant sans hook \\
+\regle{always-unstable-deps} & tirer & primitif, \code{Versioned}, top, \code{[]} & FP : source d'un spread de primitifs \\
+\regle{missing-deps} & se taire & couvert, pin, globale, racine, préfixe, comportement & FP : retour anticipé (top par join), \issue{40} ; FN : écritures invisibles au store (\issue{19}) ; message \og recreated\fg{} pour un nombre \\
+\regle{unnecessary-rerender} & arité 0 & init ou argument non \code{Stable}, argument égal & écriture conditionnelle comptée ; variable en argument ignorée \\
+\regle{missing-cleanup} & --- & cleanup présent ou inconnu, registrar \code{Once} & non sensible au chemin (S-EFF-1) ; pas d'observateurs ; doublon non consécutif \\
+\regle{stale-closure} & se taire & couvert (y compris par identité), ref ou \code{Stable}, updater, pas de deps, jamais écrit & FN : callback non résolu (\issue{24}) ; FP \Warning{} : \issue{42} \\
+\bottomrule
+\end{tabular}
+\caption{Synthèse des huit règles : polarité de lecture des deps, kills, et constats observés pendant la rédaction.}
+\label{tab:regles-effets-synthese}
+\end{table}
+
+
+\begin{resume}
+\begin{itemize}
+  \item Huit règles natives portent sur les effets et les hooks à deps. Deux sont des \Info{} de limite (\regle{widening-info}, \regle{analysis-limit}), deux peuvent produire une \Error{} (\regle{conditional-hook}, toujours ; \regle{stale-closure}, sous preuve), quatre plafonnent à \Warning{} par construction.
+  \item \regle{analysis-limit} n'est pas qu'un avis : un seul de ses diagnostics retire toutes les assurances \code{verified} du composant, et le compte en est publié (\code{suspended}).
+  \item \regle{conditional-hook} est une question de dominance : un hook est conditionnel si son bloc ne domine pas toutes les sorties \emph{atteignables} du CFG de rendu. Le jeton \code{Certified<ConditionalHookCall>} vient de \code{hook_is_conditional}.
+  \item \regle{always-unstable-deps} tire sur la borne must \code{PerRender} d'une valeur qui n'est qu'une référence ; \code{Versioned} se tait (\adr{17}), et ce silence est couplé au bras churn d'\regle{infinite-loop}.
+  \item \regle{missing-deps} raisonne sur des chemins d'accès, couvre par préfixe, lit les deps pour se taire (\code{covering}) et ne se tait que sur preuve : racine, préfixe ou comportement stables.
+  \item \regle{unnecessary-rerender} compare la valeur initiale évaluée \emph{au montage} à une écriture constante d'un effet \code{[]}.
+  \item \regle{missing-cleanup} et \regle{stale-closure} lisent la relation \relation{registrations} (\code{Firing}, \code{Timing}, \code{block_id}) ; le cleanup est trois-valué et seule l'absence est une affirmation.
+  \item L'\Error{} de \regle{stale-closure} exige cinq faits must, re-dérivés par \code{must_stale_capture} : deps \code{[]}, \code{Repeating}, timing prouvé, registration et auto-écriture sur tous les chemins (\issue{142}).
+\end{itemize}
+{\sloppy Fichiers rencontrés : \file{src/rules/impls/}, les huit fichiers du \cref{tab:regles-effets-carte}, \file{src/rules/api/query.rs} (\code{ExitDominance}, \code{cleanup_verdict}, \code{must_stale_capture}), \file{src/engine/registrations.rs}, \file{src/ir/hooks.rs} (\code{DepsArg}, \code{DepsList::covering}), \file{src/ir/free_vars.rs} (\code{AccessPath}, \code{path_covered}), \file{src/rules/registry.rs} (suspension, \code{located}, tri). Le \cref{chap:regles-rendu-rsc} quitte le domaine des valeurs pour la dépendance de rendu et le graphe de modules de Next.js.\par}
+\end{resume}
+
+\section{Exercices}
+\label{sec:regles-effets-exercices}
+
+\begin{exercice}{Préfixes}{regles-effets-prefixes}
+Un effet lit \code{x.a} (\code{useEffect(() => { use(x.a); }, D)}, avec \code{x} une prop). Prédire la sortie de \regle{missing-deps} pour $D$ = \code{[x.b]}, \code{[x]}, \code{[x.a.b]}, puis pour un corps qui lit \code{x.a[i].b} sous \code{[x.a, i]}.
+\end{exercice}
+\begin{solution}
+\code{[x.b]} : tire sur \code{x.a} (le préfixe \code{x.b} n'est pas un préfixe de \code{x.a}, et la liste nomme la racine \code{x}, donc le chemin est rapporté tel quel). \code{[x]} : muet. \code{[x.a.b]} : tire, un chemin déclaré plus long que le chemin lu ne le couvre pas. \code{x.a[i].b} : coupé en \code{x.a} par l'index dynamique, couvert par \code{x.a} ; muet. Sortie observée sur \file{/tmp/ch20/paths.tsx} (\cref{ex:regles-effets-paths}).
+\end{solution}
+
+\begin{exercice}{Polarité en une phrase}{regles-effets-polarite}
+Pourquoi \code{[...rows]} ne couvre-t-il pas une lecture de \code{rows}, alors qu'\regle{always-unstable-deps} peut tirer sur \code{rows} ? Répondre en une phrase, puis dire si le tir d'\regle{always-unstable-deps} est toujours juste.
+\end{exercice}
+\begin{solution}
+React compare \code{rows[0]}, \code{rows[1]}, etc., jamais \code{rows} : pour se taire, il faut une entrée qui couvre la lecture, ce que la source d'un spread n'est pas ; pour tirer, chaque élément visible sur-approxime ce qu'il représente, ce qui ne crée jamais de FN. Le tir n'est pas toujours juste : si les éléments de \code{rows} sont des primitifs, le \Warning{} est un FP (\file{/tmp/ch20/spread2.tsx}, \cref{sec:regles-effets-always-unstable}).
+\end{solution}
+
+\begin{exercice}{Faire varier Timer}{regles-effets-timer}
+Partir de \code{Timer} (\cref{lst:regles-effets-timer}) et obtenir successivement : un \Warning{} en changeant seulement les deps ; un \Warning{} en ne touchant que le corps du callback ; une \Error{} avec un callback qui contient un \code{if} ; un silence sans toucher aux deps. Pour chaque cas, nommer la feuille de la \cref{fig:regles-effets-conjonction} en jeu.
+\end{exercice}
+\begin{solution}
+Deps \code{[mode]} : \Warning{} (feuille 1, composant \code{Mode}). \code{() => { if (live) setN(n + 1); }} : \Warning{} (feuille 5, \code{Live}). \code{() => { if (up) { setN(n + 1); } else { setN(n - 1); } }} : \Error{}, l'écriture est sur tous les chemins du callback (\code{UpDown}). Silence : \code{setN((v) => v + 1)} (updater fonctionnel, \code{Fixed}) ou un miroir \code{r.current} (\code{Mirror}). Sorties observées sur \file{/tmp/ch20/variants.tsx}, \file{timer.tsx} et \file{sc2.tsx} ; les tests \code{non_empty_deps_uncovered_capture_warns}, \code{conditional_self_write_warns_not_error} et \code{self_write_on_every_branch_errors} de \file{tests/stale_closure.rs} épinglent les trois premiers.
+\end{solution}
+
+\begin{exercice}{La sortie orpheline}{regles-effets-orpheline}
+Soit un composant qui appelle \code{useState}, puis un \code{if}/\code{else} dont les deux branches retournent. (a) Quel bloc \code{Return} du CFG n'est pas atteignable ? (b) Si \code{ExitDominance::of} ne filtrait pas les sorties atteignables, \regle{conditional-hook} tirerait-elle sur le \code{useState}, avec le \code{compute_dominators} actuel ? (c) Et avec un algorithme de dominance qui donnerait à un bloc inatteignable un ensemble de dominateurs vide ?
+\end{exercice}
+\begin{solution}
+(a) Le \code{Return(undefined)} qui scelle la fin de la fonction (\adr{25}) : aucune branche n'y arrive. (b) Non : ce bloc n'est pas dans l'ordre post-ordre inverse, il garde pour dominateurs l'ensemble de tous les blocs (\src{src/engine/dominance.rs}{16}{22}), donc le bloc du \code{useState} le domine. (c) Oui : le bloc du \code{useState} ne le dominerait plus, \code{may_be_skipped} rendrait \code{true}, et l'on aurait une \Error{} fausse sur tout hook placé avant le \code{if}. C'est le cas que décrit le commentaire de \src{src/rules/api/query.rs}{654}{658} ; le filtre sur l'atteignabilité rend le verdict indépendant de la convention (composant \code{Both} de \file{/tmp/ch20/diamond.tsx}, \og verified\fg{}).
+\end{solution}
+
+\begin{exercice}{Trois règles sur un callback nommé}{regles-effets-tick-exo}
+Dans \code{Tick} (\cref{ex:regles-effets-tick}), expliquer pourquoi \regle{stale-closure} se tait avec \code{[tick]} alors que \code{n} est capturé, et pourquoi c'est \regle{always-unstable-deps} qui tire. Prédire ensuite les trois règles avec \code{[]}.
+\end{exercice}
+\begin{solution}
+Avec \code{[tick]}, \code{resolve_callback} constate que la variable callback est une dep (\code{path_covered}) et rend \code{None} : l'effet se relance chaque fois que \code{tick} change d'identité, donc chaque fois que ses captures changent ; la capture est toujours fraîche. Mais \code{tick} est une closure neuve à \emph{chaque} rendu : \code{PerRender}, d'où le \Warning{} \regle{always-unstable-deps}, l'effet se réenregistrant à chaque rendu. Avec \code{[]} : \regle{missing-deps} tire sur \code{tick}, \regle{stale-closure} donne une \Error{} sur \code{n} (\code{tick} résolu dans le rendu, corps concis qui écrit \code{n}), \regle{always-unstable-deps} se tait (deps vides). Sortie de \file{/tmp/ch20/tick2.tsx}.
+\end{solution}
+
+\begin{exercice}{Un hook invisible}{regles-effets-invisible}
+Dans le composant \code{B} de \file{/tmp/ch20/s4.tsx} (\code{if (on) { v = useMemo(() => 1, []); }}), quelles règles du chapitre voient le \code{useMemo} ? Remplacer \code{1} par une prop \code{p} et vérifier la réponse.
+\end{exercice}
+\begin{solution}
+Aucune. Le \code{useMemo} ne produit pas de \code{HookEntry} : il n'a ni ligne \code{hook_calls} (\regle{conditional-hook} ne le voit pas), ni \code{EffectInfo} (\regle{missing-deps} et \regle{always-unstable-deps} non plus). Avec \code{() => p} (\file{/tmp/ch20/s4b.tsx}), le composant \code{B2} n'apparaît même pas sous \code{--show-clean}, faute de hook, alors que la forme \code{const w = useMemo(() => p, []); v = w;} (\code{A2}) reçoit l'\Error{} \regle{conditional-hook} et le \Warning{} \regle{missing-deps} sur \code{p}. Le défaut est dans l'extraction des hooks, et la leçon générale : une règle ne peut pas être plus complète que l'IR qu'elle lit.
+\end{solution}

@@ -1,0 +1,2247 @@
+% ===========================================================================
+% Chapitre 02 — React vu par l'analyste : le modèle d'exécution que l'on abstrait
+% Sources : notes/16-react-semantics.md ; ADR-001, 004, 009, 017, 025, 026, 035.
+% Sorties d'analyseur observées au commit e67b10a (cargo run -q -- check ...),
+% fichiers d'exemple sous /tmp/ch02/ et /tmp/ch02next/.
+% ===========================================================================
+\chapter{React vu par l'analyste : le modèle d'exécution que l'on abstrait}
+\label{chap:react-modele}
+
+\begin{objectifs}
+  \item Décrire précisément ce que React fait d'un composant : déclenchement,
+    rendu, commit, effets, et la façon dont un \code{setState} relance le cycle.
+  \item Connaître les faits de React sur lesquels repose toute l'analyse :
+    file d'updaters et batching, comparaison \code{Object.is} des deps et de
+    l'état, identité fraîche des littéraux, ordre positionnel des hooks,
+    Strict Mode, contexte, Server Components.
+  \item Lire la sémantique formelle React-tRace (syntaxe, mémoire d'arbre,
+    transitions \code{StepInit}/\code{StepEffect}/\code{StepCheck}/\code{StepEvent},
+    théorèmes) et savoir pourquoi le projet l'a prise comme sémantique concrète
+    de référence (\adr{1}).
+  \item Savoir, pour chaque fait de React, ce que \reactant{} en garde, ce qu'il
+    en abstrait, où cela se trouve dans le code, et pourquoi l'abstraction
+    reste une sur-approximation.
+  \item Connaître les exemples canoniques (\code{Counter}, \code{SelfCounter},
+    \code{Inf}, \code{Timer}, \code{Toggle}, \code{ObjChurn}\dots) réutilisés dans
+    tout le manuscrit, avec la sortie réelle de l'analyseur sur chacun.
+\end{objectifs}
+
+\prerequis{\cref{chap:introduction} (les trois programmes fautifs et la promesse
+\Error/\Warning/\Info). Aucune connaissance d'analyse statique n'est requise : les
+notions de treillis, de join et de soundness sont seulement nommées ici et
+définies au \cref{chap:interpretation-abstraite}.}
+
+Un analyseur par interprétation abstraite ne calcule pas « dans le vide » : il
+sur-approxime une \terme{sémantique concrète}, c'est-à-dire une description
+exacte de ce que fait le programme lorsqu'il s'exécute. Pour un programme React,
+« ce que fait le programme » n'est pas seulement ce que fait le code JavaScript
+du composant : c'est ce que fait React \emph{avec} ce code --- quand il appelle la
+fonction, ce qu'il garde entre deux appels, quand il exécute les effets, ce qu'il
+compare pour décider de recommencer. Ce chapitre décrit ce modèle d'exécution du
+point de vue de quelqu'un qui doit l'abstraire.
+
+Trois sources sont distinguées tout au long du chapitre, et il importe de ne
+jamais les confondre :
+\begin{itemize}
+  \item \textbf{React} --- la documentation officielle \cite{ReactDocs}, qui fixe
+    le comportement attendu (les citations sont reprises en anglais, telles
+    quelles) ;
+  \item \textbf{React-tRace} --- l'article de Lee, Ahn et Yi (OOPSLA 2025)
+    \cite{LeeAhnYi2025}, qui donne une sémantique opérationnelle formelle d'un
+    noyau de React ;
+  \item \textbf{le code} --- ce que \reactant{} calcule réellement au commit
+    \code{e67b10a}, localisé par fichier et lignes.
+\end{itemize}
+Les huit premières sections suivent la progression d'un utilisateur de React :
+rendu, état, effets, identité, règles des hooks, Strict Mode, contexte, Server
+Components. Chacune se termine par ce que l'analyseur en fait. Les trois
+dernières prennent de la hauteur : la sémantique formelle
+(\cref{sec:react-modele-trace}), la sémantique concrète que le projet adopte
+réellement (\cref{sec:react-modele-concrete}) et le catalogue des exemples du
+manuscrit (\cref{sec:react-modele-exemples}).
+
+\section{Un composant est une fonction du rendu}
+\label{sec:react-modele-rendu}
+
+\subsection{Un premier programme : \code{Counter}}
+
+Commençons par le programme React le plus simple qui ait un état. C'est le
+premier exemple de l'article React-tRace, transcrit en TSX.
+
+\begin{exemple}{\code{Counter} : un état, un handler}{canon-counter}
+\begin{lstlisting}[language=TypeScript,caption={\code{Counter} (fichier \file{/tmp/ch02/counter.tsx})},label={lst:react-modele-counter}]
+import { useState } from "react";
+
+export function Counter() {
+  const [count, setCount] = useState(0);
+  return (
+    <button onClick={() => setCount((c) => c + 1)}>
+      {count}
+    </button>
+  );
+}
+\end{lstlisting}
+\end{exemple}
+
+Déroulons ce qui se passe à l'exécution.
+\begin{enumerate}
+  \item \emph{Montage.} React appelle la fonction \code{Counter()}. L'appel
+    \code{useState(0)} ne trouve aucun état existant : React en crée un, lui
+    donne la valeur initiale \code{0}, et renvoie la paire
+    \code{[0, setCount]}. La fonction renvoie un élément JSX, c'est-à-dire une
+    \emph{description} d'un bouton dont le texte vaut \code{0}.
+  \item \emph{Commit.} React compare cette description à ce qui est affiché
+    (rien) et crée le nœud DOM \code{<button>}.
+  \item \emph{Clic.} Le navigateur déclenche le handler
+    \code{() => setCount((c) => c + 1)}. L'appel à \code{setCount} ne modifie
+    pas \code{count} : il \emph{met en file} une mise à jour et demande un
+    nouveau rendu.
+  \item \emph{Second rendu.} React rappelle \code{Counter()}. Cette fois
+    \code{useState(0)} retrouve l'état existant, applique la mise à jour en
+    file (\code{c => c + 1} appliqué à \code{0}) et renvoie \code{[1, setCount]}.
+    L'argument \code{0} est ignoré.
+  \item \emph{Second commit.} React compare la nouvelle description à
+    l'ancienne ; seul le texte du bouton diffère, seul ce nœud texte est
+    modifié.
+\end{enumerate}
+
+\begin{react}[déclencher, rendre, valider]
+La documentation décrit trois étapes \cite{ReactRenderCommit} :
+\og Triggering a render\fg{}, \og Rendering the component\fg{} et
+\og Committing to the DOM\fg{}. Il n'y a que deux raisons de rendre un
+composant : \og It's the component's initial render\fg{} et \og The component's
+(or one of its ancestors') state has been updated\fg{}. Le rendu est récursif :
+rendre un composant rend les composants qu'il renvoie. Enfin, \og React only
+changes the DOM nodes if there's a difference between renders\fg{}.
+\end{react}
+
+Pour l'analyste, la conséquence est simple et structurante : \emph{le composant
+est une fonction que React appelle autant de fois qu'il le veut}. Entre deux
+appels, rien ne survit dans les variables locales de la fonction ; tout ce qui
+survit est rangé par React, à côté du composant, et rendu à l'appel suivant par
+les hooks.
+
+\begin{definition}{Tour de React}{tour-react}
+Un \terme{tour} de React est la séquence
+\[
+  \text{déclencheur} \;\to\; \Render \;\to\; \Commit \;\to\; \Effect
+\]
+où le \emph{déclencheur} est le montage ou une mise à jour d'état ; le
+\emph{rendu} ($\Render$) appelle les fonctions des composants concernés et
+produit une description de l'interface ; le \emph{commit} ($\Commit$) applique
+au DOM la différence avec la description précédente ; les \emph{effets}
+($\Effect$) exécutent les callbacks \code{useEffect} dont les deps ont changé.
+Si les effets appellent un setter, un nouveau tour est déclenché. Entre deux
+tours, React attend un événement extérieur (clic, réponse réseau, minuterie) :
+c'est la \emph{boucle d'événements}.
+\end{definition}
+
+La \cref{fig:react-modele-chronologie} représente un tour et les deux façons
+d'en déclencher un autre. Elle servira de référence dans tout le manuscrit :
+les phases $\Render$, $\Commit$, $\Effect$ et le temps « plus tard » ($\Tick$,
+un tour ultérieur de la boucle d'événements) sont celles que la relation des
+écrivains distingue (\cref{chap:relations}).
+
+\ifhastikz
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=7mm and 5mm]
+  \node[bloc] (trig) {déclencheur\\\scriptsize montage ou \code{set}};
+  \node[bloc,right=of trig] (render) {rendu\\\scriptsize appel du corps};
+  \node[bloc,right=of render] (commit) {commit\\\scriptsize DOM modifié};
+  \node[bloc,right=of commit] (paint) {peinture\\\scriptsize navigateur};
+  \node[bloc,right=of paint] (eff) {effets passifs\\\scriptsize \code{useEffect}};
+  \draw[fleche] (trig) -- (render);
+  \draw[fleche] (render) -- (commit);
+  \draw[fleche] (commit) -- (paint);
+  \draw[fleche] (paint) -- (eff);
+  \path (commit.north) -- (paint.north) coordinate[midway] (mcp);
+  \path (render.south) -- (paint.south) coordinate[midway] (mrp);
+  \node[etiquette,above=1mm of mcp] {\code{useLayoutEffect}};
+  \draw[flechemust] ([xshift=-4mm]eff.south) -- ++(0,-0.9)
+     -| node[etiquette,pos=0.25,above]{\code{setState} dans un effet : nouveau tour} (trig.south);
+  \node[bloc,below=18mm of mrp] (loop) {boucle d'événements\\\scriptsize attente d'un clic, d'un timer, d'une réponse};
+  \draw[fleche] ([xshift=4mm]eff.south) |- node[etiquette,pos=0.3,right]{aucun \code{set}} (loop.east);
+  \draw[flechemay] (loop.west) -| node[etiquette,pos=0.3,below]{handler ou timer : \code{set}} ([xshift=-5mm]trig.south);
+  \draw[flechemust] ([xshift=-4mm]render.north) .. controls +(-0.4,1.1) and +(0.4,1.1) ..
+     node[etiquette,above]{\code{set} pendant le rendu : rendu jeté, on recommence} ([xshift=4mm]render.north);
+\end{tikzpicture}
+\caption{Chronologie d'un tour de React. Un setter appelé dans un effet relance
+immédiatement un tour (flèche pleine) : c'est le mécanisme de la boucle
+infinie d'effets. Un setter appelé dans un handler ne relance un tour qu'après
+un événement extérieur (flèche tiretée). Un setter appelé pendant le rendu fait
+jeter le rendu et recommencer.}
+\label{fig:react-modele-chronologie}
+\end{figure}
+\fi
+
+\subsection{Le rendu doit être pur}
+
+\begin{react}[pureté du rendu]
+\og Rendering must always be a pure calculation\fg{} \cite{ReactRenderCommit} :
+mêmes entrées, même sortie (\og Same inputs, same output\fg{}), et le composant
+ne modifie rien qui existait avant son appel (\og It minds its own business\fg{}).
+Les entrées d'un rendu sont les props, l'état et le contexte.
+\end{react}
+
+La pureté est ce qui rend l'analyse possible : si le corps d'un composant est
+une fonction de (props, état, contexte), l'analyseur peut l'évaluer
+abstraitement sur des \emph{ensembles} de props et d'états sans se soucier du
+nombre de fois où React l'appelle. Mais la pureté n'est qu'une convention ---
+rien n'empêche d'appeler un setter dans le corps ou de muter un objet d'état.
+\reactant{} la traite donc comme une \emph{hypothèse} dont chaque violation a sa
+propre règle : \regle{setter-in-render} pour un setter appelé pendant le rendu,
+\regle{state-mutation} pour une mutation en place. Ce motif --- une hypothèse du
+modèle abstrait, doublée d'une règle qui signale sa violation --- reviendra
+plusieurs fois ; le projet l'appelle \emph{soundness en couches}
+(\cref{sec:react-modele-identite}).
+
+\subsection{Ce que l'analyseur voit de \code{Counter}}
+
+Le front-end de \reactant{} (\cref{chap:frontend-detection}) détecte
+\code{Counter} comme un composant, et le lowering (\cref{chap:lowering-cfg}) en
+produit deux choses : un graphe de flot de contrôle du corps, le
+\code{render_cfg}, et une liste d'entrées de hooks. Pour \code{Counter}, cette
+liste contient un \code{HookEntry::State} (le \code{useState}, label 0) et un
+\code{HookEntry::Handler} (le \code{onClick}, label 1) : le handler n'est pas un
+hook React, mais l'IR l'extrait comme un \emph{point d'entrée} séparé
+(\cref{sec:react-modele-concrete}). D'où le « 2 hooks » de la sortie :
+
+\begin{shell}
+$ reactant check --no-color --info --show-clean --project plain counter.tsx
+\end{shell}
+\begin{sortie}
+  Counter  (2 hooks)  counter.tsx  ✓
+    verified  conditional-hook  all hooks run unconditionally, in a stable order
+    verified  lazy-init  no useState/useRef initializer re-runs work on every render
+    verified  setter-in-render  no setter is called during render
+    verified  state-mutation  no state or prop object is mutated in place
+
+✓  1 file(s) no issues found.
+\end{sortie}
+
+Aucun diagnostic : un setter dans un handler est l'usage normal de React. Ce
+silence n'est pas une évidence pour un analyseur. Le handler peut s'exécuter un
+nombre quelconque de fois, et rien ne borne la valeur de \code{count} ; il faut
+donc que le moteur sache qu'une croissance causée par des clics n'est pas une
+boucle infinie. C'est
+exactement la distinction « déclenché par le cycle » / « déclenché de
+l'extérieur » de la \cref{fig:react-modele-chronologie}, étudiée à la
+\cref{sec:react-modele-concrete}.
+
+\begin{piege}
+Le corps d'un composant n'est pas « le programme ». Un lecteur qui aborde
+l'analyse comme celle d'une fonction JavaScript ordinaire oublie que React
+l'appelle en boucle, garde l'état \emph{hors} de la fonction, et exécute d'autres
+morceaux du code (effets, handlers) à d'autres moments. Toute la difficulté de
+l'analyse --- et tout ce chapitre --- tient dans ce décalage.
+\end{piege}
+
+\section{L'état : \code{useState}, la file d'updaters et le batching}
+\label{sec:react-modele-usestate}
+
+\subsection{Un setter ne modifie pas la variable}
+
+Le premier malentendu sur React porte sur ce que fait un setter. Le programme
+suivant l'expose.
+
+\begin{lstlisting}[language=TypeScript,caption={\code{Batch} : trois appels au setter dans un même handler (\file{/tmp/ch02/batching.tsx})},label={lst:react-modele-batch}]
+import { useState } from "react";
+
+export function Batch() {
+  const [n, setN] = useState(0);
+  function onClick() {
+    setN(n + 1);
+    setN(n + 1);
+    setN((m) => m + 1);
+  }
+  return <button onClick={onClick}>{n}</button>;
+}
+\end{lstlisting}
+
+Un lecteur qui lit \code{setN} comme une affectation s'attend à ce qu'un clic
+fasse passer \code{n} de \code{0} à \code{3}. Il n'en est rien : \code{n} est
+une constante du rendu courant, elle vaut \code{0} pendant tout le handler, et
+chaque appel au setter \emph{ajoute une mise à jour à une file}. La file du
+premier clic contient trois entrées, que React rejoue au rendu suivant, dans
+l'ordre :
+
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  mise à jour en file & valeur reçue & valeur produite \\
+  \midrule
+  \og remplacer par \code{0 + 1}\fg{} & \code{0} (ignorée) & \code{1} \\
+  \og remplacer par \code{0 + 1}\fg{} & \code{1} (ignorée) & \code{1} \\
+  \code{m => m + 1} & \code{1} & \code{2} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+Le bouton affiche donc \code{2}. Les deux premières entrées sont des
+\emph{remplacements} calculés avec la valeur figée \code{n = 0} ; seule la
+troisième, un \terme{updater} (une fonction de l'état précédent vers le
+suivant), lit la valeur produite par les mises à jour qui la précèdent.
+
+\begin{react}[set, file d'updaters, batching]
+La documentation de \code{useState} \cite{ReactDocs} est explicite :
+\og The set function only updates the state variable for the \emph{next}
+render. If you read the state variable after calling the set function, you
+will still get the old value that was on the screen before your call.\fg{}
+Les mises à jour sont regroupées (\emph{batching}) : \og React batches state
+updates. It updates the screen after all the event handlers have run and have
+called their set functions.\fg{} Pour les updaters, \og React queues this
+function to be processed after all the other code in the event handler has
+run. During the next render, React goes through the queue and gives you the
+final updated state.\fg{} Enfin, le regroupement ne franchit pas les
+événements : \og React does not batch across multiple intentional events like
+clicks\fg{}. L'exemple canonique de la page \og Queueing a Series of State
+Updates\fg{} : \code{setNumber(number + 5)} suivi de
+\code{setNumber(n => n + 1)} donne \code{6}.
+\end{react}
+
+\begin{piege}
+\og \code{set} modifie l'état\fg{} est faux ; \og \code{set} planifie le
+prochain rendu\fg{} est juste. Deux conséquences qui trompent régulièrement
+les contributeurs de l'analyseur. D'abord, lire l'état juste après l'avoir
+écrit, dans le même corps, donne l'\emph{ancienne} valeur : un modèle
+abstrait qui ferait \og voir\fg{} la nouvelle valeur à la ligne suivante
+serait faux (nous verrons que \reactant{} voit l'ancienne \emph{et} la
+nouvelle, ce qui est permis). Ensuite, \code{setN(n + 1)} et
+\code{setN((m) => m + 1)} ne sont pas interchangeables : le premier capture
+\code{n} au moment où la fermeture a été créée, le second lit la file. C'est
+tout le ressort de la \emph{stale closure} du \code{Timer} de l'introduction
+(\cref{lst:introduction-timer}).
+\end{piege}
+
+\subsection{Le bail-out \code{Object.is}}
+
+Un setter qui écrit la valeur déjà présente ne relance pas le rendu.
+
+\begin{react}[bail-out]
+\og If the new value you provide is identical to the current state, as
+determined by an \code{Object.is} comparison, React will skip re-rendering the
+component and its children.\fg{} \cite{ReactDocs} (page \code{useState}).
+\end{react}
+
+Ce détail décide de la terminaison de nombreux programmes. Dans le composant
+suivant, l'effet n'a pas de deps et tourne donc après chaque commit ; mais il
+écrit \code{0} dans un état qui vaut déjà \code{0}, React compare, ne rend pas,
+et il n'y a pas de second commit.
+
+\begin{lstlisting}[language=TypeScript,caption={\code{SameValue} : un effet qui réécrit la valeur courante (\file{/tmp/ch02/samevalue.tsx}, imports omis)},label={lst:react-modele-samevalue}]
+export function SameValue() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(0);
+  });
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  SameValue  (2 hooks)  samevalue.tsx
+    warn   redundant-set-state  [hook:0]  (line 5:2)  state `n` is set to a stable value it already holds, so the update is redundant
+\end{sortie}
+
+L'analyseur ne signale pas de boucle (la valeur abstraite de \code{n} reste le
+point $[0,0]$ et ne croît pas), et la règle \regle{redundant-set-state} relève
+l'écriture inutile.
+
+\begin{remarque}
+Conventions pour les sorties de ce chapitre. Toutes ont été obtenues au commit
+\code{e67b10a} par \code{reactant check --no-color --info --show-clean
+--project plain <fichier>} (le binaire de \file{target/debug}). Elles sont
+élaguées, sans que ce soit redit, des lignes \code{verified} qui ne portent pas
+l'information, des lignes de bilan final et des lignes
+\og (\emph{k} trace step(s), rerun with --trace)\fg{} ; quand une sortie
+montre des lignes en flèche (\code{→}), celles-ci viennent de la même
+commande relancée avec \code{--trace}. Les lignes \code{[verbose]} viennent de
+\code{--verbose}.
+\end{remarque}
+
+\subsection{L'état initial et l'initialiseur paresseux}
+
+L'argument de \code{useState} n'est lu qu'une fois.
+
+\begin{react}[état initial]
+\og React saves the initial state once and ignores it on the next
+renders.\fg{} Une fonction passée en argument est un \emph{initialiseur} :
+\og If you pass a function as initialState, it will be treated as an
+initializer function. It should be pure, should take no arguments, and should
+return a value of any type.\fg{} La documentation oppose
+\code{useState(createInitialTodos)} (la fonction est passée, appelée une seule
+fois) à \code{useState(createInitialTodos())} (l'appel est évalué à chaque
+rendu, son résultat jeté après le premier) \cite{ReactDocs}.
+\end{react}
+
+\begin{lstlisting}[language=TypeScript,caption={\code{Todos} : initialiseur appelé à chaque rendu, et sa forme paresseuse (\file{/tmp/ch02/lazy.tsx}, imports omis)},label={lst:react-modele-lazy}]
+function createTodos() {
+  return [{ id: 1, done: false }];
+}
+
+export function Todos() {
+  const [todos] = useState(createTodos());
+  const [lazy] = useState(() => createTodos());
+  return <ul>{todos.length + lazy.length}</ul>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  Todos  (2 hooks)  lazy.tsx
+    warn   lazy-init  [hook:0]  (line 8:8)  this useState is initialised by a direct function call. The call runs on every render but the result is only used on mount; wrap as `useState(() => ...)` to defer it
+\end{sortie}
+
+\subsection{Ce que fait le code}
+
+\paragraph{Le lowering.} Chaque appel de hook reconnu comme venant de React
+devient une entrée \code{HookEntry} (la liste complète est au
+\cref{sec:react-modele-regles-hooks}). Pour \code{useState}, l'entrée ne garde
+que l'expression initiale :
+
+\rustsnippet{src/lowering/hook_extractor.rs}{667}{681}{un \code{useState} devient \code{HookEntry::State}, un \code{useEffect} un \code{HookEntry::Effect}}
+
+La valeur lue de l'état, \code{n}, devient dans le CFG du rendu l'expression
+\code{Expr::StateVal(label)} et le setter \code{Expr::StateSetter(label)} ;
+le label est la position du hook (\cref{sec:react-modele-regles-hooks}).
+
+\paragraph{L'amorçage.} Avant la boucle de point fixe, le moteur évalue une fois
+chaque initialiseur et en fait la valeur de départ du slot. Un initialiseur
+paresseux (une fonction sans paramètre) est \emph{exécuté}, et c'est sa valeur
+de retour qui amorce le slot, conformément à la documentation :
+
+\rustsnippet{src/engine/fixpoint.rs}{336}{350}{amorçage d'un slot, initialiseur paresseux compris}
+
+Cet amorçage a lieu \emph{hors} de la boucle (\src{src/engine/fixpoint.rs}{314}{353}) :
+l'initialiseur ne ré-influence jamais le store, exactement comme React
+\og ignores it on the next renders\fg{}. La règle \regle{lazy-init} exploite
+l'autre moitié du fait React : l'expression non paresseuse, elle, est
+ré-évaluée à chaque rendu.
+
+\paragraph{Le store d'état.} L'état abstrait d'un composant est un
+\code{StateStore}, une table de label vers valeur abstraite :
+
+\rustsnippet{src/domains/stores/state_store.rs}{24}{33}{lecture et mise à jour du store d'état}
+
+Tout tient dans la seconde fonction. Écrire dans un slot ne \emph{remplace}
+pas sa valeur : on en prend le join avec la valeur écrite. C'est une
+\terme{mise à jour faible} (\emph{weak update}), et le store ne fait que
+croître selon l'ordre du treillis. Un slot jamais écrit ni amorcé vaut
+$\Bot$.
+
+\paragraph{L'exécution d'un setter.} Quand l'interprète abstrait rencontre un
+appel \code{setX(arg)}, il exécute \code{exec_setter_call}, dont le
+commentaire de tête (\src{src/domains/interp/interpreter.rs}{335}{340}) dit
+l'intention : \og weak-update the corresponding state label\fg{}, en traitant
+les updaters fonctionnels par l'exécution de leur corps avec le paramètre lié
+à la valeur courante de l'état.
+
+\rustsnippet[label={lst:react-modele-exec-setter}]{src/domains/interp/interpreter.rs}{341}{366}{\code{exec_setter_call} : un setter est un join, un updater est exécuté sur le store}
+
+Lisons-le branche par branche.
+\begin{itemize}
+  \item La garde (l.~348--350) reconnaît un appel dont le callee est une
+    variable liée à un setter de ce composant (\code{env.setter_label}).
+  \item Si l'argument est une fonction littérale (l.~353--361), c'est un
+    updater : son paramètre est lié à \code{ctx.state.get(label)}, la valeur
+    \emph{courante du store}, et son corps est exécuté ; la valeur écrite est
+    ce que l'updater renvoie.
+  \item Sinon (l.~362), l'argument est évalué dans l'environnement courant ;
+    sans argument (l.~363), on écrit $\Top$.
+  \item Dans tous les cas, l.~365, la valeur est jointe au slot.
+\end{itemize}
+La suite de la fonction (\src{src/domains/interp/interpreter.rs}{368}{392})
+traite l'appel d'un setter \emph{d'un autre composant}, en analyse
+inter-composants : l'argument est évalué et joint dans un
+\code{SharedStateStore} indexé par (composant, label). Nous y reviendrons au
+\cref{sec:react-modele-concrete}, car cette branche est aussi le siège d'un
+défaut vérifié.
+
+\begin{exemple}{\code{Batch} dans le domaine abstrait}{usestate-batch}
+Rejouons à la main la passe du handler de \code{Batch} (\cref{lst:react-modele-batch}) lors de
+la première itération, en ne suivant que l'intervalle numérique. Le store vaut
+$\{n \mapsto [0,0]\}$ et, dans l'environnement du handler, \code{n} vaut
+$[0,0]$.
+\begin{enumerate}
+  \item \code{setN(n + 1)} : on écrit $[1,1]$ ; le store devient
+    $[0,0] \join [1,1] = [0,1]$.
+  \item \code{setN(n + 1)} : \code{n} est lu dans l'environnement, qui n'a pas
+    changé ($[0,0]$) ; on écrit encore $[1,1]$ ; le store reste $[0,1]$.
+  \item \code{setN((m) => m + 1)} : \code{m} est lié au store, $[0,1]$ ;
+    l'updater renvoie $[1,2]$ ; le store devient $[0,2]$.
+\end{enumerate}
+React produit \code{2} ; l'analyseur a calculé $[0,2]$, qui contient \code{2}
+mais aussi \code{0} et \code{1}. Il ne représente ni la file, ni son ordre, ni
+le moment où elle est rejouée : il joint tout, tout de suite. (Ce calcul est
+celui de la première branche d'\code{exec_setter_call}, seule active en analyse
+intra ; sur le chemin programme de la CLI, la seconde branche s'y ajoute pour
+l'updater, avec l'effet décrit au \cref{sec:react-modele-concrete}.)
+\end{exemple}
+
+Ce calcul est imprécis, mais il est \emph{sûr} : tout état concret
+atteignable après n'importe quelle suite de clics et de rendus est obtenu en
+appliquant des mises à jour à des valeurs que le store contient déjà, et le
+store, fermé par join, contient leurs résultats. L'argument est développé au
+\cref{sec:react-modele-concrete} ; il repose sur deux choix que l'on retrouvera
+partout : la mise à jour est un join, et l'updater lit un sur-ensemble de la
+valeur que React lui passerait.
+
+\begin{remarque}
+Lire l'état après l'avoir écrit dans le même corps donne, dans l'analyseur,
+l'ancienne valeur \emph{jointe} à la nouvelle, alors que React donne
+l'ancienne. Le join contient la réponse de React : le résultat est imprécis
+mais correct. C'est le sens du premier piège de la section.
+\end{remarque}
+
+Le bail-out \code{Object.is}, lui, n'est pas modélisé dans le point fixe : le
+moteur suppose que tout set peut relancer un rendu. C'est encore une
+sur-approximation (on considère plus de rendus que React n'en fait), et le fait
+React n'est exploité que par des règles qui en ont besoin, comme
+\regle{redundant-set-state} ci-dessus ou \regle{state-mutation}, dont la
+documentation rappelle que muter un objet en place laisse \code{Object.is}
+conclure à l'égalité et saute le rendu
+(\src{src/rules/impls/state_mutation.rs}{21}{26}).
+
+\paragraph{\code{useReducer}.} Le lowering range \code{useReducer} dans la même
+case que \code{useState} :
+
+\rustsnippet{src/lowering/hook_extractor.rs}{715}{719}{\code{useReducer} : le réducteur est jeté}
+
+Le réducteur n'est jamais exécuté. \code{dispatch(action)} est donc lu comme un
+setter qui écrit \emph{l'action} dans le slot. Le \cref{sec:react-modele-concrete}
+montre la conséquence observée : une \Error{} sur un programme qui ne boucle
+pas.
+
+\section{Les effets : après le commit, gardés par les deps}
+\label{sec:react-modele-effets}
+
+\subsection{Quand un effet s'exécute}
+
+Un effet est la seule partie du composant que React exécute \emph{après} le
+commit. C'est aussi la seule qui puisse, à elle seule, relancer un tour sans
+intervention extérieure : c'est donc elle qui porte les boucles infinies.
+
+\begin{react}[\code{useEffect}]
+Signature : \code{useEffect(setup, dependencies?)}. \og React will compare each
+dependency with its previous value using the \code{Object.is} comparison. If
+you omit this argument, your Effect will re-run after every commit of the
+component.\fg{} Avec \code{[]}, l'effet ne tourne qu'après le commit initial.
+\og After every commit with changed dependencies, React will first run the
+cleanup function (if you provided it) with the old values, and then run your
+setup function with the new values\fg{} ; au démontage, le cleanup tourne une
+dernière fois. Le moment exact : \og If your Effect wasn't caused by an
+interaction (like a click), React will generally let the browser paint the
+updated screen first before running your Effect.\fg{} Enfin, \og Effects only
+run on the client\fg{} \cite{ReactDocs}.
+\end{react}
+
+Les trois formes du tableau de deps donnent trois comportements, que le
+programme suivant met côte à côte avec le même corps d'effet.
+
+\begin{lstlisting}[language=TypeScript,caption={Trois formes de deps pour le même effet (\file{/tmp/ch02/deps.tsx}, imports omis)},label={lst:react-modele-deps}]
+export function EveryCommit() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(n + 1);
+  });
+  return <div>{n}</div>;
+}
+
+export function MountOnly() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(n + 1);
+  }, []);
+  return <div>{n}</div>;
+}
+
+export function OnChange() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(n + 1);
+  }, [n]);
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+
+À l'exécution :
+\begin{itemize}
+  \item \code{EveryCommit} boucle : chaque commit exécute l'effet, qui écrit
+    une valeur nouvelle, donc un nouveau rendu, donc un nouveau commit ;
+  \item \code{MountOnly} rend deux fois (\code{0} puis \code{1}) et s'arrête :
+    l'effet ne tourne qu'une fois ;
+  \item \code{OnChange} boucle aussi : \code{n} change à chaque tour, et c'est
+    justement sa dep.
+\end{itemize}
+
+\begin{sortie}
+  EveryCommit  (2 hooks)  deps.tsx
+    warn   infinite-loop  [hook:0]  (line 5:2)  this effect keeps pushing state `n` to new values on every run. Potential infinite render loop
+    info   widening-info  (line 5:2)  state `n` kept changing during analysis and was approximated to converge, so findings that depend on it may be imprecise
+  MountOnly  (2 hooks)  deps.tsx
+    warn   missing-deps  [hook:1]  var:n  (line 13:2)  `n` is used in this effect but not in its deps array, and it is recreated on every render
+    info   widening-info  (line 13:2)  state `n` kept changing during analysis and was approximated to converge, so findings that depend on it may be imprecise
+    verified  infinite-loop  no effect diverges into an infinite render loop
+  OnChange  (2 hooks)  deps.tsx
+    warn   infinite-loop  [hook:0]  (line 21:2)  this effect keeps pushing state `n` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+    info   widening-info  (line 21:2)  state `n` kept changing during analysis and was approximated to converge, so findings that depend on it may be imprecise
+\end{sortie}
+
+Les deux boucles sont signalées en \Warning{}, jamais en \Error{} : la
+divergence d'une valeur numérique ne donne pas, à ce jour, la preuve complète
+qu'exige le niveau \Error{} (\issue{144}). \code{MountOnly} n'a pas de boucle,
+mais un \Info{} \regle{widening-info} y apparaît : le piège de la fin de section
+explique pourquoi.
+
+\subsection{\code{SelfCounter} et \code{Inf} : le cycle Check--Effect}
+
+L'article React-tRace \cite{LeeAhnYi2025} illustre l'effet par deux composants
+presque identiques. Leur transcription TSX :
+
+\begin{exemple}{\code{Inf} et \code{SelfCounter}}{canon-selfcounter}
+\begin{lstlisting}[language=TypeScript,caption={\code{Inf} et \code{SelfCounter} (\file{/tmp/ch02/selfcounter.tsx})},label={lst:react-modele-selfcounter}]
+import { useEffect, useState } from "react";
+
+export function Inf() {
+  const [s, setS] = useState(0);
+  useEffect(() => {
+    setS(s + 1);
+  });
+  return <div>{s}</div>;
+}
+
+export function SelfCounter() {
+  const [s, setS] = useState(0);
+  useEffect(() => {
+    if (s < 3) setS(s + 1);
+  }, [s]);
+  return <div>{s}</div>;
+}
+\end{lstlisting}
+\end{exemple}
+
+\code{SelfCounter} rend quatre fois de suite sans aucune interaction
+(\code{s} vaut \code{0}, \code{1}, \code{2}, \code{3}) puis s'arrête, comme le
+montre la \cref{fig:react-modele-selfcounter} ; \code{Inf}, privé de la garde,
+ne s'arrête jamais. L'article résume le mécanisme : \og Infinite render loop
+occurs because setting state within an Effect triggers the runtime to Check if
+the state has changed [\dots]. If the state whose setter function is called is
+actually modified, the component re-renders and decides to run the Effect
+again. Essentially, this Check-Effect decision cycle creates a render
+loop.\fg{} Les mots \emph{Check} et \emph{Effect} sont ici des termes
+techniques, les \emph{décisions} de la sémantique formelle
+(\cref{sec:react-modele-trace}).
+
+\ifhastikz
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[x=2.55cm,y=1cm,
+    tour/.style={bloc,minimum width=20mm,font=\scriptsize}]
+  \foreach \i/\s/\act in {0/0/{set 1},1/1/{set 2},2/2/{set 3},3/3/{aucun set}} {
+    \node[tour] (r\i) at (\i,0) {rendu\\\code{s = \s}};
+    \node[tour,below=5mm of r\i] (e\i) {effet\\\act};
+    \draw[fleche] (r\i) -- node[etiquette,right]{commit} (e\i);
+  }
+  \foreach \i/\j in {0/1,1/2,2/3} {
+    \draw[flechemust] (e\i.east) -- (r\j.west);
+  }
+  \node[bloc,right=6mm of e3,font=\scriptsize] (loop) {boucle\\d'événements};
+  \draw[fleche] (e3) -- (loop);
+  \node[etiquette,above=1mm of r0] {montage};
+  \node[etiquette,above=1mm of r1] {\code{Object.is(1, 0)} faux};
+  \node[etiquette,above=1mm of r2] {\code{Object.is(2, 1)} faux};
+  \node[etiquette,above=1mm of r3] {\code{Object.is(3, 2)} faux};
+\end{tikzpicture}
+\caption{Déroulement concret de \code{SelfCounter}. Chaque rendu est suivi d'un
+commit puis de l'effet, car la dep \code{s} a changé. Le quatrième effet tourne
+encore (la dep a changé de \code{2} à \code{3}) mais n'écrit rien : aucun tour
+n'est relancé et React attend un événement. Pour \code{Inf}, la chaîne ne
+s'arrête pas.}
+\label{fig:react-modele-selfcounter}
+\end{figure}
+\fi
+
+\begin{sortie}
+  Inf  (2 hooks)  selfcounter.tsx
+    warn   infinite-loop  [hook:0]  (line 5:2)  this effect keeps pushing state `s` to new values on every run. Potential infinite render loop
+       → state `s` is written here [hook:1] (line 5:2)
+       → the abstract value of state `s` kept growing and was widened at iteration 3
+    info   widening-info  (line 5:2)  state `s` kept changing during analysis and was approximated to converge, so findings that depend on it may be imprecise
+  SelfCounter  (2 hooks)  selfcounter.tsx
+    info   widening-info  (line 13:2)  state `s` kept changing during analysis and was approximated to converge, so findings that depend on it may be imprecise
+    verified  infinite-loop  no effect diverges into an infinite render loop
+\end{sortie}
+
+La sortie (obtenue avec \code{--trace} pour les lignes en flèche) raconte le
+calcul abstrait. Pour \code{Inf}, le slot \code{s} vaut $[0,0]$, puis
+$[0,1]$, puis $[0,2]$ ; au troisième tour de la boucle abstraite, le moteur
+applique un \emph{widening} et le slot passe à $[0,+\infty)$ ; ce slot entre
+dans la trace d'élargissement (\code{widen_trace}), et la règle
+\regle{infinite-loop} en conclut que l'effet pousse l'état vers des valeurs
+toujours nouvelles. Pour \code{SelfCounter}, le slot est aussi élargi (d'où
+l'\Info), mais l'écriture elle-même, recalculée après convergence, reste
+bornée par la garde \code{s < 3} : pas de boucle. Le mécanisme exact
+(widening à seuils, écritures « pures » des effets) est l'objet du
+\cref{chap:point-fixe-composant}.
+
+\subsection{\code{Flicker} : un rendu de trop}
+
+Un effet de montage qui écrit une constante ne boucle pas, mais coûte un rendu :
+la valeur initiale s'affiche une fraction de seconde. L'article appelle ce
+composant \code{Flicker} (\og A swift user might even see the transient state
+0\fg{}).
+
+\begin{exemple}{\code{Flicker}}{canon-flicker}
+\begin{lstlisting}[language=TypeScript,caption={\code{Flicker} (\file{/tmp/ch02/flicker.tsx}, imports omis)},label={lst:react-modele-flicker}]
+export function Flicker() {
+  const [s, setS] = useState(0);
+  useEffect(() => {
+    setS(42);
+  }, []);
+  return <div>{s}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+  Flicker  (2 hooks)  flicker.tsx
+    warn   unnecessary-rerender  [hook:0]  (line 5:2)  mount-only effect sets state `s` to a constant different from its initial value, which costs one extra rerender on mount; consider initialising directly with the target value
+\end{sortie}
+\end{exemple}
+
+\subsection{\code{Toggle} : une boucle que la valeur abstraite ne voit pas}
+
+Le dernier exemple canonique de cette section est un avertissement pour le
+lecteur, et une limite de l'outil au commit étudié.
+
+\begin{exemple}{\code{Toggle}}{canon-toggle}
+\begin{lstlisting}[language=TypeScript,caption={\code{Toggle} (\file{/tmp/ch02/toggle.tsx})},label={lst:react-modele-toggle}]
+import { useEffect, useState } from "react";
+
+export function Toggle() {
+  const [on, setOn] = useState(false);
+  useEffect(() => {
+    setOn(!on);
+  }, [on]);
+  return <div>{on ? 1 : 0}</div>;
+}
+\end{lstlisting}
+\end{exemple}
+
+En React, ce composant boucle : \code{on} passe de \code{false} à
+\code{true}, la dep a changé, l'effet repasse, \code{on} revient à
+\code{false}, et ainsi de suite, un rendu par tour. Pourtant l'ensemble des
+valeurs atteintes est fini : $\{\code{false}, \code{true}\}$. L'analyseur,
+qui calcule précisément cet ensemble, converge sans widening :
+
+\begin{sortie}
+  [verbose] Toggle: 1 iteration(s), widened: []
+✓  1 file(s) no issues found.
+\end{sortie}
+
+\begin{piege}
+Un point fixe abstrait atteint ne prouve pas que la boucle de React s'arrête.
+La sémantique que le moteur sur-approxime est l'ensemble des \emph{états}
+atteignables, pas la longueur des suites de rendus. Une boucle qui oscille
+entre des valeurs déjà vues (\code{Toggle}) a un ensemble d'états fini ; sa
+détection ne peut venir que d'un argument de \emph{structure} (la dep est le
+slot écrit, et la valeur écrite diffère toujours de la valeur lue), du même
+genre que celui du churn d'objets (\cref{sec:react-modele-identite}). Au commit
+\code{e67b10a}, ce raisonnement existe pour les références fraîches, pas pour
+une négation booléenne : \code{Toggle} est un faux négatif observé.
+\end{piege}
+
+\subsection{Cleanup et effets de mise en page}
+
+Un effet peut renvoyer une fonction de nettoyage. React l'appelle avant chaque
+ré-exécution et au démontage. Un effet qui s'abonne sans se désabonner
+empile les abonnements :
+
+\begin{lstlisting}[language=TypeScript,caption={\code{Width} : un abonnement sans cleanup (\file{/tmp/ch02/listener.tsx}, imports omis)},label={lst:react-modele-listener}]
+export function Width() {
+  const [w, setW] = useState(0);
+  const box = useRef(null);
+  useEffect(() => {
+    window.addEventListener("resize", () => setW(window.innerWidth));
+  }, [box]);
+  return <div ref={box}>{w}</div>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  Width  (4 hooks)  listener.tsx
+    warn   missing-cleanup  [hook:2]  (line 7:4)  this effect calls `window.addEventListener` but returns no cleanup. The registration is repeated every time the effect re-runs (and on every mount, twice under StrictMode) and nothing ever undoes it; return a function that tears it down
+    verified  infinite-loop  no effect diverges into an infinite render loop
+\end{sortie}
+
+Deux détails de la sortie comptent pour ce chapitre. Les « 4 hooks » sont le
+\code{useState}, le \code{useRef}, l'effet et le callback d'\code{addEventListener},
+extrait comme un handler (\code{HookEntry::Handler}) par le lowering
+(\code{extract_subscriptions}, \src{src/lowering/hook_extractor.rs}{16}{26}) : il ne tourne que sur un
+événement extérieur. Et \regle{infinite-loop} est vérifiée : l'écriture
+\code{setW} n'a lieu que sur un redimensionnement, pas dans le cycle
+rendu--effet (\cref{sec:react-modele-concrete}).
+
+\code{useLayoutEffect} et \code{useInsertionEffect} s'exécutent plus tôt que
+\code{useEffect} (avant la peinture). Pour l'analyseur, la différence de moment
+ne change rien à ce qui compte --- l'effet ne s'exécute jamais pendant le rendu,
+et il s'exécute après le commit --- et le lowering les confond :
+
+\rustsnippet{src/lowering/hook_extractor.rs}{720}{729}{\code{useLayoutEffect} et \code{useInsertionEffect} sont des \code{HookEntry::Effect}}
+
+\subsection{Ce que fait le code}
+
+\paragraph{Tous les effets, à chaque itération.} La boucle de point fixe
+(\cref{chap:point-fixe-composant}) exécute, à chaque itération, le rendu puis
+chaque effet, sur le même instantané du store et dans l'environnement de sortie
+du rendu :
+
+\rustsnippet[label={lst:react-modele-effect-pass}]{src/engine/fixpoint.rs}{415}{449}{les passes d'effets de la boucle de point fixe}
+
+Le motif \code{HookEntry::Effect { label, body_cfg, .. }} de la l.~419
+ignore le champ \code{deps} : \emph{tous} les effets sont exécutés à chaque
+itération, quels que soient leurs deps. C'est la décision de modélisation la
+plus importante de la section.
+
+\begin{decision}[tous les effets à chaque tour abstrait]
+React exécute un effet \emph{si et seulement si} l'une de ses deps a changé
+selon \code{Object.is} (ou s'il n'a pas de deps, ou au montage). Le point fixe
+l'exécute \emph{toujours}. L'ensemble des écritures possibles en est un
+sur-ensemble : c'est sound. La précision perdue est récupérée dans les règles,
+qui relisent les deps : \regle{infinite-loop} écarte les effets de montage et
+ceux dont toutes les deps sont prouvées stables
+(\src{src/rules/impls/infinite_loop.rs}{96}{113}), et la relation
+\relation{effect_triggers} dit quand un effet \emph{doit} repartir. L'ADR-004
+(\adr{4}) décrivait une passe « for each Effect whose decision = Effect » ; le
+code n'a pas de notion de décision, et c'est plus simple et plus sûr.
+\end{decision}
+
+Chaque effet démarre du même store et du même environnement (celui du rendu de
+cette itération) : l'ordre dans lequel React exécute les effets (enfants
+d'abord, puis ordre syntaxique) est abstrait par le join, qui est commutatif ;
+l'influence d'un effet sur un autre est vue à l'itération suivante. Et un effet
+voit les valeurs \emph{du rendu qui l'a créé} : c'est une fermeture, comme dans
+React.
+
+\paragraph{Quand un effet doit repartir.} Pour transformer « l'effet
+\emph{peut} repartir » en « l'effet \emph{doit} repartir », il faut savoir
+qu'une dep change à coup sûr. Le moteur calcule pour cela une relation, une
+ligne par couple (dep, slot) :
+
+\rustsnippet{src/engine/triggers.rs}{33}{44}{une ligne de la relation \relation{effect_triggers}}
+
+Le bit \code{exact} est le cœur : la dep \emph{est} la valeur du slot (ou un
+alias), donc si l'on stocke dans ce slot une valeur fraîche, \code{Object.is}
+échoue sur cette dep et l'effet repart. Sans ce bit, la dep est seulement
+\emph{versionnée} par le slot (un champ, un mémo, une prop calculée par le
+parent) et l'effet \emph{peut} repartir. Le commentaire de module précise
+l'intention : \og This answers identity, not dependence\fg{}
+(\src{src/engine/triggers.rs}{1}{17}). La relation est étudiée au
+\cref{chap:relations} ; retenons qu'elle est la traduction abstraite de la
+phrase « React compare chaque dep avec \code{Object.is} ».
+
+\begin{piege}
+\code{widen_trace} ne signifie pas « boucle React ». Dans \code{MountOnly}, le
+slot est élargi (l'\Info{} \regle{widening-info} le dit) parce que le point fixe
+exécute l'effet à chaque itération, deps \code{[]} ou non. La trace
+d'élargissement dit « la valeur abstraite croît sous l'hypothèse que tout effet
+peut toujours repartir » ; c'est la règle, en relisant les deps, qui décide
+s'il y a boucle. Lire \code{widen_trace} seul produirait un faux positif sur
+chaque effet de montage.
+\end{piege}
+
+\section{L'identité référentielle}
+\label{sec:react-modele-identite}
+
+\subsection{Même contenu, autre objet}
+
+React compare les deps, l'état et la valeur d'un contexte avec
+\code{Object.is}. Pour un nombre, une chaîne ou un booléen, c'est une
+comparaison de valeur ; pour un objet, un tableau ou une fonction, c'est une
+comparaison d'\emph{identité} : deux objets de même contenu sont différents
+s'ils ont été alloués séparément.
+
+\begin{react}[identité et mémoïsation]
+\og In JavaScript, a \code{function () {}} or \code{() => {}} always creates
+a \emph{different} function, similar to how the \code{{}} object literal always
+creates a new object\fg{} (page \code{useCallback}). La documentation de
+\code{useEffect} en tire la conséquence : un objet construit dans le corps du
+composant et placé dans les deps fait repartir l'effet à chaque rendu ; le
+remède est de le construire \emph{dans} l'effet, ou de le mémoïser.
+\code{useMemo} et \code{useCallback} renvoient la valeur en cache tant que
+leurs deps sont égales au sens de \code{Object.is}, et la recalculent sinon ;
+sans tableau, à chaque rendu. \code{useRef} renvoie le même objet à tous les
+rendus, et modifier \code{ref.current} ne déclenche pas de rendu
+\cite{ReactDocs}.
+\end{react}
+
+\begin{lstlisting}[language=TypeScript,caption={\code{Search} : une dep fraîche à chaque rendu, et sa version mémoïsée (\file{/tmp/ch02/search.tsx}, imports omis)},label={lst:react-modele-search}]
+export function Search({ query }: { query: string }) {
+  const [hits, setHits] = useState(0);
+  const options = { query, limit: 10 };
+  const stable = useMemo(() => ({ query, limit: 10 }), [query]);
+  useEffect(() => {
+    console.log(options.limit);
+  }, [options]);
+  useEffect(() => {
+    console.log(stable.limit, hits);
+  }, [stable, hits]);
+  return <button onClick={() => setHits(hits + 1)}>{hits}</button>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  Search  (5 hooks)  search.tsx
+    warn   always-unstable-deps  [hook:2]  (line 7:2)  this effect depends on `options`, a new reference every render, so `Object.is` always differs and the effect re-runs on every render regardless of the other deps
+\end{sortie}
+
+Le premier effet repart à chaque rendu : \code{options} est un littéral objet,
+donc un objet neuf à chaque appel du corps. Le second ne repart que si
+\code{query} ou \code{hits} change : \code{stable} est la même référence tant
+que \code{query} ne bouge pas. Les « 5 hooks » sont l'état, le mémo, les deux
+effets et le handler du bouton.
+
+\subsection{\code{ObjChurn} : une boucle par l'identité}
+
+L'identité peut aussi fabriquer une boucle infinie sans qu'aucune valeur ne
+« croisse ». C'est l'exemple qui a motivé l'ADR-017 (\adr{17}).
+
+\begin{exemple}{\code{ObjChurn} et \code{ObjStateDep}}{canon-objchurn}
+\begin{lstlisting}[language=TypeScript,caption={\code{ObjChurn} et \code{ObjStateDep} (\file{/tmp/ch02/objchurn.tsx})},label={lst:react-modele-objchurn}]
+import { useEffect, useState } from "react";
+
+export function ObjChurn() {
+  const [obj, setObj] = useState({ a: 1 });
+  useEffect(() => {
+    setObj({ ...obj, b: 2 });
+  }, [obj]);
+  return <div>{obj.a}</div>;
+}
+
+export function ObjStateDep() {
+  const [ctx] = useState({ locale: "en" });
+  useEffect(() => {
+    document.title = ctx.locale;
+  }, [ctx]);
+  return <div>{ctx.locale}</div>;
+}
+\end{lstlisting}
+\end{exemple}
+
+Dans \code{ObjChurn}, l'effet écrit un objet neuf ; \code{Object.is} échoue
+sur la dep \code{obj} ; l'effet repart, et ainsi de suite : c'est une boucle
+certaine, alors que le \emph{contenu} de l'objet est le même dès le deuxième
+tour. Dans \code{ObjStateDep}, l'état est aussi un objet littéral, mais rien ne
+l'écrit : sa référence est la même à chaque rendu, et l'effet ne tourne qu'au
+montage.
+
+\begin{sortie}
+  ObjChurn  (2 hooks)  objchurn.tsx
+    error  infinite-loop  [hook:0]  (line 5:2)  this effect recreates object state `obj` it depends on. Every run stores a fresh reference (`Object.is` always fails) and re-triggers itself: infinite render loop
+       → a fresh value is written to state `obj` here [hook:1] (line 6:4)
+  ObjStateDep  (2 hooks)  objchurn.tsx  ✓
+    verified  always-unstable-deps  no deps array is defeated by an always-fresh reference
+    verified  infinite-loop  no effect diverges into an infinite render loop
+\end{sortie}
+
+Les deux verdicts sont justes, et chacun demande un fait différent. Pour
+\code{ObjChurn}, la divergence de valeur (le mécanisme de \code{Inf}) ne sert à
+rien : la valeur abstraite de la référence ne croît pas, \og fraîche\fg{} joint
+\og fraîche\fg{} reste \og fraîche\fg{}, et le point fixe converge dès
+le premier test (\code{--verbose} : \code{ObjChurn: 0 iteration(s), widened: []}). Pour \code{ObjStateDep}, il faut au contraire savoir que
+\emph{lire} un état objet ne donne pas une référence fraîche à chaque rendu,
+même si l'état a été initialisé par un littéral.
+
+\subsection{Ce que fait le code}
+
+\paragraph{Les allocations.} L'évaluateur abstrait donne à chaque forme
+d'expression sa stabilité. Les littéraux objet, tableau et fonction sont frais
+à chaque rendu ; un élément JSX natif, un \code{useRef} sont stables ; un hook
+non résolu est $\Top$ :
+
+\rustsnippet{src/domains/transfer/state_value.rs}{142}{156}{l'identité des marqueurs de hooks et des littéraux}
+
+S'y ajoutent \code{new X()} (\srcline{src/domains/transfer/state_value.rs}{181})
+et les appels dont le résultat est prouvé neuf, comme \code{map}, \code{filter}
+ou \code{JSON.parse} (\code{returns_fresh_reference},
+\src{src/domains/transfer/state_value.rs}{238}{259}). La liste exclut à dessein
+\code{slice} et \code{concat}, qui renvoient une primitive sur une chaîne, et
+les méthodes en place (\code{sort}, \code{reverse}\dots) qui renvoient le
+receveur.
+
+\paragraph{Le treillis de stabilité.} La stabilité est une borne sur la
+\emph{trace de changement} d'une valeur, l'ensemble des rendus où
+\code{Object.is} échoue entre deux rendus consécutifs, qui est la seule chose
+que React observe :
+
+\rustsnippet[label={lst:react-modele-stability}]{src/domains/impls/stability.rs}{13}{52}{le treillis \code{Stability}}
+
+La \cref{fig:react-modele-stability} redessine le diagramme du commentaire. Le
+treillis est défini et étudié au \cref{chap:statevalue-stabilite}
+(\cref{def:stabilite}) ; ce qui nous importe ici est la lecture React
+de chaque point. \code{Stable} : la même référence à chaque rendu.
+\code{PerRender} : une référence neuve à chaque rendu, \emph{à coup sûr} ---
+c'est une borne must, qui permet de tirer. \code{Versioned(S)} : ne change
+\emph{qu'aux} événements de set des slots de $S$ --- c'est une borne may, qui
+permet de se taire. \code{PerRender} et \code{Versioned} ne sont pas opposés :
+ce sont deux bornes différentes, incomparables, dont le join ne garantit rien
+(\code{Unknown}).
+
+\ifhastikz
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[treillis,node distance=9mm and 14mm]
+  \node (top) {\code{Unknown} ($\Top$)};
+  \node[below left=of top] (vtop) {\code{VersionedTop}};
+  \node[below right=of top] (per) {\code{PerRender}};
+  \node[below=of vtop] (vs) {\code{Versioned(S)}};
+  \node[below=of vs] (st) {\code{Stable}};
+  \node[below right=of st] (bot) {\code{Bottom} ($\Bot$)};
+  \draw (top) -- (vtop); \draw (top) -- (per);
+  \draw (vtop) -- node[etiquette,left]{$S \subseteq S'$, seuil 4} (vs);
+  \draw (vs) -- (st); \draw (st) -- (bot); \draw (per) |- (bot);
+  \node[etiquette,left=2mm of vs] {borne may};
+  \node[etiquette,right=2mm of per] {borne must};
+\end{tikzpicture}
+\caption{Le treillis \code{Stability} (ADR-017). À gauche, la chaîne may
+« ne change qu'aux sets de $S$ », dont la hauteur est bornée par le seuil
+\code{VERSIONED_LABELS_THRESHOLD = 4} ; à droite, le fait must « neuf à chaque
+rendu ». Leur join est $\Top$.}
+\label{fig:react-modele-stability}
+\end{figure}
+\fi
+
+\paragraph{La lecture d'un état.} Voici le fait React qui règle
+\code{ObjStateDep} : un état ne change \emph{que} lorsque son setter est
+appelé. Le moteur le traduit à un seul endroit, la lecture d'un slot :
+
+\rustsnippet[label={lst:react-modele-stateval}]{src/domains/transfer/state_value.rs}{122}{134}{la conversion « côté lecture » de l'ADR-017}
+
+Le store contient le join des valeurs \emph{écrites} ; pour \code{ObjStateDep},
+c'est la référence \code{PerRender} du littéral d'initialisation. Mais ce qu'un
+rendu \emph{lit} ne peut changer qu'aux événements de set de ce slot : la
+lecture remplace donc la composante référence par
+\code{Versioned({(composant, label)})}. Une dep \code{Versioned} ne déclenche
+pas \regle{always-unstable-deps}, qui exige \code{PerRender}.
+
+\begin{invariant}{Double vue de l'état}{react-modele-double-vue}
+Le store d'état est la \emph{vue événement} : pour chaque slot, le join des
+valeurs écrites. L'évaluation de \code{Expr::StateVal} est la \emph{vue
+inter-rendus} : ce que \code{Object.is} compare d'un rendu à l'autre, dont la
+composante référence est toujours \code{Versioned} par le slot lui-même (sauf
+si elle est $\Bot$). Les règles qui comparent des valeurs écrites
+(\regle{redundant-set-state}) lisent le store ; les règles de deps lisent la
+vue inter-rendus.
+\end{invariant}
+
+Pour \code{ObjChurn}, la certitude vient d'ailleurs : de la \emph{structure}.
+La dep \code{obj} \emph{est} le slot (ligne \code{exact} de
+\relation{effect_triggers}, \cref{sec:react-modele-effets}), l'effet écrit dans
+ce slot une valeur \code{PerRender} sur tous ses chemins, et React ré-exécute
+un effet dont une dep a changé. Trois faits must, donc une \Error. Le bras
+correspondant d'\regle{infinite-loop} et le graphe de churn qui le généralise
+sont l'objet du \cref{chap:churn}.
+
+\begin{decision}[ADR-017 --- stabilité versionnée]
+\emph{Contexte.} Cinq faux positifs \regle{always-unstable-deps} du premier
+corpus avaient tous la forme de \code{ObjStateDep} : un état objet lu comme
+« neuf à chaque rendu ». Sous ce FP se cachait un FN : \code{ObjChurn} n'était
+pas détecté, parce que le join de deux références fraîches ne croît pas.
+\emph{Décision.} Un treillis à six points, fragment d'un produit may $\times$
+must ; la conversion côté lecture dans \code{StateVal} ; un bras « churn »
+dans \regle{infinite-loop}. \emph{Alternatives refusées.} Rendre les lectures
+d'état stables sans nouveau signal (rouvre le FN) ; encoder un compteur
+d'événements dans le store pour faire tirer le widening (« a non-standard
+hack ») ; garder dans le treillis deux points « change à coup sûr au set »,
+qui n'avaient qu'un consommateur, lequel a de toute façon besoin d'un
+raisonnement d'atteignabilité et vit donc dans la règle.
+\end{decision}
+
+\paragraph{Les mémos.} Le moteur ne calcule pas la \emph{valeur} d'un mémo,
+seulement son identité, comme join des stabilités de ses deps :
+
+\rustsnippet{src/domains/transfer/state_value.rs}{63}{77}{\code{recompute_memo} : les cas sans deps lisibles et \code{[]}}
+
+Sans tableau lisible, le mémo peut être recalculé à chaque rendu comme ne
+jamais l'être : $\Top$. Avec \code{[]} (d'arité exactement nulle), il est
+figé : \code{Stable}. Sinon (\src{src/domains/transfer/state_value.rs}{78}{100}),
+chaque dep contribue : une dep qui \emph{est} un slot contribue
+\code{Versioned({slot})}, les autres leur stabilité évaluée. Pour
+\code{Search}, \code{stable} hérite ainsi de la stabilité de la prop
+\code{query}, qui n'est pas prouvée \code{PerRender} : silence.
+
+\begin{definition}{Soundness en couches}{soundness-couches}
+Un argument de soundness est \terme{en couches} lorsqu'il repose sur une
+hypothèse du modèle abstrait dont chaque violation est signalée par une règle
+dédiée. La conversion côté lecture suppose que les sets ont lieu hors du rendu :
+si un setter est appelé \emph{pendant} le rendu avec une référence fraîche, le
+slot change réellement à chaque rendu et \code{Versioned} le sous-estime. Cette
+violation est signalée à part par \regle{setter-in-render}. De même, lire un
+champ d'un objet d'état suppose qu'on ne le mute pas en place, violation
+signalée par \regle{state-mutation}.
+\end{definition}
+
+\begin{piege}
+\code{Versioned} n'est pas \code{Stable}. Un état jamais écrit se lit
+\code{Versioned}, pas \code{Stable} (\issue{41}) : une dep sur lui ne peut pas
+être omise, ce qui est aussi la position d'eslint. Et le fait qu'une dep
+\code{Versioned} « garde » un effet dans \regle{infinite-loop} n'est sound
+qu'\emph{avec} le bras churn : retirer l'un sans l'autre rouvre le faux négatif
+d'\code{ObjChurn}. L'ADR-017 appelle ce couplage « a load-bearing soundness
+dependency ».
+\end{piege}
+
+\section{Les règles des hooks et l'identité positionnelle}
+\label{sec:react-modele-regles-hooks}
+
+\subsection{Un hook est identifié par sa position}
+
+Rien, dans \code{const [s] = useState(0)}, ne dit à React \emph{quel} état
+rendre : ni nom, ni clé. React s'en remet à l'ordre des appels. Au $k$-ième
+appel de hook d'un rendu, il rend le $k$-ième état de sa liste. Cet ordre doit
+donc être le même à chaque rendu.
+
+\begin{react}[règles des hooks]
+\og Don't call Hooks inside loops, conditions, nested functions, or
+\code{try}/\code{catch}/\code{finally} blocks. Instead, always use Hooks at the
+top level of your React function, before any early returns.\fg{}
+\cite{ReactRulesOfHooks} React-tRace donne la raison : \og each Hook call is
+identified by its position in a linked list of internal bookkeeping
+objects\fg{} \cite{LeeAhnYi2025}.
+\end{react}
+
+\begin{exemple}{\code{Cond}}{canon-cond}
+\begin{lstlisting}[language=TypeScript,caption={\code{Cond}, transcrit de React-tRace (\file{/tmp/ch02/cond.tsx})},label={lst:react-modele-cond}]
+import { useState } from "react";
+
+export function Cond() {
+  const [b, setB] = useState(false);
+  if (b) {
+    const [s] = useState(0);
+    return <p>{s}</p>;
+  }
+  return <button onClick={() => setB((v) => !v)}>Show</button>;
+}
+\end{lstlisting}
+\begin{sortie}
+  Cond  (3 hooks)  cond.tsx
+    error  conditional-hook  [hook:1]  (line 6:10)  this hook is called conditionally (not on every render path)
+       → guarded by a condition evaluated here, so some render paths skip the hook (line 5:6)
+\end{sortie}
+\end{exemple}
+
+Au premier rendu, \code{b} est faux, un seul hook est appelé. Après le clic,
+\code{b} est vrai et un deuxième \code{useState} apparaît, que React n'a jamais
+vu ; dans les mots de l'article, \og instead of displaying the initial state of
+s which is 0, the UI breaks down at runtime\fg{}. L'analyseur le signale en
+\Error{} : le défaut se produit dès que le code s'exécute sur l'autre branche,
+et l'appel conditionnel est prouvé.
+
+\subsection{Ce que fait le code}
+
+Le label d'un hook est un entier (\srcline{src/ir/types.rs}{2} :
+\code{pub type HookLabel = usize;}), attribué par le lowering dans l'ordre des
+appels du corps. C'est l'exact analogue du « $\ell$ » que React-tRace attache
+à chaque \code{useState} ; les handlers extraits partagent cet espace de
+labels (d'où \code{[hook:1]} pour le \code{useState} conditionnel de
+\code{Cond}, et « 3 hooks » en comptant le handler du bouton). L'IR range
+chaque hook dans une variante de \code{HookEntry}, dont voici les deux
+premières :
+
+\rustsnippet{src/ir/hooks.rs}{247}{259}{les deux premières variantes de \code{HookEntry}}
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}l>{\raggedright\arraybackslash}Xl@{}}
+  \toprule
+  Variante & Hooks React correspondants & Champs propres \\
+  \midrule
+  \code{State} & \code{useState}, \code{useReducer} (réducteur jeté) & \code{init} \\
+  \code{Effect} & \code{useEffect}, \code{useLayoutEffect}, \code{useInsertionEffect} & \code{body_cfg}, \code{deps} \\
+  \code{Memo} & \code{useMemo} & \code{body_cfg}, \code{deps} \\
+  \code{Callback} & \code{useCallback} & \code{body_cfg}, \code{params}, \code{deps} \\
+  \code{Ref} & \code{useRef} & \code{init} \\
+  \code{Custom} & tout autre \code{use*} : hook du projet, de bibliothèque, ou hook React non modélisé (\code{useContext}\dots) & \code{name}, \code{args}, \code{binding}, provenance \\
+  \code{Handler} & aucun : handler JSX \code{onX} ou callback d'\code{addEventListener} & \code{event}, \code{body_cfg} \\
+  \bottomrule
+\end{tabularx}
+\caption{Les variantes de \code{HookEntry} (\src{src/ir/hooks.rs}{247}{313}) et
+les hooks React qu'elles représentent. Toutes portent un \code{label} et un
+\code{span} ; le classement est fait par \code{make_hook_entry}
+(\src{src/lowering/hook_extractor.rs}{642}{747}).}
+\label{tab:react-modele-hookentry}
+\end{table}
+
+La \cref{tab:react-modele-hookentry} donne la carte complète ; le détail des
+champs est au \cref{chap:ir}. La règle \regle{conditional-hook} traduit la
+règle de React en termes de CFG :
+
+\rustsnippet{src/rules/impls/conditional_hook.rs}{3}{8}{\regle{conditional-hook} : un hook conditionnel ne domine pas toutes les sorties}
+
+« Appelé à chaque rendu » devient « le bloc du hook domine toutes les sorties du
+rendu » : tout chemin de l'entrée à un \code{return} passe par lui. Dans
+\code{Cond}, le bloc \code{then} ne domine pas le \code{return} du bouton. La
+dominance est définie au \cref{chap:interpretation-abstraite}
+(\cref{def:dominance}) ; c'est un fait sur \emph{tous} les chemins,
+donc un fait must, qui peut porter une \Error.
+
+\begin{decision}[ADR-025 --- la fin d'un corps est un \code{return}]
+Un corps qui « tombe » à la fin sans \code{return} renvoie \code{undefined} en
+JavaScript. Le lowering scellait autrefois ce bloc par \code{Unreachable}, ce
+qui, après inlining, coupait certains composants de leur propre sortie : 208
+composants du corpus avaient ainsi un CFG de rendu « sectionné », et la
+dominance des sorties se calculait sur moins de chemins que le programme n'en a.
+\emph{Décision} (\adr{25}) : la fin de corps est \code{Return(undefined)} ;
+\code{Unreachable} ne veut plus dire que « le contrôle s'arrête » (un
+\code{throw}) ; un \code{return} inatteignable n'est pas une sortie.
+\emph{Alternative refusée} : raccorder tout \code{Unreachable} d'un callee à la
+jonction, « just an over-approximation ». Mesurée, elle inventait un chemin
+qui atteint la sortie sans passer par les hooks du callee et signalait en
+\Error{} l'idiome conforme \og guard-throw\fg{}
+(\code{if (ctx === undefined) throw ...} puis \code{useState}). En React, un
+\code{throw} pendant le rendu \emph{abandonne} le rendu : aucun chemin ne
+continue vers les hooks suivants.
+\end{decision}
+
+\subsection{Appeler un setter pendant le rendu}
+
+La seconde règle de pureté concerne le setter. L'appeler pendant le rendu est
+autorisé, mais à une condition précise.
+
+\begin{react}[set pendant le rendu]
+\og Calling the set function \emph{during rendering} is only allowed from within
+the currently rendering component. React will discard its output and
+immediately attempt to render it again with the new state.\fg{} Un appel
+inconditionnel donne l'erreur \og Too many re-renders. React limits the number
+of renders to prevent an infinite loop.\fg{} \cite{ReactDocs} React-tRace
+(§3.1.2) : \og an unconditional top-level call to a setter function causes an
+infinite loop and is never correct\fg{}, même quand la valeur écrite est
+toujours la même ; le runtime lève une exception après 25 tentatives.
+\end{react}
+
+\begin{exemple}{\code{Inf2}}{canon-inf2}
+\begin{lstlisting}[language=TypeScript,caption={\code{Inf2} : l'updater identité, appelé dans le corps (\file{/tmp/ch02/setter_in_render.tsx})},label={lst:react-modele-inf2}]
+import { useState } from "react";
+
+export function Inf2() {
+  const [s, setS] = useState(0);
+  setS((x) => x);
+  return <div>{s}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+  Inf2  (1 hooks)  setter_in_render.tsx
+    error  setter-in-render  [hook:0]  (line 5:2)  setter `setS` called directly in the render body, move this call into a useEffect or an event handler
+       → `setS` is a state setter, so calling it writes state (line 5:2)
+\end{sortie}
+\end{exemple}
+
+L'appel est dans le bloc d'entrée, qui domine toutes les sorties : \Error.
+L'exemple est instructif pour le bail-out : l'updater identité ne change rien,
+et pourtant React boucle, parce qu'un set pendant le rendu fait \emph{jeter} le
+rendu avant toute comparaison (\cref{sec:react-modele-trace}).
+
+La documentation de React prévoit pourtant un usage légitime : \og ajuster
+l'état pendant le rendu\fg{} quand une prop change, à la place d'un effet
+(page \og You Might Not Need an Effect\fg{}).
+
+\begin{lstlisting}[language=TypeScript,caption={\code{List} : le motif « adjust state during render » (\file{/tmp/ch02/adjust.tsx})},label={lst:react-modele-adjust}]
+import { useState } from "react";
+
+export function List({ items }: { items: string[] }) {
+  const [prevItems, setPrevItems] = useState(items);
+  const [selection, setSelection] = useState<string | null>(null);
+  if (items !== prevItems) {
+    setPrevItems(items);
+    setSelection(null);
+  }
+  return <ul onClick={() => setSelection(items[0])}>{selection}</ul>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  List  (3 hooks)  adjust.tsx
+    warn   setter-in-render  [hook:1]  (line 8:4)  setter `setSelection` called directly in the render body, move this call into a useEffect or an event handler
+\end{sortie}
+
+La règle fait trois choses différentes, décrites par sa documentation :
+
+\rustsnippet{src/rules/impls/setter_in_render.rs}{18}{36}{les niveaux de \regle{setter-in-render}}
+
+\code{setPrevItems(items)} est tu : la garde qui le domine (\code{items !==
+prevItems}) lit le slot qu'il écrit, et devient fausse dès que la valeur écrite
+y est (\code{converges_once_written}, \src{src/engine/guards.rs}{60}{67}).
+\code{setSelection(null)} est signalé en \Warning{} alors qu'il fait partie du
+même motif documenté : sa garde ne lit pas \code{selection}, et la règle ne
+peut pas prouver que l'appel converge. C'est un faux positif de niveau
+\Warning, que la doctrine tolère.
+
+\section{Strict Mode : le double rendu}
+\label{sec:react-modele-strictmode}
+
+En développement, React peut exécuter volontairement deux fois une partie du
+code pour faire apparaître les impuretés.
+
+\begin{react}[\code{<StrictMode>}]
+Strict Mode active des comportements \emph{de développement} : \og Your
+components will re-render an extra time to find bugs caused by impure
+rendering\fg{}, \og Your components will re-run Effects an extra time to find
+bugs caused by missing Effect cleanup\fg{}, et de même pour les ref callbacks.
+Sont appelés deux fois : \og Your component function body (only top-level
+logic, so this doesn't include code inside event handlers)\fg{} et les fonctions
+passées à \code{useState}, aux fonctions \code{set}, à \code{useMemo} et à
+\code{useReducer}. Pour les effets, \og React will run one extra
+development-only setup+cleanup cycle before the first real setup\fg{}.
+\og All of these checks are development-only and do not impact the production
+build.\fg{} \cite{ReactDocs}
+\end{react}
+
+Un composant impur montre la différence. Celui-ci compte ses rendus dans une
+variable de module :
+
+\begin{lstlisting}[language=TypeScript,caption={\code{Impure} : le rendu modifie une variable de module (\file{/tmp/ch02/strict.tsx})},label={lst:react-modele-impure}]
+import { useState } from "react";
+
+let renders = 0;
+
+export function Impure() {
+  const [n, setN] = useState(0);
+  renders = renders + 1;
+  return <button onClick={() => setN(n + 1)}>{renders}</button>;
+}
+\end{lstlisting}
+
+Sous Strict Mode, le compteur avance de deux par rendu en développement et de
+un en production : c'est exactement ce que le double appel veut révéler.
+\reactant{} ne dit rien de ce composant :
+
+\begin{sortie}
+  Impure  (2 hooks)  strict.tsx  ✓
+    verified  conditional-hook  all hooks run unconditionally, in a stable order
+    verified  lazy-init  no useState/useRef initializer re-runs work on every render
+    verified  setter-in-render  no setter is called during render
+    verified  state-mutation  no state or prop object is mutated in place
+\end{sortie}
+
+Aucune règle du catalogue ne porte sur l'écriture d'une variable de module
+pendant le rendu ; \regle{state-mutation} ne vise que les objets d'état et de
+props, comme sa ligne \code{verified} le dit.
+
+\paragraph{Ce que fait le code.} Rien : Strict Mode n'est pas modélisé par le
+moteur. La seule trace est documentaire, dans \regle{missing-cleanup}, qui
+rappelle qu'\og under StrictMode it runs it twice on the first mount\fg{}
+(\src{src/rules/impls/missing_cleanup.rs}{9}{13}) et reprend le fait dans son
+message (\cref{lst:react-modele-listener}).
+
+Ce silence est-il sound ? L'argument suivant n'est écrit nulle part dans le
+code ; c'est une déduction. Le point fixe calcule un ensemble d'états
+atteignables et joint les écritures. Exécuter deux fois un rendu, un
+initialiseur ou un updater \emph{purs} produit deux fois les mêmes écritures, et
+$x \join x = x$ : l'ensemble calculé est inchangé. Pour les effets, le cycle
+supplémentaire setup--cleanup n'ajoute que des exécutions d'un corps que le
+point fixe exécute déjà à chaque itération. Strict Mode ne rend donc visible
+que ce qui viole la pureté, c'est-à-dire des hypothèses que le modèle abstrait
+fait déjà (\cref{sec:react-modele-rendu}).
+
+\begin{piege}
+Le double rendu de Strict Mode n'est pas un rendu « de trop » au sens des
+règles. Un contributeur qui voudrait le modéliser comme deux tours ferait
+tirer \regle{unnecessary-rerender} ou compterait deux fois une écriture de
+montage ; or ces règles parlent de la production, où le double appel n'existe
+pas. Inversement, un utilisateur qui voit son effet de montage s'exécuter deux
+fois en développement ne doit pas en conclure qu'il boucle, ni que
+\reactant{} se trompe en le traitant comme un effet de montage : l'effet est
+exécuté une fois de plus \emph{par construction}, et la règle qui s'en préoccupe est
+\regle{missing-cleanup}, pas \regle{infinite-loop}.
+\end{piege}
+
+\section{Le contexte et la propagation du rendu}
+\label{sec:react-modele-contexte}
+
+\subsection{Rendre un parent, c'est rendre ses enfants}
+
+Un rendu est récursif : rendre un composant rend les composants qu'il renvoie
+(\cref{sec:react-modele-rendu}). Un set dans un parent re-rend donc tout son
+sous-arbre, sauf les parties que React peut prouver inchangées (un élément
+reçu en \code{children} dont l'identité est conservée, un composant enveloppé
+par \code{memo} dont les props sont égales). Le contexte est l'autre canal de
+propagation : il traverse l'arbre sans passer par les props.
+
+\begin{react}[\code{useContext}]
+\og useContext returns the context value for the calling component. It is
+determined as the value passed to the closest SomeContext above the calling
+component in the tree.\fg{} À défaut de provider, c'est la \code{defaultValue}
+de \code{createContext}. \og React automatically re-renders all the children
+that use a particular context starting from the provider that receives a
+different value. The previous and the next values are compared with the
+\code{Object.is} comparison. Skipping re-renders with memo does not prevent the
+children receiving fresh context values.\fg{} D'où le conseil d'envelopper la
+valeur fournie dans \code{useMemo} et les fonctions dans \code{useCallback}
+\cite{ReactDocs}.
+\end{react}
+
+\begin{lstlisting}[language=TypeScript,caption={Un provider dont la valeur est neuve à chaque rendu (\file{/tmp/ch02/context.tsx})},label={lst:react-modele-context}]
+import { createContext, useContext, useState } from "react";
+
+const ThemeCtx = createContext({ dark: false, toggle: () => {} });
+
+export function ThemeProvider({ children }: { children: any }) {
+  const [dark, setDark] = useState(false);
+  return (
+    <ThemeCtx.Provider value={{ dark, toggle: () => setDark((d) => !d) }}>
+      {children}
+    </ThemeCtx.Provider>
+  );
+}
+
+export function Button() {
+  const { dark } = useContext(ThemeCtx);
+  return <button>{dark ? "dark" : "light"}</button>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  Button  (1 hooks)  context.tsx
+    info   analysis-limit  [hook:0]  (line 15:8)  hook `useContext` was not found in the registry. Pass its source file or add a HookSummary to analyse it (FN possible)
+    suspended  analysis-limit  1 passing check(s) withheld: the analysis was truncated in this component, so they are not guaranteed
+  ThemeProvider  (1 hooks)  context.tsx
+    info   analysis-limit  component `ThemeCtx.Provider` was not found in the analysis registry. Pass its file on the command line to analyse it (FN possible)
+    warn   unstable-context-value  (line 8:4)  `ThemeCtx.Provider` is given a newly allocated value on every render. `Object.is` fails for every consumer, so each `useContext(ThemeCtx)` re-renders whenever this component does, even when nothing in the value changed; wrap the value in `useMemo`
+    suspended  analysis-limit  4 passing check(s) withheld: the analysis was truncated in this component, so they are not guaranteed
+\end{sortie}
+
+Les deux côtés du contexte sont traités très différemment.
+
+\paragraph{Côté consommateur : $\Top$.} \code{useContext} n'est pas modélisé.
+Le lowering le range, comme tout hook React sans modèle, dans une entrée
+\code{Custom} dont la provenance garde le spécificateur \code{react}
+(commentaire de \src{src/lowering/hook_extractor.rs}{730}{732}) :
+
+\rustsnippet{src/lowering/hook_extractor.rs}{733}{744}{un hook React non modélisé devient une entrée \code{Custom}}
+
+Son site d'appel est un marqueur \code{HookMarker(_, Unknown)}, qui s'évalue en
+$\Top$ ; c'est la l.~143 de \file{src/domains/transfer/state_value.rs}, déjà
+citée au \cref{sec:react-modele-identite}. Le consommateur lit
+donc « n'importe quelle valeur », ce qui est sound, et l'\Info{}
+\regle{analysis-limit} rend le trou visible ; les vérifications qui auraient
+réussi sont « suspendues » plutôt qu'affichées comme prouvées. C'est, d'après
+\file{docs/limitations.md}, la première source de limites d'analyse du corpus
+(363 sites, \issue{28}).
+
+\paragraph{Côté provider : l'identité.} La valeur passée à \code{value} est un
+littéral objet, donc \code{PerRender} : fait must. La règle
+\regle{unstable-context-value} en tire un \Warning{} :
+
+\rustsnippet{src/rules/impls/unstable_context_value.rs}{4}{13}{le défaut visé par \regle{unstable-context-value}}
+
+\Warning{} et non \Error{} : la référence fraîche est certaine, mais son coût
+(des rendus de consommateurs) ne l'est pas --- c'est la seconde moitié de la
+définition du \Warning{} (« fait certain au coût incertain »). Au-delà de cette
+règle, la relation \relation{context_consumers} (\adr{32}) et la dépendance de
+rendu (\adr{41}) suivent un contexte prouvé de son provider jusqu'aux
+consommateurs placés sous lui, pour les règles de cascade
+\regle{state-lifted-too-high} et \regle{wasted-subtree-render}
+(\cref{chap:inter-composants}). Un élément que l'analyse ne peut pas ouvrir, en
+particulier un composant enveloppé par \code{memo} ou \code{forwardRef}
+(\issue{64}), y est compté comme un usage possible.
+
+\begin{remarque}
+La première ligne \code{info} de \code{ThemeProvider} signale que
+\code{ThemeCtx.Provider} n'est pas un composant du registre : l'analyseur voit
+une balise JSX dont il ne connaît pas le corps, et le dit. Le provider n'en
+est pas moins reconnu par la règle, qui repère \code{ThemeCtx} comme un
+\code{createContext(...)} de niveau module.
+\end{remarque}
+
+\section{Server Components et la directive \code{"use client"}}
+\label{sec:react-modele-rsc}
+
+Tout ce qui précède suppose que le composant vit dans le navigateur, où il a un
+état et des effets. Les Server Components (RSC), popularisés par l'App Router
+de Next.js, rompent cette hypothèse.
+
+\begin{react}[Server et Client Components]
+Un Server Component est rendu une fois, sur le serveur, et ne persiste pas :
+\og Server Components cannot use most Hooks. When Server Components are
+rendered, their output is essentially a list of components for the client to
+render. Server Components do not persist in memory after render and cannot
+have their own state.\fg{} La frontière est une directive de module :
+\og Add \code{'use client'} at the top of a file to mark the module and its
+transitive dependencies as client code\fg{}, et elle \og must be at the very
+beginning of a file, above any imports or other code\fg{}. Il n'y a pas de
+directive pour le côté serveur, qui est le défaut ; et \og a single module may
+be evaluated on the server when imported from server code and on the client
+when imported from client code\fg{} \cite{ReactDocs}.
+\end{react}
+
+La dernière phrase est la difficulté : être « serveur » n'est pas une propriété
+d'un fichier, mais de la façon dont on l'atteint dans le graphe d'imports.
+Considérons un projet Next minimal (\file{/tmp/ch02next/}) : un
+\file{next.config.js} vide, une page \file{app/page.tsx} sans directive, et un
+composant \file{components/like-button.tsx} qui commence par
+\code{"use client"}.
+
+\begin{lstlisting}[language=TypeScript,caption={\file{app/page.tsx} : un état dans un Server Component (\file{/tmp/ch02next/app/page.tsx})},label={lst:react-modele-page}]
+import { useState } from "react";
+import { LikeButton } from "../components/like-button";
+
+export default function Page() {
+  const [open, setOpen] = useState(false);
+  return (
+    <main onClick={() => setOpen(!open)}>
+      <LikeButton />
+    </main>
+  );
+}
+\end{lstlisting}
+
+\begin{shell}
+$ cd /tmp/ch02next && reactant check --no-color --info --show-clean .
+\end{shell}
+\begin{sortie}
+[warn] no tsconfig `paths` found, so aliased imports (e.g. `@/...`) stay unresolved and their targets are NOT analyzed (possible false negatives). Aliases declared only in next.config are not read.
+  LikeButton  (2 hooks)  components/like-button.tsx  ✓
+    verified  conditional-hook  all hooks run unconditionally, in a stable order
+    verified  lazy-init  no useState/useRef initializer re-runs work on every render
+    verified  setter-in-render  no setter is called during render
+    verified  state-mutation  no state or prop object is mutated in place
+  Page  (2 hooks)  app/page.tsx
+    warn   server-component-hook  [hook:0]  (line 5:8)  `useState` is called in a Server Component. this file is an App Router `page` and no `"use client"` directive covers it, so React renders it on the server, where hooks do not exist; add `"use client"` at the top of the file, or move the stateful part into a child component that declares it
+\end{sortie}
+
+Le projet est reconnu comme Next.js par son \file{next.config.js}. La page est
+une entrée de l'App Router, aucune directive ne la couvre : c'est un module
+serveur, et son \code{useState} est un défaut. \code{LikeButton}, sous
+\code{"use client"}, est un composant client ordinaire.
+
+\begin{decision}[ADR-026 --- analyser les Server Components quand même]
+\emph{Décision} (\adr{26}). Chaque module garde ses faits bruts
+(\code{ModuleFacts {directives, imports}}) ; un module est serveur s'il est
+atteignable depuis une entrée de l'App Router (\code{page}, \code{layout},
+\code{template}, \code{default}, \code{not-found}, \code{loading}) sans
+franchir de \code{"use client"} ; la règle \regle{server-component-hook} y
+signale les hooks, au niveau \Warning{} ; elle se tait si le programme
+n'utilise jamais \code{"use client"}. \emph{Alternatives refusées.}
+\emph{Sauter} les modules serveur : décider « serveur, on passe » sur un graphe
+d'imports incomplet ferait disparaître leurs défauts, un faux négatif. Une
+preuve must (\code{Certified}) pour la règle : \og would dress a path
+convention as a domain proof\fg{}, d'où le plafond \Warning{} : les deux faits porteurs (une convention de noms de fichiers, un graphe dont le résolveur a pu manquer des arêtes) sont hors du domaine abstrait. Un seul diagnostic par composant, car le défaut est la directive manquante du module. Supprimer les
+autres diagnostics dans un module serveur : toute erreur de classification
+deviendrait un faux négatif. Analyser un Server Component ne coûte rien en
+soundness : il n'a pas d'état, et l'interprétation abstraite le traite comme
+un composant dont les props sont $\Top$.
+\end{decision}
+
+La règle sous-déclare quand un import sur le chemin d'un module serveur n'est
+pas résolu (\issue{29}), et le premier avertissement de la sortie rappelle
+justement que des imports aliasés peuvent rester non résolus.
+
+\section{React-tRace : une sémantique formelle des hooks}
+\label{sec:react-modele-trace}
+
+Les sections précédentes décrivent React à partir de sa documentation, qui est
+informelle : elle ne dit pas, par exemple, \emph{quand exactement} la file
+d'updaters est rejouée (« sometime during the next render », relèvent les
+auteurs). Un analyseur par interprétation abstraite a besoin d'une sémantique
+concrète précise à sur-approximer. React-tRace, de Jay Lee, Joongwon Ahn et
+Kwangkeun Yi (OOPSLA 2025) \cite{LeeAhnYi2025}, en fournit une pour le cœur
+des hooks : \code{useState} et \code{useEffect}. Cette section en résume les
+éléments dont le projet se sert ; les notations sont celles de l'article.
+
+\subsection{Le langage}
+
+L'article travaille sur un petit langage applicatif, découplé de JavaScript
+(\og we decouple ourselves from the subtleties of the complex semantics of
+JS\fg{}). Sa syntaxe (Fig.~1 de l'article) :
+\[
+\begin{array}{r@{\;}c@{\;}l}
+  P &::=& D\;e \qquad D ::= \mathtt{let}\ C(x) = e\\[2pt]
+  e &::=& () \mid \mathtt{true} \mid \mathtt{false} \mid n \mid x \mid C
+          \mid e \oplus e \mid [e] \mid \mathtt{print}\ e
+          \mid \mathtt{if}\ e\ \mathtt{then}\ e\ \mathtt{else}\ e \mid e;e\\
+    &\mid& \mathtt{fun}\ x \to e \mid e\ e \mid \mathtt{let}\ x = e\ \mathtt{in}\ e
+     \mid \mathtt{let}\ (x, x_{\mathit{set}}) = \mathtt{useState}_\ell\ e\ \mathtt{in}\ e
+     \mid \mathtt{useEffect}\ e
+\end{array}
+\]
+Un programme est une suite de définitions de composants suivie d'une
+expression principale. \code{[e]} est une vue composée (l'analogue du JSX
+imbriqué) ; une fermeture utilisée comme vue représente un handler (un bouton
+\emph{est} son handler). Les hooks ne peuvent apparaître qu'au niveau supérieur
+d'un corps de composant, ce que l'interpréteur vérifie à l'analyse syntaxique ;
+chaque \code{useState} porte un label unique $\ell$. L'effet n'a pas de deps :
+il s'exécute après chaque rendu, les deps étant \og a straightforward
+extension\fg{}.
+
+\subsection{Les objets sémantiques}
+
+Les valeurs de base sont les constantes, les fermetures
+$\langle \lambda x.e, \sigma\rangle$ et un tampon de sortie $\omega$. La
+machinerie React ajoute :
+\begin{itemize}
+  \item la \emph{spécification de composant} $\langle C, v\rangle$ (un nom et
+    son argument : appliquer un composant ne fait que l'empaqueter) ;
+  \item le \emph{setter} $\langle \ell, p\rangle$ : le label du \code{useState}
+    d'origine et le chemin $p$ de la vue qui le possède ;
+  \item la \terme{mémoire d'arbre} $m = [p \mapsto \pi]$, qui associe à chaque
+    chemin une \emph{vue}
+    $\pi = \{\mathit{spec}, \mathit{dec}, \mathit{sttst}, \mathit{effq}, \mathit{child}\}$ :
+    sa spécification, un ensemble de \emph{décisions}
+    $d \in \{\mathsf{Check}, \mathsf{Effect}\}$, un store d'état
+    $\rho = [\ell \mapsto \{\mathit{val} : v, \mathit{sttq} : q\}]$ (valeur
+    courante et file d'updaters), une file d'effets et un arbre d'enfants ;
+  \item une \emph{phase} d'évaluation $\phi \in \{\mathsf{Init}, \mathsf{Succ},
+    \mathsf{Normal}\}$ : premier appel d'un corps, appels suivants, ou
+    expression principale, effets et handlers ;
+  \item un \emph{mode} du moteur : \emph{rendered} (l'interface est à l'écran,
+    des effets attendent), \emph{check} (il faut vérifier si un rendu est
+    nécessaire) ou \emph{event loop} (on attend une entrée).
+\end{itemize}
+Les décisions sont les deux mots de la citation du
+\cref{sec:react-modele-effets} : \textsf{Check} marque une vue à re-vérifier
+(un set l'a visée), \textsf{Effect} une vue dont les effets doivent tourner
+après ce rendu.
+
+\subsection{La boucle de rendu}
+
+Le moteur est un système de transitions à quatre règles (Fig.~4 de
+l'article). En omettant le tampon de sortie et la table des définitions
+$\delta$, qui ne change pas :
+\[
+\begin{array}{l@{\qquad}l}
+\textsc{StepInit} &
+  \dfrac{[\,],[\,] \vdash e \Downarrow^{\mathsf{Normal}} s
+         \qquad [\,] \vdash \mathit{init}(s) = \langle t, m\rangle}
+        {\langle e\rangle \hookrightarrow \langle t, m, \text{rendered}\rangle}\\[14pt]
+\textsc{StepEffect} &
+  \dfrac{m \vdash \mathit{commitEffs}(t) = m'}
+        {\langle t, m, \text{rendered}\rangle \hookrightarrow \langle t, m', \text{check}\rangle}\\[14pt]
+\textsc{StepCheck} &
+  \dfrac{m \vdash \mathit{check}(t) = \langle \mu, m'\rangle}
+        {\langle t, m, \text{check}\rangle \hookrightarrow \langle t, m', \mu\rangle}\\[14pt]
+\textsc{StepEvent} &
+  \dfrac{\langle \lambda x.e, \sigma\rangle \in \mathit{handlers}(m, t)
+         \qquad m, \sigma[x \mapsto ()] \vdash e \Downarrow^{\mathsf{Normal}} v, m'}
+        {\langle t, m, \text{event loop}\rangle \hookrightarrow \langle t, m', \text{check}\rangle}
+\end{array}
+\]
+avec $\mu \in \{\text{rendered}, \text{event loop}\}$. La
+\cref{fig:react-modele-trace-modes} en donne l'automate. On y lit la
+\cref{fig:react-modele-chronologie} sous forme exacte : \textsc{StepInit} est le
+montage ; \textsc{StepEffect} exécute les effets en file ; \textsc{StepCheck}
+re-rend les vues marquées \textsf{Check} et revient en mode \emph{rendered} si
+un état a changé, en \emph{event loop} sinon ; \textsc{StepEvent} exécute un
+handler, ce qui impose une nouvelle vérification.
+
+\ifhastikz
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[->,>={Stealth[length=2mm]},node distance=30mm,
+    every state/.style={draw=ra-blue,thick,fill=ra-bg,minimum size=17mm,font=\small,align=center},
+    lab/.style={font=\scriptsize}]
+  \node[state,initial,initial text={$\langle e, \delta\rangle$}] (r) {rendered};
+  \node[state,right=of r] (c) {check\\{\scriptsize $\circlearrowleft$}};
+  \node[state,right=of c] (e) {event\\loop};
+  \draw (r) edge[bend left=20] node[lab,above]{\textsc{StepEffect}} (c);
+  \draw (c) edge[bend left=20] node[lab,below,align=center]{\textsc{StepCheck}\\un état a changé} (r);
+  \draw (c) edge[bend left=20] node[lab,above,align=center]{\textsc{StepCheck}\\rien n'a changé} (e);
+  \draw (e) edge[bend left=20] node[lab,below]{\textsc{StepEvent}} (c);
+\end{tikzpicture}
+\caption{Les modes de React-tRace et ses quatre transitions. La flèche
+d'entrée est \textsc{StepInit} (évaluation de l'expression principale et
+initialisation de l'arbre). La boucle infinie d'effets est le cycle
+rendered $\to$ check $\to$ rendered qui ne passe jamais par \emph{event loop} ;
+un handler, lui, n'est exécuté qu'en mode \emph{event loop}.}
+\label{fig:react-modele-trace-modes}
+\end{figure}
+\fi
+
+\subsection{Les règles d'évaluation}
+
+Sous la boucle, l'évaluation d'une expression
+$\Sigma, \sigma \vdash e \Downarrow^{\phi}_{p} v, \Sigma', \omega$ est une
+sémantique à grands pas. Les règles propres à React sont les suivantes
+(Fig.~5 à 10 de l'article).
+\begin{description}
+  \item[\textsc{SttBind}] (phase \textsf{Init}) : \code{useState} évalue son
+    argument $v_1$, crée l'entrée $\ell \mapsto \{\mathit{val}: v_1,
+    \mathit{sttq}: [\,]\}$ et lie $x_{\mathit{set}}$ au setter
+    $\langle \ell, p\rangle$.
+  \item[\textsc{SttReBind}] (phase \textsf{Succ}) : \code{useState} rejoue la
+    file $[\langle \lambda x_i.e_i, \sigma_i\rangle]_{i=1}^{n}$ dans l'ordre,
+    $v_0 \to v_1 \to \dots \to v_n$, vide la file, stocke $v_n$, et ajoute la
+    décision \textsf{Effect} si $v_n \not\equiv v_0$.
+  \item[\textsc{AppSetComp}] (set pendant le corps, phases \textsf{Init} et
+    \textsf{Succ}) : le chemin du setter doit être celui de la vue courante ;
+    l'updater est ajouté à la file et la décision \textsf{Check} posée.
+  \item[\textsc{AppSetNormal}] (set dans un effet ou un handler, phase
+    \textsf{Normal}) : l'updater est ajouté à la file de la vue $m[p]$ désignée
+    par le setter, quelle qu'elle soit, et \textsf{Check} y est posée. C'est la
+    seule règle qui voie toute la mémoire : un enfant peut mettre à jour son
+    parent.
+  \item[\textsc{Eff}] : \code{useEffect e} ajoute la fermeture
+    $\langle \lambda\_.e, \sigma\rangle$ à la file d'effets de la vue ---
+    l'effet capture l'environnement \emph{du rendu}.
+  \item[\textsc{EvalOnce} / \textsc{EvalMult}] : un corps est évalué, puis
+    ré-évalué en phase \textsf{Succ} tant qu'il pose \textsf{Check} (file
+    d'effets vidée à chaque essai) ; React lève une exception après 25
+    essais.
+  \item[\textsc{CommitEffsPath} / \textsc{CommitEffsPathIdle}] : les effets
+    d'une vue ne sont exécutés que si sa décision contient \textsf{Effect},
+    enfants d'abord (post-ordre), puis dans l'ordre syntaxique.
+  \item[\textsc{CheckIdle} / \textsc{CheckNoEffect} / \textsc{CheckEffect}] :
+    une vue sans \textsf{Check} est sautée ; avec \textsf{Check}, son corps
+    est ré-évalué ; si la nouvelle décision ne contient pas \textsf{Effect}
+    (l'état est revenu au même), rien n'est rendu ; sinon l'enfant est
+    réconcilié et le mode redevient \emph{rendered}.
+  \item[\textsc{ReconcileComEffect} / \textsc{ReconcileComNew}] : un enfant
+    du même composant est ré-évalué en \textsf{Succ} ; un composant différent
+    à la même place est initialisé à neuf.
+\end{description}
+
+\begin{exemple}{\code{SelfCounter} en React-tRace}{trace-selfcounter}
+Au montage, \textsc{InitCom} évalue le corps en phase \textsf{Init}
+(\textsc{SttBind} : $s = 0$ ; \textsc{Eff} met l'effet en file) et pose
+\textsf{Effect} : mode \emph{rendered}. \textsc{StepEffect} exécute l'effet en
+phase \textsf{Normal} : $s < 3$, donc \textsc{AppSetNormal} met
+$\lambda s.\,s+1$ en file et pose \textsf{Check} ; mode \emph{check}.
+\textsc{StepCheck} ré-évalue le corps : \textsc{SttReBind} rejoue la file,
+$0 \to 1$, $1 \not\equiv 0$ donc \textsf{Effect} : \textsc{CheckEffect}, mode
+\emph{rendered}. Le cycle se répète jusqu'à $s = 3$ ; alors l'effet tourne mais
+ne pose pas \textsf{Check}, et \textsc{StepCheck} (\textsc{CheckIdle}) mène en
+\emph{event loop}.
+\end{exemple}
+
+\subsection{Les théorèmes}
+
+L'article prouve deux propriétés que la documentation de React énonce
+informellement (§6.1).
+
+\begin{theoreme}{Ré-évaluation par appel d'un setter (Theorem 1)}{trace-reevaluation}
+La dérivation de l'évaluation retentée d'un corps contient plusieurs évaluations
+de ce corps si et seulement si \textsc{AppSetComp} apparaît dans la dérivation
+de la première évaluation.
+\end{theoreme}
+
+\begin{theoreme}{Condition d'exécution des effets (Theorem 2)}{trace-effets}
+Si $\langle t, m, \omega, \delta, \text{check}\rangle \hookrightarrow
+\langle t, m', \omega', \delta, \mu\rangle$, alors pour tout chemin $p$
+atteignable depuis la racine dans $m$ et $m'$, \textsc{CommitEffsPath} en $p$
+apparaît dans la dérivation de la transition suivante si et seulement s'il
+existe un ancêtre $p'$ de $p$ tel que (1) pour un $\ell$ du store de $m'[p']$,
+$m[p'].\mathit{sttst}[\ell].\mathit{val} \neq m'[p'].\mathit{sttst}[\ell].\mathit{val}$ ;
+ou (2) la dérivation de la transition contient \textsc{AppSetComp} de chemin
+$p'$.
+\end{theoreme}
+
+Le premier théorème est le mécanisme d'\code{Inf2} : un set dans le corps fait
+jeter l'évaluation et recommencer, indépendamment de la valeur écrite. Le
+second dit quand les effets tournent : après un changement d'état de la vue
+\emph{ou d'un de ses ancêtres} (c'est la cascade de rendu), ou si un set a eu
+lieu pendant le corps. Un troisième résultat (Theorem~8, appuyé sur le
+Lemma~7) concerne une optimisation de React, qui applique par avance les
+updaters en tête de file sans ré-évaluer le corps : si ces updaters sont purs
+(Definition~3), l'état final est le même. Il justifie que la sémantique ignore
+cette optimisation. La validité d'une vue (Definition~6) repose enfin sur le
+fait que \og each useState call in a component body is executed exactly once
+during initialization\fg{} --- c'est ici que la règle des hooks entre dans la
+formalisation.
+
+\paragraph{Conformité.} La suite de tests couvre les 44 règles d'évaluation par
+38 tests répartis en 18 scénarios (Table~1), rejoués sur React 16.14.0,
+17.0.2, 18.3.1 et 19.1.0 ; une seule différence, due à l'optimisation
+ci-dessus (scénario S17, set depuis un événement utilisateur). L'interpréteur
+et le visualiseur sont publiés (\code{Zeta611/react-trace}).
+
+\paragraph{Extensions esquissées.} Le §7 de l'article esquisse
+\code{useRef} (un store de refs sans \textsf{Check}), \code{useMemo} (valeur
+et deps, recalcul en \textsf{Succ} si les deps diffèrent), \code{useContext}
+(recherche ascendante du provider, \textsf{Check} des consommateurs quand la
+valeur change), \code{useLayoutEffect} (un mode supplémentaire) et les hooks
+personnalisés (de simples compositions). Aucune n'est formalisée : c'est
+précisément la part que \reactant{} doit ajouter sans garantie formelle.
+
+\section{La sémantique concrète du projet : ce qu'on garde, ce qu'on abstrait}
+\label{sec:react-modele-concrete}
+
+\subsection{Le contrat : ADR-001}
+
+\begin{decision}[ADR-001 --- React-tRace comme sémantique concrète de référence]
+\emph{Contexte.} Une interprétation abstraite dérive une sémantique abstraite
+$C^\sharp$ d'une sémantique concrète $C$ ; sans $C$ explicite, la soundness ne
+peut pas être établie et les fonctions de transfert \og are written by
+guesswork\fg{}. \emph{Décision} (\adr{1}). React-tRace est la sémantique
+concrète $C$ ; les fonctions de transfert en dérivent ; les extensions (deps,
+\code{useMemo}, \code{useCallback}, \code{useRef}, objets) sont spécifiées
+comme extensions de React-tRace. \emph{Justification.} C'est la seule
+formalisation publique de React accompagnée d'une preuve de conformité ; la
+boucle \textsc{StepInit} $\to$ \textsc{StepEffect} $\to$ \textsc{StepCheck}
+correspond directement à l'itération de point fixe ; \textsc{SttReBind},
+\textsc{CheckEffect} et \textsc{CheckNoEffect} définissent exactement les
+conditions de re-rendu. \emph{Limites acceptées.} React-tRace ne couvre que
+\code{useState} et \code{useEffect} sans deps ; son langage n'est pas
+JavaScript ; les extensions n'ont pas de garantie formelle équivalente.
+\end{decision}
+
+L'ADR annonce aussi trois conséquences que le dépôt, au commit \code{e67b10a},
+ne réalise pas. Le fichier \file{docs/semantics.md} censé spécifier les
+extensions n'existe pas ; aucune fonction de \file{src/domains/} ne cite de
+règle React-tRace (\code{grep -rn "tRace" src} ne trouve rien) ; aucun test ne
+compare l'analyseur à l'interpréteur de l'article sur ses exemples (aucun test
+ne mentionne \code{Flicker}, \code{SelfCounter} ou \code{Inf2}). React-tRace est
+donc la référence \emph{conceptuelle} du projet --- l'ADR-004 et l'ADR-012 s'y
+réfèrent, et ce chapitre en tire la table de correspondance ---, pas un oracle
+outillé.
+
+\subsection{De la boucle de rendu à la boucle de point fixe}
+
+\begin{decision}[ADR-004 --- un CFG de rendu, un CFG par effet]
+Chaque composant est représenté par un \code{render_cfg} et une liste de
+\code{HookEntry}, dont chaque effet porte son propre \code{body_cfg}
+(\adr{4}). L'alternative refusée est un méta-CFG unique, rendu et effets
+reliés par des arêtes rendu $\to$ effet $\to$ check : un grand graphe
+difficile à maintenir, qui rend implicite la séparation rendu/effet et
+\og risks incorrect modeling of React's execution order\fg{}. Or la séparation
+est un invariant de React (\og the effect never executes during the
+render\fg{}), et les défauts visés sont des propriétés de l'\emph{état} au
+point fixe, pas des chemins d'un graphe unifié.
+\end{decision}
+
+La boucle de \code{analyze_component_impl}
+(\src{src/engine/fixpoint.rs}{130}{698}) joue abstraitement les tours de React.
+L'\cref{alg:react-modele-fixpoint} en donne une lecture fidèle, réduite à ce
+qui concerne ce chapitre ; son étude complète est au
+\cref{chap:point-fixe-composant}.
+
+\begin{algorithm}[htbp]
+\Entree{un composant : \code{render_cfg}, \code{hooks}, environnement initial (props)}
+\Sortie{les stores convergés, \code{widen_trace}, \code{effect_setter_writes}}
+$S \leftarrow \Bot$\;
+\PourCh{$\mathtt{State}\{\ell, \mathit{init}\}$}{$S[\ell] \leftarrow S[\ell] \join \sem{\mathit{init}}$ \tcp*{\textsc{SttBind}, l.~314--353}}
+\Tq{vrai}{
+  $(\mathit{env}, R) \leftarrow$ passe de rendu sur $S$ \tcp*{\textsc{StepInit}/\textsc{Succ}}
+  recalculer les mémos depuis $\mathit{env}$\;
+  $E \leftarrow \bigsqcup_{\text{tout effet}}$ passe d'effet depuis $\mathit{env}$ sur $S$ \tcp*{\textsc{StepEffect}, deps ignorées}
+  $H \leftarrow \bigsqcup_{\text{tout handler}}$ passe de handler depuis $\mathit{env}$ sur $S$ \tcp*{\textsc{StepEvent}, 0..N fois}
+  $N \leftarrow R \join E \join H \join$ écritures des autres composants\;
+  \Si{$N \lleq S$}{\textbf{sortir} \tcp*{\textsc{StepCheck} : rien n'a changé}}
+  $i \leftarrow i+1$\;
+  \eSi{$i \geq 3$}{\code{widen_trace} $\cup$= slots changés dans $R \join E$ (pas $H$)\; $S \leftarrow S \widen N$ (à seuils)\;}{$S \leftarrow N$\;}
+}
+rejouer le rendu sur les stores convergés ; rejouer les effets depuis $\Bot$ $\to$ \code{effect_setter_writes}\;
+\caption{La boucle de point fixe d'un composant (lecture de \src{src/engine/fixpoint.rs}{355}{593}, élaguée : garde-fou à 100 itérations, relations calculées à la fin)}
+\label{alg:react-modele-fixpoint}
+\end{algorithm}
+
+Une itération abstraite n'est pas un tour de React : elle en représente
+\emph{tous} à la fois. Le store $S$ de l'itération $k$ sur-approxime les
+valeurs que l'état peut avoir après au plus $k$ tours, de n'importe quel type
+(déclenché par un effet ou par un handler), et la boucle s'arrête quand un tour
+de plus n'ajoute rien --- c'est la version abstraite de \textsc{CheckNoEffect}
+partout. La \cref{tab:react-modele-correspondance} fait la correspondance
+règle par règle.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}>{\raggedright}p{0.3\linewidth}>{\raggedright\arraybackslash}X@{}}
+  \toprule
+  React-tRace & \reactant{} (commit \code{e67b10a}) \\
+  \midrule
+  \textsc{SttBind} (phase \textsf{Init}) & amorçage hors boucle, \src{src/engine/fixpoint.rs}{314}{353} \\
+  \textsc{AppSetComp}, \textsc{AppSetNormal} (mise en file) & \code{exec_setter_call} : join immédiat, \src{src/domains/interp/interpreter.rs}{341}{366} ; setter d'un autre composant : \code{SharedStateStore}, l.~368--392 \\
+  \textsc{SttReBind} (rejeu de la file, $v_n \not\equiv v_0$) & lecture \code{StateVal} (store joint, référence \code{Versioned}), \src{src/domains/transfer/state_value.rs}{122}{134} ; « a changé ? » = test $N \lleq S$, \srcline{src/engine/fixpoint.rs}{495} \\
+  \textsc{Eff}, \textsc{CommitEffsPath} & passes d'effets, tous les effets, \src{src/engine/fixpoint.rs}{415}{449} \\
+  \textsc{StepCheck}, \textsc{CheckNoEffect} & test de convergence, \srcline{src/engine/fixpoint.rs}{495} \\
+  cycle Check--Effect infini (§3.1.1) & \code{widen_trace}, \src{src/engine/fixpoint.rs}{514}{527}, et \code{effect_setter_writes}, l.~565--593 ; churn : lignes \code{exact} de \relation{effect_triggers} \\
+  \textsc{EvalMult} infini (§3.1.2) & \regle{setter-in-render}, \Error{} si l'appel domine toutes les sorties \\
+  \textsc{StepEvent} & \code{HookEntry::Handler}, passes de handlers hors \code{widen_trace}, \src{src/engine/fixpoint.rs}{451}{483} \\
+  setter $\langle \ell, p\rangle$ & \code{Expr::StateSetter} s'évalue en \code{component_setter(composant, label)}, \srcline{src/domains/transfer/state_value.rs}{135} (ADR-012 : \og Corresponds to \code{Set_clos { label, path }} of React-tRace\fg{}) \\
+  \textsc{AppCom}, \textit{init}, \textit{reconcile} & \code{eval_comp_app} : analyse descendante des enfants avec leurs props abstraites, \src{src/domains/transfer/state_value.rs}{470}{594} \\
+  \bottomrule
+\end{tabularx}
+\caption{Table de correspondance entre les règles de React-tRace et les mécanismes de \reactant.}
+\label{tab:react-modele-correspondance}
+\end{table}
+
+\subsection{Ce qu'on garde, ce qu'on abstrait}
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}>{\raggedright}p{0.28\linewidth}>{\raggedright}X>{\raggedright\arraybackslash}X@{}}
+  \toprule
+  Fait de React & Ce que \reactant{} en fait & Pourquoi c'est sûr \\
+  \midrule
+  Le rendu, les effets et les handlers s'exécutent à des moments distincts & gardé : un CFG par corps, trois sortes de passes & structure \\
+  Un effet capture l'environnement de son rendu & gardé : chaque effet part de l'environnement de sortie du rendu & exact \\
+  L'identité d'un hook est sa position & gardé : label = ordre d'appel & exact \\
+  Un setter est une valeur liée à un slot d'un composant & gardé : \code{component_setter}, \code{SharedStateStore} & exact \\
+  File d'updaters, ordre, batching & abstraits : join immédiat, updater sur le store & le join contient tout résultat de file \\
+  \og l'effet tourne ssi une dep a changé\fg{} & abstrait : tous les effets à chaque itération ; deps relues par les règles & plus d'exécutions que React \\
+  Bail-out \code{Object.is} & abstrait : tout set peut re-rendre & plus de rendus que React \\
+  Ordre enfants-parent des effets & abstrait : join commutatif, effets croisés vus à l'itération suivante & ordre quelconque couvert \\
+  Nombre de clics & abstrait : handlers exécutés 0..N fois dans le point fixe & toute séquence couverte \\
+  DOM, réconciliation fine, Strict Mode & ignorés (un élément natif vaut \code{Stable}) & sans effet sur l'état \\
+  Durée d'une suite de rendus & non calculée & voir le piège de \code{Toggle} \\
+  \bottomrule
+\end{tabularx}
+\caption{Les faits de React et leur sort dans l'analyseur.}
+\label{tab:react-modele-garde-abstrait}
+\end{table}
+
+La \cref{tab:react-modele-garde-abstrait} résume les choix. L'argument de
+soundness qui les réunit tient en une phrase : chaque abstraction
+\emph{ajoute} des comportements (plus d'effets exécutés, plus de rendus, plus
+de valeurs dans chaque slot), jamais n'en retire, et la mise à jour faible
+garantit que ce qu'un tour concret peut écrire est contenu dans le store. La
+définition précise de la soundness est au \cref{chap:interpretation-abstraite}
+(\cref{def:soundness}) ; la dernière ligne du tableau en marque la
+portée : ce qui est sur-approximé, c'est l'ensemble des états, pas la
+terminaison.
+
+\subsection{Les callbacks : dans le cycle ou hors du cycle}
+
+Un effet qui appelle un setter dans un \code{.then} ou un \code{setTimeout}
+relance un tour sans intervention extérieure ; un effet qui s'abonne avec
+\code{addEventListener} ne le fait qu'à chaque événement. L'analyseur doit
+distinguer les deux, sinon tout compteur de clics serait une boucle infinie.
+
+% Table literate locale : « … » (l. 13) casse la table commune (\dots) sous pdflatex.
+\rustsnippet[literate={…}{{...}}1 {→}{{$\rightarrow$}}1]{src/domains/interp/callbacks.rs}{6}{23}{la classe de déclenchement d'un callee}
+
+La classe est décidée par le nom du callee (\code{classify_callee},
+\src{src/domains/interp/callbacks.rs}{28}{56}) : \code{setTimeout},
+\code{setInterval}, \code{queueMicrotask}, \code{requestAnimationFrame},
+\code{then}/\code{catch}/\code{finally} et les fonctions d'ordre supérieur
+synchrones (\code{map}, \code{forEach}\dots) sont \code{InCycle} et leurs
+arguments fonctionnels sont exécutés ; \code{addEventListener} est
+\code{Subscription} ; tout autre callee est \code{Unknown}.
+
+\begin{decision}[ADR-009 --- points d'entrée et classe de déclenchement]
+\emph{Décision} (\adr{9}). La descente dans les callbacks est
+\emph{sémantique} (le store bouge), pas seulement structurelle ; les handlers
+JSX et les abonnements sont des \emph{points d'entrée} séparés, exécutés 0..N
+fois dans le point fixe, dont les écritures entrent dans le store mais pas dans
+\code{widen_trace} : « clicking 1000$\times$ isn't a bug ». \emph{Alternative
+refusée.} Descendre uniformément dans tout callback aurait armé la valeur sur
+\code{addEventListener('click', () => setCount(c => c + 1))} dans un effet, un
+faux positif d'\regle{infinite-loop} sur du React correct. \emph{Choix
+explicite} : \code{Unknown} n'est pas descendu, \og for a linter, false
+positives are more costly than false negatives [\dots] We accept the FN\fg{}.
+\end{decision}
+
+\begin{piege}
+Le choix \og \code{Unknown} $\to$ skip\fg{} de l'ADR-009 est en tension avec
+l'invariant du projet, « faux négatifs INTERDITS ». Un setter appelé dans
+\code{myUtil(() => setX(x + 1))} ne fait pas bouger le store ; un mécanisme
+ultérieur (l'inlining des fonctions locales connues) réduit ce trou sans le
+fermer. La relation des écrivains, elle, garde ces écritures avec une phase
+$\Top$ (\code{SetterCallPhase::Unknown}), que \regle{setter-in-render} signale
+en \Warning. Le store et la relation n'ont donc pas la même politique : « absent
+du store » ne veut pas dire « jamais écrit ».
+\end{piege}
+
+Le moment d'une écriture, vu par la relation des écrivains
+(\cref{chap:relations}), est une phase :
+
+\rustsnippet{src/engine/setters.rs}{57}{70}{les phases d'un appel de setter}
+
+\code{Handler} dit qu'un événement utilisateur s'interpose ; \code{Deferred},
+qu'un tour ultérieur de la boucle d'événements s'interpose (minuterie,
+microtâche, cleanup). Depuis l'ADR-035 (\adr{35}), une écriture placée après un
+\code{await} est aussi \code{Deferred} : le lowering coupe le bloc à l'\code{await}
+par une arête \code{EdgeKind::Await}, et la marche des setters promeut
+\code{Sync} en \code{Deferred} dans les blocs qui suivent. C'est la traduction
+exacte d'un fait du langage : après un \code{await}, on est sorti de toute
+phase de React.
+
+\subsection{Trois écarts vérifiés}
+
+L'exactitude impose de montrer aussi où la sémantique abstraite du commit
+étudié \emph{ne} sur-approxime \emph{pas} la sémantique concrète, ou la
+sur-approxime au mauvais niveau. Ce sont des défauts, pas des choix ; ils sont
+présentés ici parce que chacun se comprend par un fait React de ce chapitre.
+
+\begin{piege}
+\textbf{L'updater fonctionnel sur le chemin programme (faux négatif).}
+\begin{lstlisting}[language=TypeScript,caption={\code{D} : un updater dans un effet gardé par l'état qu'il écrit (\file{/tmp/ch02/updater.tsx}, imports omis)},label={lst:react-modele-updater}]
+export function D() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    setCount((c) => c + 1);
+  }, [count]);
+  return <div>{count}</div>;
+}
+\end{lstlisting}
+En React, c'est une boucle certaine. La CLI ne dit rien :
+\begin{sortie}
+  [verbose] D: 2 iteration(s), widened: []
+✓  1 file(s) no issues found.
+\end{sortie}
+Pourtant le test \code{functional_updater_with_state_dep_is_flagged} de
+\file{tests/functional_updater.rs}, qui analyse le même composant, passe
+(\code{cargo test --test functional_updater} : \code{5 passed}). Le test appelle
+\code{analyze_component} (analyse intra, \code{inter = None}) ; la CLI passe par
+l'analyse de programme (\code{inter} présent). La seconde branche
+d'\code{exec_setter_call} (\src{src/domains/interp/interpreter.rs}{368}{392})
+s'applique alors à tout callee qui s'évalue en setter, y compris le setter du
+composant \emph{lui-même}, et joint dans le \code{SharedStateStore}
+l'argument \emph{évalué}, c'est-à-dire la fermeture \code{c => c + 1}
+(\code{PerRender}) et non la valeur qu'elle renvoie ; ce store est rejoint au
+test de convergence, le slot devient un mélange nombre--référence sur lequel
+\code{c + 1} vaut $\Top$, et plus rien ne croît.
+\end{piege}
+
+\begin{piege}
+\textbf{\code{useReducer} (faux positif au niveau \Error).} Parce que le
+réducteur est jeté (\cref{sec:react-modele-usestate}), \code{dispatch(action)}
+écrit l'action dans le slot :
+\begin{lstlisting}[language=TypeScript,caption={\code{R} : un réducteur qui ignore l'action \code{noop} (\file{/tmp/ch02/reducer.tsx}, imports omis)},label={lst:react-modele-reducer}]
+function reducer(s: { n: number }, action: { type: string }) {
+  if (action.type === "noop") return s;
+  return { n: s.n + 1 };
+}
+
+export function R() {
+  const [state, dispatch] = useReducer(reducer, { n: 0 });
+  useEffect(() => {
+    dispatch({ type: "noop" });
+  }, [state]);
+  return <div>{state.n}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+  R  (2 hooks)  reducer.tsx
+    error  infinite-loop  [hook:0]  (line 10:2)  this effect recreates object state `state` it depends on. Every run stores a fresh reference (`Object.is` always fails) and re-triggers itself: infinite render loop
+       → a fresh value is written to state `state` here [hook:1] (line 11:4)
+\end{sortie}
+En React, le réducteur renvoie \code{s} inchangé, \code{Object.is} conclut à
+l'égalité, pas de rendu : aucune boucle. L'analyseur voit un objet frais (l'action)
+écrit dans le slot dont l'effet dépend, et conclut au churn. C'est une \Error{}
+fausse, ce que \file{docs/limitations.md} exclut (\og A false positive never
+carries an Error\fg{}).
+\end{piege}
+
+\begin{piege}
+\textbf{La boucle oscillante (faux négatif).} C'est \code{Toggle}
+(\cref{ex:canon-toggle}) : la valeur abstraite converge parce que
+l'ensemble des états est fini, et aucune preuve structurelle ne couvre une
+négation booléenne.
+\end{piege}
+
+\section{Les exemples canoniques du manuscrit}
+\label{sec:react-modele-exemples}
+
+Les chapitres suivants reviennent sans cesse à une poignée de programmes. Ils
+sont définis dans ce chapitre (ou, pour \code{Timer}, dans l'introduction) et
+réunis dans la \cref{tab:react-modele-canon}, avec le comportement de React et
+le verdict de \reactant{} au commit \code{e67b10a}. Tous les fichiers sont sous
+\file{/tmp/ch02/} et les sorties ont été obtenues par
+\code{reactant check --no-color --info --show-clean --project plain <fichier>}.
+
+Il manquait au chapitre la sortie de \code{Timer}. Le fichier
+\file{/tmp/ch02/timer.tsx} contient une variante du \code{Timer} de l'introduction
+(\cref{lst:introduction-timer}) : même structure, un état nommé \code{n} et un
+callback écrit en une ligne, \code{setInterval(() => setN(n + 1), 1000)} ; et sa
+correction
+\code{TimerFixed}, qui passe l'updater \code{(m) => m + 1} :
+
+\begin{sortie}
+  Timer  (2 hooks)  timer.tsx
+    warn   missing-deps  [hook:1]  var:n  (line 5:2)  `n` is used in this effect but not in its deps array, and it is recreated on every render
+    error  stale-closure  [hook:1]  var:n  (line 6:10)  the `setInterval` callback registered by this mount-only effect reads `n` and writes it back. `n` was captured once at mount, so every firing recomputes from the same frozen value and the state can never advance past its first update
+    info   widening-info  (line 5:2)  state `n` kept changing during analysis and was approximated to converge, so findings that depend on it may be imprecise
+  TimerFixed  (2 hooks)  timer.tsx  ✓
+    verified  stale-closure  no long-lived callback captures a stale state value
+\end{sortie}
+
+Le callback de \code{setInterval} est \code{InCycle}
+(\cref{sec:react-modele-concrete}) : son écriture entre dans le point fixe, d'où
+l'élargissement. Le fait React qui fonde l'\Error{} est celui de la
+\cref{sec:react-modele-usestate} : \code{n} est une constante du rendu de
+montage, et l'effet, de deps \code{[]}, ne tourne qu'une fois.
+
+\begin{center}\small
+\begin{longtable}{@{}>{\raggedright}p{0.25\linewidth}>{\raggedright}p{0.3\linewidth}>{\raggedright\arraybackslash}p{0.37\linewidth}@{}}
+  \caption{Les exemples canoniques. « Ex. » renvoie à l'encadré ou à l'extrait qui les définit.}\label{tab:react-modele-canon}\\
+  \toprule
+  Composant (fichier) & À l'exécution (React) & \reactant{} (\code{e67b10a}) \\
+  \midrule
+  \endfirsthead
+  \toprule
+  Composant (fichier) & À l'exécution (React) & \reactant{} (\code{e67b10a}) \\
+  \midrule
+  \endhead
+  \code{Counter} (\file{counter.tsx}), \cref{ex:canon-counter} & compte les clics & aucun diagnostic \\
+  \code{Batch} (\file{batching.tsx}), \cref{lst:react-modele-batch} & \code{+2} par clic & aucun diagnostic \\
+  \code{SameValue} (\file{samevalue.tsx}), \cref{lst:react-modele-samevalue} & bail-out, un seul rendu & \Warning{} \regle{redundant-set-state} \\
+  \code{Todos} (\file{lazy.tsx}), \cref{lst:react-modele-lazy} & appel inutile à chaque rendu & \Warning{} \regle{lazy-init} \\
+  \code{EveryCommit}, \code{OnChange} (\file{deps.tsx}) & boucle infinie & \Warning{} \regle{infinite-loop} \\
+  \code{MountOnly} (\file{deps.tsx}) & deux rendus puis arrêt & \Warning{} \regle{missing-deps}, \Info{} \regle{widening-info} \\
+  \code{Inf} (\file{selfcounter.tsx}), \cref{ex:canon-selfcounter} & boucle infinie & \Warning{} \regle{infinite-loop} \\
+  \code{SelfCounter} (id.) & quatre rendus puis arrêt & \Info{} \regle{widening-info} seulement \\
+  \code{Flicker} (\file{flicker.tsx}), \cref{ex:canon-flicker} & un rendu de trop au montage & \Warning{} \regle{unnecessary-rerender} \\
+  \code{Toggle} (\file{toggle.tsx}), \cref{ex:canon-toggle} & boucle infinie (oscillation) & \textbf{aucun diagnostic} (FN) \\
+  \code{Width} (\file{listener.tsx}), \cref{lst:react-modele-listener} & abonnements empilés & \Warning{} \regle{missing-cleanup} \\
+  \code{Search} (\file{search.tsx}), \cref{lst:react-modele-search} & un effet repart à chaque rendu & \Warning{} \regle{always-unstable-deps} \\
+  \code{ObjChurn} (\file{objchurn.tsx}), \cref{ex:canon-objchurn} & boucle infinie (identité) & \Error{} \regle{infinite-loop} \\
+  \code{ObjStateDep} (id.) & effet de montage seul & aucun diagnostic \\
+  \code{Cond} (\file{cond.tsx}), \cref{ex:canon-cond} & interface cassée après le clic & \Error{} \regle{conditional-hook} \\
+  \code{Inf2} (\file{setter_in_render.tsx}), \cref{ex:canon-inf2} & \og Too many re-renders\fg{} & \Error{} \regle{setter-in-render} \\
+  \code{List} (\file{adjust.tsx}), \cref{lst:react-modele-adjust} & motif documenté, converge & \Warning{} \regle{setter-in-render} sur \code{setSelection} (FP) \\
+  \code{Impure} (\file{strict.tsx}), \cref{lst:react-modele-impure} & rendu impur (Strict Mode le révèle) & aucun diagnostic \\
+  \code{ThemeProvider}, \code{Button} (\file{context.tsx}) & consommateurs re-rendus & \Warning{} \regle{unstable-context-value}, \Info{} \regle{analysis-limit} \\
+  \code{Page} (\file{app/page.tsx} de \file{/tmp/ch02next}) & hook dans un Server Component & \Warning{} \regle{server-component-hook} \\
+  \code{Timer} (\file{timer.tsx}), \cref{lst:introduction-timer} & chronomètre bloqué à 1 & \Error{} \regle{stale-closure}, \Warning{} \regle{missing-deps} \\
+  \code{TimerFixed} (id.) & correct & aucun diagnostic \\
+  \code{D} (\file{updater.tsx}), \cref{lst:react-modele-updater} & boucle infinie & \textbf{aucun diagnostic} (FN) \\
+  \code{R} (\file{reducer.tsx}), \cref{lst:react-modele-reducer} & pas de boucle (bail-out) & \textbf{\Error{}} \regle{infinite-loop} (FP) \\
+  \bottomrule
+\end{longtable}
+\end{center}
+
+\begin{resume}
+\begin{itemize}
+  \item Un composant est une fonction que React appelle autant de fois qu'il
+    le veut. Un tour : déclencheur, rendu, commit, effets ; un set dans un
+    effet relance un tour, un set dans un handler attend un événement, un set
+    pendant le rendu fait jeter le rendu (\cref{fig:react-modele-chronologie}).
+  \item \code{set} planifie le prochain rendu ; les mises à jour sont mises en
+    file et regroupées ; un updater lit la file ; \code{Object.is} fait sauter
+    un rendu inutile. L'analyseur ne garde ni file ni ordre : une écriture est
+    un join dans le \code{StateStore}, un updater est exécuté sur la valeur du
+    store (\code{exec_setter_call}).
+  \item Un effet tourne après le commit si une dep a changé selon
+    \code{Object.is}. Le point fixe exécute \emph{tous} les effets à chaque
+    itération ; les deps sont relues par les règles et par la relation
+    \relation{effect_triggers} (bit \code{exact} : l'effet \emph{doit} repartir).
+  \item L'identité compte autant que la valeur : littéraux \code{PerRender},
+    lecture d'un état \code{Versioned} par son slot (double vue de l'état,
+    ADR-017), mémos comme join des deps. \code{ObjChurn} est une \Error{} par
+    trois faits must, pas par divergence.
+  \item Un hook est identifié par sa position (\code{HookLabel}) ; un hook
+    conditionnel ne domine pas toutes les sorties ; la fin d'un corps est un
+    \code{return} (ADR-025).
+  \item Strict Mode n'est pas modélisé, le contexte côté consommateur est
+    $\Top$, les Server Components sont analysés quand même et un hook y est un
+    \Warning{} (ADR-026).
+  \item React-tRace fournit la sémantique concrète de référence (ADR-001) :
+    mémoire d'arbre, décisions \textsf{Check}/\textsf{Effect}, quatre
+    transitions \textsc{StepInit}, \textsc{StepEffect}, \textsc{StepCheck},
+    \textsc{StepEvent} ; la \cref{tab:react-modele-correspondance} la relie au
+    code. Le contrat est conceptuel : ni \file{docs/semantics.md}, ni oracle de
+    tests.
+  \item Le point fixe sur-approxime l'ensemble des états, pas la durée d'une
+    suite de rendus (\code{Toggle}) ; trois écarts vérifiés au commit étudié :
+    \code{Toggle} et \code{D} (FN), \code{R} (\Error{} fausse).
+\end{itemize}
+{\raggedright Fichiers rencontrés : \file{src/engine/fixpoint.rs},
+\file{src/domains/interp/interpreter.rs}, \file{src/domains/interp/callbacks.rs},
+\file{src/domains/transfer/state_value.rs}, \file{src/domains/impls/stability.rs},
+\file{src/domains/stores/state_store.rs}, \file{src/engine/triggers.rs},
+\file{src/engine/setters.rs}, \file{src/ir/hooks.rs},
+\file{src/lowering/hook_extractor.rs}. Le \cref{chap:interpretation-abstraite}
+donne le cadre mathématique (treillis, concrétisation, point fixe, widening,
+soundness) dans lequel toutes ces approximations se formulent exactement.\par}
+\end{resume}
+
+\section*{Exercices}
+\addcontentsline{toc}{section}{Exercices}
+
+\begin{exercice}{Les itérations d'\code{Inf}}{react-modele-inf}
+Pour \code{Inf} (\cref{ex:canon-selfcounter}), donner la valeur du slot
+\code{s} (composante numérique) au début de chaque itération de
+l'\cref{alg:react-modele-fixpoint}, sachant que \code{widen_threshold = 3}, et
+dire à quelle itération \code{widen_trace} reçoit le slot. Comparer avec la
+sortie \code{--verbose} : \code{Inf: 3 iteration(s), widened: [0]}.
+\end{exercice}
+\begin{solution}
+Amorçage : $[0,0]$. Passe 1 : l'effet écrit $[1,1]$, $N = [0,1] \not\lleq [0,0]$,
+$i = 1$, $S \leftarrow [0,1]$. Passe 2 : écriture $[1,2]$, $N = [0,2]$, $i = 2$,
+$S \leftarrow [0,2]$. Passe 3 : écriture $[1,3]$, $N = [0,3]$, $i = 3 \geq 3$ :
+le slot entre dans \code{widen_trace} avec l'itération 3 (d'où « widened at
+iteration 3 ») et $S \leftarrow [0,2] \widen [0,3]$, non borné à droite. Passe
+4 : plus rien ne croît, sortie. Le compteur vaut 3.
+\end{solution}
+
+\begin{exercice}{Deux updaters}{react-modele-deux-updaters}
+Un handler exécute \code{setN((c) => c + 1); setN((c) => c + 1);} avec un
+store $\{n \mapsto [0,0]\}$. Que vaut le slot après la passe selon
+\code{exec_setter_call} ? Que donne React ? Pourquoi le résultat abstrait
+est-il correct bien qu'il contienne une valeur que React ne produit jamais
+après ce clic ?
+\end{exercice}
+\begin{solution}
+Premier updater : $c = [0,0]$, écriture $[1,1]$, slot $[0,1]$. Second :
+$c = [0,1]$, écriture $[1,2]$, slot $[0,2]$. React rejoue la file :
+$0 \to 1 \to 2$, soit \code{2}. $[0,2]$ contient \code{2} ; les valeurs \code{0}
+et \code{1} en trop sont le prix du join (imprécision), pas une erreur : une
+sur-approximation peut contenir des états impossibles, elle ne doit pas en
+omettre de possibles.
+\end{solution}
+
+\begin{exercice}{Tous les effets}{react-modele-tous-effets}
+En vous appuyant sur les règles \textsc{CommitEffsPath} et
+\textsc{CommitEffsPathIdle}, montrer qu'exécuter tous les effets à chaque
+itération (\cref{lst:react-modele-effect-pass}) produit un store qui contient
+toutes les écritures des effets que React exécute. Qu'est-ce que cette
+sur-approximation coûte en précision, et où le projet la récupère-t-il ?
+\end{exercice}
+\begin{solution}
+React exécute un sous-ensemble des effets (ceux dont la vue porte
+\textsf{Effect}) ; l'analyseur les exécute tous, sur un store qui contient déjà
+toutes les valeurs atteignables à ce point ; comme les écritures sont jointes,
+l'ensemble obtenu contient celui de n'importe quel sous-ensemble. Le coût : un
+effet de montage semble tourner à chaque tour (\code{MountOnly} est élargi). Le
+projet récupère la précision dans les règles, qui relisent les deps
+(\regle{infinite-loop} écarte \code{[]} et les deps toutes stables) et dans
+\relation{effect_triggers}.
+\end{solution}
+
+\begin{exercice}{Les trois faits de l'\Error{} d'\code{ObjChurn}}{react-modele-triple-must}
+Énumérer les trois faits must qui fondent l'\Error{} d'\code{ObjChurn}. Si la
+dep est \code{[obj.a]} au lieu de \code{[obj]}, lequel manque, et pourquoi ?
+\end{exercice}
+\begin{solution}
+Must-change : la dep est le slot exact et la valeur écrite est \code{PerRender}.
+Must-reach : l'écriture a lieu sur tous les chemins du corps de l'effet.
+Must-rerun : React ré-exécute un effet dont une dep a changé. Avec
+\code{[obj.a]}, le premier manque : \code{{...obj, b: 2}} conserve la valeur
+du champ \code{a}, la dep peut ne pas changer ; l'ADR-017 plafonne ce cas au
+\Warning.
+\end{solution}
+
+\begin{exercice}{\code{ObjStateDep}}{react-modele-objstatedep}
+L'état de \code{ObjStateDep} est initialisé par un littéral objet, donc le store
+contient une référence \code{PerRender}. Expliquer pourquoi
+\regle{always-unstable-deps} ne tire pas, en citant la ligne de code
+responsable, et dire quelle hypothèse cette ligne fait sur le programme.
+\end{exercice}
+\begin{solution}
+La lecture \code{Expr::StateVal} remplace la composante référence par
+\code{Versioned({(composant, label)})}
+(\cref{lst:react-modele-stateval}, l.~130--132) ; la règle exige
+\code{PerRender}. L'hypothèse : les sets ont lieu hors du rendu ; sa violation
+est signalée par \regle{setter-in-render} (soundness en couches).
+\end{solution}
+
+\begin{exercice}{Pourquoi \code{Toggle} converge}{react-modele-toggle}
+Calculer la suite des valeurs booléennes abstraites du slot \code{on} de
+\code{Toggle} et expliquer la sortie \code{1 iteration(s), widened: []}. Quel
+fait \emph{structurel}, à la manière du bras churn, permettrait de prouver la
+boucle ? (Question ouverte : il n'existe pas de réponse dans le code.)
+\end{exercice}
+\begin{solution}
+Amorçage \code{false} ; la passe d'effet écrit \code{!on = true} ; le slot
+devient \code{{false, true}}, c'est-à-dire le top du treillis booléen ;
+$i = 1$ ; la passe suivante n'ajoute rien, sortie. Aucune croissance, donc pas
+de widening. Il faudrait établir que la dep est le slot exact (ligne
+\code{exact} de \relation{effect_triggers}) et que la valeur écrite diffère
+\emph{toujours} de la valeur lue (ici $\lnot v \neq v$ pour tout booléen), sur
+tous les chemins de l'effet : un must-change par valeur plutôt que par identité.
+\end{solution}
+
+\begin{exercice}{\code{Inf2} de bout en bout}{react-modele-inf2}
+Pour \code{Inf2} (\cref{ex:canon-inf2}), donner la règle de React-tRace
+qui s'applique à l'appel \code{setS((x) => x)}, le théorème qui explique la
+boucle, et le fait de CFG que \regle{setter-in-render} utilise pour émettre une
+\Error{} plutôt qu'un \Warning.
+\end{exercice}
+\begin{solution}
+\textsc{AppSetComp} (set pendant l'évaluation du corps) pose \textsf{Check} ;
+par le \cref{thm:trace-reevaluation}, l'évaluation est retentée
+(\textsc{EvalMult}), et comme chaque essai rappelle le setter, indéfiniment,
+quelle que soit la valeur. \regle{setter-in-render} émet une \Error{} parce
+que le bloc de l'appel domine toutes les sorties du rendu : l'appel a lieu à
+chaque rendu.
+\end{solution}

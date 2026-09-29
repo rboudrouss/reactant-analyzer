@@ -1,0 +1,954 @@
+% Chapitre 08 — Splice, remap et inlining
+% Dossiers sources : notes/03-ir.md (§3.12, §4.5–§4.13, §6.2, §6.3, §6.5, §6.6, §6.8, §8),
+% notes/06-engine-fixpoint.md (§3.9, §3.13, §4.8), notes/05-domains-transfer-stores.md (B5/B6),
+% notes/13-project-cli-driver.md (§3.11, §4.13). Code au commit e67b10a.
+% Sorties d'analyseur observées avec target/debug/reactant (commit e67b10a) sur des fichiers
+% placés sous /tmp/ch08/ (et sur les fixtures du dépôt). Les impressions d'IR viennent de la
+% sonde hors dépôt décrite au dossier 03 §6.0 (/tmp/ra-ir-probe, Config::default()) et, pour
+% les résumés de bibliothèque, d'une variante construite avec SummaryRegistry::new_with_common().
+\chapter{Splice, remap et inlining}
+\label{chap:splice-inlining}
+
+\begin{objectifs}
+  \item Comprendre pourquoi \reactant{} analyse un hook custom ou un utilitaire \emph{dans} chacun de ses appelants, en greffant son CFG, plutôt qu'une seule fois pour lui-même (\adr{5}, \adr{24}).
+  \item Connaître les quatre espaces d'identités qu'une greffe doit décaler --- blocs, labels de hooks, sites d'allocation, noms de variables --- et les types qui les portent : \code{Offsets}, \code{SpliceIds}, la table de renommage.
+  \item Savoir lire, étape par étape, la primitive unique \code{splice_callee_into_cfg} : coupe du bloc d'appel, \code{Return} réécrit en \code{Let} + \code{Jump}, \code{Unreachable} laissé coupé, arêtes, positions.
+  \item Maîtriser l'hygiène de la greffe : α-renommage des liaisons de l'appelé, isolement de ses noms libres en collision (\issue{141}), substitution des arguments dans les initialiseurs d'état.
+  \item Suivre l'expansion d'un hook custom (\code{expand_custom_hooks}) et l'inlining d'un utilitaire (\code{inline_in_cfg}), et les distinguer des deux mécanismes qui \emph{ne} greffent pas : fermetures locales (B5/B6) et composants enfants.
+  \item Savoir ce que fait un hook de bibliothèque sans source (\code{SummaryRegistry}, \og connu n'est pas modélisé\fg{}) et comment un finding né dans un hook inliné est attribué (\adr{24}).
+  \item Connaître les cas limites et les défauts observés de la greffe, et savoir où les corriger.
+\end{objectifs}
+
+\prerequis{\cref{chap:ir} (CFG, \cref{def:cfg} ; sites, \cref{def:site} ; slots et labels, \cref{def:slot} ; unités \code{HookIR}/\code{FunctionIR}), \cref{chap:lowering-cfg} (\code{Return(undefined)} en fin de corps, \code{Unreachable}, \code{HookMarker}), \cref{chap:react-modele} (ordre des hooks), \cref{chap:interpretation-abstraite} (soundness, \cref{def:soundness} ; dominance, \cref{def:dominance}).}
+
+Le lowering (\cref{chap:lowering-cfg}) produit trois sortes d'unités : des composants, des hooks custom, des utilitaires. Chacune a son CFG, ses labels, ses sites d'allocation et ses noms, tous numérotés à partir de zéro. Le moteur, lui, ne sait interpréter qu'\emph{un} composant à la fois (\cref{chap:point-fixe-composant}). Ce chapitre décrit la couche qui fait le pont : avant le premier tour de point fixe, le moteur \emph{greffe} dans le CFG de rendu du composant le corps de chaque hook custom et de chaque utilitaire qu'il appelle. Cette opération s'appelle un \terme{splice} ; appliquée à un appel, c'est un \terme{inlining}. Elle vit dans deux fichiers de l'IR, \file{src/ir/splice.rs} et \file{src/ir/remap.rs}, et deux fonctions du moteur, \code{expand_custom_hooks} et \code{expand_utility_calls} (\file{src/engine/fixpoint.rs}).
+
+% ===========================================================================
+\section{Pourquoi inliner}
+\label{sec:splice-pourquoi}
+
+\subsection{Un hook n'a pas d'analyse à lui}
+
+Partons d'un compteur qui délègue son état à un hook custom.
+
+\begin{lstlisting}[language=TypeScript,caption={Un hook custom qui boucle (\file{/tmp/ch08/hook/Counter.tsx})},label={lst:splice-counter}]
+import { useState, useEffect } from "react";
+
+function useCounter(initial: number) {
+  const [count, setCount] = useState(initial);
+  useEffect(() => {
+    setCount(count + 1);
+  }, [count]);
+  return count;
+}
+
+export function Counter() {
+  const count = useCounter(0);
+  return <div>{count}</div>;
+}
+\end{lstlisting}
+
+Le défaut est dans le hook : l'effet dépend de \code{count} et l'incrémente, donc chaque exécution en déclenche une autre. Mais c'est \code{Counter} qui boucle, et c'est lui que React rend. L'analyseur le rapporte sur le composant, en pointant la ligne du hook :
+
+\begin{sortie}
+  Counter  (1 hooks)  Counter.tsx
+    warn   infinite-loop  [hook:1]  (line 5:2)  this effect keeps pushing state `count` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       → state `count` is written here [hook:2] (line 5:2)
+       → the abstract value of state `count` kept growing and was widened at iteration 3
+\end{sortie}
+
+Pourquoi ne pas analyser \code{useCounter} une fois pour toutes, et réutiliser le résultat dans chaque appelant ? Parce que les faits d'un hook dépendent de ses arguments. Changeons l'exemple : l'effet ajoute un pas \code{step} fourni par l'appelant.
+
+\begin{lstlisting}[language=TypeScript,caption={Le même corps, deux faits incomparables (\file{/tmp/ch08/step/Step.tsx})},label={lst:splice-usestep}]
+function useStep(step: number) {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(n + step);
+  }, [n]);
+  return n;
+}
+
+export function L() {
+  const n = useStep(1);
+  return <div>{n}</div>;
+}
+
+export function M() {
+  const n = useStep(0);
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+
+\begin{sortie}
+  L  (1 hooks)  Step.tsx
+    warn   infinite-loop  [hook:1]  (line 5:2)  this effect keeps pushing state `n` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       (2 trace step(s), rerun with --trace)
+  M  (1 hooks)  Step.tsx
+    warn   redundant-set-state  [hook:1]  (line 5:2)  state `n` is set to a stable value it already holds, so the update is redundant
+       (1 trace step(s), rerun with --trace)
+\end{sortie}
+
+Même corps, même ligne, deux diagnostics différents : avec \code{step = 1} la valeur croît sans fin ; avec \code{step = 0} l'écriture réécrit la valeur courante. Une analyse unique de \code{useStep} avec un paramètre inconnu ($\Top$) ne donnerait ni l'un ni l'autre avec certitude. \adr{24} le dit en une phrase : \og A hook is not a component and has no analysis of its own; its facts exist only relative to the arguments a consumer supplies.\fg{} La conséquence architecturale est immédiate : on analyse le hook \emph{dans} chaque appelant, avec les arguments de cet appelant.
+
+\begin{react}[les hooks d'un hook custom appartiennent à l'appelant]
+Pour React, un hook custom n'existe pas : c'est une fonction ordinaire dont le nom commence par \code{use}. Quand \code{Counter} appelle \code{useCounter(0)}, le \code{useState} et le \code{useEffect} exécutés à l'intérieur sont enregistrés dans la liste de hooks de la fibre de \code{Counter}, à la suite de ceux que \code{Counter} a déjà appelés. Deux composants qui appellent le même hook ont chacun leur état. C'est pourquoi la greffe \emph{continue} la numérotation des labels de l'appelant (\cref{sec:splice-remap}) : le slot du \code{useState} de \code{useCounter} est un slot de \code{Counter}.
+\end{react}
+
+\subsection{Cinq façons de franchir un appel}
+
+L'analyse est intra-procédurale au sens où le moteur n'interprète qu'un composant à la fois ; mais un composant appelle des choses. Le code distingue cinq cas, résumés au \cref{tab:splice-mecanismes}. Trois sont des greffes ou leur substitut ; deux ne greffent rien.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{p{3.2cm}p{3.6cm}p{5.6cm}}
+\hline
+\textbf{Appel} & \textbf{Mécanisme} & \textbf{Où} \\
+\hline
+hook custom dont la source est lue & greffe du corps entier & \code{expand_custom_hooks}, \code{HookRegistry} (\cref{sec:splice-hooks}) \\
+utilitaire de module appelé en position d'instruction & greffe du corps entier & \code{expand_utility_calls}, \code{FunctionRegistry} (\cref{sec:splice-utilitaires}) \\
+hook de bibliothèque sans source & résumé abstrait, pas de greffe & \code{SummaryRegistry} (\cref{sec:splice-resumes}) \\
+fermeture locale (\code{go()}, \code{setTimeout(cb)}) & exécution du corps depuis le tas, à l'interprétation & B5/B6, \code{exec_var_callback} (\cref{sec:splice-locales}) \\
+composant enfant \code{<Child/>} & analyse séparée avec props abstraites & \code{eval_comp_app} (\adr{12}, \cref{chap:inter-composants}) \\
+\hline
+\end{tabular}
+\caption{Les cinq traitements d'un appel. Seules les deux premières lignes modifient le CFG.}\label{tab:splice-mecanismes}
+\end{table}
+
+\begin{decision}[ADR-5 --- intra-procédural, plus un registre de hooks]
+\adr{5} (mai 2026) pose le cadre. Phase 1 : chaque composant et chaque hook custom est analysé indépendamment, un hook non reconnu rend \og Unknown\fg{} pour toutes ses valeurs. Phase 2, annoncée comme future : un inlining \og call-string-1\fg{} --- à chaque appel \code{useX(args)}, substituer le corps du hook dans le CFG de l'appelant avec les arguments, à profondeur 1. Mécanisme central pour les hooks sans source : un registre en couches (hooks natifs, modules de bibliothèque, configuration utilisateur, repli \og inconnu\fg{}). L'argument : l'inter-procédural est coûteux et inutile pour les premiers bugs visés.
+
+Le code a dépassé cette ADR sur deux points qu'il faut connaître pour ne pas la lire comme une spécification. L'inlining existe et n'est pas limité à la profondeur 1 : un hook custom qui en appelle un autre est expansé récursivement (garde par nom, \cref{sec:splice-hooks}), et les utilitaires sont greffés eux aussi (jusqu'à un budget de 8 par CFG). Le squelette de registre de l'ADR (\code{HookModel}, \code{HookResult}, fichiers \file{tanstack.rs}, \file{user_config.rs}, \file{reactant.toml}) n'existe pas sous cette forme : \file{src/registry/} contient \file{keyed.rs}, \file{mod.rs} et \file{summary.rs}, où le trait s'appelle \code{HookSummary} (\cref{sec:splice-resumes}).
+\end{decision}
+
+\subsection{Où la greffe se place dans l'analyse d'un composant}
+
+Les deux passes d'expansion s'exécutent au début de \code{analyze_component_impl}, avant l'amorçage des slots et avant le premier tour de point fixe :
+
+\rustsnippet[label={lst:splice-orchestration}]{src/engine/fixpoint.rs}{197}{229}{les deux passes d'expansion, dans l'ordre}
+
+Trois choses sont à retenir de cet extrait. Une réserve d'identités, \code{SpliceIds}, est créée \emph{une fois par composant} et partagée par toutes les greffes (\cref{sec:splice-remap}). Les utilitaires sont greffés \emph{avant} les hooks, \og so utility bodies containing hook calls become visible to the hook expansion pass\fg{} ; l'ordre inverse a une conséquence que nous verrons (\cref{sec:splice-limites}). Enfin les hooks sont expansés \og before seeding so inlined State entries are seeded\fg{} : après l'expansion, le \code{useState} de \code{useCounter} est une entrée \code{State} ordinaire de \code{Counter}, et le moteur l'amorce comme les autres.
+
+% ===========================================================================
+\section{Décaler les identités : le remap}
+\label{sec:splice-remap}
+
+\subsection{Quatre espaces numérotés à partir de zéro}
+
+Greffer un CFG dans un autre, c'est copier des objets qui portent des identifiants. Or l'appelant et l'appelé ont été abaissés séparément, et chacun numérote ses choses depuis zéro. Il y a quatre espaces d'identités (\cref{tab:splice-espaces}). Pour chacun, une collision serait silencieuse : deux blocs de même \code{BlockId} s'écraseraient dans la \code{BTreeMap} des blocs ; deux hooks de même label partageraient un slot ; deux littéraux de même \code{ExprId} partageraient une entrée de tas ; deux variables de même nom partageraient une entrée d'environnement.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{p{2.6cm}p{3.4cm}p{6.4cm}}
+\hline
+\textbf{Espace} & \textbf{Décalé par} & \textbf{Règle} \\
+\hline
+\code{BlockId} & \code{splice_callee_into_cfg} & blocs de l'appelé placés au-dessus du plus grand bloc de l'appelant ; jointure juste après \\
+\code{HookLabel} & \code{Offsets::labels}, \code{remap_*} & labels de l'appelé placés au-dessus du plus grand label courant \\
+\code{ExprId} (sites) & \code{Offsets::ids}, \code{remap_*} & plage fraîche tirée d'un curseur par composant (\code{SpliceIds}) \\
+\code{Var} & table de renommage, sel & \code{x} devient \texttt{x\#s}, un sel \code{s} par greffe (\cref{sec:splice-hygiene}) \\
+\hline
+\end{tabular}
+\caption{Les quatre espaces d'identités d'une greffe et qui les décale.}\label{tab:splice-espaces}
+\end{table}
+
+Les \code{BlockId} sont renumérotés par la primitive de splice elle-même (\cref{sec:splice-primitive}). Les noms de variables relèvent de l'hygiène (\cref{sec:splice-hygiene}). Les deux autres espaces, labels et sites, sont décalés par \file{src/ir/remap.rs}, avant la greffe, sur une copie du corps de l'appelé.
+
+\subsection{\texorpdfstring{\code{Offsets}}{Offsets} : un seul porteur pour deux décalages}
+
+\rustsnippet[label={lst:splice-offsets}]{src/ir/remap.rs}{11}{37}{ce qu'une greffe décale}
+
+\code{Offsets} a deux champs. \code{labels} est ajouté à chaque \code{HookLabel} ; \code{ids} à chaque \code{ExprId} de site d'allocation. Le commentaire explique pourquoi ils sont dans une même structure : historiquement, les labels étaient décalés depuis le début et les sites ne l'étaient pas, si bien qu'un \code{ObjectLit} de l'appelé partageait l'entrée de tas d'un objet de l'appelant et répondait à ses lectures de membres (\issue{134}). Réunir les deux dans un seul porteur rend impossible, pour un futur site de greffe, de penser à l'un et d'oublier l'autre --- une application directe du principe \og corriger au centre\fg{}. Le constructeur \code{Offsets::labels} (labels seuls, pour renuméroter une table en place) n'a au \snapshotCommit{} aucun appelant de production : seuls les tests de \file{remap.rs} l'emploient, et les deux sites de greffe construisent \code{Offsets { labels, ids }} explicitement.
+
+\subsection{La largeur d'une greffe : \texorpdfstring{\code{alloc_id_span}}{alloc\_id\_span}}
+
+Pour tirer une plage de sites fraîche, il faut savoir combien de sites l'appelé occupe. C'est le rôle de \code{alloc_id_span} (\src{src/ir/remap.rs}{39}{67}). La fonction rend un de plus que le plus grand \code{ExprId} de site rencontré (\code{ObjectLit}, \code{ArrayLit}, \code{New}, \code{FnLit}), en descendant dans les corps de \code{FnLit} imbriqués --- un corps de fermeture est un CFG à part, que \code{for_each_child} ne parcourt pas. La profondeur de descente est bornée à 64 niveaux de fermetures, \og and no real body approaches it\fg{}. La mesure suppose que les sites d'un corps forment l'intervalle $0..n$, ce que garantit le compteur par fichier du lowering (\cref{sec:lowering-sites}) : on mesure un maximum, pas un nombre.
+
+\subsection{Appliquer le décalage : \texorpdfstring{\code{remap_expr}}{remap\_expr}, \texorpdfstring{\code{remap_cfg}}{remap\_cfg}, \texorpdfstring{\code{remap_hooks}}{remap\_hooks}}
+
+\code{remap_expr} (\src{src/ir/remap.rs}{69}{171}) consomme l'expression (passage par valeur) et en rend une nouvelle. Les cinq expressions qui portent un label --- \code{StateVal}, \code{StateSetter}, \code{MemoVal}, \code{CallbackVal}, \code{HookMarker} --- reçoivent \code{l + offset}. Les nœuds allouants (\code{FnLit}, et dans la suite du \code{match}, \code{ObjectLit}, \code{ArrayLit}, \code{New}) reçoivent \code{id + off.ids}. Le corps d'un \code{FnLit} est un \code{Arc<CFG>} : \code{Arc::try_unwrap} évite de le copier quand personne d'autre ne le partage. Les autres variantes se contentent de récurser ; les feuilles (\code{Lit}, \code{Var}, \code{SummaryVal}) sont rendues telles quelles. Si \code{off} est l'identité, la fonction court-circuite (test \code{remap_zero_is_identity}).
+
+\code{remap_cfg} (\src{src/ir/remap.rs}{221}{252}) applique \code{remap_expr} à toutes les instructions et à tous les terminateurs, \emph{sans toucher aux} \code{BlockId} : ce n'est pas son rôle. \code{remap_hooks} (\src{src/ir/remap.rs}{254}{344}) décale le \code{label} de chaque entrée de la table de hooks, et toutes les expressions et tous les corps qu'elle porte : \code{init} d'un \code{State} ou d'un \code{Ref}, \code{body_cfg} d'un \code{Effect}, \code{Memo}, \code{Callback} ou \code{Handler}, \code{args} d'un \code{Custom}, et les éléments des \code{deps} (via \code{map_exprs}, qui préserve l'arité et les positions de spread).
+
+\subsection{La réserve d'identités d'un composant : \texorpdfstring{\code{SpliceIds}}{SpliceIds}}
+
+Deux greffes dans un même composant ne doivent pas se marcher dessus non plus. Le moteur tire donc sel et sites d'une réserve unique, monotone :
+
+\rustsnippet[label={lst:splice-spliceids}]{src/engine/fixpoint.rs}{837}{867}{la réserve de sels et de sites d'une composante}
+
+\code{for_component} place le curseur \code{next_alloc} au-dessus des sites déjà présents dans le composant ; \code{take(span)} rend le sel courant et le début d'une plage de \code{span} sites, puis avance les deux ; \code{alloc_one} tire un site isolé pour une forme que la source n'alloue pas, l'objet résumé d'un hook de bibliothèque (\cref{sec:splice-resumes}). La largeur d'une greffe est mesurée par \code{alloc_span(cfg, hooks)} (\src{src/engine/fixpoint.rs}{869}{882}) : le maximum de \code{alloc_id_span} sur le corps et sur chaque \code{HookEntry::body_cfg()} de la table. Le corps d'un hook et les corps de ses entrées ont été numérotés par le \emph{même} compteur de fichier : ils partagent une plage, d'où le \code{max} plutôt qu'une somme, et un seul décalage pour les deux.
+
+\begin{invariant}{Plages disjointes (intention)}{splice-plages}
+Dans un composant, le sel et le curseur de sites sont monotones : chaque greffe reçoit un sel neuf et une plage de sites $[c, c + w)$ située au-dessus de tout ce qui a été attribué avant elle. L'intention, énoncée dans la doc de \code{SpliceIds} (\src{src/engine/fixpoint.rs}{828}{836}), est que deux greffes n'occupent jamais le même site, ni entre elles ni avec l'appelant ; c'est aussi ce qui fait que \emph{le même} appelé greffé deux fois donne deux sites et non un seul.
+\end{invariant}
+
+\begin{piege}
+L'invariant est une intention, pas une garantie. \code{alloc_span} ne mesure que les CFG : le corps et les \code{body_cfg()} des entrées. Or \code{HookEntry::body_cfg()} rend \code{None} pour \code{State}, \code{Ref} et \code{Custom}, si bien que les sites portés par un \code{init}, par les \code{args} d'un hook custom ou par des \code{deps} ne sont pas comptés --- alors que \code{remap_hooks} les \emph{décale}, et que les arguments d'un \code{Custom} finissent dans le CFG de rendu quand le hook est expansé. Nous montrerons une collision effective au \cref{sec:splice-limites}.
+\end{piege}
+
+% ===========================================================================
+\section{La primitive de splice}
+\label{sec:splice-primitive}
+
+\subsection{Un utilitaire à deux retours}
+
+Commençons par la greffe la plus simple à lire : un utilitaire de module, sans hook, dont le corps a plusieurs blocs.
+
+\begin{lstlisting}[language=TypeScript,caption={Un utilitaire à deux \code{return} (\file{/tmp/ch08/clamp/Counter.tsx})},label={lst:splice-clamp}]
+import { useState } from "react";
+
+function clamp(n: number) {
+  if (n > 10) {
+    return 10;
+  }
+  return n;
+}
+
+export function Counter() {
+  const [count, setCount] = useState(0);
+  const shown = clamp(count);
+  return <button onClick={() => setCount(count + 1)}>{shown}</button>;
+}
+\end{lstlisting}
+
+Le lowering produit deux CFG séparés. Celui du rendu de \code{Counter} a un seul bloc, où l'appel est une instruction \code{let shown = clamp(count)}. Celui de \code{clamp} (un \code{FunctionIR}) a quatre blocs : le \code{branch}, le bras \code{then} qui retourne, le bras implicite d'un \code{if} sans \code{else} (B2), et la suite (B3), qui retourne \code{n}. La \cref{fig:splice-avant-apres} reproduit, élaguées, les impressions de la sonde avant et après la greffe ; les arêtes observées après sont \code{B0->B1:Unconditional B1->B2:IfTrue B1->B3:IfFalse B3->B4:Unconditional B2->B5:Unconditional B4->B5:Unconditional}. Tout le reste de cette section explique comment on passe de l'une à l'autre.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=5mm and 4mm]
+  % --- avant : appelant
+  \node[etiquette] (tA) at (0,0.9) {avant : rendu de \code{Counter}};
+  \node[cfgbloc] (a0) at (0,0) {B0: let count = StateVal(0)\\\quad let setCount = …\\\quad \textbf{let shown = clamp(count)}\\-> return Native<button>…};
+  % --- avant : appelé
+  \node[etiquette] (tC) at (0,-1.6) {avant : \code{clamp} (FunctionIR)};
+  \node[cfgbloc] (c0) at (0,-2.4) {B0: branch (n Gt 10)};
+  \node[cfgbloc] (c1) at (-1.3,-3.7) {B1: return 10};
+  \node[cfgbloc] (c2) at (1.3,-3.7) {B2: jump B3};
+  \node[cfgbloc] (c3) at (1.3,-4.9) {B3: return n};
+  \draw[fleche] (c0) -- node[etiquette,left] {IfTrue} (c1);
+  \draw[fleche] (c0) -- node[etiquette,right] {IfFalse} (c2);
+  \draw[fleche] (c2) -- (c3);
+  % --- après
+  \node[etiquette] (tP) at (7.6,0.9) {après la greffe};
+  \node[cfgbloc] (p0) at (7.6,0) {B0: let count = …\\\quad let setCount = …\\-> jump B1};
+  \node[cfgbloc,fill=ra-bg] (p1) at (7.6,-1.5) {B1: \textbf{let n\#0 = count}\\-> branch (n\#0 Gt 10)};
+  \node[cfgbloc,fill=ra-bg] (p2) at (6.1,-3.0) {B2: \textbf{let shown = 10}\\-> jump B5};
+  \node[cfgbloc,fill=ra-bg] (p3) at (9.1,-3.0) {B3: jump B4};
+  \node[cfgbloc,fill=ra-bg] (p4) at (9.1,-4.2) {B4: \textbf{let shown = n\#0}\\-> jump B5};
+  \node[cfgbloc] (p5) at (7.6,-5.6) {B5 (jointure): return Native<button>…};
+  \draw[fleche] (p0) -- node[etiquette,right] {Unconditional} (p1);
+  \draw[fleche] (p1) -- node[etiquette,left] {IfTrue} (p2);
+  \draw[fleche] (p1) -- node[etiquette,right] {IfFalse} (p3);
+  \draw[fleche] (p3) -- (p4);
+  \draw[fleche] (p2) -- (p5);
+  \draw[fleche] (p4) -- (p5);
+  \draw[flechemay] (3.1,-2.0) -- node[etiquette,above] {splice} (4.6,-2.0);
+\end{tikzpicture}
+\caption{Avant et après la greffe de \code{clamp} dans \code{Counter}. Les blocs de l'appelé (fond coloré) sont décalés de 1 (le plus grand bloc de l'appelant plus un) ; la jointure B5 reçoit les instructions qui suivaient l'appel et l'ancien terminateur ; chaque \code{return e} devient \code{let shown = e} suivi d'un saut vers la jointure ; le paramètre est lié par \texttt{let n\#0 = count} en tête de l'entrée.}\label{fig:splice-avant-apres}
+\end{figure}
+
+\subsection{Le contrat : \texorpdfstring{\code{Splice}}{Splice}}
+
+La primitive prend l'appelant, la position de l'instruction d'appel, et une description de l'appelé :
+
+\rustsnippet[label={lst:splice-struct}]{src/ir/splice.rs}{33}{54}{le côté appelé d'une greffe}
+
+Champ par champ :
+\begin{itemize}
+  \item \code{callee} : le CFG à greffer, \emph{possédé} (la primitive le consomme). S'il porte des slots de hooks, ses labels doivent déjà avoir été décalés par \code{remap_cfg} : la primitive ne renumérote que les blocs et ne renomme que les variables.
+  \item \code{params}, \code{args} : les paramètres de l'appelé et les arguments de l'appel, appariés en \code{let param = arg} au début du bloc d'entrée.
+  \item \code{bound_var} : la variable de l'appelant qui reçoit la valeur de retour (\code{Some("shown")} pour \code{let shown = clamp(...)}), ou \code{None} pour une instruction nue \code{f(...);}.
+  \item \code{rename} : la table d'α-renommage, construite par \code{callee_rename_map} (\cref{sec:splice-hygiene}). Pour un hook dont les corps d'effets capturent des locales du rendu, \emph{la même} table doit être appliquée à ces corps. (La doc renvoie à \code{rename_vars_cfg} ; le moteur passe en fait par \code{rename_hook_entry}, qui l'appelle.)
+\end{itemize}
+
+La fonction rend la plage demi-ouverte des \code{BlockId} où ont atterri les blocs de l'appelé, ou \code{None} si la greffe a été sautée. Ce n'est pas un détail : \og the recorded pair every caller needs for provenance\fg{} (\src{src/ir/splice.rs}{56}{63}). Le moteur enregistre cette plage comme région inlinée ; sans elle, une écriture de setter faite par un wrapper serait certifiée comme écrite directement par l'appelant (\adr{27} §4, \cref{sec:splice-hooks}).
+
+\subsection{Étapes 1 à 4 : renommer, vérifier, couper, allouer}
+
+\rustsnippet[label={lst:splice-steps12}]{src/ir/splice.rs}{77}{134}{renommage, préconditions, coupe du bloc d'appel, allocation des blocs et liaisons de paramètres}
+
+\textbf{Étape 1.} Toutes les variables du CFG de l'appelé sont renommées d'un coup par \code{rename_vars_cfg}, et les paramètres par \code{rename_one}.
+
+\textbf{Étape 1b : les préconditions avant toute mutation.} Deux cas font sauter la greffe : un appelé sans bloc d'entrée, et un bloc d'appel absent de l'appelant. Le commentaire raconte le défaut corrigé (\issue{13}) : ces contrôles se faisaient à l'étape 6, \emph{après} avoir coupé le bloc de l'appelant et remplacé son terminateur par \code{Unreachable} ; sauter la greffe à ce moment laissait un appelant tronqué --- instructions suivantes perdues, terminateur perdu --- sans assertion ni retour arrière. Désormais une greffe sautée laisse l'appelant intact (tests \code{a_headless_callee_leaves_the_caller_untouched} et \code{a_missing_call_site_block_leaves_the_caller_untouched}, \src{src/ir/splice.rs}{862}{930}).
+
+\textbf{Étape 2 : la coupe.} Les instructions du bloc d'appel à partir de \code{stmt_idx} sont détachées dans \code{post} ; la première, l'appel lui-même, est retirée. Sa position est gardée dans \code{call_span} : c'est elle que porteront toutes les instructions \emph{synthétisées} par la greffe (\adr{39} §2, \issue{131}). Le terminateur d'origine est mis de côté dans \code{old_term} ; le bloc reçoit provisoirement \code{Unreachable}.
+
+\textbf{Étapes 3 et 4 : blocs frais, liaisons de paramètres.} Le décalage des blocs est \og le plus grand \code{BlockId} de l'appelant, plus un\fg{} ; la jointure prend l'identifiant qui suit immédiatement les blocs de l'appelé, \code{block_offset + n}. Dans notre exemple, l'appelant n'a que B0, donc \code{block_offset = 1}, les quatre blocs de \code{clamp} deviennent B1 à B4, et la jointure est B5.
+
+\begin{piege}
+Ce calcul suppose que les blocs de l'appelé sont numérotés sans trou, de 0 à $n-1$. Si ce n'était pas le cas, \code{bid + block_offset} pourrait valoir \code{join_block_id}, et l'insertion de la jointure écraserait silencieusement un bloc de l'appelé. L'invariant de densité tient en pratique (\cref{sec:ir-cfg}), mais il n'est ni documenté ni vérifié par \code{validate}.
+\end{piege}
+
+Les liaisons de paramètres sont des \code{Let}, à la position de l'appel. Le \code{zip} s'arrête à la plus courte des deux listes. Un argument surnuméraire est ignoré, comme en JavaScript (hors \code{arguments}). Un paramètre sans argument, en revanche, n'est \emph{pas} lié du tout : en JavaScript il vaudrait \code{undefined} ; ici il reste libre et se lit comme une variable absente de l'environnement, c'est-à-dire $\Top$ (\cref{chap:point-fixe-composant}). C'est une sur-approximation, pas un faux négatif.
+
+\subsection{Étape 5 : réécrire les terminateurs}
+
+\rustsnippet[label={lst:splice-step5}]{src/ir/splice.rs}{136}{186}{décalage des blocs et réécriture des retours}
+
+Chaque bloc de l'appelé est décalé, et son terminateur réécrit selon sa forme :
+\begin{itemize}
+  \item \code{Jump(t)} et \code{Branch} : les cibles sont décalées ; la condition et sa position restent.
+  \item \code{Return(e)} : devient \code{Jump(join)}, précédé de \code{let bound = e} si l'appel a une variable de liaison. C'est un \code{Let} et non un \code{Assign} : le commentaire rappelle qu'un \code{Assign} sans \code{Let} est l'orthographe IR d'une écriture dans une liaison \emph{extérieure} (\cref{sec:ir-cfg}), ce qui n'est pas le cas ici --- la variable est liée à cet endroit, comme dans l'instruction d'appel qu'on remplace. Sa position est \code{call_span}, faute de mieux : \code{Terminator::Return} ne porte pas de position (\issue{140}).
+  \item \code{Unreachable} : \emph{reste} \code{Unreachable}.
+\end{itemize}
+
+Le dernier bras mérite un encadré, parce qu'il a été tranché par une mesure.
+
+\begin{decision}[ADR-25 --- un corps qui tombe du bout rend \code{undefined} ; \code{Unreachable} veut dire \og le contrôle s'arrête\fg{}]
+Avant \adr{25}, le lowering scellait la fin d'un corps sans \code{return} par \code{Unreachable}, comme un \code{throw}. La greffe laissait ce terminateur tel quel : un hook sans \code{return} produisait une jointure sans prédécesseur, et le composant était coupé de son propre \code{Return}. Sur les huit corpus, 208 composants avaient un CFG de rendu sectionné, dont 198 avec un \code{Return} sans état : l'environnement de sortie joignait sur moins de chemins que le programme n'en a --- la direction interdite. \textbf{Décision 1} : le lowering écrit la sémantique JS, une chute en fin de corps est \code{Return(undefined)}, et le bras \code{Return} de la greffe la traite sans cas particulier (\cref{chap:lowering-cfg}). \textbf{Décision 2} : \code{throw} garde \code{Unreachable}, et la greffe continue de le laisser coupé. L'alternative tentante, relier tout \code{Unreachable} de l'appelé à la jointure (\og un chemin de plus n'est qu'une sur-approximation\fg{}), a été implémentée, mesurée et refusée : elle invente un chemin qui atteint la sortie de l'appelant \emph{sans passer par les hooks de l'appelé}, et signalait l'idiome garde-\code{throw} comme \regle{conditional-hook} au niveau \Error{} sur du code conforme. Résultat mesuré : composants sectionnés 208 $\to$ 3, 12 findings révélés, aucun perdu. Nous rejouons ce cas au \cref{ex:splice-garde-throw}.
+\end{decision}
+
+\subsection{Étapes 6 à 9 : insérer et raccorder}
+
+\rustsnippet[label={lst:splice-steps69}]{src/ir/splice.rs}{188}{214}{liaisons en tête, insertion, jointure}
+
+L'étape 6 préfixe le bloc d'entrée de l'appelé par les liaisons de paramètres ; le commentaire insiste : l'entrée est présente \emph{par l'étape 1b}, et l'appelant étant déjà à moitié réécrit, ce point ne peut plus être un point de sortie --- d'où \code{expect} et non un \code{return None}. Les étapes 7 à 9 insèrent les blocs de l'appelé, font sauter le bloc d'appel vers l'entrée de l'appelé, et créent la jointure qui porte \code{post} et \code{old_term}.
+
+\subsection{Étape 10 : les arêtes}
+
+La dernière étape (\src{src/ir/splice.rs}{216}{257}) répare les arêtes. Le moteur lit les successeurs et prédécesseurs dans \code{CFG.edges}, pas dans les terminateurs : un bloc greffé sans arête serait un bloc que la worklist n'atteint jamais. Quatre retouches :
+\begin{enumerate}[label=\alph*)]
+  \item les arêtes sortantes du bloc d'appel partent désormais de la jointure (elles suivent l'ancien terminateur) ;
+  \item une arête \code{Unconditional} du bloc d'appel vers l'entrée de l'appelé ;
+  \item les arêtes internes de l'appelé, décalées, \emph{avec leur genre} : \code{Back} pilote le widening, \code{IfTrue}/\code{IfFalse} le raffinement par les gardes, \code{Await} les phases (\cref{chap:cfg-analyzer-dominance}) ;
+  \item une arête \code{Unconditional} de chaque ancien bloc de retour vers la jointure.
+\end{enumerate}
+En build debug, \code{validate} vérifie que tout terminateur a son arête ; c'est d'ailleurs le seul appel de \code{validate} du pipeline (\cref{sec:ir-cfg}).
+
+\begin{invariant}{Ce que garantit une greffe réussie}{splice-greffe}
+Après \code{splice_callee_into_cfg} rendant \code{Some(r)} : (i) \emph{tous} les blocs et \emph{toutes} les arêtes de l'appelé sont dans l'appelant, décalés dans \code{r} (test \code{every_callee_block_and_edge_is_spliced}) ; (ii) les genres d'arêtes internes sont préservés ; (iii) le contrôle entre dans l'appelé depuis le bloc d'appel et n'en sort que par un ancien \code{Return}, vers la jointure ; un \code{Unreachable} reste sans successeur ; (iv) les instructions de l'appelé gardent leurs positions (et donc leur fichier), les instructions synthétisées prennent la position de l'appel. Après \code{None}, l'appelant est inchangé.
+\end{invariant}
+
+Le point (i) est l'objet même de la primitive. Le module l'explique en tête (\src{src/ir/splice.rs}{1}{7}) : la greffe existait en deux copies divergentes, et celle des hooks ne concaténait que le bloc d'\emph{entrée} de l'appelé, perdant silencieusement tous les autres --- un faux négatif sur tout corps de hook à plusieurs blocs. \adr{20} (Thème 1) a unifié les deux copies en une primitive partagée, avec α-renommage.
+
+\subsection{Déroulé complet : un utilitaire inter-fichiers}
+\label{sec:splice-deroule}
+
+Le dépôt contient une fixture minimale de greffe, \file{tests/fixtures/splice_span}, conçue pour vérifier les positions.
+
+\tsxsnippet{tests/fixtures/splice_span/App.tsx}{1}{6}{le composant appelant}
+\tsxsnippet{tests/fixtures/splice_span/lib/heavy.ts}{1}{5}{l'utilitaire, dans un autre fichier}
+
+Avant la greffe (sonde, lancée depuis le répertoire de la fixture), le rendu de \code{Page} a un seul bloc B0 : \code{let __obj_63 = __p0} (sans position), \code{let raw = __obj_63.raw} (\code{3:23}), \code{let data = normalize(raw)} (\code{4:8}), puis \code{return Native<div>(...)} ; le corps de \code{normalize} est un seul bloc, \code{return JSON.parse(raw)}, sans arête. Après :
+
+\begin{sortie}
+  render_cfg:
+    entry=B0
+    B0:
+      let __obj_63 = __p0   @-
+      let raw = __obj_63.raw   @fFileId(0):3:23
+      -> jump B1
+    B1:
+      let raw#0 = raw   @fFileId(0):4:8
+      let data = JSON.parse(raw#0)   @fFileId(0):4:8
+      -> jump B2
+    B2:
+      -> return Native<div>(Obj#0{}; [data.name]) prop_spans=[] @fFileId(0):5:9
+    edges: B0->B1:Unconditional B1->B2:Unconditional
+  inline_origin: InlineOrigin { name: "normalize", from: "lib/heavy.ts", kind: Utility }
+\end{sortie}
+
+Lisons bloc par bloc.
+\begin{description}
+  \item[B0] est le bloc d'appel. Ses deux premières instructions (\code{pre}) restent : la liaison sans position du paramètre déstructuré (\cref{sec:lowering-motifs}) et la lecture \code{raw = __obj_63.raw}. L'appel \code{let data = normalize(raw)} a disparu ; le terminateur est devenu \code{jump B1}. Il n'y avait pas d'instruction après l'appel, donc \code{post} est vide.
+  \item[B1] est l'ancien B0 de \code{normalize}, décalé de \code{max + 1 = 1}. En tête, la liaison de paramètre \texttt{let raw\#0 = raw} : le paramètre de l'appelé est renommé \texttt{raw\#0} (sel 0, première greffe du composant) ; l'argument \code{raw}, côté appelant, ne l'est pas. Sans renommage, les deux \code{raw} se confondraient dans l'environnement plat. Puis le \code{return JSON.parse(raw)} devenu \texttt{let data = JSON.parse(raw\#0)}, un \code{Let} lié à \code{bound_var = data}. Les deux instructions synthétisées portent la position de l'appel, \code{4:8} dans le fichier 0 (\code{App.tsx}).
+  \item[B2] est la jointure, \code{block_offset + 1 = 2}. Elle porte \code{post} (vide) et l'ancien terminateur \code{return Native<div>...}.
+  \item[arêtes] B0$\to$B1 (étape 10b) et B1$\to$B2 (étape 10d) ; l'appelé n'avait pas d'arête interne, et B0 pas d'arête sortante à déplacer.
+\end{description}
+
+La ligne \code{inline_origin} est la provenance de la greffe (\adr{19}) : elle nourrira les pas \og was inlined from\fg{} des chaînes de témoins (\cref{chap:api-regles}). La fixture charge un pack déclaratif avec une règle-sonde de niveau \Info{}, \code{probe/render-call}, qui signale les appels du rendu ; lancée depuis le répertoire de la fixture avec \code{--info}, elle voit l'appel greffé \code{JSON.parse} et le place à la position de l'appel :
+
+\begin{shell}
+$ cd tests/fixtures/splice_span && reactant check --info App.tsx lib/heavy.ts
+\end{shell}
+\begin{sortie}
+  Page  (0 hooks)  App.tsx
+    info   probe/render-call  (line 4:8)  `parse`
+
+✓  2 file(s) no issues found.
+\end{sortie}
+
+Sans \adr{39}, les deux instructions synthétisées n'auraient pas de position, et un finding ancré sur l'une d'elles ne nommerait aucune ligne (\issue{131} : 82 findings sans position sur 7\,146 dans le corpus, ramenés à 0).
+
+% ===========================================================================
+\section{Hygiène : α-renommage et capture}
+\label{sec:splice-hygiene}
+
+\subsection{Un espace de noms plat}
+
+L'environnement abstrait du moteur est indexé par \emph{nom} de variable, sans notion de portée (\cref{chap:transfert-stores}). C'est simple et rapide, mais cela rend la greffe dangereuse : si l'appelé a une locale \code{data} et l'appelant aussi, la greffe fait écrire l'une dans l'autre. Le remède classique des compilateurs est l'\terme{α-renommage} : renommer les liaisons de l'appelé en noms frais avant de le copier. La question délicate est \emph{lesquelles}.
+
+\begin{definition}{Table de renommage d'une greffe}{splice-renommage}
+Soit un appelé de corps $C$, de table de hooks $H$ et de paramètres $P$, greffé dans un CFG qui lie l'ensemble de noms $B$ (les cibles de ses \code{Let}), avec le sel $s$. Notons $\mathrm{bound}(C, P)$ l'union de $P$ et des cibles des \code{Let} de $C$, et $\mathrm{libres}(X)$ les variables libres d'un corps (\cref{def:ir-variable-libre}). L'ensemble renommé est
+\[
+R \;=\; \mathrm{bound}(C, P) \;\cup\; \Bigl\{\, v \in \mathrm{libres}(C) \cup \textstyle\bigcup_{h \in H} \mathrm{libres}(h.\mathit{body}) \;\Bigm|\; v \in B \,\Bigr\}
+\]
+et le renommage est $\rho(v) = v\#s$ pour $v \in R$, l'identité sinon.
+\end{definition}
+
+La première moitié est l'hygiène au sens strict : toute liaison de l'appelé est renommée, même sans collision. La seconde moitié traite les noms \emph{libres} de l'appelé, et seulement ceux que l'appelant lie.
+
+\subsection{Le code : \texorpdfstring{\code{bound_vars}}{bound\_vars} et \texorpdfstring{\code{callee_rename_map}}{callee\_rename\_map}}
+
+\rustsnippet[label={lst:splice-bound-vars}]{src/ir/splice.rs}{259}{272}{les liaisons d'un corps}
+
+\code{bound_vars} ne retient que les paramètres et les cibles de \code{Let}. Une cible d'\code{Assign} jamais liée par un \code{Let} dans le corps est une écriture dans une liaison extérieure, pas une locale.
+
+\rustsnippet[label={lst:splice-rename-map}]{src/ir/splice.rs}{302}{330}{la table de renommage (sa doc, \src{src/ir/splice.rs}{274}{301}, est résumée ci-dessous)}
+
+La doc de la fonction justifie la seconde moitié par un cas du corpus (\issue{141}). Le hook \code{useOpenAskAiPageInSidePanel} du projet twenty lit un \code{t} qu'il importe de \code{@lingui/core/macro} : une liaison de module, qui ne change pas entre deux rendus. Greffé dans un composant qui écrit \code{const { t } = useLingui()}, ce \code{t} libre était \emph{capturé} par la locale de l'appelant, et 208 lignes du corpus affirmaient que l'import était une valeur de hook à mettre dans des deps. En JavaScript, la portée est lexicale : un nom libre de l'appelé se résout dans le module de l'appelé, jamais dans une locale de son appelant.
+
+Pourquoi ne pas renommer \emph{tous} les noms libres ? Parce que plusieurs sont reconnus par leur nom en aval : \code{fetch}, \code{console}, \code{setTimeout}, un utilitaire frère que le registre résout. Les renommer en masse échangerait ce faux positif contre des faux négatifs. Quand l'appelant lie le nom, les deux liaisons sont prouvablement différentes, et celle de l'appelé doit être isolée ; qu'elle ne se résolve ensuite à rien est correct : une variable libre sans liaison se lit $\Top$, \og already silent\fg{}.
+
+Enfin \code{hooks} fait partie de l'entrée : au moment de la greffe, un \code{useCallback} de l'appelé est une entrée de table avec son propre corps, et il ne reste dans le CFG qu'un marqueur. Les noms que ces corps lisent --- les plus susceptibles d'être capturés --- ne sont donc pas dans $C$ ; la table, appliquée aussi à ces corps, doit être construite à partir d'eux.
+
+\begin{exemple}{Isolement d'un import en collision}{splice-capture}
+Un utilitaire lit une constante importée ; le composant a une prop du même nom (\file{/tmp/ch08/capture/}) :
+\begin{lstlisting}[language=TypeScript]
+// k.ts
+export const LIMIT = 3;
+// util.ts
+import { LIMIT } from "./k";
+export function lim() { const v = LIMIT; return v; }
+// App.tsx
+export function C({ LIMIT }) {
+  const a = lim();
+  useEffect(() => { const b = lim(); }, []);
+  return <div>{a}</div>;
+}
+\end{lstlisting}
+Dans le rendu, après greffe (sonde, extrait) :
+\begin{sortie}
+      let LIMIT = __obj_83.LIMIT   @fFileId(0):3:20
+      let v#0 = LIMIT#0   @fFileId(2):3:8
+      let a = v#0   @fFileId(0):4:8
+\end{sortie}
+La locale \code{v} est renommée (première moitié) ; le \code{LIMIT} libre de \code{lim}, que le rendu lie, devient \texttt{LIMIT\#0}, un nom qui ne se résout à rien : il ne lit plus la prop.
+\end{exemple}
+
+\subsection{Renommer sans capturer : les fermetures imbriquées}
+
+\rustsnippet[label={lst:splice-rename-expr}]{src/ir/splice.rs}{431}{447}{renommage d'une expression, cas de la fermeture}
+
+En entrant dans un \code{FnLit}, la table perd les paramètres de la fermeture : ils masquent les locales homonymes de l'appelé (test \code{rename_respects_fnlit_param_shadowing}). C'est la même discipline que \code{compute_free_vars}. \code{rename_vars_stmt} (\src{src/ir/splice.rs}{383}{411}) renomme aussi les \emph{cibles} (\code{Let.var}, \code{Assign.var}), de sorte qu'une liaison et ses lectures restent cohérentes. \code{rename_hook_entry} (\src{src/ir/splice.rs}{540}{632}) applique la même table à chaque entrée de hook de l'appelé : \code{init}, corps, \code{deps} et \code{args} ; pour un \code{Callback}, les deps (évaluées dans la portée du rendu) voient la table complète et le corps une table privée de ses paramètres.
+
+\subsection{Le sel et l'affichage : \texorpdfstring{\code{SPLICE_MARK}}{SPLICE\_MARK}}
+
+\rustsnippet[label={lst:splice-mark}]{src/ir/splice.rs}{336}{349}{le séparateur et le nom affiché}
+
+Le sel est un entier par greffe, tiré de \code{SpliceIds} ; deux greffes du même appelé dans un composant ont donc des noms frais distincts. Le séparateur \texttt{\#} ne peut pas apparaître dans un identifiant JavaScript --- sauf comme préfixe d'un champ privé \texttt{this.\#x}, qui s'abaisse en \code{FieldAccess} et n'atteint jamais une \code{Var} : l'argument tient. Les messages ne doivent jamais montrer \texttt{count\#0} : les chaînes de témoins et les règles passent par \code{source_name} (par exemple \src{src/rules/api/witness.rs}{160}{164}), testé par \code{spliced_hook_locals_are_not_shown_with_rename_salt}. Inversement, \code{source_name} ne sert jamais à comparer : seul le nom complet est unique.
+
+\subsection{Substituer les arguments dans les initialiseurs d'état}
+
+Les liaisons \code{let param = arg} suffisent pour le corps greffé. Elles ne suffisent pas pour l'\code{init} d'un \code{useState} : le moteur évalue les initialiseurs dans un environnement séparé (constantes de module et props, \cref{chap:point-fixe-composant}), que les liaisons du rendu n'atteignent pas. Pour \code{useState(initial)}, il faut donc remplacer \code{initial} par l'argument concret \code{0} dans l'expression elle-même :
+
+\rustsnippet[label={lst:splice-subst}]{src/ir/splice.rs}{636}{663}{substitution de lectures, attentive aux fermetures}
+
+Contrairement au renommage, la substitution ne touche jamais les sites de liaison. Le commentaire rappelle ce qu'elle remplace : une ancienne \code{subst_vars} écrite à la main, qui laissait tomber toute expression composée par un bras \code{other => other}, si bien qu'un paramètre niché dans \code{useState({x: param})} ou \code{useState(() => param)} n'était jamais résolu. Elle n'a qu'un appelant, \code{expand_custom_hooks}, pour les \code{init} des entrées \code{State} (\cref{sec:splice-hooks}).
+
+\begin{piege}
+La substitution retire de sa table les \emph{paramètres} d'un \code{FnLit} traversé, jamais ses \code{let} : \code{subst_vars_cfg} (\src{src/ir/splice.rs}{755}{821}) substitue tous les membres droits et terminateurs sans regarder les cibles. Un initialiseur paresseux qui masque un paramètre du hook par une locale voit donc ses lectures remplacées par l'argument. Avec \code{useCounter(p)} contenant \code{useState(() => { const p = 1; return p; })}, appelé comme \code{useCounter("x")} (\file{/tmp/ircheck/subst/}), l'entrée d'état devient (sonde) :
+\begin{sortie}
+  hook: State #1 init=Fn#1() {
+        B0:
+          let p#0 = 1   @fFileId(1):4:10
+          -> return "x"
+      } @fFileId(1):3:8
+\end{sortie}
+L'état initial est abstrait par la valeur exacte \code{"x"} alors que le programme vaut \code{1} : ce n'est pas une sur-approximation mais une valeur fausse. Le cas est rare ; la correction naturelle, au niveau de la primitive, retirerait aussi de la table les noms \code{bound_vars(body, params)} du \code{FnLit} traversé, comme le fait déjà \code{compute_free_vars}.
+\end{piege}
+
+% ===========================================================================
+\section{Expansion des hooks custom}
+\label{sec:splice-hooks}
+
+\subsection{Ce que le lowering a laissé}
+
+Revenons au compteur du \cref{lst:splice-counter}. Le lowering a produit deux unités. Dans \code{Counter}, l'appel \code{useCounter(0)} est une entrée \code{Custom} de la table de hooks, et sa valeur un marqueur opaque dans le rendu ; \code{useCounter} est un \code{HookIR} avec son corps et sa propre table, numérotée depuis 0 (sonde, lignes de provenance élaguées) :
+
+\begin{sortie}
+ComponentIR Counter file=Counter.tsx param=props dom_props={} module_consts=[]
+  render_cfg:
+    B0:
+      let count = HookMarker(0, Unknown)   @fFileId(0):12:8
+      -> return Native<div>(Obj#0{}; [count]) prop_spans=[] @fFileId(0):13:9
+  hook: Custom #0 useCounter(0) deps=Absent binding=Some("count") import_source=None resolved_file=Some("Counter.tsx") @fFileId(0):12:8
+HookIR useCounter params=["initial"] file=Counter.tsx
+  body_cfg:
+    B0:
+      let count = StateVal(0)   @fFileId(0):4:9
+      let setCount = StateSetter(0)   @fFileId(0):4:16
+      HookMarker(1, Undefined);   @fFileId(0):5:2
+      -> return count
+  hook: State #0 init=initial @fFileId(0):4:8
+  hook: Effect #1 deps=List[count] arity=Exact(1) spread_at=[] @fFileId(0):5:2
+      B0:
+        setCount((count Add 1));   @fFileId(0):6:4
+        -> return undefined
+\end{sortie}
+
+L'expansion doit produire un composant où ces deux tables n'en font qu'une. Voici le résultat :
+
+\begin{sortie}
+  render_cfg:
+    B0:
+      -> jump B1
+    B1:
+      let initial#0 = 0   @fFileId(0):12:8
+      let count#0 = StateVal(1)   @fFileId(0):4:9
+      let setCount#0 = StateSetter(1)   @fFileId(0):4:16
+      HookMarker(2, Undefined);   @fFileId(0):5:2
+      let count = count#0   @fFileId(0):12:8
+      -> jump B2
+    B2:
+      -> return Native<div>(Obj#0{}; [count]) prop_spans=[] @fFileId(0):13:9
+    edges: B0->B1:Unconditional B1->B2:Unconditional
+  hook: State #1 init=0 @fFileId(0):4:8
+  hook: Effect #2 deps=List[count#0] arity=Exact(1) spread_at=[] @fFileId(0):5:2
+      B0:
+        setCount#0((count#0 Add 1));   @fFileId(0):6:4
+        -> return undefined
+  prov: HookProvenance { label: 0, origin_hook: "useCounter", …, inlined: false, … }
+  prov: HookProvenance { label: 1, origin_hook: "useState", …, inlined: true, … }
+  prov: HookProvenance { label: 2, origin_hook: "useEffect", …, inlined: true, … }
+  inline_origin: InlineOrigin { name: "useCounter", from: "Counter.tsx", kind: Hook }
+\end{sortie}
+
+Le \cref{tab:splice-labels} récapitule ce qui est arrivé à chaque label.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{p{3.3cm}p{2.6cm}p{3.4cm}p{3cm}}
+\hline
+\textbf{Avant (unité, label)} & \textbf{Après} & \textbf{Dans le CFG} & \textbf{Provenance} \\
+\hline
+\code{Counter}, \texttt{Custom \#0} & disparue de la table & marqueur remplacé par la greffe & ligne 0 gardée, label pendant \\
+\code{useCounter}, \texttt{State \#0} & \texttt{State \#1}, \code{init=0} & \code{StateVal(1)}, \code{StateSetter(1)} & ligne 1, \code{inlined: true} \\
+\code{useCounter}, \texttt{Effect \#1} & \texttt{Effect \#2} & \code{HookMarker(2, ...)} & ligne 2, \code{inlined: true} \\
+\hline
+\end{tabular}
+\caption{Labels avant et après l'expansion de \code{useCounter} dans \code{Counter} : décalage \code{offset = max + 1 = 1}.}\label{tab:splice-labels}
+\end{table}
+
+Tous les ingrédients des sections précédentes sont là : décalage des labels (\code{offset = 1}), greffe du corps entier au site du marqueur avec liaison du retour (\texttt{let count = count\#0}), paramètre lié à la position de l'appel (\texttt{let initial\#0 = 0}), la même table de renommage appliquée au corps de l'effet et à ses deps (\texttt{count\#0}, \texttt{setCount\#0}), et l'\code{init} de l'état substitué (\code{init=initial} devenu \code{init=0}).
+
+\subsection{L'algorithme}
+
+\begin{algorithm}[htbp]
+\KwIn{la table \code{hooks} et le rendu d'un composant, la réserve \code{SpliceIds}}
+$\mathit{expanding} \gets \emptyset$ ; $i \gets 0$\;
+\While{$i < |\mathit{hooks}|$}{
+  \lIf{$\mathit{hooks}[i]$ n'est pas \code{Custom}}{$i \gets i+1$ ; continuer}
+  $(n, \mathit{args}, \mathit{src}, f) \gets \mathit{hooks}[i]$ ; $\ell \gets$ son label\;
+  \lIf{$n \in \mathit{expanding}$}{$i \gets i+1$ ; continuer \tcp*[f]{garde de récursion}}
+  $h \gets \mathit{HookRegistry}[(f, n)]$, sinon premier hook nommé $n$\;
+  \If{$h$ absent}{
+    \lIf{$\mathit{SummaryRegistry}$ connaît $(n, \mathit{src})$}{retaguer le marqueur $\ell$}
+    $i \gets i+1$ ; continuer\;
+  }
+  $o \gets 1 + \max$ des labels de $\mathit{hooks}$\;
+  $\sigma \gets [\,p \mapsto a \mid (p, a) \in \mathrm{zip}(h.\mathit{params}, \mathit{args})\,]$\;
+  $(s, c) \gets \mathit{SpliceIds}.\mathit{take}(\mathit{alloc\_span}(h))$\;
+  $\rho \gets \mathit{callee\_rename\_map}(h, s, \mathit{bound\_vars}(\mathit{render}))$\;
+  $H' \gets [\,\rho(\sigma_{\mathit{init}}(e)) \mid e \in \mathit{remap\_hooks}(h.\mathit{hooks}, \{o, c\})\,]$\;
+  greffer $\mathit{remap\_cfg}(h.\mathit{body}, \{o, c\})$ au marqueur $\ell$, lié à sa variable, avec $\rho$ ; enregistrer la région\;
+  ajouter les lignes de provenance de $h$, labels $+\,o$, \code{inlined}\;
+  $\mathit{expanding} \gets \mathit{expanding} \cup \{n\}$\;
+  remplacer $\mathit{hooks}[i]$ par $H'$ \tcp*[f]{sans avancer $i$}
+}
+\caption{\code{expand_custom_hooks} (\src{src/engine/fixpoint.rs}{889}{1142}), en pseudo-code}
+\label{alg:splice-expand}
+\end{algorithm}
+
+L'\cref{alg:splice-expand} parcourt la table par indice. Le point clé est la dernière ligne : l'entrée \code{Custom} est remplacée par les entrées de l'appelé, et $i$ n'avance pas. Si la première entrée insérée est elle-même un \code{Custom} (un hook qui appelle un hook), elle est examinée au tour suivant : l'expansion est récursive sans être écrite récursivement.
+
+\subsection{Trouver le hook, se garder de la récursion}
+
+\rustsnippet[label={lst:splice-lookup}]{src/engine/fixpoint.rs}{925}{942}{garde de récursion et recherche dans le registre}
+
+La garde est un ensemble de \emph{noms} déjà expansés dans ce composant. Elle suffit à terminer sur un hook auto-récursif ou une chaîne \code{useA} $\to$ \code{useB} $\to$ \code{useA} ; elle a un prix, que nous verrons plus bas. La recherche passe par le \code{HookRegistry}, un \code{KeyedRegistry<HookIR>} de clé \code{(fichier, nom)} (\adr{13}, \src{src/engine/hook_registry.rs}{6}{13}), construit une fois pour tout le programme. La clé complète vient du fichier résolu de l'import (\code{resolved_file}). À défaut --- import non résolu, ou ré-export à un niveau où le fichier résolu ne définit pas le nom --- le moteur retombe sur \code{get_by_name}, qui rend le premier hook de ce nom dans l'ordre des clés. C'est une asymétrie à connaître : la résolution des utilitaires, elle, refuse de deviner (\cref{sec:splice-utilitaires}).
+
+\subsection{Préparer la copie}
+
+\rustsnippet[label={lst:splice-prepare}]{src/engine/fixpoint.rs}{996}{1026}{décalage, substitution, sel, table de renommage}
+
+Quatre calculs, dans cet ordre. Le décalage des labels est \og le premier label libre après toutes les entrées courantes\fg{}, y compris celles qu'une expansion précédente vient d'insérer. La substitution \code{param_subst} apparie paramètres et arguments \emph{avant} renommage. La réserve fournit le sel et la plage de sites. La table de renommage protège les liaisons du rendu de l'appelant (\code{bound_vars(render_cfg, \&[])} : les \code{Let} du rendu, ce qui inclut les liaisons issues du déstructurage des props, \code{let x = __obj_N.x}).
+
+\rustsnippet[label={lst:splice-remapped}]{src/engine/fixpoint.rs}{1028}{1047}{la table de l'appelé, copiée et réécrite}
+
+L'ordre des trois réécritures d'une entrée est significatif : \code{remap_hooks} décale labels et sites ; \code{subst_vars_expr} remplace, dans l'\code{init} d'un \code{State} seulement, les noms de paramètres \emph{d'origine} par les arguments ; \code{rename_hook_entry} renomme ce qui reste. Faire le renommage d'abord empêcherait la substitution de reconnaître les paramètres. Puis le corps est décalé par \code{remap_cfg} et greffé au site du marqueur, trouvé par \code{find_hook_marker} (\src{src/engine/fixpoint.rs}{1144}{1163}) : le premier \code{let x = HookMarker(l, ...)} ou \code{HookMarker(l, ...);} de label $\ell$, en ordre de blocs ; la variable \code{x} devient \code{bound_var}.
+
+\subsection{Enregistrer la région et la provenance}
+
+Une greffe réussie rend sa plage de blocs, que le moteur range comme région inlinée :
+
+\rustsnippet[label={lst:splice-region}]{src/engine/setters.rs}{806}{820}{une région greffée}
+
+\code{parent} est la région qui contenait le bloc d'appel : les régions s'emboîtent comme la chaîne des wrappers. C'est ce que lit la provenance des écrivains (\adr{27} §4, \cref{chap:relations}) : une écriture de setter située dans une région est \emph{médiée par un wrapper}, et ne peut pas être certifiée comme écrite directement par le composant. D'où l'importance du cas défensif (\src{src/engine/fixpoint.rs}{1079}{1109}) : si le marqueur est introuvable (\og should not happen\fg{}), le moteur greffe les seules instructions du bloc d'entrée en tête du rendu et positionne \code{render_poisoned = true}, car ces instructions échappent à toute région ; aucune écriture du rendu ne pourra alors se dire directe. C'est un repli \emph{fail-closed}.
+
+Restent la provenance et le remplacement de l'entrée (\src{src/engine/fixpoint.rs}{1111}{1141}). L'\code{InlineOrigin} (\adr{19}) dit qu'un corps venu de \code{hook_ir.file} vit désormais dans ce CFG ; les lignes \code{HookProvenance} de l'appelé rejoignent celles du composant avec le même décalage de labels et \code{inlined: true} (\adr{23}), si bien qu'un \code{useLayoutEffect} atteint à travers un wrapper reste distinguable d'un \code{useLayoutEffect} écrit dans le composant. La ligne de l'appel au wrapper est gardée : son label est \emph{pendant} (aucune entrée de la table ne le porte plus), il faut donc passer par sa position.
+
+\subsection{Le garde-\texorpdfstring{\code{throw}}{throw}, rejoué}
+
+\begin{exemple}{Un hook qui lève une exception avant ses hooks}{splice-garde-throw}
+Le test \code{a_hook_after_a_guard_throw_is_not_conditional} (\file{tests/cfg_exit_integrity.rs}) fixe l'idiome suivant (\file{/tmp/ch08/throw/Cart.tsx}) :
+\begin{lstlisting}[language=TypeScript]
+function useCart() {
+  const ctx = useContext(CartContext);
+  if (ctx === undefined) {
+    throw new Error("useCart must be used within a CartProvider");
+  }
+  const [items, setItems] = useState(ctx.items);
+  return items;
+}
+export function CartModal() {
+  const items = useCart();
+  return <div>{items}</div>;
+}
+\end{lstlisting}
+Après expansion (sonde, extrait) :
+\begin{sortie}
+    B1:
+      let ctx#0 = HookMarker(1, Unknown)   @fFileId(0):6:8
+      -> branch (ctx#0 Eq undefined) ? B2 : B3  @fFileId(0):7:6
+    B2:
+      new#1 Error("useCart must be used within a CartProvider");   @fFileId(0):8:4
+      -> unreachable
+    B3:
+      -> jump B4
+    B4:
+      let items#0 = StateVal(2)   @fFileId(0):10:9
+      let setItems#0 = StateSetter(2)   @fFileId(0):10:16
+      let items = items#0   @fFileId(0):15:8
+      -> jump B5
+    B5:
+      -> return Native<div>(Obj#0{}; [items]) prop_spans=[] @fFileId(0):16:9
+    edges: B0->B1:Unconditional B1->B2:IfTrue B1->B3:IfFalse B3->B4:Unconditional B4->B5:Unconditional
+  hook: Custom #1 useContext(CartContext) deps=Absent binding=Some("ctx") …
+  hook: State #2 init=ctx#0.items @fFileId(0):10:8
+\end{sortie}
+B2 reste \code{unreachable}, sans arête vers la jointure B5 : la seule sortie réelle passe par B4, où vit le \code{useState} (label 2), qui domine donc toutes les sorties (\cref{def:dominance}). Aucun \regle{conditional-hook} n'est émis ; seule une \Info{} \code{analysis-limit} signale que \code{useContext}, entrée \code{Custom} de l'appelé devenue entrée du composant, n'est pas modélisé (\issue{28}). Si la greffe reliait B2 à B5, un chemin atteindrait la sortie sans passer par B4, et le hook deviendrait conditionnel au niveau \Error{}. Deux détails de lecture : l'\code{init} de l'état est \texttt{ctx\#0.items}, renommé mais évalué dans l'environnement d'entrée, où \texttt{ctx\#0} n'existe pas, donc $\Top$ ; et le champ \code{binding=Some("ctx")} de l'entrée \code{Custom} n'est \emph{pas} renommé par \code{rename_hook_entry} --- il n'est lu nulle part, il ne faut pas s'y fier après une greffe.
+\end{exemple}
+
+\subsection{Le prix de la garde : un hook appelé deux fois}
+
+La garde de récursion est par nom et par composant. La doc de la fonction l'assume : \og sound for the rare case of a hook called twice in the same component (second call stays opaque FN, not FP)\fg{} (\src{src/engine/fixpoint.rs}{884}{888}). Vérifions :
+
+\begin{lstlisting}[language=TypeScript,caption={Deux appels du même hook (\file{/tmp/ch08/step/Twice.tsx}, \code{useStep} du \cref{lst:splice-usestep})}]
+export function Both() {
+  const a = useStep(0);
+  const b = useStep(1);
+  return <div>{a}{b}</div>;
+}
+\end{lstlisting}
+Avec \code{--info} (l'\Info{} est sinon tue) :
+\begin{sortie}
+  Both  (2 hooks)  Twice.tsx
+    info   analysis-limit  [hook:1]  (line 13:8)  hook `useStep` was not found in the registry. Pass its source file or add a HookSummary to analyse it (FN possible)
+    warn   redundant-set-state  [hook:2]  (line 5:2)  state `n` is set to a stable value it already holds, so the update is redundant
+       (1 trace step(s), rerun with --trace)
+    suspended  analysis-limit  9 passing check(s) withheld: the analysis was truncated in this component, so they are not guaranteed
+\end{sortie}
+
+Seul le premier appel (\code{useStep(0)}) est greffé ; l'\regle{infinite-loop} du second est manqué. Ce n'est pas un silence : l'\Info{} est émise et les assurances du composant sont suspendues. Mais le texte de l'\Info{} est trompeur --- le hook \emph{est} dans le registre --- parce qu'il est produit par une seule règle pour toute entrée \code{Custom} restée opaque (\src{src/rules/impls/analysis_limit_info.rs}{99}{128}). La limite ne figure pas dans \file{docs/limitations.md}, qui ne mentionne que son analogue pour les utilitaires (\issue{53}). Une garde par \emph{pile d'expansion} (un nom interdit seulement dans sa propre greffe) terminerait aussi bien sur la récursion, en greffant les deux appels : c'est la piste centrale.
+
+% ===========================================================================
+\section{Inlining des utilitaires}
+\label{sec:splice-utilitaires}
+
+\subsection{Le registre des utilitaires}
+
+Un \terme{utilitaire} est une fonction de module qui n'est ni un composant ni un hook (\cref{def:composant-hook-utilitaire}). Le lowering en fait un \code{FunctionIR} : fichier, nom, paramètres, corps --- pas de table de hooks, puisque la règle des hooks interdit à une fonction ordinaire d'en appeler (\src{src/ir/function_ir.rs}{1}{22}). Le registre les indexe par \code{(fichier, nom)} et garde en plus les arêtes d'import résolues :
+
+\rustsnippet[label={lst:splice-fn-resolve}]{src/engine/function_registry.rs}{51}{63}{résolution fail-closed d'un utilitaire}
+
+\adr{27} §3 fixe la règle : une définition du fichier de l'appel, sinon l'arête d'import résolue de ce fichier pour ce nom local, \emph{jamais} une devinette par nom à travers les fichiers. L'ancien repli \og premier trouvé\fg{} greffait silencieusement le mauvais corps en cas d'homonymie, et un import renommé (\code{import { putState as ps }}) ne se résolvait pas du tout.
+
+\subsection{Trouver les appels, épuiser le budget}
+
+\code{expand_utility_calls} (\src{src/engine/fixpoint.rs}{1554}{1602}) applique \code{inline_in_cfg} au CFG de rendu \emph{et} au corps de chaque \code{Effect}, \code{Memo}, \code{Callback} et \code{Handler}, chacun avec son propre ensemble de noms en cours et son propre budget. Ni les \code{init} d'état, ni les \code{args} des hooks custom, ni les corps de fermetures imbriquées dans une expression ne sont parcourus.
+
+La boucle de \code{inline_in_cfg} (\src{src/engine/fixpoint.rs}{1604}{1665}) cherche une cible, la greffe, recommence. Chaque nom n'est inliné qu'une fois par CFG : c'est la garde de récursion (une chaîne \code{A} $\to$ \code{B} $\to$ \code{A} termine après un aller-retour), et c'est aussi une limite (\issue{53}) --- un deuxième appel du même utilitaire dans le même CFG reste un \code{Call} opaque. Le budget, \code{max_inline_depth = 8} greffes par CFG (\srcline{src/engine/fixpoint.rs}{57}), borne la croissance ; il est décrémenté même quand \code{splice_one_call} échoue. L'épuiser laisse les appels restants opaques --- c'est sound, puisqu'un appel opaque rend $\Top$ --- mais c'est une troncature, mesurée (20 CFG dans le corpus excalidraw, 6 dans memos) : \code{ctx.truncated} devient une \Info{} \code{analysis-limit}, et le composant retient ses assurances \code{verified:} plutôt que de les publier sur du code jamais lu.
+
+\rustsnippet[label={lst:splice-target}]{src/engine/fixpoint.rs}{1698}{1718}{ce qu'est un appel greffable}
+
+Seules deux formes sont des cibles : \code{let x = f(...)} et \code{f(...);}, avec \code{f} une \code{Var}. Un appel en position d'expression (\code{g(f(x))}, un bras de ternaire, une prop JSX) n'est pas inliné (\issue{52}) ; un appel de méthode \code{o.f()} non plus. Le fichier de résolution est celui de la \emph{région} qui contient l'instruction (\code{find_inlining_target}, \src{src/engine/fixpoint.rs}{1667}{1696}) : un utilitaire greffé résout ses propres appels dans son propre fichier, ce qui fait marcher les chaînes \code{putState} $\to$ \code{helper} où le composant n'importe pas \code{helper}.
+
+\rustsnippet[label={lst:splice-one-call}]{src/engine/fixpoint.rs}{1763}{1790}{la greffe d'un appel d'utilitaire}
+
+\code{splice_one_call} est un mince habillage de la primitive : un utilitaire n'a pas de hooks, donc \code{Offsets { labels: 0, ids }} et une table de hooks vide ; la table de renommage protège les liaisons \emph{du CFG où l'on greffe}. Il rend le nom \emph{exporté} (\code{utility.name}) et non le nom local de l'appel, pour que la chaîne des wrappers porte l'identité qu'une règle d'équipe nomme (\adr{27} §3).
+
+\begin{piege}
+Les utilitaires sont greffés \emph{avant} les hooks (\cref{lst:splice-orchestration}). Un utilitaire appelé \emph{dans le corps d'un hook custom} n'est donc pas inliné : quand le corps du hook arrive dans le composant, la passe des utilitaires est terminée. Avec \code{function useThing() { const [n, setN] = useState(0); bump(setN); return n; }}, le rendu de l'appelant contient après expansion \texttt{bump(setN\#0);}, un \code{Call} opaque (\file{/tmp/ch08/utilhook/U.tsx}). \adr{27} §5 reconnaît cet angle mort (\og utilities inside custom-hook bodies\fg{}) ; il retire des lignes à la relation des écrivains, sans rendre incertaine une ligne présente.
+\end{piege}
+
+\subsection{Ce qui n'est pas une greffe : fermetures locales (B5/B6)}
+\label{sec:splice-locales}
+
+Une fermeture \emph{locale} n'est pas dans le \code{FunctionRegistry} : elle n'est pas une fonction de module, c'est une valeur, un \code{FnLit} alloué dans le tas abstrait à son site (\adr{10}). Son appel est traité à l'interprétation, sans toucher au CFG. Comparons les deux chemins sur un même défaut (\file{/tmp/ch08/local/Local.tsx}) :
+
+\begin{lstlisting}[language=TypeScript]
+export function Local() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const go = () => setN(n + 1);
+    go();
+  }, [n]);
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+
+Le même fichier définit \code{Module}, identique sauf que l'effet appelle \code{bump(setM, m)}, avec \code{bump} fonction de module qui fait \code{set(v + 1);}. Les deux composants reçoivent le même \regle{infinite-loop} (\og this effect keeps pushing state `n` …\fg{}, puis \og … state `m` …\fg{}). Dans \code{Module}, \code{bump} est greffé dans le corps de l'effet. Dans \code{Local}, \code{go} est une \code{Var} liée à un site de tas ; l'appel \code{go()} a un callee de classe \code{Unknown}, et l'interpréteur l'exécute depuis le tas :
+
+\rustsnippet[label={lst:splice-b6}]{src/domains/interp/interpreter.rs}{521}{527}{B6 : appel direct d'une fermeture locale}
+
+\code{exec_var_callback} (\src{src/domains/interp/interpreter.rs}{542}{583}) exécute \emph{tous} les corps de fonction que la variable peut désigner (jointure sur les sites), dans l'environnement vivant du site d'appel complété par les captures de la fermeture. C'est aussi le mécanisme B5, pour une fermeture passée par variable à un appelant \og dans le cycle\fg{} (\code{setTimeout(cb)}, \code{.then(cb)}). Trois différences avec une greffe sont à retenir : les \emph{paramètres} de la fermeture sont liés à $\Top$, pas aux arguments ; la profondeur est bornée par \code{MAX_INLINE_DEPTH = 3} (\srcline{src/domains/interp/interpreter.rs}{21}), avec une \Info{} en mode programme ; un callee sans site de tas (un import non greffé, un paramètre) n'est pas exécuté du tout, faux négatif accepté par \adr{10} (\issue{19}).
+
+\subsection{Ce qui n'est pas une greffe : les composants enfants}
+
+Un \code{<Child/>} n'est \emph{jamais} greffé dans le CFG de son parent. \adr{12} a choisi une analyse descendante : le parent évalue les props de l'enfant en valeurs abstraites, et l'enfant est analysé à part avec ces props (\code{eval_comp_app}, \cref{chap:inter-composants}). La différence est de fond : un hook s'exécute \emph{dans} la fibre de son appelant, un enfant a sa propre fibre, son propre état, son propre cycle de rendu. Greffer un enfant confondrait ses slots avec ceux du parent. Nous verrons cependant au \cref{sec:splice-limites} que la frontière parent--enfant partage un espace d'identités, les sites du tas, et qu'elle n'y applique aucun décalage.
+
+% ===========================================================================
+\section{Les hooks de bibliothèque : des résumés}
+\label{sec:splice-resumes}
+
+\subsection{Sans source, pas de greffe}
+
+Un hook importé d'un paquet npm n'a pas de source dans le run : \code{node_modules} n'est jamais abaissé (\issue{51}, fermée \code{wontfix}). Quand \code{expand_custom_hooks} ne trouve pas un \code{Custom} dans le \code{HookRegistry}, il consulte un second registre, de \emph{résumés}. Un résumé implémente le trait \code{HookSummary} (\src{src/registry/summary.rs}{10}{48}) et répond à quatre questions, par ordre de priorité : le résultat est-il une fonction qui navigue (\code{navigates}, \code{useNavigate}) ? est-il tenu immobile par la boucle de rendu automatique (\code{held_across_updates}, les hooks de routeur, \issue{161}) ? a-t-il des membres nommés porteurs d'un contrat (\code{members}, \code{useForm().setValue}) ? sinon, quelle est sa valeur abstraite globale (\code{summarize}, $\Top$ par défaut) ? La recherche (\code{SummaryRegistry::get}, \src{src/registry/summary.rs}{166}{177}) essaie la clé \code{(Some(paquet), nom)}, avec le paquet de l'import, puis \code{(None, nom)} ; le registre commun n'enregistre que des clés portées par un paquet, de sorte qu'un \code{useRouter} local ne prend pas le contrat de celui de Next.js.
+
+\subsection{Connu n'est pas modélisé}
+
+\rustsnippet[label={lst:splice-summary-common}]{src/registry/summary.rs}{69}{77}{le registre par défaut}
+
+La phrase est à retenir : \og Registering a hook as ⊤ is not modelling it — it is recording that the hook is \emph{known}\fg{}. Beaucoup d'entrées du registre commun (\code{TANSTACK_HOOKS}, \code{REACT_ROUTER_HOOKS}, \code{USE_DEBOUNCE_HOOKS}\ldots, \src{src/registry/summary.rs}{336}{399}) rendent $\Top$ : elles n'apportent aucune précision, mais elles distinguent une imprécision \emph{délibérée} de l'\Info{} \code{analysis-limit} qui signifie \og nous n'avons même pas trouvé la définition\fg{}. Un $\Top$ connu ne suspend pas les assurances ; un $\Top$ inconnu les suspend. Et le choix de ne pas écrire de contrat est lui-même argumenté : pour \code{useDebouncedCallback}, documenté comme renvoyant un callback mémoïsé, le corpus n'offre qu'un site de vérification, \og and a claim is the direction that loses findings\fg{} (\src{src/registry/summary.rs}{142}{148}).
+
+\subsection{Ce que fait le moteur d'un résumé}
+
+\rustsnippet[label={lst:splice-summary-engine}]{src/engine/fixpoint.rs}{949}{977}{le résumé d'un hook introuvable}
+
+Le résumé devient un \code{SummaryValue} (\cref{chap:ir}) ; un contrat par membre reçoit un site d'allocation neuf, tiré de la \emph{même} réserve que les greffes (\code{alloc_one}), une par appel, pour que deux \code{useForm()} soient deux objets. Puis \code{retag_marker} (\src{src/engine/fixpoint.rs}{1247}{1275}) réécrit le marqueur du site d'appel en \code{MarkerVal::Summary(sv)}, et l'entrée \code{Custom} est \emph{gardée}. Le commentaire du code explique pourquoi : autrefois la liaison devenait un \code{SummaryVal} nu et l'entrée était retirée, ce qui effaçait le label du CFG et de la table --- un \code{useAtom()} \emph{conditionnel} était invisible à toutes les vérifications de la règle des hooks. Le marqueur est l'ancre de ces vérifications ; le retaguer par label atteint aussi un appel sans liaison et un appel dans un bloc autre que l'entrée.
+
+\begin{exemple}{Trois hooks de bibliothèque}{splice-resumes}
+\begin{lstlisting}[language=TypeScript,caption={Hook résumé par membres, hook connu, hook inconnu (\file{/tmp/ch08/summary/Form.tsx})}]
+import { useForm } from "react-hook-form";
+import { useQuery } from "@tanstack/react-query";
+import { useWeird } from "weird-lib";
+
+export function Form() {
+  const { setValue } = useForm();
+  const query = useQuery({ queryKey: ["k"] });
+  const weird = useWeird();
+  useEffect(() => {
+    setValue("name", query.data);
+  }, [query.data]);
+  return <div>{weird}</div>;
+}
+\end{lstlisting}
+Après expansion, avec le registre commun (sonde, liste de membres élaguée) :
+\begin{sortie}
+      let __obj_200 = HookMarker(0, Summary(Shape { id: ExprId(5), members: [("register", StableRef), …, ("setValue", StableRef), …, ("handleSubmit", Wrapper { stable: true }), ("watch", StableRef), ("control", StableRef)] }))   @fFileId(0):7:8
+      let setValue = __obj_200.setValue   @fFileId(0):7:10
+      let query = HookMarker(1, Summary(Top))   @fFileId(0):8:8
+      let weird = HookMarker(2, Unknown)   @fFileId(0):9:8
+\end{sortie}
+\begin{sortie}
+  Form  (4 hooks)  Form.tsx
+    info   analysis-limit  [hook:2]  (line 9:8)  hook `useWeird` was not found in the registry. Pass its source file or add a HookSummary to analyse it (FN possible)
+    suspended  analysis-limit  4 passing check(s) withheld: the analysis was truncated in this component, so they are not guaranteed
+\end{sortie}
+\code{useForm} a une forme : \code{setValue} est un membre stable, et l'effet qui l'appelle sans le déclarer n'est pas un oubli de deps. \code{useQuery} est connu et vaut $\Top$ : aucune \Info{}. \code{useWeird} est inconnu : son marqueur reste \code{Unknown}, l'\Info{} est émise et les assurances sont suspendues. Retirons \code{useWeird} (\file{/tmp/ch08/summary2/Form.tsx}) : \code{--info --show-clean} publie alors \code{verified missing-deps every effect declares the variables it reads}, parmi quatre assurances --- le $\Top$ connu de \code{useQuery} ne suspend rien.
+\end{exemple}
+
+\begin{piege}
+\code{Config::default()} a un \code{SummaryRegistry} \emph{vide} (\srcline{src/engine/fixpoint.rs}{55}) ; c'est le driver qui installe \code{new_with_common()} (\src{src/driver/mod.rs}{368}{373}), \og so unit tests keep their baselines\fg{}. Un test ou un outil qui appelle le moteur avec la configuration par défaut ne voit donc aucun résumé : tous les hooks de bibliothèque y sont inconnus. La sonde du dossier 03 est dans ce cas ; la sortie ci-dessus a été obtenue avec une variante qui installe le registre commun. Autre écart : le commentaire de tête de la branche (\src{src/engine/fixpoint.rs}{944}{948}) dit encore que les hooks connus \og are removed from the hooks vec\fg{}, alors que le code, une trentaine de lignes plus bas, les garde délibérément.
+\end{piege}
+
+% ===========================================================================
+\section{Attribuer les findings des hooks inlinés}
+\label{sec:splice-attribution}
+
+\subsection{Un défaut, trois consommateurs}
+
+Une greffe copie les instructions de l'appelé avec leurs positions, donc avec leur \code{FileId}. Un finding né dans un hook inliné est ancré dans le fichier du hook, mais rapporté sous le composant. La fixture \file{tests/fixtures/shared_hook_repeat} pose le cas type :
+
+\tsxsnippet{tests/fixtures/shared_hook_repeat/hooks/useShared.ts}{6}{12}{un hook partagé qui boucle}
+
+\file{App.tsx} y définit trois composants, \code{Alpha}, \code{Beta} et \code{Gamma}, qui appellent respectivement \code{useShared(0)}, \code{useShared(1)} et \code{useShared(2)}.
+
+\begin{shell}
+$ reactant check tests/fixtures/shared_hook_repeat --trace
+\end{shell}
+\begin{sortie}
+  Alpha  (1 hooks)  tests/fixtures/shared_hook_repeat/App.tsx
+    warn   infinite-loop  [hook:1]  (tests/fixtures/shared_hook_repeat/hooks/useShared.ts:8:2)  this effect keeps pushing state `value` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop  [in 3 components]
+       in: Alpha, Beta, Gamma
+       → state `value` is written here [hook:2] (tests/fixtures/shared_hook_repeat/hooks/useShared.ts:8:2)
+       → the abstract value of state `value` kept growing and was widened at iteration 3
+   2 component(s) hidden. Every finding in them is a source line already reported above
+
+⚠  1 warning(s) across 2 file(s), 3 component attribution(s).
+\end{sortie}
+
+La ligne principale nomme le fichier du hook, parce que l'ancre n'est pas dans le fichier du composant. Le rendu humain regroupe les trois findings identiques par localisation (\issue{129}) ; le JSON, lui, garde une ligne par consommateur, chacune avec \code{"component"} (\code{"Alpha"}, \code{"Beta"}, \code{"Gamma"}), \code{"file": "tests/fixtures/shared_hook_repeat/hooks/useShared.ts"}, \code{"component_file": "tests/fixtures/shared_hook_repeat/App.tsx"} et \code{"line": 8}.
+
+Le rendu humain passe par une seule fonction, \code{position} (\src{src/driver/human.rs}{15}{35}) : si le fichier de la position (résolu par la \code{FileTable} à partir de son \code{FileId}) diffère du fichier du composant, elle écrit \code{(chemin:L:C)}, sinon \code{(line L:C)}. La ligne principale et les pas de \code{--trace} l'empruntent tous deux, \og so the two can never disagree about where a position points\fg{}.
+
+\subsection{La décision}
+
+\begin{decision}[ADR-24 --- rendre l'origine, ne jamais fusionner les consommateurs]
+\textbf{Contexte.} Avant \adr{24}, la ligne principale imprimait \code{line:col} de l'ancre sous l'en-tête du composant : un finding ancré dans un hook inliné montrait un numéro de ligne d'un \emph{autre} fichier. Mesure sur les huit corpus avec le pack \code{guardrails} : 12 findings de règles custom sur 27 (44\,\%) étaient inexploitables ainsi (\file{presence-fade.tsx:17} pour \file{use-callback-ref.ts:17}), et le JSON était incohérent (\code{file} du composant, \code{line}/\code{col} de l'ancre). \textbf{Décision 1} : quand le fichier de l'ancre diffère de celui du composant, la ligne principale rend l'origine, et le \code{file} du JSON devient celui de l'ancre --- un changement du driver seul. \textbf{Décision 2} : les findings ne sont \emph{jamais} dédupliqués entre consommateurs, parce qu'ils sont incomparables, pas redondants : \code{useStep(1)} donne \regle{infinite-loop} et \code{useStep(0)} donne \regle{redundant-set-state} (\cref{lst:splice-usestep}). Supprimer les findings par consommateur au profit d'un finding de hook est un générateur de faux négatifs, et analyser le hook une fois avec des paramètres $\Top$ ne subsume ni n'est subsumé par les résultats par consommateur. \textbf{Décision 3} : attribution correcte n'est pas actionnabilité --- un finding bien placé dans une dépendance tierce reste dans du code qu'on ne peut pas changer ; la frontière first-party/dépendance n'est pas tranchée ici. \textbf{Alternative différée} à l'époque : regrouper pour l'\emph{affichage}. Elle a été adoptée depuis dans le rendu humain (\issue{129}, \og [in 3 components]\fg{}), le JSON gardant une ligne par composant ; les deux dangers que l'ADR signalait (un groupe n'a qu'une chaîne de témoins, et \code{[hook:N]} diverge entre membres) sont ceux qu'un tel regroupement doit respecter.
+\end{decision}
+
+L'argument de soundness est explicite dans l'ADR : le rendu ne peut pas cacher un défaut, il ne crée ni ne retire aucun finding, et comptes, \code{--fail-on} et code de sortie sont calculés avant lui. C'est le refus de la décision 2 qui porte le contenu de soundness.
+
+\subsection{Un finding sans position}
+
+La greffe donne une position à tout ce qu'elle synthétise ; reste le cas d'un finding dont l'ancre n'en a pas (typiquement un \code{Return}, \issue{140}). \adr{39} §4 le règle une fois, dans le registre des règles, plutôt que dans chaque règle :
+
+\rustsnippet[label={lst:splice-located}]{src/rules/registry.rs}{356}{369}{un finding prend la première position de sa chaîne}
+
+% ===========================================================================
+\section{Cas limites et défauts observés}
+\label{sec:splice-limites}
+
+La greffe est l'endroit où l'analyse copie du code d'un contexte dans un autre ; c'est donc là que se logent les confusions d'identités. Le \cref{tab:splice-defauts} rassemble les cas relevés au \snapshotCommit{}, dont plusieurs ne sont pas répertoriés dans le tracker. Nous détaillons ensuite les trois qui ont une conséquence observable.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{p{4.4cm}p{4.6cm}p{3.6cm}}
+\hline
+\textbf{Cas} & \textbf{Mécanisme} & \textbf{Effet observé} \\
+\hline
+\code{bump(setN, n);} avec \code{return set(n + 1)} & \code{Return} jeté sans \code{bound_var} & FN \regle{infinite-loop}, \og ✓ no issues found\fg{} \\
+parent et enfant de fichiers différents & sites du tas non décalés à l'entrée de l'enfant & FN \Error{} \regle{cross-setter-in-render} \\
+objet en argument d'un hook custom & \code{alloc_span} ignore \code{args}, \code{init}, \code{deps} & deux \texttt{Obj\#1} dans un rendu \\
+hook appelé deux fois & garde par nom & 2\textsuperscript{e} appel opaque, \Info{} trompeuse \\
+utilitaire dans un hook custom & ordre des passes & \code{Call} opaque (\adr{27} §5) \\
+local masquant un paramètre dans un \code{init} paresseux & substitution ignore les \code{let} d'un \code{FnLit} & valeur fausse \\
+utilitaire qui \emph{assigne} une variable de son module & \code{Assign} ni lié ni libre, non renommé & écrase la locale homonyme \\
+utilitaire greffé dans un effet, import homonyme d'une prop & \code{caller_bound} limité au CFG greffé & capture de la prop \\
+\hline
+\end{tabular}
+\caption{Défauts et limites de la greffe au \snapshotCommit{} (reproductions sous \file{/tmp/ch08/} et \file{/tmp/ircheck/}).}\label{tab:splice-defauts}
+\end{table}
+
+\subsection{Un \texorpdfstring{\code{return}}{return} jeté}
+
+Le bras \code{Return} de l'étape 5 ne pousse \code{let bound = ret} que si \code{bound_var} est \code{Some} ; sinon l'expression \code{ret} disparaît, avec ses lectures et ses appels. La doc de \code{Splice} dit \og \code{None} to discard as in a bare \code{f(..);}\fg{} : mais JavaScript \emph{évalue} l'expression du \code{return} avant d'en jeter la valeur.
+
+\begin{lstlisting}[language=TypeScript,caption={Un setter appelé dans un \code{return} (\file{/tmp/ircheck/ret/Ret.tsx})}]
+function bump(set, n) {
+  return set(n + 1);
+}
+export function C() {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    bump(setN, n);
+  });
+  return <div />;
+}
+\end{lstlisting}
+Corps de l'effet après greffe (sonde) : l'appel du setter a disparu.
+\begin{sortie}
+  hook: Effect #1 deps=Absent @fFileId(0):7:2
+      B1:
+        let set#0 = setN   @fFileId(0):8:4
+        let n#0 = n   @fFileId(0):8:4
+        -> jump B2
+      B2:
+        -> return undefined
+\end{sortie}
+\code{reactant check Ret.tsx} répond \og ✓ 1 file(s) no issues found.\fg{} ; la même fonction écrite \code{set(n + 1);} (\file{Stmt.tsx}) donne \og warn infinite-loop [hook:0] (line 7:2) this effect keeps pushing state `n` to new values on every run\fg{}. C'est un faux négatif, accompagné du \og ✓\fg{} réservé aux runs complets. Le même bras sert aux hooks appelés sans liaison : pour un \code{HookMarker(l, ...);} nu, \code{find_hook_marker} rend \code{bound_var = None} (elle-même rend \code{Some}), et le \code{Return(e)} du corps subit le même sort --- rejoué sur \code{useThing() \{ ...; return setN(n + 1); \}} appelé \code{useThing();} sans liaison (\file{/tmp/ircheck/ret/HookNoBind.tsx}) : même \og ✓\fg{}, un second FN de même cause.
+La correction est locale à la primitive et générale : quand \code{bound_var} vaut \code{None}, pousser \code{Stmt::ExprStmt(ret, call_span)}, comme le lowering le fait déjà pour \code{void e}.
+
+\subsection{Des sites en collision}
+
+\paragraph{Dans un composant.} Avec un hook \code{useBox} qui alloue (\code{const o = { v }; return o;}) suivi de \code{useFoo({ a: 1 })} (\file{/tmp/ircheck/alloc/App2.tsx}), le rendu après expansion contient :
+\begin{sortie}
+      let o#0 = Obj#1{v: v#0}   @fFileId(1):4:8
+      …
+      let opts#1 = Obj#1{a: 1}   @fFileId(0):7:8
+\end{sortie}
+Deux littéraux distincts portent le site \texttt{Obj\#1}. Le curseur partait de \code{alloc_span = 1} (seul l'\texttt{Obj\#0} du \code{<div/>} est visible), la greffe de \code{useBox} a reçu $[1, 2)$, et l'objet \code{{ a: 1 }}, rangé dans les \code{args} de l'entrée \code{Custom}, avait déjà l'identifiant 1 : même classe de défaut que \issue{134}, le tas étant indexé par site et \code{Heap::insert} écrasant. Aucune conséquence sur un diagnostic n'a été exhibée. Correction centrale : que \code{alloc_span} mesure toutes les expressions d'une entrée, symétriquement à \code{remap_hook_entry}.
+
+\paragraph{Entre un parent et un enfant.} Le compteur de sites est par fichier. Quand un parent analyse un enfant d'un autre fichier, \code{eval_comp_app} copie dans le tas initial de l'enfant les entrées de tas de ses props --- des sites \emph{du fichier du parent} --- alors que l'enfant alloue avec les sites \emph{de son fichier}. Si les numéros coïncident, l'objet de l'enfant écrase la fermeture du parent (\file{/tmp/ch08/heap/}) :
+\begin{lstlisting}[language=TypeScript]
+// A.tsx : la fermeture passée en prop est Fn#1
+export function Parent() {
+  const [n, setN] = useState(0);
+  return <Child onPick={() => setN(n + 1)} />;
+}
+// B.tsx, version 1 : `const b = 2;` ; version 2 : `const b = { y: 2 };` (Obj#1)
+export function Child({ onPick }) {
+  const a = { x: 1 };
+  const b = { y: 2 };
+  onPick();
+  return <div>{a.x}{b.y}</div>;
+}
+\end{lstlisting}
+\begin{sortie}
+version 1 :
+  Child  (0 hooks)  B.tsx
+    error  cross-setter-in-render  var:onPick  (line 4:2)  prop `onPick` (a state setter of parent `Parent`) called during render of `Child`, which triggers a parent re-render on every render
+       (1 trace step(s), rerun with --trace)
+   1 clean component(s) hidden, rerun with --show-clean
+
+⚠  1 error(s) across 2 file(s).
+version 2 :
+   1 clean component(s) hidden, rerun with --show-clean
+
+✓  2 file(s) no issues found.
+\end{sortie}
+Un \Error{} disparaît parce qu'un objet sans rapport a été ajouté dans l'enfant : pas un défaut de la greffe, mais de la frontière qui \emph{n'en est pas une} (\cref{chap:inter-composants}) --- \issue{134} a rendu les sites uniques par fichier et décale les greffes, mais pas l'entrée d'un enfant. Pistes : un \code{ExprId} unique à l'échelle du programme, ou un décalage des sites copiés à l'entrée de l'enfant.
+
+\subsection{Trois lectures fausses sans finding démontré}
+
+\paragraph{Un \code{Assign} non renommé.} \code{bound_vars} ne compte que les \code{Let} : une variable seulement \emph{assignée} dans l'appelé n'est ni liée ni libre au sens de \code{callee_rename_map}. Avec \code{util.ts} = \code{let mode = "a"; export function setMode() { mode = "b"; }} et un composant qui écrit \code{let mode = s; setMode();} (\file{/tmp/ch08/assign/}), le rendu après greffe contient \code{mode := "b"} juste après \code{let mode = s} : une écriture forte de la locale de l'appelant par une variable du module de l'appelé --- abstraitement \code{"b"}, concrètement \code{s}. \regle{infinite-loop} est quand même émis, pour un autre motif ; c'est le trou symétrique de \issue{141}, qui ne traite que les lectures.
+
+\paragraph{\code{caller_bound} ne voit que le CFG greffé.} Dans l'exemple du \cref{ex:splice-capture}, le même \code{lim()} greffé dans le corps de l'effet donne \texttt{let v\#1 = LIMIT} : la table protège les liaisons \emph{du corps de l'effet}, qui ne lie pas \code{LIMIT} ; la lecture de l'import devient une lecture de la prop capturée par l'effet. La protection de \issue{141} ne s'étend pas à la portée lexicale englobante.
+
+\paragraph{La substitution d'\code{init}} qui ignore les \code{let} d'une fermeture, vue au \cref{sec:splice-hygiene}.
+
+\begin{remarque}
+Un dernier constat, révélé par la greffe mais hors de son périmètre. \code{bump(setN, n);} \emph{dans le rendu} se greffe correctement (\texttt{set\#0 = setN}, \texttt{set\#0((v\#0 Add 1));}), mais \regle{setter-in-render} se tait, là où \code{setN(n + 1);} direct donne un \Error{} --- \adr{20} affirmant à tort qu'aucun alias de paramètre n'est émis. Cause côté règle : elle ne suit que \code{let x = StateSetter(l)} (\src{src/rules/impls/setter_in_render.rs}{63}{86}), pas l'alias, alors que le mécanisme générique (\code{resolve_setter_aliases}, \src{src/engine/setters.rs}{576}{580}, déjà utilisé par \regle{infinite-loop}, \regle{unnecessary-rerender}, \regle{stale-closure}) existe pour exactement ce cas.
+\end{remarque}
+
+\begin{resume}
+\begin{itemize}
+  \item Un hook custom n'a pas d'analyse propre : ses faits dépendent des arguments de chaque appelant (\adr{24}). Le moteur greffe donc son corps dans chaque composant qui l'appelle, avant l'amorçage et le point fixe ; il fait de même pour les utilitaires de module appelés en position d'instruction, et greffe ceux-ci en premier.
+  \item Une greffe décale quatre espaces d'identités : les blocs (dans la primitive), les labels et les sites (\code{Offsets}, \code{remap_cfg}, \code{remap_hooks}, plages tirées de \code{SpliceIds}), les noms (α-renommage \texttt{x\#s}).
+  \item \code{splice_callee_into_cfg} vérifie ses préconditions avant toute mutation, coupe le bloc d'appel, lie les paramètres par des \code{Let} à la position de l'appel, réécrit chaque \code{Return(e)} en \code{let bound = e} + saut vers une jointure qui porte la suite et l'ancien terminateur, laisse \code{Unreachable} coupé (\adr{25}), préserve les genres d'arêtes et rend la plage de blocs pour la provenance.
+  \item La table de renommage couvre toutes les liaisons de l'appelé et ses seuls noms libres que l'appelant lie (\issue{141}) ; elle est appliquée au corps et aux corps de ses hooks. Les \code{init} d'état reçoivent en plus une substitution des arguments.
+  \item \code{expand_custom_hooks} décale les labels au-dessus de la table courante, garde la ligne de provenance du wrapper, marque les lignes inlinées, enregistre la région (\adr{27} §4) et réexamine la position insérée pour les hooks imbriqués ; sa garde par nom laisse opaque un deuxième appel du même hook.
+  \item Fermetures locales (B5/B6) et composants enfants ne sont pas greffés ; les hooks de bibliothèque sont résumés (\code{SummaryRegistry}), et \og connu n'est pas modélisé\fg{}.
+  \item Un finding de hook inliné est rendu à son origine et jamais fusionné entre consommateurs (\adr{24}).
+  \item Défauts observés : \code{return} jeté sans liaison (FN démontré), sites en collision (dans un composant, et entre parent et enfant, FN \Error{} démontré), garde par nom, et trois lectures fausses sans finding démontré.
+\end{itemize}
+{\sloppy Fichiers rencontrés : \file{src/ir/splice.rs} ; \file{src/ir/remap.rs} ; \file{src/engine/fixpoint.rs} (\code{SpliceIds}, \code{expand_custom_hooks}, \code{expand_utility_calls}) ; \file{src/engine/hook_registry.rs} ; \file{src/engine/function_registry.rs} ; \file{src/registry/summary.rs} ; \file{src/driver/human.rs}. Le chapitre suivant ouvre la partie III : les treillis dans lesquels vivent les valeurs que le CFG greffé va propager (\cref{chap:treillis-simples}).\par}
+\end{resume}
+
+\section*{Exercices}
+\addcontentsline{toc}{section}{Exercices}
+
+\begin{exercice}{Numéroter une greffe}{splice-numeroter}
+Un rendu a les blocs B0 à B3, l'appel est dans B2, et l'appelé a trois blocs B0 (entrée, \code{branch}), B1 (\code{return a}), B2 (\code{throw}). Donnez les identifiants des blocs de l'appelé et de la jointure après la greffe, et la liste des arêtes ajoutées. Quel bloc n'a pas de successeur ?
+\end{exercice}
+\begin{solution}
+\code{block_offset = 4} : l'appelé occupe B4, B5, B6 ; la jointure est \code{4 + 3 = 7}. Arêtes : les sorties de B2 partent de B7 ; B2$\to$B4 ; B4$\to$B5 et B4$\to$B6 (genres préservés) ; B5$\to$B7. B6 (\code{Unreachable}) n'a pas de successeur.
+\end{solution}
+
+\begin{exercice}{Prédire la table de renommage}{splice-predire-renommage}
+Un hook \code{function useX(a) { const b = a + k; const [s] = useState(b); useEffect(() => { log(s, t); }); return s; }} est appelé dans un composant qui lie \code{t} et \code{s}, mais pas \code{k} ni \code{log}. Sel 2. Quels noms sont renommés, et en quoi ?
+\end{exercice}
+\begin{solution}
+Liaisons de l'appelé : \code{a}, \code{b}, \code{s} (et les temporaires du déstructurage) $\to$ \texttt{a\#2}, \texttt{b\#2}, \texttt{s\#2}. Libres : \code{k}, \code{log} (non liés par l'appelant, gardés) et \code{t}, lu dans le corps de l'effet et lié par l'appelant $\to$ \texttt{t\#2}. D'où l'importance de passer \code{hooks} à \code{callee_rename_map}.
+\end{solution}
+
+\begin{exercice}{Corriger le \texorpdfstring{\code{return}}{return} jeté}{splice-return-jete}
+Écrivez la modification du bras \code{Terminator::Return(ret)} de \code{splice_callee_into_cfg} qui supprime le faux négatif de \file{Ret.tsx}, et expliquez pourquoi elle ne peut pas créer de faux négatif ailleurs.
+\end{exercice}
+\begin{solution}
+\code{match bound_var { Some(var) => push(Stmt::Let { var, rhs: ret, span: call_span }), None => push(Stmt::ExprStmt(ret, call_span)) }}. Elle ne fait qu'\emph{ajouter} au modèle une évaluation que le programme concret effectue (comme le lowering de \code{void e}, \src{src/lowering/expr_lower.rs}{227}{232}) : les comportements abstraits couvrent au moins ceux d'avant, donc aucune écriture réelle ne peut disparaître ; au pire apparaissent des faux positifs, tolérés.
+\end{solution}
+
+\begin{exercice}{Deux appels du même hook}{splice-deux-appels}
+Proposez une garde de récursion pour \code{expand_custom_hooks} qui greffe les deux appels de \file{Twice.tsx} tout en terminant sur \code{function useA() { useA(); }}. Quelle information faut-il ajouter aux entrées insérées ?
+\end{exercice}
+\begin{solution}
+Interdire un nom seulement dans sa propre expansion : chaque entrée insérée porte la pile des hooks dont elle provient, et un \code{Custom} de nom $n$ n'est sauté que si $n$ figure dans sa propre pile. Deux appels frères ont des piles disjointes ; un appel récursif retrouve son nom dans sa pile.
+\end{solution}
+

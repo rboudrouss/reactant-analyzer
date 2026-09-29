@@ -1,0 +1,49 @@
+% Ordre d'assemblage des chapitres (voir PLAN.md). Un chapitre absent du
+% disque est ignoré, ce qui permet de compiler un manuscrit partiel.
+\newcommand{\chapitre}[1]{\IfFileExists{chapters/#1.tex}{\input{chapters/#1}}{\typeout{Chapitre absent : #1}}}
+
+\part{Le problème et son contexte}
+\chapitre{01-introduction}
+\chapitre{02-react-modele}
+\chapitre{03-interpretation-abstraite}
+\chapitre{04-tour-architecture}
+
+\part{Du source à la représentation intermédiaire}
+\chapitre{05-frontend-detection}
+\chapitre{06-ir}
+\chapitre{07-lowering-cfg}
+\chapitre{08-splice-inlining}
+
+\part{Les domaines abstraits}
+\chapitre{09-treillis-simples}
+\chapitre{10-statevalue-stabilite}
+\chapitre{11-transfert-stores}
+
+\part{Le moteur}
+\chapitre{12-cfg-analyzer-dominance}
+\chapitre{13-point-fixe-composant}
+\chapitre{14-relations}
+\chapitre{15-churn}
+\chapitre{16-inter-composants}
+
+\part{Les règles}
+\chapitre{17-api-regles}
+\chapitre{18-regles-etat}
+\chapitre{19-infinite-loop}
+\chapitre{20-regles-effets}
+\chapitre{21-regles-rendu-rsc}
+\chapitre{22-regles-declaratives}
+
+\part{L'outil et sa méthode}
+\chapitre{23-projet-cli-driver}
+\chapitre{24-distribution}
+\chapitre{25-tests-corpus}
+\chapitre{26-histoire-doctrine}
+\chapitre{27-limites-perspectives}
+
+\appendix
+\part{Annexes}
+\chapitre{A-fiches-adr}
+\chapitre{B-glossaire}
+\chapitre{C-catalogue-regles}
+% \chapitre{D-carte-code}  (non rédigée dans cette version)

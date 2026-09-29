@@ -1,0 +1,1166 @@
+% ---------------------------------------------------------------------------
+% Chapitre 17 — La couche règles : requêtes typées, sévérité certifiée, témoins
+% Sources : notes/09-rules-api.md ; src/rules/{mod,registry,docs}.rs ;
+% src/rules/api/{query,diagnostic,witness,cache}.rs ; src/rules/helpers/*.rs ;
+% tests/{layer_boundary,docs_drift,catalogue}.rs ; ADR-006, 007, 019, 021, 024, 042.
+% Sorties observées avec target/debug/reactant (commit e67b10a), fichiers /tmp/ch17/.
+% Sondes de forge compilées avec rustc contre la bibliothèque (fichiers /tmp/ch17probe/).
+% ---------------------------------------------------------------------------
+\chapter{La couche règles : requêtes typées, sévérité certifiée, témoins}
+\label{chap:api-regles}
+
+\begin{objectifs}
+  \item Situer la couche règles dans le pipeline : ce qu'elle lit (le point fixe convergé et les relations du moteur), ce qu'elle produit (des diagnostics gradués, localisés, expliqués) et ce qu'elle s'interdit (parcourir la syntaxe).
+  \item Connaître le contrat d'une règle (trait \code{Rule}, \code{RuleCtx}, \code{SafeCheck}) et savoir écrire la plus simple d'entre elles.
+  \item Comprendre comment le système de types de Rust garantit qu'une \Error{} ne peut naître que d'une preuve : le sceau de \code{Diagnostic}, le jeton \code{Certified}, les verdicts polarisés \code{MustResult} et \code{May}.
+  \item Lire les primitives must qui frappent ces jetons (dominance sur les sorties, plus grand point fixe, quantificateur $\forall$-stable, frappe au point de connaissance) et savoir en ajouter une en respectant le contrat.
+  \item Connaître le vocabulaire fermé des témoins (\code{Step}, \code{Note}, \code{FileId}) et la manière dont une chaîne devient une sortie humaine ou JSON.
+  \item Suivre la passe par composant du registre (\code{check}, \code{safe_check}, \code{located}, clamp, suspension, filtres, tri), le cache programme et la frontière \og walk-free\fg{} qui sépare les règles du moteur.
+\end{objectifs}
+
+\prerequis{\cref{chap:interpretation-abstraite} (faits must et may, \cref{def:must-may} ; soundness, \cref{def:soundness} ; dominance, \cref{def:dominance}) ; \cref{chap:statevalue-stabilite} (treillis \code{Stability}, \cref{def:stabilite}) ; \cref{chap:cfg-analyzer-dominance} (analyse d'un CFG, \code{compute_dominators}) ; \cref{chap:relations} (relations du moteur, \cref{def:relation}) et \cref{chap:churn} (graphe de churn, \cref{def:churn-graph}). Les chapitres suivants (\cref{chap:regles-etat}, \cref{chap:infinite-loop}, \cref{chap:regles-effets}, \cref{chap:regles-rendu-rsc}, \cref{chap:regles-declaratives}) supposent ce chapitre lu.}
+
+Les chapitres précédents ont construit, composant par composant, un point fixe abstrait et un ensemble de relations nommées. Il reste à en tirer ce qu'un développeur veut lire : \og ce hook est appelé conditionnellement, ligne 5\fg{}, avec un niveau de confiance juste et une explication. C'est le travail de la \terme{couche règles}, le répertoire \file{src/rules/}. Son doc-comment de tête résume la découpe :
+
+\rustsnippet[label={lst:api-regles-layout}]{src/rules/mod.rs}{1}{16}{la découpe de la couche règles}
+
+Ce chapitre ne présente pas les règles une à une (c'est l'objet des \cref{chap:regles-etat,chap:infinite-loop,chap:regles-effets,chap:regles-rendu-rsc}) ; il présente la \emph{surface} contre laquelle toutes sont écrites, et la manière dont cette surface rend certaines erreurs de raisonnement impossibles à compiler. On part d'un faux négatif réel, qui a motivé toute la conception (\adr{21}).
+
+% ===========================================================================
+\section{Le problème : dire vrai, avec la bonne certitude}
+\label{sec:api-regles-probleme}
+
+Une règle ne se contente pas de dire \og il y a peut-être un problème\fg{}. Elle choisit un niveau parmi trois (\cref{chap:introduction}) : \Error{} quand le défaut est certain dès que le code s'exécute, \Warning{} quand il n'est que possible (ou certain mais d'un coût incertain), \Info{} quand elle avoue une limite de l'analyse ou un motif qui a l'air voulu. Se tromper de niveau vers le haut est un mensonge (une \Error{} sur un fait seulement possible) ; se taire sur un défaut possible est un faux négatif (FN), interdit par l'invariant de soundness (\cref{def:soundness}). Les deux fautes naissent au même endroit : là où une règle traduit une valeur abstraite en décision.
+
+\subsection{Deux prédicats qui n'étaient pas complémentaires}
+
+Considérons un composant qui écrit son propre état dans un effet, sans condition :
+
+\begin{lstlisting}[language=TypeScript,caption={Un effet qui s'auto-relance tant que \code{data} bouge (\file{/tmp/ch17/topdep.tsx})},label={lst:api-regles-topdep}]
+import { useState, useEffect } from "react";
+
+export function Poller({ data }: { data: unknown }) {
+  const label = "fixed";
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    setN(n + 1);
+  }, [label, data]);
+  return <div>{n}</div>;
+}
+\end{lstlisting}
+
+\code{data} est une prop : l'analyse n'en sait rien, sa valeur abstraite est $\Top$. Chaque exécution de l'effet écrit \code{n + 1}, donc provoque un nouveau rendu ; si \code{data} change d'identité à chaque rendu (un objet recréé par le parent, par exemple), l'effet se relance, et la boucle ne s'arrête jamais. La règle \regle{infinite-loop} doit donc au minimum émettre un \Warning.
+
+Avant \adr{21}, elle ne le faisait pas. Le domaine offrait deux prédicats sur la stabilité d'une valeur, \code{is_stable()} (vrai seulement pour \code{Stability::Stable}) et \code{is_unstable()} (vrai seulement pour \code{PerRender}). Un helper partagé, \code{all_deps_unstable}, était construit sur le second, et la règle sautait l'effet par \code{if !all_deps_unstable(deps) { continue }}. Or pour une dep à $\Top$, les deux prédicats rendent \code{false} : \code{is_unstable() == false}, donc \code{all_deps_unstable == false}, donc la règle passe à l'effet suivant, et la boucle possible n'est jamais rapportée. L'ADR le qualifie sans détour : \og a real soundness FN --- the cardinal sin --- written by the maintainer, shipped, in a \emph{shared} helper\fg.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}lccl@{}}
+\toprule
+valeur \code{Stability} & \code{is_stable()} & \code{is_unstable()} & ce que la valeur permet \\
+\midrule
+\code{Stable} & vrai & faux & ne change jamais \\
+\code{PerRender} & faux & vrai & change à chaque rendu \\
+\code{Versioned}, \code{VersionedTop} & faux & faux & change quand un état change \\
+\code{Unknown} ($\Top$) & faux & faux & peut changer à chaque rendu \\
+\bottomrule
+\end{tabular}
+\caption{Les deux prédicats historiques (d'après \adr{21}, section \og The false negative hiding underneath\fg). Les deux dernières lignes tombent dans le \og trou\fg{} : ni stables, ni instables. Une porte construite sur \code{is_unstable} les traite comme stables.}
+\label{tab:api-regles-trou}
+\end{table}
+
+Le \cref{tab:api-regles-trou} montre le trou. Il n'y a là aucune subtilité mathématique : $\Top$ se concrétise en \og n'importe quelle valeur\fg{}, donc en particulier en une valeur qui change ; le prédicat qu'il fallait était la \emph{négation} de \code{is_stable}, pas \code{is_unstable}. Mais la convention \og $\Top$ se replie du côté may\fg{} vivait dans la tête de chaque auteur de règle, et une seule inattention suffisait.
+
+\subsection{Deux corrections, et la leçon}
+
+La correction s'est faite en deux temps (\adr{21}, section \og Hardening round\fg). D'abord \code{is_unstable} a été retiré de la surface des règles et remplacé par une sonde dont le nom dit la polarité, \code{may_change} ($\Top$, \code{Versioned}, \code{PerRender} $\mapsto$ vrai). Ensuite, le quantificateur a été corrigé : la première version sautait l'effet dès qu'\emph{une} dep était prouvée stable, ce qui faisait réapparaître le FN sur \code{[label, data]} --- exactement le \cref{lst:api-regles-topdep}. React relance un effet si \emph{une} dep a changé (sémantique \og ou\fg) ; la seule situation où le tableau de deps protège vraiment est celle où \emph{toutes} les deps sont prouvées stables (\cref{sec:api-regles-forall}). Au commit \snapshotCommit, l'analyseur rapporte bien ce composant :
+
+\begin{sortie}
+  Poller  (2 hooks)  topdep.tsx
+    warn   infinite-loop  [hook:0]  (line 6:2)  this effect keeps pushing state `n` (its deps do not provably gate it, so the effect can re-run every render) to new values on every run. Potential infinite render loop
+       → state `n` is written here [hook:1] (line 6:2)
+       → the abstract value of state `n` kept growing and was widened at iteration 3
+    warn   missing-deps  [hook:1]  var:n  (line 6:2)  `n` is used in this effect but not in its deps array, and it is recreated on every render
+       → `n` is read here [hook:1] (line 6:2)
+\end{sortie}
+
+Trois tests épinglent le comportement dans \file{tests/effect_cycles.rs} :
+\begin{itemize}
+  \item \code{top_prop_dep_does_not_silence_self_write_loop}, la même boucle avec la seule dep \code{data} ;
+  \item \code{stable_dep_alongside_top_dep_does_not_gate_self_write_loop}, notre composant, à un nom près ;
+  \item leur complément \code{all_stable_deps_gate_self_write_effect}, qui vérifie que des deps toutes constantes font bien taire la règle.
+\end{itemize}
+
+La leçon tirée par l'ADR va plus loin que le bug. Une étude y a prototypé cinq façons d'écrire des règles (Rust, JSON déclaratif, Datalog, rappel JavaScript, Starlark) et conclu que \og the frontend is not the soundness lever --- the query surface is\fg{} : tant que des sondes sûres et des sondes dangereuses coexistent, la discipline de l'auteur est la seule barrière. D'où le programme de ce chapitre : faire porter la polarité par les \emph{types}, de sorte que confondre must et may, ou attacher \code{Severity::Error} à un booléen quelconque, soit une erreur de compilation.
+
+\begin{decision}[ADR-021 --- une surface de requête typée]
+\textbf{Décision.} La polarité (must, may, $\Top$) est un type ; la sévérité \Error{} est certifiée par un jeton que seules des primitives du module \file{src/rules/api/query.rs} peuvent frapper ; $\Top$ est une variante \emph{retournée} de chaque classifieur, repliée du côté may à l'intérieur de la primitive ; toutes les règles se lient à un objet unique, \code{RuleCtx}.
+\textbf{Alternatives refusées.} (1) Faire du choix du frontend d'écriture le levier de soundness : l'étude montre que chaque frontend, tel que prototypé, plafonnait à \Warning{} pour un auteur non fiable. (2) Une migration progressive : \og a transition window would leave the FN vector open\fg{} ; la migration a été faite d'un bloc, avec les quatorze règles de l'époque. (3) Un \code{All(T)} nu dans \code{MustResult} : le jeton vit \emph{dans} \code{All} pour que toutes les primitives partagent une seule histoire de frappe.
+\textbf{Confiance résiduelle.} L'annotation de polarité de chaque primitive : une primitive may étiquetée must rouvrirait l'\Error-sur-may. Elle est désormais localisée dans un seul fichier.
+\end{decision}
+
+\begin{remarque}
+\adr{6} avait posé la frontière moteur/règles : les règles sont des post-passes pures sur le point fixe convergé, et le moteur n'émet aucun diagnostic (la seule exception historique, l'enregistrement du widening, est devenue \code{widen_trace}). \adr{21} ne remet pas cette frontière en cause ; il installe une barrière \emph{à l'intérieur} du code des règles. Quant à \adr{7}, qui organisait les requêtes entre domaines pendant le transfert (\code{QueryContext}), il concerne le moteur ; \adr{21} dit en réaliser l'idée côté règles, sous la forme d'un contexte typé. Au commit \snapshotCommit, seuls \code{QueryContext}, \code{NullCtx} et \code{FixpointCtx} subsistent de cet ADR dans \file{src/domains/context.rs}.
+\end{remarque}
+
+% ===========================================================================
+\section{Le trait \code{Rule} et une première règle}
+\label{sec:api-regles-trait}
+
+\subsection{Le contrat}
+
+Une règle est une structure sans état qui implémente le trait \code{Rule} :
+
+\rustsnippet[label={lst:api-regles-rule}]{src/rules/mod.rs}{75}{106}{le trait \code{Rule}}
+
+Trois méthodes, dont une seule obligatoire en plus du nom :
+\begin{itemize}
+  \item \code{name()} rend l'\terme{identifiant de règle}. Il est distinct du \terme{nom de diagnostic} que porte chaque finding (\code{Diagnostic::rule}) : une règle peut émettre sous plusieurs noms. \code{InfiniteLoop} émet aussi \regle{cross-component-infinite-loop}, \code{SetterInRender} émet aussi \regle{cross-setter-in-render}. Cette distinction réapparaîtra au registre (\cref{sec:api-regles-registre}), où elle protège d'un FN.
+  \item \code{check(&RuleCtx)} rend la liste des diagnostics du composant. Elle est pure : elle lit le contexte et ne modifie rien. Sa signature d'origine (\adr{6}) prenait un \code{&AnalysisResult} et rendait des \code{Warning} ; \adr{21} (§4) l'a remplacée par un \code{&RuleCtx}, l'ancre à laquelle se lieront aussi les frontends externes.
+  \item \code{safe_check} décrit l'\emph{assurance positive} affichée sous \code{--info} (\og verified: \ldots\fg) quand la règle était applicable et n'a rien trouvé. Elle ne décide que de l'\emph{applicabilité} : le registre ne l'appelle que si \code{check} a rendu une liste vide.
+  \item \code{options()} déclare les options typées qu'accepte une règle native (\cref{sec:api-regles-options}).
+\end{itemize}
+
+Le trait n'est pas \code{Send + Sync}, alors que la signature prévue par \adr{6} l'exigeait : la passe des règles est séquentielle (\cref{sec:api-regles-cache}). L'assurance est une petite structure de deux chaînes statiques :
+
+\rustsnippet[label={lst:api-regles-safecheck}]{src/rules/mod.rs}{61}{73}{\code{SafeCheck}, une assurance positive}
+
+Le doc-comment insiste sur la différence entre \og aucune alerte\fg{} et \og vérifié\fg{} : un composant sans \code{useEffect} n'a aucune boucle infinie, mais il n'a pas non plus été \emph{vérifié} contre elle. Seul le premier cas mérite une ligne \code{verified}.
+
+\subsection{L'objet de contexte \code{RuleCtx}}
+
+Tout ce qu'une règle peut lire passe par \code{RuleCtx} :
+
+\rustsnippet[label={lst:api-regles-rulectx}]{src/rules/api/query.rs}{314}{340}{\code{RuleCtx} et sa référence au cache}
+
+Quatre champs, tous privés. \code{component} est l'identité du composant analysé (un \code{ComponentId}, à comparer) ; \code{comp} est son \code{AnalysisResult<StateValue>}, résolu \emph{une fois} à la construction (\code{build} indexe \code{program.components[&component]} et panique si le composant est absent : le dispatcher ne construit un contexte que pour un composant analysé) ; \code{config} porte les options de la règle ; \code{cache} donne accès au programme entier et aux structures qui en dérivent (\cref{sec:api-regles-cache}).
+
+Les accesseurs publics sont \code{program()}, \code{component()} (l'identité), \code{component_name()} (le nom d'affichage, \og never for a comparison\fg{} : il dépend du contenu, \issue{7}), \code{comp()} et \code{config()} ; \code{cache()} est \code{pub(in crate::rules)}, invisible d'un frontend externe. Trois constructeurs existent (\src{src/rules/api/query.rs}{342}{382}) : \code{RuleCtx::new} et \code{with_config}, qui créent un cache \emph{privé}, pour les tests et les appels isolés ; \code{RuleCtx::cached}, qu'emploie le registre, qui \emph{partage} le cache de tout le programme.
+
+\subsection{Exemple minimal : \regle{conditional-hook}}
+
+La règle la plus simple du dépôt tient en trente lignes. Elle signale un hook qui n'est pas appelé à chaque rendu, ce qui casse l'association par ordre d'appel entre hooks et slots d'état.
+
+\begin{react}[l'ordre des hooks]
+React n'identifie pas un \code{useState} par son nom mais par son \emph{rang} dans la suite des appels de hooks du rendu. Si un rendu saute un hook, tous les suivants se décalent d'un cran et lisent l'état d'un autre. D'où la règle \og n'appelez les hooks qu'au niveau supérieur\fg{} \cite{ReactRulesOfHooks}.
+\end{react}
+
+\begin{lstlisting}[language=TypeScript,caption={Un hook sous condition (\file{/tmp/ch17/profile.tsx})},label={lst:api-regles-profile}]
+import { useState } from "react";
+
+export function Profile({ visible }: { visible: boolean }) {
+  if (visible) {
+    const [n, setN] = useState(0);
+    return <div onClick={() => setN(n + 1)}>{n}</div>;
+  }
+  return null;
+}
+\end{lstlisting}
+
+\rustsnippet[label={lst:api-regles-conditional-hook}]{src/rules/impls/conditional_hook.rs}{14}{46}{la règle \regle{conditional-hook} en entier}
+
+Toute l'analyse est dans la primitive \code{ctx.hook_is_conditional()}, qui rend un vecteur de \emph{preuves} \code{Certified<ConditionalHookCall>} ; la règle transforme chaque preuve en \Error{} par \code{Diagnostic::error}, et c'est la seule manière d'en construire une (\cref{sec:api-regles-typestate}). Le \code{safe_check} déclare la règle applicable dès que le composant appelle au moins un hook. L'analyseur produit :
+
+\begin{sortie}
+  Profile  (2 hooks)  profile.tsx
+    error  conditional-hook  [hook:0]  (line 5:10)  this hook is called conditionally (not on every render path)
+       → guarded by a condition evaluated here, so some render paths skip the hook (line 4:6)
+\end{sortie}
+
+La ligne principale porte le label du hook (\code{[hook:0]}) et sa position ; la ligne \code{→}, visible avec \code{--trace}, est un \emph{témoin} : l'étape qui explique pourquoi le hook est conditionnel, ici la condition \code{visible} de la ligne 4. Ni la position ni le témoin n'ont été écrits par la règle : ils voyagent \emph{dans} la preuve (\cref{sec:api-regles-dominance}). Le \og (2 hooks)\fg{} compte aussi le handler \code{onClick}, que la primitive filtre. Le détail de la règle (formulation par dominance, cas limites, FN connus) est au \cref{sec:regles-effets-conditional-hook}.
+
+\subsection{Les dix-neuf règles natives}
+
+\code{all_rules()} instancie les règles natives dans un ordre fixe, qui est aussi leur ordre d'exécution :
+
+\rustsnippet[label={lst:api-regles-all-rules}]{src/rules/mod.rs}{108}{131}{les règles natives}
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}rlXl@{}}
+\toprule
+\# & \code{Rule::name()} & autres noms émis & constructeurs présents \\
+\midrule
+1 & \regle{conditional-hook} & --- & \code{error} \\
+2 & \regle{missing-deps} & --- & \code{warn} \\
+3 & \regle{missing-cleanup} & --- & \code{warn} \\
+4 & \regle{always-unstable-deps} & --- & \code{warn} \\
+5 & \regle{lazy-init} & --- & \code{error}, \code{warn}, \code{info} \\
+6 & \regle{redundant-set-state} & --- & \code{warn} \\
+7 & \regle{unnecessary-rerender} & --- & \code{warn} \\
+8 & \regle{setter-in-render} & \regle{cross-setter-in-render} & \code{error}, \code{warn} \\
+9 & \regle{server-component-hook} & --- & \code{warn} \\
+10 & \regle{stale-closure} & --- & \code{error}, \code{warn} \\
+11 & \regle{state-mutation} & --- & \code{error}, \code{warn} \\
+12 & \regle{state-lifted-too-high} & --- & \code{warn} \\
+13 & \regle{wasted-subtree-render} & --- & \code{warn} \\
+14 & \regle{infinite-loop} & \regle{cross-component-infinite-loop} & \code{error}, \code{warn}, \code{info} \\
+15 & \regle{derived-state} & --- & \code{warn} \\
+16 & \regle{frozen-initial-state} & --- & \code{error}, \code{warn}, \code{info} \\
+17 & \regle{unstable-context-value} & --- & \code{warn} \\
+18 & \regle{widening-info} & --- & \code{info} \\
+19 & \regle{analysis-limit} & --- & \code{info} \\
+\bottomrule
+\end{tabularx}
+\caption{Les règles natives dans l'ordre d'\code{all_rules()}. La dernière colonne relève les constructeurs \code{Diagnostic::*} présents dans chaque fichier de \file{src/rules/impls/} : c'est le niveau le plus haut qu'une règle \emph{peut} atteindre avant toute surcharge. Quinze règles implémentent \code{safe_check} ; les quatre autres sont \regle{analysis-limit}, \regle{widening-info}, \regle{state-lifted-too-high} et \regle{wasted-subtree-render}.}
+\label{tab:api-regles-natives}
+\end{table}
+
+Le \cref{tab:api-regles-natives} se lit comme une carte des preuves : sept règles seulement contiennent un appel à \code{Diagnostic::error}, donc sept seulement consomment un jeton \code{Certified}. Toutes les autres plafonnent à \Warning{} \emph{par construction}. La table des docs compte vingt et une entrées, parce qu'elle est indexée par nom de diagnostic et que deux règles émettent un second nom.
+
+\begin{piege}
+Deux commentaires du registre annoncent \og the 14 native rules and the 16-entry doc table\fg{} et \og 16 native entries\fg{} (\src{src/rules/registry.rs}{121}{130}) : ils datent de la migration d'\adr{21}. Au commit \snapshotCommit, il y a dix-neuf règles et vingt et une docs. Le test \code{natives_match_all_rules_order} (\src{src/rules/registry.rs}{452}{459}) vérifie l'ordre et le compte réels, pas les commentaires.
+\end{piege}
+
+% ===========================================================================
+\section{\code{Diagnostic} et \code{Severity} : le sceau}
+\label{sec:api-regles-sceau}
+
+\subsection{Trois niveaux, deux ordres}
+
+\rustsnippet[label={lst:api-regles-severity}]{src/rules/api/diagnostic.rs}{24}{52}{les niveaux et leur rang}
+
+Le doc-comment est la définition normative des trois niveaux, la même que celle du \file{CLAUDE.md} du dépôt : une \Error{} se construit \og only from a proof of the whole claim, not of one of its conjuncts\fg{} (\issue{142}, \cref{sec:api-regles-stale}) ; un \Warning{} est un défaut possible \emph{ou} un fait certain dont le coût ne l'est pas ; une \Info{} n'est pas actionnable sans contexte et reste cachée sans \code{--info}.
+
+Deux ordres coexistent sur ce type, et il ne faut pas les confondre. Le \emph{rang} (\code{rank}, privé) est l'ordre de confiance $\textsc{Info} < \textsc{Warning} < \textsc{Error}$ ; c'est sur lui que se calcule le meet du clamp (\cref{sec:api-regles-clamp}). Le \emph{discriminant} de l'énumération suit l'ordre de déclaration, \code{Error = 0}, \code{Warning = 1}, \code{Info = 2} ; c'est lui que le tri de sortie utilise (\code{a.severity() as u8}), pour que les \Error{} viennent en tête. Le type ne dérive volontairement pas \code{PartialOrd} : un ordre dérivé serait celui du discriminant, faux pour le clamp.
+
+\begin{piege}
+Parce que \code{rank} est privé au module feuille, \file{src/rules/impls/infinite_loop.rs} en ré-implémente une copie (\src{src/rules/impls/infinite_loop.rs}{472}{477}, commentaire \og Severity has no Ord: rank Error > Warning > Info manually\fg) pour choisir le meilleur finding par slot. Deux sources de vérité pour le même ordre : si un quatrième niveau apparaissait, il faudrait penser aux deux.
+\end{piege}
+
+\subsection{La structure et son champ scellé}
+
+\rustsnippet[label={lst:api-regles-diagnostic}]{src/rules/api/diagnostic.rs}{54}{73}{\code{Diagnostic}, dont seule la sévérité est privée}
+
+Tous les champs sont publics sauf un. \code{rule} est un \code{Cow<'static, str>} : les natives passent des littéraux (empruntés, sans coût), les règles de packs possèdent leur identifiant \code{pack/rule}. \code{hook_label}, \code{var} et \code{range} désignent ce que le finding pointe ; \code{notes} est la chaîne de témoins (\cref{sec:api-regles-temoins}). Le champ \code{severity}, lui, est privé, et le commentaire dit pourquoi : \og a \code{pub} field here would let any code forge an Error by mutation or struct literal\fg.
+
+\subsection{Pourquoi un module feuille}
+
+Rendre le champ privé ne suffit pas, et c'est une leçon de Rust. La visibilité privée est \emph{descendante} : un item privé d'un module est visible de ce module \emph{et de tous ses descendants}. Quand \code{Diagnostic} vivait dans \file{src/rules/mod.rs}, chaque règle, sous-module de \code{rules}, pouvait encore appeler le constructeur \og privé\fg{} et écrire \code{Diagnostic::new(..).with_severity(Severity::Error)}. Le premier jet d'\adr{21} avait ce défaut ; la revue l'a trouvé en compilant des sondes de forge. Le correctif a été de déplacer le type dans un module \emph{feuille}, \file{src/rules/api/diagnostic.rs}, dont les règles sont des sœurs et non des descendantes :
+
+\rustsnippet[label={lst:api-regles-leaf}]{src/rules/api/diagnostic.rs}{1}{12}{le raisonnement du module feuille}
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}
+  \node[bloc] (rules) at (0,0) {\code{crate::rules}};
+  \node[bloc] (api) at (-3.6,-1.5) {\code{rules::api}};
+  \node[bloc] (impls) at (3.6,-1.5) {\code{rules::impls}};
+  \node[bloc] (diag) at (-5.4,-3.3) {\code{api::diagnostic}\\\scriptsize \code{severity}, \code{new}, \code{with_severity}};
+  \node[bloc] (query) at (-1.2,-3.3) {\code{api::query}\\\scriptsize \code{Certified::mint}};
+  \node[bloc] (ch) at (3.6,-3.3) {\code{impls::conditional_hook}};
+  \draw[fleche] (rules) -- (api);
+  \draw[fleche] (rules) -- (impls);
+  \draw[fleche] (api) -- (diag);
+  \draw[fleche] (api) -- (query);
+  \draw[fleche] (impls) -- (ch);
+  \draw[fleche,dashed,draw=ra-red] (ch.west) -- node[etiquette,below,text=ra-red,yshift=-3pt] {invisible (E0624)} (query.east);
+  \draw[fleche,dashed,draw=ra-red] (ch.south) to[out=-110,in=-70] node[etiquette,below,text=ra-red] {invisible (E0624, E0616)} (diag.south);
+\end{tikzpicture}
+\caption{L'arbre des modules de \file{src/rules/}. Un item privé est visible de son module et de ses descendants, jamais de ses sœurs ni de leurs enfants : ni la règle \code{conditional_hook} ni aucune autre ne voit le champ \code{severity}, les constructeurs privés de \code{Diagnostic} ou \code{Certified::mint}. Si \code{Diagnostic} était défini dans \code{crate::rules} lui-même, toute règle, descendante, les verrait.}
+\label{fig:api-regles-modules}
+\end{figure}
+
+La \cref{fig:api-regles-modules} résume la situation. Hors du module, trois portes seulement fabriquent un \code{Diagnostic} :
+
+\rustsnippet[label={lst:api-regles-doors}]{src/rules/api/diagnostic.rs}{157}{190}{les trois portes}
+
+\code{warn} et \code{info} sont libres : un \Warning{} n'affirme aucun fait must, une \Info{} n'affirme rien. \code{error} est la seule porte vers une \Error{}, et elle exige un argument de type \code{Certified<E>}. Elle \emph{absorbe} la provenance de la preuve (position, label du hook, témoins) : la règle n'a pas à les recopier à la main, et ne peut pas les oublier. Le \code{var} reste vide ; la règle l'ajoute si elle le souhaite.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}llX@{}}
+\toprule
+méthode & visibilité & effet \\
+\midrule
+\code{new(rule, message)} & privée & sévérité par défaut (\Warning), champs optionnels vides \\
+\code{with_severity(sev)} & privée & seule écriture de \code{severity} hors des portes \\
+\code{severity()} & \code{pub} & lecture seule \\
+\code{clamp(ceiling)} & \code{pub} & abaissement par le consommateur, jamais de montée \\
+\code{with_label}, \code{with_var}, \code{with_range} & \code{pub} & remplissent \code{hook_label}, \code{var}, \code{range} (\code{with_range} écrase la position absorbée d'une preuve) \\
+\code{with_step(step, label, range, name)} & \code{pub} & ajoute une \code{Note} dont le texte est \code{step.render(name)} \\
+\code{with_notes(notes)} & \code{pub} & ajoute (\code{extend}) des notes déjà construites \\
+\code{error(rule, proof, message)} & \code{pub} & seule porte \Error{} ; absorbe \code{range}, \code{hook_label}, \code{notes} \\
+\code{warn}, \code{info} & \code{pub} & \code{new(..).with_severity(..)} \\
+\bottomrule
+\end{tabularx}
+\caption{La surface complète de \code{Diagnostic} (\src{src/rules/api/diagnostic.rs}{74}{191}).}
+\label{tab:api-regles-diagnostic-surface}
+\end{table}
+
+Le \cref{tab:api-regles-diagnostic-surface} donne la surface complète. Une seule méthode publique touche la sévérité après construction, \code{clamp}, et elle ne sait que descendre (\cref{sec:api-regles-clamp}).
+
+% ===========================================================================
+\section{Le typestate : \code{Certified}, \code{MustResult}, \code{May}}
+\label{sec:api-regles-typestate}
+
+Le sceau interdit d'écrire \code{Severity::Error} dans un diagnostic. Il reste à décider \emph{qui} a le droit de fournir l'argument de \code{Diagnostic::error}. C'est le rôle d'un \terme{typestate} : un type dont l'existence même d'une valeur témoigne qu'un certain calcul a eu lieu.
+
+\subsection{La provenance et le jeton}
+
+Une preuve se compose de deux choses : ce qui a été prouvé (l'\emph{évidence}, dont le type dépend de la primitive) et l'endroit où la preuve se trouve (la \emph{provenance}).
+
+\rustsnippet[label={lst:api-regles-provenance}]{src/rules/api/query.rs}{52}{57}{la provenance d'une preuve}
+
+\code{range} est la position de la preuve dans le source, \code{hook_label} le hook concerné, \code{notes} une chaîne de témoins déjà rendue (\cref{sec:api-regles-temoins}). C'est un \emph{défaut}, pas un verrou : \code{Diagnostic::error} l'absorbe, et la règle peut ensuite raffiner la position par \code{with_range} (\regle{state-mutation} pointe ainsi le site de mutation plutôt que l'écriture qui prouve le cycle). Plusieurs primitives laissent la provenance vide, et le doc-comment (\src{src/rules/api/query.rs}{37}{51}) le revendique : \code{must_init_calls_setter} reçoit une \code{Expr}, qui ne porte pas de position ; \code{must_same_ref_mutation} reçoit des identifiants de conteneurs ; \code{must_on_all_paths} un ensemble de blocs. Une provenance vide y est \og honest, not an omission\fg.
+
+\rustsnippet[label={lst:api-regles-certified}]{src/rules/api/query.rs}{74}{109}{le jeton de preuve \code{Certified}}
+
+\begin{definition}{Jeton certifié, sceau de sévérité}{certified}
+Un \terme{jeton certifié} est une valeur de type \code{Certified<E>} : une évidence de type \code{E} accompagnée d'une \code{Provenance}. Ses champs sont privés et son unique constructeur, \code{Certified::mint}, est privé au module \file{src/rules/api/query.rs}. Hors de ce module, on peut \emph{lire} un jeton (\code{evidence}, \code{provenance}) ou le \emph{dégrader} (\code{into_evidence}, qui rend l'évidence et détruit la preuve), jamais en fabriquer un.
+
+Une primitive \terme{must} est une fonction de ce module qui rend un verdict dont au moins une variante contient un jeton ; elle \terme{frappe} (\emph{mint}) ce jeton quand elle a établi le fait sur tous les chemins. Un \terme{verdict polarisé} est l'une des formes \code{MustResult<T>} (\code{All(Certified<T>)}, \code{Some(T)}, \code{None}), \code{May<T>} ou un classifieur total dont $\Top$ est une variante.
+
+Le \terme{sceau de sévérité} est la conjonction de deux faits de visibilité : le champ \code{severity} de \code{Diagnostic} n'est écrit que par \code{error}, \code{warn}, \code{info} et \code{clamp} ; \code{Diagnostic::error} exige un \code{Certified<E>}. Il s'ensuit que tout diagnostic de niveau \Error{} a été construit à partir d'un jeton frappé par une primitive must.
+\end{definition}
+
+\begin{invariant}{Les points de frappe}{api-regles-frappe}
+Au commit \snapshotCommit, \file{src/rules/api/query.rs} contient exactement dix appels à \code{Certified::mint} : dans \code{hook_is_conditional} (\srcline{src/rules/api/query.rs}{498}), \code{must_setter_on_all_paths} (l.~618), \code{must_on_all_paths} (l.~631), \code{ExitDominance::certify} (l.~698), \code{must_init_calls_setter} (l.~736), \code{must_direct_write} (l.~765), \code{classify_motion} (l.~858), \code{must_stale_capture} (l.~982), \code{must_effect_cycle} (l.~1027) et \code{must_same_ref_mutation} (l.~1053). Le périmètre de confiance de toutes les \Error{} de l'outil est la correction de ces dix sites.
+\end{invariant}
+
+\code{must_frozen_seed} n'apparaît pas dans la liste : il ne frappe pas, il \emph{consomme} une preuve venue de \code{classify_motion} et la rend telle quelle ou la dégrade (\cref{sec:api-regles-motion}).
+
+\subsection{Les verdicts polarisés}
+
+\rustsnippet[label={lst:api-regles-mustresult}]{src/rules/api/query.rs}{111}{135}{\code{MustResult} et \code{May}}
+
+Vu d'une règle, \code{MustResult} est un petit treillis à trois points ordonné par la force de la preuve, $\code{None} \lleq \code{Some} \lleq \code{All}$, dont seul le sommet transporte un jeton. \code{Some(T)} dit \og établi sur certains chemins\fg{} : un fait may, dont la charge est brute. \code{May<T>} a un champ public : on en construit librement, puisque ce n'est pas une preuve, et aucune fonction ne transforme un \code{May} en \code{Certified}. Une règle typique s'écrit donc :
+
+\begin{lstlisting}[language=Rust,caption={Forme usuelle de consommation d'un \code{MustResult} (pseudo-code)}]
+match must_primitive(...) {
+    MustResult::All(proof) => Diagnostic::error(NAME, proof, "…"),
+    MustResult::Some(evidence) => Diagnostic::warn(NAME, "…"),
+    MustResult::None => /* rien, ou un autre bras */,
+}
+\end{lstlisting}
+
+\begin{piege}
+\code{MustResult::Some} n'a rien à voir avec \code{Option::Some} : c'est un fait may, pas \og une valeur présente\fg. Un \code{if let Some(x) = ...} écrit par réflexe sur un \code{MustResult} ne compile pas, mais un \code{MustResult::Some(x) => error(...)} ne compile pas non plus, faute de jeton : l'homonymie ne peut donc pas faire émettre une \Error{} à tort. Elle peut en revanche faire lire un code de travers.
+\end{piege}
+
+\subsection{Les classifieurs totaux}
+
+La deuxième moitié de la leçon d'\adr{21} concerne $\Top$. Au lieu de prédicats booléens qui laissent un trou, la surface expose des \emph{classifieurs} dont $\Top$ est une variante que la règle doit traiter :
+
+\rustsnippet[label={lst:api-regles-stability-verdict}]{src/rules/api/query.rs}{143}{179}{\code{StabilityVerdict}, classifieur total}
+
+\code{StabilityVerdict::of} est une projection totale du treillis à six éléments \code{Stability} (\cref{def:stabilite}) sur quatre verdicts : \code{Bottom} et \code{Unknown} fusionnent en \code{Unknown}, \code{VersionedTop} devient \code{Versioned} d'ensemble vide. \code{Bottom} ($\Bot$, inatteignable ou non initialisé) n'est pas \og prouvé stable\fg{} : il part du côté may. \code{is_stable} est la seule porte sûre, et la sonde \og peut changer\fg{} en est la négation typée :
+
+\rustsnippet[label={lst:api-regles-may-change}]{src/rules/api/query.rs}{221}{227}{la sonde $\Top$-sûre}
+
+Deux autres classifieurs suivent le même modèle. \code{ReturnsVerdict} (\src{src/rules/api/query.rs}{189}{219}) pose une question d'\emph{identité} et non de stabilité (un sélecteur de store qui rend une référence neuve à chaque appel) : \code{Stable}, \code{FreshReference} ou \code{Unknown} ; son doc-comment précise \og a classifier, not a must-primitive: it mints nothing\fg. \code{CleanupVerdict} (\src{src/rules/api/query.rs}{1136}{1178}) dit ce qu'un corps d'effet retourne : \code{Present}, \code{Absent} ou \code{Unknown}, où \code{Unknown} se replie du côté \og il y a peut-être un cleanup\fg{} ; seul \code{Absent} est une affirmation exploitable, et \regle{missing-cleanup} (\Warning) ne tire que sur lui.
+
+\begin{piege}
+\code{may_change} et \code{may_change_of} n'ont, au commit \snapshotCommit, aucun appelant hors de \file{query.rs} (recherche dans \file{src/} et \file{tests/}). La porte effectivement utilisée par \regle{infinite-loop} est \code{all_deps_provably_stable} (\cref{sec:api-regles-forall}), construite directement sur \code{stability_verdict_of(..).is_stable()}. La \og seule sonde $\Top$-sûre\fg{} d'\adr{21} existe donc, mais ce n'est pas elle qui a fermé le FN.
+\end{piege}
+
+\subsection{Le graphe des types}
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}
+  \node[bloc] (prim) at (0,0) {primitive \code{must_*}\\\scriptsize (\file{query.rs})};
+  \node[bloc] (cert) at (3.7,0) {\code{Certified<E>}};
+  \node[bloc] (err) at (7.3,0) {\code{Diagnostic::error}};
+  \node[bloc,fill=white,draw=ra-red] (E) at (10.2,0) {\Error};
+  \node[bloc] (mayp) at (0,-2.4) {code de règle :\\\scriptsize \code{MustResult::Some},\\\scriptsize \code{May}, \code{bool}};
+  \node[bloc] (ev) at (3.7,-3.4) {\code{E} (évidence nue)};
+  \node[bloc] (warn) at (7.3,-4.8) {\code{warn} / \code{info}};
+  \node[bloc,fill=white] (W) at (10.2,-4.8) {\Warning{} / \Info};
+  \draw[flechemust] (prim) -- node[etiquette,above] {\code{mint}} (cert);
+  \draw[flechemust] (cert) -- (err);
+  \draw[flechemust] (err) -- (E);
+  \draw[fleche] (cert) -- node[etiquette,right,pos=0.75] {\code{into_evidence}} (ev);
+  \draw[fleche] (ev.east) -| (warn.north);
+  \draw[fleche] (mayp.south) |- (warn.west);
+  \draw[fleche] (warn) -- (W);
+  \draw[fleche] (E.south) -- node[etiquette,left,pos=0.5] {\code{clamp} (descend)} (W.north);
+  \draw[fleche,dashed,draw=ra-red] (mayp.north east) -- node[etiquette,text=ra-red,above left,pos=0.45] {E0624, E0451} (cert.south west);
+  \draw[fleche,dashed,draw=ra-red] (mayp.east) -- node[etiquette,text=ra-red,below right,pos=0.7] {E0308} (err.south west);
+  \draw[fleche,dashed,draw=ra-red] (W.east) to[out=0,in=0,looseness=0.9] node[etiquette,text=ra-red,right] {E0616, E0624} (E.east);
+\end{tikzpicture}
+\caption{Le graphe des types de la sévérité. En bleu, le seul chemin vers une \Error{} : une primitive must frappe un jeton, que \code{Diagnostic::error} consomme. En gris, les chemins libres : un fait may ou une évidence dégradée ne mène qu'à \code{warn} ou \code{info}, et \code{clamp} ne fait que descendre. En rouge, les flèches interdites, avec le code d'erreur que \code{rustc} rend réellement (\cref{ex:api-regles-forge}) : passer un fait may à \code{error} (E0308, types incompatibles), frapper un jeton hors de \file{query.rs} (E0624, fonction privée ; E0451 pour un littéral de structure), remonter une sévérité en écrivant le champ (E0616, champ privé) ou par \code{with_severity} (E0624).}
+\label{fig:api-regles-typestate}
+\end{figure}
+
+La \cref{fig:api-regles-typestate} rassemble le dispositif. Chaque flèche rouge est un chemin qu'une règle pourrait vouloir emprunter par erreur, et que le compilateur refuse.
+
+\begin{exemple}{Essayez de forger une \Error}{api-regles-forge}
+Écrivons, dans une caisse extérieure qui dépend de la bibliothèque \code{reactant}, les quatre tentatives qu'un auteur pressé pourrait faire (\file{/tmp/ch17probe/src/lib.rs}) :
+\begin{lstlisting}[language=Rust]
+use reactant::rules::{Certified, Diagnostic, May, Provenance, Severity};
+
+pub fn forge_token() -> Certified<()> {
+    Certified::mint((), Provenance::default())
+}
+pub fn forge_ctor() -> Diagnostic {
+    Diagnostic::new("x", "m").with_severity(Severity::Error)
+}
+pub fn forge_field(mut d: Diagnostic) -> Diagnostic {
+    d.severity = Severity::Error;
+    d
+}
+pub fn forge_may() -> Diagnostic {
+    Diagnostic::error("x", May(()), "m")
+}
+\end{lstlisting}
+\code{rustc} refuse les quatre (sortie élaguée : les en-têtes d'erreur, puis le début du détail de la dernière ; la ligne 21 est celle du fichier de sonde, dont chaque fonction est précédée d'un commentaire) :
+\begin{sortie}
+error[E0624]: associated function `mint` is private
+error[E0624]: associated function `new` is private
+error[E0624]: method `with_severity` is private
+error[E0616]: field `severity` of struct `Diagnostic` is private
+error[E0308]: mismatched types
+   --> src/lib.rs:21:28
+    |
+ 21 |     Diagnostic::error("x", May(()), "m")
+    |     -----------------      ^^^^^^^ expected `Certified<_>`, found `May<()>`
+\end{sortie}
+et une cinquième sonde, le littéral \code{Certified { evidence: (), provenance: Provenance::default() }}, donne \og error[E0451]: fields `evidence` and `provenance` of struct `Certified` are private\fg. Depuis une règle de \file{src/rules/impls/}, sœur des modules \code{api::diagnostic} et \code{api::query}, les messages sont les mêmes : pour la visibilité privée, un module frère et une caisse extérieure sont logés à la même enseigne. \adr{21} cite les mêmes codes E0616 et E0624 pour ses propres sondes.
+\end{exemple}
+
+\begin{piege}
+Le typestate empêche de \emph{forger} une preuve, pas de la \emph{transférer}. \code{Certified} dérive \code{Clone}, et tous les champs de \code{Diagnostic} sauf la sévérité sont publics : une règle pourrait cloner une preuve réelle sur le fait A pour construire une \Error{} sur le fait B, ou changer \code{d.rule}, \code{d.message} et \code{d.range} après \code{Diagnostic::error}. \adr{21} affirme que \og certified evidence for finding A cannot build an Error about B\fg{} ; c'est vrai du type de l'évidence (un \code{Certified<ConditionalHookCall>} ne s'obtient que pour un hook conditionnel), mais aucun type ne lie la preuve au \emph{message}. Cette dernière garantie repose sur la revue, et le noyau de confiance reste la polarité des primitives.
+\end{piege}
+
+% ===========================================================================
+\section{Les primitives must}
+\label{sec:api-regles-primitives}
+
+Le typestate déplace la question \og cette \Error{} est-elle justifiée ?\fg{} vers une autre : \og cette primitive ne frappe-t-elle que sur un fait établi sur tous les chemins ?\fg. Le fichier \file{query.rs} énonce son contrat en tête de la section des primitives :
+
+\rustsnippet[label={lst:api-regles-contrat}]{src/rules/api/query.rs}{417}{421}{le contrat normatif des primitives}
+
+Trois clauses : un verdict typé par sa polarité, $\Top$ replié du côté may \emph{à l'intérieur} de la primitive, et la frappe réservée aux primitives must. La dernière phrase compte : ajouter une primitive qui respecte le contrat ne demande pas de nouvel ADR. Cette section présente les primitives de la plus simple à la plus subtile ; chacune illustre une manière différente d'obtenir un \og pour tout\fg{} correct.
+
+\subsection{Dominance sur les sorties : \code{hook_is_conditional}}
+\label{sec:api-regles-dominance}
+
+La question de \regle{conditional-hook} se formule par dominance (\cref{def:dominance}) : un hook est appelé à chaque rendu si et seulement si son bloc domine chacune des sorties du CFG de rendu. La relation \og domine toutes les sorties\fg{} a un propriétaire unique, \code{ExitDominance} :
+
+\rustsnippet[label={lst:api-regles-exit-dominance}]{src/rules/api/query.rs}{652}{683}{\code{ExitDominance} : les sorties atteignables, et leur négation}
+
+Le point décisif est le filtre \code{reachable.contains(id)}. Le lowering scelle toujours la queue d'un corps par un \code{Return(undefined)} (\cref{chap:lowering-cfg}) ; quand les deux branches d'un \code{if}/\code{else} retournent, cette queue est orpheline. La compter comme une sortie ferait échouer, pour tout hook placé avant la branche, le test \og domine toutes les sorties\fg, et la règle tirerait au niveau \Error{} sur un hook parfaitement inconditionnel. Le commentaire le dit en toutes lettres.
+
+\code{may_be_skipped} est la négation \emph{côté règle} de \code{certify}, et pas la simple lecture de son cas \code{None} : un CFG sans sortie atteignable ne prouve rien dans aucun sens, donc rien n'y est \og sautable\fg{} (\code{may_be_skipped} rend faux) et rien n'y est certifié dominant (\code{certify} rend \code{None}). Formellement, avec $X$ l'ensemble des sorties atteignables et $b$ le bloc du hook :
+\begin{align*}
+\text{\code{may_be_skipped}}(b) &\iff X \neq \emptyset \wedge \exists x \in X,\ \neg\,\dom(b, x),\\
+\text{\code{certify}}(b) = \text{\code{All}} &\iff X \neq \emptyset \wedge \forall x \in X,\ \dom(b, x).
+\end{align*}
+
+La primitive de la règle applique cette négation à chaque appel de hook et frappe une preuve par hook conditionnel :
+
+\rustsnippet[label={lst:api-regles-hook-is-conditional}]{src/rules/api/query.rs}{472}{511}{\code{hook_is_conditional}, la négation $\forall$-sorties par hook}
+
+Trois remarques.
+\begin{itemize}
+  \item Les handlers (\code{HookKind::Handler}, les props \code{onX} que le lowering range parmi les hooks) sont filtrés : ce ne sont pas des hooks au sens de React.
+  \item Le fait prouvé est un \emph{existentiel} (\og il existe un chemin qui saute le hook\fg), et c'est pourtant un fait must : il affirme que le hook \emph{est} sauté sur un chemin réel du CFG, pas qu'il \emph{pourrait} l'être. L'ordre des hooks est alors cassé pour ce rendu-là, quel que soit le coût. D'où l'\Error.
+  \item C'est la seule primitive dont la preuve transporte déjà un témoin : la note \code{Step::Branch} est construite ici, avec la position de la garde que calcule \code{guard_site} (\src{src/rules/api/query.rs}{1092}{1123}) --- parmi les dominateurs stricts du bloc terminés par un \code{Branch} dont un successeur n'atteint pas le bloc, le plus profond. Toutes les autres primitives laissent la règle construire sa chaîne ; \code{Provenance::with_notes} n'a d'ailleurs aucun appelant au commit \snapshotCommit.
+\end{itemize}
+
+L'étude de la règle elle-même, avec le schéma des deux situations typiques et les FN connus de l'extraction des hooks, est au \cref{sec:regles-effets-conditional-hook}. La dominance sert aussi à \regle{setter-in-render}, dont l'\Error{} exige que l'appel domine toutes les sorties (\cref{chap:cfg-analyzer-dominance}) ; la primitive à usage unique \code{must_dominates_all_exits} (\src{src/rules/api/query.rs}{708}{712}) construit un \code{ExitDominance} et interroge un bloc.
+
+\subsection{Une analyse must avant : \code{must_setter_on_all_paths}}
+\label{sec:api-regles-must-setter}
+
+\regle{derived-state} veut savoir si un effet appelle un setter \emph{sur tous les chemins} de son corps (\og this effect always sets\ldots\fg). La dominance d'un seul bloc ne suffit pas : l'appel peut se trouver dans plusieurs blocs, sur des branches différentes qui se rejoignent. La primitive porte donc sa propre analyse de flot de données. Elle commence par collecter les sites d'appel :
+
+\rustsnippet[label={lst:api-regles-setter-collect}]{src/rules/api/query.rs}{527}{552}{collecte des sites d'appel du setter}
+
+Les préconditions suivent (\src{src/rules/api/query.rs}{553}{575}) : au moins un site ; tous les sites visent le \emph{même} setter ; tous les arguments sont sans appel, au sens de \code{arg_is_call_free}, qui suit les liaisons locales (une variable n'est \og sans appel\fg{} que si \emph{toutes} ses liaisons le sont). Si l'une échoue, le verdict est \code{None}. Vient ensuite le calcul proprement dit :
+
+\rustsnippet[label={lst:api-regles-must-out}]{src/rules/api/query.rs}{576}{621}{l'analyse must avant et sa conclusion}
+
+Les équations, écrites en commentaire à la ligne 576, sont celles d'une analyse must avant sur le treillis booléen, dont le meet est la conjonction :
+\[
+\mathit{out}(\mathit{entry}) = \mathit{called}(\mathit{entry}),\qquad
+\mathit{in}(B) = \bigwedge_{P \in \pred(B)} \mathit{out}(P),\qquad
+\mathit{out}(B) = \mathit{in}(B) \vee \mathit{called}(B).
+\]
+L'itération part de \code{true} partout (sauf l'entrée) et ne peut que descendre : elle calcule le \emph{plus grand} point fixe. C'est la bonne solution d'une analyse must, et c'est l'inverse de ce que l'on fait pour une analyse may (\cref{def:point-fixe}) : partir de \code{false} ferait tomber l'information à tort dans toute boucle, parce qu'un arc arrière transmettrait un \code{false} initial que rien ne corrigerait.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=7mm and 12mm]
+  \node[cfgbloc] (b0) {B0 (entrée)\\\code{let i = 0}};
+  \node[cfgbloc,below=of b0] (b1) {B1 (tête)\\\code{branch i < 3}};
+  \node[cfgbloc,right=of b1] (b2) {B2 (corps)\\\code{i = i + 1}};
+  \node[cfgbloc,below=of b1] (b3) {B3 (après)\\\code{return}};
+  \draw[fleche] (b0) -- (b1);
+  \draw[fleche] (b1) -- node[etiquette,above] {vrai} (b2);
+  \draw[fleche] (b2.north) to[bend right=30] (b1.north east);
+  \draw[fleche] (b1) -- node[etiquette,left] {faux} (b3);
+\end{tikzpicture}
+\caption{Un CFG idéalisé de corps d'effet avec une boucle. L'appel \code{setB(a * 2)} est placé soit dans B0 (avant la boucle), soit dans B2 (dans la boucle), soit dans B3 (après). Le lowering réel produit davantage de blocs, mais la même forme.}
+\label{fig:api-regles-loop-cfg}
+\end{figure}
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{@{}llccccl@{}}
+\toprule
+appel dans & passe & $\mathit{out}(B0)$ & $\mathit{out}(B1)$ & $\mathit{out}(B2)$ & $\mathit{out}(B3)$ & verdict \\
+\midrule
+B0 & init & vrai & vrai & vrai & vrai & \\
+   & 1 & vrai & vrai & vrai & vrai & stable : \code{All} \\
+\addlinespace
+B0, départ à \code{false} & init & vrai & faux & faux & faux & \\
+(à ne pas faire) & 1 & vrai & faux & faux & faux & stable : \code{Some}, à tort \\
+\addlinespace
+B2 & init & faux & vrai & vrai & vrai & \\
+   & 1 & faux & \textbf{faux} & vrai & \textbf{faux} & \\
+   & 2 & faux & faux & vrai & faux & stable : \code{Some} \\
+\addlinespace
+B3 & init & faux & vrai & vrai & vrai & \\
+   & 1 & faux & \textbf{faux} & \textbf{faux} & vrai & \\
+   & 2 & faux & faux & faux & vrai & stable : \code{All} \\
+\bottomrule
+\end{tabular}
+\caption{Itérations de \code{must_out} sur le CFG de la \cref{fig:api-regles-loop-cfg}, dans l'ordre de \code{cfg.blocks.keys()} (B1, B2, B3 ; l'entrée n'est pas recalculée). En gras, les valeurs qui changent. La seule sortie est B3 ; le verdict est \code{All} si $\mathit{out}(B3)$ vaut vrai. La deuxième ligne montre ce que donnerait un plus petit point fixe : dès la première passe, $\mathit{out}(B1) = \mathit{out}(B0) \wedge \mathit{out}(B2) = \text{vrai} \wedge \text{faux}$, et la valeur fausse venue de l'arc arrière ne se corrige jamais.}
+\label{tab:api-regles-must-out}
+\end{table}
+
+Le \cref{tab:api-regles-must-out} déroule l'algorithme. Un appel dans le corps de boucle (B2) n'est pas sur tous les chemins, puisque la boucle peut ne pas s'exécuter : \code{Some}. Un appel avant ou après la boucle l'est : \code{All}. L'analyseur confirme ces trois verdicts sur trois composants de cette forme (\file{/tmp/ch17/mustloop2.tsx}, où \code{a} est un état et l'appel est \code{setB(a * 2)}) : \regle{derived-state}, qui n'agit que sur \code{MustResult::All}, signale \code{Before} et \code{After} et donne l'assurance \code{verified} à \code{Inside} :
+
+\begin{sortie}
+  After  (4 hooks)  mustloop2.tsx
+    warn   derived-state  [hook:2]  (line 27:2)  this effect always sets `setB` to a call-free expression of `a` replace with `useMemo` or compute during render
+  Before  (4 hooks)  mustloop2.tsx
+    warn   derived-state  [hook:2]  (line 6:2)  this effect always sets `setB` to a call-free expression of `a` replace with `useMemo` or compute during render
+  Inside  (4 hooks)  mustloop2.tsx  ✓
+    verified  derived-state  no effect merely mirrors other state
+\end{sortie}
+
+(Élagué et filtré sur \regle{derived-state}, avec \code{--ignore-rule infinite-loop --ignore-rule widening-info} : parce que \code{a} est un état rouvert par un \code{setA} du gestionnaire de clic, sa valeur est widenée à l'itération du point fixe, ce qui rend aussi \code{b} instable et fait porter aux trois composants un \Warning{} \regle{infinite-loop} et une \Info{} \regle{widening-info} --- un fait réel mais sans rapport avec la primitive must ici étudiée. \code{Inside} n'est donc pas un composant sans diagnostic, seulement sans diagnostic \regle{derived-state}.)
+
+Le fait est certain (\code{All}), et la règle n'en tire pourtant qu'un \Warning{} : le coût d'un état dérivé (un rendu de plus) n'est pas un défaut certain. C'est l'autre moitié de la définition des niveaux, \og a certain fact whose cost is not\fg.
+
+\begin{piege}
+\code{must_setter_on_all_paths} et \code{ExitDominance} n'ont pas la même notion de \og sortie\fg. La première prend tous les blocs \code{Return} \emph{et} \code{Unreachable}, sans filtre d'atteignabilité ; la seconde, seulement les \code{Return} atteignables. Les deux sont sound pour leur usage : dans l'analyse must, un bloc sans prédécesseur est sauté (\code{preds.is_empty()}) et garde sa valeur initiale vraie, donc une sortie orpheline n'invalide pas le \og pour tout\fg. Mais un contributeur qui voudrait unifier les deux doit le savoir. Autre détail : un appel trouvé dans le terminateur \code{Return} d'une flèche concise (\code{() => setX(v)}) est enregistré sans position (\code{None}, ligne 547), faute de position sur \code{Terminator::Return} (\issue{140}).
+\end{piege}
+
+\subsection{Le bon quantificateur : \code{all_deps_provably_stable}}
+\label{sec:api-regles-forall}
+
+Revenons au FN de la \cref{sec:api-regles-probleme}. La porte qui décide si le tableau de deps d'un effet l'empêche de boucler vit dans \file{src/rules/helpers/mod.rs} :
+
+\rustsnippet[label={lst:api-regles-forall}]{src/rules/helpers/mod.rs}{211}{235}{la porte $\forall$-stable}
+
+\begin{react}[la sémantique \og ou\fg{} des deps]
+Après chaque rendu, React compare chaque dep à sa valeur précédente par \code{Object.is}, et relance l'effet si \emph{au moins une} diffère. Un tableau \code{[a, b]} protège donc l'effet seulement si \code{a} \emph{et} \code{b} restent identiques ; \code{[]} ne le relance jamais après le montage ; l'absence de tableau le relance à chaque rendu.
+\end{react}
+
+\begin{proposition}{Soundness de la porte}{api-regles-porte}
+Soit un effet de deps $d_1, \ldots, d_k$ évaluées dans l'environnement de sortie du rendu. Si \code{all_deps_provably_stable} rend faux, la règle examine l'effet ; si elle rend vrai, chaque $d_i$ a pour valeur abstraite \code{Stable}, dont la concrétisation ne contient que des valeurs identiques d'un rendu à l'autre, donc aucune dep ne change et React ne relance pas l'effet. Sauter l'effet dans ce cas ne perd aucun comportement concret : la porte ne crée pas de FN.
+\end{proposition}
+
+Le quantificateur est la clef. Sauter dès qu'\emph{une} dep est stable (la première correction) rendrait l'implication fausse pour \code{[label, data]}. Sauter tant qu'aucune dep n'est \og instable\fg{} (le code d'origine) la rendrait fausse pour toute dep à $\Top$ ou \code{Versioned}. Le seul consommateur, \srcline{src/rules/impls/infinite_loop.rs}{110}, exige en plus une arité exacte (\code{dep_exprs.arity.exact().is_some()}) : un tableau contenant un spread aplati pourrait cacher des éléments mobiles. Un \code{deps} vide rend vrai, ce que la règle traite en amont.
+
+\subsection{Frapper au point de connaissance : \code{classify_motion} puis \code{must_frozen_seed}}
+\label{sec:api-regles-motion}
+
+La règle \regle{frozen-initial-state} signale un état initialisé depuis une prop qui change : \code{useState} ne lit son initialiseur qu'au premier rendu, et l'état reste figé sur la première valeur.
+
+\begin{lstlisting}[language=TypeScript,caption={Un état qui gèle une prop mobile (\file{/tmp/ch17/frozen.tsx})},label={lst:api-regles-frozen}]
+import { useState } from "react";
+
+function Parent() {
+  const [user, setUser] = useState({ name: "a" });
+  return <Child user={user} onRename={() => setUser({ name: "b" })} />;
+}
+
+function Child({ user }) {
+  const [local, setLocal] = useState(user);
+  return <button onClick={() => setLocal({ name: "c" })}>{local.name}</button>;
+}
+\end{lstlisting}
+
+Pour une \Error, il faut prouver que la prop \code{user} \emph{bouge vraiment}. Sa valeur abstraite dans \code{Child} est \code{Versioned{(Parent, 0)}} : elle change quand le slot 0 de \code{Parent} est écrit (\cref{def:stabilite}). Reste à vérifier que ce slot est effectivement écrit quelque part. C'est ce que fait \code{classify_motion} :
+
+\rustsnippet[label={lst:api-regles-classify-motion}]{src/rules/api/query.rs}{839}{890}{\code{classify_motion} frappe là où il constate}
+
+Si un setter du slot nourricier est réellement référencé dans son propriétaire (\code{slot_write_evidence}, \src{src/rules/api/query.rs}{810}{834}, qui s'appuie sur \code{may_written_slots}, un calcul syntaxique), la primitive frappe un \code{Certified<MovingFeeder>} \emph{ici}, avec pour provenance la position de l'écriture. Si tous les propriétaires sont analysés et qu'aucun setter n'est référencé, la prop ne bouge jamais : \code{Motion::Still}, et la règle se tait. Si un propriétaire n'a pas été analysé, rien n'est prouvé : \code{Unproven}.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}lXl@{}}
+\toprule
+composante \code{val.reference} & condition & verdict \\
+\midrule
+\code{Versioned(labels)} & un \code{(owner, slot)} a un propriétaire analysé et un setter référencé & \code{Proven} (premier label) \\
+\code{Versioned(labels)} & aucun label écrivable, au moins un propriétaire absent & \code{Unproven} \\
+\code{Versioned(labels)} & tous les propriétaires analysés, aucun setter référencé & \code{Still} \\
+\code{VersionedTop} & --- & \code{Unproven} \\
+autre & \code{val.to_stability()} vaut \code{Bottom} ou \code{Stable} & \code{Still} \\
+autre & sinon (\code{PerRender}, \code{Unknown}, \ldots) & \code{Unproven} \\
+\bottomrule
+\end{tabularx}
+\caption{La table de décision de \code{classify_motion}.}
+\label{tab:api-regles-motion}
+\end{table}
+
+La preuve n'est pas encore une \Error. Quatre portes peuvent la dégrader, et \code{must_frozen_seed} est leur seul juge :
+
+\rustsnippet[label={lst:api-regles-frozen-seed}]{src/rules/api/query.rs}{904}{916}{\code{must_frozen_seed} rend ou dégrade la preuve}
+
+Le setter ne doit pas s'échapper ; les props de seed ne doivent pas toutes porter un nom qui annonce un seed (\code{initial*}, \code{default*}) ; le slot doit être écrit localement ; et le couplage de montage doit être \code{Free} (\cref{sec:api-regles-helpers}). Toute porte qui échoue rend \code{MustResult::Some(feeder.into_evidence())} : le fait survit comme fait may, son éligibilité à l'\Error{} disparaît. L'effet se voit en ajoutant une \code{key} construite depuis la prop, qui fait remonter l'enfant quand elle change (\file{/tmp/ch17/frozenkey.tsx}, \code{<Child key={user} .../>}) :
+
+\begin{sortie}
+  Child  (2 hooks)  frozen.tsx
+    error  frozen-initial-state  [hook:0]  var:user  (line 9:8)  state `local` is seeded from `user`, which is fed by state `user` of `Parent` and changes. `useState` reads its initializer on the first render only and nothing here re-syncs it, so `local` stays frozen at the first `user` value
+       → `user` is read here [hook:0] (line 9:8)
+       → state `local` reads its initializer on the first render only, so later renders ignore it [hook:0] (line 9:8)
+       → state state `user` of `Parent` is written here
+  Child  (2 hooks)  frozenkey.tsx
+    info   frozen-initial-state  [hook:0]  var:user  (line 9:8)  state `local` is seeded from `user`, …
+\end{sortie}
+
+(Deux sorties concaténées, la seconde élaguée.) Avec la \code{key}, le couplage vaut \code{Reseeds} et la règle rend une \Info{} : dégradation, jamais suppression. Deux défauts de surface sont visibles dans la dernière note : \og state state\fg{} (le \code{display} du \code{MovingFeeder} est pré-qualifié \og state `user` of `Parent`\fg{} et le gabarit de \code{Step::Write} préfixe à nouveau \og state\fg) et l'absence de position (l'écriture est dans une flèche concise, \issue{140}).
+
+\begin{decision}[ADR-021, durcissement --- pas de distributeur de jetons]
+\textbf{Constat.} Dans la première version, \code{must_frozen_seed(bool, ...)} et \code{must_effect_cycle(bool, bool)} ne faisaient aucune analyse : tout appelant qui passait \code{true} obtenait un \code{Certified}. L'ADR les appelle des \og token vending machines\fg.
+\textbf{Décision.} La frappe se fait \og au point de connaissance\fg{} (la discipline d'\adr{19}) : là où le fait est \emph{constaté}. \code{classify_motion} vit dans \file{query.rs} et frappe en constatant l'écriture ; \code{must_frozen_seed} consomme la preuve et ne peut que la dégrader ; \code{must_effect_cycle} re-dérive ses deux faits des arêtes brutes.
+\textbf{Conséquence.} Des portes mal réglées peuvent sur-étiqueter un nourricier \emph{réellement} prouvé, jamais en fabriquer un. C'est la surface de confiance résiduelle que l'ADR nomme.
+\end{decision}
+
+\begin{piege}
+\code{Motion::Still} ne dégrade pas : il \emph{supprime} le finding. C'est une preuve d'immobilité, fondée sur la syntaxe (\code{may_written_slots}, qu'\adr{20}, item~3, interdit de remplacer par un bit observé pendant le point fixe, qui pourrait sous-compter) et sur le fait que l'état React ne bouge que par son setter. Autre asymétrie à connaître : \code{StabilityVerdict::of} envoie \code{Bottom} du côté may, mais \code{classify_motion} le compte comme \code{Still}, via \code{to_stability()}. Pour un lecteur soucieux de soundness, c'est l'endroit le plus délicat de la primitive.
+\end{piege}
+
+\subsection{Re-dériver plutôt que croire : \code{must_effect_cycle}}
+\label{sec:api-regles-effect-cycle}
+
+Le graphe de churn (\cref{def:churn-graph}) marque chacun de ses cycles de deux booléens, \code{all_must} et \code{cross_component}. La primitive qui certifie la boucle infinie \emph{ne les lit pas} : elle recompte la force de chaque arête et l'ensemble des composants impliqués (propriétaires des slots \emph{et} porteurs d'effets), puis ne frappe que si toutes les arêtes sont \code{Must} et qu'un seul composant est en jeu (\src{src/rules/api/query.rs}{1002}{1031}, étudié au \cref{sec:churn-certification}). Sa provenance est la première arête du cycle, l'écriture qui relance l'effet porteur. Elle est \code{pub(in crate::rules)} : seule la règle native l'appelle. Sur deux effets qui se renvoient des objets neufs :
+
+\begin{sortie}
+  PingPong  (4 hooks)  pingpong.tsx
+    error  infinite-loop  [hook:2]  (line 6:2)  these effects form a state-update cycle (`a` → `b` → `a`) where each step stores a fresh reference that re-runs the next effect: infinite render loop
+       → a fresh value is written to state `b` here [hook:2] (line 6:20)
+       → cycle continues: this effect freshly stores state `a` [hook:3] (line 7:20)
+\end{sortie}
+
+(Extrait : la même sortie contient une seconde \Error{} ancrée sur l'autre effet, et deux \Warning{} \regle{derived-state}.) Un cycle qui traverse deux composants reste un \Warning{} : une dep de prop n'est jamais le slot exact.
+
+\subsection{La preuve de toute la conclusion : \code{must_stale_capture}}
+\label{sec:api-regles-stale}
+
+\regle{stale-closure} signale un callback de longue durée (un \code{setInterval}, un \code{addEventListener}) qui capture un état au montage et le réécrit à chaque tir depuis cette valeur figée. L'affirmation \og l'état ne peut plus avancer\fg{} est une conjonction, et la version antérieure à \issue{142} certifiait sur l'un de ses conjoints. La primitive actuelle les exige tous :
+
+\rustsnippet[label={lst:api-regles-stale}]{src/rules/api/query.rs}{942}{959}{\code{must_stale_capture} : les premières portes}
+
+L'effet est \emph{mount-only} (deps \code{[]} exactes, \code{Arity::Exact(0)}), donc ne ré-enregistre jamais ; le registrar tire de manière répétée (\code{Firing::Repeating}) \emph{et} avec un \code{timing} connu --- les registrars reconnus par leur seul nom (\code{on}, \code{subscribe}, \code{addListener}) ont \code{Timing::Unknown}, parce que l'appelé pourrait exécuter le callback une seule fois, de façon synchrone ; l'enregistrement est sur tous les chemins du corps d'effet ; et, dans la suite de la fonction (\src{src/rules/api/query.rs}{961}{989}), le callback appelle un setter du slot sur tous ses chemins, en ne comptant que les écritures de premier niveau. C'est l'application littérale de la règle du \file{CLAUDE.md} : \og Error = preuve de \emph{toute} la conclusion, pas d'un seul conjoint\fg. La règle et ses sorties sont étudiées au \cref{chap:regles-effets}.
+
+\subsection{Les autres primitives}
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{4.3cm}X>{\raggedright\arraybackslash}p{3cm}@{}}
+\toprule
+primitive & fait certifié (évidence) & consommateurs \\
+\midrule
+\code{hook_is_conditional} & hook sauté sur un chemin (\code{ConditionalHookCall}, avec témoin) & \regle{conditional-hook} \\
+\code{ExitDominance::certify}, \code{must_dominates_all_exits} & bloc qui domine toutes les sorties atteignables (\code{DominatesAllExits}) & \regle{setter-in-render}, frontend déclaratif \\
+\code{must_on_all_paths} & un ensemble de blocs coupe tout chemin entrée--sortie (\code{OnAllPaths}) ; face typée de \code{engine::dominance::on_all_paths} & \regle{infinite-loop} \\
+\code{must_setter_on_all_paths} & un seul setter, arguments sans appel, sur tous les chemins (\code{SetterCall}) & \regle{derived-state}, frontend déclaratif \\
+\code{must_init_calls_setter} & l'initialiseur d'un \code{useState} appelle un setter (\code{InitSetterCall}) & \regle{lazy-init} \\
+\code{must_direct_write} & la ligne \code{SlotWriter} est d'origine \code{Direct}, hors de toute région greffée (\code{DirectWrite}, \adr{27}) & frontend déclaratif \\
+\code{classify_motion} & le slot nourricier d'une prop est écrit (\code{MovingFeeder}) & \regle{frozen-initial-state} \\
+\code{must_stale_capture} & callback qui fige le slot qu'il écrit (\code{StaleCapture}) & \regle{stale-closure} \\
+\code{must_effect_cycle} & cycle de churn tout-\code{Must}, mono-composant (\code{EffectCycleProof}) & \regle{infinite-loop} \\
+\code{must_same_ref_mutation} & mutation et appel du setter dans le même conteneur (\code{SameRefMutation}) & \regle{state-mutation} \\
+\bottomrule
+\end{tabularx}
+\caption{Les dix primitives qui frappent (\cref{inv:api-regles-frappe}) et leurs consommateurs. \code{must_frozen_seed} consomme la preuve de \code{classify_motion}.}
+\label{tab:api-regles-primitives}
+\end{table}
+
+Le \cref{tab:api-regles-primitives} complète la liste. \code{must_direct_write} (\src{src/rules/api/query.rs}{763}{774}) mérite une mention : sa certitude est structurelle et par ligne. Les angles morts connus de la relation \relation{slot_writers} (\issue{52}, \issue{54}) \emph{retirent des lignes} ; ils ne rendent jamais incertain un \code{Direct} présent. Une ligne absente est un finding manqué, compensé par le canal \regle{analysis-limit} (\cref{sec:api-regles-suspension}), pas une \Error{} fausse.
+
+% ===========================================================================
+\section{Les témoins}
+\label{sec:api-regles-temoins}
+
+Un diagnostic sans explication oblige le développeur à refaire l'analyse de tête. \reactant{} accompagne chaque finding d'une \terme{chaîne de témoins} : une suite d'étapes typées, chacune ancrée à un endroit du source, qui reconstitue le raisonnement. \adr{19} en fixe la forme.
+
+\subsection{Un exemple entre deux fichiers}
+
+Reprenons \regle{lazy-init} sur un initialiseur qui appelle une fonction importée (\file{/tmp/ch17/cfg/}) :
+
+\begin{lstlisting}[language=TypeScript,caption={\file{Card.tsx} et \file{api.ts}}]
+// Card.tsx
+import { useState } from "react";
+import { loadUser } from "./api";
+
+export function Card({ id }: { id: string }) {
+  const [user] = useState(loadUser(id));
+  return <div>{user.id}</div>;
+}
+
+// api.ts
+export function loadUser(id: string) {
+  fetch("/api/user/" + id);
+  return { id };
+}
+\end{lstlisting}
+
+\begin{sortie}
+  Card  (1 hooks)  Card.tsx
+    warn   lazy-init  [hook:0]  (line 5:8)  this useState is initialised by a direct function call. The call runs on every render but the result is only used on mount; wrap as `useState(() => …)` to defer it
+       → `loadUser` resolves to an import from api.ts
+       → `fetch` has side effects (subscriptions/requests/timers re-fire on every call) (api.ts:2:2)
+\end{sortie}
+
+La première étape résout le nom \code{loadUser} ; la seconde pointe l'appel \code{fetch} \emph{dans un autre fichier}, et l'affichage le nomme (\code{api.ts:2:2}) au lieu d'écrire \code{(line 2:2)}, qui désignerait à tort la ligne 2 de \file{Card.tsx}. Le niveau reste \Warning{} : la chaîne explique, elle ne prouve rien de plus.
+
+\subsection{Le vocabulaire fermé}
+
+Une étape de témoin est une \code{Note}, qui porte un jugement typé \code{Step} et son ancre :
+
+\rustsnippet[label={lst:api-regles-note}]{src/rules/api/witness.rs}{25}{41}{\code{Note}, une étape ancrée}
+
+\rustsnippet[label={lst:api-regles-step}]{src/rules/api/witness.rs}{81}{130}{\code{Step}, le vocabulaire des jugements}
+
+\begin{definition}{Chaîne de témoins}{witness}
+La \terme{chaîne de témoins} d'un diagnostic est la suite \code{notes: Vec<Note>}. Chaque \code{Note} associe un jugement \code{Step} (l'une des quatorze variantes de l'énumération fermée de \file{src/rules/api/witness.rs}), une ancre \code{(hook_label, range)} dont le \code{range} porte l'identité du fichier (\code{FileId}), et un texte \code{message} produit une fois pour toutes par \code{Step::render}. L'énumération n'a pas de variante de texte libre : une règle qui a besoin d'une nouvelle sorte de justification étend le vocabulaire.
+\end{definition}
+
+L'énumération est fermée par choix, comme le dit le doc-comment de tête du module (\src{src/rules/api/witness.rs}{1}{9}) : une variante \code{Text(String)} éroderait le vocabulaire, chaque règle finissant par y écrire sa prose. Le discriminant stable \code{Step::kind()} est défini aux lignes 134 à 151 du même fichier ; les consommateurs JSON le lisent : \code{binding}, \code{resolve}, \code{call}, \code{write}, \code{read}, \code{branch}, \code{handler}, \code{cycle-edge}, \code{widen}, \code{mutate}, \code{capture}, \code{init-once}, \code{forward}, \code{rerender}. \adr{19} en prévoyait neuf ; les cinq dernières ont été ajoutées depuis, chaque fois qu'une règle en avait besoin.
+
+\code{Step::render(&dyn Fn(HookLabel) -> String)} (\src{src/rules/api/witness.rs}{157}{271}) est l'\emph{unique} point où naît la prose des témoins. Son paramètre traduit un label de slot en nom source : une fermeture sur la table \code{state_slot_name} de la règle (qui choisit le plus petit nom source non temporaire, pour que le résultat ne dépende pas de l'aléa de hachage), ou \code{fallback_name}, qui rend \texttt{state \#N}. Les variables passent par \code{crate::ir::source_name}, qui retire le sel d'alpha-renommage des variables greffées (\cref{chap:splice-inlining}). Quelques gabarits, verbatim :
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+variante & texte produit \\
+\midrule
+\code{Resolve { Import(path) }} & \texttt{`\{n\}` resolves to an import from \{path\}} \\
+\code{Call { Effectful }} & \texttt{`\{callee\}` has side effects (subscriptions/requests/timers re-fire on every call)} \\
+\code{Write { Fresh }} & \texttt{a fresh value is written to state \{n\} here} \\
+\code{Branch { desc }} & \texttt{guarded by \{desc\}} \\
+\code{CycleEdge { from: _, to }} & \texttt{cycle continues: this effect freshly stores state \{to\}} (\code{from} n'est exporté qu'en JSON) \\
+\code{Widen { slot, iteration }} & \texttt{the abstract value of state \{n\} kept growing and was widened at iteration \{iteration\}} \\
+\code{InitOnce { slot }} & \texttt{state \{n\} reads its initializer on the first render only, so later renders ignore it} \\
+\code{Forward { props, .. }} & \texttt{`\{from\}` passes it to `<\{to\}>` \{via\} without using it itself} \\
+\bottomrule
+\end{tabularx}
+\caption{Quelques gabarits de \code{Step::render} (\src{src/rules/api/witness.rs}{157}{271}) ; \texttt{\{n\}} est le nom du slot rendu par la fermeture.}
+\label{tab:api-regles-gabarits}
+\end{table}
+
+Des classes auxiliaires raffinent certains jugements : \code{ResolveTarget} (\code{Import}, \code{LocalFn}, \code{Setter}, \code{Unknown}), \code{EffectClass} (\code{Setter}, \code{Effectful}, \code{PureCheap}, \code{Unknown} ; \og the class refines wording/severity, never soundness\fg) et \code{ValueClass} (\code{Fresh}, \code{SameAsCurrent}, \code{Unknown}).
+
+\subsection{L'identité du fichier : \code{FileId}}
+
+Pour que l'étape \code{fetch} de l'exemple puisse nommer \file{api.ts}, chaque position porte son fichier :
+
+\rustsnippet[label={lst:api-regles-fileid}]{src/ir/source_range.rs}{36}{49}{une position porte son fichier}
+
+\code{FileId} (\src{src/ir/source_range.rs}{3}{9}) est un \code{u32} interné dans une \code{FileTable} : quatre octets et \code{Copy}, de sorte que \code{SourceRange} reste \code{Copy}. C'est le premier pilier d'\adr{19}, qui corrige une limite d'\adr{11} : une position dans un CFG inliné depuis un autre fichier ne pouvait pas désigner ce fichier. Une note issue d'un hook greffé porte le \code{FileId} de son fichier d'origine, sans qu'aucun code de splice ait eu à s'en occuper. La table voyage du programme abaissé jusqu'au rapport final.
+
+\subsection{Les producteurs partagés}
+
+Certaines chaînes se construisent de la même manière dans plusieurs règles. \adr{19} (§4) les regroupe dans des producteurs de \file{witness.rs} :
+\begin{itemize}
+  \item \code{resolve_and_classify(registry, component_file, name)} (\src{src/rules/api/witness.rs}{413}{457}) résout un nom d'un niveau dans le \code{FunctionRegistry} : \code{Resolve{Unknown}} s'il est introuvable, \code{LocalFn} s'il est dans le même fichier, \code{Import(path)} sinon ; puis un \code{Call{Effectful}} \emph{seulement} si le corps résolu contient un appel à effet (\code{find_effectful_call}). Le doc-comment en donne la règle de soundness : \og the scan only \emph{refines} --- an unresolved or effect-free body adds no step, never a weaker verdict\fg.
+  \item \code{chase_value} (\src{src/rules/api/witness.rs}{463}{494}) remonte d'un saut de liaison (une liaison unique) et produit un \code{Binding}, puis résout le premier appelé.
+  \item \code{slot_history} (\src{src/rules/api/witness.rs}{529}{560}) raconte le widening d'un slot : un \code{Write} par effet écrivain enregistré dans \code{widen_trace}, puis un \code{Widen} avec l'itération. C'est la chaîne du \code{Poller} de la \cref{sec:api-regles-probleme}.
+\end{itemize}
+La classification par nom (\code{EFFECTFUL}, neuf noms comme \code{fetch}, \code{setInterval} ou \code{addEventListener}) garde un ensemble \og pur et bon marché\fg{} restreint aux builtins en temps constant (\code{Math.*}, \code{Date.now}, \code{parseInt}\ldots), \og so a \code{PureCheap} verdict never hides expensive work\fg. La provenance moteur, deuxième pilier d'\adr{19}, est enregistrée au point de connaissance, pendant l'analyse : \code{widen_trace} pour le widening, les origines d'inlining pour les greffes.
+
+\begin{piege}
+Le vocabulaire n'est pas entièrement employé. \code{ResolveTarget::Setter} n'est construit nulle part (seuls le gabarit et la sérialisation JSON le mentionnent), et \code{Step::Binding} n'est produit que par \code{chase_value}. Conséquence visible : quand l'initialiseur appelle un setter, \code{resolve_and_classify}, qui passe par le \code{FunctionRegistry} et ignore les setters, écrit une note trompeuse (\file{/tmp/ch17/setterinit.tsx}, \code{useState(setUser(null))}) :
+\begin{sortie}
+    error  lazy-init  [hook:1]  (line 5:8)  this useState init calls a state setter, so it runs a state write on every render (the result is discarded after mount); move the call into an effect or event handler
+       → `setUser` could not be resolved, treated as opaque
+\end{sortie}
+L'\Error{} est juste (\code{must_init_calls_setter}) ; seul le témoin est faux. La correction centrale serait dans le producteur, pas dans la règle (\cref{exo:api-regles-setter}).
+\end{piege}
+
+\subsection{Du témoin à la position : \code{located}}
+
+Certaines règles placent une position dans une étape du témoin mais pas sur le diagnostic lui-même. Plutôt que de corriger chaque règle, le registre applique une fonction à tous les findings :
+
+\rustsnippet[label={lst:api-regles-located}]{src/rules/registry.rs}{356}{369}{\code{located} : la première position du témoin}
+
+C'est une illustration directe du troisième principe du \file{CLAUDE.md} : un problème qui touche plusieurs règles se corrige une fois, au niveau central (\issue{131}). Deux tests l'épinglent : \code{a_finding_with_no_range_takes_its_first_witness_position} et \code{a_finding_that_has_a_range_keeps_it} (\src{src/rules/registry.rs}{401}{450}) ; le second vérifie qu'une position posée par la règle n'est jamais écrasée.
+
+\subsection{Le rendu}
+
+La prose est déjà dans chaque note ; le driver n'a qu'à la disposer. En sortie humaine (\file{src/driver/human.rs}), chaque note devient une ligne \code{→ message [hook:N] (position)}, avec au plus huit étapes, suivies de \og … n more step(s)\fg{} au-delà (\src{src/driver/human.rs}{207}{234}) ; sans \code{--trace}, une ligne \og (k trace step(s), rerun with --trace)\fg{} les résume. La position passe par une fonction unique :
+
+\rustsnippet[label={lst:api-regles-position}]{src/driver/human.rs}{23}{35}{la ligne principale et les étapes partagent la même position}
+
+En JSON, chaque note garde ses champs structurés en plus du message, avec son \code{kind} (\src{src/driver/json.rs}{148}{227}). Pour \code{Card.tsx} :
+
+\begin{sortie}
+        {
+          "message": "`fetch` has side effects (subscriptions/requests/timers re-fire on every call)",
+          "kind": "call",
+          "hook_label": null,
+          "file": "api.ts",
+          "line": 2,
+          "col": 2,
+          "callee": "fetch",
+          "effect_class": "effectful"
+        }
+\end{sortie}
+
+\begin{decision}[ADR-024 --- attribuer sans jamais fusionner]
+\textbf{Décision.} L'identité d'un finding est son ancre \code{SourceRange} ; l'endroit où il s'affiche est une vue. Quand le fichier de l'ancre diffère de celui du composant, la ligne principale nomme le fichier d'origine, et le champ \code{file} du JSON devient celui de l'ancre. Et les findings ne sont \emph{jamais} dédupliqués entre consommateurs d'un même hook.
+\textbf{Alternative refusée.} Fusionner les dix findings identiques qu'un hook partagé produit dans dix composants. Les faits par consommateur sont incomparables, pas redondants : le même corps donne \regle{infinite-loop} sous \code{useStep(1)} et \regle{redundant-set-state} sous \code{useStep(0)}. Fusionner ferait perdre l'un des deux, un FN.
+\end{decision}
+
+% ===========================================================================
+\section{Le registre}
+\label{sec:api-regles-registre}
+
+Les règles produisent des diagnostics bruts. Entre elles et l'affichage, une étape décide de ce qui est montré, à quel niveau et dans quel ordre : \code{RuleRegistry} (\file{src/rules/registry.rs}, \adr{22} §8). Le registre contient les natives, dans l'ordre d'\code{all_rules()}, puis les règles de packs dans leur ordre d'enregistrement, avec une doc par nom de diagnostic et les surcharges du consommateur. Il est partagé par tous les frontends (CLI, WASM), qui exécutent ainsi exactement la même composition.
+
+\subsection{La passe par composant}
+
+Le driver construit un cache pour tout le programme, trie les composants par nom d'affichage, puis appelle \code{registry.check_component(&rule_cache, id)} pour chacun (\src{src/driver/mod.rs}{397}{434}). Le cœur de la passe est une boucle sur les règles :
+
+\rustsnippet[label={lst:api-regles-check-component}]{src/rules/registry.rs}{254}{294}{la passe par composant, jusqu'aux filtres}
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=5mm and 5mm]
+  \node[bloc] (ctx) {\code{RuleCtx::cached}\\\scriptsize options de la règle};
+  \node[bloc,right=of ctx] (check) {\code{check}};
+  \node[bloc,right=of check] (safe) {\code{safe_check}\\\scriptsize si sortie brute vide};
+  \node[bloc,right=of safe] (loc) {\code{located}};
+  \node[bloc,right=of loc] (clamp) {clamp\\\scriptsize \code{pin} $\meet$ polarité};
+  \node[fit=(ctx)(check)(safe)(loc)(clamp),draw=ra-gray,dashed,rounded corners,inner sep=6pt,label={[etiquette]above:pour chaque règle (natives, puis packs)}] (loop) {};
+  \node[bloc,below=14mm of check] (susp) {suspension\\\scriptsize si \regle{analysis-limit} brut};
+  \node[bloc,right=of susp] (filt) {filtres\\\scriptsize \code{off} / \code{allow}};
+  \node[bloc,right=of filt] (tri) {tri total};
+  \node[bloc,right=of tri] (out) {\code{ComponentFindings}};
+  \draw[fleche] (ctx) -- (check);
+  \draw[fleche] (check) -- (safe);
+  \draw[fleche] (safe) -- (loc);
+  \draw[fleche] (loc) -- (clamp);
+  \draw[fleche] (loop.south) |- ++(0,-4mm) -| (susp.north);
+  \draw[fleche] (susp) -- (filt);
+  \draw[fleche] (filt) -- (tri);
+  \draw[fleche] (tri) -- (out);
+\end{tikzpicture}
+\caption{La séquence de \code{check_component}. \code{safe_check} ne voit que la sortie \emph{brute} de \code{check}, avant tout filtre ; la suspension lit les diagnostics \emph{non filtrés} ; le clamp précède le tri, dont la sévérité est une clé. Le filtre \code{--info} vient ensuite, dans le driver.}
+\label{fig:api-regles-sequence}
+\end{figure}
+
+La \cref{fig:api-regles-sequence} montre l'ordre, qui n'est pas arbitraire. Trois points de soundness en dépendent.
+\begin{itemize}
+  \item \code{safe_check} est consulté sur la sortie \emph{brute} : une règle dont tous les findings seront filtrés par \code{--ignore-rule} a tout de même trouvé quelque chose ; elle n'est pas \og vérifiée sûre\fg.
+  \item La suspension des assurances lit les diagnostics \emph{avant} les filtres : masquer l'\Info{} \regle{analysis-limit} cache l'avis, pas la troncature (\cref{sec:api-regles-suspension}).
+  \item Le clamp est appliqué avant le tri, puisque la sévérité est une clé de tri.
+\end{itemize}
+
+Le reste de la fonction (\src{src/rules/registry.rs}{296}{340}) établit un \emph{ordre total}. Les règles itèrent des \code{HashMap} ; sans tri, deux findings de même clé reviendraient dans un ordre dépendant de l'aléa de hachage, et deux exécutions ne produiraient pas des sorties identiques octet pour octet. La clé est le n-uplet (\code{rule}, discriminant de sévérité, position, \code{message}, \code{var}, \code{hook_label}), où la position est (absente ?, chemin du fichier, ligne, colonne) : le chemin, parce qu'un composant dont les hooks sont inlinés depuis plusieurs fichiers mélange leurs ancres (\adr{13}) ; \og absente ?\fg{} en tête, pour que les findings sans position restent en dernier. Les assurances sont triées par nom de règle.
+
+\subsection{Surcharges et clamp}
+\label{sec:api-regles-clamp}
+
+Un utilisateur peut régler une règle par fichier de configuration ou en ligne de commande. Le frontend résout d'abord les précédences (la CLI l'emporte sur la configuration, \adr{22} §5) et remet au registre des surcharges déjà résolues :
+
+\rustsnippet[label={lst:api-regles-overrides}]{src/rules/registry.rs}{29}{49}{les surcharges du consommateur}
+
+Le champ \code{ceiling} est un \emph{plafond} : le finding est abaissé à ce niveau s'il le dépasse, jamais relevé.
+
+\rustsnippet[label={lst:api-regles-clamp}]{src/rules/api/diagnostic.rs}{104}{114}{le clamp ne sait que descendre}
+
+Le raisonnement du doc-comment est court et complet. Une \Error{} ne se construit que par \code{Diagnostic::error}, donc la sévérité construite \emph{est} le plafond que permet la polarité. Le niveau final vaut $\mathit{pin} \meet \mathit{polarité}$ dans l'ordre $\textsc{Info} \lleq \textsc{Warning} \lleq \textsc{Error}$, et ce meet se réduit à un minimum : une demande de montée est un no-op structurel, que le test \code{clamp_upgrade_is_a_no_op} (\og the soundness case\fg) vérifie.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[x=1.9cm,y=1cm]
+  \foreach \lvl/\name in {0/\Info, 1/\Warning, 2/\Error} {
+    \node[etiquette,anchor=east] at (-0.2,\lvl) {\name};
+    \draw[ra-gray!40] (0,\lvl) -- (6.4,\lvl);
+  }
+  % conditional-hook : construit Error, pin warning
+  \node[noeud,fill=ra-blue!15] (a1) at (0.5,2) {};
+  \node[noeud] (a2) at (1.5,1) {};
+  \node[noeud,fill=ra-teal!25] (a3) at (2.5,1) {};
+  \draw[flechemust] (a1) -- (a3);
+  \node[etiquette,align=center] at (1.5,-0.9) {\regle{conditional-hook}\\construit \Error, pin \code{warning}};
+  \node[etiquette] at (0.5,2.4) {construit};
+  \node[etiquette] at (1.5,1.4) {pin};
+  \node[etiquette] at (2.5,1.4) {final};
+  % lazy-init : construit Warning, pin error
+  \node[noeud,fill=ra-blue!15] (b1) at (4,1) {};
+  \node[noeud] (b2) at (5,2) {};
+  \node[noeud,fill=ra-teal!25] (b3) at (6,1) {};
+  \draw[flechemust] (b1) -- (b3);
+  \draw[fleche,dashed,draw=ra-red] (b1) -- node[etiquette,text=ra-red,above left] {refusé} (b2);
+  \node[etiquette,align=center] at (5,-0.9) {\regle{lazy-init} (appel direct)\\construit \Warning, pin \code{error}};
+  \node[etiquette] at (4,1.4) {construit};
+  \node[etiquette] at (5,2.4) {pin};
+  \node[etiquette] at (6,1.4) {final};
+\end{tikzpicture}
+\caption{Le pipeline du clamp : $\mathit{final} = \mathit{pin} \meet \mathit{construit}$, calculé sur le rang. À gauche, une descente honorée ; à droite, une montée demandée et refusée par construction. Les deux cas sont ceux de la configuration \file{/tmp/ch17/cfg/reactant.config.json}.}
+\label{fig:api-regles-clamp}
+\end{figure}
+
+La \cref{fig:api-regles-clamp} illustre les deux cas sur le répertoire \file{/tmp/ch17/cfg/}, qui contient \code{Profile} (\cref{lst:api-regles-profile}) et \code{Card}, avec cette configuration :
+
+\begin{lstlisting}[language=JSON]
+{
+  "rules": {
+    "conditional-hook": "warning",
+    "lazy-init": "error"
+  }
+}
+\end{lstlisting}
+
+\begin{sortie}
+  Card  (1 hooks)  Card.tsx
+    warn   lazy-init  [hook:0]  (line 5:8)  this useState is initialised by a direct function call. The call runs on every render but the result is only used on mount; wrap as `useState(() => …)` to defer it
+       (2 trace step(s), rerun with --trace)
+  Profile  (2 hooks)  Profile.tsx
+    warn   conditional-hook  [hook:0]  (line 5:10)  this hook is called conditionally (not on every render path)
+       (1 trace step(s), rerun with --trace)
+
+⚠  2 warning(s) across 3 file(s).
+\end{sortie}
+
+\begin{decision}[ADR-022 --- $\mathit{pin} \meet \mathit{polarity}$, évalué par finding]
+\textbf{Décision.} Le niveau épinglé par le consommateur est combiné, finding par finding, avec le niveau que la polarité autorise, par un meet. Un pin ne peut qu'abaisser.
+\textbf{Alternative refusée.} Rejeter statiquement les configurations dont le pin dépasse ce qu'une règle peut prouver. Cela aurait interdit la stratification gratuite : une règle comme \regle{stale-closure} émet des \Error{} et des \Warning{}, et un pin \code{error} est légitime pour les premières sans être une promesse sur les secondes.
+\end{decision}
+
+\subsection{\code{off}, \code{allow} et la discipline des noms}
+
+Deux autres surcharges filtrent. \code{off} supprime un nom de diagnostic, \code{allow} (le drapeau \code{--rule}) restreint l'affichage à une liste ; \code{off} l'emporte toujours (\code{visible}, \src{src/rules/registry.rs}{220}{232}). Le doc-comment du module fixe une discipline de nommage : sévérité et \code{off} sont indexés par \emph{nom de diagnostic}, les options par \emph{identifiant de règle}.
+
+\rustsnippet[label={lst:api-regles-naming}]{src/rules/registry.rs}{11}{17}{pourquoi \code{off} filtre à l'émission}
+
+Si \code{off} sautait l'exécution de la règle, désactiver \regle{setter-in-render} ferait aussi disparaître \regle{cross-setter-in-render}, que l'utilisateur n'a pas demandé à taire : un FN. Le test \code{off_on_one_diagnostic_name_keeps_the_other} (\srcline{src/rules/registry.rs}{667}) l'épingle avec une règle qui émet deux noms.
+
+\subsection{La suspension des assurances}
+\label{sec:api-regles-suspension}
+
+La règle \regle{analysis-limit} émet une \Info{} quand l'analyse a dû tronquer, par exemple sur un hook de bibliothèque inconnu. Un composant ainsi tronqué ne doit pas publier en même temps des assurances universelles (\og all hooks run unconditionally\fg) que la limite même pourrait falsifier : un hook opaque peut cacher un appel conditionnel, une dep manquante, un effet divergent. Sur \file{/tmp/ch17/info.tsx}, où \code{Clean} n'appelle que des hooks connus et \code{Truncated} appelle \code{useVendor} importé de \code{"vendor-lib"}, avec \code{--info --show-clean} :
+
+\begin{sortie}
+  Clean  (3 hooks)  info.tsx  ✓
+    verified  always-unstable-deps  no deps array is defeated by an always-fresh reference
+    verified  conditional-hook  all hooks run unconditionally, in a stable order
+    …
+    verified  state-mutation  no state or prop object is mutated in place
+  Truncated  (3 hooks)  info.tsx
+    info   analysis-limit  [hook:0]  (line 11:8)  hook `useVendor` was not found in the registry. Pass its source file or add a HookSummary to analyse it (FN possible)
+    suspended  analysis-limit  4 passing check(s) withheld: the analysis was truncated in this component, so they are not guaranteed
+\end{sortie}
+
+(Élagué : \code{Clean} reçoit dix lignes \code{verified}.) Le compte des assurances retenues survit à leur effacement (\code{suspended_safe_checks}) : les retenir est juste, les retenir \emph{en silence} rendait un composant tronqué indiscernable d'un composant qui n'avait rien à vérifier. Avec en plus \code{--ignore-rule analysis-limit}, la ligne \code{info} disparaît, mais la ligne \code{suspended} reste et aucune assurance ne revient : c'est le comportement du test \code{ignoring_the_limit_hides_the_notice_but_not_the_suspension} (\srcline{src/rules/registry.rs}{775}).
+
+\begin{piege}
+La suspension est \emph{par composant}, pas par couple (type de limite, vérification) : un enfant inconnu coûte au parent des garanties qui ne portent que sur son propre corps (\issue{31}, ouverte). Elle ne touche que les lignes \code{verified}, jamais un diagnostic ni le code de sortie. Et la coche \code{✓} d'un composant signifie \og aucun diagnostic visible\fg, pas \og vérifié\fg{} : sous \code{--ignore-rule analysis-limit}, \code{Truncated} s'affiche avec \code{✓} tout en portant sa ligne \code{suspended}.
+\end{piege}
+
+\subsection{Options et validation bruyante}
+\label{sec:api-regles-options}
+
+Deux natives déclarent des options typées : \regle{state-lifted-too-high} (\code{minDepth}, \code{minWastedRenders}) et \regle{wasted-subtree-render} (\code{minWastedRenders}, \code{continuousOnly}). Une option est un \code{OptionSpec} :
+
+\rustsnippet[label={lst:api-regles-optionspec}]{src/rules/api/query.rs}{276}{288}{la déclaration typée d'une option}
+
+La règle lit sa valeur par \code{ctx.config().uint(&SPEC)} ou \code{flag(&SPEC)}, qui rend le défaut en l'absence de réglage. \code{RuleConfig} n'a pas à valider : \code{set_overrides} (\src{src/rules/registry.rs}{160}{200}) l'a fait avant toute analyse, et de manière \emph{bruyante}. Chaque clé doit nommer une doc existante ; des options doivent viser un identifiant de règle, pas un nom de diagnostic seul ; une native doit déclarer l'option, et la valeur doit passer \code{OptionSpec::check}. La moindre erreur arrête l'outil (code de sortie~2) :
+
+\begin{sortie}
+$ reactant check --rule-option conditional-hook:foo=1 .
+[error] rule `conditional-hook` is built-in and declares no options
+$ reactant check --rule-option state-lifted-too-high:minDepth=0 .
+[error] option `minDepth` of rule `state-lifted-too-high` must be an integer between 1 and 64
+$ reactant check --rule-option cross-setter-in-render:x=1 .
+[error] `cross-setter-in-render` is a diagnostic name, not a rule id. Options must target the rule
+$ reactant check --ignore-rule no-such .
+[error] unknown rule `no-such`. Run `reactant rules` for the list of valid names
+\end{sortie}
+
+Ignorer un réglage mal orthographié serait l'analogue, côté configuration, d'un faux négatif : l'utilisateur croirait une règle désactivée ou réglée alors qu'elle ne l'est pas. La validation est de plus atomique : les surcharges ne sont remplacées qu'après le succès de toutes les vérifications.
+
+L'enregistrement d'une règle de pack (\code{register}, \src{src/rules/registry.rs}{142}{158}) applique la même discipline : l'identifiant doit être de la forme \code{pack/rule} (les noms nus sont réservés aux natives), n'entrer en collision ni avec une règle ni avec une doc, et la doc fournie doit porter ce même nom. Le dernier cas remonte sous la variante \code{UnknownRule(doc.name)}, faute de variante dédiée, ce qui donne à l'auteur de pack un message peu parlant.
+
+\begin{piege}
+Deux commentaires affirment qu'aucune native ne déclare d'options (\og natives declare no params in v1\fg, \src{src/rules/registry.rs}{33}{34} ; \og no native rule declares params in v1\fg, \src{src/rules/api/query.rs}{229}{232}). Ils datent d'avant les deux règles de cascade de rendu et sont périmés.
+\end{piege}
+
+\subsection{La documentation générée}
+
+Chaque nom de diagnostic a une entrée \code{RuleDoc} :
+
+\rustsnippet[label={lst:api-regles-ruledoc}]{src/rules/docs.rs}{11}{24}{la documentation d'un nom de diagnostic}
+
+La table statique \code{RULE_DOCS} (vingt et une entrées, construites par une \code{const fn}) documente les natives ; les packs fournissent leurs docs au chargement (\code{RuleDoc::new}, chaînes possédées, d'où les \code{Cow}). \code{reactant rules} affiche le nom et le \code{summary} ; \code{reactant explain <nom>} affiche le reste, et les options déclarées :
+
+\begin{sortie}
+$ NO_COLOR=1 reactant rules
+  always-unstable-deps           a dep is a fresh reference every render, so the deps array never matches
+  analysis-limit                 the analyzer deliberately truncated analysis here (potential false negatives)
+  conditional-hook               hook called inside a conditional branch
+  …
+$ NO_COLOR=1 reactant explain state-lifted-too-high
+  …
+Options:
+  minDepth (default 1): report only when the state's home is at least this many levels below its owner
+  minWastedRenders (default 2): report only when each write re-renders at least this many components for nothing (the components above the home plus the other elements they build)
+$ NO_COLOR=1 reactant explain lazy
+[error] unknown rule `lazy`
+did you mean: lazy-init?
+\end{sortie}
+
+La doc sert aussi de référentiel des noms valides : \code{set_overrides} refuse toute clé qui n'en nomme aucune. Des tests tiennent la table (\src{src/rules/docs.rs}{385}{426}) : \code{every_rule_name_has_a_doc}, \code{multi_name_rules_have_docs} (pour les deux noms secondaires), \code{docs_are_sorted_and_unique}, \code{no_empty_fields}. Le fichier \file{tests/docs_drift.rs}, lui, ne teste pas \code{RULE_DOCS} mais le vocabulaire des packs déclaratifs : chaque ancre, arête et garde que le schéma JSON accepte doit apparaître entre accents graves dans \file{docs/custom-rules.md} et dans la référence du skill \file{skills/reactant-rules/REFERENCE.md} (\src{tests/docs_drift.rs}{53}{66}).
+
+% ===========================================================================
+\section{Le cache programme}
+\label{sec:api-regles-cache}
+
+Une règle s'exécute composant par composant, mais certaines ont besoin d'une structure du programme entier : \regle{infinite-loop} lit le graphe de churn, qui parcourt tous les composants. Tant que ce graphe était construit à l'intérieur de \code{check}, la phase des règles était quadratique en nombre de composants, au point de bloquer l'analyse de deux gros dépôts du corpus (\issue{86}). La correction, amendement d'\adr{21}, est un cache programme partagé :
+
+\rustsnippet[label={lst:api-regles-cache}]{src/rules/api/cache.rs}{26}{41}{\code{ProgramCache}}
+
+Chaque entrée est construite au premier usage (\code{OnceLock::get_or_init}) puis réutilisée par tous les composants du run. La durée de vie \code{'a} lie le cache au programme dont il dérive : \og a cache can never be read against a different analysis result\fg. Quatre structures y vivent (\src{src/rules/api/cache.rs}{43}{76}) :
+\begin{itemize}
+  \item le graphe de churn, via \code{ProgramRelations}, la structure du moteur qui le construit (\cref{chap:churn}) ;
+  \item la relation \relation{context_consumers} (\code{ContextConsumers}, \adr{32}) ;
+  \item l'index de montage (\code{MountIndex}), qui dépend lui-même de l'arbre de rendu : \code{mounts()} appelle \code{render()} ;
+  \item l'arbre de rendu (\code{RenderIndex}), construit sur les résumés de dépendance de rendu (\cref{def:render-dep}).
+\end{itemize}
+Les trois dernières sont encore construites par la couche règles, dans \file{src/rules/helpers/} ; \file{docs/relations.md} les liste sous \og Still built by the rules layer\fg, et \adr{42} (§5) prévoit leur descente dans le moteur. Seuls \code{new} et \code{program} sont publics ; les quatre accesseurs sont \code{pub(in crate::rules)}. Un frontend externe peut donc construire un cache et le passer au registre, jamais lire ses entrées.
+
+Le contexte tient le cache par l'énumération \code{CacheRef} (\cref{lst:api-regles-rulectx}) : \code{Shared(&ProgramCache)} quand le registre fournit le cache du run, \code{Own(Box<ProgramCache>)} quand un appelant construit un contexte isolé avec \code{RuleCtx::new}. Le second cas est celui des tests et du harnais \file{tests/catalogue.rs} : correct, mais il reconstruit les structures du programme pour chaque contexte, donc reproduirait la forme quadratique de \issue{86} sur un gros programme. Un frontend ne doit pas l'imiter.
+
+\begin{remarque}
+\adr{42} (§5) annonce que \og \code{ProgramRelations} replaces \code{ProgramCache}\fg{} et que \file{rules/api/cache.rs} disparaît. Au commit \snapshotCommit, le fichier existe et \code{ProgramCache} \emph{compose} \code{ProgramRelations} avec les trois structures restantes (\cref{chap:relations}). Le cache emploie \code{OnceLock} plutôt que \code{OnceCell}, ce qui le rend partageable entre fils d'exécution ; la passe des règles reste pourtant séquentielle, une boucle \code{for} sur les composants dans le driver.
+\end{remarque}
+
+% ===========================================================================
+\section{Les helpers programme}
+\label{sec:api-regles-helpers}
+
+Le répertoire \file{src/rules/helpers/} contient la machinerie partagée entre règles. \file{helpers/mod.rs} rassemble de petits outils : le nommage (\code{state_slot_name}, \code{hook_kind_word}, \code{describe_value}, qui traduit une valeur abstraite en phrase et interdit d'imprimer un domaine avec \code{{:?}}), l'applicabilité des assurances (\code{has_hook_kind}), des balayages (\code{arg_is_call_free}, \code{collect_callees}) et la porte $\forall$-stable (\cref{sec:api-regles-forall}). Sept sous-modules calculent des \emph{relations de programme}. Chacun répond à une question dont la réponse, pour être sound, doit pencher d'un côté précis ; le \cref{tab:api-regles-helpers} donne ce côté.
+
+\begin{table}[htbp]\centering\small
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{2.6cm}X>{\raggedright\arraybackslash}p{3.3cm}@{}}
+\toprule
+module & question et principe de soundness & consommateurs \\
+\midrule
+\file{render_tree.rs} & où l'état \og habite\fg{} (\code{home_of}), quels éléments re-rendent pour rien, où un setter transmis est appelé depuis un événement. L'\emph{absence} d'usage est une preuve, donc toute inconnue compte comme un usage & \regle{state-lifted-too-high}, \regle{wasted-subtree-render} \\
+\file{mount.rs} & ce que les sites d'appel prouvent sur la durée de montage d'un consommateur (\code{MountCoupling}). Le verdict ne fait que \emph{dégrader}, jamais supprimer & \regle{frozen-initial-state} \\
+\file{context_flow.rs} & un \code{useContext} a-t-il un provider au-dessus de lui ? Une absence n'est affirmée que sur des chemins entièrement vus & ancre Tier A \code{context_consumers} \\
+\file{jsx.rs}, \file{providers.rs} & la valeur passée à un élément est-elle une référence neuve à chaque rendu (\code{site_identity}) ? Verdict must à deux valeurs, \code{FreshEveryRender} ou \code{Unknown} & \regle{unstable-context-value}, relations JSX du Tier A \\
+\file{cycles.rs} & projection par composant des cycles du graphe de churn ; la position d'écriture est l'identité de la ligne (\adr{24}) & ancre Tier A \code{churn_cycles} \\
+\file{purity.rs} & un corps de fonction est-il impur (mutation d'un objet venu d'ailleurs, appel de setter) ? \code{Impure} n'est affirmé que sur un site prouvé & garde Tier A \code{updater_body} \\
+\bottomrule
+\end{tabularx}
+\caption{Les helpers programme de \file{src/rules/helpers/} et le côté vers lequel chacun penche.}
+\label{tab:api-regles-helpers}
+\end{table}
+
+\paragraph{L'absence est une preuve : \code{RenderIndex::home_of}.} \regle{state-lifted-too-high} affirme qu'un état n'est utilisé que profondément dans un seul sous-arbre, et que les composants au-dessus ne font que le transmettre. C'est une affirmation d'\emph{absence} d'usage. Le doc-comment du module en tire la conséquence (\src{src/rules/helpers/render_tree.rs}{5}{13}) : un élément dont le composant ne se résout pas, un composant ré-entré par récursion, un résumé qui a atteint un plafond ($\Top$) \og all stop the descent\fg{} et comptent comme usage. \code{home_of} (\src{src/rules/helpers/render_tree.rs}{201}{256}) exige au moins un lecteur et au moins un écrivain dans l'arbre, puis descend tant que le nœud courant n'utilise pas la valeur et qu'un seul enfant a des usagers. \code{resolve} n'accepte qu'une origine prouvée, jamais une correspondance par nom, qui pourrait choisir un homonyme d'un autre fichier et cacher les usages du vrai. Sur un état \code{q} de \code{App} utilisé seulement par \code{Search}, deux niveaux plus bas (\file{/tmp/ch17/lifted.tsx}) :
+
+\begin{sortie}
+  App  (1 hooks)  lifted.tsx
+    warn   state-lifted-too-high  [hook:0]  (line 4:8)  state `q` is only used inside `<Search>`, 2 levels below `App`. Every write re-renders `App`, `Layout` and 1 other component they render only to pass it down; move the state into `Search`
+       → `App` passes it to `<Layout>` as `q`, `onQ` without using it itself (line 5:9)
+       → `Layout` passes it to `<Search>` as `q`, `onQ` without using it itself (line 9:15)
+\end{sortie}
+
+Chaque saut du chemin devient une étape \code{Step::Forward}. Le niveau est \Warning{} : les rendus en trop sont certains, leur coût ne l'est pas. La règle est étudiée au \cref{chap:regles-rendu-rsc}.
+
+\paragraph{Dégrader, jamais tuer : \code{MountIndex}.} La \code{key} de la \cref{sec:api-regles-motion} a transformé une \Error{} en \Info. Le verdict vient de \code{MountIndex::coupling} (\src{src/rules/helpers/mount.rs}{123}{148}) : \code{Reseeds} si \emph{chaque} site d'appel porte une \code{key} ou une garde qui lit au moins ce que lit le seed ; \code{WriterCoupled} si chaque site rend le consommateur sous une garde d'état écrite dans le même commit que le nourricier ; \code{Free} sinon. Le doc-comment de \code{Reseeds} (\src{src/rules/helpers/mount.rs}{44}{67}) explique pourquoi ce n'est pas une preuve : une garde qui passe d'une valeur vraie à une autre garde l'enfant monté, et une \code{key} objet se convertit en une chaîne constante. Les deux formes gèlent réellement, et l'analyseur ne sait pas les distinguer de l'idiome : il dégrade donc, au lieu de supprimer. Un appelé non résolu est attribué à \emph{tous} les composants de ce nom, sans danger puisque la relation ne peut que dégrader, et seulement si tous les sites remontent.
+
+\paragraph{Une absence sur des chemins vus : \code{ContextConsumers}.} La relation \relation{context_consumers} dit, pour chaque \code{useContext}, si un composant qui peut le rendre fournit la même cellule de contexte. Son verdict négatif s'appelle \code{NoneOnAnalyzedPaths} et non \og aucun provider\fg{} : \code{build} (\src{src/rules/helpers/context_flow.rs}{87}{139}) abandonne une ligne dès que l'ascendance n'est pas complète (\issue{110}), qu'une récursion a été coupée, ou qu'un composant non analysé mentionne un membre de la chaîne et pourrait donc se trouver au-dessus.
+
+\paragraph{L'identité d'un site : \code{site_identity}.} Une valeur passée à \code{<Ctx.Provider value=...>} est jugée dans l'environnement du bloc, sur le tas convergé (\srcline{src/rules/helpers/jsx.rs}{270}) : \code{FreshEveryRender} si elle n'est qu'une référence neuve, \code{Unknown} sinon. Une variable n'est jugée que si elle est liée \emph{exactement une fois} dans le corps : zéro liaison signifie que le parent la possède, deux liaisons que la valeur de sortie du bloc n'est peut-être pas celle que l'élément a reçue. Les sites de providers (\code{collect_provider_sites}, \file{providers.rs}) exigent un nom de la forme \code{X.Provider} où \code{X} est une cellule \code{createContext} prouvée.
+
+\begin{piege}
+\code{collect_provider_sites} est plus étroit que la dépendance de rendu du moteur. Sur \file{/tmp/ch17/ctx.tsx}, qui passe un objet neuf à trois providers de la même cellule \code{Ctx}, seul \code{<Ctx.Provider value={{ user, setUser }}>} au niveau supérieur du rendu reçoit le \Warning{} \regle{unstable-context-value}. La forme React~19 \code{<Ctx value=...>} (composant \code{P19}) et un provider construit dans un \code{items.map(...)} (composant \code{Rows}) ne sont pas vus : le premier parce que \code{provider_context} exige le suffixe \code{.Provider}, le second parce que \code{each_component_element} ne traverse pas les corps de fonction (la famille de \issue{30}). Dans les deux cas, l'élément est aussi traité comme un composant inconnu, et une \Info{} \regle{analysis-limit} (\og component `Ctx` was not found\fg, \og component `Ctx.Provider` was not found\fg) avoue la limite et suspend les assurances : le FN n'est pas silencieux.
+\end{piege}
+
+\paragraph{Les deux derniers.} \code{collect_cycle_rows} (\src{src/rules/helpers/cycles.rs}{101}{135}) projette les cycles du graphe de churn sur un composant : une arête portée par un effet d'un autre composant sera rapportée dans la passe de cet autre composant, et une arête sans position ne produit pas de ligne (un finding manqué, jamais faux). \code{classify_body} (\file{purity.rs}) rend \code{Impure} si un site de mutation s'enracine hors du corps ou si un setter est appelé ; tout ce que la poursuite des liaisons ne sait pas placer compte comme possédé par le corps, pour que \code{Impure} reste une affirmation.
+
+% ===========================================================================
+\section{La frontière \og walk-free\fg}
+\label{sec:api-regles-walk-free}
+
+Les helpers qui calculent des relations dans la couche règles sont une dette, et \adr{42} (§1) la nomme : \og a fact computed in two places is two facts that drift\fg. La décision fixe la frontière entre moteur et règles en une phrase : une règle lit des lignes de relation et appelle des primitives must ; elle ne parcourt ni CFG ni expression. Chaque parcours vit dans le moteur et produit une relation nommée dont les colonnes déclarent leur polarité (\cref{def:relation}).
+
+La frontière est tenue par un test à \terme{cliquet} (\emph{ratchet}) :
+
+\rustsnippet[label={lst:api-regles-ratchet}]{tests/layer_boundary.rs}{19}{41}{la liste qui ne peut que rétrécir}
+
+La mécanique est simple (\src{tests/layer_boundary.rs}{54}{59}) : \code{walks_syntax} lit un fichier, le coupe au premier \texttt{\#[cfg(test)]} (un test a le droit de construire un CFG à la main) et cherche l'un des cinq marqueurs. Deux tests encadrent la liste. \code{no_rule_file_outside_the_list_walks_syntax} refuse qu'un fichier hors liste parcoure la syntaxe ; son message d'échec dit quoi faire (\og compute the fact in the engine as a relation (ADR-042 §1) instead of adding them to the list\fg). \code{the_list_only_shrinks} exige qu'un fichier qui a cessé de parcourir la syntaxe quitte la liste. Chaque entrée est une promotion à faire, pas une exception. Un troisième test vérifie que \file{docs/relations.md} nomme chaque relation stockée.
+
+\begin{decision}[ADR-042 --- les relations sont des produits du moteur]
+\textbf{Décision.} Une règle ne parcourt pas la syntaxe ; le graphe de churn descend dans le moteur (\file{engine/churn.rs}) ; les preuves suivent les données (\code{on_all_paths}, l'évaluateur convergé) ; la frontière de certification ne bouge pas, \code{must_effect_cycle} reste dans \file{query.rs}.
+\textbf{Alternatives refusées.} Fondre le churn dans \code{StateValue} (déjà refusé par \adr{41} pour la dépendance de rendu) ; unifier \relation{effect_triggers} avec les deps de la dépendance de rendu, parce qu'une dépendance n'est pas une identité.
+\end{decision}
+
+\begin{piege}
+Le cliquet est une heuristique textuelle. Il documente un engagement, il ne le prouve pas. Un parcours déguisé (\code{cfg.blocks.iter()} au lieu de \code{.values()}, ou une fonction de parcours définie ailleurs) échapperait aux marqueurs, et c'est ainsi que \file{render_tree.rs}, \file{context_flow.rs}, \file{providers.rs} et \file{cycles.rs} sont hors liste : ils lisent des résumés du moteur ou délèguent le parcours (\code{jsx::top_level_exprs}, \code{root_detector::collect_compapp_refs}). La liste réelle diffère d'ailleurs de celle qu'écrit \adr{42} : \file{helpers/mod.rs} y est entré, \file{impls/conditional_hook.rs} en est sorti depuis que sa logique vit dans \code{hook_is_conditional}.
+\end{piege}
+
+% ===========================================================================
+\section{La façade, le Tier A et l'ouverture}
+\label{sec:api-regles-ouverture}
+
+\file{src/rules/mod.rs} ré-exporte tout ce qui est public à son chemin historique (\src{src/rules/mod.rs}{25}{59}), de sorte que les déplacements successifs (découpe en \code{api}/\code{impls}/\code{helpers}, descente des setters et de l'évaluateur dans le moteur) n'ont cassé aucun chemin \code{crate::rules::X}. La façade se lit en trois cercles : \code{pub} pour la surface stable (trait, contexte, verdicts, jetons, primitives, \code{Diagnostic}, vocabulaire des témoins, docs, registre, les dix-neuf structures de règles) ; \code{pub(crate)} pour le vocabulaire partagé avec le moteur et le driver (tables d'alias de setters, nommage, balayages, évaluateur) ; \code{pub(in crate::rules)} pour ce qui ne sort pas de la couche (\code{all_deps_provably_stable}, \code{fn_lit_binding}\ldots). \code{must_effect_cycle} n'est pas ré-exporté du tout.
+
+Cette surface est aussi celle contre laquelle s'écrivent les règles déclaratives du Tier A (\adr{22}, \cref{chap:regles-declaratives}) : un pack JSON s'ancre sur une relation (\code{writers}, \code{churn_cycles}, \code{context_consumers}\ldots) et ne peut atteindre \Error{} que par des gardes \code{must_*} qui appellent les primitives de ce chapitre (\code{must_setter_on_all_paths}, \code{must_dominates_all_exits}, \code{must_direct_write}\ldots, \file{src/rules/declarative/exec.rs}). \file{tests/catalogue.rs} mesure ce que le Tier A sait exprimer : vingt-deux classes de règles, dont \code{EXPRESSIBLE_NOW = 21} sont prouvées chargées, tirant sur un fixture fautif et muettes sur un fixture conforme (\srcline{tests/catalogue.rs}{1094}) ; la vingt-deuxième est exclue par conception (\issue{101}). Une issue ouverte montre que la leçon d'\issue{142} vaut aussi là : une règle de pack épinglée \code{error} atteint \Error{} sur une seule garde \code{must_*} alors qu'une garde may de la même conjonction n'est pas prouvée (\issue{143}).
+
+\begin{remarque}
+Le principe de la couche tient en une phrase : \emph{la polarité est un type, et l'\Error{} est un jeton}. Tout le reste en découle : les primitives frappent là où elles constatent, les classifieurs rendent $\Top$ comme une variante, le registre ne peut qu'abaisser, les témoins voyagent avec les preuves, et les parcours de syntaxe quittent la couche un par un. Ce qui reste de confiance tient dans dix appels à \code{Certified::mint}.
+\end{remarque}
+
+% ===========================================================================
+\begin{resume}
+\begin{itemize}
+  \item La couche règles (\file{src/rules/}) transforme le point fixe et les relations du moteur en diagnostics gradués, localisés et expliqués. Une règle implémente \code{Rule} (\code{name}, \code{check}, \code{safe_check}, \code{options}) et ne lit que son \code{RuleCtx}. Dix-neuf règles natives émettent vingt et un noms de diagnostic.
+  \item Le FN historique d'\adr{21} venait de deux prédicats non complémentaires (\code{is_stable}, \code{is_unstable}) et d'un mauvais quantificateur. La réponse est structurelle : la polarité est un type, et $\Top$ une variante retournée.
+  \item \code{Diagnostic} vit dans un module feuille ; sa sévérité est privée ; \code{Diagnostic::error} exige un \code{Certified<E>}, dont le constructeur est privé à \file{query.rs} (\cref{def:certified}). Forger une \Error{} est une erreur de compilation (E0624, E0616, E0451, E0308). Transférer une vraie preuve reste possible et relève de la revue.
+  \item Les primitives must frappent au point de connaissance : dominance sur les sorties \emph{atteignables} (\code{hook_is_conditional}), plus grand point fixe booléen (\code{must_setter_on_all_paths}), preuve d'écriture du nourricier (\code{classify_motion}) que \code{must_frozen_seed} ne peut que dégrader, re-dérivation depuis les arêtes brutes (\code{must_effect_cycle}), preuve de tous les conjoints (\code{must_stale_capture}). La porte des deps quantifie $\forall$-stable.
+  \item Les témoins sont des \code{Note} typées par un vocabulaire fermé de quatorze \code{Step} (\cref{def:witness}) ; \code{Step::render} est l'unique point de prose ; \code{FileId} permet de nommer le fichier d'une étape ; \code{located} donne à tout finding la première position de sa chaîne.
+  \item Le registre exécute, par composant : contexte, \code{check}, \code{safe_check} sur sortie brute, \code{located}, clamp $\mathit{pin} \meet \mathit{polarité}$ (ne peut qu'abaisser), suspension des assurances sous \regle{analysis-limit}, filtres \code{off}/\code{allow} à l'émission, tri total. Toute surcharge invalide est une erreur bruyante.
+  \item \code{ProgramCache} construit une fois par run les structures du programme (\issue{86}). Les helpers programme penchent tous d'un côté sûr : l'absence d'usage est une preuve (donc l'inconnu est un usage), le couplage de montage ne fait que dégrader, l'absence de provider n'est affirmée que sur des chemins vus.
+  \item La frontière walk-free (\adr{42}) est tenue par un cliquet textuel ; dix fichiers y figurent encore.
+  \item Fichiers rencontrés : \file{src/rules/mod.rs}, \file{registry.rs}, \file{docs.rs}, \file{api/query.rs}, \file{api/diagnostic.rs}, \file{api/witness.rs}, \file{api/cache.rs}, \file{helpers/*.rs}, \file{tests/layer_boundary.rs}. Les chapitres suivants appliquent cette surface règle par règle, en commençant par les règles sur l'état (\cref{chap:regles-etat}).
+\end{itemize}
+\end{resume}
+
+% ===========================================================================
+\section*{Exercices}
+\addcontentsline{toc}{section}{Exercices}
+
+\begin{exercice}{Un distributeur de jetons}{api-regles-vending}
+On veut une primitive \code{must_effect_writes(body: &CFG, setters: &HashSet<Var>) -> MustResult<()>} qui certifie qu'un corps d'effet écrit un état sur tous ses chemins. (a) Écrivez-la en respectant le contrat de la \cref{sec:api-regles-primitives}, en réutilisant une primitive existante. (b) Un collègue propose plutôt \code{must_effect_writes(all_paths: bool) -> MustResult<()>}, l'analyse étant faite par la règle. Pourquoi \adr{21} appelle-t-il cela un distributeur de jetons ?
+\end{exercice}
+\begin{solution}
+(a) Collecter les blocs qui contiennent un appel à l'un des setters, puis déléguer à \code{must_on_all_paths(body, &blocks)} et, sur \code{All}, frapper \code{Certified::mint((), Provenance::default())} (ou mieux, \code{Provenance::at} avec la position du premier appel) ; sur \code{None}, rendre \code{None} ou \code{Some} selon qu'au moins un appel existe. La fonction vit dans \file{query.rs}, seul endroit où \code{mint} est visible. (b) La version à booléen ne fait aucune analyse : tout appelant qui passe \code{true} obtient un jeton, et la polarité redevient une affaire de discipline dans chaque règle, exactement la situation qui a produit le FN d'origine.
+\end{solution}
+
+\begin{exercice}{Itérer \code{must_out}}{api-regles-iter}
+Un corps d'effet est un losange : B0 (entrée, \code{branch c}) mène à B1 et B2, qui rejoignent B3 (\code{return}). B1 et B2 appellent tous deux \code{setX(0)}, B0 et B3 n'appellent rien. Déroulez l'algorithme du \cref{lst:api-regles-must-out} dans l'ordre B1, B2, B3. Quel est le verdict ? Même question si seul B1 appelle \code{setX(0)}.
+\end{exercice}
+\begin{solution}
+Initialisation : $\mathit{out}(B0) = $ faux, les autres à vrai. Passe 1 : $\mathit{out}(B1) = \mathit{out}(B0) \vee$ vrai $=$ vrai ; de même $\mathit{out}(B2) =$ vrai ; $\mathit{out}(B3) = (\text{vrai} \wedge \text{vrai}) \vee \text{faux} =$ vrai. Rien n'a changé : stable, la sortie B3 vaut vrai, verdict \code{All}, et le témoin désigne le site de B1, premier dans l'ordre des blocs. Si seul B1 appelle : passe 1, $\mathit{out}(B2) = $ faux (changé), $\mathit{out}(B3) = \text{vrai} \wedge \text{faux} =$ faux (changé) ; passe 2 sans changement ; verdict \code{Some}.
+\end{solution}
+
+\begin{exercice}{Pourquoi \code{off} n'arrête pas une règle}{api-regles-off}
+Un utilisateur écrit \code{"setter-in-render": "off"} dans sa configuration. Que se passerait-il si le registre sautait l'exécution de la règle \code{SetterInRender} au lieu de filtrer ses findings à l'émission ? Quel test l'empêche ?
+\end{exercice}
+\begin{solution}
+La règle émet aussi \regle{cross-setter-in-render}, un nom distinct que l'utilisateur n'a pas désactivé. Sauter la règle ferait disparaître ces findings en silence : un FN. C'est pourquoi \code{off} est indexé par nom de diagnostic et appliqué par \code{visible} après \code{check}. Le test \code{off_on_one_diagnostic_name_keeps_the_other} l'épingle.
+\end{solution}
+
+\begin{exercice}{Tromper le cliquet}{api-regles-cliquet}
+Proposez une modification d'une règle hors liste qui parcourt les blocs d'un CFG sans déclencher \code{layer_boundary}. Pourquoi serait-elle contraire à \adr{42}, même si le test passe ?
+\end{exercice}
+\begin{solution}
+Les marqueurs sont des sous-chaînes. \code{for (_, b) in body.blocks.iter()} ne contient ni \code{cfg.blocks} (la variable s'appelle \code{body}) ni \code{.blocks.values()} ; un \code{use crate::ir::stmt::Stmt as S;} suivi de \code{S::Let { .. }} évite \code{Stmt::}. Le test passe, mais le fait est calculé dans la couche règles : un second calcul du même fait, qui dérivera du premier. \adr{42} demande de produire une relation dans le moteur ; le cliquet n'est qu'une alarme, pas la définition de la frontière.
+\end{solution}
+
+\begin{exercice}{Un témoin faux, une correction centrale}{api-regles-setter}
+Le \Warning{} \og `setUser` could not be resolved, treated as opaque\fg{} de la \cref{sec:api-regles-temoins} accompagne une \Error{} juste. Proposez une correction qui ne soit pas un cas particulier dans \regle{lazy-init}. Même question pour \og state state\fg{} dans le témoin de \regle{frozen-initial-state}.
+\end{exercice}
+\begin{solution}
+Le vocabulaire a déjà la bonne variante, \code{ResolveTarget::Setter}, jamais construite. La correction centrale est dans le producteur partagé : \code{resolve_and_classify} (ou son appelant) doit connaître les setters du composant et rendre \code{Resolve{Setter}}, suivi de \code{Call{Setter}}, avant de consulter le \code{FunctionRegistry}. Toute règle qui résout un nom en profite. Pour \og state state\fg, le défaut est un contrat implicite entre la fermeture \code{name} et le gabarit de \code{Step::Write}, qui préfixe \og state\fg : soit \code{MovingFeeder::display} ne doit pas être pré-qualifié par \og state\fg, soit le gabarit doit recevoir un nom qualifié par un type distinct. Corriger la chaîne dans la seule règle serait un contournement.
+\end{solution}
+
+\begin{exercice}{Dédupliquer, un FN}{api-regles-dedup}
+Un hook \code{useStep(step)} contient \code{useEffect(() => { setN(n + step); }, [n])}. Il est appelé par \code{L} avec \code{useStep(1)} et par \code{M} avec \code{useStep(0)}. Expliquez pourquoi fusionner les findings des deux consommateurs, au motif qu'ils ont la même ancre dans le fichier du hook, produirait un FN (\adr{24}).
+\end{exercice}
+\begin{solution}
+Après greffe, les deux corps ne sont pas analysés dans le même contexte : dans \code{L}, l'effet écrit \code{n + 1}, une valeur qui croît, d'où \regle{infinite-loop} ; dans \code{M}, il écrit \code{n + 0}, la valeur déjà détenue, d'où \regle{redundant-set-state}. L'analyseur le confirme sur \file{/tmp/ch17/step.tsx} : \code{L} reçoit un \Warning{} \regle{infinite-loop} et \code{M} un \Warning{} \regle{redundant-set-state}, tous deux à la ligne 5:2 du hook. Les deux findings ont la même ancre mais affirment des faits différents. Garder un représentant supprimerait l'autre fait, que rien ne signalerait plus : un FN, que l'invariant de soundness interdit.
+\end{solution}

@@ -1,0 +1,1916 @@
+% Chapitre 16 — L'analyse inter-composants et inter-fichiers
+% Sources : notes/08 (intégralement), notes/05 (§4.1.10, §4.2), notes/06 (§4.6).
+% Commit photographié : e67b10a.
+% Toutes les sorties CLI ont été rejouées sous /tmp/ch16/ avec target/debug/reactant
+% construit depuis e67b10a. Les résumés RenderDeps champ par champ (genuine, sites,
+% handlers) viennent de la sonde de débogage du dossier 08 (§6), qui n'a pas pu être
+% reconstruite pour ce chapitre (/tmp plein) : ils sont signalés comme tels dans le texte.
+
+\chapter{L'analyse inter-composants et inter-fichiers}
+\label{chap:inter-composants}
+
+\begin{objectifs}
+  \item Comprendre pourquoi un analyseur \emph{intra}-composant, qui lit les props comme
+        $\Top$, manque les défauts qui traversent une frontière de composant, et ce qu'il faut
+        pour les voir.
+  \item Connaître l'identité d'un composant : la clé \code{(file, name)}, le
+        \code{ComponentId} interné, le nom d'affichage qui n'est qu'un rendu, l'origine
+        \code{CompOrigin} qu'un fichier prouve pour un élément JSX, et les trois réponses de
+        \code{resolve_child} (\adr{40}).
+  \item Savoir comment les racines sont choisies (\code{RootStrategy}, \code{--all-roots},
+        \code{--entry}) et pourquoi une référence non résolue compte pour tous les homonymes.
+  \item Suivre pas à pas l'inlining descendant (\code{eval_comp_app}, \code{InterCtx}, pile de
+        récursion, props dans le tas) et le flux ascendant (setter porteur de propriétaire,
+        store partagé monotone, havoc).
+  \item Comprendre le cache de composants, pourquoi il n'est qu'un \og déjà vu\fg{}, et le faux
+        négatif qui en découle ; les deux phases d'\code{analyze_program} et la discipline
+        \code{phase1_reached}.
+  \item Connaître ce que lit une règle (\code{AnalysisResult}, \code{ProgramAnalysisResult},
+        \code{RuleCtx}) et ce que le graphe de symboles d'\adr{13} est devenu.
+  \item Maîtriser la \terme{dépendance de rendu} (\adr{41}) : le treillis \code{Deps}, la
+        dépendance de contrôle, la séparation \code{genuine} / \code{sites}, handlers,
+        contextes, bindings de module, fait \code{gated}, et sa composition sur l'arbre
+        d'éléments (\code{uses}, \code{home_of}, \code{wasted_siblings}).
+\end{objectifs}
+
+\prerequis{\cref{chap:point-fixe-composant} (la boucle externe d'un composant, sa passe de
+rendu, le test de convergence, la passe de rafraîchissement) ; \cref{chap:transfert-stores}
+(\code{eval_comp_app} vu du transfert, le \code{SharedStateStore}, le tas, le havoc des
+setters, \cref{def:store}) ; \cref{chap:statevalue-stabilite} (\cref{def:statevalue}, la
+composante setter du produit, \code{InterCtx}) ; \cref{chap:ir} (\cref{def:slot},
+\cref{def:site}, \cref{def:cfg}, \code{Expr::CompApp}) ; \cref{chap:interpretation-abstraite}
+(\cref{def:treillis}, \cref{def:must-may}, \cref{def:soundness}). Les règles qui consomment la
+dépendance de rendu sont traitées aux \cref{chap:regles-etat,chap:regles-rendu-rsc}.}
+
+Jusqu'ici, le moteur a été décrit composant par composant : un CFG de rendu, des effets, des
+handlers, une boucle externe qui monte l'état jusqu'à un point fixe. Or un programme React est
+un \emph{arbre} de composants, écrit dans des dizaines de fichiers, où l'état d'un parent
+descend en props et où ses setters descendent pour être appelés plus bas. Ce chapitre répond à
+deux questions qu'aucune analyse d'un composant isolé ne peut trancher.
+
+\begin{enumerate}
+  \item \textbf{Qui rend qui, avec quelles props ?} C'est l'analyse \emph{inter-composants}
+        (\adr{12}) : un parent est analysé d'abord, et quand son rendu rencontre
+        \code{<Child a={x}/>}, l'enfant est analysé avec les props \emph{abstraites}
+        évaluées dans l'environnement du parent. Elle demande de savoir quel composant un nom
+        JSX désigne, à travers les fichiers (\adr{13}, \adr{40}), par où commencer, et comment
+        ne pas ré-analyser un enfant pour des props identiques.
+  \item \textbf{Quelles parties de la sortie d'un composant peuvent être calculées à partir
+        d'un état donné ?} C'est la \emph{dépendance de rendu} (\adr{41}), une seconde
+        analyse, séparée, lancée après convergence, qui alimente les règles de cascades de
+        re-rendus.
+\end{enumerate}
+
+Le sous-système tient dans sept fichiers de \file{src/engine/} :
+\file{component_registry.rs} (256 lignes), \file{root_detector.rs} (329),
+\file{component_cache.rs} (327), \file{symbol_graph.rs} (416), \file{analysis_result.rs} (289),
+\file{program_result.rs} (225) et \file{render_deps.rs} (1\,276). Le mécanisme lui-même est porté
+par quatre fichiers voisins : \file{src/ir/component_id.rs} (l'identité),
+\file{src/domains/context.rs} (\code{InterCtx}), \file{src/domains/transfer/state_value.rs}
+(\code{eval_comp_app}) et \file{src/engine/fixpoint.rs} (\code{analyze_program}). La
+composition des résumés de rendu sur l'arbre d'éléments vit dans la couche règles,
+\file{src/rules/helpers/render_tree.rs} (777 lignes). Toutes les sorties de l'analyseur
+montrées ici ont été observées avec le binaire du commit \snapshotCommit{} sur des fichiers
+de \file{/tmp/ch16/} ou sur les fixtures du dépôt.
+
+% ===========================================================================
+\section{Le problème : des props inconnues, un setter qui remonte}
+\label{sec:inter-composants-probleme}
+
+\subsection{Un badge qui relance son parent}
+
+\begin{exemple}{Un setter appelé pendant le rendu d'un enfant}{inter-composants-badge}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch16/intro.tsx}},label={lst:inter-composants-intro}]
+import { useState } from "react";
+
+function Badge({ onSeen }: { onSeen: (n: number) => void }) {
+  onSeen(1);
+  return <span>new</span>;
+}
+
+export function Inbox() {
+  const [seen, setSeen] = useState(0);
+  return <div>{seen}<Badge onSeen={setSeen} /></div>;
+}
+\end{lstlisting}
+\end{exemple}
+
+\code{Badge} appelle, pendant son rendu, la fonction que son parent lui passe. Or cette
+fonction est \code{setSeen}, le setter d'un slot d'\code{Inbox}. Chaque rendu de \code{Badge}
+écrit donc l'état de son parent pendant un rendu, ce que React signale en développement
+(\og Cannot update a component while rendering a different component\fg) ; chaque écriture qui
+change la valeur re-rend le parent, donc l'enfant, qui écrit de nouveau. L'analyseur le voit :
+
+\begin{sortie}
+$ reactant check intro.tsx --trace
+  Badge  (0 hooks)  intro.tsx
+    error  cross-setter-in-render  var:onSeen  (line 4:2)  prop `onSeen` (a state setter of parent `Inbox`) called during render of `Badge`, which triggers a parent re-render on every render
+       → `onSeen` is a state setter, so calling it writes state (line 4:2)
+   1 clean component(s) hidden, rerun with --show-clean
+
+⚠  1 error(s) across 1 file(s).
+\end{sortie}
+
+Le diagnostic est une \Error{} : l'appel est inconditionnel dans le corps du rendu, et le
+message nomme le propriétaire du setter, \code{Inbox}. Ce nom n'est écrit nulle part dans
+\code{Badge}.
+
+\subsection{Ce qu'un analyseur intra ne voit pas}
+
+Retirons le parent. Le fichier \file{/tmp/ch16/badge-alone.tsx} ne contient que la fonction
+\code{Badge}, verbatim :
+
+\begin{sortie}
+$ reactant check badge-alone.tsx --info
+
+✓  1 file(s) no issues found.
+\end{sortie}
+
+Aucune alarme, et à juste titre. Analysé seul, \code{Badge} reçoit un objet de props dont
+l'analyse ne sait rien : son paramètre n'est lié à rien dans l'environnement d'entrée, et une
+variable absente se lit $\Top$ (\code{AbstractEnv::lookup},
+\src{src/domains/stores/abstract_env.rs}{78}{81}). \code{onSeen} est donc \og une valeur
+quelconque\fg{} ; rien ne prouve que c'est un setter, et une règle \Error{} doit prouver
+\emph{toute} sa conclusion. Un analyseur intra-composant est sound (il ne conclut rien de faux),
+mais il est aveugle à toute une famille de défauts : un setter passé en prop et appelé
+pendant le rendu, un effet d'enfant qui relance le parent (\regle{cross-component-infinite-loop}),
+un état qu'un parent possède pour le seul usage d'un arrière-petit-enfant.
+
+\begin{react}[props, setters, identité]
+Un setter renvoyé par \code{useState} a une identité stable pour toute la vie du composant,
+et il écrit toujours le slot de son \emph{propriétaire}, quel que soit le composant qui
+l'appelle. Le passer en prop est l'idiome normal pour qu'un enfant remonte une valeur. Un
+\emph{élément} \code{<Badge onSeen={setSeen}/>} n'est qu'une description (\code{jsx(Badge,
+props)}) : \code{Badge} ne s'exécute que lorsque React monte l'élément, avec ces props
+(\cref{chap:react-modele}).
+\end{react}
+
+Pour conclure, l'analyse doit donc savoir que \code{<Badge/>} dans \code{Inbox} désigne
+\emph{ce} \code{Badge}-là, analyser \code{Badge} avec la valeur abstraite que prend
+\code{onSeen} dans \code{Inbox} --- un setter porteur de son propriétaire --- puis faire
+remonter l'écriture de \code{Badge} dans l'état d'\code{Inbox}. C'est exactement ce que fait
+l'analyse inter-composants.
+
+\subsection{Deux questions, un sous-système}
+
+La seconde question naît d'un autre programme, la fixture \file{drill.tsx} du répertoire
+\file{tests/fixtures/state_lifted_too_high/} :
+
+\tsxsnippet[label={lst:inter-composants-drill}]{tests/fixtures/state_lifted_too_high/drill.tsx}{6}{19}{un état tenu trois niveaux trop haut}
+
+Rien n'y est faux : c'est un problème de coût. À chaque frappe, \code{setValue} re-rend
+\code{App}, et donc tous les éléments de composant qu'\code{App} construit, récursivement :
+\code{Layout}, \code{Sidebar}, \code{Field}, et \code{Content} au passage. Seul \code{Field}
+utilise la valeur. Pour le dire, l'analyse doit savoir, pour chaque composant, ce qui dans sa
+sortie \emph{dépend} de l'état et ce qui ne fait que le \emph{transmettre} à un enfant. La
+valeur abstraite ne le dit pas (nous verrons pourquoi au \cref{sec:inter-composants-render-deps}) :
+il faut une analyse de dépendance.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}
+  \node[bloc] (files) at (0,0) {fichiers\\\code{.ts}/\code{.tsx}};
+  \node[bloc] (low) at (3.2,0) {\code{lower_files_with}\\{\scriptsize IR, \code{CompApp.origin}}};
+  \node[bloc] (reg) at (7.0,0) {\code{ComponentRegistry}\\{\scriptsize \code{ComponentTable}}};
+  \node[bloc] (roots) at (10.8,0) {\code{RootStrategy}\\\code{::detect}};
+  \node[bloc] (prog) at (10.8,-1.9) {\code{analyze_program}\\{\scriptsize phase 1 : racines sous \code{InterCtx}}\\{\scriptsize phase 2 : balayage intra}};
+  \node[bloc] (eca) at (10.8,-4.0) {\code{eval_comp_app}\\{\scriptsize inlining d'un enfant}};
+  \node[bloc] (res) at (1.2,-1.9) {\code{ProgramAnalysisResult}};
+  \node[bloc] (cache) at (1.2,-4.0) {\code{ProgramCache}\\{\scriptsize relations, \code{RenderIndex}}};
+  \node[bloc] (rd) at (5.0,-4.0) {\code{render_deps}\\{\scriptsize un résumé par composant}};
+  \node[bloc] (rules) at (8.2,-4.0) {\code{RuleCtx}\\\code{Rule::check}};
+  \draw[fleche] (files) -- (low);
+  \draw[fleche] (low) -- (reg);
+  \draw[fleche] (reg) -- (roots);
+  \draw[fleche] (roots) -- (prog);
+  \draw[flechemust] ($(prog.south)+(-0.4,0)$) -- node[etiquette,left] {\code{<Child/>}} ($(eca.north)+(-0.4,0)$);
+  \draw[flechemust] ($(eca.north)+(0.4,0)$) -- node[etiquette,right] {enfant analysé} ($(prog.south)+(0.4,0)$);
+  \draw[fleche] (prog) -- (res);
+  \draw[fleche] (res) -- (cache);
+  \draw[fleche] (cache) -- (rd);
+  \draw[fleche] (rd) -- (rules);
+\end{tikzpicture}
+\caption{Le pipeline programme. L'IR de tous les fichiers est abaissée d'abord ; le registre
+interne l'identité des composants ; la stratégie choisit les racines ; \code{analyze_program}
+analyse les racines en inlinant leurs enfants à la volée (\code{eval_comp_app}), puis balaie
+les composants non atteints. Les résumés de dépendance de rendu sont calculés à la demande,
+une fois par programme, dans la couche règles.}
+\label{fig:inter-composants-pipeline}
+\end{figure}
+
+La \cref{fig:inter-composants-pipeline} situe les deux mécanismes. Les points d'entrée exacts
+sont \code{resolver::analyze_lowered} (\src{src/resolver/mod.rs}{439}{452}), qui construit les
+registres et appelle \code{engine::analyze_program}
+(\src{src/engine/fixpoint.rs}{704}{819}) ; puis le driver construit un \code{ProgramCache}
+partagé par tous les \code{RuleCtx}, dont la première demande de \code{render()} calcule les
+résumés \code{render_deps} de tous les composants. Retenons un point dès maintenant : dans le
+domaine des valeurs, un élément JSX de composant vaut \emph{toujours}
+\code{StateValue::reference(Stability::Stable)} ; ce qui compte, ce sont les effets de bord de
+son évaluation --- le résultat de l'enfant, les écritures dans le store partagé, les arêtes du
+graphe d'appel.
+
+% ===========================================================================
+\section{L'identité d'un composant}
+\label{sec:inter-composants-identite}
+
+\subsection{Trois façons de nommer un composant}
+
+Avant de pouvoir analyser un enfant, il faut savoir \emph{lequel}. Considérons quatre
+fichiers (\file{/tmp/ch16/amb/}) :
+
+\begin{lstlisting}[language=TypeScript,caption={Deux \code{Widget}, un alias, une référence nue (\file{/tmp/ch16/amb/})},label={lst:inter-composants-amb}]
+// a/Widget.tsx
+import { useEffect, useState } from "react";
+export function Widget() {
+  const [n, setN] = useState(0);
+  useEffect(() => { setN(n + 1); });
+  return <p>{n}</p>;
+}
+// b/Widget.tsx
+export function Widget({ onReady }: { onReady: (v: number) => void }) {
+  onReady(1);
+  return <p>b</p>;
+}
+// App.tsx
+import { useState } from "react";
+import { Widget as Panel } from "./b/Widget";
+export function App() {
+  const [v, setV] = useState(0);
+  return <Panel onReady={setV} />;
+}
+// Page.tsx  (aucun import de Widget)
+import { useState } from "react";
+export function Page() {
+  const [v, setV] = useState(0);
+  return <Widget onReady={setV} />;
+}
+\end{lstlisting}
+
+Trois \og noms\fg{} coexistent. Le nom \emph{écrit} au site d'appel (\code{Panel},
+\code{Widget}) ; le couple (fichier de définition, nom exporté), qui seul désigne un composant
+sans ambiguïté (\code{(b/Widget.tsx, Widget)}) ; et le nom qu'un rapport \emph{affiche}, qui
+doit distinguer deux \code{Widget} (\code{Widget@b/Widget.tsx}). L'histoire du projet est
+celle de la confusion entre ces trois orthographes, et de sa résolution par \adr{40}.
+
+\subsection{\code{ComponentId} et \code{ComponentTable}}
+
+\rustsnippet{src/ir/component_id.rs}{23}{29}{l'identité d'un composant}
+
+Un \code{ComponentId} est un index de 4 octets, \code{Copy} et \code{Ord}. Il tient dans une
+clé de store ou dans un label d'un \code{BTreeSet} sans allocation, et deux identités se
+comparent en une instruction. Seule \code{ComponentTable::intern} en fabrique en production
+(\code{from_index} est réservé aux tests, \src{src/ir/component_id.rs}{44}{47}). Une valeur
+réservée, \code{ComponentId::SYNTHETIC} (\code{u32::MAX}, \srcline{src/ir/component_id.rs}{38}),
+sert aux IR construites à la main par les tests unitaires, qui n'analysent qu'un composant et
+n'en comparent jamais deux.
+
+\rustsnippet{src/ir/component_id.rs}{61}{74}{la table d'interning}
+
+La table est une bijection \code{origins} / \code{by_origin} entre identités et
+\code{CompOrigin { file, name }}. \code{intern} est idempotent
+(\src{src/ir/component_id.rs}{77}{86}) ; \code{register} accepte un identifiant existant, pour
+le seul cas qui ne peut pas passer par \code{intern} : un résultat analysé seul, qui porte
+\code{SYNTHETIC} dans ses labels et doit rejoindre un programme sans réécriture
+(\src{src/ir/component_id.rs}{94}{101}). \code{ids()} rend les identifiants triés, et comme
+l'interning suit l'ordre trié des clés du registre, tout parcours de la table est
+reproductible d'une exécution à l'autre (\src{src/ir/component_id.rs}{121}{128}).
+
+C'est le registre qui interne, parce que c'est le seul endroit qui connaît l'ensemble des
+composants :
+
+\rustsnippet{src/engine/component_registry.rs}{42}{55}{construction du registre, interning en ordre de clé trié}
+
+La table est ensuite clonée dans le résultat de programme (champ \code{component_table} de
+\code{ProgramAnalysisResult}), de sorte que règles et rendu résolvent contre
+la table même qui a indexé l'analyse. Le registre lui-même est une \code{KeyedRegistry},
+une table \code{(PathBuf, Symbol)} $\to$ \code{ComponentIR} partagée avec les registres de hooks
+et d'utilitaires (\src{src/registry/keyed.rs}{21}{113}).
+
+\subsection{Le nom d'affichage n'est qu'un rendu}
+
+\rustsnippet{src/ir/component_id.rs}{138}{154}{le nom affiché, suffixé seulement en cas de collision}
+
+Le nom d'affichage dépend du \emph{contenu} du programme analysé : \code{Widget} devient
+\code{Widget@a/Widget.tsx} dès qu'un fichier sans rapport définit un second \code{Widget}.
+C'est voulu --- le suffixe n'existe que pour distinguer deux homonymes dans un rapport ---, et
+c'est précisément pourquoi aucune table ne doit être indexée par lui.
+
+\begin{decision}[ADR-40 --- l'identité est un id interné, le nom d'affichage un rendu]
+Avant \adr{40}, le nom d'affichage était l'orthographe \emph{sur laquelle tournait l'analyse}
+(\adr{38} §5 l'avait choisie pour unifier deux orthographes) : la table des résultats, le store
+partagé, le label d'un \code{Versioned}, le propriétaire d'un setter, le graphe d'appel et
+\code{RuleCtx} étaient tous indexés par lui. Ajouter un fichier sans rapport renommait donc un
+composant et ré-indexait toutes ces tables à la fois. \adr{40} décide : (1) l'identité est un
+\code{ComponentId} interné, comme \code{FileId} l'est pour les chemins (\adr{19}) ; (2) le nom
+d'affichage est minté au rendu, depuis la table, et rien ne le compare ; (3) un élément JSX
+porte ce que son fichier a prouvé (\code{CompOrigin}) ; (4) la résolution vit en un seul
+endroit et refuse de deviner ; (5) tout chemin est normalisé au lowering
+(\code{lower_files_with}), pour que clés du registre et réponses du résolveur s'écrivent
+pareil. Mesure : digest identique sur 35\,541 fichiers (1\,348 localisations), 873\,s contre
+858\,s --- ni régression, ni gain revendiqué.
+\end{decision}
+
+Parmi les six tests du module (\src{src/ir/component_id.rs}{184}{274}), celui qui \og dit
+pourquoi pas\fg{} s'appelle
+\begin{center}\code{interning_a_namesake_changes_an_existing_display_name_but_not_its_id}\end{center}
+\noindent et son nom dit tout : ajouter un homonyme
+change le nom d'affichage d'un composant existant, jamais son identifiant. La couche règles
+dit les deux moitiés à voix haute :
+
+\rustsnippet[label={lst:inter-composants-rulectx-id}]{src/rules/api/query.rs}{393}{404}{l'identité pour comparer, le nom pour écrire}
+
+\begin{piege}
+Écrire \code{if ctx.component_name() == "Foo"} dans une règle est une faute, même quand un
+test passe : sur un autre ensemble de fichiers, le même composant s'appelle
+\code{Foo@src/a/Foo.tsx}. Toute comparaison ou toute clé passe par \code{component()} et par
+la table (\code{ProgramAnalysisResult::component_named} est l'inverse public du nom
+d'affichage, \src{src/engine/program_result.rs}{79}{81}, et répond \code{None} pour un nom nu
+ambigu).
+\end{piege}
+
+\subsection{L'origine prouvée d'un élément JSX}
+
+Un élément de composant porte, depuis \adr{40}, ce que \emph{son propre fichier} a prouvé du
+nom qu'il écrit :
+
+\rustsnippet{src/ir/expr.rs}{245}{258}{l'élément de composant dans l'IR}
+
+\rustsnippet{src/ir/expr.rs}{160}{172}{l'origine : fichier de définition et nom exporté}
+
+Les deux moitiés servent. Le fichier départage vingt composants \code{Form} ; le nom résout un
+alias : \code{import { Widget as Panel }} écrit \code{<Panel/>}, mais l'origine vaut
+\code{(b/Widget.tsx, Widget)}. L'origine est calculée au lowering par \code{build_jsx_origins}
+(\src{src/lowering/import_resolution.rs}{237}{262}) : chaque déclaration de premier niveau du
+fichier courant s'associe à elle-même, puis chaque import que le résolveur mappe vers un vrai
+fichier s'associe à \code{(fichier résolu, nom importé)}. Un nom absent de la carte est
+\emph{non résolu} --- import d'espace de noms, barrel de ré-export, paquet npm --- et
+\code{origin} vaut \code{None}, qui se lit \og ignorance\fg{}, jamais \og absence prouvée\fg.
+
+\subsection{\code{resolve_child} : trois réponses}
+
+\rustsnippet{src/engine/component_registry.rs}{8}{20}{la réponse du registre sur un nom JSX}
+
+\rustsnippet[label={lst:inter-composants-resolve-child}]{src/engine/component_registry.rs}{114}{127}{résoudre un élément, sans jamais deviner}
+
+L'ordre est : (1) l'origine prouvée, si le registre contient ce couple ; (2) sinon le nom écrit,
+s'il est unique dans tout le registre ; (3) sinon \code{Ambiguous} si plusieurs fichiers le
+définissent, \code{Unknown} si aucun. Une origine qui pointe vers un fichier qui ne définit pas
+le composant (un barrel, limite d'un niveau de ré-export, \issue{49}) retombe sur le nom. Le
+balayage des clés est linéaire par appel.
+
+\begin{exemple}{Alias, collision, ambiguïté}{inter-composants-amb}
+Sur le répertoire de la \cref{lst:inter-composants-amb} :
+\begin{sortie}
+$ reactant check . --info --verbose
+[verbose] 3 components analyzed
+[verbose] cache hits: 3, misses: 1
+  [verbose] App: 1 iteration(s), widened: []
+  [verbose] Page: 1 iteration(s), widened: []
+  [verbose] Widget@a/Widget.tsx: 3 iteration(s), widened: [0]
+  [verbose] Widget@b/Widget.tsx: 0 iteration(s), widened: []
+  Page  (1 hooks)  Page.tsx
+    info   analysis-limit  several analysed files define a component called `Widget` and this reference does not resolve to one of them, so the child is treated as unknown. Import it explicitly from its file (FN possible)
+    suspended  analysis-limit  4 passing check(s) withheld: the analysis was truncated in this component, so they are not guaranteed
+  Widget@a/Widget.tsx  (2 hooks)  a/Widget.tsx
+    warn   infinite-loop  [hook:0]  (line 5:2)  this effect keeps pushing state `n` to new values on every run. Potential infinite render loop
+    …
+  Widget@b/Widget.tsx  (0 hooks)  b/Widget.tsx
+    error  cross-setter-in-render  var:onReady  (line 2:2)  prop `onReady` (a state setter of parent `App`) called during render of `Widget@b/Widget.tsx`, which triggers a parent re-render on every render
+\end{sortie}
+(sortie élaguée : la ligne du graphe de symboles, les traces et les lignes \code{verified} sont
+omises.) \code{<Panel>} dans \code{App} a pour origine \code{(b/Widget.tsx, Widget)} : l'alias
+est résolu, l'enfant est inliné avec un setter d'\code{App}, et l'\Error{} de
+\code{b/Widget.tsx} n'existe que grâce à cet inlining. \code{<Widget>} dans \code{Page} n'a pas
+d'origine (\code{Page.tsx} n'importe rien) et deux fichiers définissent le nom : réponse
+\code{Ambiguous}, enfant inanalysable, \Info{} sur \code{Page}. Les noms affichés sont suffixés,
+et ne servent qu'à l'affichage.
+\end{exemple}
+
+\begin{decision}[ADR-40 §4 --- refuser de deviner]
+L'ancien \code{get_by_name} répondait par la première clé \code{(file, name)} \emph{dans l'ordre
+de tri}. Ce n'était pas non déterministe, c'était \emph{faux} : un leurre \code{a/Widget.tsx}
+remplaçait le \code{./b/Widget} importé, et l'\Error{} qui dépendait du vrai corps disparaissait
+(\og ✓ no issues found\fg). Désormais \code{Ambiguous} rend l'enfant inanalysable, comme un
+composant hors de l'exécution, et le parent porte une \Info{} \regle{analysis-limit}.
+\textbf{Alternative refusée} : analyser chaque candidat d'un nom ambigu. C'est sound et plus
+précis, et cela a été écarté sur mesure : 1\,347 références ambiguës sur les quatorze dépôts du
+corpus (huit n'en ont aucune), contre 24\,500 références inconnues déjà rapportées (+5,5\,\%) ;
+\code{<Button/>} seul compte 1\,453 sites ambigus quand le corpus est vu comme un seul arbre, et
+payer une analyse d'enfant par candidat à chacun est la forme du blocage quadratique de
+\issue{86}. Le résidu vient surtout d'alias \code{@workspace/*} non résolus (\issue{48}), dont
+la correction supprime la cause.
+\end{decision}
+
+\begin{piege}
+Le repli se fait sur \code{name}, le nom \emph{écrit} au site, et non sur \code{o.name}, le nom
+exporté que porte l'origine. Un alias importé à travers un barrel
+(\code{import { Widget as Panel } from "./index"}, où \file{index.ts} ne fait que
+ré-exporter) cherche donc \code{Panel} et répond \code{Unknown}, même si un seul fichier définit
+\code{Widget} (lecture de \src{src/engine/component_registry.rs}{115}{126} ; le test
+\code{an_origin_pointing_at_no_component_falls_back_to_the_name} utilise le même nom des deux
+côtés). Direction : un enfant inanalysable, donc havoc et \Info{} --- une perte de précision,
+pas de soundness. Inversement, un fichier voit toujours ses propres déclarations dans sa carte
+d'origines : un \code{<Child/>} défini dans le même fichier est résolu par l'origine, même si
+d'autres fichiers définissent un \code{Child}. Vérifié au \snapshotCommit{} sur un répertoire à
+trois fichiers (\code{Widget.tsx}, un barrel \code{index.ts} qui ré-exporte
+\code{{ Widget }}, et \code{App.tsx} qui importe \code{{ Widget as Panel } from "./index"}) :
+\code{--info --verbose} répond \Info{} \og component \code{`Panel`} was not found in the
+analysis registry\fg{}, pas \og several analysed files define\fg, bien qu'un seul fichier
+définisse \code{Widget}.
+\end{piege}
+
+% ===========================================================================
+\section{Les racines de l'analyse}
+\label{sec:inter-composants-racines}
+
+L'inlining descendant a besoin d'un point de départ : les composants analysés sans parent.
+
+\begin{definition}{Racine}{inter-composants-racine}
+Une \terme{racine} est un composant analysé en tête de la phase 1, sans parent : son
+environnement d'entrée est vide (\code{AbstractEnv::bottom()}), donc son paramètre props, non
+lié, se lit $\Top$. Les enfants qu'elle rend sont inlinés avec les props qu'elle leur calcule.
+\end{definition}
+
+\rustsnippet{src/engine/root_detector.rs}{25}{36}{les trois stratégies}
+
+Le driver choisit la stratégie d'après la ligne de commande : \code{--entry} l'emporte, puis
+\code{--all-roots}, sinon l'heuristique (\src{src/driver/mod.rs}{282}{288}).
+
+\subsection{L'heuristique : ce que personne ne rend}
+
+\rustsnippet[label={lst:inter-composants-heuristic}]{src/engine/root_detector.rs}{57}{91}{la détection des racines, stratégie par stratégie}
+
+Une racine heuristique est un composant qu'\emph{aucun} \code{CompApp} du programme ne
+référence. La collecte, \code{collect_compapp_refs} (\src{src/engine/root_detector.rs}{126}{139}),
+est syntaxique et sur-approximante : elle parcourt le rendu, les corps d'effets, de mémos, de
+callbacks et de handlers, et descend explicitement dans les \code{FnLit} imbriqués (un callback
+de \code{.map}, une render prop), que \code{for_each_child} ne traverse pas
+(\src{src/engine/root_detector.rs}{145}{160}). Chaque référence garde le nom écrit \emph{et}
+l'origine, parce que la même collecte sert aussi la relation des consommateurs de contexte
+(\issue{115}), qui a besoin de l'autre projection.
+
+La règle de marquage mérite d'être lue lentement. Une référence résolue exclut exactement un
+composant. Une référence \emph{non} résolue exclut \emph{tous} les composants de ce nom, car
+n'importe lequel peut être celui qui est rendu. Le commentaire du code dit ce qui arrivait
+avant \issue{7} : marquer par nom seul laissait la cible d'un alias (\code{<Panel/>} pour
+\code{Widget}) sans référence apparente ; elle était analysée une seconde fois comme racine,
+avec des props $\Top$, et cette passe \emph{écrasait} le résultat précis que le parent avait
+produit. Nous retrouverons ce phénomène d'écrasement au \cref{sec:inter-composants-cache}.
+
+\begin{exemple}{Racines, récursion, composant inconnu}{inter-composants-roots}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch16/roots.tsx}},label={lst:inter-composants-roots}]
+import { useState } from "react";
+
+function Leaf({ n }: { n: number }) { return <span>{n}</span>; }
+function Tree({ depth }: { depth: number }) {
+  return <Tree depth={depth - 1} />;
+}
+export function App() {
+  const [n, setN] = useState(0);
+  return (
+    <div>
+      <Leaf n={1} />
+      <Leaf n={1} />
+      <Tree depth={3} />
+      <Unknown onPick={setN} />
+    </div>
+  );
+}
+export function Orphan() { return <Leaf n={2} />; }
+\end{lstlisting}
+\begin{sortie}
+$ reactant check roots.tsx --info --verbose
+[verbose] symbol graph: 4 nodes, topo order = [Tree@roots.tsx, Leaf@roots.tsx, Orphan@roots.tsx, App@roots.tsx]
+[verbose] 2 components analyzed
+[verbose] cache hits: 5, misses: 3
+  [verbose] App: 1 iteration(s), widened: []
+  [verbose] Leaf: 0 iteration(s), widened: []
+  [verbose] Orphan: 0 iteration(s), widened: []
+  [verbose] Tree: 0 iteration(s), widened: []
+  App  (1 hooks)  roots.tsx
+    info   analysis-limit  component `Unknown` was not found in the analysis registry. Pass its file on the command line to analyse it (FN possible)
+    suspended  analysis-limit  4 passing check(s) withheld: the analysis was truncated in this component, so they are not guaranteed
+  Tree  (0 hooks)  roots.tsx
+    info   analysis-limit  recursive component reference `Tree` is not followed, so its props are treated as unknown; cross-component cycles are not fully analysed (FN possible)
+
+✓  1 file(s) no issues found.
+\end{sortie}
+\code{Leaf} est référencé ; \code{Tree} se référence lui-même, il n'est donc pas racine ; les
+racines sont \code{App} et \code{Orphan}. \og 2 components analyzed\fg{} compte les deux
+racines et rien d'autre : le compteur \code{components_analyzed} n'est incrémenté que par les
+deux boucles d'\code{analyze_program} (\srcline{src/engine/fixpoint.rs}{751},
+\srcline{src/engine/fixpoint.rs}{791}), pas par l'inlining des enfants --- son commentaire
+(\og including re-analyses due to fixpoint\fg, \srcline{src/engine/program_result.rs}{208}) est
+inexact. \code{App} fait une itération de plus que nécessaire parce que \code{setN}, passé à
+l'inconnu \code{<Unknown>}, est havoqué (\cref{sec:inter-composants-ascendant}). Les nombres de
+succès et de ratés de cache s'expliqueront au \cref{sec:inter-composants-inlining}.
+\end{exemple}
+
+\subsection{\code{--all-roots} et \code{--entry}}
+
+Avec \code{AllComponents}, tout composant est une racine, analysée avec des props $\Top$ si
+aucun parent ne l'a inliné avant. Avec \code{Explicit}, la liste vient de l'utilisateur :
+\code{explicit_matches} (\src{src/engine/root_detector.rs}{44}{50}) sélectionne, pour un nom nu
+\code{Foo}, \emph{tous} les composants écrits \code{Foo}, et pour la forme qualifiée
+\code{Foo@src/a/Foo.tsx} --- celle-là même que le rapport imprime en cas de collision --- un
+seul, via \code{resolve_display_name}. Une seule fonction sert au calcul des racines et à la
+détection des noms qui ne sélectionnent rien, pour que les deux ne puissent pas diverger :
+
+\rustsnippet{src/engine/root_detector.rs}{101}{110}{les noms d'entrée qui ne sélectionnent rien}
+
+Le driver en fait une erreur d'usage (\src{src/driver/mod.rs}{307}{321}) : une faute de frappe
+dans \code{--entry} réduisait autrefois l'exécution, en silence, à une analyse intra, et
+coûtait tous les résultats inter-composants avec un rapport par ailleurs propre.
+
+\begin{sortie}
+$ reactant check intro.tsx --entry Nope
+[error] --entry: no component named `Nope`
+[error] name a component defined in the analysed files, `Name@path` to pick one of several with the same name
+\end{sortie}
+
+\begin{piege}
+Une racine explicite mal choisie ne produit pas d'erreur, seulement moins de résultats. Sur
+l'\cref{lst:inter-composants-intro}, \code{--entry Badge} fait de \code{Badge} la racine,
+analysée avec des props $\Top$ ; \code{Inbox}, non atteint, passe en phase 2 (intra) et y
+havoque le setter qu'il passe à \code{<Badge>}. L'\Error{} disparaît (observé :
+\og ✓ 1 file(s) no issues found\fg{}, \code{Inbox: 1 iteration(s)}). À l'inverse,
+\code{--all-roots} la garde sur ce fichier, mais seulement parce que \code{Badge} (id 0) est
+analysé comme racine \emph{avant} \code{Inbox} (id 1), qui l'inline ensuite et écrase le
+résultat imprécis : l'ordre des identifiants décide (\cref{sec:inter-composants-cache}).
+\end{piege}
+
+\subsection{Un trou de la collecte, sans danger}
+
+\code{collect_compapp_refs} ne lit pas les arguments d'un \code{HookEntry::Custom} (branche
+\code{_ => {}}, \srcline{src/engine/root_detector.rs}{136}). Un élément passé à un hook opaque
+--- \code{useModal(<Dialog onClose={setS}/>)}, \code{useModal} venant d'un paquet --- ne marque
+donc pas \code{Dialog} comme référencé, et \code{Dialog} devient une racine, analysée avec des
+props $\Top$. Le dossier de notes l'a relevé sur la sonde (racines \code{App} et
+\code{Dialog}) ; le CLI montre les deux composants analysés hors inlining
+(\file{/tmp/ch16/hookarg.tsx}, \og 2 components analyzed\fg, \og cache hits: 0, misses: 0\fg) et la
+seule \Info{} sur le hook \code{useModal}. C'est une sur-approximation des racines, donc sûre ;
+on la note parce que \code{SymbolGraph}, lui, parcourt ces arguments
+(\src{src/engine/symbol_graph.rs}{271}{275}) : deux collectes \og syntaxiques\fg{} du même
+périmètre ne voient pas les mêmes choses.
+
+% ===========================================================================
+\section{L'inlining descendant}
+\label{sec:inter-composants-inlining}
+
+\subsection{Le contexte partagé \code{InterCtx}}
+
+Une racine est analysée par \code{analyze_component_impl} (\cref{chap:point-fixe-composant}),
+avec un argument de plus : un contexte inter-composants.
+
+\rustsnippet[label={lst:inter-composants-interctx}]{src/domains/context.rs}{59}{77}{le contexte d'une analyse inter-composants}
+
+Tout l'état mutable partagé --- cache, store partagé, graphe d'appel, statistiques, table des
+résultats --- est derrière des \code{RefCell}, elles-mêmes derrière des références partagées :
+on passe \code{&InterCtx} partout sans conflit d'emprunts mutables. Deux champs sont propres à
+un niveau : \code{component}, le composant en cours, et \code{call_stack}, la pile de ses
+ancêtres. \code{child(c)} fabrique le contexte d'un enfant en copiant toutes les références et
+en empilant le composant courant sur une pile neuve ; \code{is_recursive(id)} teste
+\code{call_stack.contains(&id) || component == id} (\src{src/domains/context.rs}{80}{103} ; la
+pile ne contient que les ancêtres, d'où le second disjoint, \cref{chap:statevalue-stabilite}).
+Enfin \code{analyze_child} est un pointeur de fonction, \code{analyze_component_inter}
+(\src{src/engine/fixpoint.rs}{62}{81}), fourni par le moteur : il casse le cycle de modules
+entre le transfert (\file{domains}), qui rencontre l'élément, et le point fixe
+(\file{engine}), qui sait analyser un composant.
+
+\subsection{\code{eval_comp_app}, pas à pas}
+
+L'évaluation d'un \code{Expr::CompApp} dans le domaine des valeurs délègue à
+\code{eval_comp_app} (\src{src/domains/transfer/state_value.rs}{158}{163}). La fonction tient
+en 125 lignes, que nous lisons en trois morceaux.
+
+\rustsnippet[label={lst:inter-composants-eca-1}]{src/domains/transfer/state_value.rs}{476}{518}{sans contexte inter, puis résolution de l'enfant}
+
+\begin{enumerate}
+  \item \textbf{Pas d'\code{InterCtx}} : analyse d'un composant seul, phase 2, ou passe de
+        rafraîchissement (\cref{sec:inter-composants-evaluations}). Tout enfant est alors
+        inanalysable : on havoque les setters qui s'échappent dans ses props et on rend
+        \code{Stable}.
+  \item \textbf{Résolution} par \code{resolve_child}
+        (\cref{lst:inter-composants-resolve-child}), puis \code{ComponentId}. \code{Unknown} et
+        \code{Ambiguous} sont enregistrés séparément dans les statistiques --- ils demandent à
+        l'utilisateur deux remèdes différents, élargir l'exécution ou désambiguïser --- et
+        deviendront des \Info{} \regle{analysis-limit}
+        (\src{src/rules/impls/analysis_limit_info.rs}{53}{77}) ; puis havoc et \code{Stable}.
+\end{enumerate}
+
+\rustsnippet[label={lst:inter-composants-eca-2}]{src/domains/transfer/state_value.rs}{520}{556}{récursion, props abstraites, cache}
+
+\begin{enumerate}\setcounter{enumi}{2}
+  \item \textbf{Récursion} : si l'enfant est déjà sur la pile, on compte une coupure, on note
+        la paire \code{(courant, enfant)} et on rend \code{Stable} --- \emph{avant} le clonage
+        de l'IR, qui coûte. Il n'y a \emph{pas} de havoc ici, contrairement aux branches
+        \code{Unknown}/\code{Ambiguous} (\cref{sec:inter-composants-recursion}).
+  \item \textbf{Props} : \code{eval_props_map} évalue chaque champ de l'objet props dans
+        l'environnement courant du parent et rend une carte prop $\mapsto$ \code{EnvVal}, qui
+        garde les sites du tas d'une prop fermeture ou objet. Sa version aplatie en
+        \code{StateValue} sert de clé au cache et au graphe d'appel.
+  \item \textbf{Cache} : un succès (égalité de treillis des props,
+        \cref{sec:inter-composants-cache}) enregistre une arête du graphe d'appel et rend
+        \code{Stable} \emph{sans ré-analyser l'enfant}.
+\end{enumerate}
+
+\rustsnippet[label={lst:inter-composants-eca-3}]{src/domains/transfer/state_value.rs}{558}{593}{l'environnement de l'enfant, son analyse, l'enregistrement}
+
+\begin{enumerate}\setcounter{enumi}{5}
+  \item \textbf{Environnement de l'enfant} : un environnement vide, un site frais
+        \code{props_id = ExprId::fresh()} sous lequel on range, dans un tas neuf, l'objet des
+        props (\code{HeapValue::Obj}), plus une copie des valeurs de tas des props qui ont
+        des sites ; le paramètre de l'enfant est lié à ce site
+        (\code{extend_loc}). C'est l'\code{AbstractObject} d'\adr{12} §9 : un accès
+        \code{props.onSeen} dans l'enfant lit le tas et retrouve le setter du parent.
+  \item \textbf{Analyse} : \code{analyze_child} lance une analyse \emph{complète} de l'enfant,
+        avec son propre point fixe, sous le contexte fils.
+  \item \textbf{Enregistrement} : le résultat est rangé dans \code{results} (en
+        \emph{remplaçant} celui qui s'y trouvait) et dans le cache, et une arête est ajoutée
+        au graphe d'appel. La valeur de l'élément est, dans tous les cas, \code{Stable}.
+\end{enumerate}
+
+La \cref{fig:inter-composants-sequence} résume ces échanges sous forme de diagramme de
+séquence.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[x=2.55cm,y=-0.62cm,font=\scriptsize,
+    tete/.style={bloc,font=\scriptsize,minimum width=20mm,inner sep=3pt},
+    vie/.style={draw=ra-gray,dashed},
+    msg/.style={fleche,thin},
+    ret/.style={fleche,thin,dashed},
+    lab/.style={font=\scriptsize,fill=white,inner sep=1pt}]
+  \foreach \x/\n/\t in {0/p/{rendu du parent},1/e/{\code{eval_comp_app}},2/r/{registre},3/c/{cache},4/k/{analyse de l'enfant},5/s/{store partagé}} {
+    \node[tete] (\n) at (\x,0) {\t};
+    \draw[vie] (\x,0.8) -- (\x,17.2);
+  }
+  \draw[msg] (0,1.6) -- node[lab,above] {\code{CompApp(name, props, origin)}} (1,1.6);
+  \draw[msg] (1,2.8) -- node[lab,above] {\code{resolve_child}} (2,2.8);
+  \draw[ret] (2,3.8) -- node[lab,above] {\code{Resolved} / \code{Unknown} / \code{Ambiguous}} (1,3.8);
+  \node[etiquette,anchor=west,align=left] at (1.05,5.3) {inconnu, ambigu : havoc, \code{Stable}\\ sur la pile ? coupure, \code{Stable}\\ sinon \code{eval_props_map}};
+  \draw[msg] (1,7.0) -- node[lab,above] {\code{lookup(child, props)}} (3,7.0);
+  \draw[ret] (3,8.1) -- node[lab,above] {succès : arête, \code{Stable}} (1,8.1);
+  \draw[msg] (1,9.4) -- node[lab,above] {\code{analyze_child(ir, env, tas, ctx fils)}} (4,9.4);
+  \draw[msg] (4,10.8) -- node[lab,above] {\code{update((parent, l), v)}} (5,10.8);
+  \node[etiquette,anchor=west,align=left] at (4.05,11.8) {appel d'un setter\\ du parent};
+  \draw[ret] (4,13.0) -- node[lab,above] {\code{AnalysisResult}} (1,13.0);
+  \draw[msg] (1,14.0) -- node[lab,above] {\code{insert} ; \code{results.insert}} (3,14.0);
+  \draw[ret] (1,15.0) -- node[lab,above] {\code{Stable}} (0,15.0);
+  \draw[msg] (0,16.4) -- node[lab,above] {\code{slice(parent)} au test de convergence} (5,16.4);
+\end{tikzpicture}
+\caption{Diagramme de séquence de l'évaluation d'un élément \code{<Child/>} sous un
+\code{InterCtx}. Les retours sont en pointillés. L'écriture de l'enfant dans le store partagé
+n'est lue par le parent qu'au test de convergence de \emph{sa} boucle, qui relance un tour si
+elle fait monter son état.}
+\label{fig:inter-composants-sequence}
+\end{figure}
+
+\subsection{Les props dans le tas}
+\label{sec:inter-composants-props-tas}
+
+Pourquoi passer les props par le tas plutôt que par l'environnement ? Parce qu'un enfant doit
+pouvoir \emph{exécuter} une fermeture reçue en prop. \code{eval_props_map}
+(\src{src/domains/transfer/state_value.rs}{653}{689}) alloue dans le tas du parent un
+\code{FnLit} passé en ligne (\code{onTick={() => setB(b + 1)}}), avec ses captures, et garde
+son site ; une prop qui aliase un littéral déjà alloué garde aussi ses sites
+(\code{resolve_locs}). L'enfant reçoit une copie de ces entrées : quand son effet appelle
+\code{onTick()}, le corps s'exécute avec ses captures, et l'appel de \code{setB} a pour
+propriétaire le parent (\cref{chap:transfert-stores}, exemple \og une boucle croisée\fg).
+
+Deux limites de cette frontière sont traitées ailleurs, et il suffit ici de les situer. Seuls
+les sites \emph{directs} des props sont copiés : une fermeture rangée comme \emph{membre} d'un
+objet passé en prop arrive dans l'enfant sans son corps (défaut D11 du dossier 05,
+\cref{chap:transfert-stores}). Et les sites copiés gardent les \code{ExprId} du fichier parent,
+qui peuvent entrer en collision avec ceux que l'enfant alloue dans son propre fichier
+(\cref{chap:ir,chap:splice-inlining}).
+
+\subsection{Combien de fois un élément est-il évalué ?}
+\label{sec:inter-composants-evaluations}
+
+Les compteurs de cache de l'\cref{ex:inter-composants-roots} (5 succès, 3 ratés) paraissent
+énigmatiques tant qu'on ne sait pas combien de fois un \code{CompApp} est évalué. Trois faits,
+vérifiés dans le code, suffisent.
+
+\begin{enumerate}
+  \item La passe de rendu d'un composant tourne \code{iterations + 1} fois sous
+        \code{InterCtx} : la boucle externe sort sur \code{new_state.leq(&state)}
+        \emph{avant} d'incrémenter \code{iteration} (\src{src/engine/fixpoint.rs}{355}{499}).
+  \item Elle est suivie d'une passe de rafraîchissement \emph{sans} \code{InterCtx}
+        (\src{src/engine/fixpoint.rs}{532}{560}), qui ne ré-inline rien : elle passe par la
+        branche \og pas d'\code{InterCtx}\fg{} d'\code{eval_comp_app}.
+  \item Dans une passe, un élément imbriqué dans un élément hôte est évalué \emph{une} fois
+        (bras \code{CompApp} d'\code{exec_callbacks_depth},
+        \src{src/domains/interp/interpreter.rs}{529}{533}) ; un élément qui est
+        \emph{directement} l'expression du \code{return} l'est \emph{deux} fois : par ce même
+        bras, puis par l'appel d'\code{exec_expr_effects} sur le terminateur \code{Return}
+        (\src{src/domains/interp/interpreter.rs}{123}{125},
+        \src{src/engine/cfg_analyzer.rs}{84}{86}). La seconde évaluation est un succès de
+        cache.
+\end{enumerate}
+
+\begin{exemple}{Le \code{return} direct compte double}{inter-composants-double}
+Dans \file{/tmp/ch16/ret.tsx}, \code{function A() { return <Leaf n={1} />; }} et
+\code{function B() { return <div><Leaf n={2} /></div>; }} : \code{--verbose} rapporte
+\og cache hits: 1, misses: 2\fg. Un raté par valeur de props, et un seul succès : la seconde
+évaluation du \code{return} direct d'\code{A}. Sur \file{roots.tsx}, \code{App}
+(\code{iterations = 1}, donc deux passes, éléments imbriqués dans \code{<div>}) évalue ses
+quatre éléments deux fois ; \code{<Unknown>} ne touche pas le cache ; \code{Orphan}
+(\code{return <Leaf n={2} />} direct) évalue son élément deux fois. On obtient trois ratés
+(\code{Leaf{n:1}}, \code{Tree}, \code{Leaf{n:2}}) et cinq succès (le second
+\code{<Leaf n={1}/>} de la première passe, les trois éléments résolus de la seconde passe
+d'\code{App}, la seconde évaluation d'\code{Orphan}). Même raisonnement sur \file{drill.tsx} :
+\og cache hits: 3, misses: 7\fg{} (\cref{exo:inter-composants-drill-cache}).
+\end{exemple}
+
+Le coût d'un élément est donc au plus une analyse de l'enfant par valeur de props distincte,
+bornée par le cache, mais cette analyse est elle-même récursive (les enfants de l'enfant) : le
+coût total dépend de la profondeur de l'arbre et du nombre de passes de chaque ancêtre. Il n'y
+a pas de borne plus fine dans le code ; la pile interdit seulement les cycles.
+
+\subsection{La récursion : une coupure, pas un havoc}
+\label{sec:inter-composants-recursion}
+
+Un composant récursif est légitime en React --- un arbre, un menu imbriqué --- et chaque
+instance a son propre état. L'analyse, elle, ne suit pas la récursion : \adr{12} §11 prévoyait
+une coupure \og façon MOPSA\fg{} avec un résultat $\Top$ et une hypothèse
+\code{A_ignore_recursion} enregistrée.
+
+\begin{exemple}{Un setter remis à l'instance intérieure}{inter-composants-rec}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch16/rec.tsx}},label={lst:inter-composants-rec}]
+import { useState } from "react";
+function Tree({ depth, onHit }: { depth: number; onHit?: (v: number) => void }) {
+  const [x, setX] = useState(0);
+  if (depth < 3) onHit?.(1);
+  return <div>{x}{depth > 0 ? <Tree depth={depth - 1} onHit={setX} /> : null}</div>;
+}
+export function App() {
+  return <Tree depth={3} />;
+}
+\end{lstlisting}
+À l'exécution, l'instance intérieure appelle \code{onHit}, c'est-à-dire le \code{setX} de
+l'instance extérieure, pendant son rendu : un vrai \regle{cross-setter-in-render}.
+\begin{sortie}
+$ reactant check rec.tsx --info --show-clean
+  Tree  (1 hooks)  rec.tsx
+    info   analysis-limit  recursive component reference `Tree` is not followed, so its props are treated as unknown; cross-component cycles are not fully analysed (FN possible)
+    suspended  analysis-limit  4 passing check(s) withheld: the analysis was truncated in this component, so they are not guaranteed
+
+✓  1 file(s) no issues found.
+\end{sortie}
+\end{exemple}
+
+L'analyse inline \code{Tree} une fois depuis \code{App} ; l'élément \code{<Tree …/>} intérieur
+tombe sur la coupure, qui rend \code{Stable} \emph{sans} havoc : \code{x} n'est pas mis à $\Top$,
+et l'écriture de l'instance intérieure n'est vue par personne. Le faux négatif est
+\emph{déclaré} --- \Info{} \regle{analysis-limit} et suspension des assurances
+\og verified\fg{} du composant tronqué --- et c'est cette suspension, non une
+sur-approximation de l'état, qui protège les garanties publiées.
+
+\begin{piege}
+Le texte de l'\Info{} (\og its props are treated as unknown\fg) décrit l'intention d'\adr{12},
+pas le code : l'instance récursive n'est pas analysée, ses props ne sont ni évaluées ni
+havoquées. De même, les commentaires de \code{AnalysisStats::recursive_component_refs}
+(\og cut to ⊤\fg, \srcline{src/engine/program_result.rs}{210}) et de
+\code{ProgramAnalysisResult::recursive_components} (\og received ⊤ result\fg,
+\srcline{src/engine/program_result.rs}{33}) sont inexacts : la coupure rend \code{Stable} et ne
+met rien à $\Top$ (\src{src/domains/transfer/state_value.rs}{520}{528}). Havoquer ici, avec le
+même mécanisme que la branche \code{Unknown}, serait la correction centrale ; le choix n'est
+pas tranché au snapshot.
+\end{piege}
+
+% ===========================================================================
+\section{Le flux ascendant : setters, store partagé, havoc}
+\label{sec:inter-composants-ascendant}
+
+\subsection{Un setter qui porte son propriétaire}
+
+\adr{12} §7 introduisait une valeur \code{ComponentSetter { component, label }}, transposition
+du \code{Set_clos { label, path }} de React-tRace~\cite{LeeAhnYi2025} : un setter qui sait à
+quel composant il appartient. Elle est devenue la composante setter du produit
+\code{StateValue} (\cref{def:statevalue}), dont \code{as_setter()} rend le couple
+\code{(ComponentId, HookLabel)}. Quand un parent passe \code{setSeen}, la prop \code{onSeen} de
+l'enfant vaut ce setter, propriétaire compris. L'interpréteur n'a plus qu'à regarder, à chaque
+appel, si le callee s'évalue en setter :
+
+\rustsnippet[label={lst:inter-composants-cross-setter}]{src/domains/interp/interpreter.rs}{368}{391}{l'appel d'un setter porteur de propriétaire écrit le store partagé}
+
+L'argument (le premier, ou $\Top$ s'il manque ou ne se lit pas) est joint dans l'entrée
+\code{(propriétaire, label)} du store partagé. Le bras est gardé par \code{ctx.inter.is_some()} :
+sans contexte inter, il ne fait rien --- mais sans contexte inter, aucun setter étranger ne
+peut non plus arriver dans l'environnement.
+
+\subsection{Le store partagé, et pourquoi il n'y a pas de point fixe de programme}
+
+\rustsnippet{src/domains/stores/shared_state_store.rs}{29}{34}{une mise à jour monotone}
+
+Le store partagé (\cref{def:store}) associe à chaque couple \code{(ComponentId, HookLabel)} une
+valeur, $\Bot$ pour une clé inconnue, et ne fait que croître. La boucle externe du parent
+importe sa tranche à chaque test de convergence :
+
+\rustsnippet[label={lst:inter-composants-import}]{src/engine/fixpoint.rs}{486}{497}{le parent importe les écritures de ses enfants}
+
+\begin{decision}[ADR-12 §1, §5, §8 --- inlining descendant, flux bidirectionnel, pas de couche programme]
+Le parent est analysé d'abord, et l'enfant est analysé au point d'application avec les props
+abstraites ; pas de résumés paramétriques ascendants, qui demanderaient une couche d'abstraction
+supplémentaire \og without justified gain at the current stage\fg. Le flux est bidirectionnel :
+les props descendent, les setters remontent. Et il n'y a \og no separate program-level fixpoint
+layer\fg{} : les écritures d'un enfant sont des mutations du store partagé,
+\og indistinguishable from local setters from the fixpoint's perspective\fg. La sensibilité au
+contexte est obtenue par le cache (une analyse par valeur de props). Écarts avec le texte :
+les clés sont des \code{ComponentId}, pas des \code{Symbol} (\adr{40}) ; la récursion rend
+\code{Stable}, pas $\Top$.
+\end{decision}
+
+\begin{proposition}{L'import d'un store monotone préserve la convergence}{inter-composants-monotone}
+Soit $S_i$ l'état du parent au tour $i$ et $X_i$ sa tranche du store partagé lue à ce tour. Si
+$X_i \lleq X_{i+1}$ pour tout $i$ (le store ne fait que croître) et si le nouvel état est
+$S'_i = F(S_i) \join X_i$ avec $F$ monotone, la boucle externe du parent, munie de son widening
+(\cref{chap:point-fixe-composant}), s'arrête sur un état $S$ tel que $F(S) \join X \lleq S$,
+où $X$ est la tranche lue au dernier tour.
+\end{proposition}
+
+\noindent\emph{Esquisse.} La suite des tranches est croissante dans un domaine où le widening
+force la stabilisation des slots ; le test \code{new_state.leq(&state)} est le même que pour un
+setter local, et une écriture d'enfant n'est, pour la boucle, qu'un terme de plus dans le join.
+La proposition ne dit rien de la tranche écrite \emph{après} le dernier tour du parent (par un
+enfant analysé plus tard, sous une autre racine) : c'est l'une des raisons pour lesquelles
+la table des résultats n'est pas un point fixe de programme
+(\cref{sec:inter-composants-cache}). \hfill$\square$
+
+Sur l'\cref{lst:inter-composants-intro}, la chaîne est complète : \code{Inbox} rend
+\code{<Badge>}, qui est inliné ; le rendu de \code{Badge} appelle \code{onSeen(1)}, setter
+d'\code{Inbox} : \code{shared[(Inbox, 0)]} $\join$= $[1,1]$. Au test de convergence,
+\code{Inbox} importe sa tranche, son état monte, il fait un second tour (\og Inbox: 1
+iteration(s)\fg{} en \code{--verbose}), où \code{<Badge>} est un succès de cache (la prop
+\code{onSeen} n'a pas changé : \og cache hits: 1, misses: 1\fg). La règle
+\regle{cross-setter-in-render}, qui tourne sur \code{Badge}, voit dans son résultat un appel
+inconditionnel, pendant le rendu, d'une valeur setter dont le propriétaire est un autre
+composant.
+
+\subsection{Le havoc des setters qui s'échappent}
+
+\begin{definition}{Havoc}{inter-composants-havoc}
+\terme{Havoquer} un slot, c'est y joindre $\Top$ parce que son setter s'échappe vers un
+code que l'analyse ne peut pas suivre : un enfant inconnu, ambigu, ou toute analyse sans
+contexte inter. Un tel code peut appeler le setter n'importe quand, avec n'importe quel
+argument ; laisser le slot intact sous-approximerait l'état et fabriquerait des conclusions
+\og l'état est stable\fg.
+\end{definition}
+
+\code{havoc_setter_props} (\src{src/domains/transfer/state_value.rs}{265}{297}, détaillé au
+\cref{chap:transfert-stores}) collecte, pour chaque champ de l'objet props, le setter nu
+(\code{as_setter()} sur la valeur) et les setters cachés derrière des fermetures, des objets du
+tas et des spreads (\code{collect_escaping_setters}). Puis :
+
+\rustsnippet{src/domains/transfer/state_value.rs}{287}{296}{un setter propre au composant ou d'un ancêtre}
+
+Un setter du composant courant est havoqué dans son propre store ; un setter d'ancêtre, arrivé
+par une prop et transmis plus bas, l'est dans le store partagé, que l'ancêtre importera.
+Sur \file{roots.tsx}, c'est ce havoc de \code{setN}, remis à \code{<Unknown>}, qui fait faire
+à \code{App} un second tour.
+
+\begin{exemple}{Un setter dans un littéral inline n'est pas havoqué}{inter-composants-hv}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch16/hv.tsx}},label={lst:inter-composants-hv}]
+import { useState } from "react";
+export function A() { const [n, setN] = useState(0); return <div>{n}<Unknown onPick={setN} /></div>; }
+export function B() { const [n, setN] = useState(0); return <div>{n}<Unknown api={{ setN }} /></div>; }
+export function C() { const [n, setN] = useState(0); const api = { setN }; return <div>{n}<Unknown api={api} /></div>; }
+export function D() { const [n, setN] = useState(0); return <div>{n}<Unknown list={[setN]} /></div>; }
+\end{lstlisting}
+\begin{sortie}
+$ reactant check hv.tsx --verbose
+  [verbose] A: 1 iteration(s), widened: []
+  [verbose] B: 0 iteration(s), widened: []
+  [verbose] C: 1 iteration(s), widened: []
+  [verbose] D: 0 iteration(s), widened: []
+\end{sortie}
+(lignes \code{[verbose]} des composants seulement.) Le havoc, qui fait bouger \code{n} au premier
+tour et donc provoque un second tour, a lieu pour \code{A} (setter nu) et pour \code{C} (objet
+du tas), \emph{pas} pour \code{B} ni \code{D}. \code{collect_escaping_setters}
+(\src{src/domains/transfer/state_value.rs}{315}{367}) descend dans les champs d'un
+\code{ObjectLit} ou d'un \code{ArrayLit} syntaxique, mais n'y retient un champ \code{Var} que
+s'il désigne un site du tas ; un setter nu en position de champ n'est poussé nulle part, et
+\code{havoc_setter_props} ne teste \code{as_setter()} que sur la valeur du champ de props
+entier. L'état reste à sa valeur initiale : c'est un trou de soundness du domaine des valeurs,
+dont le cas le plus courant est \code{<Ctx.Provider value={{ q, setQ }}>} --- un provider
+est un composant inconnu du registre (\cref{sec:inter-composants-contextes}). Le dossier de
+notes n'a construit aucun diagnostic faux à partir de ce trou ; il n'avait pas d'issue au
+snapshot.
+\end{exemple}
+
+% ===========================================================================
+\section{Le cache de composants}
+\label{sec:inter-composants-cache}
+
+\subsection{Une analyse par valeur de props}
+
+\rustsnippet{src/engine/component_cache.rs}{19}{27}{le cache, indexé par identité et props abstraites}
+
+La clé est l'identité de l'enfant et ses props abstraites aplaties en \code{StateValue} (les
+sites du tas sont perdus à l'aplatissement). Chaque composant a au plus
+\code{DEFAULT_MAX_PER_COMPONENT = 5} entrées (\srcline{src/engine/component_cache.rs}{10}).
+
+\rustsnippet{src/engine/component_cache.rs}{98}{119}{égalité stricte : mêmes clés, $\lleq$ dans les deux sens}
+
+Le succès exige l'égalité de treillis, $a \lleq b \wedge b \lleq a$, champ par champ, après une
+comparaison des cardinaux. \adr{12} §2 l'explique : ne jamais réutiliser un résultat calculé
+pour une entrée moins précise (par exemple $\Top$) quand l'entrée courante est plus précise.
+
+\rustsnippet{src/engine/component_cache.rs}{65}{92}{insertion, et éviction par join}
+
+Au-delà de cinq entrées, toutes les props sont jointes point à point, une clé absente d'une
+entrée comptant pour $\Top$ (\code{join_all_props}, \src{src/engine/component_cache.rs}{121}{136}),
+en une seule entrée dégradée.
+
+\begin{exemple}{Égalité stricte et éviction}{inter-composants-cache}
+\file{/tmp/ch16/cache1.tsx} (\code{<Leaf n={1}/><Leaf n={1}/>} sous un parent sans état) :
+\og cache hits: 1, misses: 1\fg{} ; le second site est un succès. \file{/tmp/ch16/cache.tsx}
+(\code{n} vaut 1 à 6, puis encore 1) : \og cache hits: 0, misses: 7\fg. Au sixième insert, les
+cinq entrées et la nouvelle sont jointes en \code{n} $\in [1,6]$ ; le septième site
+(\code{n = 1}) rate, car $[1,1] \neq [1,6]$, et il est ré-inséré. Le test unitaire
+\code{eviction_on_overflow} (\src{src/engine/component_cache.rs}{281}{299}) vérifie qu'il ne
+reste qu'une entrée après débordement ; \code{top_props_match_anything_after_eviction}, malgré
+son nom, vérifie qu'un \code{Stable} \emph{rate} contre une entrée $\Top$
+(\src{src/engine/component_cache.rs}{301}{326}).
+\end{exemple}
+
+\subsection{Un \og déjà vu\fg{}, pas une table de résultats}
+
+Voici la subtilité la plus importante du chapitre. \code{lookup} renvoie un
+\code{Arc<AnalysisResult>}, mais son seul appelant, \code{eval_comp_app}, ne regarde que
+\code{is_some()} (\cref{lst:inter-composants-eca-2}). Trois conséquences :
+\begin{itemize}
+  \item le résultat stocké dans une entrée n'est \emph{jamais relu} ;
+  \item le résultat \og de programme\fg{} d'un enfant est \code{results[child]}, remplacé à
+        chaque raté par l'analyse du dernier site, jamais joint ;
+  \item l'entrée dégradée associe des props jointes au résultat de la \emph{dernière}
+        insertion : la doc (\og sound over-approximation\fg) ne vaut que pour la décision
+        \og sauter une analyse\fg.
+\end{itemize}
+
+Sauter une analyse est sound pour le \emph{store partagé} : l'analyse sautée a déjà fait ses
+écritures, de façon monotone, lors du raté qui a rempli l'entrée. Elle ne l'est pas pour la
+table des résultats, que lisent toutes les règles intra-composant de l'enfant.
+
+\begin{exemple}{Un résultat d'enfant écrasé : un faux négatif qui dépend de l'ordre}{inter-composants-overwrite}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch16/overwrite.tsx}},label={lst:inter-composants-overwrite}]
+import { useState } from "react";
+
+function Child({ onUpdate }: { onUpdate: (n: number) => void }) {
+  onUpdate(1);
+  return <div />;
+}
+export function A() {
+  const [n, setN] = useState(0);
+  return <Child onUpdate={setN} />;
+}
+export function B() {
+  return <Child onUpdate={() => {}} />;
+}
+\end{lstlisting}
+\begin{sortie}
+$ reactant check overwrite.tsx
+   2 clean component(s) hidden, rerun with --show-clean
+
+✓  1 file(s) no issues found.
+\end{sortie}
+Renommons \code{A} en \code{Z}, sans rien changer d'autre (\file{/tmp/ch16/overwrite2.tsx}) :
+\begin{sortie}
+$ reactant check overwrite2.tsx
+  Child  (0 hooks)  overwrite2.tsx
+    error  cross-setter-in-render  var:onUpdate  (line 4:2)  prop `onUpdate` (a state setter of parent `Z`) called during render of `Child`, which triggers a parent re-render on every render
+\end{sortie}
+(dernières lignes omises.) Les racines sont analysées dans l'ordre des identifiants, donc
+alphabétique dans un même fichier. Dans le premier cas, \code{A} inline \code{Child} avec un
+setter, puis \code{B} l'inline avec une fonction vide --- props différentes, raté --- et
+\emph{remplace} \code{results[Child]}. La règle ne voit plus que le dernier site. Dans le
+second, \code{Z} passe en dernier et son site gagne.
+\end{exemple}
+
+L'erreur réelle d'\code{A} est perdue, sans \Info{} ni suspension : c'est un faux négatif non
+déclaré, qui viole l'invariant de soundness du projet. Il n'avait pas d'issue au snapshot (le
+dossier de notes l'a signalé). La même famille couvre \code{--all-roots} : chaque enfant y est
+ré-analysé comme racine, avec des props $\Top$, et si son identifiant est plus grand que celui
+de son parent, ce dernier résultat l'emporte (la boucle de phase 1 ne saute pas une racine déjà
+présente dans \code{results}). La correction centrale n'est pas triviale : joindre les résultats
+de tous les sites, ou indexer les résultats par (identité, props) et faire lire aux règles
+l'ensemble des contextes d'un composant (\cref{exo:inter-composants-overwrite}).
+
+\begin{piege}
+Deux résultats d'un même composant ne se joignent pas comme deux états : un
+\code{AnalysisResult} porte des CFG, des tables de hooks, des relations, des environnements par
+bloc. C'est pourquoi \code{exit_env} lui-même joint avec \code{reduce} et non avec
+\code{fold(⊥, join)} : dans ce treillis d'environnements, $\Bot$ n'est pas neutre pour le join,
+une clé absente de $\Bot$ devenant $\Top$ (\src{src/engine/analysis_result.rs}{275}{288}).
+\end{piege}
+
+% ===========================================================================
+\section{Deux phases}
+\label{sec:inter-composants-phases}
+
+\rustsnippet[label={lst:inter-composants-phase1}]{src/engine/fixpoint.rs}{720}{755}{phase 1 : les racines, sous un \code{InterCtx}}
+
+La phase 1 analyse chaque racine, dans l'ordre croissant des identifiants, avec un contexte
+inter neuf (pile vide) ; ses enfants sont inlinés à la volée, et leurs résultats s'accumulent
+dans \code{results}. La phase 2 (\src{src/engine/fixpoint.rs}{764}{794}, commentée au
+\cref{chap:point-fixe-composant}) balaie tous les composants qui ne sont ni racines ni présents
+dans \code{results}, et les analyse \emph{intra} : \code{inter = None}, props $\Top$, mais avec
+leur vrai \code{ComponentId}, parce qu'un label \code{Versioned} minté ici sera comparé à des
+résultats de phase 1. Entre les deux, une photographie :
+
+\rustsnippet{src/engine/fixpoint.rs}{757}{762}{ce que la phase 1 a atteint, photographié avant la phase 2}
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=8mm and 14mm]
+  \node[bloc,very thick] (app) {\code{App}\\{\scriptsize racine}};
+  \node[bloc,very thick,right=30mm of app] (page) {\code{Page}\\{\scriptsize racine}};
+  \node[bloc,below=of app] (wb) {\code{Widget@b/Widget.tsx}\\{\scriptsize inliné, props d'\code{App}}};
+  \node[bloc,draw=ra-gray,fill=white,right=22mm of page] (wa) {\code{Widget@a/Widget.tsx}\\{\scriptsize phase 2 : intra, props $\Top$}};
+  \node[cfgbloc,below=of page] (amb) {\code{<Widget>} ambigu\\havoc de \code{setV}};
+  \draw[flechemust] (app) -- node[etiquette,left] {\code{<Panel>}} (wb);
+  \draw[flechemay] (page) -- (amb);
+  \begin{scope}[on background layer]
+    \node[draw=ra-blue,dashed,rounded corners,fill=ra-bg!40,inner sep=3mm,fit=(app)(page)(wb)(amb),label={[etiquette]above:\code{phase1_reached}}] {};
+  \end{scope}
+  \node[etiquette,below=2mm of wa,align=center] {aucune arête du graphe d'appel ;\\ \code{callers_of} vide = ascendance inconnue};
+\end{tikzpicture}
+\caption{Les deux phases sur l'exemple de la \cref{lst:inter-composants-amb}. En phase 1, les
+racines \code{App} et \code{Page} sont analysées ; \code{App} inline \code{Widget@b} par son
+origine ; la référence nue de \code{Page} est ambiguë, donc havoquée. Personne n'atteint
+\code{Widget@a}, que la phase 2 analyse seul. L'ensemble \code{phase1_reached} (cadre
+pointillé) est photographié entre les deux.}
+\label{fig:inter-composants-phases}
+\end{figure}
+
+\subsection{La discipline de lecture de \code{phase1_reached}}
+
+Un composant de phase 2 n'a pas de \code{InterCtx}, donc n'enregistre aucune arête du graphe
+d'appel : vu par \code{callers_of}, il est indiscernable d'une vraie racine. C'est tout le sens
+de la photographie (\issue{110}), dont la documentation énonce la règle :
+
+\rustsnippet{src/engine/program_result.rs}{52}{68}{ce que la phase 1 a atteint, et comment le lire}
+
+\begin{invariant}{Une ascendance vide n'est pas une ascendance prouvée}{inter-composants-ascendance}
+Pour un composant hors de \code{phase1_reached}, un \code{callers_of} vide signifie
+\og ascendance inconnue\fg, jamais \og racine prouvée\fg. Toute relation qui remonte les appelants
+pour conclure à une \emph{absence} --- pas de provider au-dessus, pas d'appelant qui détienne le
+setter --- consulte d'abord cet ensemble.
+\end{invariant}
+
+\code{complete_ancestry} (\src{src/engine/program_result.rs}{134}{151}) rend la fermeture
+transitive des appelants, ou \code{None} dès qu'un composant du chemin n'a pas été analysé en
+phase 1. Son consommateur est la relation des consommateurs de contexte
+(\srcline{src/rules/helpers/context_flow.rs}{100}), qui écarte aussi une ascendance passant par
+une récursion coupée (\code{recursive_components},
+\src{src/rules/helpers/context_flow.rs}{104}{108}). La limite ouverte \issue{20} en est la
+conséquence visible : \regle{cross-component-infinite-loop} reste muette quand le parent n'est
+analysé qu'en intra.
+
+Le \cref{chap:point-fixe-composant} a listé ce que \code{inter = None} coûte en phase 2 : hooks
+personnalisés non greffés, \code{SummaryRegistry} non consulté, tout enfant havoqué, troncature
+du budget d'utilitaires silencieuse. Ajoutons-en une, symétrique de la dernière :
+\code{callback_depth_capped} (\src{src/domains/interp/interpreter.rs}{484}{491}) et
+\code{inline_budget_exhausted} (\src{src/engine/fixpoint.rs}{211}{218}) ne sont renseignés que
+sous \code{InterCtx}, si bien qu'un composant de phase 2 qui atteint ces plafonds ne porte pas
+l'\Info{} correspondante. Les résumés de dépendance de rendu, eux, restent précis en phase 2,
+parce qu'ils sont locaux (\cref{sec:inter-composants-render-deps}).
+
+% ===========================================================================
+\section{Ce que lit une règle}
+\label{sec:inter-composants-resultats}
+
+\subsection{\code{AnalysisResult} : le résultat d'un composant}
+
+Le résultat d'un composant (\src{src/engine/analysis_result.rs}{171}{272}) est ce que lisent
+toutes les règles. Ses champs se rangent en cinq groupes (\cref{tab:inter-composants-result}) ;
+les chapitres précédents ont décrit comment chacun est calculé.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{p{27mm}p{50mm}p{62mm}}
+\toprule
+groupe & champs & rôle \\
+\midrule
+identité & \code{component}, \code{file}, \code{param}, \code{dom_props}, \code{module_consts} &
+  le composant (son \code{ComponentId}), son fichier (clé des témoins, \adr{19}), le binding
+  des props, les props typées DOM, les constantes de module (seule preuve qu'un
+  \code{<X.Provider>} est un provider) \\
+stores convergés & \code{state_store}, \code{memo_store}, \code{block_states},
+  \code{effect_block_states}, \code{handler_block_states}, \code{heap},
+  \code{effect_setter_writes}, \code{custom_arg_returns} &
+  valeurs des slots et des mémos, environnement en sortie de chaque bloc (rendu, effets,
+  handlers), tas final, écritures pures des effets (\cref{chap:point-fixe-composant}) \\
+tables syntaxiques & \code{render_cfg}, \code{hooks}, \code{hook_provenance},
+  \code{hook_calls}, \code{effect_info}, \code{handler_info} &
+  le CFG après expansion, les entrées de hooks et leur provenance, les sites d'appel, les deps,
+  les handlers \\
+relations & \code{slot_writers}, \code{slot_seeds}, \code{registrations},
+  \code{effect_triggers} & calculées à convergence (\cref{chap:relations}) \\
+traçabilité & \code{widen_trace}, \code{inline_origins}, \code{iterations} &
+  widenings forcés, symboles inlinés, nombre d'itérations externes \\
+\bottomrule
+\end{tabular}
+\caption{Les champs d'\code{AnalysisResult}. Tout champ documenté \og Empty for hand-built
+IR\fg{} se lit \og non prouvé\fg, jamais \og absence prouvée\fg.}
+\label{tab:inter-composants-result}
+\end{table}
+
+Un seul point est propre à ce chapitre : le résultat d'un enfant est celui de sa \emph{dernière}
+analyse effective, pour les props de son dernier site analysé
+(\cref{ex:inter-composants-overwrite}).
+
+\subsection{\code{ProgramAnalysisResult} et ses satellites}
+
+Le résultat de programme (\src{src/engine/program_result.rs}{28}{69}) rassemble : la table
+\code{components} (\code{ComponentId} $\to$ \code{AnalysisResult}) ; le store partagé final ; le
+graphe d'appel ; les composants dont la récursion a été coupée ; les statistiques ; la
+\code{ComponentTable} ; la \code{FileTable} (\adr{19}) ; le registre des utilitaires, exposé aux
+producteurs de témoins ; la \code{ModuleTable} (\adr{26}) ; et \code{phase1_reached}.
+\code{file_table} et \code{module_table} sont laissés vides par \code{analyze_program} et remplis
+par \code{analyze_lowered} (\src{src/resolver/mod.rs}{448}{451}). \code{Default} est \og le
+programme vide\fg, où chaque table répond \og rien de connu\fg ; \code{single}
+(\src{src/engine/program_result.rs}{91}{114}) fabrique un programme d'un seul composant déjà
+analysé en \emph{enregistrant} son identifiant (souvent \code{SYNTHETIC}) au lieu d'en minter
+un que ses labels internes ne connaîtraient pas.
+
+Le graphe d'appel (\src{src/engine/program_result.rs}{166}{201}) associe à chaque appelant une
+liste de \code{CallSite { callee, props, location }}. Il est bruité, et il faut le savoir pour
+le lire : \code{location} vaut toujours \code{None} (\code{record_call_site(..., None)}), une
+ligne est poussée à \emph{chaque} évaluation --- donc plusieurs par passe de rendu, et deux
+pour un \code{return} direct (\cref{sec:inter-composants-evaluations}) ---, et
+\code{callers_of} balaie toutes les arêtes et rend chaque appelant une fois, alors que
+\code{callees_of} rend les lignes telles quelles, doublons compris.
+L'information par site, avec sa position, est aujourd'hui portée par les \code{ElementSite} de
+la dépendance de rendu (\cref{sec:inter-composants-collecte}).
+
+Les statistiques \code{AnalysisStats} (\src{src/engine/program_result.rs}{203}{225}) comptent
+succès et ratés du cache, coupures de récursion et composants analysés, et rangent en ensembles
+les paires \code{(appelant, appelé)} coupées par récursion, les références inconnues et
+ambiguës (le callee y reste un nom, faute de résolution), les composants dont la profondeur de
+callbacks ou le budget d'utilitaires a été atteint. La règle \regle{analysis-limit}
+(\src{src/rules/impls/analysis_limit_info.rs}{39}{97}) les transforme en \Info{} et suspend les
+assurances du composant concerné.
+
+\subsection{\code{RuleCtx} et \code{ProgramCache}}
+
+Une règle ne reçoit ni l'un ni l'autre directement, mais un \code{RuleCtx}
+(\src{src/rules/api/query.rs}{318}{323}) : l'identité du composant, son \code{AnalysisResult}
+résolu une fois, sa configuration, et un \code{ProgramCache} partagé par tous les composants du
+programme. \code{ctx.comp()} rend le résultat du composant, \code{ctx.program()} celui du
+programme, \code{ctx.component()} l'identité, \code{ctx.component_name()} le nom à écrire
+(\cref{lst:inter-composants-rulectx-id}). Le \code{ProgramCache}
+(\src{src/rules/api/cache.rs}{26}{31}) compose les relations de programme du moteur
+(\code{ProgramRelations}, le graphe de churn, \adr{42} §5) avec trois structures que la couche
+règles construit encore elle-même, chacune dans un \code{OnceLock} calculé à la première
+demande : la relation des consommateurs de contexte, l'index des montages et l'index de rendu
+(\code{RenderIndex}). Demander les montages construit l'index de rendu, puisque
+\code{MountIndex} lit ses conditions de montage sur \code{ElementSite::guard}
+(\src{src/rules/api/cache.rs}{62}{68}, \issue{149}).
+
+% ===========================================================================
+\section{Le graphe de symboles : prévu, réalisé}
+\label{sec:inter-composants-symboles}
+
+\adr{13} (analyse inter-fichiers) prévoyait un pipeline \emph{eager} en cinq étapes, dont la
+dernière était \og Lower + analyze in topo order\fg{} : un graphe de symboles (composants, hooks,
+utilitaires --- pas de fichiers, parce que les imports circulaires entre fichiers sont courants
+alors que les dépendances circulaires entre fonctions React sont quasi inexistantes), trié
+topologiquement pour analyser les feuilles d'abord. Le graphe existe
+(\file{src/engine/symbol_graph.rs}) : \code{build} (\src{src/engine/symbol_graph.rs}{60}{118})
+crée un nœud par composant et par hook et une arête $A \to B$ quand $A$ appelle syntaxiquement
+$B$ --- précise quand le lowering a résolu le callee (origine d'un élément,
+\code{resolved_file} d'un hook), sinon biaisée vers le même fichier puis vers le premier nœud
+homonyme inséré. \code{topo_sort} (\src{src/engine/symbol_graph.rs}{195}{255}) est un Kahn
+inversé : les appelés d'abord, les nœuds pris dans des cycles ajoutés à la fin.
+
+\begin{decision}[ADR-13 §4, §6 --- un ordre topologique qui n'ordonne rien]
+L'ordre effectif de l'analyse est celui des racines (identifiants croissants) et de l'inlining
+descendant ; ni \code{analyze_program} ni le driver ne lisent l'ordre topologique. Son unique
+consommateur est une ligne de \code{--verbose} (\src{src/driver/mod.rs}{324}{336}) --- c'est la
+ligne \og symbol graph: … topo order = […]\fg{} des sorties de ce chapitre. \issue{7} le relevait
+déjà. Le reste d'\adr{13} est bien réalisé : clés composites \code{(PathBuf, String)} pour tous
+les registres (d'où \code{ComponentKey}), traits \code{FileDiscoverer} et \code{ImportResolver},
+entrée par répertoire, \code{FunctionIR} et inlining des utilitaires en position d'instruction,
+imports non résolus lus $\Top$ avec une \Info. Le repli \code{get_by_name}, qu'\adr{13} acceptait
+comme limite, a été retiré pour les composants par \adr{40}.
+\end{decision}
+
+\begin{piege}
+La doc de \code{build} affirme un graphe \og over-approximate but never under-approximate\fg.
+C'est faux pour un élément construit dans un \code{FnLit} en ligne du rendu (callback de
+\code{.map}, render prop) : \code{collect_callees_in_expr} ne traverse pas les \code{FnLit}
+(\src{src/engine/symbol_graph.rs}{284}{304}) et \code{CFG::for_each_expr} ne visite que les
+expressions de premier niveau. Sur \file{/tmp/ch16/sg1.tsx}
+(\code{function Z() { return <ul>{[1].map((i) => <A key={i} />)}</ul>; }}), \code{--verbose}
+affiche \og topo order = [Z@sg1.tsx, A@sg1.tsx]\fg{} : aucune arête $Z \to A$, alors que la
+détection de racines, qui descend dans les \code{FnLit}, voit bien \code{A} (\og 1 components
+analyzed\fg). Sans conséquence sur les résultats, puisque le graphe n'est qu'affiché.
+\end{piege}
+
+% ===========================================================================
+\section{La dépendance de rendu}
+\label{sec:inter-composants-render-deps}
+
+\subsection{Pourquoi une seconde analyse}
+
+\begin{exemple}{Une valeur calculée, une condition, un voisin coûteux}{inter-composants-ctrl}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch16/ctrl.tsx}},label={lst:inter-composants-ctrl}]
+import { useState } from "react";
+function Row({ i }: { i: number }) { return <li>row {i}</li>; }
+function Heavy() { return <ul>{[1, 2, 3].map((i) => <Row key={i} i={i} />)}</ul>; }
+function Hint({ msg }: { msg: string }) { return <p>{msg}</p>; }
+function Clear() { return <button>clear</button>; }
+export function Search() {
+  const [text, setText] = useState("");
+  let msg = "";
+  if (text.length > 3) msg = "long";
+  return (
+    <div>
+      <input value={text} onChange={(e) => setText(e.target.value)} />
+      <Hint msg={msg} />
+      {text ? <Clear /> : null}
+      <Heavy />
+    </div>
+  );
+}
+\end{lstlisting}
+\begin{sortie}
+$ reactant check ctrl.tsx --rule wasted-subtree-render --trace
+  Search  (2 hooks)  ctrl.tsx
+    warn   wasted-subtree-render  [hook:0]  (line 12:26)  each `change` event writes state `text` and re-renders `<Heavy>` (at least 2 component renders, including a list) although none of its inputs depends on it. Move `text` and the elements that use it into their own component, or build the unrelated elements higher up and pass them in as `children`
+       → `<Heavy>` re-renders (at least 2 component renders, including a list) although none of its props depends on it (line 15:6)
+\end{sortie}
+\end{exemple}
+
+Chaque frappe re-rend les trois éléments de \code{Search}. \code{<Heavy>} ne dépend de rien :
+c'est du gaspillage. \code{<Hint>} reçoit \code{msg}, une chaîne littérale choisie sous une
+condition sur \code{text} : sa valeur ne contient pas \code{text}, mais elle en \emph{dépend}.
+\code{<Clear>} n'a aucune prop, mais son \emph{existence} dépend de \code{text}. Le domaine des
+valeurs ne sait dire aucune de ces deux choses : \code{Stability::Versioned(S)}
+(\cref{def:stabilite}) vit sur le seul slot de référence, si bien qu'un booléen,
+\code{text.length} ou une allocation \code{{ a: text }} (qui est \code{PerRender}) n'en portent
+rien, et \code{MountIndex::Guard} contournait le manque par un balayage syntaxique des
+\code{StateVal}.
+
+\begin{decision}[ADR-41 §1 --- une analyse avant séparée, pas un champ de \code{StateValue}]
+La dépendance de rendu est une analyse avant, lancée sur un composant \emph{convergé}, à la
+demande. Elle n'est \emph{pas} une composante du produit \code{StateValue} : comme champ, elle
+changerait toutes les comparaisons de valeurs existantes --- \regle{unnecessary-rerender}
+compare \code{arg == init}, la clé du \code{ComponentCache} compare des props --- et la
+dépendance est un autre fait que la valeur (un \code{{ a: text }} frais dépend de \code{text}).
+Le résumé est \emph{local} au composant (une prop se lit \code{Prop(name)}, quoi que passe le
+parent) et se compose sur l'arbre d'éléments à origine prouvée, ce qui garde précis le résumé
+d'un composant analysé seulement en phase 2. Cette décision a retiré un contournement
+(le balayage syntaxique de \code{MountIndex}, \issue{149}) en corrigeant la cause : c'est le
+premier principe du projet appliqué.
+\end{decision}
+
+\subsection{Les sources et le treillis \code{Deps}}
+
+\rustsnippet[label={lst:inter-composants-source}]{src/engine/render_deps.rs}{53}{84}{une entrée de rendu, dans le repère d'un composant}
+
+Une source est une entrée du rendu \emph{dans le repère d'un composant} : \code{Slot(0)} du
+parent et \code{Slot(0)} de l'enfant sont deux choses différentes, et \code{Prop(name)} est
+relatif au composant courant. Seules \code{Context(id)} et \code{Module(name)} sont
+\emph{indépendantes du repère} : le même contexte et le même nom de module dans tous les
+composants, ce qui leur permet de descendre l'arbre d'éléments sans traduction.
+
+\begin{definition}{Dépendance de rendu}{render-dep}
+Soit $\mathit{Src}$ l'ensemble (fini pour un programme) des sources d'un composant. La
+\terme{dépendance de rendu} d'une valeur $v$ du rendu est un élément de
+$\powerset(\mathit{Src}) \cup \{\Top\}$ ordonné par inclusion, $\Top$ au sommet : un ensemble
+\emph{may} des sources dont $v$ peut être calculée, directement (opérande, capture) ou par
+contrôle (condition d'une branche qui décide de son affectation). $\Top$ signifie \og peut
+dépendre de n'importe quoi\fg. Le join est l'union, $\Top$ absorbant. Une source absente de la
+dépendance est une source dont $v$ est \emph{prouvée} indépendante.
+\end{definition}
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[x=2.3cm,y=1.15cm,treillis,
+    n/.style={font=\scriptsize,inner sep=2pt}]
+  \node[n] (bot) at (0,0) {$\emptyset$};
+  \node[n] (a) at (-1.4,1) {$\{\code{Slot(0)}\}$};
+  \node[n] (b) at (0,1) {$\{\code{Prop(v)}\}$};
+  \node[n] (c) at (1.4,1) {$\{\code{Module(c)}\}$};
+  \node[n] (ab) at (-1.4,2) {$\{\code{Slot(0)},\code{Prop(v)}\}$};
+  \node[n] (ac) at (0,2) {$\{\code{Slot(0)},\code{Module(c)}\}$};
+  \node[n] (bc) at (1.4,2) {$\{\code{Prop(v)},\code{Module(c)}\}$};
+  \node[n] (abc) at (0,3) {$\{\code{Slot(0)},\code{Prop(v)},\code{Module(c)}\}$};
+  \node[n] (top) at (0,4) {$\Top$ (\code{top = true})};
+  \foreach \u/\v in {bot/a,bot/b,bot/c,a/ab,a/ac,b/ab,b/bc,c/ac,c/bc,ab/abc,ac/abc,bc/abc,abc/top}
+    \draw[thin,draw=ra-gray] (\u) -- (\v);
+  \node[etiquette,align=left,anchor=west] at (1.9,3.2) {\code{set} : union (may)\\
+    \code{gated} $\subseteq$ \code{set} : intersection sur les\\ contributeurs qui portent la source (must)\\
+    \code{writes} : union, avec son propre \code{top}};
+\end{tikzpicture}
+\caption{Le treillis \code{Deps} pour trois sources : parties ordonnées par inclusion, plus un
+sommet $\Top$ qui vide \code{set} et \code{gated}. Le treillis est fini, donc la montée
+s'arrête sans widening. La composante \code{gated} va dans le sens dual : elle ne peut que
+rétrécir quand on joint.}
+\label{fig:inter-composants-deps}
+\end{figure}
+
+\rustsnippet{src/engine/render_deps.rs}{119}{131}{un ensemble may de sources, et deux compléments}
+
+\code{Deps} porte l'ensemble \code{set}, le drapeau \code{top}, et deux compléments utiles aux
+valeurs fonctions. \code{gated} est la partie de \code{set} qu'une fonction n'atteint, quand on
+l'appelle, que derrière un test de ses propres arguments (\cref{sec:inter-composants-gated}) ;
+\code{writes} est l'ensemble des noms de module qu'appeler la fonction peut écrire
+(\code{Writes { top, names }}, \src{src/engine/render_deps.rs}{90}{117}). Leur join cohabite
+dans une même fonction :
+
+\rustsnippet[label={lst:inter-composants-union}]{src/engine/render_deps.rs}{153}{170}{le join : may pour \code{set}, must pour \code{gated}}
+
+\code{set} croît par union. Une source reste \code{gated} seulement si \emph{aucun}
+contributeur ne l'apporte non gardée : on calcule les sources non gardées des deux côtés, on
+réunit les \code{gated}, puis on retire les non gardées. \code{top} absorbe tout, sauf
+\code{writes}, qui garde son propre \code{top} (\code{Deps::top()} pose
+\code{writes: Writes::top()}, \src{src/engine/render_deps.rs}{141}{147}). Enfin
+\code{ungated()} (\src{src/engine/render_deps.rs}{172}{180}) efface \code{gated} en gardant
+\code{writes} : appliquée au résultat d'un appel, elle dit que la valeur n'est plus la fonction
+décrite (\code{debounce(fn)} rend une fonction qui appelle peut-être \code{fn}), si bien que le
+fait may survit et le fait must non.
+
+\begin{piege}
+\code{Deps::is_empty()} est \code{!top && set.is_empty()} (\srcline{src/engine/render_deps.rs}{149}) :
+il \emph{ignore} \code{writes}. Une fermeture qui n'écrit qu'un binding de module est
+\og vide\fg{} pour ce test. Ce n'est pas un défaut --- les questions de rendu passent par
+\code{touches}, et les écritures par \code{co_writes} --- mais un appel à \code{is_empty} pour
+décider qu'une fonction \og ne fait rien\fg{} serait faux.
+\end{piege}
+
+Une question se pose dans un repère sous la forme d'une \code{Relevance { any_prop, sources }}
+(\src{src/engine/render_deps.rs}{207}{250}), et la réponse élémentaire est \code{touches}
+(\src{src/engine/render_deps.rs}{185}{205}) : une dépendance touche une question si elles
+partagent une source, si la dépendance est $\Top$ et la question non vide, ou si l'une porte
+l'objet props entier (\code{AllProps}) et l'autre une prop. \code{gated_for(rel)} répond vrai
+quand toutes les sources de \code{rel} que la dépendance porte sont gardées
+(\cref{chap:regles-rendu-rsc} montre ces deux fonctions).
+
+\subsection{L'analyse avant d'un composant}
+
+\code{render_deps} (\src{src/engine/render_deps.rs}{417}{503}) prend un \code{AnalysisResult}
+convergé --- donc le CFG \emph{après} greffe des hooks personnalisés et des utilitaires --- et
+l'ensemble \code{written} des noms qu'une fonction quelconque du programme écrit. La valeur
+abstraite interne est un \code{DVal { deps, shape }}
+(\src{src/engine/render_deps.rs}{333}{379}) : une forme \code{Props} marque l'objet props (un
+\code{.field} dessus donne \code{Prop(field)}), une forme \code{Members} garde les sources membre
+par membre d'un littéral local (ce dont un retour de hook déstructuré a besoin). L'environnement
+d'entrée lie le paramètre props à \code{DVal { {AllProps}, Props }}
+(\src{src/engine/render_deps.rs}{447}{454}).
+
+\paragraph{Évaluation.} \code{eval} (\src{src/engine/render_deps.rs}{815}{948}) suit la
+\cref{tab:inter-composants-eval}. Deux lignes méritent l'attention : un élément de composant
+s'évalue à $\emptyset$ --- ses props sont les entrées de l'enfant, attribuées au site, et
+l'élément lui-même n'est pas un usage ---, alors qu'un élément hôte prend l'union de ses props
+et de ses enfants.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{p{42mm}p{100mm}}
+\toprule
+expression & dépendance \\
+\midrule
+\code{Lit}, \code{SummaryVal} & $\emptyset$ \\
+\code{StateVal(l)}, \code{StateSetter(l)} & \code{{Slot(l)}}, \code{{Setter(l)}} (respectivement) \\
+\code{HookMarker(l)} & ref : \code{{Ref(l)}} ; hook opaque : \code{{Hook(l)}} $\cup$ arguments (dé-gardés) ; sinon $\emptyset$ \\
+\code{MemoVal(l)}, \code{CallbackVal(l)} & variables libres du corps (fermeture pour un callback) $\cup$ liste de deps ; entrée introuvable : $\Top$ \\
+\code{FnLit} & fermeture : captures (gardées si derrière un test des paramètres) $+$ \code{writes} \\
+\code{FieldAccess} & sur \code{Props} : \code{{Prop(field)}} ; sur \code{Members} : le membre ; sinon la base \\
+\code{IndexAccess}, \code{BinOp} & union des opérandes \\
+\code{Call}, \code{New} & callee et arguments, dé-gardés ; un callee \code{use}/\code{useX} lève \code{inline_hook} \\
+\code{ObjectLit} & union des champs ; forme \code{Members} si aucun n'est un spread \\
+\code{ArrayLit} & union des éléments ; jamais de forme \code{Members} \\
+\code{CompApp} & $\emptyset$ \\
+\code{NativeElem} & props $\cup$ enfants \\
+\bottomrule
+\end{tabular}
+\caption{L'évaluation de la dépendance de rendu (\src{src/engine/render_deps.rs}{815}{948}).}
+\label{tab:inter-composants-eval}
+\end{table}
+
+\paragraph{Lecture d'un nom.} Un nom non lié dans le composant --- binding de module, import,
+global --- n'est pas forcément une constante :
+
+\rustsnippet{src/engine/render_deps.rs}{603}{625}{un nom non lié : contexte prouvé, binding écrit, ou rien}
+
+Un objet contexte prouvé (\code{ModuleConstInit::Context}) se lit \code{Context(id)} ; un nom que
+quelque fonction du programme écrit se lit \code{Module(name)} ; tout le reste est constant d'un
+rendu à l'autre et ne dépend de rien. Restreindre \code{Module} aux noms écrits garde les
+ensembles petits : sur le dépôt twenty, lire \code{Module} pour \emph{tout} nom libre coûtait
+70\,\% (301\,s à 514\,s) ; avec la restriction, l'exécution mesure 366\,s (plan de campagne
+\file{docs/campaign/rerender-cascade-plan.md}, §10, \og Corpus effect of module writes\fg).
+
+\paragraph{Transfert et dépendance de contrôle.} \code{run_cfg} itère en ordre RPO jusqu'à
+stabilité, au plus \code{MAX_ROUNDS = 64} tours. Au début de chaque bloc, il calcule sa
+\emph{condition de chemin} \code{pc} : la dépendance des conditions des branches qui le
+contrôlent, évaluées dans l'environnement de sortie du bloc de branche.
+
+\rustsnippet[label={lst:inter-composants-pc}]{src/engine/render_deps.rs}{689}{704}{la condition de chemin d'un bloc, puis le transfert}
+
+Une branche \emph{contrôle} un bloc quand exactement un de ses deux côtés l'atteint : c'est la
+différence symétrique des ensembles atteignables depuis \code{then_} et \code{else_}
+(\code{controlling_branches}, \src{src/engine/render_deps.rs}{1240}{1276}), la même définition
+que \code{MountIndex}. Le transfert (\src{src/engine/render_deps.rs}{777}{813}) ajoute \code{pc} à
+toute affectation : \code{env[x] = eval(rhs)} $\cup$ \code{pc}. Dans l'\cref{ex:inter-composants-ctrl},
+\code{msg = "long"} est dans le bloc contrôlé par \code{text.length > 3} : \code{msg} prend
+\code{{Slot(0)}}, et \code{<Hint>} n'est pas gaspillé. Un \code{MemberWrite obj.k = v} est une
+mise à jour \emph{faible} de la racine, qui perd sa forme ; un appel de méthode en instruction
+(\code{xs.push(v)}) ajoute ses arguments au récepteur --- sans \code{pc}, et pour toute méthode,
+pas seulement les méthodes mutantes. Si la boucle ne converge pas en 64 tours, le drapeau
+\code{top} passe à vrai et \emph{tout} le résumé devient $\Top$ : le plafond est une garde, pas
+un bouton de précision, et il dégrade vers le haut.
+
+\subsection{La collecte : utiliser ou transmettre}
+\label{sec:inter-composants-collecte}
+
+Après le point fixe, une passe de collecte parcourt les blocs dans le même ordre et produit le
+résumé :
+
+\rustsnippet[label={lst:inter-composants-renderdeps}]{src/engine/render_deps.rs}{301}{322}{le résumé d'un composant}
+
+C'est le cœur de la dichotomie : \code{genuine} est ce que le composant \emph{utilise},
+\code{sites} ce qu'il \emph{transmet}. Entrent dans \code{genuine} : les appels en position
+d'instruction, les écritures de membre pendant le rendu et la valeur rendue, chacun avec son
+\code{pc} ; tout élément \emph{hôte} (\code{NativeElem}), qui est sortie du composant qui le
+construit, même passé en \code{children} à un enfant (\code{<Modal><input value={text}/></Modal>}) ;
+les effets (variables libres du corps et liste de deps, évaluées dans l'environnement de sortie
+du bloc d'appel, \src{src/engine/render_deps.rs}{466}{497}) ; les arguments d'un hook resté opaque
+après expansion. Un \code{Let} ou un \code{Assign} n'est jamais un usage en soi ; une condition de
+branche n'en est un qu'à travers le \code{pc} des blocs qu'elle contrôle.
+
+Chaque élément de composant devient un site :
+
+\rustsnippet{src/engine/render_deps.rs}{252}{277}{un élément de composant construit par le rendu}
+
+\rustsnippet{src/engine/render_deps.rs}{961}{979}{la garde d'un site : le chemin, et le type d'élément s'il est une valeur}
+
+La garde d'un site est le \code{pc} de son bloc, plus --- si le nom de type est une valeur du
+rendu (\code{const { Modal } = useModal(); <Modal/>}) --- la dépendance de cette valeur : quel
+composant se monte en dépend, comme d'une condition (ce correctif a retiré 8 FP sur le dépôt dub
+lors de la campagne). Chaque prop explicite garde sa dépendance ; les spreads vont dans
+\code{spread} ; \code{provides} est renseigné si le nom, sans \code{.Provider}, désigne un
+contexte prouvé non masqué ; \code{parent} est l'indice du site dans lequel celui-ci est imbriqué
+comme prop ou enfant. Chaque prop \code{onX} (ou spread) d'un élément hôte devient un
+\code{HostHandler} (\src{src/engine/render_deps.rs}{282}{299}), avec la balise, l'attribut
+\code{type} littéral et la dépendance de la valeur du handler : c'est là qu'un setter
+\og atterrit\fg.
+
+\paragraph{Callbacks synchrones.} Les \code{FnLit} passés à un appel (\code{.map},
+\code{.forEach}) tournent pendant le rendu : \code{collect} les analyse par \code{nested}
+(\src{src/engine/render_deps.rs}{1079}{1109}), avec des paramètres alimentés par le récepteur et
+les autres arguments, \code{in_list} vrai, et une profondeur bornée par \code{MAX_NESTING = 8}
+(au-delà, $\Top$). Le corps d'un \code{useMemo} lu pendant le rendu est parcouru de même, sans
+\code{in_list}. Un \code{FnLit} qui n'est pas passé à un appel ne tourne pas pendant le rendu :
+seules ses captures comptent, comme dépendance de la valeur fonction.
+
+\begin{exemple}{Une écriture dans un \code{forEach} est perdue}{inter-composants-foreach}
+\begin{lstlisting}[language=TypeScript,caption={\file{/tmp/ch16/foreach.tsx} (extrait)},label={lst:inter-composants-foreach}]
+export function App() {
+  const [sel, setSel] = useState(0);
+  let label = "";
+  [1, 2, 3].forEach((i) => { if (i === sel) label = String(i); });
+  return (
+    <div>
+      <input value={sel} onChange={(e) => setSel(Number(e.target.value))} />
+      <Child label={label} />
+      <Heavy />
+    </div>
+  );
+}
+\end{lstlisting}
+\begin{sortie}
+$ reactant check foreach.tsx --rule wasted-subtree-render
+  App  (2 hooks)  foreach.tsx
+    warn   wasted-subtree-render  [hook:0]  (line 10:25)  each `change` event writes state `sel` and re-renders `<Child>` and `<Heavy>` (2 component renders) although none of their inputs depends on it. Move `sel` and the elements that use it into their own component, or build the unrelated elements higher up and pass them in as `children`
+\end{sortie}
+L'affirmation est fausse pour \code{<Child>} : \code{label} est calculé à partir de \code{sel}.
+Deux faits du code se combinent. \code{nested} lance \code{run_cfg(body, …, false)} et
+\emph{jette} l'environnement de sortie du callback : une écriture du callback dans un binding
+local du rendu ne remonte pas. Et \code{compute_free_vars} retire \code{label}, cible d'un
+\code{Assign}, des variables libres du callback (\src{src/ir/free_vars.rs}{96}{106}). \code{label}
+garde donc la dépendance de \code{""}, $\emptyset$. C'est une source manquante, donc un faux
+positif d'une règle d'absence --- la direction qu'\adr{41} §2 veut exclure ; il n'était ni
+documenté dans \file{docs/limitations.md} ni suivi par une issue au snapshot.
+\end{exemple}
+
+\subsection{Handlers gardés : le fait \code{gated}}
+\label{sec:inter-composants-gated}
+
+Une frappe dans un champ texte écrit à chaque touche ; un \code{onKeyDown} qui n'écrit que sur
+\code{Enter} écrit une fois par validation. La différence n'est pas une question de preuve mais
+de \emph{fréquence}, et la règle \regle{wasted-subtree-render} ne signale par défaut que les
+déclencheurs continus (option \code{continuousOnly}, \adr{41}, \cref{chap:regles-rendu-rsc}).
+\code{param_gated_vars} (\src{src/engine/render_deps.rs}{1176}{1238}) calcule, pour une fonction,
+les variables libres qu'elle n'atteint que derrière un test de ses paramètres : il propage les
+variables \emph{teintées} par les paramètres jusqu'à un point fixe, et les blocs contrôlés par
+une condition qui en lit une ; une variable libre est gardée si elle n'apparaît que dans de tels
+blocs. Sur la fixture \file{tests/fixtures/wasted_subtree_render/keyed.tsx}, le handler de
+\code{Submit} (\code{if (e.key !== "Enter") return; setQ(...)}) a la dépendance
+\code{{Setter(0)}} avec \code{gated = {Setter(0)}} (résumé relevé par la sonde du dossier 08) ;
+\code{KeyLog} (\code{onKeyDown={(e) => setLast(e.key)}}) ne garde rien. Par défaut, seul
+\code{KeyLog} est signalé ; avec \code{continuousOnly=false}, \code{Escape}, \code{Handed},
+\code{KeyLog} et \code{Submit} le sont (observé). Le fait est \emph{must} : un seul contributeur
+non gardé l'annule (\cref{lst:inter-composants-union}), et il ne peut que classer un
+déclencheur comme discret, jamais changer une preuve.
+
+\subsection{Contextes}
+\label{sec:inter-composants-contextes}
+
+\tsxsnippet[label={lst:inter-composants-context}]{tests/fixtures/state_lifted_too_high/context.tsx}{6}{21}{un état qui atteint son consommateur par contexte}
+
+Dans le résumé d'\code{App} (sonde du dossier 08), le provider est un site
+\code{provides = Some(Query)} dont la prop \code{value} a la dépendance
+\code{{Slot(0), Setter(0)}} ; \code{<Header>} et \code{<Page>} ont \code{parent = Some(0)} ;
+\code{children} vaut $\emptyset$, puisqu'un élément de composant s'évalue à $\emptyset$. Dans
+\code{Search}, \code{useContext(Query)} est un hook opaque : sa dépendance est \code{Hook(0)}
+$\cup$ celle de son argument, \code{Context(Query)}. Le drapeau \code{any_context} reste faux,
+parce que \code{Query} est prouvé et écrit dans le composant ; il passe à vrai pour un
+\code{useContext} d'un objet non prouvé ou atteint par un hook inliné, et pour tout hook de code
+utilisateur que l'analyse n'a pas pu inliner (\code{reads_unnamed_context},
+\src{src/engine/render_deps.rs}{645}{670}). Un hook de paquet, lui, ne peut atteindre un contexte
+des modules utilisateur que si on le lui passe, ce que ses arguments montrent.
+
+\begin{sortie}
+$ reactant check tests/fixtures/state_lifted_too_high/context.tsx --rule state-lifted-too-high --trace
+  App  (1 hooks)  tests/fixtures/state_lifted_too_high/context.tsx
+    warn   state-lifted-too-high  [hook:0]  (line 14:8)  state `q` is only used inside `<Search>`, 2 levels below `App`. Every write re-renders `App`, `Page` and 2 other components they render although none of them uses it; move the state into `Search`, with the `Query` provider that hands it on
+       → `App` renders `<Page>` inside the `Query` provider without using it itself (line 18:6)
+       → `Page` renders `<Search>` inside the `Query` provider without using it itself (line 12:41)
+\end{sortie}
+
+Côté domaine des valeurs, \code{Query.Provider} est un composant \emph{inconnu} du registre : il
+compte dans \code{unknown_component_refs}, d'où les \Info{} \regle{analysis-limit} sur les
+\code{X.Provider}, et c'est le cas courant du trou de havoc de l'\cref{ex:inter-composants-hv}.
+Dans \code{Guarded}, plus bas dans la même fixture, un \code{<Tooltip/>} non résolu sous le
+provider compte comme consommateur possible : pas de finding.
+
+\subsection{Bindings de module}
+
+Un handler peut changer autre chose qu'un état : \code{cache.hits += 1}, \code{counter++},
+\code{seen.set(k, v)}. Si un autre composant lit ce binding, il n'est pas gaspillé.
+\code{written_names} (\src{src/engine/render_deps.rs}{406}{412}) rassemble les racines écrites du
+rendu et de chaque corps de hook ; \code{written_roots} (\src{src/engine/render_deps.rs}{1125}{1171})
+retient la cible d'un \code{Assign} (l'IR épelle ainsi l'écriture d'un binding extérieur), la
+racine d'un \code{MemberWrite}, le récepteur d'une méthode mutante (la liste d'\adr{28} :
+\code{push}, \code{pop}, \dots, \code{set}, et \code{Object.assign}), fermetures imbriquées
+comprises, moins ce que le corps lie. L'union sur tous les composants est l'ensemble
+\code{written} de la lecture d'un nom. Puis \code{writes_of} (\src{src/engine/render_deps.rs}{580}{601})
+traduit les racines écrites d'un corps en noms de module \emph{à travers les valeurs qu'elles
+peuvent aliaser} (\code{const c = cache; c.x = 1} écrit \code{cache}) ; une racine de valeur
+$\Top$ donne \code{Writes::top()}.
+
+\begin{sortie}
+$ reactant check tests/fixtures/wasted_subtree_render/module_write.tsx --rule wasted-subtree-render --rule-option wasted-subtree-render:continuousOnly=false
+  Control  (2 hooks)  …  each `change` event writes state `text` and re-renders `<Hits>`, `<Count>`, `<Seen>`, `<Stats>` and `<Chart>` (6 component renders) …
+  Debounced  (2 hooks)  …  each `change` event writes state `text` and re-renders `<Chart>` (2 component renders) …
+  Handed  (1 hooks)  …  each `change` event in `<Field>` writes state `text` and re-renders `<Chart>` (2 component renders) …
+  Typing  (2 hooks)  …  each `change` event writes state `text` and re-renders `<Chart>` (2 component renders) …
+\end{sortie}
+
+(lignes élaguées aux en-têtes et au début des messages.) \code{Control} n'écrit que son état :
+les cinq voisins sont gaspillés. Le handler de \code{Typing} écrit \code{cache}, \code{counter}
+et \code{seen} à côté de \code{setText} : \code{Hits}, \code{Count}, \code{Seen} et \code{Stats}
+(qui lit \code{cache} à travers l'utilitaire \code{describe()} inliné) cessent d'être gaspillés,
+seul \code{Chart} reste. Dans \code{Handed}, le setter descend vers \code{Field}, dont la
+fermeture écrit \code{last} : \code{writes} s'accumule le long du trajet. Dans \code{Debounced},
+\code{debounce(...)} est opaque, mais \code{ungated()} garde \code{writes}.
+
+\begin{remarque}
+Les noms de module s'apparient \emph{par orthographe}, à travers les fichiers : deux
+\code{cache} sans rapport n'en font qu'un, ce qui donne moins de findings, jamais un faux. Une
+hypothèse reste, énoncée par \adr{41} §2 : un appel que l'analyse ne voit pas ne lit ni n'écrit
+de binding de module (\issue{51}, \issue{52}).
+\end{remarque}
+
+% ===========================================================================
+\section{Composer sur l'arbre d'éléments}
+\label{sec:inter-composants-arbre}
+
+\subsection{L'index de rendu et la résolution d'un site}
+
+Les résumés sont locaux ; les questions sont globales (\og où cet état est-il utilisé ?\fg). La
+couche règles les compose dans \code{RenderIndex} (\file{src/rules/helpers/render_tree.rs}),
+construit une fois par programme : \code{build} (\src{src/rules/helpers/render_tree.rs}{117}{137})
+calcule \code{written}, puis un résumé par composant, puis le nombre de sites qui nomment chaque
+composant. Passer d'un site à un composant se fait par \code{resolve}
+(\src{src/rules/helpers/render_tree.rs}{767}{777}), qui n'accepte que l'origine prouvée
+(\code{table.id_of(origin)}).
+
+\begin{piege}
+Il y a donc deux notions de \og résolu\fg. Le moteur (\code{resolve_child}) accepte l'origine,
+sinon un nom unique ; l'arbre d'éléments n'accepte que l'origine. Un site sans origine dont le
+nom est unique est inliné par le moteur mais opaque pour les cascades. Chacun est prudent dans
+sa polarité : l'inliner qui trouverait un enfant par son nom analyse au pire un corps de trop,
+alors que la règle de cascade qui se tromperait d'enfant \emph{cacherait} les usages du vrai.
+\end{piege}
+
+\subsection{\code{uses} : descendre en traduisant la question}
+
+\code{uses(comp, rel)} (\src{src/rules/helpers/render_tree.rs}{516}{592}) construit un arbre
+d'usages. Le nœud est \emph{utilisateur} si le résumé \code{uses(rel)} (\code{genuine} touche la
+question, ou \code{any_context} et la question nomme un contexte). Pour chaque site : une garde
+touchée fait du nœud un utilisateur ; un provider est sauté, sa valeur étant suivie par contexte ;
+sinon on calcule les props qui portent la question (\code{forwarded}, qui laisse passer un spread
+de l'objet props sous les mêmes noms et traite tout autre spread comme \og n'importe quelle
+prop\fg), les contextes qui la portent (\code{contexts_at}, qui remonte les \code{parent}
+jusqu'aux providers dont la \code{value} la touche) et les modules. Un site dans une liste, non
+résolu, trop profond (\code{MAX_DEPTH = 64}) ou déjà visité fait du nœud un utilisateur. Sinon on
+descend avec la question \emph{traduite dans le repère de l'enfant} : \code{Prop(p)} pour chaque
+prop qui la porte, \code{any_prop} si un spread peut renommer, contextes et modules tels quels.
+
+\subsection{\code{home_of} : le plus petit sous-arbre}
+
+\code{home_of(owner, label)} (\src{src/rules/helpers/render_tree.rs}{195}{257}) rend \code{None}
+si un écrivain du slot peut écrire n'importe quoi (\code{co_writes.top}), si personne ne lit le
+slot ou si personne ne l'écrit. Sinon il construit l'arbre d'usages de la question
+\code{{Slot(l), Setter(l)}} $\cup$ \code{co_writes} et descend tant qu'exactement un enfant a
+des usages :
+
+\rustsnippet{src/rules/helpers/render_tree.rs}{226}{244}{descendre tant qu'un seul enfant utilise}
+
+Le chemin parcouru est la liste des composants qui re-rendent pour rien ; \code{siblings} compte
+les autres sites (hors providers) que construisent les composants du chemin.
+\code{co_writes} (\src{src/rules/helpers/render_tree.rs}{154}{178}) réunit les \code{writes} des
+\emph{landings} du setter et les \code{effect_writes} des effets qui écrivent le slot ;
+\code{landings} (\src{src/rules/helpers/render_tree.rs}{379}{512}) suit la capacité
+\code{Setter(l)} de prop en prop jusqu'aux handlers hôtes dont la dépendance la touche --- une
+prop à la fois, car \og a prop that lands below must not hide one that does not\fg{} ---, et une
+prop \code{onX} qui n'atterrit nulle part plus bas atterrit sur l'élément lui-même.
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[node distance=9mm and 12mm,
+    comp/.style={bloc,minimum width=24mm},
+    chemin/.style={comp,draw=ra-amber,very thick},
+    maison/.style={comp,draw=ra-blue,fill=ra-blue!12,very thick}]
+  \node[chemin] (app) {\code{App}\\{\scriptsize possède \code{Slot(0)}, \code{Setter(0)}}\\{\scriptsize \code{genuine} $=\emptyset$}};
+  \node[chemin,below=of app] (lay) {\code{Layout}\\{\scriptsize \code{genuine} $=\emptyset$}};
+  \node[chemin,below left=of lay] (side) {\code{Sidebar}\\{\scriptsize \code{genuine} $=\emptyset$}};
+  \node[comp,below right=of lay,draw=ra-gray] (cont) {\code{Content}\\{\scriptsize aucune prop : frère}};
+  \node[maison,below=of side] (field) {\code{Field}\\{\scriptsize \code{genuine} $=$ \{\code{Prop(value)},}\\{\scriptsize \code{Prop(onChange)}\}}};
+  \draw[fleche] (app) -- node[etiquette,right,align=left] {\{\code{Prop(value)}, \code{Prop(onChange)}\}} (lay);
+  \draw[fleche] (lay) -- node[etiquette,left,align=right] {\{\code{Prop(value)},\\ \code{Prop(onChange)}\}} (side);
+  \draw[fleche,draw=ra-gray] (lay) -- node[etiquette,right] {$\emptyset$} (cont);
+  \draw[fleche] (side) -- node[etiquette,left,align=right] {\{\code{Prop(value)},\\ \code{Prop(onChange)}\}} (field);
+  \node[etiquette,right=4mm of field,align=left] {\emph{home} : le handler de l'\code{<input>}\\ lit \code{Prop(onChange)}, sa \code{value}\\ lit \code{Prop(value)}};
+\end{tikzpicture}
+\caption{L'arbre d'éléments de \code{drill.tsx} et la question \code{{Slot(0), Setter(0)}}
+d'\code{App}, traduite à chaque saut dans le repère de l'enfant. Les trois composants du chemin
+(bord orangé) ne font que transmettre ; \code{Field} (bleu) est le \emph{home} ;
+\code{Content} est un frère qui re-rend aussi (\code{siblings = 1}).}
+\label{fig:inter-composants-drill}
+\end{figure}
+
+\begin{exemple}{Le home de \code{value} dans \code{drill.tsx}}{inter-composants-home}
+Les résumés (sonde du dossier 08) : \code{App}, \code{Layout} et \code{Sidebar} ont
+\code{genuine} $= \emptyset$, et chacun transmet \code{value} et \code{onChange} à son unique
+enfant utilisateur ; \code{Field} a \code{genuine} $=$ \code{{Prop(onChange), Prop(value)}}
+et un handler \code{change} sur \code{<input>} de dépendance \code{{Prop(onChange)}}.
+\code{home_of(App, 0)} descend \code{App} $\to$ \code{Layout} $\to$ \code{Sidebar} $\to$
+\code{Field} (\cref{fig:inter-composants-drill}), avec un frère, \code{Content} :
+\begin{sortie}
+$ reactant check tests/fixtures/state_lifted_too_high/drill.tsx --rule state-lifted-too-high --trace
+  App  (1 hooks)  tests/fixtures/state_lifted_too_high/drill.tsx
+    warn   state-lifted-too-high  [hook:0]  (line 17:8)  state `value` is only used inside `<Field>`, 3 levels below `App`. Every write re-renders `App`, `Layout`, `Sidebar` and 1 other component they render only to pass it down; move the state into `Field`
+       → `App` passes it to `<Layout>` as `value`, `onChange` without using it itself (line 18:9)
+       → `Layout` passes it to `<Sidebar>` as `value`, `onChange` without using it itself (line 14:15)
+       → `Sidebar` passes it to `<Field>` as `value`, `onChange` without using it itself (line 11:32)
+\end{sortie}
+La règle elle-même, ses seuils et ses options sont au \cref{chap:regles-etat}.
+\end{exemple}
+
+\code{wasted_siblings(owner, rel)} (\src{src/rules/helpers/render_tree.rs}{266}{326}) répond à la
+question complémentaire, celle de \regle{wasted-subtree-render} (\cref{chap:regles-rendu-rsc}) :
+les sites qu'aucune garde, prop ou spread (hors provider), ni aucun site englobant, ne relie à la
+question ; seuls les composants résolus sont candidats, un enfant qui utilise un contexte porté
+ou un module écrit est écarté, et le coût est une borne inférieure (une liste compte une fois).
+
+\begin{remarque}
+Tout le fichier \file{render_tree.rs} obéit à la règle que son en-tête énonce
+(\src{src/rules/helpers/render_tree.rs}{11}{13}) : l'absence d'usage y est une preuve, donc tout
+inconnu est un usage --- élément non résolu, récursion, profondeur, résumé $\Top$, contexte non
+nommé, écrivain de racine $\Top$ (\adr{41} §2). Le \cref{chap:regles-rendu-rsc} en fait un
+invariant.
+\end{remarque}
+
+% ===========================================================================
+\section{Soundness : ce qui est garanti, ce qui fuit}
+\label{sec:inter-composants-soundness}
+
+Les deux mécanismes du chapitre n'ont pas la même polarité. L'inlining alimente des règles qui
+prouvent une \emph{présence} (un setter appelé, une boucle) : il doit sur-approximer l'état. La
+dépendance de rendu alimente des règles qui prouvent une \emph{absence} (\og aucune entrée ne
+dépend de l'état\fg) : pour elles, une source manquante est un faux positif, et \og sound\fg{}
+veut dire \og tout inconnu est un usage\fg. La \cref{tab:inter-composants-soundness} récapitule
+les garanties et les fuites vérifiées au snapshot.
+
+\begin{table}[htbp]\centering\small
+\begin{tabular}{p{40mm}p{48mm}p{52mm}}
+\toprule
+mécanisme & garantie & fuite vérifiée \\
+\midrule
+résolution (\code{resolve_child}) & jamais de devinette : ambigu $=$ inanalysable & repli sur le nom écrit après un barrel (précision seulement) \\
+enfant inanalysable & havoc des setters échappés & setter champ d'un littéral inline (\cref{ex:inter-composants-hv}) \\
+récursion & coupure déclarée, assurances suspendues & aucun havoc (\cref{ex:inter-composants-rec}) \\
+store partagé & monotone, importé par join & --- \\
+cache & saut d'analyse sound pour le store & \code{results[child]} écrasé : FN non déclaré (\cref{ex:inter-composants-overwrite}) \\
+élément argument d'un hook opaque & racine en trop, \Info{} sur le hook & ni inliné ni havoqué : \code{App: 0 iteration(s)} sur \file{hookarg.tsx} \\
+phase 2 & \code{phase1_reached}, \code{complete_ancestry} & plafonds non enregistrés hors \code{InterCtx} \\
+dépendance de rendu & plafonds $\Rightarrow \Top$ ; inconnu $=$ usage & écriture d'un callback synchrone perdue (\cref{ex:inter-composants-foreach}) \\
+bindings de module & \code{Module(name)}, \code{writes} & appel opaque supposé muet (\issue{51}, \issue{52}) \\
+\bottomrule
+\end{tabular}
+\caption{Garanties et fuites du sous-système inter-composants.}
+\label{tab:inter-composants-soundness}
+\end{table}
+
+La ligne \og élément argument d'un hook opaque\fg{} demande un mot. Sur
+\file{/tmp/ch16/hookarg.tsx} (\code{const m = useModal(<Dialog onClose={setS} />)}, avec un
+\code{Dialog} qui appelle \code{onClose(1)} pendant son rendu), \code{--verbose} rapporte
+\og cache hits: 0, misses: 0\fg{} et \og App: 0 iteration(s)\fg : l'élément argument n'est jamais
+évalué par le domaine des valeurs, donc ni inliné, ni havoqué, et \code{s} reste à sa valeur
+initiale, alors qu'un \code{useModal} qui rend l'élément ferait appeler \code{setS}. Le faux
+négatif est déclaré par l'\Info{} du hook inconnu (\og hook \code{`useModal`} was not found in the
+registry … (FN possible)\fg), qui suspend les assurances d'\code{App}. Vérifié au
+\snapshotCommit{} au-delà des seuls compteurs : \code{make_hook_entry}
+(\src{src/lowering/hook_extractor.rs}{641}{660}) retire les arguments d'un hook Custom du CFG et
+les range dans \code{HookEntry::Custom::args}, sans laisser de \code{Expr::Call} qui les
+contiendrait encore ; \code{expand_custom_hooks} (\src{src/engine/fixpoint.rs}{889}{992}) ne les
+lit que pour une substitution syntaxique (\code{param_subst}, seuls les inits \code{State} du
+hook expansé) ; \code{custom_arg_returns} (\src{src/engine/fixpoint.rs}{240}{275}) n'exécute
+qu'un argument \code{FnLit} ou une variable dont la liaison est certifiée fonction
+(\code{certified_fn_binding}) --- un \code{Expr::CompApp} ne correspond à aucun des deux et
+retombe dans le \code{continue}. Aucun autre point du moteur n'évalue les arguments d'un hook
+Custom : le \code{Dialog} de l'exemple n'est donc bien ni inliné ni havoqué.
+
+Enfin, trois commentaires de code sont en retard sur lui : \code{components_analyzed}
+(\og including re-analyses\fg), \code{recursive_component_refs} et
+\code{recursive_components} (\og $\Top$\fg{} au lieu de \code{Stable}), et la doc du
+\code{ComponentCache} (\og sound over-approximation\fg{} pour une entrée dont le résultat est
+celui de la dernière insertion).
+
+% ===========================================================================
+\begin{resume}
+\begin{itemize}
+  \item Un analyseur intra lit les props comme $\Top$ : sound, mais aveugle aux défauts qui
+        traversent une frontière (un setter du parent appelé par l'enfant). L'analyse
+        inter-composants (\adr{12}) inline chaque enfant au point où le parent construit
+        l'élément, avec les props abstraites du parent, et fait remonter ses écritures.
+  \item \textbf{Identité} (\adr{40}) : clé \code{(file, name)}, \code{ComponentId} interné par
+        le registre dans une \code{ComponentTable} portée par le résultat ; le nom d'affichage
+        (\code{Name@file} en cas de collision) n'est qu'un rendu, jamais une clé
+        (\code{RuleCtx::component()} contre \code{component_name()}). Un élément porte
+        l'origine que son fichier a prouvée ; \code{resolve_child} répond \code{Resolved},
+        \code{Unknown} ou \code{Ambiguous}, et refuse de deviner.
+  \item \textbf{Racines} : heuristique (ce qu'aucun \code{CompApp} ne référence, une référence
+        non résolue comptant pour tous les homonymes), \code{--all-roots}, \code{--entry}
+        (un nom qui ne sélectionne rien est une erreur d'usage).
+  \item \textbf{Inlining} : \code{eval_comp_app} résout, coupe la récursion (sans havoc),
+        évalue les props dans le tas, consulte le cache, analyse l'enfant sous un
+        \code{InterCtx} fils, range son résultat. Un élément vaut toujours \code{Stable} ; un
+        \code{return} direct est évalué deux fois par passe.
+  \item \textbf{Flux ascendant} : un setter porte son propriétaire ; l'appeler écrit le
+        \code{SharedStateStore}, monotone, que la boucle du parent importe à chaque test de
+        convergence ; pas de point fixe de programme. Un setter qui s'échappe vers un enfant
+        inanalysable est havoqué (trou : setter champ d'un littéral inline).
+  \item \textbf{Cache} : égalité de treillis, cinq entrées, éviction par join. Ce n'est qu'un
+        \og déjà vu\fg{} : \code{results[child]} est le dernier raté, jamais un join, d'où un FN
+        dépendant de l'ordre des racines.
+  \item \textbf{Deux phases} : racines sous \code{InterCtx}, puis balayage intra ;
+        \code{phase1_reached} photographié entre les deux ; hors de lui, une ascendance vide est
+        inconnue (\code{complete_ancestry}).
+  \item \textbf{Graphe de symboles} (\adr{13}) : construit, trié, affiché en \code{--verbose},
+        n'ordonne rien.
+  \item \textbf{Dépendance de rendu} (\adr{41}, \cref{def:render-dep}) : analyse avant séparée
+        sur le composant convergé ; \code{Deps} $= \powerset(\mathit{Src}) \cup \{\Top\}$, may,
+        avec \code{gated} (must) et \code{writes} ; dépendance de contrôle par les branches qui
+        contrôlent un bloc ; \code{genuine} (utilisé) contre \code{sites} (transmis) ; handlers,
+        contextes (\code{Context(id)}, \code{any_context}), bindings de module
+        (\code{Module(name)}). Composition sur l'arbre à origine prouvée : \code{uses},
+        \code{home_of}, \code{landings}, \code{wasted_siblings} ; tout inconnu est un usage.
+  \item Fichiers : \file{component_registry.rs}, \file{root_detector.rs},
+        \file{component_cache.rs}, \file{symbol_graph.rs}, \file{analysis_result.rs},
+        \file{program_result.rs}, \file{render_deps.rs} ; \file{component_id.rs},
+        \file{context.rs}, \file{state_value.rs}, \file{fixpoint.rs} ;
+        \file{rules/helpers/render_tree.rs}.
+\end{itemize}
+La partie suivante passe aux règles : le \cref{chap:api-regles} montre comment elles lisent ces
+résultats par des requêtes typées et un sceau de sévérité ; \regle{state-lifted-too-high} et
+\regle{wasted-subtree-render} (\cref{chap:regles-etat,chap:regles-rendu-rsc}) sont les deux
+consommateurs de la dépendance de rendu.
+\end{resume}
+
+\section*{Exercices}
+\addcontentsline{toc}{section}{Exercices}
+\label{sec:inter-composants-exercices}
+
+\begin{exercice}{Compter les passages dans le cache}{inter-composants-drill-cache}
+Sur \file{drill.tsx} (\cref{lst:inter-composants-drill}), \code{--verbose} affiche
+\og cache hits: 3, misses: 7\fg{} et \og App: 1 iteration(s)\fg. Retrouver ces nombres à partir
+des trois faits du \cref{sec:inter-composants-evaluations}.
+\end{exercice}
+\begin{solution}
+\code{App} fait deux passes (une itération, due au setter appelé par \code{Field} via le store
+partagé). Son \code{return <Layout …/>} est direct : deux évaluations par passe. Passe 1 : raté
+(\code{Layout} analysé, donc \code{Sidebar}, \code{Field} et \code{Content}), puis succès. Passe 2 :
+\code{value} a changé, raté (\code{Layout} ré-analysé, et avec lui \code{Sidebar} et
+\code{Field}, dont les props ont changé), puis succès. \code{Content} (props vides) rate la
+première fois et réussit à la seconde analyse de \code{Layout}. Ratés : 2 (\code{Layout}) + 2
+(\code{Sidebar}) + 2 (\code{Field}) + 1 (\code{Content}) = 7 ; succès : 2 (\code{App}) + 1
+(\code{Content}) = 3.
+\end{solution}
+
+\begin{exercice}{Pourquoi tous les homonymes}{inter-composants-homonymes}
+Dans l'heuristique des racines, une référence sans origine marque comme référencés
+\emph{tous} les composants de ce nom. Que se passerait-il si elle n'en marquait aucun ? si elle
+n'en marquait qu'un, le premier par tri ?
+\end{exercice}
+\begin{solution}
+N'en marquer aucun ferait de chaque homonyme une racine analysée avec des props $\Top$ ; si l'un
+d'eux est aussi inliné par un parent qui l'importe, l'ordre des identifiants peut faire gagner
+le résultat imprécis (écrasement de \code{results}). N'en marquer qu'un reproduirait la devinette
+qu'\adr{40} a supprimée : la référence ne désigne pas forcément celui-là. Marquer tous les
+homonymes ne coûte que des racines en moins, jamais une conclusion.
+\end{solution}
+
+\begin{exercice}{Corriger l'écrasement à la racine}{inter-composants-overwrite}
+Reproduire l'\cref{ex:inter-composants-overwrite}, puis proposer une correction de
+\code{results[child]} qui se justifie en un paragraphe (\og règle du paragraphe unique\fg).
+\end{exercice}
+\begin{solution}
+Deux pistes. Indexer les résultats par (identité, props abstraites) --- la clé du cache --- et
+faire tourner les règles intra-composant sur chaque contexte d'un composant : c'est la
+sensibilité au contexte qu'\adr{12} §2 revendique, poussée jusqu'aux règles ; le coût est un
+multiplicateur borné par la taille du cache. Ou joindre les résultats d'un même composant, ce
+qui exige un join d'\code{AnalysisResult} qui n'existe pas (CFG, relations et témoins ne se
+joignent pas comme des états, \cref{sec:inter-composants-cache}). La première se justifie en une
+phrase (\og une règle doit voir chaque contexte d'appel analysé\fg) ; la seconde non. Aucune n'est
+implémentée au snapshot.
+\end{solution}
+
+\begin{exercice}{Perdre le fait \code{gated}}{inter-composants-gated}
+Écrire un handler \code{onKeyDown} qui appelle \code{setQ} derrière \code{if (e.key === "Enter")}
+\emph{et} ailleurs sans test. Que devient \code{gated} ? Relier la réponse à
+\cref{lst:inter-composants-union}.
+\end{exercice}
+\begin{solution}
+Par exemple
+\code{(e) => { if (e.key === "Enter") setQ(e.currentTarget.value); log(setQ); }}.
+\code{param_gated_vars} trouve \code{setQ} dans un bloc contrôlé par un test de \code{e}
+\emph{et} dans un bloc non contrôlé : \code{setQ} est dans \code{open}, donc pas gardé. Plus
+généralement, dans \code{union_with}, une source apportée non gardée par un seul contributeur
+est retirée de \code{gated} : le fait est must. Le déclencheur redevient continu. Observé sur
+\file{/tmp/ch16/gated.tsx}, avec un \code{<Heavy/>} voisin : sans option,
+\regle{wasted-subtree-render} ne signale que le composant \code{Mixed} (\og each \code{`keydown`}
+event writes state \code{`q`} and re-renders \code{`<Heavy>`}\fg), pas \code{Keyed}, dont le seul
+appel est gardé.
+\end{solution}
+
+\begin{exercice}{Repères}{inter-composants-frame}
+Expliquer pourquoi \code{Module(name)} et \code{Context(id)} descendent l'arbre d'éléments sans
+traduction, alors que \code{Slot(l)} et \code{Prop(p)} doivent être traduits à chaque saut.
+\end{exercice}
+\begin{solution}
+\code{Slot(l)} désigne le slot $l$ \emph{du composant courant} : le même label dans l'enfant est un
+autre slot. \code{Prop(p)} désigne la prop $p$ \emph{reçue} : la prop \code{value} du parent
+devient, chez l'enfant, la prop sous laquelle il la transmet. Un nom de module ou un contexte
+prouvé désigne le même objet dans tous les composants (appariement par orthographe pour le
+premier, \code{ContextId} canonique pour le second) : \code{uses} les recopie tels quels dans la
+question traduite.
+\end{solution}
+
+\begin{exercice}{Un havoc complet}{inter-composants-havoc}
+Sur l'\cref{ex:inter-composants-hv}, où faut-il corriger pour que \code{B} et \code{D} soient
+havoqués, et pourquoi pas dans une règle ?
+\end{exercice}
+\begin{solution}
+Dans \code{collect_escaping_setters}, au niveau où il descend dans les champs d'un
+\code{ObjectLit} ou les éléments d'un \code{ArrayLit} : un champ dont la \emph{valeur} est un
+setter (\code{as_setter()}) doit être poussé, comme l'est le setter nu au niveau de la prop.
+C'est le mécanisme partagé de soundness du domaine des valeurs : toutes les règles lisent l'état
+qu'il calcule, et un correctif par règle serait le contournement que le premier principe du
+projet interdit.
+\end{solution}
+
+\begin{exercice}{Ce qui manque à \code{nested}}{inter-composants-foreach}
+Sur l'\cref{ex:inter-composants-foreach}, quel fait faudrait-il remonter de l'analyse du
+callback pour que \code{<Child>} ne soit pas signalé ? Pourquoi la copie des seules variables
+libres aggrave-t-elle le problème ?
+\end{exercice}
+\begin{solution}
+Il faudrait joindre, dans l'environnement du rendu, la dépendance des bindings \emph{extérieurs}
+que le callback affecte (ici \code{label}, avec le \code{pc} du test \code{i === sel}). Or
+\code{nested} jette l'environnement de sortie, et \code{compute_free_vars} retire les cibles
+d'\code{Assign} des variables libres : \code{label} n'est même pas copié dans l'environnement du
+callback, et rien ne dit qu'il est écrit. Les racines écrites existent pourtant déjà
+(\code{written_roots}) : c'est le fait à réutiliser.
+\end{solution}
+
+\begin{exercice}{Le bottom qui n'est pas neutre}{inter-composants-exit-env}
+Pourquoi \code{AnalysisResult::exit_env} joint-il les environnements de sortie avec
+\code{reduce} et non avec \code{fold(AbstractEnv::bottom(), join)} ?
+\end{exercice}
+\begin{solution}
+Dans le join d'environnements, une clé présente d'un seul côté prend $\Top$
+(\cref{chap:transfert-stores}). Partir de l'environnement vide ferait donc passer à $\Top$
+toute variable de l'autre environnement : $\Bot$ n'est pas l'élément neutre du join. \code{reduce}
+part du premier environnement réel, et seul le cas \og aucun bloc \code{Return}\fg{} rend
+l'environnement vide.
+\end{solution}
