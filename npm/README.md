@@ -115,15 +115,23 @@ Worker. Types ship with the package.
 
 ## What it catches
 
-`infinite-loop`, `cross-component-infinite-loop`, `derived-state`,
-`stale-closure`, `frozen-initial-state`, `state-mutation`,
-`unstable-context-value`, `setter-in-render`, `cross-setter-in-render`,
-`missing-cleanup`, `redundant-set-state`, `unnecessary-rerender`, `lazy-init`,
-`state-lifted-too-high`, `wasted-subtree-render`, `server-component-hook`, plus `missing-deps`, `always-unstable-deps` and
-`conditional-hook`, which overlap with ESLint but fire through helpers and
-cross-file custom hooks too.
+Nineteen rules, sorted by what you see in the browser:
 
-Run `reactant explain <rule>` for any of them.
+| What you see | Rules |
+|---|---|
+| Loops that never settle | `infinite-loop`, `cross-component-infinite-loop`, `setter-in-render`, `cross-setter-in-render` |
+| Re-renders nobody asked for | `state-lifted-too-high`, `wasted-subtree-render`, `unstable-context-value` |
+| State that should not be state | `derived-state`, `unnecessary-rerender`, `redundant-set-state` |
+| Values frozen in time | `stale-closure`, `frozen-initial-state` |
+| Identity and mutation | `state-mutation`, `lazy-init` |
+| Lifecycle and environment | `missing-cleanup`, `server-component-hook` |
+| Also covered by ESLint, followed further | `missing-deps`, `always-unstable-deps`, `conditional-hook`, which fire through helpers and cross-file custom hooks too |
+
+`reactant rules` lists them, plus two informational entries (`analysis-limit`,
+`widening-info`) the run uses to say where it could not look. Run
+`reactant explain <rule>` for an example and a fix. The two render-cascade
+rules take options (`minDepth`, `minWastedRenders`, `continuousOnly`), set in
+`reactant.config.json` or with `--rule-option`.
 
 Every finding carries a witness chain: the typed steps explaining why the rule
 fired, such as which binding resolves where, which call writes which state slot,

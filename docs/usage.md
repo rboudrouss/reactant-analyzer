@@ -108,11 +108,21 @@ degrades to defaults. CLI flags beat config values.
   and their Errors gate `--fail-on` exactly like native ones.
 - `options` are validated against the params the rule declares
   (an unknown key or a type mismatch exits with code 2). A built-in rule
-  accepts only the options `reactant explain <rule>` lists; today that is
-  `state-lifted-too-high` (`minDepth`, `minWastedRenders`):
+  accepts only the options `reactant explain <rule>` lists; today those are
+  the two render-cascade rules (ADR-041):
+
+  | Rule | Option | Default | Meaning |
+  |---|---|---|---|
+  | `state-lifted-too-high` | `minDepth` | `1` | report only when the state's home is at least this many levels below its owner |
+  | `state-lifted-too-high` | `minWastedRenders` | `2` | report only when each write re-renders at least this many components for nothing |
+  | `wasted-subtree-render` | `minWastedRenders` | `2` | same threshold; a subtree holding a list always qualifies |
+  | `wasted-subtree-render` | `continuousOnly` | `true` | report only states written from a continuous event (typing, pointer motion, scroll, drag, a timer); `false` also reports clicks and other discrete events |
 
   ```jsonc
-  "rules": { "state-lifted-too-high": { "options": { "minDepth": 2 } } }
+  "rules": {
+    "state-lifted-too-high": { "options": { "minDepth": 2 } },
+    "wasted-subtree-render": { "options": { "continuousOnly": false } }
+  }
   ```
 
 ## Rule packs (Tier A)
