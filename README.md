@@ -134,7 +134,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rboudrouss/reactant-analyzer@v0.6.0
+      - uses: rboudrouss/reactant-analyzer@v0.7.0
         with:
           path: .              # default: the whole checkout
           fail-on: error       # warnings annotate the PR without failing it
