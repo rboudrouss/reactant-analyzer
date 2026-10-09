@@ -48,7 +48,7 @@ jobs:
       # key: the corpus is re-cloned only when someone deliberately moves it.
       - name: Cache the corpus
         id: corpus-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: test-repo
           key: corpus-${{ hashFiles('scripts/setup-test-repo.sh') }}
