@@ -79,7 +79,7 @@ enum Command {
 pub enum OutputFormat {
     /// Grouped, colored, human-readable report
     Human,
-    /// One JSON document on stdout (schema v1, see docs/usage.md)
+    /// One JSON document on stdout (schema v2, see docs/usage.md)
     Json,
 }
 

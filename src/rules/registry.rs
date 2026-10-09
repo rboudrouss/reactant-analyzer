@@ -127,7 +127,7 @@ pub struct RuleRegistry {
 }
 
 impl RuleRegistry {
-    /// The 14 native rules and the 16-entry doc table; no overrides.
+    /// The 19 native rules (17 rules, `WideningInfo`, `AnalysisLimitInfo`) and the doc table; no overrides.
     pub fn natives() -> Self {
         RuleRegistry {
             rules: all_rules(),

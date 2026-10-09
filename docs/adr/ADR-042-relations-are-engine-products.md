@@ -142,10 +142,11 @@ edges, and the corpus measures the cost. `Handler` rows on dep-driven edges
 were May edges; they are dropped on the strength of the ADR-034 registrar
 proof, the same argument ADR-018 already made for no-deps effects.
 
-The convergence kill is unchanged: it applies only to a slot with a single
-effect write row program-wide, counted on the relation (`region ==
-Effect(_)` and `phase != Handler`), and reads `written.value` and
-`written.expr` from the row.
+The convergence kill was unchanged *at the time of this decision*: it
+applied only to a slot with a single effect write row program-wide, counted
+on the relation (`region == Effect(_)` and `phase != Handler`), and read
+`written.value` and `written.expr` from the row. The amendment below
+replaces it (single-writer precondition gone).
 
 **ADR-020 item 2 is respected.** The relation carries every candidate edge,
 including the dep-driven same-slot edge the graph arm excludes today, tagged
@@ -255,7 +256,9 @@ with the pack typings.
 
 - `rules/helpers/churn.rs` and `rules/helpers/churn_graph.rs` are deleted;
   `engine/churn.rs`, `engine/guards.rs`, `engine/triggers.rs` and
-  `engine/program_relations.rs` exist. `rules/api/cache.rs` is gone.
+  `engine/program_relations.rs` exist. `rules/api/cache.rs` stays, slimmed:
+  it composes `ProgramRelations` with the three structures that have not
+  moved yet (context consumers, mount index, render tree).
 - #26 closes by construction, with a regression test in
   `tests/effect_cycles.rs`. #39 (convergent multi-writer FP) is untouched:
   the single-writer condition is the same.

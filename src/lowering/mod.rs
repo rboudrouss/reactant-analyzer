@@ -161,7 +161,7 @@ impl Candidate<'_> {
 
 /// Local names bound to the `react` module itself: `import React from
 /// "react"` and `import * as R from "react"`. `R.useMemo(...)` is React's
-/// hook only through one of these bindings (see `ImportCtx::callee_is_react`).
+/// hook only through one of these bindings (see `ImportCtx::classify_callee`).
 fn build_react_ns(program: &Program) -> HashSet<String> {
     let mut ns = HashSet::new();
     for stmt in &program.body {
@@ -276,7 +276,7 @@ fn collect_module_consts(
 
     // `createContext(…)` reached through a React binding: a bare name imported
     // from "react", or `<ns>.createContext` where `ns` is the react module
-    // (`React` is accepted unimported, matching `ImportCtx::callee_is_react`).
+    // (`React` is accepted unimported, matching `ImportCtx::classify_callee`).
     let create_context = react_create_context_names(program);
     let is_create_context = |call: &oxc_ast::ast::CallExpression| match &call.callee {
         Expression::Identifier(id) => create_context.contains(id.name.as_str()),

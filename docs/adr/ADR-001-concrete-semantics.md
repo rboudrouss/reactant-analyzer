@@ -3,6 +3,12 @@
 - **Status**: Accepted
 - **Date**: 2026-05-29
 
+> **Status (2026-10-09).** The decision stands; three of the Consequences
+> below were never delivered. `docs/semantics.md` was not written (the
+> extensions are specified in the ADRs that introduce them), the transfer
+> functions do not cite React-tRace rules, and no regression test runs
+> against the reference interpreter. Read them as intentions, not as state.
+
 ## Context
 
 An analyzer based on abstract interpretation requires a concrete semantics C from which one derives the abstract semantics C#. Without an explicit C, the soundness of the analyzer cannot be established formally, and the transfer functions are written by guesswork.

@@ -41,7 +41,7 @@ fn default<'a>(
 /// Any locally-defined hook-named function is a custom hook — INCLUDING one
 /// named like a React built-in (`function useMemo(name, options)`, memos): JS
 /// scoping makes the local definition shadow the React import/global, and the
-/// call-site classification (`ImportCtx::callee_is_react`) relies on these
+/// call-site classification (`ImportCtx::classify_callee`) relies on these
 /// names to resolve the collision.
 fn is_custom_hook(name: &str) -> bool {
     super::is_hook_name(name)

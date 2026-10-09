@@ -2,6 +2,13 @@
 
 - **Status**: Implemented
 - **Date**: 2026-07-16
+
+> **Status (2026-10-09).** Two paragraphs are superseded. The graph arm is
+> `src/engine/churn.rs`, not `src/rules/helpers/churn_graph.rs` (deleted by
+> [ADR-042](ADR-042-relations-are-engine-products.md)). The convergence kill
+> no longer rests on "the single-writer condition": it is the multi-site
+> proof `converges_under_all_writes` (`src/engine/guards.rs`, #154), which
+> also kills a multi-writer slot when every write's guards die.
 - **Refines**: [ADR-017](ADR-017-versioned-stability.md) (§Limitations — multi-effect cycles)
 - **Context**: [ADR-012](ADR-012-inter-component-analysis.md) (ComponentSetter props)
 

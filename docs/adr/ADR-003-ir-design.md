@@ -3,6 +3,11 @@
 - **Status**: Accepted
 - **Date**: 2026-05-29
 
+> **Status (2026-10-09).** `docs/ir.md` was never written; the IR is
+> specified by `src/ir/`. Component identification has a fourth rule since
+> #122 (see the list below), implemented in
+> `src/lowering/component_detector.rs`.
+
 ## Context
 
 The analyzer traverses Oxc AST code (full JS/TS, rich in syntactic sugar). Applying the transfer functions directly on the Oxc AST forces handling dozens of equivalent forms (destructuring, short-circuits, ternaries, early returns). A dedicated IR normalizes these forms and drastically simplifies the abstract domains.
@@ -23,7 +28,7 @@ A tree-shaped IR (React-tRace style) requires a CPS-transform pass for early ret
 
 ### IR structure
 
-See `docs/ir.md` for the full grammar.
+The grammar is `src/ir/` (`docs/ir.md` was never written).
 
 Key points:
 - `BasicBlock` = linear sequence of `Stmt`, terminated by a `Terminator` (Jump | Branch | Return).
@@ -50,6 +55,8 @@ A component is identified if:
 1. **Priority 0**: name starts with `use` → custom hook, never a component.
 2. **Priority 1**: at least one return path produces a `JSXElement` → component.
 3. **Priority 2**: annotated `React.FC` / `React.ReactElement` / `JSX.Element` → component.
+4. **Priority 3** (#122): the body calls a React hook → component (finds the
+   components that return `null` on every path).
 
 ## Consequences
 

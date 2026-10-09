@@ -162,7 +162,8 @@ Consolidated list in [docs/TODO.md](../TODO.md#adr-013--cross-file-analysis-limi
 
 - `src/resolver/`: new module with traits + default implementations
 - `src/engine/symbol_graph.rs`: new — symbol graph + topo sort
-- `src/lowering/symbol_extractor.rs`: new — lightweight pre-pass
+- `src/lowering/symbol_extractor.rs`: announced, never created — the
+  extraction lives in `src/engine/symbol_graph.rs`
 - `src/ir/component.rs`, `src/ir/hook_ir.rs`: `file: PathBuf` added
 - `src/ir/function_ir.rs`: new
 - `src/engine/component_registry.rs`, `src/engine/hook_registry.rs`: keys `(PathBuf, String)`
