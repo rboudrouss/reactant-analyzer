@@ -24,6 +24,14 @@ decided.
 Everything under *Confirmed defects* is the first kind. Everything else on this
 page is the second.
 
+**Checked against React.** The termination claims (`infinite-loop`,
+`setter-in-render` and their cross-component forms) are tested against real
+React by the oracle under `oracle/` ([semantics.md](semantics.md),
+[ADR-043](adr/ADR-043-react-is-the-concrete-oracle.md)): a program that loops in
+React must get a finding, and an Error must come with a loop. The programs the
+analyzer gets wrong today are listed, one per file, in `oracle/cases/` with
+their issue.
+
 ## Confirmed defects
 
 These drop or falsify information the analysis then relies on.

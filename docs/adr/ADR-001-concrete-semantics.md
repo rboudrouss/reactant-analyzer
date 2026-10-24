@@ -8,6 +8,13 @@
 > extensions are specified in the ADRs that introduce them), the transfer
 > functions do not cite React-tRace rules, and no regression test runs
 > against the reference interpreter. Read them as intentions, not as state.
+>
+> **Status (2026-10-25).** Two of the three are now delivered by
+> [ADR-043](ADR-043-react-is-the-concrete-oracle.md), with one change: the
+> reference the tests run is React itself, not the React-tRace interpreter.
+> [`docs/semantics.md`](../semantics.md) states the semantics in React-tRace's
+> vocabulary, and `oracle/` checks the analyzer against React on generated
+> programs. Transfer functions citing the rules remains undone.
 
 ## Context
 

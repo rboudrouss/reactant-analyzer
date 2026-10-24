@@ -1,0 +1,23 @@
+{
+  "name": "reactant-oracle",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Concrete oracle for reactant: renders generated components in real React and checks the analyzer's claims against what happened",
+  "type": "module",
+  "engines": {
+    "node": ">=22.22"
+  },
+  "bin": {
+    "reactant-oracle": "bin/oracle.mjs"
+  },
+  "scripts": {
+    "cases": "node bin/oracle.mjs cases",
+    "fuzz": "node bin/oracle.mjs fuzz"
+  },
+  "dependencies": {
+    "esbuild": "0.28.2",
+    "jsdom": "30.1.3",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  }
+}
