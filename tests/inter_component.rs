@@ -300,6 +300,7 @@ fn setter_prop_propagates_to_shared_state() {
             hook_provenance: vec![],
             hooks: vec![HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             }],
@@ -701,6 +702,7 @@ fn prop_drilling_direct_ir() {
             hook_provenance: vec![],
             hooks: vec![HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             }],
@@ -727,9 +729,8 @@ fn prop_drilling_direct_ir() {
     );
 }
 
-// But what about the FieldAccess in effect body calling on ComponentSetter?
-// The `exec_setter_call` only handles `Call { fn_: Var(name), ... }`.
-// For `Call { fn_: FieldAccess { ... }, ... }` we need an additional check.
+// A `Call { fn_: FieldAccess { ... }, ... }` on a ComponentSetter is resolved
+// by evaluating the callee, like any other slot write (`exec_slot_write`).
 
 // ── Section 7: prop drilling updates SharedStateStore ────────────────────────
 

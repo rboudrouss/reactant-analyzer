@@ -7,6 +7,7 @@ use crate::{
         impls::StateValue,
         stores::{AbstractEnv, EnvVal, HeapValue, resolve_locs},
     },
+    engine::Reducer,
     ir::{
         cfg::{CFG, EdgeKind, Terminator},
         expr::{Expr, MarkerVal, SummaryValue},
@@ -77,12 +78,13 @@ fn exec_full_stmt<T: Transfer>(
         // An expression statement (`expr;`) contributes only its side effects.
         // The same is true of a concise-arrow `Return` body, which the fixpoint
         // engine feeds through here — both share the single definition in
-        // [`exec_expr_effects`] (callback pre-pass + setter + inter-component).
+        // [`exec_expr_effects`] (call effects + inter-component).
         Stmt::ExprStmt(expr, _) => {
             exec_expr_effects(transfer, expr, env, ctx, depth);
         }
-        // Binding statements: callback pre-pass over the RHS parts, then the
-        // binding core.
+        // Binding statements: the effects of every call in the RHS parts —
+        // a slot write included, `x = flag && setA(1)` is one (#169) — then
+        // the binding core.
         Stmt::Let { rhs, .. } | Stmt::Assign { rhs, .. } => {
             exec_callbacks_depth(transfer, rhs, env, ctx, depth);
             exec_stmt_core(transfer, stmt, env, ctx);
@@ -99,12 +101,13 @@ fn exec_full_stmt<T: Transfer>(
 }
 
 /// Fire the side effects of an expression evaluated in *effect position* — a
-/// bare `expr;` statement or a concise-arrow `Return` body. Runs the callback
-/// pre-pass, the setter-call weak-update, and — for a component application —
-/// the inter-component `eval_expr` (setter handling alone does not fire it).
+/// bare `expr;` statement, a concise-arrow `Return` body or a branch
+/// condition. Runs the effects of every call in it (callbacks and slot
+/// writes, [`exec_callbacks_depth`]) and — for a component application — the
+/// inter-component `eval_expr`.
 ///
 /// This is the single definition of "run an expression for its effects". The
-/// interpreter's `ExprStmt` handling and the fixpoint engine's `Return`
+/// interpreter's `ExprStmt` handling and the fixpoint engine's terminator
 /// handling both go through it (via [`Transfer::exec_expr_effects`]); the
 /// engine no longer fabricates a throwaway `Stmt::ExprStmt` to reach it.
 ///
@@ -119,7 +122,6 @@ pub(crate) fn exec_expr_effects<T: Transfer>(
     depth: usize,
 ) {
     exec_callbacks_depth(transfer, expr, env, ctx, depth);
-    exec_setter_call(transfer, expr, env, ctx, depth);
     if let Expr::CompApp { .. } = expr {
         transfer.eval_expr(expr, env, ctx);
     }
@@ -332,63 +334,73 @@ fn obj_members<T: Transfer>(
     out
 }
 
-/// If `expr` is a setter call `setX(arg)`, weak-update the corresponding state
-/// label. Handles functional updaters (`setX(c => …)`: the `FnLit` arg runs via
-/// `exec_body_depth` with `c` bound to the current state value).
+/// The one transfer for "write a state slot": a call `f(arg)` whose callee is
+/// a setter or a `dispatch`, of this component or of another one.
 ///
-/// Shared by `ExprStmt` statements and concise-arrow implicit returns (the
-/// latter behave like a side-effecting statement *and* yield a value).
-fn exec_setter_call<T: Transfer>(
+/// [`exec_callbacks_depth`] reaches it for every call it walks, so a write is
+/// a write wherever the call sits — a statement, a `&&` arm lowered to an
+/// `Assign`, an argument (#169). The value stored is the one React stores:
+/// - a `useReducer` slot stores `reducer(state, arg)` (#170), the reducer run
+///   in its own scope — only its two parameters bound — or ⊤ when it has no
+///   body in reach;
+/// - a functional updater `set(c => …)` stores its return, `c` bound to the
+///   slot's current value (#168) — ⊤ for another component's slot, whose
+///   value lives in its owner's fixpoint;
+/// - any other argument is stored as evaluated.
+fn exec_slot_write<T: Transfer>(
     transfer: &T,
-    expr: &Expr,
+    fn_: &Expr,
+    args: &[Expr],
     env: &AbstractEnv<T::Domain>,
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) {
-    if let Expr::Call { fn_, args } = expr
-        && let Expr::Var(name) = fn_.as_ref()
-        && let Some(label) = env.setter_label(name)
-    {
-        let arg_val = match args.first() {
+    let bound = match fn_ {
+        Expr::Var(name) => env.setter_label(name),
+        _ => None,
+    };
+    let target = match bound {
+        Some(label) => Some((ctx.component, label)),
+        None => transfer
+            .eval_expr(fn_, env, ctx)
+            .as_state_value()
+            .and_then(|sv| sv.as_setter().map(|(c, l)| (*c, *l))),
+    };
+    let Some((owner, label)) = target else {
+        return;
+    };
+    let current = if owner == ctx.component {
+        ctx.state.get(label)
+    } else {
+        T::Domain::top()
+    };
+    let next = match ctx.query.reducer(owner, label) {
+        Some(Reducer::Body { params, body }) => {
+            let action = args
+                .first()
+                .map_or_else(T::Domain::top, |a| transfer.eval_expr(a, env, ctx));
+            let mut scope = AbstractEnv::new();
+            for (param, val) in params.iter().zip([current, action]) {
+                scope.extend(param.clone(), val);
+            }
+            exec_body_depth(transfer, &body, &scope, ctx, depth + 1)
+        }
+        Some(Reducer::Opaque) => T::Domain::top(),
+        None => match args.first() {
             Some(Expr::FnLit {
                 params, body_cfg, ..
             }) => {
                 let mut sub_env = env.clone();
                 if let Some(param) = params.first() {
-                    sub_env.extend(param.clone(), ctx.state.get(label));
+                    sub_env.extend(param.clone(), current);
                 }
                 exec_body_depth(transfer, body_cfg, &sub_env, ctx, depth + 1)
             }
             Some(a) => transfer.eval_expr(a, env, ctx),
             None => T::Domain::top(),
-        };
-        ctx.state.update(label, arg_val);
-    }
-
-    // Cross-component ComponentSetter call.
-    // Handles fn_ = Var(name), FieldAccess { obj: Var, field }, or any other expr
-    // that evaluates to ComponentSetter { component, label }.
-    if let Expr::Call { fn_, args } = expr {
-        let comp_setter = transfer
-            .eval_expr(fn_, env, ctx)
-            .as_state_value()
-            .and_then(|sv| sv.as_setter().map(|(c, l)| (*c, *l)));
-        if let Some((component, label)) = comp_setter
-            && ctx.inter.is_some()
-        {
-            let arg_val = args
-                .first()
-                .map(|a| transfer.eval_expr(a, env, ctx))
-                .and_then(|v| v.as_state_value())
-                .unwrap_or(crate::domains::StateValue::top());
-            if let Some(inter) = &ctx.inter {
-                inter
-                    .shared_state
-                    .borrow_mut()
-                    .update(component, label, arg_val);
-            }
-        }
-    }
+        },
+    };
+    ctx.write_slot(owner, label, next);
 }
 
 /// Processes blocks in topological order. Back edges are ignored for env
@@ -438,7 +450,6 @@ fn exec_body_impl<T: Transfer>(
                     // take EXPR's value as the return. `eval_expr` alone is pure
                     // and would silently drop those effects.
                     exec_callbacks_depth(transfer, expr, &env, ctx, depth);
-                    exec_setter_call(transfer, expr, &env, ctx, depth);
                     let v = transfer.eval_expr(expr, &env, ctx);
                     return_val = return_val.join(&v);
                 }
@@ -448,7 +459,11 @@ fn exec_body_impl<T: Transfer>(
                         .and_modify(|e| *e = e.join(&env))
                         .or_insert(env);
                 }
-                Terminator::Branch { then_, else_, .. } => {
+                Terminator::Branch {
+                    cond, then_, else_, ..
+                } => {
+                    // A condition is evaluated, so its calls run.
+                    exec_callbacks_depth(transfer, cond, &env, ctx, depth);
                     for &next in &[*then_, *else_] {
                         env_at
                             .entry(next)
@@ -468,8 +483,14 @@ fn exec_body_impl<T: Transfer>(
     return_val
 }
 
-/// Per-expression side-effect pre-pass: for in-cycle calls (`.then`, timers,
-/// sync HOFs), execute closure arguments for their side effects.
+/// Per-expression effect walk: every call in `expr` runs its effects — the
+/// closure arguments of in-cycle calls (`.then`, timers, sync HOFs) and of
+/// local functions execute, and a call through a setter writes its slot
+/// ([`exec_slot_write`]).
+///
+/// The inlining budget bounds the bodies this walk executes, never the walk:
+/// past [`MAX_INLINE_DEPTH`] a callback or a child component is skipped, but a
+/// slot write still lands — dropping it would be a missed write.
 ///
 /// Invariant: never recurse INTO a `FnLit` body here bodies run only via
 /// `exec_body_depth`; otherwise `exec_body_impl → exec_full_stmt → exec_callbacks_depth`
@@ -481,15 +502,13 @@ fn exec_callbacks_depth<T: Transfer>(
     ctx: &mut AnalysisCtx<T::Domain>,
     depth: usize,
 ) {
-    if depth >= MAX_INLINE_DEPTH {
-        if let Some(inter) = ctx.inter {
-            inter
-                .stats
-                .borrow_mut()
-                .callback_depth_capped
-                .insert(inter.component);
-        }
-        return;
+    let capped = depth >= MAX_INLINE_DEPTH;
+    if capped && let Some(inter) = ctx.inter {
+        inter
+            .stats
+            .borrow_mut()
+            .callback_depth_capped
+            .insert(inter.component);
     }
     match expr {
         Expr::Call { fn_, args } => {
@@ -500,7 +519,7 @@ fn exec_callbacks_depth<T: Transfer>(
                 match arg {
                     Expr::FnLit {
                         params, body_cfg, ..
-                    } if class == TriggerClass::InCycle => {
+                    } if class == TriggerClass::InCycle && !capped => {
                         let mut sub_env = env.clone();
                         for p in params {
                             sub_env.extend(p.clone(), T::Domain::top());
@@ -508,10 +527,11 @@ fn exec_callbacks_depth<T: Transfer>(
                         let _ = exec_body_depth(transfer, body_cfg, &sub_env, ctx, depth + 1);
                     }
                     // B5: variable callback resolve Identifier to heap Fn and execute.
-                    Expr::Var(name) if class == TriggerClass::InCycle => {
+                    Expr::Var(name) if class == TriggerClass::InCycle && !capped => {
                         exec_var_callback(transfer, name, env, ctx, depth);
                     }
-                    // Setter/Subscription/Unknown inline closures not descended.
+                    // Setter/Subscription/Unknown inline closures not descended:
+                    // a setter's updater runs in the slot write below.
                     Expr::FnLit { .. } => {}
                     other => {
                         exec_callbacks_depth(transfer, other, env, ctx, depth);
@@ -521,15 +541,20 @@ fn exec_callbacks_depth<T: Transfer>(
             // B6: direct local call inlining Unknown callee that resolves to a heap Fn.
             // External/imported functions have no Loc → skipped (no FP).
             if class == TriggerClass::Unknown
+                && !capped
                 && let Expr::Var(name) = fn_.as_ref()
             {
                 exec_var_callback(transfer, name, env, ctx, depth);
             }
+            // Arguments first, then the call itself.
+            exec_slot_write(transfer, fn_, args, env, ctx, depth);
         }
         Expr::CompApp { props, .. } => {
             exec_callbacks_depth(transfer, props, env, ctx, depth);
             // Fire inter-component inlining for CompApp inside children/fields.
-            transfer.eval_expr(expr, env, ctx);
+            if !capped {
+                transfer.eval_expr(expr, env, ctx);
+            }
         }
         // Bare FnLit outside a call: never runs by itself — not descended.
         // Everything else: generic child descent.

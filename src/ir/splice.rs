@@ -548,9 +548,15 @@ pub fn rename_hook_entry(entry: HookEntry, ren: &HashMap<Var, Var>) -> HookEntry
         return entry;
     }
     match entry {
-        HookEntry::State { label, init, span } => HookEntry::State {
+        HookEntry::State {
+            label,
+            init,
+            reducer,
+            span,
+        } => HookEntry::State {
             label,
             init: rename_vars_expr(init, ren),
+            reducer: reducer.map(|r| rename_vars_expr(r, ren)),
             span,
         },
         HookEntry::Ref { label, init, span } => HookEntry::Ref {

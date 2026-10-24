@@ -667,7 +667,12 @@ fn make_hook_entry(
     match name {
         "useState" => {
             let init = it.next().unwrap_or(Expr::Lit(Prim::Unit));
-            Some(HookEntry::State { label, init, span })
+            Some(HookEntry::State {
+                label,
+                init,
+                reducer: None,
+                span,
+            })
         }
         "useEffect" => {
             let body_cfg = hook_body_cfg(it.next());
@@ -713,9 +718,17 @@ fn make_hook_entry(
             Some(HookEntry::Ref { label, init, span })
         }
         "useReducer" => {
-            let _reducer = it.next(); // skip reducer fn
+            // A state slot whose writes go through the reducer: `dispatch(a)`
+            // stores `reducer(state, a)`. A missing reducer is still one —
+            // the next state is then unknown, never the action.
+            let reducer = Some(it.next().unwrap_or(Expr::Lit(Prim::Unit)));
             let init = it.next().unwrap_or(Expr::Lit(Prim::Unit));
-            Some(HookEntry::State { label, init, span })
+            Some(HookEntry::State {
+                label,
+                init,
+                reducer,
+                span,
+            })
         }
         "useLayoutEffect" | "useInsertionEffect" => {
             let body_cfg = hook_body_cfg(it.next());

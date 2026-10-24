@@ -230,6 +230,7 @@ mod tests {
     fn a_modelled_hook_is_named_by_its_origin() {
         let state = HookEntry::State {
             label: 0,
+            reducer: None,
             init: Expr::Lit(Prim::Unit),
             span: None,
         };

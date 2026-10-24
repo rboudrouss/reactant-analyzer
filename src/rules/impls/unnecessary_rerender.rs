@@ -228,6 +228,7 @@ mod tests {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
+                reducer: None,
                 init,
                 span: None,
             },

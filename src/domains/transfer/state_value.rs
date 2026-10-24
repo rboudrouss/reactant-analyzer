@@ -259,9 +259,9 @@ fn returns_fresh_reference(callee: &Expr) -> bool {
 }
 
 /// Join ⊤ into every state slot whose setter is passed as a prop to an
-/// unanalyzable child. Own-component setters go through `ctx.state`; a
-/// forwarded ancestor setter goes through the `SharedStateStore` so the
-/// ancestor's fixpoint sees the write.
+/// unanalyzable child, through [`AnalysisCtx::write_slot`]: an own slot in
+/// `ctx.state`, a forwarded ancestor's in the `SharedStateStore` its fixpoint
+/// imports.
 fn havoc_setter_props(
     props_expr: &Expr,
     env: &AbstractEnv<StateValue>,
@@ -285,14 +285,7 @@ fn havoc_setter_props(
         collect_escaping_setters(v, env, ctx.heap, own, &mut setters, &mut HashSet::new());
     }
     for (comp, label) in setters {
-        if comp == own {
-            ctx.state.update(label, StateValue::top());
-        } else if let Some(inter) = &ctx.inter {
-            inter
-                .shared_state
-                .borrow_mut()
-                .update(comp, label, StateValue::top());
-        }
+        ctx.write_slot(comp, label, StateValue::top());
     }
 }
 

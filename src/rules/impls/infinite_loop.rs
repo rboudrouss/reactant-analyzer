@@ -803,6 +803,7 @@ mod tests {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             },
@@ -869,6 +870,7 @@ mod tests {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             },
@@ -991,6 +993,7 @@ mod tests {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             },
@@ -1340,6 +1343,7 @@ mod tests {
         let hooks = vec![
             HookEntry::State {
                 label: 0,
+                reducer: None,
                 init: Expr::Lit(Prim::Int(0)),
                 span: None,
             },

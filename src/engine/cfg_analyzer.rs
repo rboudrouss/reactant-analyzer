@@ -79,10 +79,11 @@ pub fn analyze_cfg<'inter, T: Transfer>(
             }
             // A concise-arrow body (`() => setN(1)`) lowers its expression to a
             // `Return` terminator, not an `ExprStmt` — but its side effects must
-            // still fire. Run them through the shared effect-firing path instead
-            // of fabricating a throwaway `Stmt::ExprStmt`.
-            if let Terminator::Return(return_expr) = &block.term {
-                transfer.exec_expr_effects(return_expr, &mut env_out, &mut ac);
+            // still fire, and so must a branch condition's. Run them through the
+            // shared effect-firing path instead of fabricating a throwaway
+            // `Stmt::ExprStmt`.
+            if let Terminator::Return(e) | Terminator::Branch { cond: e, .. } = &block.term {
+                transfer.exec_expr_effects(e, &mut env_out, &mut ac);
             }
         }
 

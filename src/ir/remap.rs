@@ -265,9 +265,15 @@ pub fn remap_hooks(hooks: Vec<HookEntry>, off: Offsets) -> Vec<HookEntry> {
 
 fn remap_hook_entry(entry: HookEntry, off: Offsets) -> HookEntry {
     match entry {
-        HookEntry::State { label, init, span } => HookEntry::State {
+        HookEntry::State {
+            label,
+            init,
+            reducer,
+            span,
+        } => HookEntry::State {
             label: label + off.labels,
             init: remap_expr(init, off),
+            reducer: reducer.map(|r| remap_expr(r, off)),
             span,
         },
         HookEntry::Effect {
@@ -420,6 +426,7 @@ mod tests {
             HookEntry::State {
                 label: 0,
                 init: Expr::Lit(Prim::Int(0)),
+                reducer: None,
                 span: None,
             },
             HookEntry::Effect {

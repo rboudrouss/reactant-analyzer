@@ -7,7 +7,7 @@ use crate::{
     },
     engine::{
         AnalysisResult, AnalysisStats, ComponentCache, ComponentCallGraph, ComponentRegistry,
-        HookRegistry, fixpoint::Config,
+        HookRegistry, ProgramReducers, Reducer, Reducers, fixpoint::Config,
     },
     ir::{ComponentId, component::ComponentIR},
 };
@@ -39,6 +39,12 @@ pub trait QueryContext {
     ) -> Option<std::sync::Arc<crate::ir::cfg::CFG>> {
         None
     }
+
+    /// The reducer of slot `(owner, label)` if it is a `useReducer` slot:
+    /// a write through its `dispatch` stores `reducer(state, action)`.
+    fn reducer(&self, _owner: ComponentId, _label: crate::ir::types::HookLabel) -> Option<Reducer> {
+        None
+    }
 }
 
 // ── NullCtx ───────────────────────────────────────────────────────────────────
@@ -60,6 +66,9 @@ pub struct InterCtx<'a> {
     pub registry: &'a ComponentRegistry,
     pub cache: &'a RefCell<ComponentCache>,
     pub shared_state: &'a RefCell<SharedStateStore>,
+    /// Every `useReducer` slot's reducer, registered by its owner: what a
+    /// child's write through a parent's `dispatch` stores.
+    pub reducers: &'a ProgramReducers,
     pub call_graph: &'a RefCell<ComponentCallGraph>,
     pub stats: &'a RefCell<AnalysisStats>,
     /// All analysis results accumulated across the entire program analysis.
@@ -86,6 +95,7 @@ impl<'a> InterCtx<'a> {
             registry: self.registry,
             cache: self.cache,
             shared_state: self.shared_state,
+            reducers: self.reducers,
             call_graph: self.call_graph,
             stats: self.stats,
             results: self.results,
@@ -142,6 +152,18 @@ impl<'a, D: AbstractDomain> AnalysisCtx<'a, D> {
             inter: None,
         }
     }
+
+    /// Weakly store `val` into slot `(owner, label)`: the component's own slot
+    /// in its store, another component's in the shared store its owner's
+    /// fixpoint imports. Every slot write lands through here.
+    pub fn write_slot(&mut self, owner: ComponentId, label: crate::ir::types::HookLabel, val: D) {
+        if owner == self.component {
+            self.state.update(label, val);
+        } else if let Some(inter) = self.inter {
+            let val = val.as_state_value().unwrap_or_else(StateValue::top);
+            inter.shared_state.borrow_mut().update(owner, label, val);
+        }
+    }
 }
 
 // ── FixpointCtx ───────────────────────────────────────────────────────────────
@@ -159,6 +181,9 @@ pub struct FixpointCtx<'a> {
         crate::ir::types::HookLabel,
         std::sync::Arc<crate::ir::cfg::CFG>,
     >,
+    /// `useReducer` reducers reachable from this component (see
+    /// `QueryContext::reducer`).
+    pub reducers: &'a Reducers<'a>,
 }
 
 impl QueryContext for FixpointCtx<'_> {
@@ -167,5 +192,9 @@ impl QueryContext for FixpointCtx<'_> {
         label: crate::ir::types::HookLabel,
     ) -> Option<std::sync::Arc<crate::ir::cfg::CFG>> {
         self.callbacks.get(&label).cloned()
+    }
+
+    fn reducer(&self, owner: ComponentId, label: crate::ir::types::HookLabel) -> Option<Reducer> {
+        self.reducers.get(owner, label)
     }
 }

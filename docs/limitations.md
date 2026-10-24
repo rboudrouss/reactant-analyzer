@@ -57,8 +57,9 @@ that writes it (see *Cross-file limits*).
 - Hooks and callees it cannot reach: npm-package callees and utilities cut off by the inlining depth
   [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19), silently: `pkgFn(() => setN(n + 1))` in an effect gets no
   analysis-limit, and `infinite-loop` is reported verified; utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52); a setter called
-  through an index or a returned function [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46). A setter *call* in any expression position,
-  `wrap(setN(1))`, a ternary arm, a JSX prop, is seen; it is the callee's *inlining* that is not.
+  through an index or a returned function [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46). A setter or `dispatch` *call* in any expression
+  position, `wrap(setN(1))`, a `&&` or ternary arm, a branch condition, a JSX prop, writes its slot
+  [#169](https://github.com/rboudrouss/reactant-analyzer/issues/169); it is the callee's *inlining* that is not.
 - `useContext` is unmodelled, so a context value reads ⊤. This is the single largest source of
   analysis limits, 363 sites across the eight corpora [#28](https://github.com/rboudrouss/reactant-analyzer/issues/28).
 - Seven React hooks are unmodelled and emit an Info rather than a summary: `useActionState`,
@@ -129,6 +130,11 @@ carries an Error.
   [#35](https://github.com/rboudrouss/reactant-analyzer/issues/35).
 - **Module-level constants** read as ⊤ when the initializer is a call (`const X = f()`)
   [#34](https://github.com/rboudrouss/reactant-analyzer/issues/34), or when the hook was inlined from another file [#36](https://github.com/rboudrouss/reactant-analyzer/issues/36).
+- **`useReducer`**: a `dispatch` stores what the reducer returns, and the reducer runs in its own
+  scope, `(state, action)` bound and every other name ⊤. An action's members (`action.type`) are
+  not read, so a reducer that returns its state on one action and a fresh object on another may
+  store a fresh reference on every dispatch; a reducer the analysis cannot reach (a prop, an
+  unresolved import) stores ⊤ [#170](https://github.com/rboudrouss/reactant-analyzer/issues/170).
 - **`state-mutation`** on a DOM-typed prop whose type is imported from another file [#38](https://github.com/rboudrouss/reactant-analyzer/issues/38).
 - **The churn graph** keeps a cycle edge on a convergent slot when the proof cannot read what
   would settle it: a write site in another component, whose guards live in that component's

@@ -249,6 +249,10 @@ pub enum HookEntry {
     State {
         label: HookLabel,
         init: Expr,
+        /// `useReducer`'s reducer, as written: a write through the slot's
+        /// `dispatch` stores `reducer(state, action)`, never the action.
+        /// `None` for `useState`.
+        reducer: Option<Expr>,
         span: Option<SourceRange>,
     },
     Effect {

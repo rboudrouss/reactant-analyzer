@@ -23,6 +23,7 @@ use crate::{
         stores::{AbstractEnv, Heap, MemoStore, StateStore},
     },
     engine::{
+        Reducer,
         cfg_analyzer::entry_env_of,
         setters::{Updater, WriterRegion},
     },
@@ -110,6 +111,25 @@ pub fn classify(
                 expr,
             }
         }
+    }
+}
+
+/// What a write into a `useReducer` slot stores: the reducer's return, its
+/// returns classified like a functional updater's (the state is its first
+/// parameter). The action is not the stored value, so it is not `expr`
+/// either: no proof may compare the slot against it.
+pub fn dispatched(reducer: &Reducer) -> Written {
+    match reducer {
+        Reducer::Body { params, body } => Written {
+            fresh: returns_freshness(body, params),
+            value: returns_value(body),
+            expr: None,
+        },
+        Reducer::Opaque => Written {
+            fresh: Freshness::Maybe,
+            value: StateValue::top(),
+            expr: None,
+        },
     }
 }
 
