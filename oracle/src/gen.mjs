@@ -11,6 +11,8 @@
 // position, `useReducer`, cleanup writes, memo-carried loops, string growth,
 // `return set(..)` through a helper, a child rendered twice, setter aliases.
 // Constants stay below 4 so a guarded program settles in a handful of renders.
+// The world is open on two sides: a program may span several files, and a
+// write may go through `ext`, a package the analyzer has no source for.
 
 export function rng(seed) {
   let a = seed >>> 0;
@@ -48,6 +50,15 @@ export function generate(seed, index) {
   for (let i = 0; i < nComps; i++) {
     const isApp = i === nComps - 1;
     p.comps.push(genComp(r, p, isApp ? "App" : `C${i}`, isApp));
+  }
+  // Some programs are split across files that import each other: the module
+  // helpers in `lib.tsx`, the first components in a file each. A component
+  // renders only earlier ones, so moving out a prefix never makes a file import
+  // `App.tsx`. The shrinker can fold anything back into it.
+  if (r.chance(0.3)) {
+    for (const h of p.helpers) h.file = "lib.tsx";
+    const cut = r.int(0, nComps - 1);
+    for (const [i, c] of p.comps.entries()) c.file = i < cut ? `${c.name}.tsx` : "App.tsx";
   }
   return p;
 }
@@ -238,6 +249,9 @@ function genWrite(r, p, env, where) {
     [async ? 2 : 0, "timeout"],
     [async ? 2 : 0, "then"],
     [1, "iife"],
+    // Through a package the analyzer cannot see into (ADR-009's `Unknown`).
+    [1, "runNow"],
+    [async ? 1 : 0, "defer"],
     [w.type === "num" && w.kind === "setter" && arg.kind !== "updater" ? 2 : 0, "helper"],
   ]);
   if (wrap === "helper") {

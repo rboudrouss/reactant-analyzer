@@ -1,47 +1,65 @@
-// Prints a program AST (gen.mjs) as TSX. The printer is total on every tree the
-// generator or the shrinker produces; whether the result runs is the runner's
-// question, not the printer's.
+// Prints a program AST (gen.mjs) as TSX, one file or several (files.mjs). The
+// printer is total on every tree the generator or the shrinker produces;
+// whether the result runs is the runner's question, not the printer's.
 
-const IMPORTS = ["useState", "useEffect", "useLayoutEffect", "useReducer", "useMemo", "useCallback", "useRef"];
+import { joinFiles, ENTRY } from "./files.mjs";
 
+const REACT = ["useState", "useEffect", "useLayoutEffect", "useReducer", "useMemo", "useCallback", "useRef"];
+// The package the analyzer cannot see into (react-run.mjs).
+const EXT = ["defer", "runNow"];
+
+const fileOf = (x) => x.file ?? ENTRY;
+
+/**
+ * Every helper and component goes to its `file` (default `App.tsx`), in
+ * program order. A file's imports are read off its text: the generated names
+ * are unique, so a name defined in another file and mentioned here is a use.
+ */
 export function printProgram(p) {
-  const used = IMPORTS.filter((h) => p.comps.some((c) => usesHook(c, h)) || p.helpers.some((x) => x.kind === "hook" && h === "useState"));
-  const out = [];
-  if (used.length) out.push(`import { ${used.join(", ")} } from "react";`, "");
-  for (const h of p.helpers) out.push(printHelper(h), "");
-  for (const c of p.comps) out.push(printComp(c), "");
-  return out.join("\n");
-}
-
-function usesHook(c, h) {
-  return c.body.some((it) => {
-    if (it.kind === "state") return h === "useState";
-    if (it.kind === "reducer") return h === "useReducer";
-    if (it.kind === "ref") return h === "useRef";
-    if (it.kind === "memo") return h === "useMemo";
-    if (it.kind === "callback") return h === "useCallback";
-    if (it.kind === "effect") return h === (it.layout ? "useLayoutEffect" : "useEffect");
-    return false;
+  const all = [...p.helpers, ...p.comps];
+  const bare = all.map((x) => (x.kind === "comp" ? printComp(x, false) : printHelper(x, false)));
+  const mentioned = (text, id) => new RegExp(`\\b${id}\\b`).test(text);
+  // Exported when another file mentions it (and components as generated).
+  const usedElsewhere = (x) => all.some((y, j) => fileOf(y) !== fileOf(x) && mentioned(bare[j], x.name));
+  const items = all.map((x) => ({ x, text: x.kind === "comp" ? printComp(x, usedElsewhere(x)) : printHelper(x, usedElsewhere(x)) }));
+  const names = [ENTRY, ...new Set(items.map((i) => fileOf(i.x)).filter((f) => f !== ENTRY))];
+  const files = names.map((name) => {
+    const body = items.filter((i) => fileOf(i.x) === name).map((i) => i.text);
+    const text = body.join("\n\n");
+    const mentions = (id) => mentioned(text, id);
+    const imports = [];
+    const react = REACT.filter(mentions);
+    if (react.length) imports.push(`import { ${react.join(", ")} } from "react";`);
+    const ext = EXT.filter(mentions);
+    if (ext.length) imports.push(`import { ${ext.join(", ")} } from "ext";`);
+    for (const other of names) {
+      if (other === name) continue;
+      const used = items.filter((i) => fileOf(i.x) === other && mentions(i.x.name)).map((i) => i.x.name);
+      if (used.length) imports.push(`import { ${used.join(", ")} } from "./${other.replace(/\.tsx?$/, "")}";`);
+    }
+    return { name, text: [...(imports.length ? [imports.join("\n"), ""] : []), ...body.flatMap((b) => [b, ""])].join("\n") };
   });
+  return joinFiles(files);
 }
 
-function printHelper(h) {
+function printHelper(h, exported) {
+  const ex = exported ? "export " : "";
   switch (h.kind) {
     case "bump":
-      if (h.form === "arrow") return `const ${h.name} = (set, n) => set(${expr(h.arg)});`;
-      return `function ${h.name}(set, n) {\n  ${h.form === "return" ? "return " : ""}set(${expr(h.arg)});\n}`;
+      if (h.form === "arrow") return `${ex}const ${h.name} = (set, n) => set(${expr(h.arg)});`;
+      return `${ex}function ${h.name}(set, n) {\n  ${h.form === "return" ? "return " : ""}set(${expr(h.arg)});\n}`;
     case "reducer":
-      return `function ${h.name}(s, a) {\n  return ${expr(h.body)};\n}`;
+      return `${ex}function ${h.name}(s, a) {\n  return ${expr(h.body)};\n}`;
     case "hook":
-      return `function ${h.name}(init) {\n  const [v, setV] = useState(init);\n  return [v, setV];\n}`;
+      return `${ex}function ${h.name}(init) {\n  const [v, setV] = useState(init);\n  return [v, setV];\n}`;
     default:
       throw new Error(`print: helper ${h.kind}`);
   }
 }
 
-function printComp(c) {
+function printComp(c, usedElsewhere) {
   const params = c.props.length ? `{ ${c.props.map((p) => p.name).join(", ")} }` : "";
-  const lines = [`${c.exported ? "export " : ""}function ${c.name}(${params}) {`];
+  const lines = [`${c.exported || usedElsewhere ? "export " : ""}function ${c.name}(${params}) {`];
   for (const it of c.body) lines.push(indent(item(it), 1));
   lines.push(`  return ${jsx(c.view, 1)};`, "}");
   return lines.join("\n");
@@ -108,6 +126,9 @@ export function stmt(s) {
           return `Promise.resolve().then(() => ${call});`;
         case "iife":
           return `(() => ${call})();`;
+        case "defer":
+        case "runNow":
+          return `${s.wrap}(() => ${call});`;
         default:
           throw new Error(`print: wrap ${s.wrap}`);
       }

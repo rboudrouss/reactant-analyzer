@@ -3,7 +3,8 @@
 // The edits are generic over the tree, not per node kind: drop an element of
 // any array (a component, a helper, a hook, a statement, a dep, a child, a
 // prop), null a nullable field (cleanup, key, cond), replace a node by a
-// descendant of the same sort, reset an option to its plain value. An edit that
+// descendant of the same sort, reset an option to its plain value (a
+// component or helper moved back into `App.tsx` is one). An edit that
 // leaves a dangling name is not prevented: React crashes on it, the predicate
 // requires a valid run, and the edit is rejected. The validity check is the
 // semantics, not a second, hand-kept model of scoping.
@@ -11,7 +12,7 @@
 const EXPR = new Set(["num", "str", "bool", "null", "var", "member", "bin", "not", "cond", "fcall", "obj", "arr", "arrow"]);
 const STMT = new Set(["write", "helpercall", "call", "if", "refset"]);
 const NULLABLE = new Set(["cleanup", "key", "cond", "spread"]);
-const PLAIN = { wrap: "plain", layout: false, lazy: false };
+const PLAIN = { wrap: "plain", layout: false, lazy: false, file: "App.tsx" };
 
 const sortOf = (n) => (EXPR.has(n.kind) ? "expr" : STMT.has(n.kind) ? "stmt" : n.kind);
 

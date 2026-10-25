@@ -46,7 +46,7 @@ async function check(pool, source) {
 function describe(r) {
   const renders = Object.entries(r.react.renders).map(([k, n]) => `${k}×${n}`).join(" ");
   const lines = [
-    `react:    ${r.react.verdict}${r.react.via ? ` (${r.react.via})` : ""}  renders: ${renders || "-"}${r.react.warnings.length ? `  warnings: ${r.react.warnings.join(", ")}` : ""}`,
+    `react:    ${r.react.verdict}${r.react.via ? ` (${r.react.via})` : ""}${r.react.inLoop?.length ? ` through ${r.react.inLoop.join(", ")}` : ""}  renders: ${renders || "-"}${r.react.warnings.length ? `  warnings: ${r.react.warnings.join(", ")}` : ""}`,
     `reactant: ${r.claims.loops.length ? r.claims.loops.map((l) => `${l.severity} ${l.rule} on ${l.component}:${l.line ?? "?"}`).join("; ") : "no loop claim"}${r.claims.limits.length ? `  (+${r.claims.limits.length} analysis-limit)` : ""}`,
     `verdict:  ${r.verdict}${r.why ? ` — ${r.why}` : ""}`,
   ];
@@ -100,12 +100,12 @@ async function cmdCases(opts) {
   const results = await Promise.all(files.map(async (f) => [f, await check(pool, readFileSync(join(dir, f), "utf8")), caseHeader(readFileSync(join(dir, f), "utf8"))]));
   for (const [f, r, h] of results) {
     const problems = [];
-    if (!h.react) problems.push("missing `// oracle: react=loop|converges` header");
+    if (!h.react) problems.push("missing `// oracle: react=loop|converges|perpetual` header");
     else if (h.react !== r.react.verdict) problems.push(`React did \`${r.react.verdict}\`, the case expects \`${h.react}\`: the reading of React in docs/semantics.md is wrong here`);
     if (VIOLATIONS.has(r.verdict) && h.known !== r.verdict) problems.push(`new ${r.verdict}: ${r.why}`);
     if (h.known && h.known !== r.verdict) problems.push(`marked known=${h.known} ${h.issue ?? ""} but the verdict is now ${r.verdict}: if the issue is fixed, drop the \`known\` line`);
     const tag = problems.length ? "FAIL" : VIOLATIONS.has(r.verdict) ? `known ${h.issue ?? ""}`.trim() : "ok";
-    console.log(`${tag.padEnd(10)} ${f.padEnd(40)} react=${r.react.verdict.padEnd(9)} ${r.verdict}`);
+    console.log(`${tag.padEnd(10)} ${f.padEnd(40)} react=${r.react.verdict.padEnd(10)} ${r.verdict}`);
     for (const p of problems) console.log(`           ${p}`);
     if (problems.length) console.log(describe(r).replace(/^/gm, "           "));
     failures += problems.length ? 1 : 0;
@@ -152,6 +152,14 @@ async function cmdFuzz(opts) {
   const secs = ((Date.now() - started) / 1000).toFixed(1);
   console.log(`seed ${seed}, ${count} programs in ${secs}s`);
   console.log(VERDICTS.map((v) => `${v}=${tally[v]}`).join("  "));
+  const fns = results.filter((r) => r.verdict === "fn");
+  if (fns.length) {
+    const share = (p) => fns.filter(p).length;
+    console.log(
+      `fn: ${share((r) => /\bfrom "ext"/.test(r.source))} through ext, ${share((r) => r.source.includes("// @file"))} multi-file, ` +
+        `${share((r) => r.claims.loops.length > 0)} claimed outside the loop, ${share((r) => r.disclosed)} disclosed (overlapping)`,
+    );
+  }
 
   const outDir = opts.out ? resolve(opts.out) : null;
   if (outDir) mkdirSync(outDir, { recursive: true });

@@ -28,7 +28,8 @@ page is the second.
 `setter-in-render` and their cross-component forms) are tested against real
 React by the oracle under `oracle/` ([semantics.md](semantics.md),
 [ADR-043](adr/ADR-043-react-is-the-concrete-oracle.md)): a program that loops in
-React must get a finding, and an Error must come with a loop. The programs the
+React must get a finding on a component the loop re-renders, and an Error must
+come with a program that does not settle. The programs the
 analyzer gets wrong today are listed, one per file, in `oracle/cases/` with
 their issue.
 
@@ -53,7 +54,8 @@ that writes it (see *Cross-file limits*).
 ## What reactant may miss (false negatives)
 
 - Hooks and callees it cannot reach: npm-package callees and utilities cut off by the inlining depth
-  [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19); utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52); a setter called
+  [#19](https://github.com/rboudrouss/reactant-analyzer/issues/19), silently: `pkgFn(() => setN(n + 1))` in an effect gets no
+  analysis-limit, and `infinite-loop` is reported verified; utility *inlining* is statement-position only [#52](https://github.com/rboudrouss/reactant-analyzer/issues/52); a setter called
   through an index or a returned function [#46](https://github.com/rboudrouss/reactant-analyzer/issues/46). A setter *call* in any expression position,
   `wrap(setN(1))`, a ternary arm, a JSX prop, is seen; it is the callee's *inlining* that is not.
 - `useContext` is unmodelled, so a context value reads ⊤. This is the single largest source of

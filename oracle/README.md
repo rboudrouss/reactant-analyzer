@@ -15,11 +15,12 @@ node oracle/bin/oracle.mjs run file.tsx              # one program, every detail
 
 | File | Role |
 |---|---|
-| `src/react-run.mjs` | the concrete run: compile, render, drain timers, verdict |
+| `src/react-run.mjs` | the concrete run: compile, render, drain timers, verdict; provides `ext` |
+| `src/files.mjs` | one program text ↔ its files (`// @file NAME` lines) |
 | `src/gen.mjs`, `src/print.mjs` | the program generator and its TSX printer |
 | `src/reactant.mjs` | runs the analyzer, extracts the loop claims |
 | `src/judge.mjs` | P1 / P2, the verdict classes |
 | `src/shrink.mjs` | generic AST shrinking |
 | `src/pool.mjs`, `src/worker.mjs` | worker threads with a time limit |
-| `cases/` | one program per behaviour, `// oracle: react=…` and `known=…` headers |
+| `cases/` | one program per behaviour (one or several files), `// oracle: react=…` and `known=…` headers |
 | `fuzz-baseline.json` | the violations of the CI sample; regenerate with `--write-baseline` |

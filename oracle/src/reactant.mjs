@@ -6,6 +6,7 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { splitFiles } from "./files.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -38,7 +39,7 @@ function release() {
   else slots++;
 }
 
-/** Analyzes `source` as a single file and returns the parsed report. */
+/** Analyzes the files of `source` (files.mjs) as one project; returns the parsed report. */
 export async function analyze(source, opts) {
   await acquire();
   try {
@@ -50,12 +51,11 @@ export async function analyze(source, opts) {
 
 function analyzeNow(source, { bin = reactantBinary() } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "reactant-oracle-"));
-  const file = join(dir, "App.tsx");
-  writeFileSync(file, source);
+  for (const f of splitFiles(source)) writeFileSync(join(dir, f.name), f.text);
   return new Promise((res, rej) => {
     execFile(
       bin,
-      ["check", "--format", "json", "--fail-on", "never", "--info", "--project", "plain", file],
+      ["check", "--format", "json", "--fail-on", "never", "--info", "--project", "plain", dir],
       { cwd: dir, maxBuffer: 64 << 20, timeout: 60_000 },
       (err, stdout, stderr) => {
         rmSync(dir, { recursive: true, force: true });

@@ -20,16 +20,19 @@ they broke.
 ## Decision
 
 1. **The oracle runs React, not the paper.** `oracle/` renders each program in
-   `react-dom` under jsdom, at pinned versions, and reduces the run to `loop`,
+   `react-dom` under jsdom, at pinned versions, and reduces the run to `loop`
+   (renders without time advancing), `perpetual` (re-arms timers for ever),
    `converges` or invalid. React-tRace stays the vocabulary of
    `docs/semantics.md` and the formal reading of the subset it covers.
 2. **The invariants are two executable properties.** P1: React loops ⇒ the
-   analyzer makes a loop claim. P2: an Error loop claim on a rendered component
-   ⇒ React loops. One run per program decides both, because generated programs
-   take no props and no input.
+   analyzer makes a loop claim on a component the loop re-renders. P2: an
+   Error loop claim on a rendered component ⇒ React does not settle. A
+   perpetual program is claimed by no rule. One run per program decides both,
+   because generated programs take no props and no input.
 3. **Programs are generated, then shrunk.** A seeded generator of typed
-   programs over the shapes the analyzer has been wrong on; a generic shrinker
-   that keeps an edit when the failure persists and React still runs.
+   programs over the shapes the analyzer has been wrong on, over one file or
+   several, and through a package the analyzer has no source for; a generic
+   shrinker that keeps an edit when the failure persists and React still runs.
 4. **Two gates in CI.** `oracle/cases/` is the regression suite, one file per
    behaviour, with the known violations marked by issue; a fixed fuzz sample is
    compared with `oracle/fuzz-baseline.json` exactly, as the corpus baseline is.

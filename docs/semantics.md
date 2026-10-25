@@ -63,14 +63,24 @@ while rendering a different component".
 `oracle/src/react-run.mjs` compiles a program as written (esbuild, `tsx`), runs
 it, and reduces the run to one verdict:
 
-- **`loop`** — React stopped the run: "Too many re-renders" (more than 25
-  render-phase passes, React-tRace's §3.1.2), "Maximum update depth exceeded"
-  (more than 50 nested synchronous updates, thrown; or more than 50 nested
-  passive updates, logged); or a budget ran out: more than 300 renders in total,
-  or more than 200 timer callbacks fired.
+- **`loop`** — the program renders without time advancing. React stopped the
+  run: "Too many re-renders" (more than 25 render-phase passes, React-tRace's
+  §3.1.2), "Maximum update depth exceeded" (more than 50 nested synchronous
+  updates, thrown; or more than 50 nested passive updates, logged); or more
+  than 300 renders happened in one *step*, the mount or a single timer callback
+  with the microtasks it queues.
+- **`perpetual`** — every step settles, but the program keeps arming timers:
+  more than 200 timer callbacks fired. A clock is perpetual, and so is a value
+  ping-ponged through `setTimeout`.
 - **`converges`** — no update and no timer is pending, under the budgets.
 - **`crash`** (any other error) or **`timeout`** — not a test; the program is
   discarded.
+
+A `loop` also names the components *in* the loop: those rendered at least 10
+times in the step that ran out. The components on the cycle render dozens of
+times before any guard fires; an ancestor that React re-renders once to retry
+after the error does not. A child that the looping component re-renders is in
+the loop, since it renders with it.
 
 Two things are instrumented, and neither is visible to the program: the JSX
 runtime wraps each function component to count its renders, and the timer
@@ -78,10 +88,10 @@ functions the program sees are a virtual clock drained one callback at a time,
 each inside `act`.
 
 The budgets make `loop` mean "did not settle within the budget". A program
-that settles after 301 renders would be read as a loop, which could only
-*excuse* an Error (§5, P2), never hide a missing finding. The generator keeps
-every constant below 4, so its programs settle in a few dozen renders when they
-settle at all.
+that settles after 301 renders in one step would be read as a loop, which could
+only *excuse* an Error (§5, P2), never hide a missing finding. The generator
+keeps every constant below 4, so its programs settle in a few dozen renders when
+they settle at all.
 
 ## 4. The programs
 
@@ -97,11 +107,25 @@ of the right type. The vocabulary was chosen from the shapes the analyzer has
 been wrong on (#168–#181); the generator is where a new shape goes when a
 review finds one.
 
+The world the programs live in is open on two sides, the two the analyzer
+handles least by construction:
+
+- **Several files.** About a third of the programs put the module helpers in
+  `lib.tsx` and the first components in a file each, importing one another. A
+  program is still one text: a `// @file NAME` line starts a file
+  (`oracle/src/files.mjs`), and the runner and the analyzer both get every file.
+- **A package with no source.** A write may go through `runNow(cb)` (calls `cb`
+  at once) or `defer(cb)` (calls it in a microtask), imported from `ext`. The
+  runner provides `ext`; for the analyzer it is an npm package it cannot read,
+  ADR-009's `Unknown` callee.
+
 `oracle/src/shrink.mjs` reduces a failing program: it drops any element of any
 list, nulls an optional field, replaces a node by a descendant of the same
-sort, resets an option to its plain value, and keeps the edit when the failure
-class is unchanged and React still runs the program. Validity is checked by
-running React, not by a second model of scoping.
+sort, resets an option to its plain value (a write through `ext` back to a
+plain call, a component back into `App.tsx`), and keeps the edit when the
+failure class is unchanged and React still runs the program. Validity is
+checked by running React, not by a second model of scoping. A violation that
+shrinks back to one file and no `ext` was not caused by either.
 
 ## 5. The soundness relation
 
@@ -110,17 +134,27 @@ running React, not by a second model of scoping.
 `cross-component-infinite-loop`, `setter-in-render` or `cross-setter-in-render`.
 
 - **P1 (no false negative).** If React loops, the analyzer makes a loop claim
-  somewhere in the program. A violation is `fn`. When an `analysis-limit` was
-  reported, the `fn` is marked *disclosed*; it is still an `fn`.
+  on a component in the loop (§3). A claim on another component does not
+  count: with three components, a Warning on the wrong one would otherwise hide
+  the missing one. A violation is `fn`. When an `analysis-limit` was reported,
+  the `fn` is marked *disclosed*; it is still an `fn`.
 - **P2 (an Error is certain).** If the analyzer makes an Error loop claim on a
-  component that React rendered, React loops. For `cross-setter-in-render`,
-  React's "Cannot update a component while rendering a different component"
-  also satisfies it, since the rule names that defect too. A violation is
-  `error-unsound`.
+  component that React rendered, React does not settle. For
+  `cross-setter-in-render`, React's "Cannot update a component while rendering
+  a different component" also satisfies it, since the rule names that defect
+  too. A violation is `error-unsound`.
+
+**The rules do not claim perpetual programs.** Their findings say "infinite
+render loop", a program that renders without time advancing, which React
+eventually stops or which freezes the page. A program that re-renders once per
+timer callback is a clock as often as a bug, and nothing in its text says which
+one it is. So a `perpetual` program needs no claim (P1 does not apply), and
+since it does not settle, it refutes none either (P2 holds). It is counted as
+`perpetual` and judged no further.
 
 A program the analyzer cannot parse is `parse-error`, also a violation. The
 other classes are `tp` and `tn` (agreement), `fp` (a Warning on a program that
-settles, tolerated and counted) and `invalid` (React crashed).
+settles, tolerated and counted), `perpetual`, and `invalid` (React crashed).
 
 The check is one execution per program, which is what makes it exact rather
 than statistical: a program has no props and no input, so React's run is the
@@ -140,14 +174,17 @@ node oracle/bin/oracle.mjs run some/file.tsx        # one program, every detail
 
 `REACTANT_BIN` overrides the binary (default `target/release/reactant`).
 
-- **`oracle/cases/*.tsx`** is the regression suite. Each file exports `App` and
-  states what React does (`// oracle: react=loop|converges`); a case the
-  analyzer gets wrong today says so (`// oracle: known=fn #168`). The suite
+- **`oracle/cases/*.tsx`** is the regression suite. Each file exports `App`
+  (several files go in one case with `// @file` lines) and states what React
+  does (`// oracle: react=loop|converges|perpetual`); a case the analyzer gets
+  wrong today says so (`// oracle: known=fn #168`). The suite
   fails when React disagrees with the header (this page is wrong), when a new
   violation appears, or when a known one disappears (the issue may be fixed:
   drop the line).
 - **`fuzz`** generates programs, judges them, and with `--shrink` reduces each
-  violation and prints it once per distinct shape. CI runs a fixed sample
+  violation and prints it once per distinct shape. It also reports how many
+  `fn` go through `ext`, span several files, or have a claim on a component
+  outside the loop. CI runs a fixed sample
   against `oracle/fuzz-baseline.json` and fails on any difference, in either
   direction, as `docs/corpus-baseline.json` does for the corpus; a change that
   fixes or breaks programs regenerates it with `--write-baseline` in the same
@@ -161,6 +198,9 @@ node oracle/bin/oracle.mjs run some/file.tsx        # one program, every detail
   double effect would be a second semantics to state).
 - No events: loops that need a user action, and handler-driven rules, are out
   of reach.
+- "In the loop" is by render count, so a child the looping component
+  re-renders counts as in the loop: a claim on it satisfies P1 even when the
+  defect is in its parent.
 - Only the termination claims are checked. `redundant-set-state` (a write that
   causes no render), `state-mutation` and `stale-closure` have observable
   concrete counterparts and are the next candidates.

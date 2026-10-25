@@ -9,17 +9,34 @@
 import { createRequire } from "node:module";
 import { JSDOM } from "jsdom";
 import { transformSync } from "esbuild";
+import { splitFiles, ENTRY } from "./files.mjs";
 
 const require = createRequire(import.meta.url);
 
-// A program that renders more than this many times in total, without React
-// stopping it first, is read as a loop. React-tRace's conformance suite uses
-// 100 re-renders for the same purpose; the generated programs settle in a few
+// A program that renders more than this many times in one step — the mount, or
+// one timer callback — without React stopping it first, is read as a loop:
+// it renders without time advancing. React-tRace's conformance suite uses 100
+// re-renders for the same purpose; the generated programs settle in a few
 // dozen at most, so the gap is wide.
 export const RENDER_BUDGET = 300;
-// Timer callbacks fired before the run is read as a loop carried by timers
-// (an effect that re-arms a `setTimeout` on every run).
+// Timer callbacks fired before the run is read as perpetual: it keeps
+// re-arming timers, so it never settles, but at the pace of the clock (§3).
 export const TIMER_BUDGET = 200;
+// A component rendered at least this many times in the step React stopped is
+// taking part in the loop (P1 asks for a claim on one of them). The cycle's
+// components render dozens of times before any guard fires (25, 50, or the
+// budget); an ancestor React re-renders once to retry after the error does not.
+export const IN_LOOP = 10;
+
+/**
+ * A package the analyzer cannot see into (ADR-009's `Unknown` callee): a bare
+ * specifier that resolves nowhere on disk. `runNow` calls its callback at once,
+ * `defer` in a microtask, like `Promise.then`; neither is a timer.
+ */
+const EXT = {
+  runNow: (cb) => cb(),
+  defer: (cb) => void Promise.resolve().then(cb),
+};
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>");
 for (const key of ["window", "document", "navigator", "HTMLElement", "Node", "Element"]) {
@@ -34,7 +51,7 @@ const ReactDOMClient = require("react-dom/client");
 
 class RenderBudgetExceeded extends Error {
   constructor() {
-    super(`oracle: more than ${RENDER_BUDGET} renders`);
+    super(`oracle: more than ${RENDER_BUDGET} renders in one step`);
     this.name = "RenderBudgetExceeded";
   }
 }
@@ -51,8 +68,9 @@ function counted(type) {
     w = function (props) {
       if (run) {
         run.renders[name] = (run.renders[name] ?? 0) + 1;
+        run.stepRenders[name] = (run.stepRenders[name] ?? 0) + 1;
         run.total += 1;
-        if (run.total > RENDER_BUDGET) throw new RenderBudgetExceeded();
+        if (++run.step > RENDER_BUDGET) throw new RenderBudgetExceeded();
       }
       return type(props);
     };
@@ -122,26 +140,63 @@ function classifyError(err) {
   return { verdict: "crash", via: msg.split("\n")[0].slice(0, 200) };
 }
 
-export function compile(source) {
+export function compile(source, name = ENTRY) {
   return transformSync(source, {
     loader: "tsx",
     jsx: "automatic",
     format: "cjs",
     target: "es2022",
-    sourcefile: "program.tsx",
+    sourcefile: name,
   }).code;
 }
 
 /**
+ * Evaluates every file of `source` as a CommonJS module, the entry first;
+ * `./X` resolves to the file `X.tsx` (or `.ts`) of the same program.
+ */
+function load(source, clock) {
+  const files = new Map(splitFiles(source).map((f) => [f.name, f.text]));
+  const cache = new Map();
+  const t = clock.api;
+  const evaluate = (name) => {
+    if (cache.has(name)) return cache.get(name).exports;
+    const module = { exports: {} };
+    cache.set(name, module);
+    new Function(
+      "require", "module", "exports",
+      "setTimeout", "clearTimeout", "setInterval", "clearInterval", "requestAnimationFrame", "cancelAnimationFrame",
+      compile(files.get(name), name),
+    )(req, module, module.exports, t.setTimeout, t.clearTimeout, t.setInterval, t.clearInterval, t.requestAnimationFrame, t.cancelAnimationFrame);
+    return module.exports;
+  };
+  const req = (id) => {
+    if (id === "react") return reactShim;
+    if (id === "react/jsx-runtime") return jsxShim;
+    if (id === "react-dom") return require("react-dom");
+    if (id === "react-dom/client") return ReactDOMClient;
+    if (id === "ext") return EXT;
+    if (id.startsWith("./")) {
+      const base = id.slice(2);
+      const name = [base, `${base}.tsx`, `${base}.ts`].find((n) => files.has(n));
+      if (name) return evaluate(name);
+    }
+    throw new Error(`oracle: cannot import ${id}`);
+  };
+  return evaluate(files.has(ENTRY) ? ENTRY : files.keys().next().value);
+}
+
+/**
  * Renders `root` (default `App`) from `source` and returns the verdict:
- * `loop` (React stopped it, or a budget ran out), `converges` (no pending work
- * left), or `crash` (any other error: the program is not a valid test).
+ * `loop` (React stopped it, or it rendered past the budget without time
+ * advancing), `perpetual` (it kept re-arming timers past the timer budget),
+ * `converges` (no pending work left), or `crash` (any other error: the program
+ * is not a valid test). `inLoop` names the components the loop re-renders.
  */
 export async function runProgram(source, { root = "App" } = {}) {
   const clock = virtualClock();
   const errors = [];
   const warnings = [];
-  run = { renders: {}, total: 0 };
+  run = { renders: {}, total: 0, step: 0, stepRenders: {} };
 
   const origError = console.error;
   const origWarn = console.warn;
@@ -151,29 +206,15 @@ export async function runProgram(source, { root = "App" } = {}) {
   const finish = (verdict, via) => {
     console.error = origError;
     console.warn = origWarn;
-    const out = { verdict, via, renders: run.renders, total: run.total, warnings: summarizeWarnings(warnings) };
+    const inLoop = verdict === "loop" ? Object.keys(run.stepRenders).filter((k) => run.stepRenders[k] >= IN_LOOP).sort() : [];
+    const out = { verdict, via, renders: run.renders, total: run.total, inLoop, warnings: summarizeWarnings(warnings) };
     run = null;
     return out;
   };
 
   let exports;
   try {
-    const code = compile(source);
-    const module = { exports: {} };
-    const req = (id) => {
-      if (id === "react") return reactShim;
-      if (id === "react/jsx-runtime") return jsxShim;
-      if (id === "react-dom") return require("react-dom");
-      if (id === "react-dom/client") return ReactDOMClient;
-      throw new Error(`oracle: cannot import ${id}`);
-    };
-    const t = clock.api;
-    new Function(
-      "require", "module", "exports",
-      "setTimeout", "clearTimeout", "setInterval", "clearInterval", "requestAnimationFrame", "cancelAnimationFrame",
-      code,
-    )(req, module, module.exports, t.setTimeout, t.clearTimeout, t.setInterval, t.clearInterval, t.requestAnimationFrame, t.cancelAnimationFrame);
-    exports = module.exports;
+    exports = load(source, clock);
   } catch (e) {
     return finish("crash", `compile/eval: ${String(e?.message ?? e).split("\n")[0]}`);
   }
@@ -193,7 +234,7 @@ export async function runProgram(source, { root = "App" } = {}) {
       if (c.verdict === "loop") return c;
     }
     for (const w of warnings) for (const [re, via] of LOOP_PATTERNS) if (re.test(w)) return { verdict: "loop", via };
-    if (run.total > RENDER_BUDGET) return { verdict: "loop", via: "render-budget" };
+    if (run.step > RENDER_BUDGET) return { verdict: "loop", via: "render-budget" };
     if (errors.length) return classifyError(errors[0]);
     return null;
   };
@@ -210,7 +251,9 @@ export async function runProgram(source, { root = "App" } = {}) {
       if (v) return finish(v.verdict, v.via);
       const fire = clock.next();
       if (!fire) break;
-      if (++fired > TIMER_BUDGET) return finish("loop", "timer-budget");
+      if (++fired > TIMER_BUDGET) return finish("perpetual", "timer-budget");
+      run.step = 0;
+      run.stepRenders = {};
       try {
         await React.act(async () => fire());
       } catch (e) {
