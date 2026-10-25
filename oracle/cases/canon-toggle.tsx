@@ -1,5 +1,5 @@
 // oracle: react=loop
-// oracle: known=fn
+// oracle: known=fn #187
 // `Toggle` (manuscrit ch. 2 and 27): a cycle over a finite set of values converges
 // without widening, so neither the fixpoint arm nor the churn arm sees it.
 import { useEffect, useState } from "react";

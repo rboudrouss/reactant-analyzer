@@ -1,5 +1,5 @@
 // oracle: react=loop
-// oracle: known=fn
+// oracle: known=fn #185
 // Found by `oracle fuzz --seed 2` (programs 976, 752, 1044, 1087, shrunk). The
 // render-phase form of new-custom-hook-setter.tsx: "Too many re-renders" in
 // React, `verified setter-in-render` from the analyzer.
